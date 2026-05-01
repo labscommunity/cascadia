@@ -119,7 +119,8 @@ class OpenVINOEngine(Engine):
             assert self._downstream is not None, "non-last first stage needs downstream"
             self._downstream.send(hs)
             token_array, _ = self._downstream.recv()
-            next_token = int(token_array[0])
+            # Wire format always returns a 3D array; .flat[0] handles any shape.
+            next_token = int(token_array.flat[0])
 
         active.generated.append(next_token)
         active.current_ids = np.append(active.current_ids, [[next_token]], axis=1)
