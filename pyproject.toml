@@ -20,6 +20,9 @@ dependencies = [
     "numpy>=1.24",
     "transformers>=4.40",
     "safetensors>=0.4",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +31,9 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
 ]
+
+[project.scripts]
+tahoma = "tahoma.cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]

@@ -29,6 +29,23 @@ logger = logging.getLogger(__name__)
 
 
 # HF model_type → (layers_attr, embed_attr, norm_attr, head_attr, rotary_attr)
+def _torch_device(device: str) -> str:
+    """Translate the OpenVINO device hint (CPU/GPU/NPU) to a torch device string."""
+    d = device.upper()
+    if d == "CPU":
+        return "cpu"
+    if d == "GPU":
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        logger.warning("device=GPU requested but no torch GPU backend; falling back to CPU")
+        return "cpu"
+    if d == "NPU":
+        raise NotImplementedError("NPU is not supported by the PyTorch loader path")
+    raise ValueError(f"unknown device hint: {device!r}")
+
+
 _MODEL_STRUCTURE: dict[str, tuple[str, str, str, str, str | None]] = {
     "llama":      ("model.layers", "model.embed_tokens", "model.norm", "lm_head", "model.rotary_emb"),
     "mistral":    ("model.layers", "model.embed_tokens", "model.norm", "lm_head", "model.rotary_emb"),
@@ -138,6 +155,7 @@ class ModelShard:
         layer_config = self._text_config
         layers_attr, embed_attr, norm_attr, head_attr, _rotary_attr = self._model_structure
         layer_class, norm_class, rotary_class = self._get_component_classes(self._config.model_type)
+        torch_dev = _torch_device(spec.device)
 
         # Decoder layers
         layers = nn.ModuleList()
@@ -152,6 +170,7 @@ class ModelShard:
             layer.load_state_dict(layer_sd, strict=False)
             layer.eval()
             layer.half()
+            layer.to(torch_dev)
             layers.append(layer)
         self._layers = layers
 
@@ -166,6 +185,7 @@ class ModelShard:
             embed.load_state_dict(embed_sd, strict=False)
             embed.eval()
             embed.half()
+            embed.to(torch_dev)
             self._embed = embed
 
         # Final norm + LM head (last stage only)
@@ -189,6 +209,7 @@ class ModelShard:
             norm.load_state_dict(norm_sd, strict=False)
             norm.eval()
             norm.half()
+            norm.to(torch_dev)
             self._norm = norm
 
             head = nn.Linear(layer_config.hidden_size, layer_config.vocab_size, bias=False)
@@ -200,11 +221,12 @@ class ModelShard:
             head.load_state_dict(head_sd, strict=False)
             head.eval()
             head.half()
+            head.to(torch_dev)
             self._head = head
 
         # Rotary embedding (no learned weights, config-derived only)
         if rotary_class is not None:
-            self._rotary_emb = rotary_class(config=self._config)
+            self._rotary_emb = rotary_class(config=self._config).to(torch_dev)
 
     @staticmethod
     def _get_component_classes(model_type: str):
@@ -245,9 +267,10 @@ class ModelShard:
             raise RuntimeError("embed() is only valid on the first pipeline stage")
         if self._embed is None:
             raise RuntimeError("embedding not loaded; call load() first")
+        torch_dev = _torch_device(self.spec.device)
         with torch.no_grad():
-            tensor = torch.tensor(input_ids, dtype=torch.long)
-            return self._embed(tensor).numpy()
+            tensor = torch.tensor(input_ids, dtype=torch.long, device=torch_dev)
+            return self._embed(tensor).cpu().numpy()
 
     def forward_layers(
         self,
@@ -258,9 +281,9 @@ class ModelShard:
         if not self._loaded:
             raise RuntimeError("model not loaded; call load() first")
 
-        device = self.spec.device
+        device = _torch_device(self.spec.device)
         with torch.no_grad():
-            hs = torch.tensor(hidden_states, device=device)
+            hs = torch.tensor(hidden_states, device=device, dtype=torch.float16)
             if position_ids is not None:
                 pos = torch.tensor(position_ids, device=device)
             else:
@@ -305,9 +328,9 @@ class ModelShard:
 
         from transformers.cache_utils import DynamicCache
 
-        device = self.spec.device
+        device = _torch_device(self.spec.device)
         with torch.no_grad():
-            hs = torch.tensor(hidden_states, device=device)
+            hs = torch.tensor(hidden_states, device=device, dtype=torch.float16)
             if position_ids is not None:
                 pos = torch.tensor(position_ids, device=device)
             else:
@@ -357,10 +380,11 @@ class ModelShard:
             raise RuntimeError("lm_head() is only valid on the last pipeline stage")
         if self._norm is None or self._head is None:
             raise RuntimeError("norm/head not loaded; call load() first")
+        torch_dev = _torch_device(self.spec.device)
         with torch.no_grad():
-            hs = torch.tensor(hidden_states)
+            hs = torch.tensor(hidden_states, device=torch_dev, dtype=torch.float16)
             hs = self._norm(hs)
-            return self._head(hs).numpy()
+            return self._head(hs).cpu().numpy()
 
     @property
     def hidden_size(self) -> int | None:

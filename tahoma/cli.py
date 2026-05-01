@@ -1,0 +1,148 @@
+"""Tahoma CLI.
+
+Examples:
+    # Last stage on rank 1 (listens on :9100):
+    tahoma worker --rank 1 --total 2 --model /path/to/model --listen :9100
+
+    # First stage on rank 0 (sends to next-stage host:9100, serves API on :8000):
+    tahoma worker --rank 0 --total 2 --model /path/to/model \
+        --next 192.168.1.50:9100 --api :8000
+
+For non-API single-stage interactive use, omit `--api` and pipe prompts on stdin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from tahoma.shared.shard import ShardPlan
+from tahoma.shared.topology import PeerEndpoint, PeerLayout
+from tahoma.shared.types import GenerationTask
+from tahoma.worker.engines.openvino import OpenVINOBuilder
+from tahoma.worker.runner import Runner
+
+logger = logging.getLogger(__name__)
+
+
+def parse_addr(s: str, default_host: str = "0.0.0.0") -> tuple[str, int]:
+    """Parse `host:port` or `:port`."""
+    if s.startswith(":"):
+        return default_host, int(s[1:])
+    host, port = s.rsplit(":", 1)
+    return host, int(port)
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    plan = ShardPlan.from_hf_model_id(
+        args.model, num_stages=args.total, devices=[args.device] * args.total,
+    )
+    if args.rank < 0 or args.rank >= args.total:
+        sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
+    spec = plan.stages[args.rank]
+    logger.info(
+        "rank=%d/%d layers=[%d,%d) device=%s first=%s last=%s",
+        args.rank, args.total, spec.layer_start, spec.layer_end, spec.device,
+        spec.is_first_stage, spec.is_last_stage,
+    )
+
+    listen_host, listen_port = parse_addr(args.listen)
+    builder = OpenVINOBuilder(model_path=args.model)
+    builder.configure_listen(listen_host, listen_port)
+
+    upstream: PeerEndpoint | None = None
+    if not spec.is_first_stage:
+        # We listen for the upstream peer; PeerEndpoint here just signals
+        # "we have an upstream" to the builder.
+        upstream = PeerEndpoint(host=listen_host, port=listen_port)
+
+    downstream: PeerEndpoint | None = None
+    if not spec.is_last_stage:
+        if not args.next:
+            sys.exit("--next is required for non-last stages")
+        host, port = parse_addr(args.next, default_host="127.0.0.1")
+        downstream = PeerEndpoint(host=host, port=port)
+
+    peers = PeerLayout(upstream=upstream, downstream=downstream)
+    runner = Runner(builder)
+
+    try:
+        runner.start(peers, spec)
+
+        if not spec.is_first_stage:
+            logger.info("entering relay loop")
+            runner.run_relay_loop()
+            return 0
+
+        # First stage: API or stdin.
+        if args.api:
+            from tahoma.api import make_app
+            import uvicorn  # type: ignore[import-untyped]
+
+            api_host, api_port = parse_addr(args.api)
+            app = make_app(runner, model_id=args.model)
+            logger.info("API serving on %s:%d", api_host, api_port)
+            uvicorn.run(app, host=api_host, port=api_port, log_level="info")
+            return 0
+
+        # No API → stdin loop for quick CLI testing.
+        logger.info("stdin mode: type a prompt and press enter")
+        for line in sys.stdin:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            task = GenerationTask(
+                task_id=f"stdin-{len(line)}",
+                prompt=line,
+                max_tokens=args.max_tokens,
+            )
+            for chunk in runner.generate(task):
+                print(chunk.text, end="", flush=True)
+                if chunk.is_final:
+                    print()
+        return 0
+    finally:
+        runner.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="tahoma")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    pw = sub.add_parser("worker", help="run a pipeline-stage worker")
+    pw.add_argument("--rank", type=int, required=True, help="0-based stage index")
+    pw.add_argument("--total", type=int, required=True, help="total number of stages")
+    pw.add_argument(
+        "--model", required=True, help="HF model id or local model directory",
+    )
+    pw.add_argument(
+        "--listen", default=":9100",
+        help="bind address for the upstream-receiving socket (default :9100)",
+    )
+    pw.add_argument(
+        "--next", help="downstream peer (host:port) — required for non-last stages",
+    )
+    pw.add_argument(
+        "--api", help="API bind address (e.g. :8000) — only for rank 0",
+    )
+    pw.add_argument(
+        "--device", default="CPU", help="device hint: CPU / GPU / NPU (default CPU)",
+    )
+    pw.add_argument(
+        "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
+    )
+    pw.set_defaults(func=cmd_worker)
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    )
+
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
