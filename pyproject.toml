@@ -18,7 +18,11 @@ classifiers = [
 dependencies = [
     "torch>=2.2",
     "numpy>=1.24",
-    "transformers>=4.40",
+    # transformers 5.x changed rotary attention_scaling for rope_type="llama3"
+    # in a way that breaks Llama 3.1 8B Instruct's KV-cache decode (model
+    # produces correct first token then degenerate tokens). Pinning to 4.x
+    # until the loader is updated to handle the 5.x rotary path correctly.
+    "transformers>=4.57,<5.0",
     "safetensors>=0.4",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
