@@ -352,6 +352,13 @@ class ModelShard:
                 # [past_len, past_len + 1).
                 pos = torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0)
 
+            # transformers 5.x decoder layers require `position_embeddings`
+            # (cos, sin) rather than `position_ids`. Compute via the model's
+            # rotary embedding if we have one.
+            position_embeddings = None
+            if self._rotary_emb is not None:
+                position_embeddings = self._rotary_emb(hs, pos)
+
             total_len = past_len + seq_len
             causal_mask = torch.full(
                 (1, 1, seq_len, total_len), float("-inf"),
@@ -365,13 +372,22 @@ class ModelShard:
                 past_key_values = DynamicCache()
 
             for layer in self._layers:
-                out = layer(
-                    hs,
-                    position_ids=pos,
-                    attention_mask=causal_mask,
-                    past_key_value=past_key_values,
-                    use_cache=True,
-                )
+                if position_embeddings is not None:
+                    out = layer(
+                        hs,
+                        position_embeddings=position_embeddings,
+                        attention_mask=causal_mask,
+                        past_key_value=past_key_values,
+                        use_cache=True,
+                    )
+                else:
+                    out = layer(
+                        hs,
+                        position_ids=pos,
+                        attention_mask=causal_mask,
+                        past_key_value=past_key_values,
+                        use_cache=True,
+                    )
                 hs = out[0]
                 if hs.dim() == 2:
                     hs = hs.unsqueeze(0)
