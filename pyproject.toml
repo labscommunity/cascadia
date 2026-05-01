@@ -15,7 +15,12 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+]
 
 [project.optional-dependencies]
 dev = [
