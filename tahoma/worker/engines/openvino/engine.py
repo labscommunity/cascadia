@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -34,12 +35,21 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _ActiveTask:
     task: GenerationTask
-    current_ids: np.ndarray  # [1, current_seq_len]
+    prompt_ids: np.ndarray             # [1, prompt_len]
     generated: list[int] = field(default_factory=list)
+    prefilled: bool = False            # whether the full prompt has been fed
+    last_token: int | None = None      # for decode (single-token) steps
+    past_kv: Any = None                # DynamicCache for stage-0 layers
 
 
 class OpenVINOEngine(Engine):
-    """Per-stage inference engine, dispatched by `ShardSpec.is_first/last_stage`."""
+    """Per-stage inference engine, dispatched by `ShardSpec.is_first/last_stage`.
+
+    Uses KV cache: prefill on first step (full prompt), decode (single token)
+    thereafter. Stage 0 carries `past_kv` per active task; relay/last stages
+    carry one shared `past_kv` per engine, reset whenever a multi-token
+    activation arrives (signals a new prefill upstream).
+    """
 
     def __init__(
         self,
@@ -54,6 +64,8 @@ class OpenVINOEngine(Engine):
         self._downstream = downstream_client
         self._active: dict[TaskId, _ActiveTask] = {}
         self._pending: list[GenerationTask] = []
+        # Relay/last stages: single past_kv that resets on each new prefill.
+        self._relay_past_kv: Any = None
 
     def warmup(self) -> None:
         """First stage runs a 1-token forward to warm graphs.
@@ -95,10 +107,10 @@ class OpenVINOEngine(Engine):
         # serves one task at a time.
         if not self._active and self._pending:
             task = self._pending.pop(0)
-            input_ids = self.shard.tokenizer.encode(task.prompt, return_tensors="np")
-            self._active[task.task_id] = _ActiveTask(task=task, current_ids=input_ids)
+            prompt_ids = self.shard.tokenizer.encode(task.prompt, return_tensors="np")
+            self._active[task.task_id] = _ActiveTask(task=task, prompt_ids=prompt_ids)
             logger.info(
-                "task %s active: prompt_tokens=%d", task.task_id[:8], input_ids.shape[1],
+                "task %s active: prompt_tokens=%d", task.task_id[:8], prompt_ids.shape[1],
             )
 
         if not self._active:
@@ -107,12 +119,20 @@ class OpenVINOEngine(Engine):
         task_id = next(iter(self._active))
         active = self._active[task_id]
 
-        # Stage-0 forward
-        hs = self.shard.embed(active.current_ids)
-        hs = self.shard.forward_layers(hs)
+        # Prefill on the first step (full prompt), decode (1 token) thereafter.
+        if not active.prefilled:
+            input_ids = active.prompt_ids
+            active.prefilled = True
+        else:
+            input_ids = np.array([[active.last_token]], dtype=np.int64)
+
+        hs = self.shard.embed(input_ids)
+        hs, active.past_kv = self.shard.forward_layers_cached(
+            hs, past_key_values=active.past_kv,
+        )
 
         if self.spec.is_last_stage:
-            # 1-stage pipeline (single node)
+            # 1-stage pipeline (single node).
             logits = self.shard.lm_head(hs)
             next_token = int(np.argmax(logits[0, -1, :]))
         else:
@@ -122,8 +142,8 @@ class OpenVINOEngine(Engine):
             # Wire format always returns a 3D array; .flat[0] handles any shape.
             next_token = int(token_array.flat[0])
 
+        active.last_token = next_token
         active.generated.append(next_token)
-        active.current_ids = np.append(active.current_ids, [[next_token]], axis=1)
 
         text = self.shard.tokenizer.decode([next_token], skip_special_tokens=True)
         eos = getattr(self.shard.tokenizer, "eos_token_id", None)
@@ -147,7 +167,12 @@ class OpenVINOEngine(Engine):
     def _step_middle(self) -> None:
         assert self._upstream is not None and self._downstream is not None
         activation, _ = self._upstream.recv()
-        output = self.shard.forward_layers(activation)
+        # Multi-token arrival signals a new prefill — reset cache.
+        if activation.shape[1] > 1:
+            self._relay_past_kv = None
+        output, self._relay_past_kv = self.shard.forward_layers_cached(
+            activation, past_key_values=self._relay_past_kv,
+        )
         self._downstream.send(output)
         token_array, _ = self._downstream.recv()
         self._upstream.send(token_array)
@@ -157,7 +182,12 @@ class OpenVINOEngine(Engine):
     def _step_last(self) -> None:
         assert self._upstream is not None
         activation, _ = self._upstream.recv()
-        hs = self.shard.forward_layers(activation)
+        # Multi-token arrival signals a new prefill — reset cache.
+        if activation.shape[1] > 1:
+            self._relay_past_kv = None
+        hs, self._relay_past_kv = self.shard.forward_layers_cached(
+            activation, past_key_values=self._relay_past_kv,
+        )
         logits = self.shard.lm_head(hs)
         next_token = int(np.argmax(logits[0, -1, :]))
         token_array = np.array([next_token], dtype=np.int32)

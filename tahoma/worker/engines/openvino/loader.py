@@ -331,12 +331,8 @@ class ModelShard:
         device = _torch_device(self.spec.device)
         with torch.no_grad():
             hs = torch.tensor(hidden_states, device=device, dtype=torch.float16)
-            if position_ids is not None:
-                pos = torch.tensor(position_ids, device=device)
-            else:
-                pos = torch.arange(hs.shape[1], device=device).unsqueeze(0)
-
             seq_len = hs.shape[1]
+
             past_len = 0
             if past_key_values is not None and hasattr(past_key_values, "get_seq_length"):
                 # DynamicCache indexes by layer_idx; use the first held layer.
@@ -347,6 +343,14 @@ class ModelShard:
                     else 0
                 )
                 past_len = past_key_values.get_seq_length(first_layer_idx)
+
+            if position_ids is not None:
+                pos = torch.tensor(position_ids, device=device)
+            else:
+                # Default span [past_len, past_len + seq_len). For prefill that's
+                # [0, seq_len); for decode (past_len > 0, seq_len == 1) it's
+                # [past_len, past_len + 1).
+                pos = torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0)
 
             total_len = past_len + seq_len
             causal_mask = torch.full(
