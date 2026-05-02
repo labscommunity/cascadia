@@ -66,9 +66,11 @@ class OVGenAIEngine(Engine):
         self,
         pipe: Any,
         max_tokens_default: int = 256,
+        speculative_k: int = 0,
     ):
         self._pipe = pipe
         self._max_tokens_default = max_tokens_default
+        self._speculative_k = speculative_k  # 0 = no spec; >0 = num_assistant_tokens
         self._pending: list[GenerationTask] = []
         # We don't track an "active" set the way streaming engines do — the
         # generate() call below is blocking, so the task is "active" only
@@ -79,10 +81,14 @@ class OVGenAIEngine(Engine):
         try:
             import openvino_genai as ov_genai
             cfg = ov_genai.GenerationConfig()
-            cfg.max_new_tokens = 1
+            cfg.max_new_tokens = 4
             cfg.do_sample = False
+            if self._speculative_k > 0:
+                cfg.num_assistant_tokens = self._speculative_k
             self._pipe.generate("Hi", cfg)
-            logger.info("ov-genai warmup ok")
+            logger.info(
+                "ov-genai warmup ok (spec_k=%d)", self._speculative_k,
+            )
         except Exception as err:  # noqa: BLE001
             logger.warning("ov-genai warmup failed: %s", err)
 
@@ -102,6 +108,8 @@ class OVGenAIEngine(Engine):
         cfg.do_sample = task.temperature > 0.0
         if task.temperature > 0.0:
             cfg.temperature = task.temperature
+        if self._speculative_k > 0:
+            cfg.num_assistant_tokens = self._speculative_k
 
         t0 = time.perf_counter()
         result = self._pipe.generate(task.prompt, cfg)
@@ -152,12 +160,18 @@ class OVGenAIBuilder(Builder):
         cache_dir: str | None = None,
         kv_cache_precision: str | None = None,
         dyn_quant_group: str | None = None,
+        draft_model_path: str | None = None,
+        draft_device: str | None = None,
+        speculative_k: int = 5,
     ):
         self._model_path = model_path
         self._device = device
         self._cache_dir = cache_dir
         self._kv_cache_precision = kv_cache_precision
         self._dyn_quant_group = dyn_quant_group
+        self._draft_model_path = draft_model_path
+        self._draft_device = draft_device or device
+        self._speculative_k = speculative_k if draft_model_path else 0
         self._pipe: Any = None
 
     def configure_listen(self, host: str, port: int) -> None:
@@ -192,7 +206,6 @@ class OVGenAIBuilder(Builder):
         if self._dyn_quant_group:
             plugin_config["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = self._dyn_quant_group
 
-        yield LoadProgress(0, None, f"compiling LLMPipeline on {self._device}")
         try:
             import openvino_genai as ov_genai
         except ImportError as err:
@@ -200,13 +213,25 @@ class OVGenAIBuilder(Builder):
                 "openvino-genai is required for the ov-genai engine; "
                 "install with `pip install openvino-genai==<matching openvino version>`",
             ) from err
-        self._pipe = ov_genai.LLMPipeline(self._model_path, self._device, **plugin_config)
+
+        if self._draft_model_path:
+            yield LoadProgress(0, None, f"loading draft model {self._draft_model_path}")
+            if not Path(self._draft_model_path).exists():
+                raise RuntimeError(f"draft model not found at {self._draft_model_path}")
+            draft = ov_genai.draft_model(self._draft_model_path, self._draft_device)
+            yield LoadProgress(0, None, f"compiling LLMPipeline + draft on {self._device}")
+            self._pipe = ov_genai.LLMPipeline(
+                self._model_path, self._device, draft_model=draft, **plugin_config,
+            )
+        else:
+            yield LoadProgress(0, None, f"compiling LLMPipeline on {self._device}")
+            self._pipe = ov_genai.LLMPipeline(self._model_path, self._device, **plugin_config)
         yield LoadProgress(1, 1, "ready")
 
     def build(self) -> Engine:
         if self._pipe is None:
             raise RuntimeError("call load() before build()")
-        return OVGenAIEngine(pipe=self._pipe)
+        return OVGenAIEngine(pipe=self._pipe, speculative_k=self._speculative_k)
 
     def close(self) -> None:
         self._pipe = None

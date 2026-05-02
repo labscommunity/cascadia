@@ -6,14 +6,15 @@ Best measured tok/s per `(model, hardware, engine, prompt-class)` combination.
 
 | Hardware | Engine | Output | tok/s | Source |
 |---|---|---|---|---|
-| **alpha B390 GPU** | **LLMPipeline + FastDraft 150M K=5** | **64 tok** | **119.24** | c18-fastdraft/c18-1 |
+| **alpha B390 GPU** | **tahoma `ov-genai` + FastDraft K=5** | **64 tok** | **134.90** | c18-fastdraft/c18-6 |
+| alpha B390 GPU | LLMPipeline + FastDraft 150M K=5 (raw) | 64 tok | 119.24 | c18-fastdraft/c18-1 |
 | alpha B390 GPU | LLMPipeline + FastDraft 150M K=10 | 64 tok | 118.22 | c18-fastdraft/c18-2 |
 | alpha B390 GPU | LLMPipeline + 1B INT4 draft K=10 | 64 tok | 100.90 | c2-llmpipe-spec/c2-4 |
-| alpha B390 GPU | LLMPipeline plain | 64 tok | 96.41 | c1-llmpipeline/c1-1 |
-| alpha B390 GPU | LLMPipeline + plugin properties | 64 tok | 92.74 | c1-llmpipeline/c1-3 |
-| charlie 140V GPU | LLMPipeline plain | 64 tok | 91.14 | c1-llmpipeline/c1-2 |
-| alpha B390 GPU | tahoma `--engine ov-genai` | 64 tok | 87.10 | c3-ov-genai-engine/c3-1 |
-| charlie 140V GPU | tahoma `--engine ov-genai` | 64 tok | 71.31 | c3-ov-genai-engine/c5-1 |
+| alpha B390 GPU | LLMPipeline plain (raw) | 64 tok | 96.41 | c1-llmpipeline/c1-1 |
+| **charlie 140V GPU** | **tahoma `ov-genai` + FastDraft K=5** | **64 tok** | **96.04** | c18-fastdraft/c18-7 |
+| charlie 140V GPU | LLMPipeline plain (raw) | 64 tok | 91.14 | c1-llmpipeline/c1-2 |
+| alpha B390 GPU | tahoma `ov-genai` plain | 64 tok | 87.10 | c3-ov-genai-engine/c3-1 |
+| charlie 140V GPU | tahoma `ov-genai` plain | 64 tok | 71.31 | c3-ov-genai-engine/c5-1 |
 | **alpha B390 GPU** | **LLMPipeline + FastDraft 150M K=5** | **256 tok** | **24.79** | c18-fastdraft/c18-3 |
 | alpha B390 GPU | LLMPipeline + 1B INT4 draft K=5 | 256 tok | 24.94 | c6-long-gen/c6-2 |
 | charlie 140V GPU | LLMPipeline plain | 256 tok | 23.18 | c10-other-models/c17 |
@@ -35,7 +36,15 @@ Best measured tok/s per `(model, hardware, engine, prompt-class)` combination.
 |---|---|---|---|
 | ov-dist-spec | K=4, v5 shards | 17.59 | c0-baselines/c0-5 |
 
-(Strictly slower than single-node `ov-genai+FastDraft` (119 tok/s on alpha). Distributed serving for 8B is no longer a perf decision — only a fit decision for models that don't fit on one node.)
+(Strictly slower than single-node `ov-genai+FastDraft` (134.9 tok/s on alpha, 96.0 on charlie). Distributed serving for 8B is no longer a perf decision.)
+
+## Aggregate speedup vs project's original main-branch baseline
+
+| Hardware | main `baselines.md` claim | New best (this branch) | Multiplier |
+|---|---|---|---|
+| alpha B390 GPU (8B INT4) | 16.7 (`ov-optimum`) | **134.90** (`ov-genai + FastDraft K=5`) | **8.1×** |
+| alpha B390 GPU (8B INT4) | 35.0 (`ov-spec K=4`) | **134.90** (`ov-genai + FastDraft K=5`) | **3.9×** |
+| charlie 140V GPU (8B INT4) | 17.0 (`ov-optimum`) | **96.04** (`ov-genai + FastDraft K=5`) | **5.6×** |
 
 ## Notes
 

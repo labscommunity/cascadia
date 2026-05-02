@@ -214,6 +214,9 @@ def _ov_genai_builder(args: argparse.Namespace, _host: str, _port: int) -> Build
         cache_dir=getattr(args, "ov_cache_dir", None),
         kv_cache_precision=getattr(args, "ov_kv_precision", None),
         dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
+        draft_model_path=getattr(args, "draft_model", None),
+        draft_device=getattr(args, "draft_device", None) or args.device,
+        speculative_k=getattr(args, "spec_k", 5),
     )
 
 

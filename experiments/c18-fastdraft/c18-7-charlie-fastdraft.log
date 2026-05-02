@@ -1,0 +1,13 @@
+2026-05-01 23:43:06,181 INFO tahoma.cli | engine=ov-genai rank=0/1 device=GPU model=C:\cascadia\models\llama-3.1-8b-int4 namespace=default
+2026-05-01 23:43:07,298 INFO tahoma.worker.runner | connect: upstream=None downstream=None
+2026-05-01 23:43:07,298 INFO tahoma.worker.runner | load: locating IR at C:\cascadia\models\llama-3.1-8b-int4
+2026-05-01 23:43:07,394 INFO tahoma.worker.runner | load: loading draft model C:\cascadia\models\fastdraft-150m-int8-ov
+2026-05-01 23:43:07,489 INFO tahoma.worker.runner | load: compiling LLMPipeline + draft on GPU
+2026-05-01 23:43:28,518 INFO tahoma.worker.runner | load: ready
+2026-05-01 23:43:28,569 INFO tahoma.worker.runner | build engine
+2026-05-01 23:43:28,569 INFO tahoma.worker.runner | warmup
+2026-05-01 23:43:29,699 INFO tahoma.worker.engines.openvino.genai_engine | ov-genai warmup ok (spec_k=5)
+2026-05-01 23:43:29,699 INFO tahoma.worker.runner | runner ready
+2026-05-01 23:43:29,699 INFO tahoma.cli | stdin mode: type a prompt and press enter
+The capital of France is Paris.2026-05-01 23:43:30,366 INFO tahoma.worker.engines.openvino.genai_engine | task stdin-30 done: 64 tokens in 0.667s (96.0 tok/s)
+
