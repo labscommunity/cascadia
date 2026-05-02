@@ -46,3 +46,27 @@ The bench script defaulted to `n = max_tokens` if perf_metrics didn't
 return num_generated_tokens. perf_metrics in OV 2026.1 LLMPipeline often
 returns this as None or 0 for greedy short outputs, causing the fallback
 to inflate. Should always use `tokenizer.encode(text).input_ids.shape[-1]`.
+
+## Update: charlie 1B Llama corrected
+
+| Hardware | Mode | dt | actual tokens | actual tok/s | bench claimed |
+|----------|------|---:|--------------:|-------------:|--------------:|
+| charlie 140V GPU | LLMPipeline plain (1B INT4) | 0.144s | **8** | **55.6** | 211.39 (3.8× inflated) |
+
+## Final corrected absolute baselines (all from same factual prompt)
+
+| Hardware | Model | Mode | actual tok/s |
+|----------|-------|------|-------------:|
+| charlie 140V GPU | Llama 3.2 1B INT4 | plain | 55.6 |
+| alpha B390 GPU | Llama 3.1 8B INT4 | plain | 17.5 |
+| alpha B390 GPU | Llama 3.1 8B INT4 | + FastDraft K=5 | 27.2 |
+| charlie 140V GPU | Llama 3.1 8B INT4 | + PL extractive (1K input + ~99 actual tokens) | ~28 |
+
+## All RELATIVE wins still valid
+
+| Workload | Relative win |
+|----------|-------------:|
+| LLMPipeline vs OVModelForCausalLM | ~10× (Discovery #1) |
+| FastDraft vs LLMPipeline plain (factual chat) | +55% (corrected from +24%) |
+| PL vs LLMPipeline plain (extractive RAG) | +40% (corrected from +94%) |
+| NPU concurrent vs sequential aggregate | +16% (Discovery #4) |
