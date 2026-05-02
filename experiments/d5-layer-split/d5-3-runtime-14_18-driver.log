@@ -1,0 +1,86 @@
+python : 2026-05-02 10:09:48,603 INFO tahoma.cli | engine=ov-runtime rank=0/2 device=GPU 
+model=C:\cascadia\shards_2s_14_18 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 10:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 10:09:50,109 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 10:09:50,141 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 10:09:50,204 INFO tahoma.worker.runner | load: reading C:\cascadia\shards_2s_14_18
+2026-05-02 10:09:50,204 INFO tahoma.worker.runner | load: compiling OV shard
+2026-05-02 10:09:59,309 INFO tahoma.worker.runner | load: loading rotary + tokenizer
+2026-05-02 10:10:08,634 INFO tahoma.worker.runner | load: ready
+2026-05-02 10:10:09,054 INFO tahoma.worker.runner | build engine
+2026-05-02 10:10:09,054 INFO tahoma.worker.runner | warmup
+2026-05-02 10:10:09,247 INFO tahoma.worker.engines.openvino.ov_runtime | warmup ok
+2026-05-02 10:10:09,247 INFO tahoma.worker.runner | runner ready
+2026-05-02 10:10:09,247 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 10:10:09,248 INFO tahoma.worker.engines.openvino.ov_runtime | task stdin-30 active: prompt_tokens=8
+ Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is
+WALL_CLOCK_S=38.904455
+python : 2026-05-02 10:10:28,072 INFO tahoma.cli | engine=ov-runtime rank=0/2 device=GPU 
+model=C:\cascadia\shards_2s_14_18 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 10:1...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 10:10:29,531 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+Traceback (most recent call last):
+  File "C:\tahoma\tahoma\worker\transport.py", line 174, in connect
+    sock.connect((self.host, self.port))
+TimeoutError: timed out
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 40, in start
+    self._builder.connect(peers)
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 325, in connect
+    client.connect()
+  File "C:\tahoma\tahoma\worker\transport.py", line 184, in connect
+    raise TimeoutError(
+TimeoutError: could not connect to 10.10.10.2:9100 within 30.0s
+WALL_CLOCK_S=32.874098
