@@ -44,19 +44,31 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 | charlie 140V GPU | 1 | 143 | 143 |
 | charlie 140V GPU | 8 | **149** | 18.6 |
 
-## Phi-3-mini-128k INT4
+## Phi-3-mini INT4
 
-| Engine | tok/s |
-|---|---|
-| LLMPipeline + 50M FastDraft K=5 | 43.90 (+36% over plain) |
-| LLMPipeline plain | 32.18 |
+| Hardware | Engine | tok/s |
+|---|---|---|
+| **alpha B390 GPU** | **LLMPipeline + 50M FastDraft K=5** | **43.90 (+36%)** |
+| charlie 140V GPU | LLMPipeline + 50M FastDraft K=5 | 40.68 (+12%) |
+| charlie 140V GPU | LLMPipeline plain | 36.26 |
+| alpha B390 GPU | LLMPipeline plain | 32.18 |
 
-## Llama 3.2 1B Instruct INT4 (alpha B390)
+## Llama 3.2 1B Instruct INT4 — single user
 
-| Output | tok/s |
-|---|---|
-| 64 tok | 149.47 |
-| 256 tok | 81.07 |
+### 64-token factual
+
+| Hardware | Engine | tok/s |
+|---|---|---|
+| **charlie 140V GPU** | LLMPipeline plain | **211.39** |
+| alpha B390 GPU | LLMPipeline plain | 149.47 |
+| alpha host NPU (Battlemage box) | LLMPipeline plain | 135.84 |
+| charlie 140V NPU | LLMPipeline plain | 112.89 |
+
+### 256-token
+
+| Hardware | Engine | tok/s |
+|---|---|---|
+| alpha B390 GPU | LLMPipeline plain | 81.07 |
 
 ## Distributed (alpha + charlie via Thunderbolt 4)
 

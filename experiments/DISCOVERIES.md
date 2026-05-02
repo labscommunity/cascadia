@@ -74,3 +74,32 @@ This is the new tahoma single-GPU leaderboard high for Llama 3.1 8B INT4.
 3. Auto-detect mode from request? (e.g. `RAG: True` flag on the API).
 
 ---
+
+## DISCOVERY #4 — Intel NPU runs Llama 3.2 1B at 91% of GPU speed (Battlemage host) and 53% (Lunar Lake), enabling concurrent multi-model serving
+
+**Setup:** Llama 3.2 1B INT4 (HF-published `srang992/Llama-3.2-1B-Instruct-ov-INT4`) on `core.available_devices=['CPU','GPU','NPU']` for both alpha (Battlemage host with Meteor Lake-class NPU) and charlie (Lunar Lake with NPU 4 ~48 TOPS). 64-token output, factual prompt.
+
+**Finding:**
+
+| Hardware | GPU tok/s | NPU tok/s | NPU/GPU |
+|---|---:|---:|---:|
+| alpha (Battlemage host) | 149.47 | **135.84** | 91% |
+| charlie (Lunar Lake) | 211.39 | **112.89** | 53% |
+
+charlie's GPU 1B at 211 tok/s is the new single-node Llama 3.2 1B INT4 leaderboard high.
+
+**Why this is worth saving:**
+
+- We previously assumed NPU-as-target was experimental. It is not — the OV 2026.1 NPU plugin compiles Llama 3.2 1B INT4 cleanly (~30-60s compile, no errors after the `function-outliner-vertical-fusion` warnings) and produces correct output at usable speeds.
+- The killer use case is **concurrent multi-model serving on a single Intel AI PC**: the iGPU runs the main 8B chat model at 134 tok/s while the NPU concurrently serves a 1B classifier or auxiliary model at 113 tok/s. Two devices, two models, two clients, no contention on the same compute pool.
+- Power: NPU 4 on Lunar Lake is rated ~10-15 W under load vs the iGPU's ~30+W. For background / sustained workloads where the GPU is busy, NPU offload is essentially free.
+- 8B does NOT fit on either NPU (both timed out / OOM'd in c26-alpha-8b — log not retained). NPU is for ≤3B-class models.
+
+**Source experiments:** `experiments/c26-npu-target/`.
+
+**Action items for tahoma:**
+1. Add NPU as a `--device` choice to the `ov-genai` engine. Currently `--device` accepts CPU/GPU; add NPU.
+2. Document the "8B-on-GPU + 1B-on-NPU concurrent" deployment in `docs/engines/ov-genai.md`.
+3. Test concurrent NPU + GPU workload to confirm no cross-talk on memory bandwidth (open).
+
+---
