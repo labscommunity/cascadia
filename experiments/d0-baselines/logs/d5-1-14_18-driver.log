@@ -1,0 +1,58 @@
+python : 2026-05-02 10:07:31,140 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2s_14_18 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 10:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 10:07:32,590 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 10:07:32,606 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 10:07:32,686 INFO tahoma.worker.runner | load: compiling target stage 0
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 41, in start
+    for progress in self._builder.load(shard):
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 339, in load
+    raise RuntimeError(f"stage 0 IR is missing v5 inputs: {sorted(missing)}")
+RuntimeError: stage 0 IR is missing v5 inputs: ['attention_mask', 'beam_idx', 'position_ids']
+WALL_CLOCK_S=13.4370567
+python : 2026-05-02 10:07:45,085 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2s_14_18 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 10:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 10:07:46,535 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 10:07:46,535 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 10:07:46,615 INFO tahoma.worker.runner | load: compiling target stage 0
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 41, in start
+    for progress in self._builder.load(shard):
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 339, in load
+    raise RuntimeError(f"stage 0 IR is missing v5 inputs: {sorted(missing)}")
+RuntimeError: stage 0 IR is missing v5 inputs: ['attention_mask', 'beam_idx', 'position_ids']
+WALL_CLOCK_S=9.803462
