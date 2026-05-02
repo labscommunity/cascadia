@@ -35,6 +35,12 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
 ]
+# Optional: OpenVINO Runtime engine (single-stage, INT4 GPU). Requires Intel
+# hardware. Install with `pip install tahoma[ov]`.
+ov = [
+    "openvino>=2026.0",
+    "optimum[openvino]>=1.27",
+]
 
 [project.scripts]
 tahoma = "tahoma.cli:main"

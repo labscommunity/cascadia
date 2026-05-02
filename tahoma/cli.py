@@ -20,6 +20,7 @@ import sys
 from tahoma.shared.shard import ShardPlan
 from tahoma.shared.topology import PeerEndpoint, PeerLayout
 from tahoma.shared.types import GenerationTask
+from tahoma.worker.engines.base import Builder
 from tahoma.worker.engines.openvino import OpenVINOBuilder
 from tahoma.worker.runner import Runner
 
@@ -35,21 +36,45 @@ def parse_addr(s: str, default_host: str = "0.0.0.0") -> tuple[str, int]:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    plan = ShardPlan.from_hf_model_id(
-        args.model, num_stages=args.total, devices=[args.device] * args.total,
-    )
     if args.rank < 0 or args.rank >= args.total:
         sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
-    spec = plan.stages[args.rank]
-    logger.info(
-        "rank=%d/%d layers=[%d,%d) device=%s first=%s last=%s",
-        args.rank, args.total, spec.layer_start, spec.layer_end, spec.device,
-        spec.is_first_stage, spec.is_last_stage,
-    )
+
+    if args.engine == "ov-optimum":
+        if args.total != 1:
+            sys.exit("--engine ov-optimum is single-stage only; use --total 1")
+        from tahoma.shared.shard import ShardSpec
+
+        spec = ShardSpec(
+            model_id=args.model, layer_start=0, layer_end=0,
+            total_layers=0, device=args.device,
+            is_first_stage=True, is_last_stage=True,
+        )
+        logger.info(
+            "engine=ov-optimum rank=0/1 device=%s model=%s",
+            args.device, args.model,
+        )
+    else:
+        plan = ShardPlan.from_hf_model_id(
+            args.model, num_stages=args.total, devices=[args.device] * args.total,
+        )
+        spec = plan.stages[args.rank]
+        logger.info(
+            "engine=pytorch rank=%d/%d layers=[%d,%d) device=%s first=%s last=%s",
+            args.rank, args.total, spec.layer_start, spec.layer_end, spec.device,
+            spec.is_first_stage, spec.is_last_stage,
+        )
 
     listen_host, listen_port = parse_addr(args.listen)
-    builder = OpenVINOBuilder(model_path=args.model)
-    builder.configure_listen(listen_host, listen_port)
+
+    builder: Builder
+    if args.engine == "ov-optimum":
+        from tahoma.worker.engines.openvino.optimum_engine import OptimumOVBuilder
+
+        builder = OptimumOVBuilder(model_path=args.model, device=args.device)
+    else:
+        ov_builder = OpenVINOBuilder(model_path=args.model)
+        ov_builder.configure_listen(listen_host, listen_port)
+        builder = ov_builder
 
     upstream: PeerEndpoint | None = None
     if not spec.is_first_stage:
@@ -128,6 +153,14 @@ def main() -> int:
     )
     pw.add_argument(
         "--device", default="CPU", help="device hint: CPU / GPU / NPU (default CPU)",
+    )
+    pw.add_argument(
+        "--engine", default="pytorch", choices=["pytorch", "ov-optimum"],
+        help=(
+            "inference engine: 'pytorch' (default, distributed-capable) or "
+            "'ov-optimum' (single-stage OpenVINO Runtime via optimum-intel; "
+            "expects a pre-exported OV IR directory at --model)"
+        ),
     )
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
