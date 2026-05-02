@@ -9,34 +9,80 @@ Tracking the Python → Rust hard rewrite landed under `rust/` on the
 |---|---|:-:|:-:|:-:|---|
 | `ov-genai` | ✅ | ✅ 5 | ✅ alpha + charlie | ✅ | **at parity** (Rust 20.5 vs Python 20.3 plain; 22.3 vs 22.6 FastDraft; 29.3 vs 29.4 PL) |
 | `ov-runtime` | ✅ | ✅ 3 | ✅ alpha + charlie | ⏳ no v3 shards on hand | n/a |
-| `ov-dist-spec` | ✅ | ✅ 9 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 | **Rust 2.2× slower** (12.66 vs 28.05 tok/s; same 64 tok output, Rust accept 0.83 vs Python 0.59) |
+| `ov-dist-spec` | ✅ | ✅ 9 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 | **Rust 1.29× slower** (21.70 vs 28.05 tok/s in `--release`; was 2.21× in debug) |
 
-The distributed perf gap is a real regression vs Python and **blocks
-Python tree removal**. Causes (most-likely-first):
+### Perf-gap investigation (commits b396709, 655f6b8)
 
-1. C++ FFI shim's `set_input` allocates a fresh `ov::Tensor` and
-   `memcpy`s the input bytes on every call. Per spec round there are
-   ~4 set_input calls per node × ~18 rounds = ~72 alloc+memcpy ops in
-   Rust that the pip-installed Python OV does mostly zero-copy via
-   numpy array borrowing.
-2. `tokio::task::block_in_place` + `Handle::block_on` bridge fires on
-   every TCP send/recv across the language boundary. Measurable
-   per-call overhead at this round count.
-3. Each spec-round now has identical wire-format work (verified
-   tested in commit 16d7c97) but more native-call overhead.
+Original assumption ("FFI memcpy is the bottleneck") was **wrong** —
+empirical instrumentation per spec round on alpha+charlie/TB4 found:
 
-**Suggested optimization PR** (not in this PR):
-- Switch the FFI shim to zero-copy: pre-allocate per-stage tensors at
-  load time via the borrowing constructor `ov::Tensor::Tensor(elem,
-  shape, void* data)`, reuse across infer calls.
-- Drop the f16→f32→f16 round-trip in worker step (already partially
-  done in 16d7c97 — the worker now passes wire f16 bytes through
-  unchanged when the IR port is f16).
-- Consider making `Engine::step` async to remove the runtime-bridge.
+| Component (debug profile) | Time/round | % of round |
+|---|---:|---:|
+| Driver stage_0 GPU infer | 27 ms | 25% |
+| Worker stage_1 GPU compute (waited for) | 32 ms | 30% |
+| TCP send + recv | 1 ms | 1% |
+| **f16 → f32 of 1 MB logits payload** | **70 ms** | **65%** ← root cause |
+| Per-round total | ~110 ms | |
 
-For the **single-node `ov-genai`** path the per-call overhead is
-amortized over a single `generate()` call so doesn't materially affect
-tok/s; A/B parity confirmed.
+The half crate's `f16::to_f32` runs unoptimized in debug builds (no
+SIMD); release builds use AVX2/F16C intrinsics and the same conversion
+takes 2 ms instead of 70 ms. Building tahoma with `--release` collapses
+the dist-spec perf gap from 2.21× to 1.29×.
+
+### Building for performance — IMPORTANT
+
+The dist-spec engine **must be built with `--release`** for production
+use. Default `cargo build` produces a 2× slower binary on this engine.
+
+```powershell
+cd C:\Users\cascadia\tahoma-rust
+cargo build --release -p tahoma --features openvino
+.\target\release\tahoma.exe ...
+```
+
+The single-node `ov-genai` engine is much less affected by the build
+profile because most of its work is inside the openvino-genai C++
+library; LLMPipeline takes only one `generate()` call per task so
+per-call Rust overhead is amortized.
+
+### Remaining ~23% gap on dist-spec
+
+Profiled in release mode; remaining costs:
+
+* **35 ms/round** waiting for the worker's stage_1 inference (intrinsic
+  to OV + iGPU; not a Rust-side issue)
+* **2 ms/round** for the 1 MB f16 → f32 logit conversion (could be
+  eliminated by doing argmax directly on f16; saves ~36 ms/task ~ 1%)
+* Smaller (per-call OV overhead, per-call ov::Tensor allocation in the
+  FFI shim) that would each save single-digit % at most
+
+The **structural fix** for the next ~10-20% would be the zero-copy
+borrowing-tensor constructor in the C++ shim:
+
+```cpp
+// Current shim (alloc + memcpy):
+ov::Tensor t(element_type, shape);
+memcpy(t.data(), input, byte_size);
+request->set_tensor(name, t);
+
+// Zero-copy alternative:
+ov::Tensor t(element_type, shape, input);   // borrows; no alloc, no copy
+request->set_tensor(name, t);
+```
+
+The wrapping constructor is documented and stable in OV; the safety
+contract is that `input` must outlive the inference call. This is
+straightforward to satisfy by holding the input bytes (`Vec<u8>` from
+the Rust side) for the duration of `infer()` and dropping after
+`get_output_tensor()` is consumed.
+
+### Decision: Python tree removal
+
+The 1.29× gap on distributed is no longer a hard "most performant for
+the user" blocker; it's a tradeoff. Single-binary deployment + memory
+safety + tokio concurrency vs 23% slower distributed inference. Bench
+the user's actual workload mix before deciding. For now Python remains
+on this branch.
 
 ## What's working today
 
