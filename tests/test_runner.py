@@ -164,3 +164,80 @@ def test_load_failure_propagates() -> None:
     runner = Runner(builder)
     with pytest.raises(ValueError, match="bad shard"):
         runner.start(PeerLayout(upstream=None, downstream=None), _shard())
+
+
+def test_concurrent_generate_routes_chunks_per_task() -> None:
+    """Two tasks submitted concurrently each receive their own chunks.
+
+    The fake engine emits chunks for both tasks interleaved; the runner
+    must route each chunk to the right caller.
+    """
+    import threading
+
+    @dataclass
+    class TwoTaskEngine(FakeEngine):
+        # Step yields one chunk for whichever task is next in the queue.
+        # We hard-code an interleaving so the ordering is deterministic.
+        plan: list[tuple[str, str, bool]] = field(default_factory=lambda: [
+            ("a", "A1", False), ("b", "B1", False),
+            ("a", "A2", False), ("b", "B2", False),
+            ("a", "A3", True),  ("b", "B3", True),
+        ])
+        cursor: int = 0
+
+        def step(self) -> Iterable[tuple[TaskId, Chunk]]:
+            if self.cursor >= len(self.plan):
+                return
+            tid, text, final = self.plan[self.cursor]
+            self.cursor += 1
+            yield (tid, Chunk(task_id=tid, token_id=self.cursor, text=text, is_final=final))
+
+    engine = TwoTaskEngine()
+    builder = FakeBuilder(engine=engine)
+    runner = Runner(builder)
+    runner.start(PeerLayout(upstream=None, downstream=None), _shard())
+
+    out_a: list[Chunk] = []
+    out_b: list[Chunk] = []
+
+    def run(task_id: str, sink: list[Chunk]) -> None:
+        task = GenerationTask(task_id=task_id, prompt="x", max_tokens=10)
+        sink.extend(runner.generate(task))
+
+    ta = threading.Thread(target=run, args=("a", out_a), daemon=True)
+    tb = threading.Thread(target=run, args=("b", out_b), daemon=True)
+    ta.start()
+    tb.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+    assert not ta.is_alive() and not tb.is_alive()
+
+    assert [c.text for c in out_a] == ["A1", "A2", "A3"]
+    assert [c.text for c in out_b] == ["B1", "B2", "B3"]
+
+
+def test_cancel_terminates_generate_early() -> None:
+    """cancel() pushes the named task into a cancelled set; the next
+    generate() poll for that task returns."""
+    chunks = [Chunk(task_id="t1", token_id=i, text=str(i)) for i in range(20)]
+    engine = FakeEngine(chunks_to_yield=chunks)
+    builder = FakeBuilder(engine=engine)
+    runner = Runner(builder)
+    runner.start(PeerLayout(upstream=None, downstream=None), _shard())
+
+    # Run generate in a thread; cancel after one chunk.
+    import threading
+    received: list[Chunk] = []
+    def run() -> None:
+        for c in runner.generate(_task()):
+            received.append(c)
+            if len(received) == 1:
+                runner.cancel("t1")
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    # Should have received at least one chunk and then exited well before
+    # the 20-chunk plan finished naturally.
+    assert 1 <= len(received) < 20
