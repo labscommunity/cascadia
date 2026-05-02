@@ -46,3 +46,26 @@ For tahoma extractive RAG deployment:
 
 The PL flag remains universally beneficial for extractive workloads
 across this entire range. The peak is at 4K input.
+
+## Cross-platform alpha confirmation (8K input + 256 output extractive)
+
+| Hardware | Plain | PL | Δ |
+|----------|------:|---:|--:|
+| alpha B390 | 94.95 | **179.75** | **+89%** |
+| charlie 140V | 100.62 | 173.91 | +73% |
+
+Both platforms confirm: PL still wins big at 8K input, but slightly less
+than at 4K (~+90% vs +94%). The PL win curve is broad and forgiving.
+
+## FINAL Discovery #3 cross-platform table
+
+| Hardware | Input | Output | Plain | PL | Δ |
+|----------|-------|--------|------:|---:|--:|
+| alpha B390 | 1024 | 256 | 94.88 | 150.71 | +59% |
+| alpha B390 | **4096** | **256** | 97.21 | **191.53** | **+97%** |
+| alpha B390 | 8192 | 256 | 94.95 | 179.75 | +89% |
+| charlie 140V | 1024 | 256 | 101.88 | 160.64 | +58% |
+| charlie 140V | **4096** | **256** | 100.17 | **194.36** | **+94%** |
+| charlie 140V | 8192 | 256 | 100.62 | 173.91 | +73% |
+
+**Peak: 4K input + 256 output extractive on charlie 140V iGPU = 194.36 tok/s.**
