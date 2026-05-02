@@ -83,6 +83,24 @@ def cmd_worker(args: argparse.Namespace) -> int:
             "engine=ov-spec rank=0/1 device=%s target=%s draft=%s K=%d",
             args.device, args.model, args.draft_model, args.spec_k,
         )
+    elif args.engine == "ov-dist-spec":
+        if args.total < 2:
+            sys.exit("--engine ov-dist-spec requires --total >= 2")
+        if args.rank == 0 and not args.draft_model:
+            sys.exit("--engine ov-dist-spec rank 0 requires --draft-model")
+        from tahoma.shared.shard import ShardSpec
+
+        spec = ShardSpec(
+            model_id=args.model, layer_start=0, layer_end=0,
+            total_layers=0, device=args.device,
+            is_first_stage=(args.rank == 0),
+            is_last_stage=(args.rank == args.total - 1),
+        )
+        logger.info(
+            "engine=ov-dist-spec rank=%d/%d device=%s pipeline=%s draft=%s K=%d",
+            args.rank, args.total, args.device, args.model,
+            args.draft_model, args.spec_k,
+        )
     else:
         plan = ShardPlan.from_hf_model_id(
             args.model, num_stages=args.total, devices=[args.device] * args.total,
@@ -129,6 +147,28 @@ def cmd_worker(args: argparse.Namespace) -> int:
             draft_weight_format=args.ov_weight_format,
             k=args.spec_k,
         )
+    elif args.engine == "ov-dist-spec":
+        if args.rank == 0:
+            from tahoma.worker.engines.openvino.dist_spec import OVDistributedSpecBuilder
+
+            builder = OVDistributedSpecBuilder(
+                pipeline_dir=args.model,
+                draft_model_path=args.draft_model,
+                device=args.device,
+                weight_format=args.ov_weight_format,
+                k=args.spec_k,
+            )
+        else:
+            from tahoma.worker.engines.openvino.dist_spec import OVDistSpecWorkerBuilder
+
+            ov_dist_worker = OVDistSpecWorkerBuilder(
+                pipeline_dir=args.model,
+                rank=args.rank,
+                total=args.total,
+                device=args.device,
+            )
+            ov_dist_worker.configure_listen(listen_host, listen_port)
+            builder = ov_dist_worker
     else:
         ov_builder = OpenVINOBuilder(model_path=args.model)
         ov_builder.configure_listen(listen_host, listen_port)
@@ -214,7 +254,7 @@ def main() -> int:
     )
     pw.add_argument(
         "--engine", default="pytorch",
-        choices=["pytorch", "ov-optimum", "ov-runtime", "ov-spec"],
+        choices=["pytorch", "ov-optimum", "ov-runtime", "ov-spec", "ov-dist-spec"],
         help=(
             "inference engine: "
             "'pytorch' (default, distributed) | "
@@ -222,7 +262,9 @@ def main() -> int:
             "'ov-runtime' (multi-stage OV with stateful KV cache; expects a "
             "pre-exported pipeline directory at --model with stage_<i>/ subdirs) | "
             "'ov-spec' (single-stage OV with mask-based speculative decoding; "
-            "requires --draft-model)"
+            "requires --draft-model) | "
+            "'ov-dist-spec' (multi-stage OV with spec decode; requires "
+            "--draft-model on rank 0; uses physical KV trim)"
         ),
     )
     pw.add_argument(
