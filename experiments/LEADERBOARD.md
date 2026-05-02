@@ -6,11 +6,13 @@ Best measured tok/s per (model, hardware, engine, prompt-class) combination. Row
 
 | Hardware | Engine | tok/s | Source |
 |---|---|---|---|
-| **alpha B390 GPU** | **openvino_genai.LLMPipeline (greedy, no config)** | **96.41** | c1-llmpipeline/c1-1 |
+| **alpha B390 GPU** | **openvino_genai.LLMPipeline (raw)** | **96.41** | c1-llmpipeline/c1-1 |
+| **charlie 140V GPU** | **openvino_genai.LLMPipeline (raw)** | **91.14** | c1-llmpipeline/c1-2 |
+| alpha B390 GPU | LLMPipeline + CACHE_DIR/KV_u8/DynQuant=32 | 92.74 | c1-llmpipeline/c1-3 |
+| alpha B390 GPU | tahoma `--engine ov-genai` | 87.10 | c3-ov-genai-engine/c3-1 |
 | alpha B390 GPU | ov-spec K=4 + 1B INT4 draft | 13.83 | c0-baselines/c0-3 |
 | alpha B390 GPU | ov-optimum (OVModelForCausalLM) | 8.89 | c0-baselines/c0-1b |
 | charlie 140V GPU | ov-optimum (OVModelForCausalLM) | 10.33 | c0-baselines/c0-2 |
-| charlie 140V GPU | LLMPipeline | (n/a) | DLL ABI mismatch — c1-2 |
 
 ## Llama 3.1 8B Instruct INT4 — distributed (alpha + charlie via Thunderbolt 4)
 
@@ -23,4 +25,4 @@ Best measured tok/s per (model, hardware, engine, prompt-class) combination. Row
 ## Notes
 
 - All numbers above are decode-only tok/s (load + warmup excluded), 64 generated tokens, prompt = "What is the capital of France?".
-- The 10.8× LLMPipeline jump on alpha is documented in `DISCOVERIES.md` #1.
+- DISCOVERY #1 in `DISCOVERIES.md` documents the LLMPipeline jump.

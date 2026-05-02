@@ -242,6 +242,23 @@ def main() -> int:
         help="weight format for OV IR auto-export (only used by --engine ov-optimum)",
     )
     pw.add_argument(
+        "--ov-cache-dir", default=None,
+        help="OpenVINO compiled-blob cache dir (CACHE_DIR plugin property). "
+             "Cuts cold-start time from ~20 s to ~2 s on second + runs. "
+             "Used by --engine ov-genai.",
+    )
+    pw.add_argument(
+        "--ov-kv-precision", default=None,
+        choices=[None, "u8", "f16"],
+        help="KV_CACHE_PRECISION plugin property. Default since OV 2024.6 "
+             "is u8 on GPU; only override if debugging. Used by --engine ov-genai.",
+    )
+    pw.add_argument(
+        "--ov-dyn-quant-group", default=None,
+        help="DYNAMIC_QUANTIZATION_GROUP_SIZE plugin property (e.g. 32). "
+             "Default since OV 2025.2 on XMX silicon. Used by --engine ov-genai.",
+    )
+    pw.add_argument(
         "--draft-model",
         help=(
             "speculative-decoding draft model — small model id or path that "

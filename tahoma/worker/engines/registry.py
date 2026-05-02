@@ -205,6 +205,30 @@ register(EngineSpec(
 ))
 
 
+# ov-genai (LLMPipeline — currently the fastest single-stage GPU path)
+def _ov_genai_builder(args: argparse.Namespace, _host: str, _port: int) -> Builder:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+    return OVGenAIBuilder(
+        model_path=args.model,
+        device=args.device,
+        cache_dir=getattr(args, "ov_cache_dir", None),
+        kv_cache_precision=getattr(args, "ov_kv_precision", None),
+        dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
+    )
+
+
+register(EngineSpec(
+    name="ov-genai",
+    description="single-stage openvino_genai.LLMPipeline; ~10x faster than ov-optimum on Intel GPU",
+    validate=_require_single_stage("ov-genai"),
+    build_shard_spec=lambda args: ShardSpec(
+        model_id=args.model, layer_start=0, layer_end=0, total_layers=0,
+        device=args.device, is_first_stage=True, is_last_stage=True,
+    ),
+    build_builder=_ov_genai_builder,
+))
+
+
 # ov-runtime
 def _ov_runtime_builder(args: argparse.Namespace, host: str, port: int) -> Builder:
     from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder

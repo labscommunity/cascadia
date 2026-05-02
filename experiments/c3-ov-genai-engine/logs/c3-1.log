@@ -1,0 +1,20 @@
+python : 2026-05-01 23:00:03,138 INFO tahoma.cli | engine=ov-genai rank=0/1 device=GPU 
+model=C:\cascadia\models\llama-3.1-8b-int4 namespace=default
+At line:1 char:168
++ ...  France?" | python -m tahoma worker --rank 0 --total 1 --engine ov-ge ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-01 23:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-01 23:00:04,623 INFO tahoma.worker.runner | connect: upstream=None downstream=None
+2026-05-01 23:00:04,623 INFO tahoma.worker.runner | load: locating IR at C:\cascadia\models\llama-3.1-8b-int4
+2026-05-01 23:00:04,623 INFO tahoma.worker.runner | load: compiling LLMPipeline on GPU
+2026-05-01 23:00:26,240 INFO tahoma.worker.runner | load: ready
+2026-05-01 23:00:26,240 INFO tahoma.worker.runner | build engine
+2026-05-01 23:00:26,240 INFO tahoma.worker.runner | warmup
+2026-05-01 23:00:26,672 INFO tahoma.worker.engines.openvino.genai_engine | ov-genai warmup ok
+2026-05-01 23:00:26,673 INFO tahoma.worker.runner | runner ready
+2026-05-01 23:00:26,673 INFO tahoma.cli | stdin mode: type a prompt and press enter
+The capital of France is Paris.2026-05-01 23:00:27,407 INFO tahoma.worker.engines.openvino.genai_engine | task stdin-30 done: 64 tokens in 0.735s 
+(87.1 tok/s)
+
