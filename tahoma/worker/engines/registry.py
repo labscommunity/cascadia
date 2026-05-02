@@ -239,13 +239,50 @@ def _ov_spec_builder(args: argparse.Namespace, _host: str, _port: int) -> Builde
 
 register(EngineSpec(
     name="ov-spec",
-    description="single-stage OV spec decode; requires --draft-model",
+    description="single-stage OV spec decode (legacy; prefer ov-genai)",
     validate=_and(_require_single_stage("ov-spec"), _require_draft("ov-spec")),
     build_shard_spec=lambda args: ShardSpec(
         model_id=args.model, layer_start=0, layer_end=0, total_layers=0,
         device=args.device, is_first_stage=True, is_last_stage=True,
     ),
     build_builder=_ov_spec_builder,
+))
+
+
+# ov-genai
+def _ov_genai_validate(args: argparse.Namespace) -> None:
+    _require_single_stage("ov-genai")(args)
+    if args.draft_model and args.prompt_lookup > 0:
+        raise SystemExit(
+            "--engine ov-genai: --draft-model and --prompt-lookup are mutually "
+            "exclusive (both set GenerationConfig.num_assistant_tokens). Pick one.",
+        )
+
+
+def _ov_genai_builder(args: argparse.Namespace, _host: str, _port: int) -> Builder:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+    return OVGenAIBuilder(
+        model_path=args.model,
+        device=args.device,
+        cache_dir=getattr(args, "ov_cache_dir", None),
+        kv_cache_precision=getattr(args, "ov_kv_precision", None),
+        dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
+        draft_model_path=getattr(args, "draft_model", None),
+        draft_device=getattr(args, "draft_device", None) or args.device,
+        speculative_k=getattr(args, "spec_k", 5),
+        prompt_lookup_ngram=getattr(args, "prompt_lookup", 0),
+    )
+
+
+register(EngineSpec(
+    name="ov-genai",
+    description="single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup",
+    validate=_ov_genai_validate,
+    build_shard_spec=lambda args: ShardSpec(
+        model_id=args.model, layer_start=0, layer_end=0, total_layers=0,
+        device=args.device, is_first_stage=True, is_last_stage=True,
+    ),
+    build_builder=_ov_genai_builder,
 ))
 
 

@@ -242,6 +242,50 @@ def main() -> int:
         help="weight format for OV IR auto-export (only used by --engine ov-optimum)",
     )
     pw.add_argument(
+        "--ov-cache-dir", default=None,
+        help=(
+            "OpenVINO compiled-blob cache dir (sets plugin CACHE_DIR). "
+            "Persists kernel JIT results across runs; cuts cold-start by ~62%% "
+            "on second+ launches. Used by --engine ov-genai. "
+            "Suggested: ~/.cache/tahoma/ov_kernel_cache."
+        ),
+    )
+    pw.add_argument(
+        "--ov-kv-precision", default=None,
+        choices=[None, "u8", "f16"],
+        help=(
+            "OV GPU KV-cache precision (sets plugin KV_CACHE_PRECISION). "
+            "Default (unset) is already optimal on Battlemage / Lunar Lake; "
+            "expose only for debugging. Used by --engine ov-genai."
+        ),
+    )
+    pw.add_argument(
+        "--ov-dyn-quant-group", default=None,
+        help=(
+            "OV GPU dynamic-quantization group size "
+            "(sets plugin DYNAMIC_QUANTIZATION_GROUP_SIZE, e.g. 32 / 64). "
+            "Used by --engine ov-genai."
+        ),
+    )
+    pw.add_argument(
+        "--prompt-lookup", type=int, default=0, metavar="N",
+        help=(
+            "enable Prompt Lookup decoding with n-gram size N "
+            "(used by --engine ov-genai). Drafts tokens by matching the last "
+            "N-gram against the input prompt. Best for extractive workloads "
+            "(summarisation, RAG, code-in-context); +40-50%% on Battlemage / "
+            "Lunar Lake. Mutually exclusive with --draft-model."
+        ),
+    )
+    pw.add_argument(
+        "--draft-device", default=None,
+        help=(
+            "device for the speculative draft model "
+            "(default: same as --device). Useful for placing the draft on a "
+            "smaller / faster device — e.g. NPU draft + GPU target on Lunar Lake."
+        ),
+    )
+    pw.add_argument(
         "--draft-model",
         help=(
             "speculative-decoding draft model — small model id or path that "

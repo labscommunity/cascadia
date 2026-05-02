@@ -164,3 +164,53 @@ def test_build_before_connect_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="call (connect|load)"):
         builder.build()
+
+
+# -- ov-genai -----------------------------------------------------------------
+
+def test_ov_genai_rejects_draft_and_prompt_lookup_combo() -> None:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        OVGenAIBuilder(
+            model_path="/fake", device="CPU",
+            draft_model_path="/fake-draft", prompt_lookup_ngram=3,
+        )
+
+
+def test_ov_genai_rejects_multi_stage(tmp_path: Path) -> None:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+
+    builder = OVGenAIBuilder(model_path=str(tmp_path), device="CPU")
+    multi_stage_shard = ShardSpec(
+        model_id="fake", layer_start=0, layer_end=0, total_layers=0,
+        device="CPU", is_first_stage=True, is_last_stage=False,
+    )
+    with pytest.raises(RuntimeError, match="--total 1"):
+        list(builder.load(multi_stage_shard))
+
+
+def test_ov_genai_rejects_peer_layout(tmp_path: Path) -> None:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+
+    builder = OVGenAIBuilder(model_path=str(tmp_path), device="CPU")
+    with pytest.raises(RuntimeError, match="single-stage only"):
+        builder.connect(PeerLayout(
+            upstream=PeerEndpoint(host="localhost", port=1234), downstream=None,
+        ))
+
+
+def test_ov_genai_build_before_load_raises(tmp_path: Path) -> None:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+
+    builder = OVGenAIBuilder(model_path=str(tmp_path), device="CPU")
+    with pytest.raises(RuntimeError, match="call load"):
+        builder.build()
+
+
+def test_ov_genai_load_missing_ir_raises(tmp_path: Path) -> None:
+    from tahoma.worker.engines.openvino.genai_engine import OVGenAIBuilder
+
+    builder = OVGenAIBuilder(model_path=str(tmp_path / "does-not-exist"), device="CPU")
+    with pytest.raises(RuntimeError, match="OV IR not found"):
+        list(builder.load(_shard()))
