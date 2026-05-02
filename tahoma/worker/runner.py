@@ -10,7 +10,7 @@ Lifecycle:
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 
 from tahoma.shared.shard import ShardSpec
 from tahoma.shared.topology import PeerLayout
