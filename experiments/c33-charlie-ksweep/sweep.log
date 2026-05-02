@@ -1,0 +1,8 @@
+--- K=3 ---
+RESULT={"target": "GPU", "draft": "GPU", "k": 3, "tokens": 64, "decode_s": 0.7954403999974602, "tok_s": 80.45857364072073, "first_text": "The capital of France is Paris."}
+--- K=5 ---
+RESULT={"target": "GPU", "draft": "GPU", "k": 5, "tokens": 64, "decode_s": 0.6681745999994746, "tok_s": 95.78334764603493, "first_text": "The capital of France is Paris."}
+--- K=7 ---
+RESULT={"target": "GPU", "draft": "GPU", "k": 7, "tokens": 64, "decode_s": 0.7350234000005003, "tok_s": 87.07205784190876, "first_text": "The capital of France is Paris."}
+--- K=10 ---
+RESULT={"target": "GPU", "draft": "GPU", "k": 10, "tokens": 64, "decode_s": 0.6742430999984208, "tok_s": 94.9212531802697, "first_text": "The capital of France is Paris."}
