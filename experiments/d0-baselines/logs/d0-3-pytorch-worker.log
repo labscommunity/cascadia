@@ -1,0 +1,93 @@
+python : Traceback (most recent call last):
+At line:1 char:56
++ ...  C:\tahoma; python -m tahoma worker --rank 1 --total 2 --engine pytor ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\utils\_http.py", line 403, in hf_raise_for_status
+    response.raise_for_status()
+  File "C:\Program Files\Python311\Lib\site-packages\requests\models.py", line 1028, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: 
+https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/config.json
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\utils\hub.py", line 479, in cached_files
+    hf_hub_download(
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\utils\_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 1014, in hf_hub_download
+    return _hf_hub_download_to_cache_dir(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 1121, in 
+_hf_hub_download_to_cache_dir
+    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 1662, in 
+_raise_on_head_call_error
+    raise head_call_error
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 1550, in 
+_get_metadata_or_catch_error
+    metadata = get_hf_file_metadata(
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\utils\_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 1467, in 
+get_hf_file_metadata
+    r = _request_wrapper(
+        ^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 283, in _request_wrapper
+    response = _request_wrapper(
+               ^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\file_download.py", line 307, in _request_wrapper
+    hf_raise_for_status(response)
+  File "C:\Program Files\Python311\Lib\site-packages\huggingface_hub\utils\_http.py", line 420, in hf_raise_for_status
+    raise _format(GatedRepoError, message, response) from e
+huggingface_hub.errors.GatedRepoError: 401 Client Error. (Request ID: 
+Root=1-69f614c6-7bd92d816d7430681a7cf5d7;5a3ae63c-db0d-46b2-be23-7f4af7d6dcdb)
+Cannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/config.json.
+Access to model meta-llama/Llama-3.1-8B-Instruct is restricted. You must have access to it and be authenticated to 
+access it. Please log in.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 361, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 103, in cmd_worker
+    spec = engine.build_shard_spec(args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\registry.py", line 98, in _pytorch_spec
+    plan = ShardPlan.from_hf_model_id(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\shared\shard.py", line 127, in from_hf_model_id
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\models\auto\configuration_auto.py", line 1332, in 
+from_pretrained
+    config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\configuration_utils.py", line 662, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\configuration_utils.py", line 721, in 
+_get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\utils\hub.py", line 322, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\transformers\utils\hub.py", line 543, in cached_files
+    raise OSError(
+OSError: You are trying to access a gated repo.
+Make sure to have access to it at https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct.
+401 Client Error. (Request ID: Root=1-69f614c6-7bd92d816d7430681a7cf5d7;5a3ae63c-db0d-46b2-be23-7f4af7d6dcdb)
+Cannot access gated repo for url https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct/resolve/main/config.json.
+Access to model meta-llama/Llama-3.1-8B-Instruct is restricted. You must have access to it and be authenticated to 
+access it. Please log in.

@@ -1,0 +1,58 @@
+python : 2026-05-02 08:00:19,632 INFO tahoma.cli | engine=ov-runtime rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v3 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:00:21,172 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:00:21,172 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:00:21,251 INFO tahoma.worker.runner | load: reading C:\cascadia\shards_2stage_v3
+2026-05-02 08:00:21,251 INFO tahoma.worker.runner | load: compiling OV shard
+2026-05-02 08:00:29,289 INFO tahoma.worker.runner | load: loading rotary + tokenizer
+2026-05-02 08:00:38,464 INFO tahoma.worker.engines.openvino._hub | bundled tokenizer at 
+C:\cascadia\shards_2stage_v3\tokenizer unusable (ValueError); falling back to unsloth/Meta-Llama-3.1-8B-Instruct
+2026-05-02 08:00:39,646 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:00:40,088 INFO tahoma.worker.runner | build engine
+2026-05-02 08:00:40,088 INFO tahoma.worker.runner | warmup
+2026-05-02 08:00:40,303 INFO tahoma.worker.engines.openvino.ov_runtime | warmup ok
+2026-05-02 08:00:40,303 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:00:40,303 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:00:40,304 INFO tahoma.worker.engines.openvino.ov_runtime | task stdin-30 active: prompt_tokens=8
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 197, in cmd_worker
+    for chunk in runner.generate(task):
+  File "C:\tahoma\tahoma\worker\runner.py", line 59, in generate
+    chunks = self.step_once()
+             ^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in step_once
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in <dictcomp>
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 202, in step
+    yield from self._step_first()
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 239, in _step_first
+    token_array, _ = self._downstream.recv()
+                     ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\transport.py", line 197, in recv
+    return recv_tensor(self._sock)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\transport.py", line 85, in recv_tensor
+    header = _recv_exact(sock, HEADER_SIZE)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\transport.py", line 101, in _recv_exact
+    raise ConnectionError("socket closed during recv")
+ConnectionError: socket closed during recv
+WALL_CLOCK_S=23.1377786

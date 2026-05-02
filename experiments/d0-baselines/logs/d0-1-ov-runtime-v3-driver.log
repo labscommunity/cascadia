@@ -1,0 +1,36 @@
+python : 2026-05-02 08:08:29,062 INFO tahoma.cli | engine=ov-runtime rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v3 namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:0...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:08:30,534 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:08:30,550 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:08:30,629 INFO tahoma.worker.runner | load: reading C:\cascadia\shards_2stage_v3
+2026-05-02 08:08:30,629 INFO tahoma.worker.runner | load: compiling OV shard
+2026-05-02 08:08:39,090 INFO tahoma.worker.runner | load: loading rotary + tokenizer
+2026-05-02 08:08:47,637 INFO tahoma.worker.engines.openvino._hub | bundled tokenizer at 
+C:\cascadia\shards_2stage_v3\tokenizer unusable (ValueError); falling back to unsloth/Meta-Llama-3.1-8B-Instruct
+2026-05-02 08:08:48,779 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:08:49,237 INFO tahoma.worker.runner | build engine
+2026-05-02 08:08:49,237 INFO tahoma.worker.runner | warmup
+2026-05-02 08:08:49,427 INFO tahoma.worker.engines.openvino.ov_runtime | warmup ok
+2026-05-02 08:08:49,427 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:08:49,427 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:08:49,428 INFO tahoma.worker.engines.openvino.ov_runtime | task stdin-30 active: prompt_tokens=8
+ Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France?
+A) Berlin
+B) Paris
+C) Rome
+D) Madrid
+Answer: B) Paris
+Answer: B) Paris
+
+WALL_CLOCK_S=33.6476953
