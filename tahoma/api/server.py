@@ -33,6 +33,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from tahoma.master import (
+    StageRequirement,
+    elect_master,
+    is_master,
+    propose_placements,
+)
+from tahoma.shared.topology import Topology
 from tahoma.shared.types import GenerationTask
 from tahoma.worker.runner import Runner
 
@@ -164,13 +171,19 @@ class _ServerState:
                 pass
 
 
-def make_app(runner: Runner, model_id: str) -> FastAPI:
+def make_app(
+    runner: Runner,
+    model_id: str,
+    *,
+    topology: Topology | None = None,
+) -> FastAPI:
     state = _ServerState(
         node_id=_node_id(),
         namespace=_namespace(),
         started_at=time.time(),
     )
     tracing = _tracing_enabled()
+    topo = topology if topology is not None else Topology()
 
     app = FastAPI(title="Tahoma", version="0.0.1")
 
@@ -195,6 +208,44 @@ def make_app(runner: Runner, model_id: str) -> FastAPI:
             "completed": state.completed,
             "cancelled": state.cancelled,
             "tracing": tracing,
+            "peers": [
+                {
+                    "node_id": n.node_id, "host": n.host, "port": n.port,
+                    "device": n.device, "memory_mb": n.memory_mb,
+                    "engines": n.engines,
+                }
+                for n in topo.nodes.values()
+            ],
+            "is_master": is_master(topo, state.node_id, state.namespace),
+            "master": elect_master(topo, state.namespace),
+        }
+
+    @app.post("/instance/previews")
+    def previews(spec: dict) -> dict:
+        """Return suggested pipeline placements for a model.
+
+        Request body::
+
+            {"requirements": [
+                {"rank": 0, "min_memory_mb": 8000, "needs_engines": ["ov-runtime"]},
+                {"rank": 1, "min_memory_mb": 8000, "needs_engines": ["ov-runtime"]}
+            ]}
+        """
+        try:
+            reqs = [
+                StageRequirement(
+                    rank=int(r["rank"]),
+                    min_memory_mb=int(r.get("min_memory_mb", 0)),
+                    needs_engines=tuple(r.get("needs_engines", [])),
+                )
+                for r in spec.get("requirements", [])
+            ]
+        except (KeyError, TypeError, ValueError) as err:
+            raise HTTPException(status_code=400, detail=f"invalid requirements: {err}") from err
+        proposals = propose_placements(topo, reqs, namespace=state.namespace)
+        return {
+            "namespace": state.namespace,
+            "proposals": [p.as_dict() for p in proposals],
         }
 
     @app.get("/events")

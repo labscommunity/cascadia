@@ -41,6 +41,12 @@ ov = [
     "openvino>=2026.0",
     "optimum[openvino]>=1.27",
 ]
+# Optional: zero-config peer discovery via mDNS. Pure Python, ~200 KB. Only
+# required when launching a worker with `--discover`. Install with
+# `pip install tahoma[discovery]`.
+discovery = [
+    "zeroconf>=0.130",
+]
 
 [project.scripts]
 tahoma = "tahoma.cli:main"

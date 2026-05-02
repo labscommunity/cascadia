@@ -46,6 +46,24 @@ def _write_pid_file(path: Path) -> None:
     atexit.register(lambda: path.unlink(missing_ok=True))
 
 
+def _persistent_node_id() -> str:
+    """Stable per-machine node id. Cached at /tmp/tahoma-node-id (or
+    TAHOMA_NODE_ID_DIR/tahoma-node-id) so peers see the same id across
+    restarts of the process."""
+    import uuid
+    cache_dir = os.environ.get("TAHOMA_NODE_ID_DIR", "/tmp")
+    path = Path(cache_dir) / "tahoma-node-id"
+    if path.exists():
+        return path.read_text().strip()
+    nid = str(uuid.uuid4())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(nid)
+    except OSError:
+        pass
+    return nid
+
+
 def cmd_engines(_args: argparse.Namespace) -> int:
     for name in registry.names():
         spec = registry.get(name)
@@ -97,8 +115,33 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if args.pid_file:
         _write_pid_file(Path(args.pid_file))
 
+    # Optional zero-config peer discovery. When enabled, this node advertises
+    # itself via mDNS and listens for siblings in the same namespace; the
+    # topology graph is shared with the API server's /state and
+    # /instance/previews endpoints.
+    from tahoma.shared.topology import NodeInfo, Topology
+    topology = Topology()
+    discovery_service = None
+    if args.discover:
+        from tahoma.discovery import DiscoveryService, _local_ip
+        node = NodeInfo(
+            node_id=os.environ.get("TAHOMA_NODE_ID", "")
+                or _persistent_node_id(),
+            host=listen_host if listen_host != "0.0.0.0" else _local_ip(),
+            port=listen_port,
+            namespace=os.environ.get("TAHOMA_NAMESPACE", "default"),
+            device=args.device,
+            engines=[args.engine],
+        )
+        discovery_service = DiscoveryService(
+            node, topology,
+            namespace=node.namespace,
+        )
+
     def _shutdown(signum: int, _frame: FrameType | None) -> None:
         logger.info("received signal %d, shutting down", signum)
+        if discovery_service is not None:
+            discovery_service.close()
         runner.close()
         sys.exit(0)
 
@@ -107,6 +150,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
     try:
         runner.start(peers, spec)
+        if discovery_service is not None:
+            discovery_service.start()
 
         if not spec.is_first_stage:
             logger.info("entering relay loop")
@@ -119,7 +164,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             import uvicorn  # type: ignore[import-untyped]
 
             api_host, api_port = parse_addr(args.api)
-            app = make_app(runner, model_id=args.model)
+            app = make_app(runner, model_id=args.model, topology=topology)
             logger.info("API serving on %s:%d", api_host, api_port)
             uvicorn.run(app, host=api_host, port=api_port, log_level="info")
             return 0
@@ -141,6 +186,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
                     print()
         return 0
     finally:
+        if discovery_service is not None:
+            discovery_service.close()
         runner.close()
 
 
@@ -231,6 +278,15 @@ def main() -> int:
             "allow the engine to execute code from the model repository "
             "(custom tokenizer / attention / etc). SECURITY BOUNDARY — only "
             "enable for models you trust."
+        ),
+    )
+    pw.add_argument(
+        "--discover", action="store_true",
+        help=(
+            "advertise this worker via mDNS and discover peers in the same "
+            "TAHOMA_NAMESPACE. Discovered peers populate /state and feed "
+            "/instance/previews. Requires the `zeroconf` package (install "
+            "with `pip install tahoma[discovery]`)."
         ),
     )
     pw.set_defaults(func=cmd_worker)
