@@ -56,6 +56,10 @@ mod sys {
     pub struct tahoma_tokenizer_t {
         _private: [u8; 0],
     }
+    #[repr(C)]
+    pub struct tahoma_runtime_t {
+        _private: [u8; 0],
+    }
 
     extern "C" {
         pub fn tahoma_last_error_message() -> *const c_char;
@@ -114,6 +118,55 @@ mod sys {
             tok: *mut tahoma_tokenizer_t,
             text: *const c_char,
             out_count: *mut u32,
+        ) -> c_int;
+
+        pub fn tahoma_runtime_compile(
+            model_xml_path: *const c_char,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut tahoma_runtime_t,
+        ) -> c_int;
+
+        pub fn tahoma_runtime_destroy(handle: *mut tahoma_runtime_t);
+        pub fn tahoma_runtime_reset_state(handle: *mut tahoma_runtime_t) -> c_int;
+
+        pub fn tahoma_runtime_input_count(handle: *mut tahoma_runtime_t) -> usize;
+        pub fn tahoma_runtime_output_count(handle: *mut tahoma_runtime_t) -> usize;
+
+        pub fn tahoma_runtime_input_name(
+            handle: *mut tahoma_runtime_t, idx: usize,
+            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_name(
+            handle: *mut tahoma_runtime_t, idx: usize,
+            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+        ) -> c_int;
+
+        pub fn tahoma_runtime_set_input(
+            handle: *mut tahoma_runtime_t, tensor_name: *const c_char,
+            dtype: u32, shape: *const usize, rank: usize,
+            data: *const u8, data_size: usize,
+        ) -> c_int;
+
+        pub fn tahoma_runtime_infer(handle: *mut tahoma_runtime_t) -> c_int;
+
+        pub fn tahoma_runtime_output_rank(
+            handle: *mut tahoma_runtime_t, output_idx: usize, out_rank: *mut usize,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_shape(
+            handle: *mut tahoma_runtime_t, output_idx: usize,
+            out_shape: *mut usize, shape_cap: usize,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_dtype(
+            handle: *mut tahoma_runtime_t, output_idx: usize, out_dtype: *mut u32,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_byte_size(
+            handle: *mut tahoma_runtime_t, output_idx: usize, out: *mut usize,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_copy(
+            handle: *mut tahoma_runtime_t, output_idx: usize,
+            out_buf: *mut u8, out_buf_size: usize,
         ) -> c_int;
     }
 }
@@ -349,6 +402,244 @@ impl Drop for LlmPipeline {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { sys::tahoma_pipeline_destroy(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+/// dtype codes shared with tahoma-transport's `DType` enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DType {
+    F32 = 0,
+    F16 = 1,
+    I8 = 2,
+    I32 = 3,
+    I64 = 4,
+}
+
+impl DType {
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => Self::F16,
+            2 => Self::I8,
+            3 => Self::I32,
+            4 => Self::I64,
+            _ => Self::F32,
+        }
+    }
+    pub fn bytes_per_element(&self) -> usize {
+        match self {
+            Self::F32 | Self::I32 => 4,
+            Self::F16 => 2,
+            Self::I8 => 1,
+            Self::I64 => 8,
+        }
+    }
+}
+
+/// Safe wrapper around the low-level OV Core/CompiledModel/InferRequest.
+/// Used by the ov-runtime + ov-dist-spec engines. The genai LLMPipeline
+/// has its own [`LlmPipeline`] type above.
+pub struct Runtime {
+    #[cfg(feature = "openvino")]
+    handle: *mut sys::tahoma_runtime_t,
+}
+
+unsafe impl Send for Runtime {}
+
+impl Runtime {
+    /// Compile a model from disk and create an InferRequest.
+    pub fn compile(model_xml_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        Self::do_compile(model_xml_path, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_compile(_path: &str, _device: &str, _plugin: &PluginConfig) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_compile(model_xml_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        let path_c = cstr(model_xml_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        let mut handle: *mut sys::tahoma_runtime_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::tahoma_runtime_compile(
+                path_c.as_ptr(), device_c.as_ptr(),
+                ptrs.as_ptr(), plugin.entries.len(), &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self { handle })
+    }
+
+    pub fn reset_state(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let rc = sys::tahoma_runtime_reset_state(self.handle);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    pub fn input_count(&self) -> usize {
+        #[cfg(not(feature = "openvino"))]
+        return 0;
+        #[cfg(feature = "openvino")]
+        unsafe {
+            sys::tahoma_runtime_input_count(self.handle)
+        }
+    }
+
+    pub fn output_count(&self) -> usize {
+        #[cfg(not(feature = "openvino"))]
+        return 0;
+        #[cfg(feature = "openvino")]
+        unsafe {
+            sys::tahoma_runtime_output_count(self.handle)
+        }
+    }
+
+    #[cfg(feature = "openvino")]
+    fn name_at(&self, getter: unsafe extern "C" fn(
+        *mut sys::tahoma_runtime_t, usize, *mut c_char, usize, *mut usize,
+    ) -> c_int, idx: usize) -> Result<String> {
+        unsafe {
+            let mut needed: usize = 0;
+            let rc = getter(self.handle, idx, ptr::null_mut(), 0, &mut needed);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut buf = vec![0u8; needed + 1];
+            let rc = getter(self.handle, idx, buf.as_mut_ptr() as *mut c_char,
+                            buf.len(), &mut needed);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            buf.truncate(needed);
+            String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+        }
+    }
+
+    pub fn input_name(&self, idx: usize) -> Result<String> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        self.name_at(sys::tahoma_runtime_input_name, idx)
+    }
+    pub fn output_name(&self, idx: usize) -> Result<String> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        self.name_at(sys::tahoma_runtime_output_name, idx)
+    }
+
+    pub fn input_names(&self) -> Result<Vec<String>> {
+        let n = self.input_count();
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            v.push(self.input_name(i)?);
+        }
+        Ok(v)
+    }
+
+    pub fn output_names(&self) -> Result<Vec<String>> {
+        let n = self.output_count();
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            v.push(self.output_name(i)?);
+        }
+        Ok(v)
+    }
+
+    /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes.
+    pub fn set_input(&mut self, name: &str, dtype: DType, shape: &[usize], data: &[u8]) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (name, dtype, shape, data);
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let name_c = cstr(name)?;
+            let rc = sys::tahoma_runtime_set_input(
+                self.handle, name_c.as_ptr(),
+                dtype as u32, shape.as_ptr(), shape.len(),
+                data.as_ptr(), data.len(),
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    pub fn infer(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let rc = sys::tahoma_runtime_infer(self.handle);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    /// Read output `idx`. Returns (dtype, shape, raw_bytes).
+    pub fn output(&self, idx: usize) -> Result<(DType, Vec<usize>, Vec<u8>)> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = idx;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut rank: usize = 0;
+            if sys::tahoma_runtime_output_rank(self.handle, idx, &mut rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut shape = vec![0usize; rank];
+            if sys::tahoma_runtime_output_shape(self.handle, idx, shape.as_mut_ptr(), rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut dtype_code: u32 = 0;
+            if sys::tahoma_runtime_output_dtype(self.handle, idx, &mut dtype_code) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut byte_size: usize = 0;
+            if sys::tahoma_runtime_output_byte_size(self.handle, idx, &mut byte_size) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut buf = vec![0u8; byte_size];
+            if sys::tahoma_runtime_output_copy(self.handle, idx, buf.as_mut_ptr(), byte_size) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok((DType::from_code(dtype_code), shape, buf))
+        }
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sys::tahoma_runtime_destroy(self.handle) };
             self.handle = ptr::null_mut();
         }
     }

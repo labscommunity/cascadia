@@ -12,7 +12,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use tahoma_engine::Builder;
 use tahoma_engine_mock::MockBuilder;
-use tahoma_engine_openvino::OvGenaiBuilder;
+use tahoma_engine_openvino::{
+    OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+};
 use tahoma_runner::Runner;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use tracing::info;
@@ -41,6 +43,8 @@ pub enum Command {
 pub enum EngineKind {
     Mock,
     OvGenai,
+    OvRuntime,
+    OvDistSpec,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -130,8 +134,10 @@ fn init_tracing(level: &str) {
 }
 
 fn cmd_engines() -> Result<()> {
-    println!("  mock       deterministic word-echo engine for tests");
-    println!("  ov-genai   single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
+    println!("  mock           deterministic word-echo engine for tests");
+    println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
+    println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
+    println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     Ok(())
 }
 
@@ -177,6 +183,57 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
             Ok(Box::new(b))
+        }
+        EngineKind::OvRuntime => {
+            let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            if let Some(dir) = &args.ov_cache_dir {
+                b = b.with_cache_dir(dir);
+            }
+            if let Some(prec) = &args.ov_kv_precision {
+                b = b.with_kv_cache_precision(prec);
+            }
+            if let Some(group) = &args.ov_dyn_quant_group {
+                b = b.with_dyn_quant_group(group);
+            }
+            Ok(Box::new(b))
+        }
+        EngineKind::OvDistSpec => {
+            // Driver = rank 0 (needs --draft-model). Worker = rank > 0.
+            if args.rank == 0 {
+                let draft = args
+                    .draft_model
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("ov-dist-spec rank 0 requires --draft-model"))?;
+                let mut b =
+                    OvDistSpecBuilder::new(&args.model, draft, &args.device, args.spec_k);
+                if let Some(dir) = &args.ov_cache_dir {
+                    b = b.with_cache_dir(dir);
+                }
+                if let Some(prec) = &args.ov_kv_precision {
+                    b = b.with_kv_cache_precision(prec);
+                }
+                if let Some(group) = &args.ov_dyn_quant_group {
+                    b = b.with_dyn_quant_group(group);
+                }
+                Ok(Box::new(b))
+            } else {
+                let mut b = OvDistSpecWorkerBuilder::new(
+                    &args.model,
+                    args.rank,
+                    args.total,
+                    &args.device,
+                );
+                if let Some(dir) = &args.ov_cache_dir {
+                    b = b.with_cache_dir(dir);
+                }
+                if let Some(prec) = &args.ov_kv_precision {
+                    b = b.with_kv_cache_precision(prec);
+                }
+                if let Some(group) = &args.ov_dyn_quant_group {
+                    b = b.with_dyn_quant_group(group);
+                }
+                Ok(Box::new(b))
+            }
         }
     }
 }

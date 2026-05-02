@@ -1,8 +1,10 @@
 // C ABI shim around openvino-genai's C++ LLMPipeline + GenerationConfig +
-// Tokenizer. Exists because the upstream C API does not yet expose
-// draft_model(), Tokenizer access, or the prompt_lookup property.
+// Tokenizer + the lower-level Core/CompiledModel/InferRequest used by
+// ov-runtime + ov-dist-spec engines. Exists because the upstream C API
+// does not yet expose draft_model(), Tokenizer access, prompt_lookup
+// property, or InferRequest::reset_state().
 //
-// Thread safety: pipeline handles are NOT thread-safe; serialise calls from
+// Thread safety: all handles are NOT thread-safe; serialise calls from
 // the Rust side. Tokenizer handles are owned by their pipeline and live
 // only as long as the pipeline does.
 //
@@ -27,17 +29,14 @@ extern "C" {
 typedef struct tahoma_pipeline_t tahoma_pipeline_t;
 typedef struct tahoma_genconfig_t tahoma_genconfig_t;
 typedef struct tahoma_tokenizer_t tahoma_tokenizer_t;
-typedef struct tahoma_result_t tahoma_result_t;
+typedef struct tahoma_runtime_t tahoma_runtime_t;
 
 /// Get the last error message thrown anywhere in the shim. Static buffer;
 /// not thread-safe — read it on the same thread that triggered the error.
 const char* tahoma_last_error_message();
 
-// ---- Pipeline construction ------------------------------------------------
+// ---- Pipeline (LLMPipeline) construction ---------------------------------
 
-/// Create a plain LLMPipeline (no draft, no prompt_lookup).
-/// `properties_kv` is a flat array of [key, value, key, value, ...] strings;
-/// `properties_count` is the number of pairs (so the array has 2*N entries).
 int32_t tahoma_pipeline_create(
     const char* model_path,
     const char* device,
@@ -45,9 +44,6 @@ int32_t tahoma_pipeline_create(
     size_t properties_count,
     tahoma_pipeline_t** out_handle);
 
-/// Create an LLMPipeline with FastDraft companion. The draft model is loaded
-/// onto `draft_device` and registered as the assistant model. Pass NULL or ""
-/// for `draft_device` to use the same device as the target.
 int32_t tahoma_pipeline_create_with_draft(
     const char* model_path,
     const char* device,
@@ -57,7 +53,6 @@ int32_t tahoma_pipeline_create_with_draft(
     size_t properties_count,
     tahoma_pipeline_t** out_handle);
 
-/// Create an LLMPipeline with prompt-lookup decoding enabled.
 int32_t tahoma_pipeline_create_with_prompt_lookup(
     const char* model_path,
     const char* device,
@@ -79,9 +74,6 @@ void tahoma_genconfig_set_max_ngram_size(tahoma_genconfig_t* cfg, uint32_t v);
 
 // ---- Generation -----------------------------------------------------------
 
-/// Run a single greedy/sampled generation. The result text is heap-allocated
-/// and must be freed via tahoma_free_string. `out_token_count` is the number
-/// of tokens emitted (per the pipeline's perf metrics, when available).
 int32_t tahoma_pipeline_generate(
     tahoma_pipeline_t* handle,
     const char* prompt,
@@ -93,16 +85,90 @@ void tahoma_free_string(char* s);
 
 // ---- Tokenizer (workaround for missing C API) -----------------------------
 
-/// Borrow the pipeline's tokenizer. The returned handle is invalidated when
-/// the pipeline is destroyed; the caller does NOT free it.
 tahoma_tokenizer_t* tahoma_pipeline_get_tokenizer(tahoma_pipeline_t* handle);
 
-/// Encode `text` and return the number of resulting tokens. Used to fix the
-/// perf-metrics token-count bug for short greedy decodes.
 int32_t tahoma_tokenizer_count_tokens(
     tahoma_tokenizer_t* tok,
     const char* text,
     uint32_t* out_count);
+
+// ---- Lower-level OV runtime (Core + CompiledModel + InferRequest) ---------
+//
+// Used by the ov-runtime + ov-dist-spec engines. Wraps a single per-stage
+// IR; `reset_state()` is the key function the openvino-rs crate omits.
+
+/// Compile a model from the given .xml file path, on the given device,
+/// with optional plugin-config properties.
+int32_t tahoma_runtime_compile(
+    const char* model_xml_path,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    tahoma_runtime_t** out_handle);
+
+void tahoma_runtime_destroy(tahoma_runtime_t* handle);
+
+/// Reset stateful KV-cache nodes to their initial value. No-op on
+/// stateless models.
+int32_t tahoma_runtime_reset_state(tahoma_runtime_t* handle);
+
+size_t tahoma_runtime_input_count(tahoma_runtime_t* handle);
+size_t tahoma_runtime_output_count(tahoma_runtime_t* handle);
+
+/// Returns the FIRST tensor name (alias) of the input/output port at `idx`.
+/// Caller-allocated buffer; pass `out_buf=NULL, out_cap=0` to size-query
+/// (returns required capacity excluding the trailing NUL via *out_len).
+int32_t tahoma_runtime_input_name(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len);
+int32_t tahoma_runtime_output_name(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len);
+
+/// Element type codes — keep in sync with tahoma-transport's DType.
+/// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64.
+#define TAHOMA_DTYPE_F32 0u
+#define TAHOMA_DTYPE_F16 1u
+#define TAHOMA_DTYPE_I8  2u
+#define TAHOMA_DTYPE_I32 3u
+#define TAHOMA_DTYPE_I64 4u
+
+/// Bind an input tensor by name. `shape` is `rank` element counts (no
+/// padding); `data` is row-major raw bytes whose total length must equal
+/// product(shape) * dtype.bytes_per_element.
+int32_t tahoma_runtime_set_input(
+    tahoma_runtime_t* handle,
+    const char* tensor_name,
+    uint32_t dtype,
+    const size_t* shape,
+    size_t rank,
+    const void* data,
+    size_t data_size);
+
+/// Run inference. Inputs must have been set via tahoma_runtime_set_input.
+int32_t tahoma_runtime_infer(tahoma_runtime_t* handle);
+
+/// Get the output tensor's shape rank. After this, call
+/// tahoma_runtime_output_shape with a buffer of size `rank` to read the
+/// actual dim values.
+int32_t tahoma_runtime_output_rank(
+    tahoma_runtime_t* handle, size_t output_idx, size_t* out_rank);
+
+int32_t tahoma_runtime_output_shape(
+    tahoma_runtime_t* handle, size_t output_idx,
+    size_t* out_shape, size_t shape_cap);
+
+int32_t tahoma_runtime_output_dtype(
+    tahoma_runtime_t* handle, size_t output_idx, uint32_t* out_dtype);
+
+/// Copy the output tensor's raw bytes into `out_buf`. `out_buf_size` must
+/// equal byte_size of the output tensor (call output_byte_size first).
+int32_t tahoma_runtime_output_byte_size(
+    tahoma_runtime_t* handle, size_t output_idx, size_t* out_byte_size);
+
+int32_t tahoma_runtime_output_copy(
+    tahoma_runtime_t* handle, size_t output_idx,
+    void* out_buf, size_t out_buf_size);
 
 #ifdef __cplusplus
 }

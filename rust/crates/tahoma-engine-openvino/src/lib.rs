@@ -10,6 +10,15 @@
 //! `openvino` crate (Core/CompiledModel/InferRequest) and the
 //! distributed spec-decode protocol; tracked separately.
 
+pub mod dist_spec;
 pub mod genai;
+pub mod rotary;
+pub mod runtime;
 
+pub use dist_spec::{
+    DistributedMaskedReq, FrameKind, MaskedReq, OvDistSpecBuilder, OvDistSpecEngine,
+    OvDistSpecWorkerBuilder, OvDistSpecWorkerEngine, SpecDecodeStats,
+};
 pub use genai::{OvGenaiBuilder, OvGenaiEngine};
+pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
+pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};

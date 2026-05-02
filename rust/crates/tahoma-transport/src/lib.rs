@@ -226,6 +226,24 @@ impl ActivationServer {
         send_tensor(sock, tensor).await
     }
 
+    /// Send raw bytes over the established connection. Used by the
+    /// dist-spec engines to prefix tensor frames with control bytes
+    /// (kind + logical_pos_start).
+    pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        sock.write_all(bytes).await?;
+        sock.flush().await?;
+        Ok(())
+    }
+
+    /// Receive exactly `n` raw bytes from the established connection.
+    pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
+        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let mut buf = vec![0u8; n];
+        recv_exact(sock, &mut buf).await?;
+        Ok(buf)
+    }
+
     pub async fn close(&mut self) {
         if let Some(mut sock) = self.client.take() {
             let _ = sock.shutdown().await;
@@ -289,6 +307,20 @@ impl ActivationClient {
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         recv_tensor(sock).await
+    }
+
+    pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        sock.write_all(bytes).await?;
+        sock.flush().await?;
+        Ok(())
+    }
+
+    pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
+        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let mut buf = vec![0u8; n];
+        recv_exact(sock, &mut buf).await?;
+        Ok(buf)
     }
 
     pub async fn close(&mut self) {
