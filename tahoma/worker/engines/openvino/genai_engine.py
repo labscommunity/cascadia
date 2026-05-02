@@ -67,10 +67,12 @@ class OVGenAIEngine(Engine):
         pipe: Any,
         max_tokens_default: int = 256,
         speculative_k: int = 0,
+        prompt_lookup_ngram: int = 0,
     ):
         self._pipe = pipe
         self._max_tokens_default = max_tokens_default
         self._speculative_k = speculative_k  # 0 = no spec; >0 = num_assistant_tokens
+        self._prompt_lookup_ngram = prompt_lookup_ngram  # 0 = no PL; >0 = max_ngram_size
         self._pending: list[GenerationTask] = []
         # We don't track an "active" set the way streaming engines do — the
         # generate() call below is blocking, so the task is "active" only
@@ -85,9 +87,13 @@ class OVGenAIEngine(Engine):
             cfg.do_sample = False
             if self._speculative_k > 0:
                 cfg.num_assistant_tokens = self._speculative_k
+            if self._prompt_lookup_ngram > 0:
+                cfg.num_assistant_tokens = max(self._speculative_k, 5)
+                cfg.max_ngram_size = self._prompt_lookup_ngram
             self._pipe.generate("Hi", cfg)
             logger.info(
-                "ov-genai warmup ok (spec_k=%d)", self._speculative_k,
+                "ov-genai warmup ok (spec_k=%d, prompt_lookup_ngram=%d)",
+                self._speculative_k, self._prompt_lookup_ngram,
             )
         except Exception as err:  # noqa: BLE001
             logger.warning("ov-genai warmup failed: %s", err)
@@ -110,6 +116,11 @@ class OVGenAIEngine(Engine):
             cfg.temperature = task.temperature
         if self._speculative_k > 0:
             cfg.num_assistant_tokens = self._speculative_k
+        if self._prompt_lookup_ngram > 0:
+            # Prompt-lookup mode: tokens come from the input n-gram match.
+            # Default K=5 if speculative_k wasn't set explicitly.
+            cfg.num_assistant_tokens = max(self._speculative_k, 5)
+            cfg.max_ngram_size = self._prompt_lookup_ngram
 
         t0 = time.perf_counter()
         result = self._pipe.generate(task.prompt, cfg)
@@ -163,7 +174,13 @@ class OVGenAIBuilder(Builder):
         draft_model_path: str | None = None,
         draft_device: str | None = None,
         speculative_k: int = 5,
+        prompt_lookup_ngram: int = 0,
     ):
+        if draft_model_path and prompt_lookup_ngram > 0:
+            raise ValueError(
+                "--draft-model and --prompt-lookup are mutually exclusive "
+                "(both set the same `num_assistant_tokens`)",
+            )
         self._model_path = model_path
         self._device = device
         self._cache_dir = cache_dir
@@ -172,6 +189,7 @@ class OVGenAIBuilder(Builder):
         self._draft_model_path = draft_model_path
         self._draft_device = draft_device or device
         self._speculative_k = speculative_k if draft_model_path else 0
+        self._prompt_lookup_ngram = prompt_lookup_ngram
         self._pipe: Any = None
 
     def configure_listen(self, host: str, port: int) -> None:
@@ -223,6 +241,14 @@ class OVGenAIBuilder(Builder):
             self._pipe = ov_genai.LLMPipeline(
                 self._model_path, self._device, draft_model=draft, **plugin_config,
             )
+        elif self._prompt_lookup_ngram > 0:
+            yield LoadProgress(
+                0, None,
+                f"compiling LLMPipeline + prompt_lookup (n={self._prompt_lookup_ngram}) on {self._device}",
+            )
+            self._pipe = ov_genai.LLMPipeline(
+                self._model_path, self._device, prompt_lookup=True, **plugin_config,
+            )
         else:
             yield LoadProgress(0, None, f"compiling LLMPipeline on {self._device}")
             self._pipe = ov_genai.LLMPipeline(self._model_path, self._device, **plugin_config)
@@ -231,7 +257,11 @@ class OVGenAIBuilder(Builder):
     def build(self) -> Engine:
         if self._pipe is None:
             raise RuntimeError("call load() before build()")
-        return OVGenAIEngine(pipe=self._pipe, speculative_k=self._speculative_k)
+        return OVGenAIEngine(
+            pipe=self._pipe,
+            speculative_k=self._speculative_k,
+            prompt_lookup_ngram=self._prompt_lookup_ngram,
+        )
 
     def close(self) -> None:
         self._pipe = None

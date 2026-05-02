@@ -259,6 +259,13 @@ def main() -> int:
              "Default since OV 2025.2 on XMX silicon. Used by --engine ov-genai.",
     )
     pw.add_argument(
+        "--prompt-lookup", type=int, default=0,
+        help="enable prompt-lookup decoding with the given max_ngram_size "
+             "(0 = disabled). Used by --engine ov-genai. Mutually exclusive "
+             "with --draft-model. Best for RAG / summarization workloads "
+             "where output reuses input n-grams (+59-65%% on alpha/charlie B390/140V).",
+    )
+    pw.add_argument(
         "--draft-model",
         help=(
             "speculative-decoding draft model — small model id or path that "

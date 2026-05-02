@@ -1,0 +1,14 @@
+2026-05-02 00:23:01,854 INFO tahoma.cli | engine=ov-genai rank=0/1 device=GPU model=C:\cascadia\models\llama-3.1-8b-int4 namespace=default
+2026-05-02 00:23:03,307 INFO tahoma.worker.runner | connect: upstream=None downstream=None
+2026-05-02 00:23:03,307 INFO tahoma.worker.runner | load: locating IR at C:\cascadia\models\llama-3.1-8b-int4
+2026-05-02 00:23:03,386 INFO tahoma.worker.runner | load: compiling LLMPipeline + prompt_lookup (n=3) on GPU
+2026-05-02 00:23:22,062 INFO tahoma.worker.runner | load: ready
+2026-05-02 00:23:22,062 INFO tahoma.worker.runner | build engine
+2026-05-02 00:23:22,062 INFO tahoma.worker.runner | warmup
+2026-05-02 00:23:22,736 INFO tahoma.worker.engines.openvino.genai_engine | ov-genai warmup ok (spec_k=0, prompt_lookup_ngram=3)
+2026-05-02 00:23:22,736 INFO tahoma.worker.runner | runner ready
+2026-05-02 00:23:22,736 INFO tahoma.cli | stdin mode: type a prompt and press enter
+There is no passage provided for me to summarize. However, I can provide a summary of the concept of distributed inference for large language models.
+
+Distributed inference is a technique used to speed up the inference process for large language models. It involves splitting the model into smaller parts and processing them in parallel across multiple devices or machines. This approach can significantly reduce the computational time required for inference, making it more efficient and scalable for large models.2026-05-02 00:23:27,707 INFO tahoma.worker.engines.openvino.genai_engine | task stdin-18 done: 128 tokens in 4.969s (25.8 tok/s)
+

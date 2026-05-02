@@ -217,6 +217,7 @@ def _ov_genai_builder(args: argparse.Namespace, _host: str, _port: int) -> Build
         draft_model_path=getattr(args, "draft_model", None),
         draft_device=getattr(args, "draft_device", None) or args.device,
         speculative_k=getattr(args, "spec_k", 5),
+        prompt_lookup_ngram=getattr(args, "prompt_lookup", 0),
     )
 
 
