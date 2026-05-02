@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "C:\tahoma\bench_llmpipe_spec.py", line 101, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\bench_llmpipe_spec.py", line 39, in main
+    pipe = ov_genai.LLMPipeline(
+           ^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Check 'unregistered_parameters.str().empty()' failed at src\core\src\model.cpp:266:
+Model references undeclared parameters: opset1::Parameter beam_idx () -> (i32[?])
+opset1::Parameter attention_mask () -> (i64[?,?])
+
+

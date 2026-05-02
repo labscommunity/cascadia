@@ -1,0 +1,14 @@
+{
+  "model": "C:\\cascadia\\models\\llama-3.1-8b-int4",
+  "device": "GPU",
+  "tokens": 64,
+  "decode_s": 0.7021856307983398,
+  "tok_s": 91.14398984102839,
+  "load_s": 21.314932823181152,
+  "warmup_s": 1.025456428527832,
+  "plugin_config": {},
+  "perf_metrics": {},
+  "first_text": "The capital of France is Paris.",
+  "id": "c1-2",
+  "host": "charlie.local"
+}

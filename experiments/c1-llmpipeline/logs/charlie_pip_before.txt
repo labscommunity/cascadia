@@ -1,0 +1,4 @@
+openvino==2026.2.0.dev20260420
+openvino-genai==2026.0.0.0
+openvino-telemetry==2025.2.0
+openvino-tokenizers==2026.0.0.0
