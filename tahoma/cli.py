@@ -74,6 +74,10 @@ def cmd_engines(_args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     if args.rank < 0 or args.rank >= args.total:
         sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
+    if args.tp_size < 1:
+        sys.exit(f"--tp-size must be >= 1; got {args.tp_size}")
+    if args.tp_rank < 0 or args.tp_rank >= args.tp_size:
+        sys.exit(f"--tp-rank must be in [0, {args.tp_size}); got {args.tp_rank}")
 
     # Surface env vars from CLI flags so the API layer + downstream modules
     # see them consistently. CLI flags take precedence over existing env.
@@ -288,6 +292,18 @@ def main() -> int:
             "/instance/previews. Requires the `zeroconf` package (install "
             "with `pip install tahoma[discovery]`)."
         ),
+    )
+    pw.add_argument(
+        "--tp-size", type=int, default=1,
+        help=(
+            "tensor-parallel group size for this stage (default 1 = PP-only). "
+            "Engines that don't declare TP support reject tp_size > 1. "
+            "See docs/architecture/tensor-parallelism.md."
+        ),
+    )
+    pw.add_argument(
+        "--tp-rank", type=int, default=0,
+        help="this worker's rank inside the TP group (0..tp_size-1).",
     )
     pw.set_defaults(func=cmd_worker)
 

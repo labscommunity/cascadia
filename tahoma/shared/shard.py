@@ -11,7 +11,15 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ShardSpec:
-    """A single node's slice of a model — what one Engine instance will run."""
+    """A single rank's slice of a model — what one Engine instance will run.
+
+    For pure pipeline parallelism (the default) ``tp_size == 1`` and the spec
+    describes a contiguous range of layers. When ``tp_size > 1`` the same
+    layer range is held by ``tp_size`` peers cooperatively, each owning a
+    1/N slice of every weight matrix; engines that opt into TP must perform
+    an all-reduce after each attention output and each MLP output. See
+    ``tahoma.parallel`` for the collective primitive.
+    """
 
     model_id: str
     layer_start: int     # inclusive
@@ -20,10 +28,17 @@ class ShardSpec:
     device: str          # OpenVINO device hint: "CPU", "GPU", "NPU"
     is_first_stage: bool
     is_last_stage: bool
+    # Tensor parallel layout (default = pipeline-only, no TP).
+    tp_size: int = 1
+    tp_rank: int = 0
 
     @property
     def num_layers(self) -> int:
         return self.layer_end - self.layer_start
+
+    @property
+    def is_tp(self) -> bool:
+        return self.tp_size > 1
 
 
 @dataclass(frozen=True)

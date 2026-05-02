@@ -84,6 +84,13 @@ See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key seams:
 - [ov-spec](docs/engines/ov-spec.md) — single-stage speculative decoding
 - [ov-dist-spec](docs/engines/ov-dist-spec.md) — multi-stage spec with mask-based rewind
 
+## Cluster
+
+- Auto-discovery: `tahoma worker --discover ...` (requires `pip install tahoma[discovery]`) advertises this node via mDNS on `_tahoma._tcp.local.` and browses for siblings in the same `TAHOMA_NAMESPACE`. Discovered peers feed `/state` and `/instance/previews` for placement suggestions.
+- Master election: lowest-lexicographic node id in a namespace wins; no explicit messaging.
+- Placement: `POST /instance/previews` returns the top-N pipeline orderings ranked by sum-of-edge-latency (using the per-link measurements in the topology graph — exo's graph stores socket vs RDMA *types* but no measurements).
+- Tensor parallelism: foundation only — see [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md). Engines opt in by calling `TPGroup.all_reduce_sum_inplace` after attention and MLP outputs; today's v5 shards aren't TP-split, so no built-in engine ships TP yet.
+
 ## Deploying
 
 Tahoma does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Tahoma handles `SIGTERM` cleanly (`runner.close()` then exit 0) and supports `--pid-file` for supervisor integration.
