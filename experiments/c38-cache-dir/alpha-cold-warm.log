@@ -1,0 +1,15 @@
+=== alpha cold load ===
+cleared cache at C:\Users\cascadia\.cache\bench_cache
+loading LLMPipeline with CACHE_DIR=C:\Users\cascadia\.cache\bench_cache...
+load took 26.98s
+RESULT={"mode": "clear-then-load", "load_s": 26.97994930006098, "warmup_s": 0.7086768000153825}
+
+=== alpha warm load ===
+loading LLMPipeline with CACHE_DIR=C:\Users\cascadia\.cache\bench_cache...
+load took 10.20s
+RESULT={"mode": "warm-load", "load_s": 10.204436600091867, "warmup_s": 0.72606569994241}
+
+=== alpha warm load (2nd run) ===
+loading LLMPipeline with CACHE_DIR=C:\Users\cascadia\.cache\bench_cache...
+load took 14.96s
+RESULT={"mode": "warm-load", "load_s": 14.958059800090268, "warmup_s": 0.7170727000338957}
