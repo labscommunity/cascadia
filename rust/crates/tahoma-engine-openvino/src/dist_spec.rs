@@ -434,6 +434,7 @@ impl MaskedReq {
             .ok_or_else(|| EngineError::Backend("missing position_ids name".into()))?
             .clone();
 
+        let _ts_setup = std::time::Instant::now();
         self.runtime
             .set_input(&in_ids_name, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
             .map_err(map_ov_err)?;
@@ -455,8 +456,14 @@ impl MaskedReq {
                     .map_err(map_ov_err)?;
             }
         }
+        let setup_us = _ts_setup.elapsed().as_micros();
+        let _ts_infer = std::time::Instant::now();
         self.runtime.infer().map_err(map_ov_err)?;
+        let infer_us = _ts_infer.elapsed().as_micros();
+        let _ts_out = std::time::Instant::now();
         let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
+        let output_us = _ts_out.elapsed().as_micros();
+        let _ts_conv = std::time::Instant::now();
         let floats = match dtype {
             ShimDType::F32 => bytes
                 .chunks_exact(4)
@@ -469,6 +476,11 @@ impl MaskedReq {
                 )))
             }
         };
+        let convert_us = _ts_conv.elapsed().as_micros();
+        tracing::debug!(
+            n, setup_us, infer_us, output_us, convert_us, vocab = floats.len(),
+            "draft.feed timing"
+        );
         self.cache_len += n;
         self.logical_pos += n;
         let mut out_shape = [1, 1, floats.len()];
@@ -891,8 +903,33 @@ pub struct OvDistSpecEngine {
 
 impl Engine for OvDistSpecEngine {
     fn warmup(&mut self) {
-        // Optional: skip a real warmup; spec decode has too many moving parts.
-        info!("ov-dist-spec warmup skipped (driven on first task)");
+        // Run a tiny spec-decode round to pre-pay the cold OV initialization
+        // cost (kernel JIT, compiled-blob load, plugin first-touch).
+        // Mirrors Python's `OvDistributedSpecEngine.warmup()` which does
+        // `list(spec_decode_greedy_stream(target, draft, "Hi" tokens, max=2, k))`.
+        // Without this the first user task pays ~700 ms of cold-init cost
+        // and Rust shows up as 23% slower than Python in micro-benchmarks
+        // even though the steady-state per-token cost is the same.
+        let enc = match self.tokenizer.encode("Hi", false) {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(error = %err, "ov-dist-spec warmup tokenize failed");
+                return;
+            }
+        };
+        let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+        let mut stats = SpecDecodeStats::default();
+        match spec_decode_greedy(
+            &mut self.target,
+            &mut self.draft,
+            &prompt_ids,
+            2,
+            self.k,
+            &mut stats,
+        ) {
+            Ok(_) => info!(k = self.k, "ov-dist-spec warmup ok"),
+            Err(err) => warn!(error = %err, "ov-dist-spec warmup failed"),
+        }
     }
 
     fn submit(&mut self, task: GenerationTask) {
