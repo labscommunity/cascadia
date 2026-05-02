@@ -33,6 +33,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from tahoma.api import ollama as ollama_routes
+from tahoma.download import (
+    discover_local_snapshots,
+    get_model,
+    list_models,
+    pull,
+    register as registry_register,
+    search_hf,
+    unregister,
+)
 from tahoma.master import (
     StageRequirement,
     elect_master,
@@ -82,6 +92,17 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ToolFunctionSpec(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+
+
+class ToolSpec(BaseModel):
+    type: str = "function"
+    function: ToolFunctionSpec
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -95,6 +116,13 @@ class ChatCompletionRequest(BaseModel):
     top_logprobs: int = Field(0, ge=0, le=20)
     # Pass-through for reasoning models (DeepSeek V3.1, Qwen3, GLM-4.7, ...).
     enable_thinking: bool = False
+    # OpenAI-compatible tool definitions. Tahoma accepts and forwards them
+    # into the prompt; engines that lack a grammar-constrained sampling path
+    # can emit `tool_calls: null` in the response. Engines that DO know how
+    # to call tools should look at `task.tools` (currently empty — the
+    # plumbing is in place; engine integration is a follow-up).
+    tools: list[ToolSpec] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
 
 class TopLogprobOut(BaseModel):
@@ -114,11 +142,25 @@ class ChoiceLogprobsOut(BaseModel):
     content: list[TokenLogprobsOut] = []
 
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON-encoded args, per OpenAI spec
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatMessage
     finish_reason: str
     logprobs: ChoiceLogprobsOut | None = None
+    # Empty list when the engine doesn't emit tool calls. Always present so
+    # OpenAI clients have a stable shape.
+    tool_calls: list[ToolCall] = []
 
 
 class ChatCompletionUsage(BaseModel):
@@ -186,6 +228,11 @@ def make_app(
     topo = topology if topology is not None else Topology()
 
     app = FastAPI(title="Tahoma", version="0.0.1")
+
+    # Ollama-compatible endpoints (/api/version, /api/tags, /api/show,
+    # /api/generate, /api/chat) registered alongside the OpenAI surface.
+    # OpenWebUI and other Ollama clients just work.
+    ollama_routes.register(app, runner, model_id)
 
     # ----- liveness + ops -------------------------------------------------
 
@@ -269,11 +316,109 @@ def make_app(
     # ----- model listing --------------------------------------------------
 
     @app.get("/v1/models")
-    def list_models() -> dict:
+    def list_v1_models() -> dict:
+        # Currently-served model + everything we have in the registry.
+        seen: set[str] = {model_id}
+        data = [{"id": model_id, "object": "model", "owned_by": "tahoma"}]
+        for entry in list_models():
+            if entry.id in seen:
+                continue
+            seen.add(entry.id)
+            data.append(entry.to_openai())
+        return {"object": "list", "data": data}
+
+    # ----- model registry -----------------------------------------------
+
+    @app.get("/models")
+    def reg_list_models() -> dict:
+        return {"models": [
+            {
+                "id": e.id, "source": e.source, "local_path": e.local_path,
+                "size_bytes": e.size_bytes, "pulled_at": e.pulled_at,
+                "revision": e.revision, "tags": e.tags,
+            }
+            for e in list_models()
+        ]}
+
+    @app.get("/models/{model_id:path}")
+    def reg_get_model(model_id: str) -> dict:
+        entry = get_model(model_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"unknown model {model_id!r}")
         return {
-            "object": "list",
-            "data": [{"id": model_id, "object": "model", "owned_by": "tahoma"}],
+            "id": entry.id, "source": entry.source,
+            "local_path": entry.local_path, "size_bytes": entry.size_bytes,
+            "pulled_at": entry.pulled_at, "revision": entry.revision,
+            "tags": entry.tags,
         }
+
+    @app.delete("/models/{model_id:path}")
+    def reg_delete_model(model_id: str) -> dict:
+        if not unregister(model_id):
+            raise HTTPException(status_code=404, detail=f"unknown model {model_id!r}")
+        return {"unregistered": model_id}
+
+    @app.post("/models/discover")
+    def reg_discover() -> dict:
+        """Walk the HF cache and register everything that's already there."""
+        added: list[str] = []
+        for entry in discover_local_snapshots():
+            if get_model(entry.id) is None:
+                registry_register(entry)
+                added.append(entry.id)
+        return {"discovered": added}
+
+    @app.get("/models/search/{query:path}")
+    def reg_search(query: str, limit: int = 20) -> dict:
+        return {"results": search_hf(query, limit=limit)}
+
+    @app.post("/models/pull")
+    async def reg_pull(spec: dict) -> Any:
+        model_id_in = spec.get("model")
+        if not model_id_in:
+            raise HTTPException(status_code=400, detail="missing 'model' field")
+        revision = spec.get("revision")
+        stream = spec.get("stream", True)
+
+        if not stream:
+            # Block until done; return final event.
+            final: dict[str, Any] = {}
+            for event in pull(model_id_in, revision=revision):
+                final = {
+                    "status": event.status, "progress_bytes": event.progress_bytes,
+                    "total_bytes": event.total_bytes, "file": event.file,
+                    "error": event.error,
+                }
+            return final
+
+        async def stream_pull() -> AsyncIterator[bytes]:
+            queue: asyncio.Queue[Any] = asyncio.Queue()
+            SENTINEL = object()
+
+            def producer() -> None:
+                try:
+                    for event in pull(model_id_in, revision=revision):
+                        queue.put_nowait(event)
+                finally:
+                    queue.put_nowait(SENTINEL)
+
+            # Fire the producer; do NOT await — it must run concurrently.
+            producer_task = asyncio.create_task(asyncio.to_thread(producer))
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is SENTINEL:
+                        break
+                    yield (json.dumps({
+                        "status": item.status, "progress_bytes": item.progress_bytes,
+                        "total_bytes": item.total_bytes, "file": item.file,
+                        "error": item.error,
+                    }) + "\n").encode()
+            finally:
+                with contextlib.suppress(Exception):
+                    await producer_task
+
+        return StreamingResponse(stream_pull(), media_type="application/x-ndjson")
 
     # ----- cancellation ---------------------------------------------------
 
