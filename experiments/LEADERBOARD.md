@@ -41,6 +41,9 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 |---|---|---|---|
 | alpha B390 GPU | 1 | 134 | 134 |
 | alpha B390 GPU | 8 | **138** | 17 |
+| alpha B390 GPU | 16 | 274 | 17.1 |
+| alpha B390 GPU | 32 | **559** | 17.5 |
+| alpha B390 GPU | 64 | 362 (-35%, saturation) | 5.65 |
 | charlie 140V GPU | 1 | 143 | 143 |
 | charlie 140V GPU | 8 | **149** | 18.6 |
 

@@ -94,3 +94,32 @@ stays around 18.5 tok/s on charlie vs 17.2 on alpha.
 Both nodes confirmed: a single Intel AI PC can serve ~8 concurrent
 chat sessions at ~18-20 tok/s each on Llama 3.1 8B INT4 — about the
 same total throughput as serving 1 user at 134-149 tok/s.
+
+## Update (c20 part 4): batch=64 — SATURATION FOUND on alpha B390
+
+| Batch | Decode (s) | Aggregate tok/s | Per-request tok/s |
+|---|---|---|---|
+| 1 | 0.48 | 134 | 134 |
+| 8 | 3.71 | 138 | 17.2 |
+| 16 | 3.74 | 274 | 17.1 |
+| 32 | 3.66 | **559** | 17.5 |
+| **64** | **11.32** | **362 (-35%)** | **5.65 (-68%)** |
+
+**At batch=64, aggregate throughput DROPS by 35%** vs batch=32.
+The GPU compute saturates: between batch=32 and batch=64 the per-step
+forward pass time more than doubles (each forward processes more KV
+attention), and the per-request throughput collapses from 17.5 to 5.65.
+
+**Conclusion: alpha B390 sweet spot is batch=32** for Llama 3.1 8B INT4
+multi-tenant CB serving. Aggregate 559 tok/s, ~17 per-user tok/s.
+Higher batches are a regression.
+
+Likely causes of saturation between 32→64:
+- KV cache memory pressure (4 GB cache_size config exhausted)
+- max_num_batched_tokens=8192 partly hit (64 × 100 input ~= 6400 tokens)
+- GPU compute parallelism plateaus when KV per-batch grows past the
+  XMX matrix tile sizes
+
+For tahoma's deployment recipe: cap concurrent CB requests at 32 on
+B390-class hardware. Higher concurrency requires sharding to multiple
+nodes (which is the original tahoma value proposition).
