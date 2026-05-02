@@ -2,7 +2,7 @@
 
 Bypasses optimum-intel and transformers' `_assisted_decoding` (which is
 incompatible with optimum-intel 1.27's tuple-format past_key_values), going
-directly to OpenVINO Runtime + the manual `spec_decode_greedy` loop.
+directly to OpenVINO Runtime + the manual `spec_decode_greedy_stream` loop.
 
 Single-stage. Loads two pre-exported OV IR models — a target (the model
 you actually want output from) and a small draft. They must share a
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from tahoma.shared.shard import ShardSpec
@@ -25,8 +25,10 @@ from tahoma.worker.engines.base import Builder, Engine
 from tahoma.worker.engines.openvino.optimum_engine import resolve_or_export_ov_ir
 from tahoma.worker.engines.openvino.spec_decode import (
     MaskedReq,
+    SpecDecodeStats,
     make_masked_req,
     spec_decode_greedy,
+    spec_decode_greedy_stream,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,17 +37,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _Active:
     task: GenerationTask
-    tokens: list[int]
-    stats: Any
+    iterator: Any                     # generator yielding token ids
+    stats: SpecDecodeStats
+    emitted: int = 0
+    last_text: str = ""               # decoded text emitted so far (for incremental decode)
+    pending_ids: list[int] = field(default_factory=list)
 
 
 class OVSpecDecodeEngine(Engine):
-    """Single-stage spec-decode engine.
-
-    Greedy only. Yields one chunk with the full completion (not per-token
-    streaming) — since spec_decode_greedy runs to max_tokens before returning,
-    streaming would require a non-trivial refactor.
-    """
+    """Single-stage spec-decode engine. Streams chunks per accepted token."""
 
     def __init__(
         self,
@@ -74,28 +74,65 @@ class OVSpecDecodeEngine(Engine):
             return
         self._pending.append(task)
 
+    def _start(self, task: GenerationTask) -> _Active:
+        ids = self._tokenizer(task.prompt, return_tensors="np").input_ids.astype("int64")
+        stats = SpecDecodeStats()
+        gen = spec_decode_greedy_stream(
+            self._target, self._draft, ids,
+            max_tokens=task.max_tokens, k=self._k, stats=stats,
+        )
+        return _Active(task=task, iterator=gen, stats=stats)
+
     def step(self) -> Iterable[tuple[TaskId, Chunk]]:
         if not self._active and self._pending:
             task = self._pending.pop(0)
-            ids = self._tokenizer(task.prompt, return_tensors="np").input_ids.astype("int64")
-            tokens, stats = spec_decode_greedy(
-                self._target, self._draft, ids,
-                max_tokens=task.max_tokens, k=self._k,
-            )
-            text = self._tokenizer.decode(tokens, skip_special_tokens=True)
+            self._active[task.task_id] = self._start(task)
+            logger.info("task %s active (K=%d)", task.task_id[:8], self._k)
+
+        if not self._active:
+            return
+
+        task_id, active = next(iter(self._active.items()))
+
+        try:
+            tok = next(active.iterator)
+        except StopIteration:
             logger.info(
-                "task %s: %d tokens, %d steps, accept_rate=%.2f",
-                task.task_id[:8], len(tokens), stats.n_steps, stats.accept_rate,
+                "task %s done: %d tokens, %d steps, accept_rate=%.2f",
+                task_id[:8], active.emitted, active.stats.n_steps,
+                active.stats.accept_rate,
             )
-            yield task.task_id, Chunk(
-                task_id=task.task_id,
-                token_id=tokens[-1] if tokens else 0,
-                text=text,
-                is_final=True,
+            yield task_id, Chunk(
+                task_id=task_id, token_id=0, text="", is_final=True,
             )
+            del self._active[task_id]
+            return
+
+        active.emitted += 1
+        active.pending_ids.append(int(tok))
+        # Incremental decode: re-decode the full pending list and emit the
+        # new suffix only. This is correct for tokenizers that defer text
+        # across boundary bytes (e.g., sentencepiece byte-fallback).
+        full_text = self._tokenizer.decode(active.pending_ids, skip_special_tokens=True)
+        delta = full_text[len(active.last_text):]
+        active.last_text = full_text
+
+        is_final = active.emitted >= active.task.max_tokens
+
+        yield task_id, Chunk(
+            task_id=task_id, token_id=int(tok), text=delta, is_final=is_final,
+        )
+
+        if is_final:
+            logger.info(
+                "task %s done: %d tokens, %d steps, accept_rate=%.2f",
+                task_id[:8], active.emitted, active.stats.n_steps,
+                active.stats.accept_rate,
+            )
+            del self._active[task_id]
 
     def close(self) -> None:
-        pass
+        self._active.clear()
 
 
 class OVSpecDecodeBuilder(Builder):

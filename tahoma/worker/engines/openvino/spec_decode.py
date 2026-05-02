@@ -117,6 +117,28 @@ def spec_decode_greedy(
     Bit-exact with target's own greedy decode given the same prompt.
     Returns generated token ids + per-run telemetry.
     """
+    stats = SpecDecodeStats()
+    gens = list(spec_decode_greedy_stream(target, draft, prompt_ids, max_tokens, k=k, stats=stats))
+    return gens, stats
+
+
+def spec_decode_greedy_stream(
+    target: MaskedReq,
+    draft: MaskedReq,
+    prompt_ids: np.ndarray,
+    max_tokens: int,
+    k: int = 3,
+    stats: SpecDecodeStats | None = None,
+):
+    """Generator-version of `spec_decode_greedy`. Yields token ids as they're emitted.
+
+    Each spec-decode round yields between 1 and K+1 tokens (the matched draft
+    prefix plus the correction). Caller can stream them through a tokenizer
+    decoder for live UI updates.
+    """
+    if stats is None:
+        stats = SpecDecodeStats()
+
     target.reset()
     draft.reset()
 
@@ -124,21 +146,23 @@ def spec_decode_greedy(
     draft.feed(prompt_ids)
 
     first = int(np.argmax(t_logits[0, -1, :]))
-    gens: list[int] = [first]
-    prev_correction = first
+    yielded = 1
+    yield first
 
+    if yielded >= max_tokens:
+        return
+
+    prev_correction = first
     d_logits = draft.feed(np.array([[first]], dtype=np.int64))
     d_last_logit = d_logits[0, -1, :].copy()
 
-    stats = SpecDecodeStats()
-
-    while len(gens) < max_tokens:
+    while yielded < max_tokens:
         stats.n_steps += 1
 
         # 1. Draft K candidates.
         drafts = [int(np.argmax(d_last_logit))]
         for i in range(1, k):
-            if len(gens) + len(drafts) >= max_tokens:
+            if yielded + len(drafts) >= max_tokens:
                 break
             d_logits = draft.feed(np.array([[drafts[i - 1]]], dtype=np.int64))
             drafts.append(int(np.argmax(d_logits[0, -1, :])))
@@ -166,9 +190,10 @@ def spec_decode_greedy(
             correction = int(t_greedy[len(drafts)])
 
         for tk in drafts[:accepted] + [correction]:
-            if len(gens) >= max_tokens:
+            if yielded >= max_tokens:
                 break
-            gens.append(tk)
+            yielded += 1
+            yield tk
 
         # 5. Rewind target by the rejected drafts.
         target.rewind(len(drafts) - accepted)
@@ -182,8 +207,6 @@ def spec_decode_greedy(
             d_logits = draft.feed(np.array([[correction]], dtype=np.int64))
         d_last_logit = d_logits[0, -1, :].copy()
         prev_correction = correction
-
-    return gens[:max_tokens], stats
 
 
 def make_masked_req(compiled_model: Any) -> MaskedReq:
