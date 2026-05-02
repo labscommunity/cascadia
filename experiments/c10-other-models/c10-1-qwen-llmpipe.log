@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "C:\tahoma\bench_llmpipeline.py", line 108, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\bench_llmpipeline.py", line 52, in main
+    pipe.generate(args.prompt, cfg_warm)
+RuntimeError: Check 'm_ireq_queue_tokenizer' failed at C:\Jenkins\workspace\private-ci\ie\build-windows-vs2022@2\b\repos\openvino.genai\src\cpp\src\tokenizer\tokenizer_impl.cpp:626:
+Either openvino_tokenizer.xml was not provided or it was not loaded correctly. Tokenizer::encode is not available
+

@@ -1,0 +1,1 @@
+RESULT={"load_s": 21.87646222114563, "turn1_s": 2.0199570655822754, "turn2_s": 1.803145408630371, "prefix_caching": true, "system_chars": 708}

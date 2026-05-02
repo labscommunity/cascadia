@@ -1,0 +1,1 @@
+RESULT={"model": "C:\\cascadia\\models\\srang992-llama-3.2-1b-int4-ov", "device": "GPU", "tokens": 256, "decode_s": 3.1578197479248047, "tok_s": 81.06859176120903, "load_s": 14.431886196136475, "warmup_s": 0.5564689636230469, "plugin_config": {}, "perf_metrics": {}, "first_text": "Distributed Inference for Large Language Models\n\nLarge language models (LLMs) ha"}

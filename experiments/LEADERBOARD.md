@@ -1,18 +1,29 @@
 # Leaderboard
 
-Best measured tok/s per (model, hardware, engine, prompt-class) combination. Rows are replaced when a higher number lands; the previous record stays in the linked experiment dir.
+Best measured tok/s per `(model, hardware, engine, prompt-class)` combination. Rows are replaced when a higher number lands; the previous record stays in the linked experiment dir.
 
-## Llama 3.1 8B Instruct INT4 — single node
+## Llama 3.1 8B Instruct INT4
 
-| Hardware | Engine | tok/s | Source |
-|---|---|---|---|
-| **alpha B390 GPU** | **openvino_genai.LLMPipeline (raw)** | **96.41** | c1-llmpipeline/c1-1 |
-| **charlie 140V GPU** | **openvino_genai.LLMPipeline (raw)** | **91.14** | c1-llmpipeline/c1-2 |
-| alpha B390 GPU | LLMPipeline + CACHE_DIR/KV_u8/DynQuant=32 | 92.74 | c1-llmpipeline/c1-3 |
-| alpha B390 GPU | tahoma `--engine ov-genai` | 87.10 | c3-ov-genai-engine/c3-1 |
-| alpha B390 GPU | ov-spec K=4 + 1B INT4 draft | 13.83 | c0-baselines/c0-3 |
-| alpha B390 GPU | ov-optimum (OVModelForCausalLM) | 8.89 | c0-baselines/c0-1b |
-| charlie 140V GPU | ov-optimum (OVModelForCausalLM) | 10.33 | c0-baselines/c0-2 |
+| Hardware | Engine | Output | tok/s | Source |
+|---|---|---|---|---|
+| **alpha B390 GPU** | **LLMPipeline + draft K=10** | **64 tok** | **100.90** | c2-llmpipe-spec/c2-4 |
+| alpha B390 GPU | LLMPipeline plain | 64 tok | 96.41 | c1-llmpipeline/c1-1 |
+| alpha B390 GPU | LLMPipeline + CACHE_DIR/KV_u8/DynQuant=32 | 64 tok | 92.74 | c1-llmpipeline/c1-3 |
+| charlie 140V GPU | LLMPipeline plain | 64 tok | 91.14 | c1-llmpipeline/c1-2 |
+| alpha B390 GPU | tahoma `--engine ov-genai` | 64 tok | 87.10 | c3-ov-genai-engine/c3-1 |
+| charlie 140V GPU | tahoma `--engine ov-genai` | 64 tok | 71.31 | c3-ov-genai-engine/c5-1 |
+| alpha B390 GPU | LLMPipeline + draft K=5 | **256 tok** | **24.94** | c6-long-gen/c6-2 |
+| alpha B390 GPU | LLMPipeline plain | 256 tok | 21.54 | c6-long-gen/c6-1 |
+| alpha B390 GPU | ov-spec K=4 + 1B INT4 draft | 64 tok | 13.83 | c0-baselines/c0-3 |
+| alpha B390 GPU | ov-optimum (OVModelForCausalLM) | 64 tok | 8.89 | c0-baselines/c0-1b |
+| charlie 140V GPU | ov-optimum (OVModelForCausalLM) | 64 tok | 10.33 | c0-baselines/c0-2 |
+
+## Llama 3.2 1B Instruct INT4
+
+| Hardware | Engine | Output | tok/s | Source |
+|---|---|---|---|---|
+| **alpha B390 GPU** | **LLMPipeline plain** | **64 tok** | **149.47** | c10-other-models/c10-3 |
+| alpha B390 GPU | LLMPipeline plain | 256 tok | 81.07 | c10-other-models/c10-2 |
 
 ## Llama 3.1 8B Instruct INT4 — distributed (alpha + charlie via Thunderbolt 4)
 
@@ -20,9 +31,11 @@ Best measured tok/s per (model, hardware, engine, prompt-class) combination. Row
 |---|---|---|---|
 | ov-dist-spec | K=4, v5 shards | 17.59 | c0-baselines/c0-5 |
 
-(Now strictly slower than single-node alpha LLMPipeline. Distributed serving for 8B is no longer a perf win — it's a fit win for models that don't fit on one node.)
+(Strictly slower than single-node `ov-genai` (~91 tok/s on either node), so distributed serving for 8B is no longer a perf decision — only a fit decision for models that don't fit on one node.)
 
 ## Notes
 
-- All numbers above are decode-only tok/s (load + warmup excluded), 64 generated tokens, prompt = "What is the capital of France?".
+- All numbers above are decode-only tok/s (load + warmup excluded).
+- Default prompt is "What is the capital of France?" for 64-tok runs.
+- 256-tok runs use "Write a short essay about distributed inference for large language models." (creative writing).
 - DISCOVERY #1 in `DISCOVERIES.md` documents the LLMPipeline jump.
