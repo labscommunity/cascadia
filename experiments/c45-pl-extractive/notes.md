@@ -54,3 +54,19 @@ model summarizes by quoting → high n-gram match → PL helps.
   open-ended QA."
 - Consider auto-detection: if input ≥100 tok AND request flags
   `extractive=True`, enable PL.
+
+## Update (output length sweep at 1024 input, extractive)
+
+| Output | Plain tok/s | PL tok/s | Δ |
+|--------|------------:|---------:|--:|
+| 64  |  25.65 |  40.20 | +57% |
+| 128 |  51.70 |  80.76 | +56% |
+| 256 | 101.88 | **160.64** | **+58%** |
+
+PL win is consistent ~+57% across output lengths. **PL at 1024 input
++ 256 output extractive = 160.64 tok/s on charlie iGPU.**
+
+This is the new tahoma RAG leaderboard high. For real RAG deployments
+(1K input passage, 256-token extractive summary), PL on Lunar Lake
+delivers 160 tok/s — comparable to the short-input + FastDraft 134 tok/s
+headline.

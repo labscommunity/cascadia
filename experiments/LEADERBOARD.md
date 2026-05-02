@@ -100,3 +100,16 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 - DISCOVERY #1 in `DISCOVERIES.md` documents the LLMPipeline jump.
 - DISCOVERY #2 documents the FastDraft win.
 - DISCOVERY #3 documents the Prompt Lookup win.
+
+## Llama 3.1 8B INT4 — RAG/extractive workloads (LLMPipeline + prompt_lookup)
+
+| Hardware | Input | Output | Plain | PL n=3 | Δ | Source |
+|---|---|---|---|---|---|---|
+| **charlie 140V GPU** | 1024 | 256 | 101.88 | **160.64** | **+58%** | c45 |
+| charlie 140V GPU | 1024 | 128 | 51.70 | 80.76 | +56% | c45 |
+| charlie 140V GPU | 1024 | 64  | 25.65 | 40.20 | +57% | c45 |
+| charlie 140V GPU | 2048 | 128 | 52.15 | 89.37 | +71% | c45 |
+| charlie 140V GPU |  256 | 128 | 56.94 | 85.13 | +50% | c45 |
+| charlie 140V GPU |  256 | 128 | 66.16 | 108.82 | +65% | c21 (original) |
+
+**PL for extractive workloads scales beautifully across both input and output dimensions.**
