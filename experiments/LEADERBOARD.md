@@ -113,3 +113,16 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 | charlie 140V GPU |  256 | 128 | 66.16 | 108.82 | +65% | c21 (original) |
 
 **PL for extractive workloads scales beautifully across both input and output dimensions.**
+
+## Llama 3.1 8B INT4 — RAG extractive cross-platform (LLMPipeline + prompt_lookup)
+
+| Hardware | Input | Output | Plain | PL n=3 | Δ |
+|---|---|---|---|---|---|
+| **charlie 140V GPU** | 1024 | 256 | 101.88 | **160.64** | +58% |
+| **alpha B390 GPU** | 1024 | 256 | 94.88 | **150.71** | +59% |
+| charlie 140V GPU | 1024 | 128 | 51.70 | 80.76 | +56% |
+| alpha B390 GPU | 1024 | 128 | 47.11 | 75.34 | +60% |
+| charlie 140V GPU | 1024 | 64 | 25.65 | 40.20 | +57% |
+| alpha B390 GPU | 1024 | 64 | 23.61 | 37.63 | +59% |
+
+**charlie 140V iGPU edges out alpha B390 dGPU for RAG workloads** — likely due to lower iGPU latency to system RAM.

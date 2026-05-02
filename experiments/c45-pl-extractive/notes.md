@@ -70,3 +70,31 @@ This is the new tahoma RAG leaderboard high. For real RAG deployments
 (1K input passage, 256-token extractive summary), PL on Lunar Lake
 delivers 160 tok/s — comparable to the short-input + FastDraft 134 tok/s
 headline.
+
+## Update (alpha B390 cross-platform validation)
+
+| Output | alpha plain | alpha PL | Δ | charlie PL (for ref) |
+|--------|-----------:|---------:|--:|----------------------:|
+| 64  |  23.61 |  37.63 | +59% | 40.20 |
+| 128 |  47.11 |  75.34 | +60% | 80.76 |
+| 256 |  94.88 | **150.71** | **+59%** | **160.64** |
+
+PL extractive win is robustly **~+59-60%** on both alpha B390 and
+charlie 140V. Both platforms hit 150+ tok/s at 1K input + 256 output.
+
+Charlie is slightly faster than alpha for this workload (160 vs 150)
+likely due to iGPU's lower latency to system RAM vs dGPU's PCIe
+transfers — an unexpected platform inversion vs short-input chat.
+
+## Final RAG/extractive headline
+
+**For 1K-input + 256-output extractive RAG workloads**:
+- charlie 140V (Lunar Lake): **160.64 tok/s**
+- alpha B390 (Battlemage): **150.71 tok/s**
+- Both are within ~10% of each other.
+
+Compare to short-input chat (5-token prompt, 64 tok output):
+- alpha B390 + FastDraft: 134.90 tok/s (Discovery #2)
+- charlie 140V + FastDraft: 96.04 tok/s
+
+**For real RAG, Lunar Lake's iGPU + PL is the leaderboard winner.**
