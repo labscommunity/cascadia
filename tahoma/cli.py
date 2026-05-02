@@ -53,6 +53,20 @@ def cmd_worker(args: argparse.Namespace) -> int:
             "engine=ov-optimum rank=0/1 device=%s model=%s",
             args.device, args.model,
         )
+    elif args.engine == "ov-runtime":
+        # ShardSpec is built inside the builder from pipeline_config.json.
+        from tahoma.shared.shard import ShardSpec
+
+        spec = ShardSpec(
+            model_id=args.model, layer_start=0, layer_end=0,
+            total_layers=0, device=args.device,
+            is_first_stage=(args.rank == 0),
+            is_last_stage=(args.rank == args.total - 1),
+        )
+        logger.info(
+            "engine=ov-runtime rank=%d/%d device=%s pipeline=%s",
+            args.rank, args.total, args.device, args.model,
+        )
     else:
         plan = ShardPlan.from_hf_model_id(
             args.model, num_stages=args.total, devices=[args.device] * args.total,
@@ -75,6 +89,17 @@ def cmd_worker(args: argparse.Namespace) -> int:
             device=args.device,
             weight_format=args.ov_weight_format,
         )
+    elif args.engine == "ov-runtime":
+        from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder
+
+        ov_runtime_builder = OVRuntimeBuilder(
+            pipeline_dir=args.model,
+            rank=args.rank,
+            total=args.total,
+            device=args.device,
+        )
+        ov_runtime_builder.configure_listen(listen_host, listen_port)
+        builder = ov_runtime_builder
     else:
         ov_builder = OpenVINOBuilder(model_path=args.model)
         ov_builder.configure_listen(listen_host, listen_port)
@@ -159,11 +184,14 @@ def main() -> int:
         "--device", default="CPU", help="device hint: CPU / GPU / NPU (default CPU)",
     )
     pw.add_argument(
-        "--engine", default="pytorch", choices=["pytorch", "ov-optimum"],
+        "--engine", default="pytorch",
+        choices=["pytorch", "ov-optimum", "ov-runtime"],
         help=(
-            "inference engine: 'pytorch' (default, distributed-capable) or "
-            "'ov-optimum' (single-stage OpenVINO Runtime via optimum-intel; "
-            "auto-exports from HF id if --model is not already an OV IR dir)"
+            "inference engine: "
+            "'pytorch' (default, distributed) | "
+            "'ov-optimum' (single-stage OV via optimum-intel; auto-export) | "
+            "'ov-runtime' (multi-stage OV with stateful KV cache; expects a "
+            "pre-exported pipeline directory at --model with stage_<i>/ subdirs)"
         ),
     )
     pw.add_argument(
