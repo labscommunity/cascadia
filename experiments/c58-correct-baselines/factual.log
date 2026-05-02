@@ -1,0 +1,4 @@
+=== alpha plain (factual, max=64) ===
+RESULT={"mode": "plain", "cap": 64, "best": {"dt": 0.45618139998987317, "actual_tokens": 8, "actual_tok_s": 17.536883354248097, "text": "The capital of France is Paris."}}
+=== alpha FastDraft (factual, max=64) ===
+RESULT={"mode": "fastdraft", "cap": 64, "best": {"dt": 0.29427339998073876, "actual_tokens": 8, "actual_tok_s": 27.18560359354134, "text": "The capital of France is Paris."}}
