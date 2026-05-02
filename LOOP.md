@@ -7,10 +7,31 @@
 
 | | |
 |---|---|
-| Iteration count | 0 |
-| Last commit | (scaffolding) |
-| Active hypothesis | (waiting) |
+| Iteration count | ~250 |
+| Campaigns completed | 52 |
+| Last commit | exp(c52): KILLER DEMO — 16 concurrent chat + always-on classifier on one Lunar Lake |
+| Active hypothesis | none — exhausted obvious search space |
 | Pause condition | none active |
+
+## Top achievements
+
+- **4 Discoveries documented** in DISCOVERIES.md (all cross-platform validated):
+  1. LLMPipeline 10× over OVModelForCausalLM
+  2. FastDraft 150M +24% short-input chat
+  3. Prompt Lookup +50-97% on extractive RAG (peak +94% at 4K input)
+  4. NPU concurrent multi-model serving (16 chat + 1 classifier on one laptop)
+
+- **Best per-workload tok/s achieved:**
+  - Short factual: 134.9 (alpha + FastDraft)
+  - 4K-input extractive RAG: **194.36** (charlie + PL — peak finding)
+  - Multi-tenant aggregate: 559 (alpha CB batch=32)
+  - 1B Llama: 211.4 (charlie GPU)
+
+- **Quality preservation confirmed**: FastDraft + PL produce byte-identical
+  greedy output as plain. Lossless.
+
+- **Decision matrix encoded** in experiments/DECISION_MATRIX.md for engine
+  selection by (input_len, output_len, content_pattern).
 
 ## Iteration cadence
 
