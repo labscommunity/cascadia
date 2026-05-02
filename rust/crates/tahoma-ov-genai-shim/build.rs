@@ -19,7 +19,11 @@ fn main() {
 
     let runtime_include = format!("{ov_root}/runtime/include");
     let genai_include = format!("{ov_root}/runtime/include/openvino/genai");
-    let runtime_lib = format!("{ov_root}/runtime/lib/intel64");
+    // OpenVINO 2026.x Windows ships .lib files under lib/intel64/Release
+    // (and lib/intel64/Debug); Linux ships them directly under
+    // lib/intel64. Add both paths; the linker picks whichever resolves.
+    let runtime_lib_root = format!("{ov_root}/runtime/lib/intel64");
+    let runtime_lib_release = format!("{ov_root}/runtime/lib/intel64/Release");
 
     cc::Build::new()
         .cpp(true)
@@ -29,7 +33,8 @@ fn main() {
         .include(&genai_include)
         .compile("tahoma_ov_genai_shim");
 
-    println!("cargo:rustc-link-search=native={runtime_lib}");
+    println!("cargo:rustc-link-search=native={runtime_lib_release}");
+    println!("cargo:rustc-link-search=native={runtime_lib_root}");
     println!("cargo:rustc-link-lib=dylib=openvino_genai");
     println!("cargo:rustc-link-lib=dylib=openvino");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
