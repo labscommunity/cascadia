@@ -1,0 +1,12 @@
+--- input ~2048 PL ngram=2 ---
+RESULT={"input_target": 2048, "ngram": 2, "k": 5, "best": {"dt": 1.8676245999995444, "n_out": 64, "decode_tok_s": 34.268128616433735}}
+--- input ~2048 PL ngram=3 ---
+RESULT={"input_target": 2048, "ngram": 3, "k": 5, "best": {"dt": 1.8012796999973943, "n_out": 64, "decode_tok_s": 35.530295489419316}}
+--- input ~2048 PL ngram=5 ---
+RESULT={"input_target": 2048, "ngram": 5, "k": 5, "best": {"dt": 1.8829058000010264, "n_out": 64, "decode_tok_s": 33.99001691957458}}
+--- input ~4096 PL ngram=2 ---
+RESULT={"input_target": 4096, "ngram": 2, "k": 5, "best": {"dt": 1.9528895000003104, "n_out": 64, "decode_tok_s": 32.77195151082016}}
+--- input ~4096 PL ngram=3 ---
+RESULT={"input_target": 4096, "ngram": 3, "k": 5, "best": {"dt": 1.952029300002323, "n_out": 64, "decode_tok_s": 32.786393114039754}}
+--- input ~4096 PL ngram=5 ---
+RESULT={"input_target": 4096, "ngram": 5, "k": 5, "best": {"dt": 1.9531528000006801, "n_out": 64, "decode_tok_s": 32.76753360002234}}
