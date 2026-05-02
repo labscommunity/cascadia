@@ -145,3 +145,29 @@ python -m tahoma worker --rank 1 --total 2 \
 ```
 
 Expected: ~30-33 tok/s actual generation rate for Llama 3.1 8B INT4 on alpha+charlie/TB4.
+
+## d3 final — output length amortization curve
+
+K=4 + FastDraft 150M, varying output length:
+
+| Output | rounds | accept | tok/s |
+|--------|-------:|-------:|------:|
+|     64 |     22 |  ~2.91 | 30.90 |
+|    256 |     81 |   3.16 | 33.40 |
+|    512 |    149 |   3.44 | 37.04 |
+|   1024 |    285 |   3.59 | **38.49** |
+
+Throughput grows monotonically with output length but plateaus around
+~38-39 tok/s. The diminishing returns past 256 output suggest that the
+spec-decode round overhead is fully amortized by then.
+
+## ABSOLUTE peak distributed result for tahoma
+
+**38.49 tok/s** on alpha+charlie/TB4, Llama 3.1 8B INT4, ov-dist-spec,
+K=4, FastDraft 150M draft, 1024-token output.
+
+Compared to single-node best (28.29 tok/s LLMP+FD K=3 256-out): **+36%**.
+Compared to original c0-5 baseline (15.66-17.59 tok/s): **+118-146%**.
+Compared to single-node OVModelForCausalLM (17.23): **+123%**.
+
+This is the answer to "improve distributed perf for tahoma".
