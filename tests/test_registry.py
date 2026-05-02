@@ -20,13 +20,14 @@ def _ns(**kwargs: object) -> argparse.Namespace:
         "draft_model": None,
         "spec_k": 4,
         "ov_weight_format": "int4",
+        "prompt_lookup": 0,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
 
 
 def test_built_ins_registered() -> None:
-    expected = {"pytorch", "ov-optimum", "ov-runtime", "ov-spec", "ov-dist-spec"}
+    expected = {"pytorch", "ov-optimum", "ov-runtime", "ov-spec", "ov-dist-spec", "ov-genai"}
     assert set(registry.names()) >= expected
 
 
@@ -68,3 +69,18 @@ def test_ov_dist_spec_requires_two_stages_and_draft_on_rank_0() -> None:
 def test_pytorch_no_constraints() -> None:
     spec = registry.get("pytorch")
     spec.validate(_ns(total=4, rank=2))  # any combination is fine
+
+
+def test_ov_genai_requires_single_stage() -> None:
+    spec = registry.get("ov-genai")
+    with pytest.raises(SystemExit, match="single-stage only"):
+        spec.validate(_ns(total=2))
+    spec.validate(_ns(total=1))  # ok
+
+
+def test_ov_genai_rejects_draft_and_prompt_lookup_combo() -> None:
+    spec = registry.get("ov-genai")
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        spec.validate(_ns(total=1, draft_model="draft-id", prompt_lookup=3))
+    spec.validate(_ns(total=1, draft_model="draft-id"))  # ok
+    spec.validate(_ns(total=1, prompt_lookup=3))  # ok

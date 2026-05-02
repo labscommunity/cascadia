@@ -12,14 +12,26 @@ from tahoma.parallel import TPGroup
 from tahoma.parallel.group import TPPeer, _split_chunks
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _peer_addrs(tp_size: int) -> list[int]:
-    return [_free_port() for _ in range(tp_size)]
+    """Allocate `tp_size` unique ephemeral ports.
+
+    Sequentially closing one ephemeral socket before opening the next
+    lets the kernel hand the same port to two consecutive calls under
+    load (and once intermittently caused EADDRINUSE in CI py3.12).
+    Hold every discovery socket open simultaneously so the kernel
+    guarantees uniqueness, then close them all together. The race
+    window between close-and-rebind still exists but is dramatically
+    narrowed and applies only to inter-process collisions.
+    """
+    socks = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(tp_size)]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        ports = [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+    return ports
 
 
 def _peers_for(rank: int, tp_size: int, ports: list[int]) -> list[TPPeer]:
