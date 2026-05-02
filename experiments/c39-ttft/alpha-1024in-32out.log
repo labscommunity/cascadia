@@ -1,0 +1,8 @@
+--- plain ---
+RESULT={"mode": "plain", "input": 1024, "out": 32, "best_tok_s": 20.044114591471146, "best_ttft_ms": 105.00800323486328, "best_dt": 1.596478599938564}
+--- fastdraft ---
+RESULT={"mode": "fastdraft", "input": 1024, "out": 32, "best_tok_s": 18.669922079445662, "best_ttft_ms": 117.7186050415039, "best_dt": 1.7139867999358103}
+--- fastdraft-adaptive ---
+RESULT={"mode": "fastdraft-adaptive", "input": 1024, "out": 32, "best_tok_s": 19.59907279289122, "best_ttft_ms": 125.81990814208984, "best_dt": 1.6327302999561653}
+--- prompt-lookup ---
+RESULT={"mode": "prompt-lookup", "input": 1024, "out": 32, "best_tok_s": 20.097134475221587, "best_ttft_ms": 128.0261993408203, "best_dt": 1.5922667999984697}
