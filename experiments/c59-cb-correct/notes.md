@@ -49,3 +49,38 @@ The inflation depends on whether the prompt makes the model fill the cap:
 - **Single-user factual chat absolute numbers are inflated** by ~5-8× (real ~17-30 tok/s on 8B INT4).
 - **PL extractive RAG absolute numbers are inflated** by ~5-14× (real ~20-30 tok/s on 8B INT4).
 - **Long-creative (256+ tok output) numbers** likely accurate but should be verified case-by-case.
+
+## Update: Creative writing 256-out verified
+
+| Workload | Bench claimed | Actual | Status |
+|----------|---:|---:|---|
+| FastDraft K=3 creative writing 256 out (alpha) | 27.12 | 28.29 | **stands** |
+
+Creative writing fills the 256 cap (model produces 257 actual tokens),
+so no inflation.
+
+## Final inflation factor map (definitive)
+
+| Workload | Inflation | Status |
+|----------|----------:|--------|
+| Factual chat ("capital of France"), cap=64 | ~8× | inflated |
+| Extractive summary ("summarize in 2 sentences"), cap≥256 | 5-14× | inflated |
+| Concept explanation ("explain a concept"), cap=64 | ~1× | accurate |
+| Long-creative ("write essay"), cap=256 | ~1× | accurate |
+| Multi-tenant CB ("explain a concept"), any cap | ~1× | accurate |
+
+The inflation problem is specific to prompts that EOS early. For workloads
+that naturally fill the cap, the bench numbers are accurate.
+
+## Final corrected absolute headline numbers
+
+| Workload | Hardware | Best engine | Real tok/s |
+|----------|----------|-------------|-----------:|
+| 256-tok creative writing | alpha B390 | FastDraft K=3 | 28.29 |
+| Multi-tenant chat aggregate (b=8) | alpha B390 | CB | 131.41 |
+| Multi-tenant chat aggregate (b=32) | alpha B390 | CB | 559 (extrapolated; same prompt class) |
+| Short factual chat | alpha B390 | FastDraft K=5 | 27.19 |
+| Long-input extractive RAG | charlie 140V | PL | ~28 |
+| Llama 1B chat | charlie 140V | plain | 55.6 |
+
+These are the ACTUAL achievable rates, not the inflated bench reports.
