@@ -1,0 +1,65 @@
+python : 2026-05-01 22:44:04,373 INFO tahoma.cli | engine=ov-runtime rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:226
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-01 22:4...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-01 22:44:05,562 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-01 22:44:05,578 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-01 22:44:05,641 INFO tahoma.worker.runner | load: reading C:\cascadia\shards_2stage_v5_beam
+2026-05-01 22:44:05,641 INFO tahoma.worker.runner | load: compiling OV shard
+2026-05-01 22:44:16,703 INFO tahoma.worker.runner | load: loading rotary + tokenizer
+2026-05-01 22:44:25,729 INFO tahoma.worker.engines.openvino._hub | bundled tokenizer at 
+C:\cascadia\shards_2stage_v5_beam\tokenizer unusable (ValueError); falling back to unsloth/Meta-Llama-3.1-8B-Instruct
+2026-05-01 22:44:26,814 INFO tahoma.worker.runner | load: ready
+2026-05-01 22:44:27,340 INFO tahoma.worker.runner | build engine
+2026-05-01 22:44:27,340 INFO tahoma.worker.runner | warmup
+2026-05-01 22:44:27,359 WARNING tahoma.worker.engines.openvino.ov_runtime | warmup failed: Exception from 
+src\inference\src\cpp\infer_request.cpp:224:
+Check 'pshape.compatible(ov::PartialShape(user_tensor->get_shape())) || is_batched_input(port)' failed at 
+src\plugins\intel_gpu\src\plugin\sync_infer_request.cpp:777:
+[GPU] The input tensor size is not equal to model port shape, can't handle input tensor with name: 
+parameter:attention_mask, because model input (shape=[?,?]) and tensor (shape=[1,2,128]) are incompatible
+2026-05-01 22:44:27,359 INFO tahoma.worker.runner | runner ready
+2026-05-01 22:44:27,359 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-01 22:44:27,359 INFO tahoma.worker.engines.openvino.ov_runtime | task stdin-30 active: prompt_tokens=8
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 344, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 197, in cmd_worker
+    for chunk in runner.generate(task):
+  File "C:\tahoma\tahoma\worker\runner.py", line 59, in generate
+    chunks = self.step_once()
+             ^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in step_once
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in <dictcomp>
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 202, in step
+    yield from self._step_first()
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 230, in _step_first
+    hs = self._infer_first(input_ids, position=self._shard.position)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 172, in _infer_first
+    out = self._shard.request.infer(feed)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\site-packages\openvino\_ov_api.py", line 202, in infer
+    return OVDict(super().infer(_data_dispatch(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Exception from src\inference\src\cpp\infer_request.cpp:224:
+Check 'pshape.compatible(ov::PartialShape(user_tensor->get_shape())) || is_batched_input(port)' failed at 
+src\plugins\intel_gpu\src\plugin\sync_infer_request.cpp:777:
+[GPU] The input tensor size is not equal to model port shape, can't handle input tensor with name: 
+parameter:attention_mask, because model input (shape=[?,?]) and tensor (shape=[1,8,128]) are incompatible
+WALL_CLOCK_S=25.4687261

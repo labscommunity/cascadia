@@ -1,0 +1,15 @@
+{
+  "id": "c0-5",
+  "host": "alpha+charlie via TB",
+  "engine": "ov-dist-spec",
+  "model": "shards_2stage_v5_beam (Llama 3.1 8B INT4)",
+  "config": {"K": 4, "draft": "unsloth/Llama-3.2-1B-Instruct"},
+  "wallclock_s": 30.95,
+  "load_s": 22.1,
+  "tokens": 64,
+  "steps": 18,
+  "decode_s": 3.638,
+  "tok_s": 17.59,
+  "accept": 0.62,
+  "comment": "matches main baseline 17.36"
+}

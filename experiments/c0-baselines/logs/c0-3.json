@@ -1,0 +1,12 @@
+{
+  "id": "c0-3",
+  "host": "alpha.local",
+  "engine": "ov-spec",
+  "model": "C:\\cascadia\\models\\llama-3.1-8b-int4",
+  "wallclock_s": 39.3183371,
+  "load_s": 32.298,
+  "tokens": 64,
+  "decode_s": 4.628,
+  "tok_s": 13.828867761452031,
+  "accept": null
+}

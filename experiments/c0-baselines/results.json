@@ -1,0 +1,21 @@
+{
+  "id": "c0-baselines",
+  "campaign": "c0-baselines",
+  "iteration": 0,
+  "date": "2026-05-02",
+  "summary": "Re-measured ov-optimum, ov-spec, ov-dist-spec on alpha (Battlemage B390) and charlie (Arc 140V Lunar Lake). Single-node numbers ~50% below saved main baselines; distributed ov-dist-spec matches baseline. Two surprises: alpha B390 < charlie 140V (perf inversion); ov-spec accept rate fell from 0.91 to 0.50.",
+  "configurations": [
+    {"id": "c0-1",  "tok_s": 8.85,  "host": "alpha",  "engine": "ov-optimum"},
+    {"id": "c0-1b", "tok_s": 8.89,  "host": "alpha",  "engine": "ov-optimum"},
+    {"id": "c0-2",  "tok_s": 10.33, "host": "charlie","engine": "ov-optimum"},
+    {"id": "c0-3",  "tok_s": 13.83, "host": "alpha",  "engine": "ov-spec",     "accept": 0.50, "steps": 21},
+    {"id": "c0-4",  "tok_s": null,  "host": "dist",   "engine": "ov-runtime",  "result": "ERROR — engine not v5-compatible"},
+    {"id": "c0-5",  "tok_s": 17.59, "host": "dist",   "engine": "ov-dist-spec","accept": 0.62, "steps": 18}
+  ],
+  "result": "BASELINES_RECORDED",
+  "follow_ups": [
+    "Why is alpha B390 slower than charlie 140V?",
+    "Why did ov-spec accept rate drop to 0.50?",
+    "ov-runtime needs v5-input wiring or fail-fast"
+  ]
+}

@@ -1,0 +1,40 @@
+python : 2026-05-01 22:44:00,964 INFO tahoma.cli | engine=ov-runtime rank=1/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam_stage_1 namespace=default
+At line:1 char:143
++ ...  C:\tahoma; python -m tahoma worker --rank 1 --total 2 --engine ov-ru ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-01 22:4...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-01 22:44:01,992 INFO tahoma.worker.runner | connect: upstream=PeerEndpoint(host='10.10.10.2', port=9100) 
+downstream=None
+2026-05-01 22:44:01,992 INFO tahoma.worker.transport | ActivationServer listening on 10.10.10.2:9100
+2026-05-01 22:44:05,248 INFO tahoma.worker.transport | ActivationServer accepted connection from ('10.10.10.1', 58799)
+2026-05-01 22:44:05,560 INFO tahoma.worker.runner | load: reading C:\cascadia\shards_2stage_v5_beam_stage_1
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 344, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 41, in start
+    for progress in self._builder.load(shard):
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 334, in load
+    pipeline_cfg = _load_pipeline_config(self._pipeline_dir)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\ov_runtime.py", line 52, in _load_pipeline_config
+    return json.loads((pipeline_dir / "pipeline_config.json").read_text())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\pathlib.py", line 1058, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\Python311\Lib\pathlib.py", line 1044, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 
+'C:\\cascadia\\shards_2stage_v5_beam_stage_1\\pipeline_config.json'

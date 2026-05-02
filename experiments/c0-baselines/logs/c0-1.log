@@ -1,0 +1,34 @@
+python : 2026-05-01 22:39:09,467 INFO tahoma.cli | engine=ov-optimum rank=0/1 device=GPU 
+model=C:\cascadia\models\llama-3.1-8b-int4 namespace=default
+At line:1 char:226
++ ...  France?' | python -m tahoma worker --rank 0 --total 1 --engine ov-op ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-01 22:3...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-01 22:39:10,629 INFO tahoma.worker.runner | connect: upstream=None downstream=None
+2026-05-01 22:39:16,577 INFO tahoma.worker.runner | load: resolving C:\cascadia\models\llama-3.1-8b-int4
+2026-05-01 22:39:16,577 INFO tahoma.worker.runner | load: compiling OV target model
+2026-05-01 22:39:34,425 INFO tahoma.worker.runner | load: loading tokenizer
+2026-05-01 22:39:35,786 INFO tahoma.worker.runner | load: ready
+2026-05-01 22:39:35,786 INFO tahoma.worker.runner | build engine
+2026-05-01 22:39:35,786 INFO tahoma.worker.runner | warmup
+2026-05-01 22:39:36,310 INFO tahoma.worker.engines.openvino.optimum_engine | warmup ok (spec_decode=False)
+2026-05-01 22:39:36,310 INFO tahoma.worker.runner | runner ready
+2026-05-01 22:39:36,310 INFO tahoma.cli | stdin mode: type a prompt and press enter
+The following generation flags are not valid and may be ignored: ['top_p']. Set `TRANSFORMERS_VERBOSITY=info` for more 
+details.
+2026-05-01 22:39:36,314 INFO tahoma.worker.engines.openvino.optimum_engine | task stdin-30 active
+ Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France?
+A. Lyon
+B. Paris
+C. Marseille
+D. Bordeaux
+Answer: B. Paris
+Answer: B. Paris
+
+WALL_CLOCK_S=34.0900387

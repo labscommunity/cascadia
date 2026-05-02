@@ -1,0 +1,12 @@
+{
+  "id": "c0-2",
+  "host": "charlie.local",
+  "engine": "ov-optimum",
+  "model": "C:\\cascadia\\models\\llama-3.1-8b-int4",
+  "wallclock_s": 35.5121485,
+  "load_s": 29.307,
+  "tokens": 64,
+  "decode_s": 6.198148500000002,
+  "tok_s": 10.32566418826525,
+  "accept": null
+}

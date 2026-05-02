@@ -1,0 +1,20 @@
+python : 2026-05-01 22:45:09,440 INFO tahoma.cli | engine=ov-dist-spec rank=1/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam_stage_1 namespace=default
+At line:1 char:143
++ ...  C:\tahoma; python -m tahoma worker --rank 1 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-01 22:4...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-01 22:45:10,581 INFO tahoma.worker.runner | connect: upstream=PeerEndpoint(host='10.10.10.2', port=9100) 
+downstream=None
+2026-05-01 22:45:10,581 INFO tahoma.worker.transport | ActivationServer listening on 10.10.10.2:9100
+2026-05-01 22:45:13,912 INFO tahoma.worker.transport | ActivationServer accepted connection from ('10.10.10.1', 58803)
+2026-05-01 22:45:14,148 INFO tahoma.worker.runner | load: compiling stage 1
+2026-05-01 22:45:21,159 INFO tahoma.worker.runner | load: ready
+2026-05-01 22:45:21,159 INFO tahoma.worker.runner | build engine
+2026-05-01 22:45:21,159 INFO tahoma.worker.runner | warmup
+2026-05-01 22:45:21,159 INFO tahoma.worker.engines.openvino.dist_spec | worker warmup skipped (driven by driver)
+2026-05-01 22:45:21,160 INFO tahoma.worker.runner | runner ready
+2026-05-01 22:45:21,160 INFO tahoma.cli | entering relay loop
+2026-05-01 22:45:41,009 INFO tahoma.worker.runner | transport closed: socket closed during recv
