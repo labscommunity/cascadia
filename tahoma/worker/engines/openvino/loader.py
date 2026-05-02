@@ -120,6 +120,12 @@ class ModelShard:
         if spec.is_last_stage:
             weight_prefixes.append(f"{norm_attr}.")
             weight_prefixes.append(f"{head_attr}.")
+            # If the model ties embedding/lm_head weights AND we're not the
+            # first stage, we still need the embed weight to populate lm_head.
+            if not spec.is_first_stage and getattr(
+                self._config, "tie_word_embeddings", False,
+            ):
+                weight_prefixes.append(f"{embed_attr}.")
 
         safetensor_files = sorted(glob.glob(str(model_dir / "*.safetensors")))
         if not safetensor_files:
@@ -218,7 +224,28 @@ class ModelShard:
                 for k, v in state_dict.items()
                 if k.startswith(f"{head_attr}.")
             }
-            head.load_state_dict(head_sd, strict=False)
+            tied = bool(getattr(self._config, "tie_word_embeddings", False))
+            if not head_sd and tied:
+                # Tied embeddings (Llama 3.2 1B/3B, Gemma, etc.): the model
+                # config sets tie_word_embeddings=true and lm_head.weight is
+                # NOT in the safetensors. Load it from embed_tokens.weight
+                # so we don't silently keep a random-init head — that produces
+                # garbage logits and (under TP) different garbage on each rank.
+                tied_key = f"{embed_attr}.weight"
+                if tied_key in state_dict:
+                    head.weight.data = state_dict[tied_key].clone()
+                    logger.info("lm_head: tied to %s", tied_key)
+                elif spec.is_first_stage and self._embed is not None:
+                    head.weight.data = self._embed.weight.data.clone()
+                    logger.info("lm_head: tied to in-memory embed_tokens")
+                else:
+                    raise RuntimeError(
+                        f"lm_head not in safetensors and tie_word_embeddings=True, "
+                        f"but {tied_key} also missing — cannot tie. "
+                        f"Multi-stage TP needs the embed weight on the last stage too.",
+                    )
+            else:
+                head.load_state_dict(head_sd, strict=False)
             head.eval()
             head.half()
             head.to(torch_dev)

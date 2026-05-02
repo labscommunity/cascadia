@@ -117,6 +117,70 @@ register(EngineSpec(
 ))
 
 
+# pytorch-tp (PyTorch with tensor parallelism inside one or more PP stages)
+def _pytorch_tp_validate(args: argparse.Namespace) -> None:
+    if args.tp_size < 2:
+        raise SystemExit(
+            "--engine pytorch-tp requires --tp-size >= 2; for tp_size=1 use --engine pytorch",
+        )
+    if not args.tp_listen:
+        raise SystemExit("--engine pytorch-tp requires --tp-listen host:port")
+    if len(args.tp_peer) != args.tp_size - 1:
+        raise SystemExit(
+            f"--engine pytorch-tp requires --tp-peer for every other rank "
+            f"({args.tp_size - 1} entries; got {len(args.tp_peer)})",
+        )
+
+
+def _pytorch_tp_spec(args: argparse.Namespace) -> ShardSpec:
+    base = _pytorch_spec(args)
+    return ShardSpec(
+        model_id=base.model_id, layer_start=base.layer_start,
+        layer_end=base.layer_end, total_layers=base.total_layers,
+        device=base.device,
+        is_first_stage=base.is_first_stage,
+        is_last_stage=base.is_last_stage,
+        tp_size=args.tp_size, tp_rank=args.tp_rank,
+    )
+
+
+def _pytorch_tp_builder(args: argparse.Namespace, host: str, port: int) -> Builder:
+    from tahoma.parallel.group import TPPeer
+    from tahoma.worker.engines.openvino.tp_engine import PyTorchTPBuilder
+
+    tp_listen_host, tp_listen_port = _parse_addr(args.tp_listen)
+    peers: list[TPPeer] = []
+    for spec in args.tp_peer:
+        rank_str, addr = spec.split("@", 1)
+        peer_host, peer_port = _parse_addr(addr)
+        peers.append(TPPeer(tp_rank=int(rank_str), host=peer_host, port=peer_port))
+
+    builder = PyTorchTPBuilder(
+        model_path=args.model,
+        tp_rank=args.tp_rank, tp_size=args.tp_size,
+        tp_listen=(tp_listen_host, tp_listen_port),
+        tp_peers=peers,
+    )
+    builder.configure_listen(host, port)
+    return builder
+
+
+def _parse_addr(s: str, default_host: str = "0.0.0.0") -> tuple[str, int]:
+    if s.startswith(":"):
+        return default_host, int(s[1:])
+    h, p = s.rsplit(":", 1)
+    return h, int(p)
+
+
+register(EngineSpec(
+    name="pytorch-tp",
+    description="PyTorch with tensor parallelism (column/row-split + ring all-reduce)",
+    validate=_pytorch_tp_validate,
+    build_shard_spec=_pytorch_tp_spec,
+    build_builder=_pytorch_tp_builder,
+))
+
+
 # ov-optimum
 def _ov_optimum_builder(args: argparse.Namespace, _host: str, _port: int) -> Builder:
     from tahoma.worker.engines.openvino.optimum_engine import OptimumOVBuilder

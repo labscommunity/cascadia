@@ -72,6 +72,16 @@ def cmd_engines(_args: argparse.Namespace) -> int:
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
+    # Force UTF-8 on stdout/stderr — model tokenizers emit byte-pair fragments
+    # that cp1252 (Windows default) cannot encode. Fail-fast if reconfigure
+    # isn't supported (Python < 3.7).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (AttributeError, OSError):
+                pass
+
     if args.rank < 0 or args.rank >= args.total:
         sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
     if args.tp_size < 1:
@@ -304,6 +314,20 @@ def main() -> int:
     pw.add_argument(
         "--tp-rank", type=int, default=0,
         help="this worker's rank inside the TP group (0..tp_size-1).",
+    )
+    pw.add_argument(
+        "--tp-listen", default=None,
+        help=(
+            "TP-group listen address (host:port). Each TP rank binds one "
+            "port for the inbound peer in the all-reduce ring."
+        ),
+    )
+    pw.add_argument(
+        "--tp-peer", action="append", default=[],
+        help=(
+            "TP peer in the form 'tp_rank@host:port'. Repeat the flag for "
+            "every other rank in the group (tp_size-1 entries total)."
+        ),
     )
     pw.set_defaults(func=cmd_worker)
 
