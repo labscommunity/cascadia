@@ -55,3 +55,23 @@ batch=2-4 vs the no-scheduler path. CB IS engaged.
 - Wire concurrent-request handling into tahoma's `OVGenAIEngine` — the
   CB-mode pipe lets multiple `pipe.generate()` calls overlap, which is
   what real serving needs.
+
+## Update (c20 part 2): FastDraft + CB
+
+| Batch | Aggregate tok/s (no draft) | Aggregate tok/s (+FastDraft K=5) |
+|---|---|---|
+| 2 | 35.9 | 34.2 |
+| 4 | 69.6 | 53.7 |
+| 8 | **137.9** | 105.7 |
+
+Adding FastDraft to CB mode **HURTS aggregate throughput** at batch ≥ 4. The draft-then-verify pattern doesn't compose with continuous batching's "batched matmul over all in-flight requests" — the draft sequence is serial per request, eating the parallelism benefit.
+
+**Decision matrix:**
+
+| Workload | Best engine config |
+|---|---|
+| Single-user interactive (chat, code completion) | LLMPipeline + FastDraft K=5, no SchedulerConfig — **134 tok/s on alpha B390** |
+| Multi-tenant API server (8+ concurrent users) | LLMPipeline + SchedulerConfig (no draft) — **138 tok/s aggregate, ~17 per-request** |
+| Mixed (1-3 concurrent) | Try both; SchedulerConfig+FastDraft is in the middle, neither extreme. |
+
+For tahoma: the `ov-genai` engine should expose both modes via flags. Today it has `--draft-model` (single-user mode); a follow-up should add `--ov-scheduler-cb` for the multi-tenant path.
