@@ -1,0 +1,8 @@
+[worker bound at 2s]
+=== run 1 ===
+2026-05-02 08:18:20,307 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 done: 64 tokens, 12 steps, 
+WALL_CLOCK_S=28.2778728
+=== run 2 ===
+Traceback (most recent call last):
+Traceback (most recent call last):
+WALL_CLOCK_S=32.8817089

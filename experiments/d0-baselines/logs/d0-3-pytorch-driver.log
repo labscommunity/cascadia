@@ -1,19 +1,18 @@
-python : 2026-05-02 08:15:49,223 INFO tahoma.cli | engine=pytorch rank=1/2 device=GPU 
+python : 2026-05-02 08:15:55,435 INFO tahoma.cli | engine=pytorch rank=0/2 device=GPU 
 model=unsloth/Meta-Llama-3.1-8B-Instruct namespace=default
-At line:1 char:56
-+ ...  C:\tahoma; python -m tahoma worker --rank 1 --total 2 --engine pytor ...
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine pytor ...
 +                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : NotSpecified: (2026-05-02 08:1...mespace=default:String) [], RemoteException
     + FullyQualifiedErrorId : NativeCommandError
  
-2026-05-02 08:15:49,225 INFO tahoma.worker.runner | connect: upstream=PeerEndpoint(host='10.10.10.2', port=9100) 
-downstream=None
-2026-05-02 08:15:49,225 INFO tahoma.worker.transport | ActivationServer listening on 10.10.10.2:9100
-2026-05-02 08:15:55,070 INFO tahoma.worker.transport | ActivationServer accepted connection from ('10.10.10.1', 51902)
-2026-05-02 08:15:55,070 INFO tahoma.worker.runner | load: starting
-2026-05-02 08:15:55,070 INFO tahoma.worker.runner | load: loading weights
-2026-05-02 08:15:58,452 INFO tahoma.worker.engines.openvino.loader | Loading shard from 
-unsloth\Meta-Llama-3.1-8B-Instruct (layers 16-31, first=False, last=True)
+2026-05-02 08:15:55,446 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:15:55,466 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:15:55,466 INFO tahoma.worker.runner | load: starting
+2026-05-02 08:15:55,466 INFO tahoma.worker.runner | load: loading weights
+2026-05-02 08:15:59,541 INFO tahoma.worker.engines.openvino.loader | Loading shard from 
+unsloth\Meta-Llama-3.1-8B-Instruct (layers 0-15, first=True, last=False)
 Traceback (most recent call last):
   File "C:\Program Files\Python311\Lib\site-packages\transformers\utils\hub.py", line 479, in cached_files
     hf_hub_download(
@@ -55,7 +54,7 @@ Traceback (most recent call last):
   File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
     raise SystemExit(main())
                      ^^^^^^
-  File "C:\tahoma\tahoma\cli.py", line 361, in main
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
     return args.func(args)
            ^^^^^^^^^^^^^^^
   File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
@@ -80,3 +79,38 @@ _get_config_dict
 OSError: Can't load the configuration of 'unsloth\Meta-Llama-3.1-8B-Instruct'. If you were trying to load it from 
 'https://huggingface.co/models', make sure you don't have a local directory with the same name. Otherwise, make sure 
 'unsloth\Meta-Llama-3.1-8B-Instruct' is the correct path to a directory containing a config.json file
+WALL_CLOCK_S=9.425134
+python : 2026-05-02 08:16:05,328 INFO tahoma.cli | engine=pytorch rank=0/2 device=GPU 
+model=unsloth/Meta-Llama-3.1-8B-Instruct namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine pytor ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:1...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:16:05,332 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+Traceback (most recent call last):
+  File "C:\tahoma\tahoma\worker\transport.py", line 174, in connect
+    sock.connect((self.host, self.port))
+TimeoutError: timed out
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 40, in start
+    self._builder.connect(peers)
+  File "C:\tahoma\tahoma\worker\engines\openvino\engine.py", line 240, in connect
+    client.connect()
+  File "C:\tahoma\tahoma\worker\transport.py", line 184, in connect
+    raise TimeoutError(
+TimeoutError: could not connect to 10.10.10.2:9100 within 30.0s
+WALL_CLOCK_S=34.8344561

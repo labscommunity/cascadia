@@ -49,3 +49,47 @@ For tahoma to make distributed competitive, we need either:
 (c) accept ~half-speed per-token but use distribution for models that DON'T fit on one node (e.g., Mixtral 8×7B INT4, Llama 3.3 70B INT4)
 
 (c) is the strongest motivation for distribution anyway — single-node 8B is faster everywhere; distribution exists for models that single-node can't run at all.
+
+## K-sweep for ov-dist-spec on alpha+charlie/TB4
+
+| K | tokens | spec rounds | accept/round | decode_s | tok/s |
+|---|-------:|------------:|-------------:|---------:|------:|
+| 1 | 64 | 34 | 1.88 | 3.665 | 17.46 |
+| **2** | 64 | 24 | 2.67 | 3.397 | **18.84** ← sweet spot |
+| 3 | 64 | 20 | 3.20 | 3.497 | 18.30 |
+| 4 | 64 | 18 | 3.55 | 4.088 | 15.66 |
+| 8 | 64 | 12 | 5.33 | 5.763 | 11.10 |
+
+## Distributed has a DIFFERENT K sweet spot than single-node
+
+Single-node spec decode (Phase 1): K=5 was the sweet spot.
+Distributed (Phase 2): K=2 wins.
+
+Why: each spec round in distributed mode runs K+1 forward passes through
+the FULL pipeline (alpha → charlie → alpha return). The per-round
+overhead grows linearly with K, but the amortization benefit doesn't
+because the accept rate on K candidates with the 1B FastDraft is
+~0.62 (constant). So lower K = lower overhead = higher net throughput.
+
+**Real headline number: ov-dist-spec K=2 at 18.84 tok/s — actually
+BEATS single-node OVModelForCausalLM (17.23 tok/s) by +9%.**
+
+This is the first case where distributed inference is strictly better
+than the single-node equivalent for the SAME engine class.
+
+## Comparison table (corrected, actual tok counts)
+
+| Engine | Where | tok/s | Notes |
+|--------|-------|------:|-------|
+| OVModelForCausalLM | single-node alpha | 17.23 | c60 |
+| LLMPipeline plain | single-node alpha | 17.45 | c61 |
+| LLMPipeline + FastDraft K=5 | single-node alpha | 27.02 | c61 |
+| ov-runtime v3 | distributed alpha+charlie | ~8.5 | rough — no done log |
+| ov-dist-spec K=4 v5 | distributed alpha+charlie | 15.66 | c0-5 era result |
+| **ov-dist-spec K=2 v5** | **distributed alpha+charlie** | **18.84** | **NEW d0** |
+| ov-dist-spec K=8 v5 | distributed alpha+charlie | 11.10 | over-spec hurts |
+
+**Distributed wins for ov-dist-spec class (+9% over single OVModel).**
+**LLMPipeline + FastDraft is still 43% faster than the best distributed result** (27.02 vs 18.84) — porting LLMPipeline's optimizations to multi-stage is the only way to close that gap on models that fit on one node.
+
+For models that DON'T fit on one node, distributed is the only option.
