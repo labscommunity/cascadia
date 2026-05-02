@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "C:\tahoma\bench_llmpipe_spec.py", line 101, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\bench_llmpipe_spec.py", line 59, in main
+    res = pipe.generate(args.prompt, cfg)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Check 'assistant_confidence_threshold == 0.0f || num_assistant_tokens == 0' failed at C:\Jenkins\workspace\private-ci\ie\build-windows-vs2022@2\b\repos\openvino.genai\src\cpp\src\generation_config.cpp:353:
+Parameters `assistant_confidence_threshold` and `num_assistant_tokens` are mutually exclusive in `GenerationConfig`
+
