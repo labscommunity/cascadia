@@ -1,49 +1,52 @@
 # Autolab loop status
 
-**Branch:** `autolab/intel-gpu-perf`
-**Goal:** unlock hidden / novel inference-perf gains on Intel GPUs (Arc 140V Lunar Lake, Arc B390 Battlemage). Stop only on user intervention.
+**Branch:** `autolab/intel-gpu-perf` (now also runs distributed campaigns under `d0+`)
+**Phase 1 Goal (DONE):** unlock hidden / novel inference-perf gains on a single Intel GPU.
+**Phase 2 Goal (ACTIVE):** improve tok/s for **distributed** workloads on alpha + charlie via Thunderbolt 4. The original single-machine work missed tahoma's actual mission (run models that don't fit on one node); this phase corrects that.
 
 ## Current state
 
 | | |
 |---|---|
-| Iteration count | ~370 |
-| Campaigns completed | 59 |
-| Last commit | exp(c59): CB multi-tenant numbers ARE accurate — no inflation |
-| Active hypothesis | none — exhausted obvious search space + corrected bench artifact |
+| Phase 1 campaigns | 62 (single-machine, completed) |
+| Phase 2 campaigns | 0 (distributed, starting) |
+| Last commit | docs(loop): update with c57-c59 correction notes (will rebase after first d-bench) |
+| Active hypothesis | d0: re-baseline all four distributed engines with proper actual-token counting |
 | Pause condition | none active |
 
-## ⚠️ Major correction documented at c57-c59
+## Phase 2 hypothesis tree (distributed)
 
-The bench scripts were reporting `tok_s = max_tokens / total_dt` instead of
-actual generated tokens. Discovered at c57 by counting tokens with the
-LLMPipeline tokenizer.
+- **d0** — distributed baselines: re-bench `pytorch`, `pytorch-tp`, `ov-runtime`, `ov-dist-spec` across alpha+charlie/TB4 with proper methodology (actual tokens via tokenizer, ≥3 runs, same prompt as single-node baselines for direct comparison).
+- **d1** — network characterization: measure actual TB4 latency + bandwidth (iperf3 + ping). Establishes upper bound on per-token activation transfer.
+- **d2** — identify the bottleneck: where does the slowest distributed engine spend time? Network IO vs OV compute vs OV plugin.
+- **d3+** — actual perf experiments, planned after d2 finds the dominant cost. Candidate hypotheses:
+  - INT8 / FP8 activation compression on the inter-stage wire
+  - Micro-batching to overlap network + compute
+  - Disaggregated prefill/decode (DistServe-style)
+  - Tensor parallelism over TB4 (`pytorch-tp` engine, never benched)
+  - Models that don't fit on one node — Mixtral 8×7B INT4 (~24 GB) or Llama 3.3 70B INT4 (~35 GB)
+  - Distributed FastDraft + PL (port the Phase 1 wins to multi-stage)
 
-- Single-user chat / factual: inflated 5-8×. Real rates ~17-30 tok/s on 8B INT4.
-- Single-user PL extractive: inflated 5-14×. Real rates ~20-30 tok/s.
-- CB multi-tenant: NOT inflated (concept-explanation prompts fill cap naturally).
-- All RELATIVE wins (Discovery #1-#4) remain valid because both A and B in
-  any comparison hit the same EOS behavior.
+## Phase 2 methodology rules (from Phase 1 corrections)
 
-## Top achievements
+1. **Always count actual generated tokens via the LLMPipeline tokenizer** — not `max_tokens` cap. The Phase 1 bench inflated headlines 5-14× via this bug.
+2. **Warm both sides of any A-vs-B comparison** with multiple full generates before timing.
+3. **Use the same chat-template handling** on every engine in a comparison.
+4. **Never run multiple LLMPipeline procs against the same physical GPU concurrently** — they serialise on the kernel queue.
+5. **≥3 runs** per config; report best + median + variance for sub-10% claims.
+6. **Be skeptical of claims that beat memory-bandwidth physics** (~150-200 tok/s for 8B INT4 on Intel iGPU).
 
-- **4 Discoveries documented** in DISCOVERIES.md (all cross-platform validated):
-  1. LLMPipeline 10× over OVModelForCausalLM
-  2. FastDraft 150M +24% short-input chat
-  3. Prompt Lookup +50-97% on extractive RAG (peak +94% at 4K input)
-  4. NPU concurrent multi-model serving (16 chat + 1 classifier on one laptop)
+## Phase 1 carryover (don't lose these)
 
-- **Best per-workload tok/s achieved:**
-  - Short factual: 134.9 (alpha + FastDraft)
-  - 4K-input extractive RAG: **194.36** (charlie + PL — peak finding)
-  - Multi-tenant aggregate: 559 (alpha CB batch=32)
-  - 1B Llama: 211.4 (charlie GPU)
+- Real per-token rate on 8B INT4 single-node: ~17-30 tok/s.
+- 3 verified single-machine wins: FastDraft +55%, PL +40-50% extractive, NPU concurrent +14.6%.
+- 1 debunked: LLMPipeline ≈ OVModelForCausalLM at raw rate (the original "10×" was bench artifact).
+- See `experiments/SUMMARY.md`, `DISCOVERIES.md`, `DECISION_MATRIX.md`.
 
-- **Quality preservation confirmed**: FastDraft + PL produce byte-identical
-  greedy output as plain. Lossless.
+## Phase 2 distributed-only addenda
 
-- **Decision matrix encoded** in experiments/DECISION_MATRIX.md for engine
-  selection by (input_len, output_len, content_pattern).
+- LLMPipeline does NOT support multi-stage. The single-node FastDraft / PL / CB wins are not directly portable to ov-runtime / ov-dist-spec without engine work.
+- The original c4/c5 distributed baseline was **17.59 tok/s** (ov-dist-spec K=4 v5 shards) — likely also inflated by the cap-based bench. Will re-measure in d0.
 
 ## Iteration cadence
 
