@@ -1,0 +1,12 @@
+compiling pipe (mode=chat-cb)...
+warmup...
+bench mode=chat-cb, turns=4...
+C:\Users\cascadia\bench_multiturn.py:63: DeprecationWarning: start_chat() / finish_chat() API is deprecated and will be removed in the next major release. Please use generate() with ChatHistory argument.
+  pipe.start_chat(system_message=system)
+  turn 0: 64 tok in 2.593s (24.7 tok/s) ttft=None
+  turn 1: 64 tok in 2.209s (29.0 tok/s) ttft=None
+  turn 2: 64 tok in 0.962s (66.5 tok/s) ttft=None
+  turn 3: 64 tok in 1.443s (44.4 tok/s) ttft=None
+RESULT={"mode": "chat-cb", "turns": [{"turn": 0, "tok": 64, "dt": 2.593185400008224, "tok_s": 24.680071081611455, "ttft_ms": null}, {"turn": 1, "tok": 64, "dt": 2.2088051000609994, "tok_s": 28.974942152312373, "ttft_ms": null}, {"turn": 2, "tok": 64, "dt": 0.9616977000841871, "tok_s": 66.54897895086724, "ttft_ms": null}, {"turn": 3, "tok": 64, "dt": 1.4430299999658018, "tok_s": 44.351122292340925, "ttft_ms": null}]}
+C:\Users\cascadia\bench_multiturn.py:83: DeprecationWarning: start_chat() / finish_chat() API is deprecated and will be removed in the next major release. Please use generate() with ChatHistory argument.
+  pipe.finish_chat()
