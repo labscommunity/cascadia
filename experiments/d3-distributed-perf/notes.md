@@ -103,3 +103,45 @@ For Llama 3.1 8B INT4 distributed across 2 Intel nodes via TB4:
 ## Stability check
 
 K=3 + FastDraft + 256out re-run: 29.70 tok/s (vs original 29.99 — within 1%). Stable.
+
+## d3 update — output length doesn't matter; distributed wins both
+
+K=4 + FastDraft 150M sweep across output lengths:
+
+| Output | rounds | accept | tok/s | vs single-node |
+|--------|-------:|-------:|------:|---------------:|
+| 64 | 22 | 2.91 | **30.90** | +14% (vs LLMP+FD 27.02) |
+| 256 | 81 | 3.16 | **33.40** | +18% (vs LLMP+FD 256-out 28.29) |
+
+Distributed inference now beats single-node for **both** short factual chat
+AND long-creative output. The win comes from spec decode amortization across
+2 GPUs rather than 1.
+
+## How distributed beats single-node
+
+Distributed effectively gets:
+- **Stage parallelism**: alpha runs stage_0 (16 layers + embedding) while charlie runs stage_1 (16 layers + lm_head). Per spec round there's some sequential dependency but during prefill / draft generation phase, alpha can work ahead.
+- **Compute aggregation**: 2 GPUs > 1 GPU when the workload is balanced.
+- **Spec decode amortization**: K=4 + 256 out means ~80 spec rounds amortizing the per-round network/sync overhead.
+- **FastDraft 150M**: tiny per-round draft compute means K can be larger without paying overhead.
+
+## Recommended distributed config for tahoma
+
+```bash
+# alpha (rank 0):
+python -m tahoma worker --rank 0 --total 2 \
+  --engine ov-dist-spec --device GPU \
+  --model C:\cascadia\shards_2stage_v5_beam \
+  --draft-model C:\cascadia\models\fastdraft-150m-int8-ov \
+  --spec-k 4 \
+  --next 10.10.10.2:9100 \
+  --max-tokens 256
+
+# charlie (rank 1):
+python -m tahoma worker --rank 1 --total 2 \
+  --engine ov-dist-spec --device GPU \
+  --model C:\cascadia\shards_2stage_v5_beam \
+  --listen 10.10.10.2:9100
+```
+
+Expected: ~30-33 tok/s actual generation rate for Llama 3.1 8B INT4 on alpha+charlie/TB4.
