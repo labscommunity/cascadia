@@ -124,17 +124,48 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
-/// Bridge sync code to an async future. Works whether we're called
-/// from inside a tokio worker thread (e.g. `ChunkStream::poll_next` on
-/// the driver) or from a plain blocking thread (e.g.
-/// `Runner::run_relay_loop` via `spawn_blocking` on workers). Without
-/// the dispatch, calling `block_on` from a worker thread panics with
-/// "Cannot start a runtime from within a runtime".
+/// Bridge sync code to an async future.
+///
+/// Two contexts hit this path:
+///
+/// * Driver via `ChunkStream::poll_next` — running inside a tokio
+///   worker thread polling an async task. Naked `block_on` panics
+///   with "Cannot start a runtime from within a runtime"; need
+///   `block_in_place` to migrate other tasks off this worker first.
+///
+/// * Worker via `Runner::run_relay_loop`, dispatched through
+///   `tokio::task::spawn_blocking`. Spawn_blocking threads are NOT
+///   polling tasks; `Handle::block_on` works directly. Wrapping with
+///   `block_in_place` is unnecessary AND expensive on Windows
+///   (empirically ~20 ms per call vs ~5–30 µs the docs would suggest;
+///   adds ~60 ms per worker frame round-trip with 3 wire I/O calls).
+///
+/// We dispatch via a thread-local flag set by [`enter_blocking_context`].
+/// Workers call it once at engine init; ChunkStream callers don't and
+/// fall through to the safe block_in_place path.
 fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => handle.block_on(fut),
+    if BLOCKING_CONTEXT.with(|f| f.get()) {
+        // We're on a spawn_blocking thread (worker relay loop); naked
+        // block_on is safe and ~250x cheaper than block_in_place wrap.
+        handle.block_on(fut)
+    } else if tokio::runtime::Handle::try_current().is_ok() {
+        // We're on an async worker thread (driver's ChunkStream poll).
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        // No tokio context at all — naked block_on.
+        handle.block_on(fut)
     }
+}
+
+thread_local! {
+    static BLOCKING_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the current thread as a blocking-pool thread. Called by the
+/// worker's `run_relay_loop` so subsequent [`run_async`] calls skip
+/// the expensive `block_in_place` wrap.
+pub fn enter_blocking_context() {
+    BLOCKING_CONTEXT.with(|f| f.set(true));
 }
 
 // -------- pipeline / stage config --------
@@ -535,6 +566,7 @@ impl DistributedMaskedReq {
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
         let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
+        let _ts = std::time::Instant::now();
         self.stage0
             .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
             .map_err(map_ov_err)?;
@@ -548,9 +580,14 @@ impl DistributedMaskedReq {
         self.stage0
             .set_input(&beam_name, ShimDType::I32, &[1], &beam_bytes)
             .map_err(map_ov_err)?;
+        let setup_us = _ts.elapsed().as_micros();
+        let _ts = std::time::Instant::now();
         self.stage0.infer().map_err(map_ov_err)?;
+        let infer_us = _ts.elapsed().as_micros();
+        let _ts = std::time::Instant::now();
         let (dtype, hidden_shape, hidden_bytes) =
             self.stage0.output(0).map_err(map_ov_err)?;
+        let output_us = _ts.elapsed().as_micros();
         let hidden_f32 = match dtype {
             ShimDType::F32 => hidden_bytes
                 .chunks_exact(4)
@@ -574,12 +611,18 @@ impl DistributedMaskedReq {
         let logical_pos_start = self.logical_pos as u32;
         let downstream = self.downstream.clone();
         let attn_clone = attn.clone();
-        let (logits, _logits_shape) = run_async(&self.runtime_handle, async move {
+        let _ts = std::time::Instant::now();
+        let mut t_send = std::time::Duration::ZERO;
+        let mut t_recv = std::time::Duration::ZERO;
+        let mut t_lock = std::time::Duration::ZERO;
+        let _ts_lock = std::time::Instant::now();
+        let (logits, _logits_shape, send_d, recv_d) = run_async(&self.runtime_handle, async move {
                 let mut g = downstream.lock().await;
                 // We need raw socket access. The ActivationClient exposes
                 // send_raw/recv_raw + send_tensor/recv_tensor; build the
                 // FORWARD frame inline (kind+pos via send_raw, then
                 // attention_mask + hidden via send_tensor).
+                let _ts_send = std::time::Instant::now();
                 let mut header = [0u8; 8];
                 header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
                 header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
@@ -592,16 +635,22 @@ impl DistributedMaskedReq {
                 g.send(&attn_tensor).await?;
                 let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
                 g.send(&hidden_tensor).await?;
+                let send_dur = _ts_send.elapsed();
 
                 // Read LOGITS_RESPONSE.
+                let _ts_kind = std::time::Instant::now();
                 let kind_bytes = g.recv_raw(4).await?;
+                let recv_kind_dur = _ts_kind.elapsed();
                 let kind = u32::from_be_bytes([
                     kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3],
                 ]);
                 if kind != FrameKind::LogitsResponse as u32 {
                     return Err(tahoma_transport::TransportError::SocketClosed);
                 }
+                let _ts_payload = std::time::Instant::now();
                 let (t, _) = g.recv().await?;
+                let recv_payload_dur = _ts_payload.elapsed();
+                let _ts_conv = std::time::Instant::now();
                 let logits_f32 = match t.dtype {
                     WireDType::F32 => t
                         .data
@@ -611,12 +660,41 @@ impl DistributedMaskedReq {
                     WireDType::F16 => f16_bytes_to_f32(&t.data),
                     _ => return Err(tahoma_transport::TransportError::SocketClosed),
                 };
+                let convert_dur = _ts_conv.elapsed();
+                tracing::debug!(
+                    recv_kind_us = recv_kind_dur.as_micros() as u64,
+                    recv_payload_us = recv_payload_dur.as_micros() as u64,
+                    convert_us = convert_dur.as_micros() as u64,
+                    payload_bytes = t.data.len(),
+                    "driver recv breakdown"
+                );
+                let recv_dur = _ts_send.elapsed() - send_dur;
                 Ok::<_, tahoma_transport::TransportError>((
                     logits_f32,
                     [t.shape[0] as usize, t.shape[1] as usize, t.shape[2] as usize],
+                    send_dur,
+                    recv_dur,
                 ))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        t_lock = _ts_lock.elapsed();
+        let wire_us = _ts.elapsed().as_micros();
+        t_send = send_d;
+        t_recv = recv_d;
+        tracing::debug!(
+            wire_us, send_us = t_send.as_micros() as u64,
+            recv_us = t_recv.as_micros() as u64,
+            lock_us = t_lock.as_micros() as u64,
+            "wire breakdown"
+        );
+        tracing::debug!(
+            n = n,
+            setup_us,
+            infer_us,
+            output_us,
+            wire_us,
+            "target.feed timing"
+        );
 
         self.cache_len += n;
         self.logical_pos += n;
@@ -681,11 +759,18 @@ pub fn spec_decode_greedy(
     stats: &mut SpecDecodeStats,
 ) -> Result<Vec<i64>, EngineError> {
     let mut out: Vec<i64> = Vec::new();
+    let mut t_target = std::time::Duration::ZERO;
+    let mut t_draft = std::time::Duration::ZERO;
+    let t_total = std::time::Instant::now();
     target.reset()?;
     draft.reset()?;
 
+    let _ts = std::time::Instant::now();
     let (t_logits, t_shape) = target.feed(prompt_ids)?;
+    t_target += _ts.elapsed();
+    let _ts = std::time::Instant::now();
     draft.feed(prompt_ids)?;
+    t_draft += _ts.elapsed();
 
     let vocab = t_shape[2];
     let last_row = &t_logits[t_logits.len() - vocab..];
@@ -696,7 +781,9 @@ pub fn spec_decode_greedy(
     }
 
     let mut prev_correction = first;
+    let _ts = std::time::Instant::now();
     let (d_logits, d_shape) = draft.feed(&[first])?;
+    t_draft += _ts.elapsed();
     let dv = d_shape[2];
     let mut d_last_logit: Vec<f32> = d_logits[d_logits.len() - dv..].to_vec();
 
@@ -709,7 +796,9 @@ pub fn spec_decode_greedy(
                 break;
             }
             let prev = *drafts.last().unwrap();
+            let _ts = std::time::Instant::now();
             let (l, sh) = draft.feed(&[prev])?;
+            t_draft += _ts.elapsed();
             let dv2 = sh[2];
             drafts.push(argmax(&l[l.len() - dv2..]) as i64);
         }
@@ -720,7 +809,9 @@ pub fn spec_decode_greedy(
         let mut verify = Vec::with_capacity(drafts.len() + 1);
         verify.push(prev_correction);
         verify.extend_from_slice(&drafts);
+        let _ts = std::time::Instant::now();
         let (t_logits, t_shape) = target.feed(&verify)?;
+        t_target += _ts.elapsed();
         let v = t_shape[2];
         // Greedy per row
         let mut t_greedy = Vec::with_capacity(verify.len());
@@ -758,18 +849,31 @@ pub fn spec_decode_greedy(
         // Draft rewind / catch-up
         if accepted < drafts.len() {
             draft.rewind(d_advanced - accepted);
+            let _ts = std::time::Instant::now();
             let (l, sh) = draft.feed(&[correction])?;
+            t_draft += _ts.elapsed();
             let dv = sh[2];
             d_last_logit = l[l.len() - dv..].to_vec();
         } else {
+            let _ts = std::time::Instant::now();
             let (_, _) = draft.feed(&[*drafts.last().unwrap()])?;
             let (l, sh) = draft.feed(&[correction])?;
+            t_draft += _ts.elapsed();
             let dv = sh[2];
             d_last_logit = l[l.len() - dv..].to_vec();
         }
         prev_correction = correction;
     }
 
+    let total = t_total.elapsed();
+    let other = total.saturating_sub(t_target).saturating_sub(t_draft);
+    info!(
+        target_ms = t_target.as_millis() as u64,
+        draft_ms = t_draft.as_millis() as u64,
+        other_ms = other.as_millis() as u64,
+        total_ms = total.as_millis() as u64,
+        "spec_decode timing"
+    );
     Ok(out)
 }
 
@@ -1053,6 +1157,9 @@ impl Engine for OvDistSpecWorkerEngine {
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+        // First call from a spawn_blocking thread marks the thread
+        // for the cheap block_on path in run_async. Idempotent.
+        enter_blocking_context();
         let result = self.handle_one_frame();
         if let Err(e) = result {
             // Transport-closed errors signal the driver disconnected;
@@ -1094,6 +1201,7 @@ impl OvDistSpecWorkerEngine {
         let downstream = self.downstream.clone();
 
         // 1. Read kind from upstream.
+        let _ts_recv_kind = std::time::Instant::now();
         let kind = run_async(&self.runtime_handle, async {
                 let mut g = upstream.lock().await;
                 g.recv_raw(4).await.map(|b| {
@@ -1101,6 +1209,7 @@ impl OvDistSpecWorkerEngine {
                 })
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let recv_kind_us = _ts_recv_kind.elapsed().as_micros();
         let kind = FrameKind::from_u32(kind)
             .ok_or_else(|| EngineError::Backend(format!("bad kind {kind}")))?;
 
@@ -1126,6 +1235,7 @@ impl OvDistSpecWorkerEngine {
                 //    to avoid the f16→f32→f16 round-trip the previous
                 //    impl did per spec round.
                 let upstream2 = upstream.clone();
+                let _ts_recv_body = std::time::Instant::now();
                 let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) = run_async(&self.runtime_handle, async move {
                         let mut g = upstream2.lock().await;
                         let pos_bytes = g.recv_raw(4).await?;
@@ -1148,6 +1258,7 @@ impl OvDistSpecWorkerEngine {
                         ))
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let recv_body_us = _ts_recv_body.elapsed().as_micros();
 
                 // 3. Run inference on this stage.
                 let new_tokens = hidden_shape[1];
@@ -1184,6 +1295,7 @@ impl OvDistSpecWorkerEngine {
                         "unexpected hidden dtype on wire {hidden_dtype:?}"
                     ))),
                 };
+                let _ts_setup = std::time::Instant::now();
                 self.runtime
                     .set_input(&in_hs, shim_dtype, &hidden_shape, &hidden_bytes)
                     .map_err(map_ov_err)?;
@@ -1201,9 +1313,18 @@ impl OvDistSpecWorkerEngine {
                 self.runtime
                     .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
                     .map_err(map_ov_err)?;
+                let setup_us = _ts_setup.elapsed().as_micros();
+                let _ts_infer = std::time::Instant::now();
                 self.runtime.infer().map_err(map_ov_err)?;
+                let infer_us = _ts_infer.elapsed().as_micros();
+                let _ts_out = std::time::Instant::now();
                 let (out_dtype, out_shape, out_bytes) =
                     self.runtime.output(0).map_err(map_ov_err)?;
+                let output_us = _ts_out.elapsed().as_micros();
+                tracing::debug!(
+                    n = new_tokens, setup_us, infer_us, output_us,
+                    "worker.frame timing"
+                );
                 let out_f16_bytes = match out_dtype {
                     ShimDType::F16 => out_bytes,
                     ShimDType::F32 => {
@@ -1228,6 +1349,7 @@ impl OvDistSpecWorkerEngine {
                 if self.is_last {
                     // Send LOGITS_RESPONSE back to upstream
                     let upstream3 = upstream.clone();
+                    let _ts_send = std::time::Instant::now();
                     run_async(&self.runtime_handle, async move {
                         let mut g = upstream3.lock().await;
                         g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
@@ -1236,6 +1358,11 @@ impl OvDistSpecWorkerEngine {
                         g.send(&t).await
                     })
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
+                    let send_us = _ts_send.elapsed().as_micros();
+                    tracing::debug!(
+                        recv_kind_us, recv_body_us, send_us,
+                        "worker.frame wire timing (last stage)"
+                    );
                 } else {
                     // Forward downstream, then relay LOGITS_RESPONSE upstream
                     let downstream =
