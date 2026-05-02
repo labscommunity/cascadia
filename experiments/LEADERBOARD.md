@@ -126,3 +126,13 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 | alpha B390 GPU | 1024 | 64 | 23.61 | 37.63 | +59% |
 
 **charlie 140V iGPU edges out alpha B390 dGPU for RAG workloads** — likely due to lower iGPU latency to system RAM.
+
+## PEAK PL extractive: 4K input + 256 output
+
+| Hardware | Plain | PL n=3 | Δ |
+|---|---|---|---|
+| **charlie 140V GPU** | 100.17 | **194.36** | **+94%** |
+| **alpha B390 GPU** | 97.21 | **191.53** | **+97%** |
+
+**194 tok/s on a Lunar Lake iGPU for real RAG at 4K input + 256 output.**
+Best single-instance speedup in the autolab session (PL nearly doubles plain).
