@@ -5,7 +5,7 @@ Tracking the Python → Rust hard rewrite landed under `rust/` on the
 
 ## What's working today
 
-`cargo test --workspace` on macOS — **45 passing, 0 failures.**
+`cargo test --workspace` on macOS — **47 passing, 0 failures.**
 
 | Crate | Tests | What it does |
 |---|---:|---|
@@ -22,6 +22,7 @@ Tracking the Python → Rust hard rewrite landed under `rust/` on the
 | `tahoma-discovery` | 2 | mDNS via mdns-sd; populates Topology |
 | `tahoma-download` | 3 | Local registry + HF snapshot pull (hf-hub) |
 | `tahoma` | — | Binary entry point |
+| `tahoma-tests-e2e` | 2 | **Real binary spawn** — built `tahoma` exe, /health poll, /v1/models, /v1/chat/completions, concurrent request fan-out |
 
 End-to-end smoke: the `tahoma` binary serves valid OpenAI
 chat-completions JSON against the mock engine.
@@ -54,48 +55,88 @@ In rough priority order:
 
 ## Windows setup (alpha + charlie)
 
-To validate the C++ FFI shim against real OpenVINO, the AI PCs need:
+### What's already installed (autonomous, this session)
 
-1. **Rust toolchain** (~150 MB):
+* **Rust toolchain 1.95.0** on both alpha and charlie via headless
+  `rustup-init.exe -y --default-toolchain stable`.
+* **MSVC C++ build tools** on alpha (Visual Studio 2022 BuildTools
+  with `Microsoft.VisualStudio.Workload.VCTools;includeRecommended`
+  + Windows 11 SDK 22621) installed via the silent
+  `vs_buildtools.exe modify` path. Verified `cl.exe` + `vcvars64.bat`
+  present.
+* **OpenVINO GenAI 2026.1 Windows SDK** (~208 MB, includes C++ headers
+  for `llm_pipeline.hpp`, `generation_config.hpp`, `tokenizer.hpp` plus
+  `openvino_genai.lib` import library) downloaded from
+  `https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.1/windows/openvino_genai_windows_2026.1.0.0_x86_64.zip`
+  and extracted to
+  `C:\tahoma\ov_genai_sdk\openvino_genai_windows_2026.1.0.0_x86_64\`.
+  Set `INTEL_OPENVINO_DIR` to that directory before building.
+* **Tahoma source synced** to `C:\Users\cascadia\tahoma-rust\` (also at
+  `C:\tahoma\rust\` but that path is SAC-blocked — see below).
+
+### Hard blockers requiring user intervention
+
+These prevent the autonomous run from completing on-hardware e2e
+validation. Both alpha and charlie are **Windows 11 Home** with
+**Smart App Control** (SAC) enforced (Code Integrity status `2` on
+both). SAC blocks every unsigned `.exe` cargo produces in
+`target/debug/build/...` with `(os error 4551)` — including the
+`thiserror` and `getrandom` proc-macro build scripts that every Rust
+crate depends on.
+
+Tested paths that all hit the same SAC block:
+
+* Build under `C:\tahoma\rust\` — blocked.
+* Build under `C:\Users\cascadia\tahoma-rust\` — blocked.
+* `cargo check` (no link, just type-check) — also blocked because
+  proc-macro crates still need build-script execution.
+
+Possible fixes the user needs to choose:
+
+1. **Disable Smart App Control** on at least one AI PC.
+   *Caveat:* SAC is one-way. Once disabled it cannot be re-enabled
+   without reinstalling Windows. Settings → Privacy & security →
+   Windows Security → App & browser control → Smart App Control →
+   "Off". This is the **fastest unblock**.
+2. **Use WSL2** instead of native Windows. WSL Linux processes are
+   not subject to SAC. `Ubuntu-24.04` is registered on alpha but the
+   ext4 disk is missing (`HCS/ERROR_PATH_NOT_FOUND`); `wsl --install
+   -d Ubuntu-24.04` started but hit an `HCS_E_CONNECTION_TIMEOUT`
+   creating the VM. A Windows reboot typically clears that. After
+   reboot:
    ```powershell
-   Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
-   .\rustup-init.exe -y --default-toolchain stable
+   wsl --unregister Ubuntu-24.04
+   wsl --install -d Ubuntu-24.04
+   wsl -d Ubuntu-24.04 -- bash
+   # inside Ubuntu:
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
    ```
+   Then download the **Linux** OpenVINO 2026.1 archive (separate URL,
+   `openvino_genai_ubuntu24_2026.1.0.0_x86_64.tgz`) and build with
+   `--features openvino` from inside WSL.
+3. **Use a different machine** without SAC (any Windows 11 Pro/
+   Enterprise install, any Linux box).
 
-2. **MSVC C++ build tools** (~7 GB, requires admin):
-   - VS 2022 Build Tools is partially installed at
-     `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
-     but the **C++ workload is missing**.
-   - Add it via Visual Studio Installer → Modify → "Desktop development
-     with C++" workload (includes MSVC compiler, Windows SDK,
-     CMake support).
-   - Or scripted: `vs_BuildTools.exe --add Microsoft.VisualStudio.Workload.VCTools --quiet`
+### Build command (once unblocked)
 
-3. **OpenVINO 2026.x SDK** (~3 GB) with C++ headers:
-   - Download from intel.com/openvino → "OpenVINO Toolkit" archive
-     (not the runtime-only pip package).
-   - Extract somewhere stable, e.g. `C:\openvino_2026\`.
-   - Set `INTEL_OPENVINO_DIR` env var to that root.
-   - The C++ shim's build.rs reads this env var to locate
-     `runtime/include` (headers) and `runtime/lib/intel64`
-     (libopenvino_genai.lib).
+```powershell
+$env:INTEL_OPENVINO_DIR = 'C:\tahoma\ov_genai_sdk\openvino_genai_windows_2026.1.0.0_x86_64'
+cd C:\Users\cascadia\tahoma-rust
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+cargo build -p tahoma --release --features openvino
+```
 
-4. **Build with the openvino feature**:
-   ```powershell
-   cd C:\tahoma\rust
-   cargo build -p tahoma --release --features openvino
-   ```
+### Run (once built)
 
-5. **Run**:
-   ```powershell
-   .\target\release\tahoma.exe worker --rank 0 --total 1 `
-       --engine ov-genai --device GPU `
-       --model C:\cascadia\models\llama-3.1-8b-int4 `
-       --ov-cache-dir C:\cascadia\ov_cache_genai `
-       --api :8000
-   ```
+```powershell
+.\target\release\tahoma.exe worker --rank 0 --total 1 `
+    --engine ov-genai --device GPU `
+    --model C:\cascadia\models\llama-3.1-8b-int4 `
+    --ov-cache-dir C:\cascadia\ov_cache_genai `
+    --api :8000
+```
 
-Once steps 1–3 are completed by the user, the e2e validation
+Once any of the unblock paths above is taken, the e2e validation
 (equivalent to the Python PR #2 e2e matrix) becomes scriptable from
 Mac via SSH.
 
