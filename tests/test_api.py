@@ -98,16 +98,53 @@ def test_chat_completion_finish_reason_length_at_max() -> None:
     assert r.json()["choices"][0]["finish_reason"] == "length"
 
 
-def test_streaming_request_returns_501() -> None:
-    r = _client().post(
+def test_streaming_returns_sse_event_stream() -> None:
+    runner = FakeRunner(text_chunks=["A", "B", "C"])
+    r = _client(runner).post(
         "/v1/chat/completions",
         json={
             "model": "x", "messages": [{"role": "u", "content": "p"}],
             "stream": True,
         },
     )
-    assert r.status_code == 501
-    assert "streaming" in r.json()["detail"]
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    body = r.text
+    # First chunk has the assistant role; deltas carry content; ends with [DONE].
+    assert '"role": "assistant"' in body
+    assert '"content": "A"' in body
+    assert '"content": "B"' in body
+    assert '"content": "C"' in body
+    assert "data: [DONE]" in body
+    assert "chat.completion.chunk" in body
+
+
+def test_node_id_endpoint() -> None:
+    r = _client().get("/node_id")
+    assert r.status_code == 200
+    body = r.json()
+    assert "node_id" in body and len(body["node_id"]) > 0
+    assert body["namespace"] == "default"
+
+
+def test_state_endpoint_reports_in_flight_and_counts() -> None:
+    runner = FakeRunner(text_chunks=["x"])
+    client = _client(runner)
+    # Drive one completion to bump the counter.
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "x", "messages": [{"role": "u", "content": "p"}]},
+    )
+    s = client.get("/state").json()
+    assert s["model"] == "fake-model"
+    assert s["completed"] == 1
+    assert s["in_flight"] == []
+    assert "uptime_s" in s
+
+
+def test_cancel_unknown_task_returns_404() -> None:
+    r = _client().post("/v1/cancel/does-not-exist")
+    assert r.status_code == 404
 
 
 def test_chat_completion_validates_request_shape() -> None:

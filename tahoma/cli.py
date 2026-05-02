@@ -57,12 +57,22 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if args.rank < 0 or args.rank >= args.total:
         sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
 
+    # Surface env vars from CLI flags so the API layer + downstream modules
+    # see them consistently. CLI flags take precedence over existing env.
+    if args.namespace:
+        os.environ["TAHOMA_NAMESPACE"] = args.namespace
+    if args.tracing:
+        os.environ["TAHOMA_TRACING_ENABLED"] = "1"
+    if args.trust_remote_code:
+        os.environ["TAHOMA_TRUST_REMOTE_CODE"] = "1"
+
     engine = registry.get(args.engine)
     engine.validate(args)
     spec = engine.build_shard_spec(args)
     logger.info(
-        "engine=%s rank=%d/%d device=%s model=%s",
+        "engine=%s rank=%d/%d device=%s model=%s namespace=%s",
         engine.name, args.rank, args.total, args.device, args.model,
+        os.environ.get("TAHOMA_NAMESPACE", "default"),
     )
 
     listen_host, listen_port = parse_addr(args.listen)
@@ -199,6 +209,29 @@ def main() -> int:
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="logging level (default INFO)",
+    )
+    pw.add_argument(
+        "--namespace", default=None,
+        help=(
+            "cluster isolation namespace; sets TAHOMA_NAMESPACE for discovery + "
+            "topology lookups. Lets dev/prod clusters coexist on one LAN. "
+            "Defaults to TAHOMA_NAMESPACE env or 'default'."
+        ),
+    )
+    pw.add_argument(
+        "--tracing", action="store_true",
+        help=(
+            "enable per-task trace logging and event emission "
+            "(equivalent to TAHOMA_TRACING_ENABLED=1)"
+        ),
+    )
+    pw.add_argument(
+        "--trust-remote-code", action="store_true",
+        help=(
+            "allow the engine to execute code from the model repository "
+            "(custom tokenizer / attention / etc). SECURITY BOUNDARY — only "
+            "enable for models you trust."
+        ),
     )
     pw.set_defaults(func=cmd_worker)
 
