@@ -7,11 +7,23 @@
 
 | | |
 |---|---|
-| Iteration count | ~250 |
-| Campaigns completed | 52 |
-| Last commit | exp(c52): KILLER DEMO — 16 concurrent chat + always-on classifier on one Lunar Lake |
-| Active hypothesis | none — exhausted obvious search space |
+| Iteration count | ~370 |
+| Campaigns completed | 59 |
+| Last commit | exp(c59): CB multi-tenant numbers ARE accurate — no inflation |
+| Active hypothesis | none — exhausted obvious search space + corrected bench artifact |
 | Pause condition | none active |
+
+## ⚠️ Major correction documented at c57-c59
+
+The bench scripts were reporting `tok_s = max_tokens / total_dt` instead of
+actual generated tokens. Discovered at c57 by counting tokens with the
+LLMPipeline tokenizer.
+
+- Single-user chat / factual: inflated 5-8×. Real rates ~17-30 tok/s on 8B INT4.
+- Single-user PL extractive: inflated 5-14×. Real rates ~20-30 tok/s.
+- CB multi-tenant: NOT inflated (concept-explanation prompts fill cap naturally).
+- All RELATIVE wins (Discovery #1-#4) remain valid because both A and B in
+  any comparison hit the same EOS behavior.
 
 ## Top achievements
 
