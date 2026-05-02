@@ -1,0 +1,8 @@
+--- input ~1024 + K=5, out=32 ---
+RESULT={"input_target": 1024, "k": 5, "best": {"dt": 1.735952000017278, "n_out": 32, "ttft_ms": 118.61369323730469, "decode_tok_s": 18.433689410583646}}
+--- input ~1024 + K=5, out=64 ---
+RESULT={"input_target": 1024, "k": 5, "best": {"dt": 1.9126771999290213, "n_out": 64, "ttft_ms": 124.64849090576172, "decode_tok_s": 33.460952011335216}}
+--- input ~1024 + K=5, out=128 ---
+RESULT={"input_target": 1024, "k": 5, "best": {"dt": 1.9494819000829011, "n_out": 128, "ttft_ms": 138.65219116210938, "decode_tok_s": 65.65847058880456}}
+--- input ~1024 + K=5, out=256 ---
+RESULT={"input_target": 1024, "k": 5, "best": {"dt": 2.034562399960123, "n_out": 256, "ttft_ms": 139.9561004638672, "decode_tok_s": 125.82558293862972}}

@@ -1,0 +1,8 @@
+--- input ~128 PL ---
+RESULT={"input_target": 128, "ngram": 3, "k": 5, "best": {"dt": 1.1984334999979183, "n_out": 64, "decode_tok_s": 53.40304656045677}}
+--- input ~512 PL ---
+RESULT={"input_target": 512, "ngram": 3, "k": 5, "best": {"dt": 1.9429893000015, "n_out": 64, "decode_tok_s": 32.93893589632768}}
+--- input ~1024 PL ---
+RESULT={"input_target": 1024, "ngram": 3, "k": 5, "best": {"dt": 2.028379600000335, "n_out": 64, "decode_tok_s": 31.552279464844467}}
+--- input ~2048 PL ---
+RESULT={"input_target": 2048, "ngram": 3, "k": 5, "best": {"dt": 1.840895500001352, "n_out": 64, "decode_tok_s": 34.765688763948305}}

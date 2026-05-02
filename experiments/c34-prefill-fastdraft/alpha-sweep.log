@@ -1,0 +1,10 @@
+--- input ~128 + K=5 FastDraft ---
+RESULT={"input_target": 128, "k": 5, "best": {"dt": 1.0310325999744236, "n_out": 32, "ttft_ms": 311.4579772949219, "decode_tok_s": 31.036845974408383}}
+--- input ~512 + K=5 FastDraft ---
+RESULT={"input_target": 512, "k": 5, "best": {"dt": 1.8531672999961302, "n_out": 32, "ttft_ms": 299.9325866699219, "decode_tok_s": 17.26773400332869}}
+--- input ~1024 + K=5 FastDraft ---
+RESULT={"input_target": 1024, "k": 5, "best": {"dt": 1.7536295000463724, "n_out": 32, "ttft_ms": 122.37520599365234, "decode_tok_s": 18.247868206570317}}
+--- input ~2048 + K=5 FastDraft ---
+RESULT={"input_target": 2048, "k": 5, "best": {"dt": 1.8067804999882355, "n_out": 32, "ttft_ms": 119.08990478515625, "decode_tok_s": 17.711061194322365}}
+--- input ~4096 + K=5 FastDraft ---
+RESULT={"input_target": 4096, "k": 5, "best": {"dt": 1.5926421999465674, "n_out": 32, "ttft_ms": 308.8984069824219, "decode_tok_s": 20.092397401672258}}
