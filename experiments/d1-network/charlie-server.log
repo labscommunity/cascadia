@@ -1,0 +1,4 @@
+server listening on :51234
+connected from ('10.10.10.1', 51847)
+BW_RX: 1094.1 MB/s (8.75 Gbps) over 0.98s
+LATENCY: 0.142 ms/round-trip (1000 round-trips in 0.14s)
