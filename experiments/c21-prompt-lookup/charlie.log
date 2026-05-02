@@ -1,0 +1,4 @@
+--- charlie no lookup ---
+RESULT={"use_lookup": false, "tokens": 128, "decode_s": 1.9345755577087402, "tok_s": 66.16438396006605, "first_text": "Distributed inference is a technique used to speed up the inference process for "}
+--- charlie with lookup ---
+RESULT={"use_lookup": true, "tokens": 128, "decode_s": 1.1762166023254395, "tok_s": 108.82349368894943, "first_text": "Distributed inference is a technique used to speed up the inference process for "}
