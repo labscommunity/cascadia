@@ -1,0 +1,28 @@
+[package]
+name = "tahoma-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tahoma CLI — clap-based, mirrors the Python `python -m tahoma worker` flag set."
+
+[features]
+default = []
+openvino = ["tahoma-engine-openvino/openvino"]
+
+[dependencies]
+tahoma-types = { workspace = true }
+tahoma-engine = { workspace = true }
+tahoma-engine-mock = { workspace = true }
+tahoma-engine-openvino = { workspace = true }
+tahoma-runner = { workspace = true }
+tahoma-api = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }

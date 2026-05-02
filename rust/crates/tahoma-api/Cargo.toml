@@ -1,0 +1,28 @@
+[package]
+name = "tahoma-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible HTTP server (axum). Wraps tahoma-runner with /health, /v1/models, /v1/chat/completions."
+
+[dependencies]
+tahoma-types = { workspace = true }
+tahoma-engine = { workspace = true }
+tahoma-runner = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tahoma-engine-mock = { workspace = true }
