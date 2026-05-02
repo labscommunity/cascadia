@@ -1,22 +1,34 @@
-"""Control-frame wire protocol for distributed speculative decoding.
+"""Control-frame wire protocol for distributed speculative decoding (v5).
 
-Adds a thin command layer on top of `transport.py`'s `send_tensor` /
-`recv_tensor`. The driver issues commands to each worker stage; the worker
-responds (for FORWARD) or applies state changes (REWIND, RESET).
+v5 shards use canonical optimum-intel-style inputs:
+``(input_ids|hidden_states, attention_mask, position_ids, beam_idx)``. KV cache
+is internal stateful storage. Rewind is mask-based: the driver flips bits in
+its `valid_mask` and the worker just sees an updated `attention_mask` on the
+next FORWARD — no `query_state`/`set_state` round-trip needed.
 
-Frame format::
+Frames
+------
 
-    [4B kind BE] [4B int_arg BE] [4B has_tensor BE]
-    [if has_tensor: send_tensor format (24B header + payload)]
+FORWARD (driver -> worker, also worker -> next worker for chains > 2 stages)
+    [4B kind=1 BE][4B logical_pos_start BE]
+    + send_tensor(attention_mask)   # int64 [1, total_seq_len]
+    + send_tensor(hidden_states)    # float16 [1, new_tokens, hidden_size]
 
-`kind`:
-    1 = FORWARD          payload = activation tensor
-    2 = REWIND           int_arg = count of cache positions to drop
-    3 = RESET            (no args)
-    4 = LOGITS_RESPONSE  payload = logits tensor (worker → driver)
+RESET (driver -> worker, propagated downstream)
+    [4B kind=3 BE]
 
-Tensor payloads reuse the existing `send_tensor` / `recv_tensor` format so we
-don't duplicate dtype + shape encoding.
+LOGITS_RESPONSE (worker -> upstream)
+    [4B kind=4 BE]
+    + send_tensor(logits)           # float16 [1, new_tokens, vocab_size]
+
+`logical_pos_start` is the position id of the first new token (i.e. the
+driver's `logical_pos`). The worker derives `position_ids =
+arange(logical_pos_start, logical_pos_start + new_tokens)`. `attention_mask`
+covers the full `total_seq_len = past_in_cache + new_tokens` and is what
+encodes any rewinds the driver has applied.
+
+Tensor payloads reuse `transport.send_tensor` / `recv_tensor` so dtype + shape
+encoding stays in one place.
 """
 
 from __future__ import annotations
@@ -36,35 +48,65 @@ from tahoma.worker.transport import (
 
 class FrameKind(IntEnum):
     FORWARD = 1
-    REWIND = 2
     RESET = 3
     LOGITS_RESPONSE = 4
 
 
-_FRAME_HEADER_FMT = ">III"
-_FRAME_HEADER_SIZE = 12
+_KIND_FMT = ">I"
+_KIND_SIZE = 4
+_FORWARD_HEADER_FMT = ">II"  # kind + logical_pos_start
+_FORWARD_HEADER_SIZE = 8
 
 
-def send_frame(
+def send_forward(
     sock: socket.socket,
-    kind: FrameKind,
-    *,
-    int_arg: int = 0,
-    tensor: np.ndarray | None = None,
+    logical_pos_start: int,
+    attention_mask: np.ndarray,
+    hidden_states: np.ndarray,
 ) -> None:
-    """Send a control frame. `tensor` is optional payload."""
-    has_tensor = 1 if tensor is not None else 0
-    header = struct.pack(_FRAME_HEADER_FMT, int(kind), int_arg, has_tensor)
+    """Driver/relay -> next stage. Sends an attention-aware activation frame."""
+    header = struct.pack(_FORWARD_HEADER_FMT, int(FrameKind.FORWARD), int(logical_pos_start))
     sock.sendall(header)
-    if tensor is not None:
-        send_tensor(sock, tensor)
+    send_tensor(sock, attention_mask)
+    send_tensor(sock, hidden_states)
 
 
-def recv_frame(sock: socket.socket) -> tuple[FrameKind, int, np.ndarray | None]:
-    """Receive one control frame. Returns (kind, int_arg, tensor_or_None)."""
-    header = _recv_exact(sock, _FRAME_HEADER_SIZE)
-    kind_int, int_arg, has_tensor = struct.unpack(_FRAME_HEADER_FMT, header)
-    tensor: np.ndarray | None = None
-    if has_tensor:
-        tensor, _stats = recv_tensor(sock)
-    return FrameKind(kind_int), int_arg, tensor
+def send_reset(sock: socket.socket) -> None:
+    sock.sendall(struct.pack(_KIND_FMT, int(FrameKind.RESET)))
+
+
+def send_logits(sock: socket.socket, logits: np.ndarray) -> None:
+    sock.sendall(struct.pack(_KIND_FMT, int(FrameKind.LOGITS_RESPONSE)))
+    send_tensor(sock, logits)
+
+
+def recv_kind(sock: socket.socket) -> FrameKind:
+    """Read just the kind. Useful for dispatching in the worker loop."""
+    raw = _recv_exact(sock, _KIND_SIZE)
+    (kind,) = struct.unpack(_KIND_FMT, raw)
+    return FrameKind(kind)
+
+
+def recv_forward_body(
+    sock: socket.socket,
+) -> tuple[int, np.ndarray, np.ndarray]:
+    """Read the rest of a FORWARD frame after `recv_kind` returned FORWARD.
+
+    Returns (logical_pos_start, attention_mask, hidden_states). Tensor ranks
+    are normalized to their canonical shapes (attention_mask: [1, total],
+    hidden_states: [1, new_tokens, hidden_size]) — `transport.send_tensor`
+    pads to MAX_RANK=3 on the wire.
+    """
+    raw = _recv_exact(sock, _FORWARD_HEADER_SIZE - _KIND_SIZE)  # 4 more bytes
+    (logical_pos_start,) = struct.unpack(">I", raw)
+    attention_mask, _ = recv_tensor(sock)
+    if attention_mask.ndim == 3 and attention_mask.shape[0] == 1:
+        attention_mask = attention_mask[0]
+    hidden_states, _ = recv_tensor(sock)
+    return int(logical_pos_start), attention_mask, hidden_states
+
+
+def recv_logits_body(sock: socket.socket) -> np.ndarray:
+    logits, _ = recv_tensor(sock)
+    # Logits are canonical [1, new_tokens, vocab_size]; recv returns same.
+    return logits

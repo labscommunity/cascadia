@@ -37,6 +37,7 @@ def _serve_once(server: ActivationServer, received: dict) -> None:
         ((1, 4, 32), np.float32),
         ((2, 3, 5), np.int8),
         ((1, 1, 100), np.int32),
+        ((1, 1, 64), np.int64),  # used by attention_mask in dist_spec_protocol
     ],
 )
 def test_roundtrip(shape: tuple[int, ...], dtype: type) -> None:

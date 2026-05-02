@@ -30,12 +30,20 @@ DTYPE_MAP: dict[int, type] = {
     1: np.float16,
     2: np.int8,
     3: np.int32,
+    4: np.int64,
 }
 DTYPE_REVERSE: dict[type, int] = {v: k for k, v in DTYPE_MAP.items()}
 
 HEADER_SIZE = 20  # 5 × uint32_be
 RECV_BUFFER = 65_536
 MAX_RANK = 3
+
+# Default timeout for blocking send / recv after a connection is established.
+# A single tensor transfer over LAN is sub-second; over a degraded link,
+# 60 s gives the peer plenty of time to flush. Beyond that we assume the peer
+# is dead and surface a TimeoutError so the caller can clean up rather than
+# hanging the pipeline indefinitely.
+DEFAULT_SOCKET_TIMEOUT = 60.0
 
 
 @dataclass
@@ -121,6 +129,7 @@ class ActivationServer:
             raise RuntimeError("call start() before accept()")
         sock, addr = self._server_sock.accept()
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(DEFAULT_SOCKET_TIMEOUT)
         self._client_sock = sock
         logger.info("ActivationServer accepted connection from %s", addr)
 
@@ -163,6 +172,7 @@ class ActivationClient:
             sock.settimeout(max(0.5, deadline - time.monotonic()))
             try:
                 sock.connect((self.host, self.port))
+                sock.settimeout(DEFAULT_SOCKET_TIMEOUT)
                 self._sock = sock
                 logger.info("ActivationClient connected to %s:%d", self.host, self.port)
                 return
