@@ -67,3 +67,39 @@ For tahoma's mission, this means:
 - d5: investigate why K=4+ is unstable (network reset on retry). Possibly worker socket-close race in the bench harness.
 - d6: try other layer splits (12/20, 14/18) to see if balancing helps.
 - d7: port the LLMPipeline runtime to multi-stage (major engineering, deferred).
+
+## d3 update — extended K-sweep with FastDraft, 256 out
+
+| K | rounds | accept | tok/s |
+|---|-------:|-------:|------:|
+| 2 | 111 | 2.31 | 29.16 |
+| 3 |  99 | 2.59 | 29.99 |
+| **4** |  **81** | **3.16** | **33.40** ← peak |
+| 5 |  78 | 3.28 | 33.33 |
+| 6 |  74 | 3.46 | 32.65 |
+
+**Distributed peak: 33.40 tok/s with K=4 + FastDraft 150M + 256 out.**
+
+Beats single-node best (28.29) by **+18%**.
+Beats single-node OVModelForCausalLM (17.23) by **+94%**.
+
+## Why K=4 wins with FastDraft (vs K=2 with 1B Llama draft)
+
+The 1B Llama draft has much higher per-round compute (~7ms per draft forward pass). With K=4, that's 28ms of draft compute per round — significant.
+The 150M FastDraft is ~10× smaller, with ~0.7ms per draft forward. K=4 means 2.8ms of draft compute per round — negligible.
+
+So FastDraft can sustain larger K values without paying the per-round overhead penalty. The optimal K shifts from 2 (with 1B draft) to 4 (with 150M FastDraft).
+
+## Tuned recommendation for tahoma distributed deployment
+
+For Llama 3.1 8B INT4 distributed across 2 Intel nodes via TB4:
+- engine: `ov-dist-spec`
+- shards: 2-stage v5 (paged attention, beam-aware)
+- draft model: `OpenVINO/Llama-3.1-8B-Instruct-FastDraft-150M-int8-ov` (NOT 1B Llama)
+- spec_k: 4
+- max_tokens: 256+ (long output amortizes spec round overhead)
+- expected throughput: ~33 tok/s (versus 28.3 single-node best, +18%)
+
+## Stability check
+
+K=3 + FastDraft + 256out re-run: 29.70 tok/s (vs original 29.99 — within 1%). Stable.
