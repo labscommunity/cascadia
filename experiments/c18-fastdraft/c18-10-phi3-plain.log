@@ -1,0 +1,1 @@
+RESULT={"model": "C:\\cascadia\\models\\phi3-mini-128k-int4-ov", "device": "GPU", "tokens": 64, "decode_s": 1.9885895252227783, "tok_s": 32.18361516453738, "load_s": 16.412961959838867, "warmup_s": 0.5331144332885742, "plugin_config": {}, "perf_metrics": {}, "first_text": "The capital of France is Paris. It is not only the country's largest city but al"}
