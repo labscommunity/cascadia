@@ -1,0 +1,6 @@
+--- threshold=0.3 ---
+RESULT={"input": 1024, "out": 32, "threshold": 0.3, "best": {"dt": 1.4676699000410736, "n_out": 32, "tok_s": 21.80326788680783}}
+--- threshold=0.5 ---
+RESULT={"input": 1024, "out": 32, "threshold": 0.5, "best": {"dt": 1.5001657999819145, "n_out": 32, "tok_s": 21.330975549759756}}
+--- threshold=0.7 ---
+RESULT={"input": 1024, "out": 32, "threshold": 0.7, "best": {"dt": 1.5266741000814363, "n_out": 32, "tok_s": 20.96059663178477}}
