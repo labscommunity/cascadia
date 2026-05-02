@@ -23,8 +23,8 @@ long out 256+    │ FastDraft K=3 │ Plain           │ Plain            │
 ─────────────────┴──────────────┴─────────────────┴──────────────────┘
 ```
 
-If RAG/summarization (output reuses input): `prompt_lookup=True, max_ngram_size=3`
-gives +50-65% on charlie at 100-1K input. Mutually exclusive with FastDraft.
+If RAG/summarization with input 100-1K tokens: `prompt_lookup=True, max_ngram_size=3`
+gives +50-65% on charlie. CAVEAT: at 4K+ input, PL is a -14% LOSS (c43). Test A/B for new workloads.
 
 ## Plugin properties (do NOT override on Battlemage)
 

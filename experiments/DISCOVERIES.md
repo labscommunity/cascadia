@@ -103,3 +103,23 @@ charlie's GPU 1B at 211 tok/s is the new single-node Llama 3.2 1B INT4 leaderboa
 3. Test concurrent NPU + GPU workload to confirm no cross-talk on memory bandwidth (open).
 
 ---
+
+---
+
+## DISCOVERY #3 REVISION (c43, 2026-05-02) — Prompt Lookup is workload-specific, NOT universal
+
+**Original c21 finding:** PL +59-65% on RAG/summarization. Held for the specific workload tested (250-token passage + 128-token summary).
+
+**c43 finding:** at 4096-token input + 64-token output on charlie 140V GPU:
+- Plain LLMPipeline: 38.4 tok/s
+- PL with n=3, K=5: 32.8 tok/s (**-14% LOSS**)
+
+The PL win does NOT extrapolate to very long inputs. The n-gram lookup table's build/search cost scales with input length and eventually exceeds the per-step savings from accepted draft tokens.
+
+**REVISED guidance:**
+- PL helps in the 100-1000 token input range with output that reuses input vocabulary.
+- PL loses at very short inputs (no matches) and very long inputs (lookup overhead).
+- For new workloads: A/B test PL on/off rather than enabling unconditionally.
+
+The Discovery #3 headline number stands for the c21 workload but is NOT a universal RAG win.
+
