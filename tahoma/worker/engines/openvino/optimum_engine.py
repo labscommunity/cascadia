@@ -125,23 +125,48 @@ class OptimumOVEngine(Engine):
         self._model = model
         self._tokenizer = tokenizer
         self._draft_model = draft_model
+        self._spec_decode_enabled = draft_model is not None
         self._active: dict[TaskId, _ActiveTask] = {}
         self._pending: list[GenerationTask] = []
 
     def warmup(self) -> None:
+        # If spec decode is configured, validate it during warmup. transformers
+        # `_assisted_decoding` calls `past_key_values.crop()` which expects a
+        # Cache object — optimum-intel still returns a tuple in some versions,
+        # raising AttributeError. If that happens, fall back to plain generate
+        # for the rest of the engine's lifetime so requests don't 500.
         try:
             ids = self._tokenizer("Hi", return_tensors="pt")
             kwargs = dict(
                 **ids,
-                max_new_tokens=1,
+                max_new_tokens=2,
                 pad_token_id=self._tokenizer.eos_token_id,
             )
-            if self._draft_model is not None:
+            if self._spec_decode_enabled:
                 kwargs["assistant_model"] = self._draft_model
             self._model.generate(**kwargs)
-            logger.info(
-                "warmup ok (spec_decode=%s)", self._draft_model is not None,
-            )
+            logger.info("warmup ok (spec_decode=%s)", self._spec_decode_enabled)
+        except AttributeError as err:
+            if self._spec_decode_enabled and "crop" in str(err):
+                logger.warning(
+                    "spec decode incompatible with this optimum-intel "
+                    "version (Cache.crop missing on past_key_values); "
+                    "falling back to plain generate. Workaround: port "
+                    "rainier's MaskedReq spec decode (DISCOVERY #20)."
+                )
+                self._spec_decode_enabled = False
+                # Re-warmup without assistant_model to populate caches.
+                try:
+                    self._model.generate(
+                        **self._tokenizer("Hi", return_tensors="pt"),
+                        max_new_tokens=1,
+                        pad_token_id=self._tokenizer.eos_token_id,
+                    )
+                    logger.info("warmup ok (fallback)")
+                except Exception as err2:  # noqa: BLE001
+                    logger.warning("fallback warmup failed: %s", err2)
+            else:
+                logger.warning("warmup failed: %s", err)
         except Exception as err:  # noqa: BLE001
             logger.warning("warmup failed: %s", err)
 
@@ -169,7 +194,7 @@ class OptimumOVEngine(Engine):
             pad_token_id=self._tokenizer.eos_token_id,
             streamer=streamer,
         )
-        if self._draft_model is not None:
+        if self._spec_decode_enabled:
             kwargs["assistant_model"] = self._draft_model
         thread = Thread(target=self._model.generate, kwargs=kwargs, daemon=True)
         thread.start()
