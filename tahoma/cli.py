@@ -70,7 +70,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if args.engine == "ov-optimum":
         from tahoma.worker.engines.openvino.optimum_engine import OptimumOVBuilder
 
-        builder = OptimumOVBuilder(model_path=args.model, device=args.device)
+        builder = OptimumOVBuilder(
+            model_path=args.model,
+            device=args.device,
+            weight_format=args.ov_weight_format,
+        )
     else:
         ov_builder = OpenVINOBuilder(model_path=args.model)
         ov_builder.configure_listen(listen_host, listen_port)
@@ -159,8 +163,13 @@ def main() -> int:
         help=(
             "inference engine: 'pytorch' (default, distributed-capable) or "
             "'ov-optimum' (single-stage OpenVINO Runtime via optimum-intel; "
-            "expects a pre-exported OV IR directory at --model)"
+            "auto-exports from HF id if --model is not already an OV IR dir)"
         ),
+    )
+    pw.add_argument(
+        "--ov-weight-format", default="int4",
+        choices=["int4", "int8", "fp16", "fp32"],
+        help="weight format for OV IR auto-export (only used by --engine ov-optimum)",
     )
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",

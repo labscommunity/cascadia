@@ -2,7 +2,8 @@
 
 Wraps `optimum.intel.OVModelForCausalLM` for fast 1-stage inference using
 pre-exported OpenVINO IR (typically INT4 quantized via
-`optimum-cli export openvino --weight-format int4 ...`).
+`optimum-cli export openvino --weight-format int4 ...`). Auto-exports from
+a HuggingFace model id if `--model` isn't already an OV IR directory.
 
 Limitations:
 - **Single-stage only.** The model runs in one process; no cross-node
@@ -16,8 +17,11 @@ same hardware (~17 tok/s vs ~4 tok/s on Lunar Lake Arc 140V for Llama-3.1-8B).
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Thread
 from typing import Any
 
@@ -27,6 +31,70 @@ from tahoma.shared.types import Chunk, GenerationTask, LoadProgress, TaskId
 from tahoma.worker.engines.base import Builder, Engine
 
 logger = logging.getLogger(__name__)
+
+
+_VALID_WEIGHT_FORMATS = ("int4", "int8", "fp16", "fp32")
+
+
+def _is_ov_ir_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "openvino_model.xml").exists()
+
+
+def _ov_export_cache_dir() -> Path:
+    return Path.home() / ".cache" / "tahoma" / "ov_exports"
+
+
+def resolve_or_export_ov_ir(model_path: str, weight_format: str = "int4") -> str:
+    """Return a path to an OV IR directory.
+
+    If `model_path` is already a directory containing `openvino_model.xml`,
+    return it unchanged. Otherwise treat it as a HuggingFace model id and
+    invoke `optimum-cli export openvino --weight-format <fmt>` into a cache
+    directory under `~/.cache/tahoma/ov_exports/`.
+
+    Subsequent calls with the same id+format reuse the cached export.
+    """
+    if weight_format not in _VALID_WEIGHT_FORMATS:
+        raise ValueError(
+            f"weight_format must be one of {_VALID_WEIGHT_FORMATS}; "
+            f"got {weight_format!r}"
+        )
+
+    p = Path(model_path)
+    if _is_ov_ir_dir(p):
+        return str(p)
+
+    cache = _ov_export_cache_dir()
+    safe = model_path.replace("/", "--").replace("\\", "--")
+    out = cache / f"{safe}-{weight_format}"
+
+    if _is_ov_ir_dir(out):
+        logger.info("using cached OV IR at %s", out)
+        return str(out)
+
+    if shutil.which("optimum-cli") is None:
+        raise RuntimeError(
+            "optimum-cli not on PATH; install with `pip install tahoma[ov]` "
+            "or pre-export manually with "
+            "`optimum-cli export openvino --weight-format int4 ...`"
+        )
+
+    out.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "exporting %s -> %s (weight_format=%s); this may take several minutes",
+        model_path, out, weight_format,
+    )
+    subprocess.run(
+        [
+            "optimum-cli", "export", "openvino",
+            "--model", model_path,
+            "--weight-format", weight_format,
+            str(out),
+        ],
+        check=True,
+    )
+    logger.info("export complete")
+    return str(out)
 
 
 @dataclass
@@ -140,11 +208,18 @@ class OptimumOVEngine(Engine):
 
 
 class OptimumOVBuilder(Builder):
-    """Builder for `OptimumOVEngine`. Loads pre-exported OV IR + tokenizer."""
+    """Builder for `OptimumOVEngine`. Loads (or auto-exports) OV IR + tokenizer."""
 
-    def __init__(self, model_path: str, device: str = "GPU"):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "GPU",
+        weight_format: str = "int4",
+    ):
         self._model_path = model_path
         self._device = device
+        self._weight_format = weight_format
+        self._resolved_path: str | None = None
         self._model: Any = None
         self._tokenizer: Any = None
 
@@ -164,14 +239,19 @@ class OptimumOVBuilder(Builder):
                 "(set --total 1)"
             )
 
+        yield LoadProgress(0, None, f"resolving {self._model_path}")
+        self._resolved_path = resolve_or_export_ov_ir(
+            self._model_path, weight_format=self._weight_format,
+        )
+
         yield LoadProgress(0, None, "compiling OV model")
         self._model = OVModelForCausalLM.from_pretrained(
-            self._model_path,
+            self._resolved_path,
             device=self._device,
             export=False,
         )
         yield LoadProgress(0, None, "loading tokenizer")
-        self._tokenizer = AutoTokenizer.from_pretrained(self._model_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(self._resolved_path)
         yield LoadProgress(1, 1, "ready")
 
     def build(self) -> Engine:
