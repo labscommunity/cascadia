@@ -246,7 +246,8 @@ def main() -> int:
         help=(
             "OpenVINO compiled-blob cache dir (sets plugin CACHE_DIR). "
             "Persists kernel JIT results across runs; cuts cold-start by ~62%% "
-            "on second+ launches. Used by --engine ov-genai. "
+            "on second+ launches. Applied to ov-genai, ov-runtime, ov-dist-spec "
+            "(every node compiles independently in distributed mode). "
             "Suggested: ~/.cache/tahoma/ov_kernel_cache."
         ),
     )
@@ -256,7 +257,7 @@ def main() -> int:
         help=(
             "OV GPU KV-cache precision (sets plugin KV_CACHE_PRECISION). "
             "Default (unset) is already optimal on Battlemage / Lunar Lake; "
-            "expose only for debugging. Used by --engine ov-genai."
+            "expose only for debugging. Applied to ov-genai, ov-runtime, ov-dist-spec."
         ),
     )
     pw.add_argument(
@@ -264,7 +265,7 @@ def main() -> int:
         help=(
             "OV GPU dynamic-quantization group size "
             "(sets plugin DYNAMIC_QUANTIZATION_GROUP_SIZE, e.g. 32 / 64). "
-            "Used by --engine ov-genai."
+            "Applied to ov-genai, ov-runtime, ov-dist-spec."
         ),
     )
     pw.add_argument(

@@ -285,12 +285,18 @@ class OVDistributedSpecBuilder(Builder):
         device: str = "GPU",
         weight_format: str = "int4",
         k: int = 4,
+        cache_dir: str | None = None,
+        kv_cache_precision: str | None = None,
+        dyn_quant_group: str | None = None,
     ):
         self._pipeline_dir = Path(pipeline_dir)
         self._draft_model_path = draft_model_path
         self._device = device
         self._weight_format = weight_format
         self._k = k
+        self._cache_dir = cache_dir
+        self._kv_cache_precision = kv_cache_precision
+        self._dyn_quant_group = dyn_quant_group
         self._stage0: Any = None
         self._stage0_inputs: dict[str, str] = {}
         self._draft_req: Any = None
@@ -329,9 +335,16 @@ class OVDistributedSpecBuilder(Builder):
 
         force_offline()
 
+        from tahoma.worker.engines.openvino._plugin import build_plugin_config
+        plugin_config = build_plugin_config(
+            self._cache_dir, self._kv_cache_precision, self._dyn_quant_group,
+        )
+
         yield LoadProgress(0, None, "compiling target stage 0")
         core = ov.Core()
-        target_compiled = core.compile_model(str(stage_dir / "openvino_model.xml"), self._device)
+        target_compiled = core.compile_model(
+            str(stage_dir / "openvino_model.xml"), self._device, plugin_config,
+        )
         self._stage0 = target_compiled.create_infer_request()
         self._stage0_inputs = _v5_inputs(target_compiled)
         missing = {"input_ids", "attention_mask", "position_ids", "beam_idx"} - set(self._stage0_inputs)
@@ -347,7 +360,9 @@ class OVDistributedSpecBuilder(Builder):
         )
 
         yield LoadProgress(0, None, "compiling draft")
-        draft_compiled = core.compile_model(f"{draft_path}/openvino_model.xml", self._device)
+        draft_compiled = core.compile_model(
+            f"{draft_path}/openvino_model.xml", self._device, plugin_config,
+        )
         draft_req = draft_compiled.create_infer_request()
         has_beam = any(
             any("beam_idx" in n for n in inp.get_names()) for inp in draft_compiled.inputs
@@ -474,11 +489,17 @@ class OVDistSpecWorkerBuilder(Builder):
         rank: int,
         total: int,
         device: str = "GPU",
+        cache_dir: str | None = None,
+        kv_cache_precision: str | None = None,
+        dyn_quant_group: str | None = None,
     ):
         self._pipeline_dir = Path(pipeline_dir)
         self._rank = rank
         self._total = total
         self._device = device
+        self._cache_dir = cache_dir
+        self._kv_cache_precision = kv_cache_precision
+        self._dyn_quant_group = dyn_quant_group
         self._req: Any = None
         self._inputs: dict[str, str] = {}
         self._upstream: ActivationServer | None = None
@@ -530,9 +551,16 @@ class OVDistSpecWorkerBuilder(Builder):
 
         force_offline()
 
+        from tahoma.worker.engines.openvino._plugin import build_plugin_config
+        plugin_config = build_plugin_config(
+            self._cache_dir, self._kv_cache_precision, self._dyn_quant_group,
+        )
+
         yield LoadProgress(0, None, f"compiling stage {self._rank}")
         core = ov.Core()
-        compiled = core.compile_model(str(stage_dir / "openvino_model.xml"), self._device)
+        compiled = core.compile_model(
+            str(stage_dir / "openvino_model.xml"), self._device, plugin_config,
+        )
         self._req = compiled.create_infer_request()
         self._inputs = _v5_inputs(compiled)
         missing = {"hidden_states", "attention_mask", "position_ids", "beam_idx"} - set(self._inputs)

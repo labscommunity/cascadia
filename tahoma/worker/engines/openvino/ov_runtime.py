@@ -292,11 +292,23 @@ class OVRuntimeEngine(Engine):
 class OVRuntimeBuilder(Builder):
     """Builder for `OVRuntimeEngine`. Loads a per-stage stateful OV IR shard."""
 
-    def __init__(self, pipeline_dir: str, rank: int, total: int, device: str = "GPU"):
+    def __init__(
+        self,
+        pipeline_dir: str,
+        rank: int,
+        total: int,
+        device: str = "GPU",
+        cache_dir: str | None = None,
+        kv_cache_precision: str | None = None,
+        dyn_quant_group: str | None = None,
+    ):
         self._pipeline_dir = Path(pipeline_dir)
         self._rank = rank
         self._total = total
         self._device = device
+        self._cache_dir = cache_dir
+        self._kv_cache_precision = kv_cache_precision
+        self._dyn_quant_group = dyn_quant_group
         self._shard: _Shard | None = None
         self._spec: ShardSpec | None = None
         self._rotary: Any = None
@@ -357,10 +369,15 @@ class OVRuntimeBuilder(Builder):
         self._hidden_size = pipeline_cfg["hidden_size"]
         model_id = pipeline_cfg["model_id"]
 
+        from tahoma.worker.engines.openvino._plugin import build_plugin_config
+        plugin_config = build_plugin_config(
+            self._cache_dir, self._kv_cache_precision, self._dyn_quant_group,
+        )
+
         yield LoadProgress(0, None, "compiling OV shard")
         core = ov.Core()
         model = core.read_model(str(stage_dir / "openvino_model.xml"))
-        compiled = core.compile_model(model, self._device)
+        compiled = core.compile_model(model, self._device, plugin_config)
         request = compiled.create_infer_request()
 
         input_names = [list(inp.names)[0] for inp in compiled.inputs]

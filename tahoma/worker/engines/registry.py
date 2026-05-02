@@ -210,6 +210,9 @@ def _ov_runtime_builder(args: argparse.Namespace, host: str, port: int) -> Build
     from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder
     builder = OVRuntimeBuilder(
         pipeline_dir=args.model, rank=args.rank, total=args.total, device=args.device,
+        cache_dir=getattr(args, "ov_cache_dir", None),
+        kv_cache_precision=getattr(args, "ov_kv_precision", None),
+        dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
     )
     builder.configure_listen(host, port)
     return builder
@@ -303,10 +306,16 @@ def _ov_dist_spec_builder(args: argparse.Namespace, host: str, port: int) -> Bui
             device=args.device,
             weight_format=args.ov_weight_format,
             k=args.spec_k,
+            cache_dir=getattr(args, "ov_cache_dir", None),
+            kv_cache_precision=getattr(args, "ov_kv_precision", None),
+            dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
         )
     from tahoma.worker.engines.openvino.dist_spec import OVDistSpecWorkerBuilder
     builder = OVDistSpecWorkerBuilder(
         pipeline_dir=args.model, rank=args.rank, total=args.total, device=args.device,
+        cache_dir=getattr(args, "ov_cache_dir", None),
+        kv_cache_precision=getattr(args, "ov_kv_precision", None),
+        dyn_quant_group=getattr(args, "ov_dyn_quant_group", None),
     )
     builder.configure_listen(host, port)
     return builder

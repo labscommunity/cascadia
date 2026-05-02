@@ -233,13 +233,10 @@ class OVGenAIBuilder(Builder):
                 f"{self._model_path}",
             )
 
-        plugin_config: dict[str, str] = {}
-        if self._cache_dir:
-            plugin_config["CACHE_DIR"] = self._cache_dir
-        if self._kv_cache_precision:
-            plugin_config["KV_CACHE_PRECISION"] = self._kv_cache_precision
-        if self._dyn_quant_group:
-            plugin_config["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = self._dyn_quant_group
+        from tahoma.worker.engines.openvino._plugin import build_plugin_config
+        plugin_config = build_plugin_config(
+            self._cache_dir, self._kv_cache_precision, self._dyn_quant_group,
+        )
 
         try:
             import openvino_genai as ov_genai
