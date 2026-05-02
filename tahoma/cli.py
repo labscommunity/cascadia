@@ -67,6 +67,22 @@ def cmd_worker(args: argparse.Namespace) -> int:
             "engine=ov-runtime rank=%d/%d device=%s pipeline=%s",
             args.rank, args.total, args.device, args.model,
         )
+    elif args.engine == "ov-spec":
+        if args.total != 1:
+            sys.exit("--engine ov-spec is single-stage only; use --total 1")
+        if not args.draft_model:
+            sys.exit("--engine ov-spec requires --draft-model")
+        from tahoma.shared.shard import ShardSpec
+
+        spec = ShardSpec(
+            model_id=args.model, layer_start=0, layer_end=0,
+            total_layers=0, device=args.device,
+            is_first_stage=True, is_last_stage=True,
+        )
+        logger.info(
+            "engine=ov-spec rank=0/1 device=%s target=%s draft=%s K=%d",
+            args.device, args.model, args.draft_model, args.spec_k,
+        )
     else:
         plan = ShardPlan.from_hf_model_id(
             args.model, num_stages=args.total, devices=[args.device] * args.total,
@@ -102,6 +118,17 @@ def cmd_worker(args: argparse.Namespace) -> int:
         )
         ov_runtime_builder.configure_listen(listen_host, listen_port)
         builder = ov_runtime_builder
+    elif args.engine == "ov-spec":
+        from tahoma.worker.engines.openvino.spec_decode_engine import OVSpecDecodeBuilder
+
+        builder = OVSpecDecodeBuilder(
+            model_path=args.model,
+            draft_model_path=args.draft_model,
+            device=args.device,
+            weight_format=args.ov_weight_format,
+            draft_weight_format=args.ov_weight_format,
+            k=args.spec_k,
+        )
     else:
         ov_builder = OpenVINOBuilder(model_path=args.model)
         ov_builder.configure_listen(listen_host, listen_port)
@@ -187,13 +214,15 @@ def main() -> int:
     )
     pw.add_argument(
         "--engine", default="pytorch",
-        choices=["pytorch", "ov-optimum", "ov-runtime"],
+        choices=["pytorch", "ov-optimum", "ov-runtime", "ov-spec"],
         help=(
             "inference engine: "
             "'pytorch' (default, distributed) | "
             "'ov-optimum' (single-stage OV via optimum-intel; auto-export) | "
             "'ov-runtime' (multi-stage OV with stateful KV cache; expects a "
-            "pre-exported pipeline directory at --model with stage_<i>/ subdirs)"
+            "pre-exported pipeline directory at --model with stage_<i>/ subdirs) | "
+            "'ov-spec' (single-stage OV with mask-based speculative decoding; "
+            "requires --draft-model)"
         ),
     )
     pw.add_argument(
@@ -206,8 +235,13 @@ def main() -> int:
         help=(
             "speculative-decoding draft model — small model id or path that "
             "shares the target's tokenizer (e.g. unsloth/Llama-3.2-1B-Instruct "
-            "for a Llama-3.1 target). Only used by --engine ov-optimum."
+            "for a Llama-3.1 target). Used by --engine ov-optimum (best effort, "
+            "may fall back) and required by --engine ov-spec."
         ),
+    )
+    pw.add_argument(
+        "--spec-k", type=int, default=3,
+        help="speculative-decoding draft length per round (default 3)",
     )
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
