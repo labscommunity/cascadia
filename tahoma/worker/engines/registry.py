@@ -1,0 +1,220 @@
+"""Engine registry — central wiring of CLI ``--engine`` choices to builders.
+
+Each entry binds a name (``ov-runtime``, ``ov-spec``, ...) to the validation,
+shard-spec construction, and builder construction needed to start the engine.
+``cli.cmd_worker`` looks up the entry once and calls the three callbacks; no
+per-engine if/elif chain.
+
+Add a new engine in three steps:
+1. Implement an ``Engine`` + ``Builder`` (see ``engines/base.py``).
+2. Register an ``EngineSpec`` here.
+3. Add the name to the CLI ``--engine`` choices in ``cli.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from tahoma.shared.shard import ShardPlan, ShardSpec
+from tahoma.worker.engines.base import Builder
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    """Wiring metadata for one engine implementation."""
+
+    name: str
+    description: str
+    validate: Callable[[argparse.Namespace], None]
+    build_shard_spec: Callable[[argparse.Namespace], ShardSpec]
+    build_builder: Callable[[argparse.Namespace, str, int], Builder]
+
+
+_REGISTRY: dict[str, EngineSpec] = {}
+
+
+def register(engine: EngineSpec) -> None:
+    if engine.name in _REGISTRY:
+        raise ValueError(f"engine {engine.name!r} already registered")
+    _REGISTRY[engine.name] = engine
+
+
+def get(name: str) -> EngineSpec:
+    if name not in _REGISTRY:
+        raise KeyError(f"unknown engine {name!r}; choices: {sorted(_REGISTRY)}")
+    return _REGISTRY[name]
+
+
+def names() -> list[str]:
+    return sorted(_REGISTRY)
+
+
+# ---------------------------------------------------------------------------
+# Built-in engine registrations
+# ---------------------------------------------------------------------------
+
+def _stub_shard_spec(args: argparse.Namespace) -> ShardSpec:
+    """ShardSpec for engines that build their own internal layer plan from
+    a pipeline_config.json or that are single-stage."""
+    return ShardSpec(
+        model_id=args.model,
+        layer_start=0,
+        layer_end=0,
+        total_layers=0,
+        device=args.device,
+        is_first_stage=(args.rank == 0),
+        is_last_stage=(args.rank == args.total - 1),
+    )
+
+
+def _require_single_stage(name: str) -> Callable[[argparse.Namespace], None]:
+    def check(args: argparse.Namespace) -> None:
+        if args.total != 1:
+            raise SystemExit(f"--engine {name} is single-stage only; use --total 1")
+    return check
+
+
+def _require_draft(name: str) -> Callable[[argparse.Namespace], None]:
+    def check(args: argparse.Namespace) -> None:
+        if not args.draft_model:
+            raise SystemExit(f"--engine {name} requires --draft-model")
+    return check
+
+
+def _and(*checks: Callable[[argparse.Namespace], None]) -> Callable[[argparse.Namespace], None]:
+    def check(args: argparse.Namespace) -> None:
+        for c in checks:
+            c(args)
+    return check
+
+
+# pytorch (default, distributed)
+def _pytorch_spec(args: argparse.Namespace) -> ShardSpec:
+    plan = ShardPlan.from_hf_model_id(
+        args.model, num_stages=args.total, devices=[args.device] * args.total,
+    )
+    return plan.stages[args.rank]
+
+
+def _pytorch_builder(args: argparse.Namespace, host: str, port: int) -> Builder:
+    from tahoma.worker.engines.openvino import OpenVINOBuilder
+    builder = OpenVINOBuilder(model_path=args.model)
+    builder.configure_listen(host, port)
+    return builder
+
+
+register(EngineSpec(
+    name="pytorch",
+    description="distributed PyTorch (default)",
+    validate=lambda _args: None,
+    build_shard_spec=_pytorch_spec,
+    build_builder=_pytorch_builder,
+))
+
+
+# ov-optimum
+def _ov_optimum_builder(args: argparse.Namespace, _host: str, _port: int) -> Builder:
+    from tahoma.worker.engines.openvino.optimum_engine import OptimumOVBuilder
+    return OptimumOVBuilder(
+        model_path=args.model,
+        device=args.device,
+        weight_format=args.ov_weight_format,
+        draft_model_path=args.draft_model,
+        draft_weight_format=args.ov_weight_format,
+    )
+
+
+register(EngineSpec(
+    name="ov-optimum",
+    description="single-stage OV via optimum-intel; auto-export",
+    validate=_require_single_stage("ov-optimum"),
+    build_shard_spec=lambda args: ShardSpec(
+        model_id=args.model, layer_start=0, layer_end=0, total_layers=0,
+        device=args.device, is_first_stage=True, is_last_stage=True,
+    ),
+    build_builder=_ov_optimum_builder,
+))
+
+
+# ov-runtime
+def _ov_runtime_builder(args: argparse.Namespace, host: str, port: int) -> Builder:
+    from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder
+    builder = OVRuntimeBuilder(
+        pipeline_dir=args.model, rank=args.rank, total=args.total, device=args.device,
+    )
+    builder.configure_listen(host, port)
+    return builder
+
+
+register(EngineSpec(
+    name="ov-runtime",
+    description="multi-stage OV with stateful KV cache; pre-exported pipeline dir",
+    validate=lambda _args: None,
+    build_shard_spec=_stub_shard_spec,
+    build_builder=_ov_runtime_builder,
+))
+
+
+# ov-spec
+def _ov_spec_builder(args: argparse.Namespace, _host: str, _port: int) -> Builder:
+    from tahoma.worker.engines.openvino.spec_decode_engine import OVSpecDecodeBuilder
+    return OVSpecDecodeBuilder(
+        model_path=args.model,
+        draft_model_path=args.draft_model,
+        device=args.device,
+        weight_format=args.ov_weight_format,
+        draft_weight_format=args.ov_weight_format,
+        k=args.spec_k,
+    )
+
+
+register(EngineSpec(
+    name="ov-spec",
+    description="single-stage OV spec decode; requires --draft-model",
+    validate=_and(_require_single_stage("ov-spec"), _require_draft("ov-spec")),
+    build_shard_spec=lambda args: ShardSpec(
+        model_id=args.model, layer_start=0, layer_end=0, total_layers=0,
+        device=args.device, is_first_stage=True, is_last_stage=True,
+    ),
+    build_builder=_ov_spec_builder,
+))
+
+
+# ov-dist-spec
+def _ov_dist_spec_validate(args: argparse.Namespace) -> None:
+    if args.total < 2:
+        raise SystemExit("--engine ov-dist-spec requires --total >= 2")
+    if args.rank == 0 and not args.draft_model:
+        raise SystemExit("--engine ov-dist-spec rank 0 requires --draft-model")
+
+
+def _ov_dist_spec_builder(args: argparse.Namespace, host: str, port: int) -> Builder:
+    if args.rank == 0:
+        from tahoma.worker.engines.openvino.dist_spec import OVDistributedSpecBuilder
+        return OVDistributedSpecBuilder(
+            pipeline_dir=args.model,
+            draft_model_path=args.draft_model,
+            device=args.device,
+            weight_format=args.ov_weight_format,
+            k=args.spec_k,
+        )
+    from tahoma.worker.engines.openvino.dist_spec import OVDistSpecWorkerBuilder
+    builder = OVDistSpecWorkerBuilder(
+        pipeline_dir=args.model, rank=args.rank, total=args.total, device=args.device,
+    )
+    builder.configure_listen(host, port)
+    return builder
+
+
+register(EngineSpec(
+    name="ov-dist-spec",
+    description="multi-stage OV spec decode with mask-based rewind; v5 shards",
+    validate=_ov_dist_spec_validate,
+    build_shard_spec=_stub_shard_spec,
+    build_builder=_ov_dist_spec_builder,
+))

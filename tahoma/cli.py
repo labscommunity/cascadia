@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import signal
 import sys
+from pathlib import Path
+from types import FrameType
 
-from tahoma.shared.shard import ShardPlan
 from tahoma.shared.topology import PeerEndpoint, PeerLayout
 from tahoma.shared.types import GenerationTask
-from tahoma.worker.engines.base import Builder
-from tahoma.worker.engines.openvino import OpenVINOBuilder
+from tahoma.worker.engines import registry
 from tahoma.worker.runner import Runner
 
 logger = logging.getLogger(__name__)
@@ -35,144 +37,36 @@ def parse_addr(s: str, default_host: str = "0.0.0.0") -> tuple[str, int]:
     return host, int(port)
 
 
+def _write_pid_file(path: Path) -> None:
+    """Write our PID and ensure removal on normal exit. Used by supervisors
+    (systemd Type=simple, NSSM, supervisord) that probe liveness via PID file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{os.getpid()}\n")
+    import atexit
+    atexit.register(lambda: path.unlink(missing_ok=True))
+
+
+def cmd_engines(_args: argparse.Namespace) -> int:
+    for name in registry.names():
+        spec = registry.get(name)
+        print(f"  {name:<14}  {spec.description}")
+    return 0
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     if args.rank < 0 or args.rank >= args.total:
         sys.exit(f"--rank must be in [0, {args.total}); got {args.rank}")
 
-    if args.engine == "ov-optimum":
-        if args.total != 1:
-            sys.exit("--engine ov-optimum is single-stage only; use --total 1")
-        from tahoma.shared.shard import ShardSpec
-
-        spec = ShardSpec(
-            model_id=args.model, layer_start=0, layer_end=0,
-            total_layers=0, device=args.device,
-            is_first_stage=True, is_last_stage=True,
-        )
-        logger.info(
-            "engine=ov-optimum rank=0/1 device=%s model=%s",
-            args.device, args.model,
-        )
-    elif args.engine == "ov-runtime":
-        # ShardSpec is built inside the builder from pipeline_config.json.
-        from tahoma.shared.shard import ShardSpec
-
-        spec = ShardSpec(
-            model_id=args.model, layer_start=0, layer_end=0,
-            total_layers=0, device=args.device,
-            is_first_stage=(args.rank == 0),
-            is_last_stage=(args.rank == args.total - 1),
-        )
-        logger.info(
-            "engine=ov-runtime rank=%d/%d device=%s pipeline=%s",
-            args.rank, args.total, args.device, args.model,
-        )
-    elif args.engine == "ov-spec":
-        if args.total != 1:
-            sys.exit("--engine ov-spec is single-stage only; use --total 1")
-        if not args.draft_model:
-            sys.exit("--engine ov-spec requires --draft-model")
-        from tahoma.shared.shard import ShardSpec
-
-        spec = ShardSpec(
-            model_id=args.model, layer_start=0, layer_end=0,
-            total_layers=0, device=args.device,
-            is_first_stage=True, is_last_stage=True,
-        )
-        logger.info(
-            "engine=ov-spec rank=0/1 device=%s target=%s draft=%s K=%d",
-            args.device, args.model, args.draft_model, args.spec_k,
-        )
-    elif args.engine == "ov-dist-spec":
-        if args.total < 2:
-            sys.exit("--engine ov-dist-spec requires --total >= 2")
-        if args.rank == 0 and not args.draft_model:
-            sys.exit("--engine ov-dist-spec rank 0 requires --draft-model")
-        from tahoma.shared.shard import ShardSpec
-
-        spec = ShardSpec(
-            model_id=args.model, layer_start=0, layer_end=0,
-            total_layers=0, device=args.device,
-            is_first_stage=(args.rank == 0),
-            is_last_stage=(args.rank == args.total - 1),
-        )
-        logger.info(
-            "engine=ov-dist-spec rank=%d/%d device=%s pipeline=%s draft=%s K=%d",
-            args.rank, args.total, args.device, args.model,
-            args.draft_model, args.spec_k,
-        )
-    else:
-        plan = ShardPlan.from_hf_model_id(
-            args.model, num_stages=args.total, devices=[args.device] * args.total,
-        )
-        spec = plan.stages[args.rank]
-        logger.info(
-            "engine=pytorch rank=%d/%d layers=[%d,%d) device=%s first=%s last=%s",
-            args.rank, args.total, spec.layer_start, spec.layer_end, spec.device,
-            spec.is_first_stage, spec.is_last_stage,
-        )
+    engine = registry.get(args.engine)
+    engine.validate(args)
+    spec = engine.build_shard_spec(args)
+    logger.info(
+        "engine=%s rank=%d/%d device=%s model=%s",
+        engine.name, args.rank, args.total, args.device, args.model,
+    )
 
     listen_host, listen_port = parse_addr(args.listen)
-
-    builder: Builder
-    if args.engine == "ov-optimum":
-        from tahoma.worker.engines.openvino.optimum_engine import OptimumOVBuilder
-
-        builder = OptimumOVBuilder(
-            model_path=args.model,
-            device=args.device,
-            weight_format=args.ov_weight_format,
-            draft_model_path=args.draft_model,
-            draft_weight_format=args.ov_weight_format,
-        )
-    elif args.engine == "ov-runtime":
-        from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder
-
-        ov_runtime_builder = OVRuntimeBuilder(
-            pipeline_dir=args.model,
-            rank=args.rank,
-            total=args.total,
-            device=args.device,
-        )
-        ov_runtime_builder.configure_listen(listen_host, listen_port)
-        builder = ov_runtime_builder
-    elif args.engine == "ov-spec":
-        from tahoma.worker.engines.openvino.spec_decode_engine import OVSpecDecodeBuilder
-
-        builder = OVSpecDecodeBuilder(
-            model_path=args.model,
-            draft_model_path=args.draft_model,
-            device=args.device,
-            weight_format=args.ov_weight_format,
-            draft_weight_format=args.ov_weight_format,
-            k=args.spec_k,
-        )
-    elif args.engine == "ov-dist-spec":
-        if args.rank == 0:
-            from tahoma.worker.engines.openvino.dist_spec import OVDistributedSpecBuilder
-
-            builder = OVDistributedSpecBuilder(
-                pipeline_dir=args.model,
-                draft_model_path=args.draft_model,
-                device=args.device,
-                weight_format=args.ov_weight_format,
-                k=args.spec_k,
-            )
-        else:
-            from tahoma.worker.engines.openvino.dist_spec import OVDistSpecWorkerBuilder
-
-            ov_dist_worker = OVDistSpecWorkerBuilder(
-                pipeline_dir=args.model,
-                rank=args.rank,
-                total=args.total,
-                device=args.device,
-            )
-            ov_dist_worker.configure_listen(listen_host, listen_port)
-            builder = ov_dist_worker
-    else:
-        ov_builder = OpenVINOBuilder(model_path=args.model)
-        ov_builder.configure_listen(listen_host, listen_port)
-        builder = ov_builder
+    builder = engine.build_builder(args, listen_host, listen_port)
 
     upstream: PeerEndpoint | None = None
     if not spec.is_first_stage:
@@ -189,6 +83,17 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
     peers = PeerLayout(upstream=upstream, downstream=downstream)
     runner = Runner(builder)
+
+    if args.pid_file:
+        _write_pid_file(Path(args.pid_file))
+
+    def _shutdown(signum: int, _frame: FrameType | None) -> None:
+        logger.info("received signal %d, shutting down", signum)
+        runner.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     try:
         runner.start(peers, spec)
@@ -254,17 +159,10 @@ def main() -> int:
     )
     pw.add_argument(
         "--engine", default="pytorch",
-        choices=["pytorch", "ov-optimum", "ov-runtime", "ov-spec", "ov-dist-spec"],
+        choices=registry.names(),
         help=(
-            "inference engine: "
-            "'pytorch' (default, distributed) | "
-            "'ov-optimum' (single-stage OV via optimum-intel; auto-export) | "
-            "'ov-runtime' (multi-stage OV with stateful KV cache; expects a "
-            "pre-exported pipeline directory at --model with stage_<i>/ subdirs) | "
-            "'ov-spec' (single-stage OV with mask-based speculative decoding; "
-            "requires --draft-model) | "
-            "'ov-dist-spec' (multi-stage OV with spec decode; requires "
-            "--draft-model on rank 0; uses physical KV trim)"
+            "inference engine. Run `tahoma engines` to see descriptions. "
+            "Add new engines via `tahoma.worker.engines.registry.register(...)`."
         ),
     )
     pw.add_argument(
@@ -293,12 +191,24 @@ def main() -> int:
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
     )
+    pw.add_argument(
+        "--pid-file",
+        help="write the worker's PID here for systemd / NSSM / supervisord integration",
+    )
+    pw.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="logging level (default INFO)",
+    )
     pw.set_defaults(func=cmd_worker)
+
+    pe = sub.add_parser("engines", help="list registered inference engines")
+    pe.set_defaults(func=cmd_engines)
 
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(args, "log_level", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
 
