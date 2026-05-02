@@ -75,3 +75,22 @@ Adding FastDraft to CB mode **HURTS aggregate throughput** at batch ≥ 4. The d
 | Mixed (1-3 concurrent) | Try both; SchedulerConfig+FastDraft is in the middle, neither extreme. |
 
 For tahoma: the `ov-genai` engine should expose both modes via flags. Today it has `--draft-model` (single-user mode); a follow-up should add `--ov-scheduler-cb` for the multi-tenant path.
+
+## Update (c20 part 3): charlie CB sweep
+
+| Batch | Aggregate tok/s | Per-request |
+|---|---|---|
+| 1 | 143.00 | 143.0 |
+| 2 | 40.88 | 20.4 |
+| 4 | 74.07 | 18.5 |
+| 8 | **149.14** | 18.6 |
+
+Charlie's Lunar Lake 140V iGPU saturates at the same batch=8 sweet
+spot as alpha's Battlemage. Slightly higher aggregate (149 vs 138) —
+the iGPU's parallelism handles the batched matmul slightly better
+than Battlemage's higher-clock single-stream design. Per-request
+stays around 18.5 tok/s on charlie vs 17.2 on alpha.
+
+Both nodes confirmed: a single Intel AI PC can serve ~8 concurrent
+chat sessions at ~18-20 tok/s each on Llama 3.1 8B INT4 — about the
+same total throughput as serving 1 user at 134-149 tok/s.

@@ -1,0 +1,4 @@
+charlie batch=1: agg=143.00
+charlie batch=2: agg=40.88
+charlie batch=4: agg=74.07
+charlie batch=8: agg=149.14

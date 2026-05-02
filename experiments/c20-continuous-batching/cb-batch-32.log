@@ -1,0 +1,1 @@
+RESULT={"batch": 32, "decode_s": 3.663647413253784, "aggregate_tok_s": 559.0057581936128, "per_request_tok_s": 17.4689299435504}
