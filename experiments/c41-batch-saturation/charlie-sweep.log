@@ -1,0 +1,6 @@
+--- charlie batch=16 ---
+RESULT={"batch": 16, "decode_s": 4.8555526999989524, "aggregate_tok_s": 210.892572538698, "per_request_tok_s": 13.180785783668625}
+--- charlie batch=32 ---
+RESULT={"batch": 32, "decode_s": 7.137968700000783, "aggregate_tok_s": 286.9163603925267, "per_request_tok_s": 8.96613626226646}
+--- charlie batch=64 ---
+RESULT={"batch": 64, "decode_s": 13.049795899998571, "aggregate_tok_s": 313.8746407520786, "per_request_tok_s": 4.904291261751228}
