@@ -1,0 +1,1 @@
+RESULT={"model": "C:\\cascadia\\models\\llama-3.1-8b-int4", "device": "GPU", "tokens": 64, "decode_s": 0.6638462543487549, "tok_s": 96.40786489453819, "load_s": 18.49015712738037, "warmup_s": 0.7086925506591797, "plugin_config": {}, "perf_metrics": {}, "first_text": "The capital of France is Paris."}

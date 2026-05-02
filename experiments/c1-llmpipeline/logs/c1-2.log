@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "C:\tahoma\bench_llmpipeline.py", line 108, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\bench_llmpipeline.py", line 34, in main
+    import openvino_genai as ov_genai
+  File "C:\Program Files\Python311\Lib\site-packages\openvino_genai\__init__.py", line 13, in <module>
+    from .py_openvino_genai import (
+ImportError: DLL load failed while importing py_openvino_genai: The specified procedure could not be found.

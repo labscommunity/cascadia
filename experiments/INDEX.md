@@ -10,3 +10,5 @@ Chronological list of every experiment run on this branch. Status legend: ✓ WI
 | 4    | c0-baselines | c0-3   | re-measure ov-spec K=4 on alpha | alpha | 📊 13.83 tok/s, accept 0.50 | -60% vs main 35.0; accept fell from 0.91 |
 | 5    | c0-baselines | c0-4   | re-measure ov-runtime on TB (v5 shards) | dist | ◌ engine v3-only, shape mismatch | — |
 | 6    | c0-baselines | c0-5   | re-measure ov-dist-spec on TB | dist | 📊 17.59 tok/s, accept 0.62 | matches main 17.36 |
+| 7    | c1-llmpipeline | c1-1 | LLMPipeline (no plugin config) on alpha | alpha | **✓ 96.41 tok/s** | **+10.8×** vs c0-1b |
+| 8    | c1-llmpipeline | c1-2 | LLMPipeline on charlie | charlie | ◌ DLL ABI mismatch (genai/OV) | — |
