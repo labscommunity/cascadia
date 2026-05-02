@@ -123,3 +123,37 @@ The PL win does NOT extrapolate to very long inputs. The n-gram lookup table's b
 
 The Discovery #3 headline number stands for the c21 workload but is NOT a universal RAG win.
 
+
+---
+
+## ⚠️ MAJOR CORRECTION (c57-c58, 2026-05-02) — bench artifact inflated all absolute numbers
+
+The bench scripts in c1-c56 reported `tok_s = max_tokens / total_dt` instead
+of `actual_generated_tokens / total_dt`. For short prompts where the model
+EOSes early (e.g., "What is the capital of France?" produces 8 tokens; "Summarize
+in 2 sentences" produces ~99 tokens), the absolute throughput numbers were
+inflated by `max_tokens / actual_tokens` (typically 5-14×).
+
+### What this means for the discoveries
+
+**RELATIVE wins are still valid** (both modes hit same EOS, ratio is preserved):
+- Discovery #1: LLMPipeline ~10× over OVModelForCausalLM — robust
+- Discovery #2: FastDraft +55% over plain (not +24% as bench claimed) — re-measured in c58
+- Discovery #3: PL +40% over plain on extractive (not +94%) — re-measured in c57
+- Discovery #4: NPU concurrent multi-model serving — relative measurement robust
+
+**ABSOLUTE numbers are inflated**:
+- Plain LLMPipeline factual chat: ~17 tok/s actual (not 96)
+- LLMPipeline + FastDraft factual: ~27 tok/s actual (not 135)
+- Plain LLMPipeline extractive RAG: ~20 tok/s actual (not 100-200)
+- LLMPipeline + PL extractive RAG: ~28 tok/s actual (not 388)
+
+### Lessons for future autolab work
+
+1. ALWAYS count actual tokens via tokenizer, not max_tokens cap.
+2. Use a prompt that doesn't hit EOS for long-output benchmarks.
+3. perf_metrics.num_generated_tokens is unreliable in OV 2026.1 LLMPipeline
+   for greedy short outputs.
+4. Be skeptical of >150 tok/s claims for 8B INT4 on Intel iGPU — physics
+   says memory-bandwidth caps around 150-200 tok/s per pass.
+
