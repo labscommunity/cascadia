@@ -1,0 +1,4 @@
+--- charlie threshold=0.3 ---
+RESULT={"input": 1024, "out": 32, "threshold": 0.3, "best": {"dt": 1.5211531999993895, "n_out": 32, "tok_s": 21.03667138853131}}
+--- charlie threshold=0.5 ---
+RESULT={"input": 1024, "out": 32, "threshold": 0.5, "best": {"dt": 1.51494140000068, "n_out": 32, "tok_s": 21.12292924332627}}

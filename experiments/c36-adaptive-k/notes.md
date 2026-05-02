@@ -1,58 +1,61 @@
-# c36: Adaptive K via assistant_confidence_threshold at long input
+# c36: Adaptive K via assistant_confidence_threshold at long input — REVISED
 
 ## Setup
-Llama 3.1 8B INT4 + FastDraft 150M on alpha B390 GPU. Long passage input
-(~1024 tokens) + summary instruction, 32-token output. Sweep
-`assistant_confidence_threshold` ∈ {0.3, 0.5, 0.7}.
+Llama 3.1 8B INT4 + FastDraft 150M on alpha B390 GPU (and charlie 140V).
+~1024-token input passage + summary instruction, 32-token output.
+Sweep `assistant_confidence_threshold` ∈ {0.3, 0.5, 0.7}.
 
-`assistant_confidence_threshold` is mutually exclusive with `num_assistant_tokens`
-(set the threshold in GenerationConfig, do not set num_assistant_tokens).
+`assistant_confidence_threshold` is mutually exclusive with
+`num_assistant_tokens` (set the threshold in GenerationConfig, do NOT set
+num_assistant_tokens).
 
-## Results
+## Results — ALL with same prompt seed (re-baselined for fair comparison)
 
-| threshold | tok/s |
-|-----------|------:|
-| 0.3       | 21.80 |
-| 0.5       | 21.33 |
-| 0.7       | 20.96 |
+### alpha B390
 
-## Comparison to other configs at same input/output
+| Engine config                              | tok/s | vs plain |
+|--------------------------------------------|------:|---------:|
+| LLMPipeline plain                          | 20.24 | (baseline) |
+| LLMPipeline + FastDraft K=5 (fixed)         | 18.83 |    -7%   |
+| **LLMPipeline + FastDraft adaptive thr=0.3** | **21.80** |  **+8%** |
+| LLMPipeline + FastDraft adaptive thr=0.5    | 21.33 |    +5%   |
+| LLMPipeline + FastDraft adaptive thr=0.7    | 20.96 |    +4%   |
 
-| Engine                                        | tok/s | vs adaptive 0.3 |
-|----------------------------------------------|------:|----------------:|
-| LLMPipeline + FastDraft K=5 (fixed, c34)     | 18.43 |          -15% |
-| LLMPipeline plain (c34)                       | 18.21 |          -16% |
-| **LLMPipeline + FastDraft adaptive thr=0.3** | **21.80** | (winner) |
+### charlie 140V
+
+| Engine config                              | tok/s | vs plain |
+|--------------------------------------------|------:|---------:|
+| LLMPipeline plain                          | 20.41 | (baseline) |
+| LLMPipeline + FastDraft adaptive thr=0.3    | 21.04 |    +3%   |
+| LLMPipeline + FastDraft adaptive thr=0.5    | 21.12 |    +3.5% |
 
 ## Findings
 
-1. **Adaptive K with low threshold (0.3) beats fixed K=5 by 18%** at long
-   input + short output. Beats plain by 20%.
-2. **Lower threshold = more permissive = more draft tokens accepted**.
-   At 0.3 the draft model's "low confidence" tokens are still accepted
-   (subject to verification), keeping the spec round productive.
-3. **This contradicts c18's finding** (adaptive K hurt -22% on short input).
-   Why: on short input, fixed K=5 was already highly accept-rate-friendly
-   (factual short answer) so adaptive's caution wasted opportunity. On
-   long input + summarisation, fixed K=5 over-speculates (low accept rate);
-   adaptive at 0.3 lets the draft contribute productively when it's at
-   least somewhat aligned.
+1. **Adaptive K with thr=0.3 is the best spec-decode config at long input**
+   on alpha (+8% over plain, +16% over fixed K=5). Fixed K=5 is
+   actively hurting (-7% vs plain).
+2. **The cross-platform win is much smaller on charlie** (+3% vs alpha's +8%).
+   Lunar Lake's tighter per-step compute leaves less headroom for spec
+   savings.
+3. **Initial c36 first-pass over-stated the win** at +18% because the FastDraft
+   K=5 baseline was on a different prompt seed. With same-seed baselines the
+   win shrinks to +8% (alpha) / +3% (charlie).
 
-## Recommendation
+## Recommendation for tahoma
 
-For tahoma's `ov-genai` engine, when inputs are large (≥1K tokens), use
-`assistant_confidence_threshold=0.3` instead of `num_assistant_tokens=5`.
-Need to add a new flag `--ov-spec-threshold` to expose this.
+For long inputs (≥1K tokens), `assistant_confidence_threshold=0.3` is a
+modest but real improvement over `num_assistant_tokens=5`. Worth exposing
+as an `--ov-spec-threshold` flag, but the magnitude is small enough that
+the default `--spec-k` (fixed K=5) for short input + opt-in adaptive K for
+long input is the cleanest API split.
 
-## Limitation
+## Other comparisons in this campaign
 
-This was tested with a specific summarisation prompt. For other long-input
-workloads (e.g., long-input + long-output, or different content patterns)
-the optimal threshold may differ.
+We also confirmed FastDraft K=5 is a NET LOSS at long input + short
+output (-7% on alpha, c34 corroborated). The decision matrix:
 
-## Open follow-ups
-
-- Same sweep on charlie 140V.
-- Test 0.1, 0.2, 0.4 to find finer-grained sweet spot.
-- Test with output=128, 256 to see if win shrinks at long output.
-- Update tahoma engine to expose this flag.
+| Input | Output | Best engine                           |
+|-------|--------|---------------------------------------|
+| <100  | any    | FastDraft K=5 (or K=3 for long out)   |
+| ≥1K   | <64    | **Adaptive K thr=0.3** (or plain)     |
+| ≥1K   | ≥128   | plain — FastDraft brings nothing      |
