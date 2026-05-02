@@ -1,0 +1,17 @@
+{
+  "model": "C:\\cascadia\\models\\llama-3.1-8b-int4",
+  "draft": "C:\\cascadia\\models\\srang992-llama-3.2-1b-int4-ov",
+  "device": "GPU",
+  "k": 3,
+  "threshold": 0.0,
+  "tokens": 64,
+  "decode_s": 0.7125141620635986,
+  "tok_s": 89.82277603387116,
+  "load_s": 29.19395160675049,
+  "warmup_s": 0.7905135154724121,
+  "plugin_config": {},
+  "perf_metrics": {},
+  "first_text": "The capital of France is Paris.",
+  "id": "c2-2",
+  "host": "alpha.local"
+}

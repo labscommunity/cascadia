@@ -1,0 +1,1 @@
+RESULT={"model": "C:\\cascadia\\models\\llama-3.1-8b-int4", "device": "GPU", "tokens": 256, "decode_s": 11.882542133331299, "tok_s": 21.544211426097405, "load_s": 16.443909645080566, "warmup_s": 0.7037789821624756, "plugin_config": {}, "perf_metrics": {}, "first_text": "**Distributed Inference for Large Language Models: A Game-Changer in Natural Lan"}
