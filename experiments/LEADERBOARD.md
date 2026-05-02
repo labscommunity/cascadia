@@ -136,3 +136,15 @@ Best measured tok/s per `(model, hardware, engine, workload)` combination.
 
 **194 tok/s on a Lunar Lake iGPU for real RAG at 4K input + 256 output.**
 Best single-instance speedup in the autolab session (PL nearly doubles plain).
+
+## ABSOLUTE PEAK: PL extractive at 4K input + 512 output
+
+| Hardware | Plain | PL n=3 | Δ |
+|---|---|---|---|
+| **charlie 140V GPU (Lunar Lake iGPU)** | 199.57 | **388.81** | **+95%** |
+| **alpha B390 GPU (Battlemage dGPU)** | 194.57 | **381.54** | **+96%** |
+
+**~388 tok/s on a Lunar Lake iGPU** for real extractive RAG at 4K input
++ 512 output. Pure decode rate ~480 tok/s (excluding ~250ms TTFT prefill).
+PL nearly DOUBLES plain throughput. This is the absolute single-instance
+peak in the autolab session.
