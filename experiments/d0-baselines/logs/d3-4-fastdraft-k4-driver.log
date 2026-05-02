@@ -1,0 +1,41 @@
+python : 2026-05-02 08:33:16,341 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:3...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:33:17,816 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:33:17,832 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:33:17,895 INFO tahoma.worker.runner | load: compiling target stage 0
+2026-05-02 08:33:21,198 INFO tahoma.worker.runner | load: loading tokenizer
+2026-05-02 08:33:30,326 INFO tahoma.worker.runner | load: resolving draft C:\cascadia\models\fastdraft-150m-int8-ov
+2026-05-02 08:33:30,326 INFO tahoma.worker.runner | load: compiling draft
+2026-05-02 08:33:31,787 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:33:31,787 INFO tahoma.worker.runner | build engine
+2026-05-02 08:33:31,787 INFO tahoma.worker.runner | warmup
+2026-05-02 08:33:32,569 INFO tahoma.worker.engines.openvino.dist_spec | warmup ok (dist-spec v5 K=4)
+2026-05-02 08:33:32,571 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:33:32,571 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:33:32,571 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 active (dist-spec v5 K=4)
+ Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France?
+A) Berlin
+B) Paris
+C) Rome
+D) Madrid
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. 
+The best answer is B. The best answer is B. The best answer is B. The best answer is B. The best answer is B. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy.2026-05-02 08:33:40,211 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 done: 256 tokens, 81 steps, 
+accept=0.55
+
+WALL_CLOCK_S=26.1663867

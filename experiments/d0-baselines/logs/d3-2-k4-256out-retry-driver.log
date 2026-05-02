@@ -1,0 +1,90 @@
+python : 2026-05-02 08:28:54,772 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:28:56,268 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:28:56,284 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:28:56,347 INFO tahoma.worker.runner | load: compiling target stage 0
+2026-05-02 08:28:59,663 INFO tahoma.worker.runner | load: loading tokenizer
+2026-05-02 08:29:08,827 INFO tahoma.worker.runner | load: resolving draft unsloth/Llama-3.2-1B-Instruct
+2026-05-02 08:29:08,827 INFO tahoma.worker.engines.openvino.optimum_engine | using cached OV IR at 
+C:\Users\cascadia\.cache\tahoma\ov_exports\unsloth--Llama-3.2-1B-Instruct-int4
+2026-05-02 08:29:08,827 INFO tahoma.worker.runner | load: compiling draft
+2026-05-02 08:29:12,601 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:29:12,601 INFO tahoma.worker.runner | build engine
+2026-05-02 08:29:12,601 INFO tahoma.worker.runner | warmup
+2026-05-02 08:29:24,997 WARNING tahoma.worker.engines.openvino.dist_spec | warmup failed: [WinError 10054] An existing 
+connection was forcibly closed by the remote host
+2026-05-02 08:29:24,997 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:29:24,997 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:29:24,997 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 active (dist-spec v5 K=4)
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 197, in cmd_worker
+    for chunk in runner.generate(task):
+  File "C:\tahoma\tahoma\worker\runner.py", line 59, in generate
+    chunks = self.step_once()
+             ^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in step_once
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in <dictcomp>
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 244, in step
+    tok = next(active.iterator)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\spec_decode.py", line 142, in spec_decode_greedy_stream
+    target.reset()
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 128, in reset
+    send_reset(self.downstream_sock)
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec_protocol.py", line 75, in send_reset
+    sock.sendall(struct.pack(_KIND_FMT, int(FrameKind.RESET)))
+ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+WALL_CLOCK_S=31.9520039
+python : 2026-05-02 08:29:27,397 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:29:28,875 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+Traceback (most recent call last):
+  File "C:\tahoma\tahoma\worker\transport.py", line 174, in connect
+    sock.connect((self.host, self.port))
+TimeoutError: timed out
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 166, in cmd_worker
+    runner.start(peers, spec)
+  File "C:\tahoma\tahoma\worker\runner.py", line 40, in start
+    self._builder.connect(peers)
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 306, in connect
+    client.connect()
+  File "C:\tahoma\tahoma\worker\transport.py", line 184, in connect
+    raise TimeoutError(
+TimeoutError: could not connect to 10.10.10.2:9100 within 30.0s
+WALL_CLOCK_S=32.8903292

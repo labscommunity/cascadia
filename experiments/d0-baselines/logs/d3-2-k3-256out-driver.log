@@ -1,0 +1,122 @@
+python : 2026-05-02 08:27:28,054 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:27:29,499 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:27:29,530 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:27:29,594 INFO tahoma.worker.runner | load: compiling target stage 0
+2026-05-02 08:27:32,876 INFO tahoma.worker.runner | load: loading tokenizer
+WALL_CLOCK_S=9.576611
+python : 2026-05-02 08:27:40,023 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:27:41,482 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:27:41,498 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:27:41,561 INFO tahoma.worker.runner | load: compiling target stage 0
+2026-05-02 08:27:44,814 INFO tahoma.worker.runner | load: loading tokenizer
+2026-05-02 08:27:53,819 INFO tahoma.worker.runner | load: resolving draft unsloth/Llama-3.2-1B-Instruct
+2026-05-02 08:27:53,819 INFO tahoma.worker.engines.openvino.optimum_engine | using cached OV IR at 
+C:\Users\cascadia\.cache\tahoma\ov_exports\unsloth--Llama-3.2-1B-Instruct-int4
+2026-05-02 08:27:53,819 INFO tahoma.worker.runner | load: compiling draft
+2026-05-02 08:27:57,782 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:27:57,782 INFO tahoma.worker.runner | build engine
+2026-05-02 08:27:57,782 INFO tahoma.worker.runner | warmup
+2026-05-02 08:28:14,271 WARNING tahoma.worker.engines.openvino.dist_spec | warmup failed: [WinError 10054] An existing 
+connection was forcibly closed by the remote host
+2026-05-02 08:28:14,271 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:28:14,271 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:28:14,271 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 active (dist-spec v5 K=3)
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\tahoma\tahoma\__main__.py", line 6, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 368, in main
+    return args.func(args)
+           ^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\cli.py", line 197, in cmd_worker
+    for chunk in runner.generate(task):
+  File "C:\tahoma\tahoma\worker\runner.py", line 59, in generate
+    chunks = self.step_once()
+             ^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in step_once
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\runner.py", line 53, in <dictcomp>
+    return {tid: chunk for tid, chunk in self.engine.step()}
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 244, in step
+    tok = next(active.iterator)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\tahoma\tahoma\worker\engines\openvino\spec_decode.py", line 142, in spec_decode_greedy_stream
+    target.reset()
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec.py", line 128, in reset
+    send_reset(self.downstream_sock)
+  File "C:\tahoma\tahoma\worker\engines\openvino\dist_spec_protocol.py", line 75, in send_reset
+    sock.sendall(struct.pack(_KIND_FMT, int(FrameKind.RESET)))
+ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+WALL_CLOCK_S=36.0117635
+python : 2026-05-02 08:27:38,165 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-05-02 08:27:39,626 INFO tahoma.worker.runner | connect: upstream=None downstream=PeerEndpoint(host='10.10.10.2', 
+port=9100)
+2026-05-02 08:27:41,166 INFO tahoma.worker.transport | ActivationClient connected to 10.10.10.2:9100
+2026-05-02 08:27:41,340 INFO tahoma.worker.runner | load: compiling target stage 0
+2026-05-02 08:27:48,108 INFO tahoma.worker.runner | load: loading tokenizer
+2026-05-02 08:27:57,203 INFO tahoma.worker.runner | load: resolving draft unsloth/Llama-3.2-1B-Instruct
+2026-05-02 08:27:57,203 INFO tahoma.worker.engines.openvino.optimum_engine | using cached OV IR at 
+C:\Users\cascadia\.cache\tahoma\ov_exports\unsloth--Llama-3.2-1B-Instruct-int4
+2026-05-02 08:27:57,203 INFO tahoma.worker.runner | load: compiling draft
+2026-05-02 08:28:01,080 INFO tahoma.worker.runner | load: ready
+2026-05-02 08:28:01,080 INFO tahoma.worker.runner | build engine
+2026-05-02 08:28:01,080 INFO tahoma.worker.runner | warmup
+2026-05-02 08:28:02,465 INFO tahoma.worker.engines.openvino.dist_spec | warmup ok (dist-spec v5 K=3)
+2026-05-02 08:28:02,465 INFO tahoma.worker.runner | runner ready
+2026-05-02 08:28:02,465 INFO tahoma.cli | stdin mode: type a prompt and press enter
+2026-05-02 08:28:02,465 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 active (dist-spec v5 K=3)
+ Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France? Paris
+What is the capital of France?
+A) Berlin
+B) Paris
+C) Rome
+D) Madrid
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Answer: B) Paris
+Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. 
+The best answer is B. The best answer is B. The best answer is B. The best answer is B. The best answer is B. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy. Madrid is the capital of Spain. Explanation: Paris is the capital of France. Berlin is the capital of Germany. Rome is the capital of Italy.2026-05-02 08:28:14,271 INFO tahoma.worker.engines.openvino.dist_spec | task stdin-30 done: 256 tokens, 72 steps, 
+accept=0.86
+
+WALL_CLOCK_S=38.1333141
+python : 2026-05-02 08:28:16,556 INFO tahoma.cli | engine=ov-dist-spec rank=0/2 device=GPU 
+model=C:\cascadia\shards_2stage_v5_beam namespace=default
+At line:1 char:139
++ ...  France?' | python -m tahoma worker --rank 0 --total 2 --engine ov-di ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-05-02 08:2...mespace=default:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+WALL_CLOCK_S=5.4164334
