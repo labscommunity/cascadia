@@ -240,8 +240,13 @@ def main() -> int:
         ),
     )
     pw.add_argument(
-        "--spec-k", type=int, default=3,
-        help="speculative-decoding draft length per round (default 3)",
+        "--spec-k", type=int, default=4,
+        help=(
+            "speculative-decoding draft length per round (default 4). "
+            "Tuned on Llama-3.1-8B target + Llama-3.2-1B draft on Arc B390: "
+            "K=3 → 24.6 tok/s, K=4 → 35 tok/s (91% accept), K=5 → 28 tok/s, "
+            "K=7 → 26 tok/s. Sweet spot depends on draft acceptance rate."
+        ),
     )
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
