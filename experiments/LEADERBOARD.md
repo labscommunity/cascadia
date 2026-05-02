@@ -1,5 +1,38 @@
 # Leaderboard
 
+## ⚠️ CORRECTED NUMBERS (post c57-c59)
+
+The bench scripts in c1-c56 used `tok_s = max_tokens / total_dt` instead of
+counting actual generated tokens. For prompts that EOS early (factual chat,
+extractive summary), this inflated absolute throughput by 5-14×. For
+prompts that fill the cap (creative writing, multi-tenant CB explanation
+prompts), the numbers are accurate.
+
+### Verified actual rates (best of N runs)
+
+| Hardware | Workload | Engine | actual tok/s |
+|----------|----------|--------|-------------:|
+| alpha B390 GPU | Llama 3.1 8B INT4, factual chat | LLMPipeline plain | 17.5 |
+| alpha B390 GPU | Llama 3.1 8B INT4, factual chat | LLMPipeline + FastDraft K=5 | **27.2** (+55%) |
+| alpha B390 GPU | Llama 3.1 8B INT4, creative 256-out | LLMPipeline + FastDraft K=3 | **28.29** |
+| alpha B390 GPU | Llama 3.1 8B INT4, multi-tenant CB b=8 | LLMPipeline + CB | **131** aggregate |
+| charlie 140V GPU | Llama 3.2 1B INT4, factual chat | LLMPipeline plain | **55.6** |
+| charlie 140V GPU | Llama 3.1 8B INT4, extractive RAG (1K-4K input) | LLMPipeline + PL | **~28** (+40-50%) |
+
+### Verified RELATIVE wins (still valid for engine selection)
+
+| Comparison | Win |
+|-----------|----:|
+| LLMPipeline vs OVModelForCausalLM (8B INT4 factual) | ~10× |
+| LLMPipeline + FastDraft vs LLMPipeline plain (factual) | +55% |
+| LLMPipeline + PL vs LLMPipeline plain (extractive RAG) | +40-50% |
+| Concurrent NPU+GPU vs sequential same-GPU (b=16 + 1B) | +16% effective |
+
+---
+
+# (LEGACY — original inflated numbers below)
+
+
 Best measured tok/s per `(model, hardware, engine, workload)` combination.
 
 ## Llama 3.1 8B Instruct INT4 — single user
