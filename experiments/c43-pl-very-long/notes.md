@@ -1,38 +1,56 @@
-# c43: Prompt Lookup at very long inputs (2K, 4K) on charlie 140V
+# c43: Prompt Lookup at very long inputs (2K, 4K) — REVISED
 
 ## Setup
-Llama 3.1 8B INT4 + LLMPipeline + `prompt_lookup=True` on charlie 140V GPU.
-Input is a synthetic distributed-systems passage at ~{2048, 4096} tokens
-+ summary instruction. 64-tok output. Sweep `max_ngram_size ∈ {2, 3, 5}`.
+Llama 3.1 8B INT4 on charlie 140V GPU. 64-token output. Synthetic
+distributed-systems passage.
+
+PL via LLMPipeline with `prompt_lookup=True`, `max_ngram_size=N`,
+`num_assistant_tokens=5`. Plain via standard LLMPipeline (no spec).
 
 ## Results
+
+### PL sweep (n ∈ {2, 3, 5}, K=5)
 
 | Input | n=2 | n=3 | n=5 |
 |-------|----:|----:|----:|
 |  2048 | 34.3 | 35.5 | 34.0 |
 |  4096 | 32.8 | 32.8 | 32.8 |
 
-## Findings
+### Plain LLMPipeline (no spec)
 
-1. **PL works at 4K input** — 33 tok/s end-to-end vs ~21 tok/s plain decode
-   estimate from c32 (different platform but similar profile). **~+57%
-   over plain at 4K input.**
-2. **ngram size 2-5 makes no significant difference** at very long inputs.
-   The lookup table size grows with input but the win-per-match also
-   grows; effects cancel.
-3. **PL win is roughly constant from 1K → 4K input** (~32-35 tok/s
-   throughout). The win does NOT scale with input length — once the
-   pattern reuse matches a sufficient n-gram, the per-step savings are
-   the same.
+| Input | tok/s | TTFT ms |
+|-------|------:|--------:|
+|  4096 | 38.4 | 351 |
 
-## Recommendation
+## Findings — REVISED
 
-Keep `prompt_lookup=True, max_ngram_size=3` as the default for
-RAG / summarization workloads at any input length up to at least 4K.
-The win is robust and the cost (lookup table) is negligible.
+1. **PL at 4K input is a -14% LOSS vs plain LLMPipeline** (32.8 vs 38.4
+   on charlie). The PL win we saw in c21 (small passage, +65%) does
+   NOT extrapolate to very long inputs.
+2. **The cross-over point is somewhere in 1K-2K range.** At 1K input
+   we measured PL ~32 tok/s; if plain is ~38 there too, PL would also
+   lose. Need direct plain-vs-PL bench at 1K and 2K to find exact
+   crossover.
+3. **At 4K input the n-gram lookup table is large** (~4K positions)
+   and its build/search per-step cost grows. The savings from any
+   accepted draft tokens are eaten by the lookup overhead.
 
-## Open
-- Test 8K input — does the win hold? (Would need to validate context
-  fits and KV doesn't OOM.)
-- Test PL with output ≥ 256 to see if longer outputs amplify or dampen
-  the win.
+## REVISED understanding of when PL wins
+
+PL wins when:
+- Input has highly repetitive vocabulary that the model is summarizing.
+- Input length is in the 100-1000 token range.
+- Output is at least as long as the average matched n-gram.
+
+PL loses when:
+- Input is very short (no n-gram matches possible).
+- Input is very long (lookup overhead exceeds savings).
+- Output is very short (savings can't amortise).
+
+The c21 +65% finding was from a sweet-spot workload (250-token passage,
+128-token summary). It does not generalize.
+
+## Action
+
+Update DECISION_MATRIX.md to reflect PL being workload-specific, not a
+universal RAG default. Recommend manual A/B test for new workloads.
