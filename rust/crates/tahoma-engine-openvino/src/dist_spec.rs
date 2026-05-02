@@ -1121,8 +1121,12 @@ impl OvDistSpecWorkerEngine {
             )),
             FrameKind::Forward => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
+                //    Keep hidden as raw bytes (f16 wire format) — the IR
+                //    expects f16 for the hidden_states port and we want
+                //    to avoid the f16→f32→f16 round-trip the previous
+                //    impl did per spec round.
                 let upstream2 = upstream.clone();
-                let (logical_pos_start, attn, hidden_f32, hidden_shape) = run_async(&self.runtime_handle, async move {
+                let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) = run_async(&self.runtime_handle, async move {
                         let mut g = upstream2.lock().await;
                         let pos_bytes = g.recv_raw(4).await?;
                         let logical_pos_start = u32::from_be_bytes([
@@ -1131,19 +1135,11 @@ impl OvDistSpecWorkerEngine {
                         let (attn_t, _) = g.recv().await?;
                         let attn_i64 = bytes_to_i64(&attn_t.data);
                         let (hidden_t, _) = g.recv().await?;
-                        let hs_f32 = match hidden_t.dtype {
-                            WireDType::F32 => hidden_t
-                                .data
-                                .chunks_exact(4)
-                                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                .collect::<Vec<_>>(),
-                            WireDType::F16 => f16_bytes_to_f32(&hidden_t.data),
-                            _ => return Err(tahoma_transport::TransportError::SocketClosed),
-                        };
                         Ok::<_, tahoma_transport::TransportError>((
                             logical_pos_start,
                             attn_i64,
-                            hs_f32,
+                            hidden_t.data,
+                            hidden_t.dtype,
                             [
                                 hidden_t.shape[0] as usize,
                                 hidden_t.shape[1] as usize,
@@ -1179,14 +1175,17 @@ impl OvDistSpecWorkerEngine {
                     .cloned()
                     .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
 
-                // The v5 shard's hidden_states port is f16 (not f32). The
-                // Python engine does .astype(np.float32) and pip-OV
-                // silently down-casts; the Rust GPU plugin does NOT
-                // auto-cast and rejects with "tensor f16 vs port f32".
-                // Pass the raw f16 bytes (wire format) directly.
-                let hs_bytes_f16 = f32_to_f16_bytes(&hidden_f32);
+                // The v5 shard's hidden_states port is f16. Pass the wire
+                // bytes through directly to avoid f16→f32→f16 round-trip.
+                let shim_dtype = match hidden_dtype {
+                    WireDType::F16 => ShimDType::F16,
+                    WireDType::F32 => ShimDType::F32,
+                    _ => return Err(EngineError::Backend(format!(
+                        "unexpected hidden dtype on wire {hidden_dtype:?}"
+                    ))),
+                };
                 self.runtime
-                    .set_input(&in_hs, ShimDType::F16, &hidden_shape, &hs_bytes_f16)
+                    .set_input(&in_hs, shim_dtype, &hidden_shape, &hidden_bytes)
                     .map_err(map_ov_err)?;
                 self.runtime
                     .set_input(
@@ -1221,8 +1220,6 @@ impl OvDistSpecWorkerEngine {
                         )))
                     }
                 };
-                // Avoid unused-var warning when not used below.
-                let _ = hidden_f32;
                 let mut out_shape_wire = [1u32; MAX_RANK];
                 for (i, d) in out_shape.iter().enumerate().take(MAX_RANK) {
                     out_shape_wire[i] = *d as u32;

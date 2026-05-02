@@ -3,9 +3,44 @@
 Tracking the Python → Rust hard rewrite landed under `rust/` on the
 `feat/rust-port` branch. Updated whenever a phase lands.
 
+## Engine port status (alpha + charlie hardware)
+
+| Engine | Port | Mac unit tests | Real OV build | Real-model e2e | A/B vs Python |
+|---|---|:-:|:-:|:-:|---|
+| `ov-genai` | ✅ | ✅ 5 | ✅ alpha + charlie | ✅ | **at parity** (Rust 20.5 vs Python 20.3 plain; 22.3 vs 22.6 FastDraft; 29.3 vs 29.4 PL) |
+| `ov-runtime` | ✅ | ✅ 3 | ✅ alpha + charlie | ⏳ no v3 shards on hand | n/a |
+| `ov-dist-spec` | ✅ | ✅ 9 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 | **Rust 2.2× slower** (12.66 vs 28.05 tok/s; same 64 tok output, Rust accept 0.83 vs Python 0.59) |
+
+The distributed perf gap is a real regression vs Python and **blocks
+Python tree removal**. Causes (most-likely-first):
+
+1. C++ FFI shim's `set_input` allocates a fresh `ov::Tensor` and
+   `memcpy`s the input bytes on every call. Per spec round there are
+   ~4 set_input calls per node × ~18 rounds = ~72 alloc+memcpy ops in
+   Rust that the pip-installed Python OV does mostly zero-copy via
+   numpy array borrowing.
+2. `tokio::task::block_in_place` + `Handle::block_on` bridge fires on
+   every TCP send/recv across the language boundary. Measurable
+   per-call overhead at this round count.
+3. Each spec-round now has identical wire-format work (verified
+   tested in commit 16d7c97) but more native-call overhead.
+
+**Suggested optimization PR** (not in this PR):
+- Switch the FFI shim to zero-copy: pre-allocate per-stage tensors at
+  load time via the borrowing constructor `ov::Tensor::Tensor(elem,
+  shape, void* data)`, reuse across infer calls.
+- Drop the f16→f32→f16 round-trip in worker step (already partially
+  done in 16d7c97 — the worker now passes wire f16 bytes through
+  unchanged when the IR port is f16).
+- Consider making `Engine::step` async to remove the runtime-bridge.
+
+For the **single-node `ov-genai`** path the per-call overhead is
+amortized over a single `generate()` call so doesn't materially affect
+tok/s; A/B parity confirmed.
+
 ## What's working today
 
-`cargo test --workspace` on macOS — **47 passing, 0 failures.**
+`cargo test --workspace` on macOS — **63 passing, 0 failures.**
 
 | Crate | Tests | What it does |
 |---|---:|---|
