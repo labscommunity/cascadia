@@ -65,7 +65,6 @@ def _build_rotary(model_id: str) -> tuple[Any, Any]:
     Uses `local_files_only=True` to avoid HF round-trips at every load —
     expects the model's config.json to already be in the HF hub cache.
     """
-    import torch
     from transformers import AutoConfig
     from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
@@ -329,7 +328,6 @@ class OVRuntimeBuilder(Builder):
 
     def load(self, shard: ShardSpec) -> Iterable[LoadProgress]:
         import openvino as ov  # type: ignore[import-untyped]
-        from transformers import AutoTokenizer
 
         yield LoadProgress(0, None, f"reading {self._pipeline_dir}")
         pipeline_cfg = _load_pipeline_config(self._pipeline_dir)
@@ -384,21 +382,8 @@ class OVRuntimeBuilder(Builder):
 
     @staticmethod
     def _load_tokenizer(tokenizer_dir: Path, model_id: str) -> Any:
-        """Try the bundled tokenizer first; fall back to HF cache on the
-        model id. The bundled tokenizer can fail if it was exported with a
-        newer transformers that references a class the local install lacks.
-        """
-        from transformers import AutoTokenizer
-
-        if tokenizer_dir.is_dir():
-            try:
-                return AutoTokenizer.from_pretrained(str(tokenizer_dir))
-            except (ValueError, KeyError, ImportError) as err:
-                logger.warning(
-                    "bundled tokenizer at %s failed (%s); falling back to %s",
-                    tokenizer_dir, err, model_id,
-                )
-        return AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        from tahoma.worker.engines.openvino._hub import load_tokenizer
+        return load_tokenizer(model_id, bundled_dir=tokenizer_dir)
 
     def build(self) -> Engine:
         if self._shard is None or self._spec is None:

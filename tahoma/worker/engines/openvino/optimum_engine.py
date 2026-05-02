@@ -86,14 +86,25 @@ def resolve_or_export_ov_ir(model_path: str, weight_format: str = "int4") -> str
         )
 
     out.mkdir(parents=True, exist_ok=True)
+    resolved_model = model_path
+    if "/" in model_path and not Path(model_path).exists():
+        from tahoma.worker.engines.openvino._hub import resolve_local_snapshot
+        try:
+            resolved_model = resolve_local_snapshot(model_path)
+        except (OSError, ValueError) as err:
+            logger.info(
+                "no local snapshot for %s (%s); optimum-cli will fetch from hub",
+                model_path, type(err).__name__,
+            )
     logger.info(
         "exporting %s -> %s (weight_format=%s); this may take several minutes",
-        model_path, out, weight_format,
+        resolved_model, out, weight_format,
     )
     subprocess.run(
         [
             "optimum-cli", "export", "openvino",
-            "--model", model_path,
+            "--model", resolved_model,
+            "--task", "text-generation-with-past",
             "--weight-format", weight_format,
             str(out),
         ],
