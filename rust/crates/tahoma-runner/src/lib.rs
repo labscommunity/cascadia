@@ -53,13 +53,24 @@ impl Runner {
         }
     }
 
-    /// Connect transports, load weights, build engine, warm up.
-    pub async fn start(&self, peers: PeerLayout, shard: ShardSpec) -> Result<(), EngineError> {
+    /// Connect transports, load weights, build engine, warm up. Pass
+    /// `listen_addr = Some((host, port))` for stages that need to bind a
+    /// listener for an upstream peer (non-first stages); `None` is fine
+    /// for single-stage / first-stage engines.
+    pub async fn start_with_listen(
+        &self,
+        peers: PeerLayout,
+        shard: ShardSpec,
+        listen_addr: Option<(&str, u16)>,
+    ) -> Result<(), EngineError> {
         let mut builder = self
             .builder
             .lock()
             .take()
             .ok_or(EngineError::NotLoaded)?;
+        if let Some((host, port)) = listen_addr {
+            builder.configure_listen(host, port);
+        }
         info!(
             upstream = ?peers.upstream,
             downstream = ?peers.downstream,
@@ -83,6 +94,14 @@ impl Runner {
 
         *self.engine.lock() = Some(engine);
         Ok(())
+    }
+
+    /// Backwards-compatible shortcut equivalent to
+    /// `start_with_listen(peers, shard, None)`. Engines that need a
+    /// listener (workers, middle stages) should call
+    /// [`start_with_listen`] with the correct address.
+    pub async fn start(&self, peers: PeerLayout, shard: ShardSpec) -> Result<(), EngineError> {
+        self.start_with_listen(peers, shard, None).await
     }
 
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {

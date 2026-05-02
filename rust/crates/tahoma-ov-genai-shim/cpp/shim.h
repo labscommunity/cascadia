@@ -125,6 +125,17 @@ int32_t tahoma_runtime_output_name(
     tahoma_runtime_t* handle, size_t idx,
     char* out_buf, size_t out_cap, size_t* out_len);
 
+/// All aliases of input/output port `idx`, joined by '\n'. Use this for
+/// canonical-name matching against IRs that expose multiple aliases per
+/// port (e.g. v5 stage_1 IRs where "hidden_states" is a secondary
+/// alias of an internal node name).
+int32_t tahoma_runtime_input_name_all(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len);
+int32_t tahoma_runtime_output_name_all(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len);
+
 /// Element type codes — keep in sync with tahoma-transport's DType.
 /// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64.
 #define TAHOMA_DTYPE_F32 0u

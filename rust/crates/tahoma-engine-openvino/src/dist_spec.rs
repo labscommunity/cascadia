@@ -124,6 +124,19 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// Bridge sync code to an async future. Works whether we're called
+/// from inside a tokio worker thread (e.g. `ChunkStream::poll_next` on
+/// the driver) or from a plain blocking thread (e.g.
+/// `Runner::run_relay_loop` via `spawn_blocking` on workers). Without
+/// the dispatch, calling `block_on` from a worker thread panics with
+/// "Cannot start a runtime from within a runtime".
+fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => handle.block_on(fut),
+    }
+}
+
 // -------- pipeline / stage config --------
 
 #[derive(Debug, Deserialize)]
@@ -156,10 +169,15 @@ fn read_stage_config(p: &std::path::Path) -> Result<StageConfig, EngineError> {
         .map_err(|e| EngineError::InvalidConfig(format!("stage_config.json: {e}")))
 }
 
-fn v5_inputs(runtime: &OvRuntime) -> Result<std::collections::HashMap<String, String>, EngineError> {
+fn v5_inputs(
+    runtime: &OvRuntime,
+) -> Result<std::collections::HashMap<String, String>, EngineError> {
     use std::collections::HashMap;
-    let names = runtime.input_names().map_err(map_ov_err)?;
+    let n_inputs = runtime.input_count();
     let mut map: HashMap<String, String> = HashMap::new();
+    // Mirrors the Python _v5_inputs(): for each input port, check ALL
+    // its aliases against each canonical name; if a match is found,
+    // map the canonical name -> the port's primary (first) name.
     for canonical in [
         "input_ids",
         "hidden_states",
@@ -167,9 +185,14 @@ fn v5_inputs(runtime: &OvRuntime) -> Result<std::collections::HashMap<String, St
         "position_ids",
         "beam_idx",
     ] {
-        for n in &names {
-            if n == canonical || n.contains(canonical) {
-                map.insert(canonical.to_string(), n.clone());
+        for idx in 0..n_inputs {
+            let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
+            let primary = runtime.input_name(idx).map_err(map_ov_err)?;
+            if aliases
+                .iter()
+                .any(|a| a == canonical || a.contains(canonical))
+            {
+                map.insert(canonical.to_string(), primary);
                 break;
             }
         }
@@ -311,13 +334,21 @@ pub struct MaskedReq {
 
 impl MaskedReq {
     pub fn new(runtime: OvRuntime) -> Result<Self, EngineError> {
-        let names = runtime.input_names().map_err(map_ov_err)?;
-        let has_beam = names.iter().any(|n| n.contains("beam_idx"));
+        let n_inputs = runtime.input_count();
         let mut inputs = std::collections::HashMap::new();
+        let mut has_beam = false;
         for canonical in ["input_ids", "attention_mask", "position_ids", "beam_idx"] {
-            for n in &names {
-                if n == canonical || n.contains(canonical) {
-                    inputs.insert(canonical.to_string(), n.clone());
+            for idx in 0..n_inputs {
+                let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
+                let primary = runtime.input_name(idx).map_err(map_ov_err)?;
+                if aliases
+                    .iter()
+                    .any(|a| a == canonical || a.contains(canonical))
+                {
+                    if canonical == "beam_idx" {
+                        has_beam = true;
+                    }
+                    inputs.insert(canonical.to_string(), primary);
                     break;
                 }
             }
@@ -470,8 +501,7 @@ impl DistributedMaskedReq {
     pub fn reset(&mut self) -> Result<(), EngineError> {
         self.stage0.reset_state().map_err(map_ov_err)?;
         let downstream = self.downstream.clone();
-        self.runtime_handle
-            .block_on(async move {
+        run_async(&self.runtime_handle, async move {
                 let mut g = downstream.lock().await;
                 let raw = (FrameKind::Reset as u32).to_be_bytes();
                 g.send_raw(&raw).await
@@ -544,9 +574,7 @@ impl DistributedMaskedReq {
         let logical_pos_start = self.logical_pos as u32;
         let downstream = self.downstream.clone();
         let attn_clone = attn.clone();
-        let (logits, _logits_shape) = self
-            .runtime_handle
-            .block_on(async move {
+        let (logits, _logits_shape) = run_async(&self.runtime_handle, async move {
                 let mut g = downstream.lock().await;
                 // We need raw socket access. The ActivationClient exposes
                 // send_raw/recv_raw + send_tensor/recv_tensor; build the
@@ -1027,7 +1055,34 @@ impl Engine for OvDistSpecWorkerEngine {
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
         let result = self.handle_one_frame();
         if let Err(e) = result {
-            warn!(error = %e, "ov-dist-spec worker step error");
+            // Transport-closed errors signal the driver disconnected;
+            // don't spam the log. Drop the upstream/downstream so the
+            // next step exits the relay loop cleanly via NotConnected.
+            let msg = e.to_string();
+            if msg.contains("socket closed") || msg.contains("not connected") {
+                warn!("ov-dist-spec worker: upstream closed, exiting");
+                // Mark engine as drained by clearing connections.
+                let _ = self
+                    .runtime_handle
+                    .clone()
+                    .block_on(async {
+                        let mut g = self.upstream.lock().await;
+                        g.close().await;
+                        Ok::<_, tahoma_transport::TransportError>(())
+                    });
+                if let Some(d) = &self.downstream {
+                    let _ = self.runtime_handle.clone().block_on(async {
+                        let mut g = d.lock().await;
+                        g.close().await;
+                        Ok::<_, tahoma_transport::TransportError>(())
+                    });
+                }
+                // Sleep a tick so the relay loop's busy spin doesn't
+                // hot-loop until the runner notices.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            } else {
+                warn!(error = %e, "ov-dist-spec worker step error");
+            }
         }
         Vec::new()
     }
@@ -1039,9 +1094,7 @@ impl OvDistSpecWorkerEngine {
         let downstream = self.downstream.clone();
 
         // 1. Read kind from upstream.
-        let kind = self
-            .runtime_handle
-            .block_on(async {
+        let kind = run_async(&self.runtime_handle, async {
                 let mut g = upstream.lock().await;
                 g.recv_raw(4).await.map(|b| {
                     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
@@ -1055,11 +1108,10 @@ impl OvDistSpecWorkerEngine {
             FrameKind::Reset => {
                 self.runtime.reset_state().map_err(map_ov_err)?;
                 if let Some(d) = downstream {
-                    self.runtime_handle
-                        .block_on(async move {
-                            let mut dg = d.lock().await;
-                            dg.send_raw(&(FrameKind::Reset as u32).to_be_bytes()).await
-                        })
+                    run_async(&self.runtime_handle, async move {
+                        let mut dg = d.lock().await;
+                        dg.send_raw(&(FrameKind::Reset as u32).to_be_bytes()).await
+                    })
                         .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
                 Ok(())
@@ -1070,9 +1122,7 @@ impl OvDistSpecWorkerEngine {
             FrameKind::Forward => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
                 let upstream2 = upstream.clone();
-                let (logical_pos_start, attn, hidden_f32, hidden_shape) = self
-                    .runtime_handle
-                    .block_on(async move {
+                let (logical_pos_start, attn, hidden_f32, hidden_shape) = run_async(&self.runtime_handle, async move {
                         let mut g = upstream2.lock().await;
                         let pos_bytes = g.recv_raw(4).await?;
                         let logical_pos_start = u32::from_be_bytes([
@@ -1129,16 +1179,14 @@ impl OvDistSpecWorkerEngine {
                     .cloned()
                     .ok_or_else(|| EngineError::Backend("missing beam_idx input".into()))?;
 
-                // hidden_states needs to be f32 going into the IR (per Python)
-                let hs_bytes = {
-                    let mut b = Vec::with_capacity(hidden_f32.len() * 4);
-                    for x in &hidden_f32 {
-                        b.extend_from_slice(&x.to_le_bytes());
-                    }
-                    b
-                };
+                // The v5 shard's hidden_states port is f16 (not f32). The
+                // Python engine does .astype(np.float32) and pip-OV
+                // silently down-casts; the Rust GPU plugin does NOT
+                // auto-cast and rejects with "tensor f16 vs port f32".
+                // Pass the raw f16 bytes (wire format) directly.
+                let hs_bytes_f16 = f32_to_f16_bytes(&hidden_f32);
                 self.runtime
-                    .set_input(&in_hs, ShimDType::F32, &hidden_shape, &hs_bytes)
+                    .set_input(&in_hs, ShimDType::F16, &hidden_shape, &hs_bytes_f16)
                     .map_err(map_ov_err)?;
                 self.runtime
                     .set_input(
@@ -1173,6 +1221,8 @@ impl OvDistSpecWorkerEngine {
                         )))
                     }
                 };
+                // Avoid unused-var warning when not used below.
+                let _ = hidden_f32;
                 let mut out_shape_wire = [1u32; MAX_RANK];
                 for (i, d) in out_shape.iter().enumerate().take(MAX_RANK) {
                     out_shape_wire[i] = *d as u32;
@@ -1181,22 +1231,20 @@ impl OvDistSpecWorkerEngine {
                 if self.is_last {
                     // Send LOGITS_RESPONSE back to upstream
                     let upstream3 = upstream.clone();
-                    self.runtime_handle
-                        .block_on(async move {
-                            let mut g = upstream3.lock().await;
-                            g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                                .await?;
-                            let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
-                            g.send(&t).await
-                        })
-                        .map_err(|e| EngineError::Backend(e.to_string()))?;
+                    run_async(&self.runtime_handle, async move {
+                        let mut g = upstream3.lock().await;
+                        g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+                            .await?;
+                        let t = WireTensor::new(WireDType::F16, out_shape_wire, out_f16_bytes);
+                        g.send(&t).await
+                    })
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
                 } else {
                     // Forward downstream, then relay LOGITS_RESPONSE upstream
                     let downstream =
                         downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
                     let upstream3 = upstream.clone();
-                    self.runtime_handle
-                        .block_on(async move {
+                    run_async(&self.runtime_handle, async move {
                             // Send FORWARD downstream
                             let attn_t = WireTensor::new(
                                 WireDType::I64,
@@ -1450,6 +1498,7 @@ fn lookup_eos(model_dir: &std::path::Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tahoma_transport::{ActivationClient, ActivationServer};
 
     #[test]
     fn frame_kind_roundtrip() {
@@ -1461,8 +1510,129 @@ mod tests {
     }
 
     #[test]
+    fn frame_kind_unknown_returns_none() {
+        assert_eq!(FrameKind::from_u32(99), None);
+        assert_eq!(FrameKind::from_u32(0), None);
+        assert_eq!(FrameKind::from_u32(2), None); // gap between 1 and 3
+    }
+
+    #[test]
     fn argmax_basic() {
         let v = vec![0.1, 0.5, 0.2, 0.05];
         assert_eq!(argmax(&v), 1);
+    }
+
+    #[test]
+    fn argmax_picks_first_on_ties() {
+        let v = vec![0.5, 0.5, 0.5];
+        assert_eq!(argmax(&v), 0);
+    }
+
+    #[test]
+    fn dtype_conversions_roundtrip() {
+        let f = vec![1.0f32, -2.5, 3.14, 0.0];
+        let bytes16 = f32_to_f16_bytes(&f);
+        assert_eq!(bytes16.len(), f.len() * 2);
+        let back = f16_bytes_to_f32(&bytes16);
+        for (a, b) in f.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 0.01, "lost precision: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn i64_bytes_roundtrip() {
+        let xs = vec![1i64, -2, 3, 4_000_000_000];
+        let bytes = i64_to_bytes(&xs);
+        assert_eq!(bytes.len(), xs.len() * 8);
+        assert_eq!(bytes_to_i64(&bytes), xs);
+    }
+
+    /// FORWARD frame round-trip via real TCP + ActivationClient/Server,
+    /// mirrors `tests/test_dist_spec_protocol.py::test_forward_roundtrip`.
+    #[tokio::test]
+    async fn forward_roundtrip() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let kb = server.recv_raw(4).await.unwrap();
+            let kind = FrameKind::from_u32(u32::from_be_bytes([
+                kb[0], kb[1], kb[2], kb[3],
+            ]))
+            .unwrap();
+            let pos_b = server.recv_raw(4).await.unwrap();
+            let pos = u32::from_be_bytes([pos_b[0], pos_b[1], pos_b[2], pos_b[3]]);
+            let (attn, _) = server.recv().await.unwrap();
+            let (hidden, _) = server.recv().await.unwrap();
+            (kind, pos, attn.data, hidden.data)
+        });
+
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+
+        // Send FORWARD frame inline (mirroring DistributedMaskedReq.feed)
+        let mut header = [0u8; 8];
+        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+        header[4..8].copy_from_slice(&42u32.to_be_bytes());
+        client.send_raw(&header).await.unwrap();
+        let attn = vec![1i64, 1, 1, 0, 1];
+        let attn_t = WireTensor::new(WireDType::I64, [1, 1, 5], i64_to_bytes(&attn));
+        client.send(&attn_t).await.unwrap();
+        let hidden_data = (0..16u8).collect::<Vec<u8>>();
+        let hidden_t = WireTensor::new(WireDType::F16, [1, 2, 4], hidden_data.clone());
+        client.send(&hidden_t).await.unwrap();
+
+        let (kind, pos, attn_rx, hidden_rx) = h.await.unwrap();
+        assert_eq!(kind, FrameKind::Forward);
+        assert_eq!(pos, 42);
+        assert_eq!(attn_rx, i64_to_bytes(&attn));
+        assert_eq!(hidden_rx, hidden_data);
+    }
+
+    #[tokio::test]
+    async fn reset_kind_only() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let kb = server.recv_raw(4).await.unwrap();
+            FrameKind::from_u32(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])).unwrap()
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let raw = (FrameKind::Reset as u32).to_be_bytes();
+        client.send_raw(&raw).await.unwrap();
+        assert_eq!(h.await.unwrap(), FrameKind::Reset);
+    }
+
+    #[tokio::test]
+    async fn logits_response_roundtrip() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let kb = server.recv_raw(4).await.unwrap();
+            let kind = FrameKind::from_u32(u32::from_be_bytes([
+                kb[0], kb[1], kb[2], kb[3],
+            ]))
+            .unwrap();
+            let (logits, _) = server.recv().await.unwrap();
+            (kind, logits.data)
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        client
+            .send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+            .await
+            .unwrap();
+        let logits = (0..200u8).collect::<Vec<u8>>();
+        let t = WireTensor::new(WireDType::F16, [1, 2, 50], logits.clone());
+        client.send(&t).await.unwrap();
+        let (kind, rx) = h.await.unwrap();
+        assert_eq!(kind, FrameKind::LogitsResponse);
+        assert_eq!(rx, logits);
     }
 }

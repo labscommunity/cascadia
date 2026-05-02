@@ -143,6 +143,15 @@ mod sys {
             out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
         ) -> c_int;
 
+        pub fn tahoma_runtime_input_name_all(
+            handle: *mut tahoma_runtime_t, idx: usize,
+            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+        ) -> c_int;
+        pub fn tahoma_runtime_output_name_all(
+            handle: *mut tahoma_runtime_t, idx: usize,
+            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+        ) -> c_int;
+
         pub fn tahoma_runtime_set_input(
             handle: *mut tahoma_runtime_t, tensor_name: *const c_char,
             dtype: u32, shape: *const usize, rank: usize,
@@ -546,6 +555,29 @@ impl Runtime {
         return Err(Error::Stub);
         #[cfg(feature = "openvino")]
         self.name_at(sys::tahoma_runtime_output_name, idx)
+    }
+
+    /// All aliases for input port `idx`, as `Vec<String>`. Useful for
+    /// matching against canonical names like "hidden_states" or
+    /// "attention_mask" where the IR's first/any name is an internal
+    /// node ID rather than the canonical name.
+    pub fn input_aliases(&self, idx: usize) -> Result<Vec<String>> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        {
+            let joined = self.name_at(sys::tahoma_runtime_input_name_all, idx)?;
+            Ok(joined.split('\n').map(str::to_string).collect())
+        }
+    }
+    pub fn output_aliases(&self, idx: usize) -> Result<Vec<String>> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        {
+            let joined = self.name_at(sys::tahoma_runtime_output_name_all, idx)?;
+            Ok(joined.split('\n').map(str::to_string).collect())
+        }
     }
 
     pub fn input_names(&self) -> Result<Vec<String>> {

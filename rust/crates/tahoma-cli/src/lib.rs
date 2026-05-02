@@ -294,7 +294,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
 
     let builder = build_builder(&args)?;
     let runner = Arc::new(Runner::new(builder));
-    runner.start(peers, shard).await?;
+    let listen = if !is_first {
+        Some((listen_host.as_str(), listen_port))
+    } else {
+        None
+    };
+    runner.start_with_listen(peers, shard, listen).await?;
 
     if !is_first {
         info!("entering relay loop");

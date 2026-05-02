@@ -71,6 +71,21 @@ int32_t copy_name_to_buf(const std::string& name, char* out_buf,
     return 0;
 }
 
+// Join all aliases of a port with '\n' so Rust can split on the
+// delimiter. OV node names can't legally contain newlines (per IR
+// spec), so this is unambiguous. Templated since OV returns
+// std::unordered_set<std::string> at 2026.1 but the API may move
+// to std::set in future releases.
+template <typename Set>
+std::string join_port_names(const Set& names) {
+    std::string out;
+    for (const auto& n : names) {
+        if (!out.empty()) out.push_back('\n');
+        out += n;
+    }
+    return out;
+}
+
 }  // namespace
 
 struct tahoma_pipeline_t {
@@ -87,8 +102,10 @@ struct tahoma_runtime_t {
     ov::Core core;
     std::shared_ptr<ov::CompiledModel> compiled;
     std::shared_ptr<ov::InferRequest> request;
-    std::vector<std::string> input_names;
+    std::vector<std::string> input_names;     // first/any name per port
     std::vector<std::string> output_names;
+    std::vector<std::string> input_aliases;   // ALL aliases joined by '\n'
+    std::vector<std::string> output_aliases;
 };
 
 extern "C" {
@@ -263,6 +280,7 @@ int32_t tahoma_runtime_compile(
                 const auto& names = port.get_names();
                 name = names.empty() ? std::string{} : *names.begin();
             }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
             handle->input_names.push_back(std::move(name));
         }
         for (const auto& port : handle->compiled->outputs()) {
@@ -273,6 +291,7 @@ int32_t tahoma_runtime_compile(
                 const auto& names = port.get_names();
                 name = names.empty() ? std::string{} : *names.begin();
             }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
             handle->output_names.push_back(std::move(name));
         }
 
@@ -328,6 +347,24 @@ int32_t tahoma_runtime_output_name(
         set_last_error("output idx out of range"); return 1;
     }
     return copy_name_to_buf(handle->output_names[idx], out_buf, out_cap, out_len);
+}
+
+int32_t tahoma_runtime_input_name_all(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    if (!handle || idx >= handle->input_aliases.size()) {
+        set_last_error("input idx out of range"); return 1;
+    }
+    return copy_name_to_buf(handle->input_aliases[idx], out_buf, out_cap, out_len);
+}
+
+int32_t tahoma_runtime_output_name_all(
+    tahoma_runtime_t* handle, size_t idx,
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    if (!handle || idx >= handle->output_aliases.size()) {
+        set_last_error("output idx out of range"); return 1;
+    }
+    return copy_name_to_buf(handle->output_aliases[idx], out_buf, out_cap, out_len);
 }
 
 int32_t tahoma_runtime_set_input(
