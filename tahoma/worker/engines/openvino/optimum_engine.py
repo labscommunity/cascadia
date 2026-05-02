@@ -12,6 +12,12 @@ Limitations:
 Why this exists: OV Runtime + INT4 + OV's KV cache + iGPU graph compilation
 benchmarks ~4x faster than the PyTorch fp16 + manual KV cache path on the
 same hardware (~17 tok/s vs ~4 tok/s on Lunar Lake Arc 140V for Llama-3.1-8B).
+
+Speculative decoding: pass a `draft_model_path` (optionally an HF id, will
+auto-export) and the engine forwards `assistant_model=draft` into target's
+`generate()`. Target and draft must share a tokenizer (e.g. Llama-3.1-8B
+target + Llama-3.2-1B draft). Per rainier DISCOVERY #20 this is a 1.3-1.5×
+single-user decode speedup at K=3.
 """
 
 from __future__ import annotations
@@ -115,21 +121,27 @@ class OptimumOVEngine(Engine):
     queue (blocking briefly on the next token) and yields it.
     """
 
-    def __init__(self, model: Any, tokenizer: Any):
+    def __init__(self, model: Any, tokenizer: Any, draft_model: Any = None):
         self._model = model
         self._tokenizer = tokenizer
+        self._draft_model = draft_model
         self._active: dict[TaskId, _ActiveTask] = {}
         self._pending: list[GenerationTask] = []
 
     def warmup(self) -> None:
         try:
             ids = self._tokenizer("Hi", return_tensors="pt")
-            self._model.generate(
+            kwargs = dict(
                 **ids,
                 max_new_tokens=1,
                 pad_token_id=self._tokenizer.eos_token_id,
             )
-            logger.info("warmup ok")
+            if self._draft_model is not None:
+                kwargs["assistant_model"] = self._draft_model
+            self._model.generate(**kwargs)
+            logger.info(
+                "warmup ok (spec_decode=%s)", self._draft_model is not None,
+            )
         except Exception as err:  # noqa: BLE001
             logger.warning("warmup failed: %s", err)
 
@@ -157,6 +169,8 @@ class OptimumOVEngine(Engine):
             pad_token_id=self._tokenizer.eos_token_id,
             streamer=streamer,
         )
+        if self._draft_model is not None:
+            kwargs["assistant_model"] = self._draft_model
         thread = Thread(target=self._model.generate, kwargs=kwargs, daemon=True)
         thread.start()
         return _ActiveTask(
@@ -208,19 +222,29 @@ class OptimumOVEngine(Engine):
 
 
 class OptimumOVBuilder(Builder):
-    """Builder for `OptimumOVEngine`. Loads (or auto-exports) OV IR + tokenizer."""
+    """Builder for `OptimumOVEngine`. Loads (or auto-exports) OV IR + tokenizer.
+
+    Optional speculative decoding: pass `draft_model_path`; the draft is
+    loaded onto the same device and used as `assistant_model` in `generate()`.
+    """
 
     def __init__(
         self,
         model_path: str,
         device: str = "GPU",
         weight_format: str = "int4",
+        draft_model_path: str | None = None,
+        draft_weight_format: str = "int4",
     ):
         self._model_path = model_path
         self._device = device
         self._weight_format = weight_format
+        self._draft_model_path = draft_model_path
+        self._draft_weight_format = draft_weight_format
         self._resolved_path: str | None = None
+        self._resolved_draft_path: str | None = None
         self._model: Any = None
+        self._draft_model: Any = None
         self._tokenizer: Any = None
 
     def connect(self, peers: PeerLayout) -> None:
@@ -244,12 +268,25 @@ class OptimumOVBuilder(Builder):
             self._model_path, weight_format=self._weight_format,
         )
 
-        yield LoadProgress(0, None, "compiling OV model")
+        yield LoadProgress(0, None, "compiling OV target model")
         self._model = OVModelForCausalLM.from_pretrained(
             self._resolved_path,
             device=self._device,
             export=False,
         )
+
+        if self._draft_model_path is not None:
+            yield LoadProgress(0, None, f"resolving draft {self._draft_model_path}")
+            self._resolved_draft_path = resolve_or_export_ov_ir(
+                self._draft_model_path, weight_format=self._draft_weight_format,
+            )
+            yield LoadProgress(0, None, "compiling OV draft model")
+            self._draft_model = OVModelForCausalLM.from_pretrained(
+                self._resolved_draft_path,
+                device=self._device,
+                export=False,
+            )
+
         yield LoadProgress(0, None, "loading tokenizer")
         self._tokenizer = AutoTokenizer.from_pretrained(self._resolved_path)
         yield LoadProgress(1, 1, "ready")
@@ -257,8 +294,11 @@ class OptimumOVBuilder(Builder):
     def build(self) -> Engine:
         if self._model is None or self._tokenizer is None:
             raise RuntimeError("call load() before build()")
-        return OptimumOVEngine(self._model, self._tokenizer)
+        return OptimumOVEngine(
+            self._model, self._tokenizer, draft_model=self._draft_model,
+        )
 
     def close(self) -> None:
         self._model = None
+        self._draft_model = None
         self._tokenizer = None

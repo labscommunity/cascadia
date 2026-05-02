@@ -88,6 +88,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
             model_path=args.model,
             device=args.device,
             weight_format=args.ov_weight_format,
+            draft_model_path=args.draft_model,
+            draft_weight_format=args.ov_weight_format,
         )
     elif args.engine == "ov-runtime":
         from tahoma.worker.engines.openvino.ov_runtime import OVRuntimeBuilder
@@ -198,6 +200,14 @@ def main() -> int:
         "--ov-weight-format", default="int4",
         choices=["int4", "int8", "fp16", "fp32"],
         help="weight format for OV IR auto-export (only used by --engine ov-optimum)",
+    )
+    pw.add_argument(
+        "--draft-model",
+        help=(
+            "speculative-decoding draft model — small model id or path that "
+            "shares the target's tokenizer (e.g. unsloth/Llama-3.2-1B-Instruct "
+            "for a Llama-3.1 target). Only used by --engine ov-optimum."
+        ),
     )
     pw.add_argument(
         "--max-tokens", type=int, default=64, help="max new tokens for stdin mode",
