@@ -1,0 +1,42 @@
+optimum-cli : `torch_dtype` is deprecated! Use `dtype` instead!
+At line:1 char:64
++ ... dia\models; optimum-cli export openvino -m C:\cascadia\models\llama-3 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (`torch_dtype` i...dtype` instead!:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loading checkpoint shards:  50%|#####     | 2/4 [00:00<00:00, 15.31it/s]
+Loading checkpoint shards: 100%|##########| 4/4 [00:00<00:00, 17.65it/s]
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+C:\Progra~1\Python311\Lib\site-packages\transformers\cache_utils.py:132: TracerWarning: Converting a tensor to a 
+Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value 
+will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if not self.is_initialized or self.keys.numel() == 0:
+C:\Progra~1\Python311\Lib\site-packages\transformers\masking_utils.py:207: TracerWarning: Converting a tensor to a 
+Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value 
+will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if (padding_length := kv_length + kv_offset - attention_mask.shape[-1]) > 0:
+C:\Progra~1\Python311\Lib\site-packages\optimum\exporters\openvino\model_patcher.py:207: TracerWarning: torch.tensor 
+results are registered as constants in the trace. You can safely ignore this warning if you use this function to 
+create tensors out of constant variables that would be the same every time you call this function. In any other case, 
+this might cause the trace to be incorrect.
+  torch.tensor(0.0, device=mask.device, dtype=dtype),
+C:\Progra~1\Python311\Lib\site-packages\optimum\exporters\openvino\model_patcher.py:208: TracerWarning: torch.tensor 
+results are registered as constants in the trace. You can safely ignore this warning if you use this function to 
+create tensors out of constant variables that would be the same every time you call this function. In any other case, 
+this might cause the trace to be incorrect.
+  torch.tensor(torch.finfo(torch.float16).min, device=mask.device, dtype=dtype),
+C:\Progra~1\Python311\Lib\site-packages\transformers\integrations\sdpa_attention.py:81: TracerWarning: Converting a 
+tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so 
+this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+Statistics collection ------------------------ 100% 128/128 • 0:17:19 • 0:00:00
+INFO:nncf:Statistics of the bitwidth distribution:
++---------------------------+-----------------------------+----------------------------------------+
+| Weight compression mode   | % all parameters (layers)   | % ratio-defining parameters (layers)   |
++===========================+=============================+========================================+
+| int8_asym, per-channel    | 13% (2 / 226)               | 0% (0 / 224)                           |
++---------------------------+-----------------------------+----------------------------------------+
+| int4_asym, group size 128 | 87% (224 / 226)             | 100% (224 / 224)                       |
++---------------------------+-----------------------------+----------------------------------------+
