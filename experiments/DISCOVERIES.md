@@ -157,3 +157,25 @@ inflated by `max_tokens / actual_tokens` (typically 5-14×).
 4. Be skeptical of >150 tok/s claims for 8B INT4 on Intel iGPU — physics
    says memory-bandwidth caps around 150-200 tok/s per pass.
 
+
+---
+
+## ⚠️ DISCOVERY #1 DEBUNKED at c60 (2026-05-02)
+
+The original c1 finding "LLMPipeline is 10.8× faster than OVModelForCausalLM"
+was a bench artifact:
+- c0 OVModel bench was cold-start inflated (no proper warmup): claimed 8.89 tok/s
+- c1 LLMPipeline bench was max_tokens-cap inflated: claimed 96.41 tok/s
+
+Verified at c60 with proper warmup + actual token counting:
+- OVModelForCausalLM: 19.72 tok/s
+- LLMPipeline: 17.42 tok/s
+
+LLMPipeline is actually ~12% slower per-token. NOT 10× faster.
+
+LLMPipeline IS still the right choice for tahoma but for OTHER reasons:
+- Proper chat template handling (LLMPipeline EOSes correctly)
+- Spec decode hooks (FastDraft +55%, PL +40-50%)
+- Continuous batching support
+
+Discoveries #2-4 remain valid (RELATIVE wins within LLMPipeline).
