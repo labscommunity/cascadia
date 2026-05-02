@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "C:\tahoma\bench_llmpipeline.py", line 108, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\tahoma\bench_llmpipeline.py", line 52, in main
+    pipe.generate(args.prompt, cfg_warm)
+RuntimeError: Exception from src\inference\src\cpp\infer_request.cpp:194:
+Check '::getPort(port, name, {_impl->get_inputs(), _impl->get_outputs()})' failed at src\inference\src\cpp\infer_request.cpp:194:
+Port for tensor name attention_mask was not found.
+
+
