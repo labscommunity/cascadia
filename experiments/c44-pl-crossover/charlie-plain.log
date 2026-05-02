@@ -1,0 +1,6 @@
+--- charlie plain 512 input + 64 output ---
+RESULT={"input_target": 512, "best": {"dt": 1.7605575999987195, "n_out": 64, "n_in": 0, "ttft_ms": 336.652099609375, "decode_tok_s": 36.352119351304694}, "all": [{"dt": 1.953422499998851, "n_out": 64, "n_in": 0, "ttft_ms": 528.1673583984375, "decode_tok_s": 32.763009538406386}, {"dt": 1.7605575999987195, "n_out": 64, "n_in": 0, "ttft_ms": 336.652099609375, "decode_tok_s": 36.352119351304694}]}
+--- charlie plain 1024 input + 64 output ---
+RESULT={"input_target": 1024, "best": {"dt": 1.837326299999404, "n_out": 64, "n_in": 0, "ttft_ms": 218.46861267089844, "decode_tok_s": 34.83322477886522}, "all": [{"dt": 2.439267000001564, "n_out": 64, "n_in": 0, "ttft_ms": 811.80908203125, "decode_tok_s": 26.237390166783285}, {"dt": 1.837326299999404, "n_out": 64, "n_in": 0, "ttft_ms": 218.46861267089844, "decode_tok_s": 34.83322477886522}]}
+--- charlie plain 2048 input + 64 output ---
+RESULT={"input_target": 2048, "best": {"dt": 1.9053852999968512, "n_out": 64, "n_in": 0, "ttft_ms": 215.42929077148438, "decode_tok_s": 33.58900690590284}, "all": [{"dt": 3.0074241000002075, "n_out": 64, "n_in": 0, "ttft_ms": 1310.9051513671875, "decode_tok_s": 21.280670059136515}, {"dt": 1.9053852999968512, "n_out": 64, "n_in": 0, "ttft_ms": 215.42929077148438, "decode_tok_s": 33.58900690590284}]}
