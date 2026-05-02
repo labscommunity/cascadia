@@ -61,3 +61,37 @@ Always verify cross-engine comparisons by:
 1. Counting actual generated tokens.
 2. Properly warming both engines before timing.
 3. Using the SAME prompt-handling (chat template applied or not).
+
+## Update: Apples-to-apples comparison (c60-fair)
+
+When BOTH engines:
+1. Use the same chat template (both apply Llama 3 chat template)
+2. Are properly warmed up (multiple warm-up generates)
+3. Produce the same output (both generate "The capital of France is Paris." = 8 tokens)
+
+| Engine | actual tokens | dt | actual tok/s |
+|--------|--------------:|---:|-------------:|
+| `OVModelForCausalLM` | 8 | 0.464s | 17.23 |
+| `LLMPipeline` | 8 | 0.464s | 17.24 |
+| **Ratio** | — | — | **1.00× (IDENTICAL)** |
+
+## DEFINITIVE finding
+
+OVModelForCausalLM and LLMPipeline have **the SAME per-token throughput**
+on Intel GPU for INT4 LLMs in OV 2026.1. Discovery #1's claimed 10×
+speedup was 100% a bench artifact.
+
+The original c0/c1 numbers (8.89 vs 96.41) emerged from:
+- c0 OVModel bench: cold-start (no warmup → JIT compile included in timing)
+- c1 LLMPipeline bench: warmed up + max_tokens-cap inflation
+
+When you fix BOTH bench errors, the engines tie.
+
+## Why LLMPipeline is still right for tahoma
+
+- **Chat template applied correctly** by default.
+- **Spec decode hooks** (FastDraft +55%, PL +40-50%).
+- **Continuous batching** support.
+- **Cleaner Python API** (`pipe.generate(prompt, cfg)` vs setting up tokenizer + generation_config + decode).
+
+These are real engineering wins. Just NOT a raw per-token speed win.
