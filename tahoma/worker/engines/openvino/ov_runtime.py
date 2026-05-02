@@ -61,12 +61,17 @@ def _build_rotary(model_id: str) -> tuple[Any, Any]:
 
     The rotary uses transformers' canonical Llama implementation, which
     handles `rope_scaling = {type: "llama3", ...}` correctly.
+
+    Uses `local_files_only=True` to avoid HF round-trips at every load —
+    expects the model's config.json to already be in the HF hub cache.
     """
     import torch
     from transformers import AutoConfig
     from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=True, local_files_only=True,
+    )
     rotary = LlamaRotaryEmbedding(config=config)
     rotary.eval()
     for p in rotary.parameters():
@@ -373,12 +378,27 @@ class OVRuntimeBuilder(Builder):
         self._rotary, _ = _build_rotary(model_id)
         if is_first:
             tokenizer_dir = self._pipeline_dir / "tokenizer"
-            if tokenizer_dir.is_dir():
-                self._tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir))
-            else:
-                self._tokenizer = AutoTokenizer.from_pretrained(model_id)
+            self._tokenizer = self._load_tokenizer(tokenizer_dir, model_id)
 
         yield LoadProgress(1, 1, "ready")
+
+    @staticmethod
+    def _load_tokenizer(tokenizer_dir: Path, model_id: str) -> Any:
+        """Try the bundled tokenizer first; fall back to HF cache on the
+        model id. The bundled tokenizer can fail if it was exported with a
+        newer transformers that references a class the local install lacks.
+        """
+        from transformers import AutoTokenizer
+
+        if tokenizer_dir.is_dir():
+            try:
+                return AutoTokenizer.from_pretrained(str(tokenizer_dir))
+            except (ValueError, KeyError, ImportError) as err:
+                logger.warning(
+                    "bundled tokenizer at %s failed (%s); falling back to %s",
+                    tokenizer_dir, err, model_id,
+                )
+        return AutoTokenizer.from_pretrained(model_id, local_files_only=True)
 
     def build(self) -> Engine:
         if self._shard is None or self._spec is None:
