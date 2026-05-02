@@ -1,0 +1,33 @@
+=== plain 4K + 512 (actual tokens) ===
+  {
+    "dt": 5.18346439999732,
+    "actual_tokens": 99,
+    "perf_n": null,
+    "actual_tok_s": 19.099195511027567,
+    "text_len": 560
+  },
+  {
+    "dt": 4.966028900002129,
+    "actual_tokens": 99,
+    "perf_n": null,
+    "actual_tok_s": 19.935445804585942,
+    "text_len": 560
+  }
+]
+
+=== PL 4K + 512 (actual tokens) ===
+  {
+    "dt": 3.79924469999969,
+    "actual_tokens": 99,
+    "perf_n": null,
+    "actual_tok_s": 26.057810911734133,
+    "text_len": 560
+  },
+  {
+    "dt": 3.533135499998025,
+    "actual_tokens": 99,
+    "perf_n": null,
+    "actual_tok_s": 28.020436804661284,
+    "text_len": 560
+  }
+]
