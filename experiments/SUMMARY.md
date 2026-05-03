@@ -42,6 +42,22 @@ Everything load-bearing in pipeline-parallel inference:
 - [LEADERBOARD.md](LEADERBOARD.md) — best-of for each (model × workload × topology) tuple
 - [DISCOVERIES.md](DISCOVERIES.md) — novel / surprising findings worth saving forever
 
+## Session-1 final (2026-05-03, ~5 hours, 14 commits, 12 campaigns, 3 discoveries)
+
+The headline story: **distributed pipeline-parallel inference of Llama 3.1 8B INT4 on alpha (B390 dGPU) + charlie (LL 140V iGPU) over Thunderbolt 4 cannot beat single-node alpha for single-user sequential decode**, regardless of layer split, K-tuning, plugin config, NPU experiments, or speculation regime tested.
+
+The structural ceiling is ~17-18 tok/s vs single-node 23 tok/s (e0/e10/D2). The 1.20× perf bar is unreachable on this model+hardware combination without changing one of:
+
+1. **Model size** — distributed wins by default for models too big for one node (Mixtral 8x7B INT4, Llama 70B INT4). Blocked this session on Mixtral cas-bridge download stalls.
+2. **Hardware concurrency** — within-host TP via alpha NPU + alpha GPU on the same forward. Multi-week engineering, big potential.
+3. **Speculation regime** — needs reliable next-token prediction from a fast local source. Pseudo-head via embed projection at layers 16/22 was tested and FAILED (0% agreement, D3) — the residual stream still encodes the input token, not the next.
+
+## Discoveries
+
+- **D1** — OV 2026.1 PA transformation requires optimum-cli-shape IRs and is not retrofittable to per-stage trace-based exports (e9).
+- **D2** — 2-stage PP on 8B INT4 over alpha+charlie has a structural upper bound at ~17-18 tok/s; beating single-node for single-user sequential decode is impossible without changing model, hardware concurrency, or speculation (e0/e10).
+- **D3** — Embed-matrix projection of intermediate hidden state (layer 16 or 22 of 32) gives 0% agreement with next-token argmax — the fast-speculation shortcut M3 is dead at validation (m3-pseudohead-feasibility).
+
 ## Session-1 status (2026-05-03)
 
 After 11 campaigns the central finding is **D2** in DISCOVERIES.md: for Llama 3.1 8B INT4 on alpha (B390 dGPU) + charlie (LL 140V iGPU) over TB4, single-user sequential 2-stage PP is structurally bounded at ~17-18 tok/s vs single-node alpha at 23 tok/s. The bar (28 tok/s) is unreachable on this model+hardware without changing one of: model size, hardware concurrency model, speculation regime.
