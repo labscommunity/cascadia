@@ -581,6 +581,13 @@ pub struct DistributedMaskedReq {
     valid_mask: Vec<i64>,
     cache_len: usize,
     logical_pos: usize,
+    // Per-task accumulators — `spec_decode_greedy` resets these at task
+    // start so the final `spec_decode timing` line attributes target
+    // time correctly between alpha-side compute and wire (charlie+net).
+    pub t_alpha_setup: std::time::Duration,
+    pub t_alpha_infer: std::time::Duration,
+    pub t_alpha_output: std::time::Duration,
+    pub t_wire: std::time::Duration,
 }
 
 impl DistributedMaskedReq {
@@ -605,6 +612,10 @@ impl DistributedMaskedReq {
             valid_mask: vec![1i64; 4096],
             cache_len: 0,
             logical_pos: 0,
+            t_alpha_setup: std::time::Duration::ZERO,
+            t_alpha_infer: std::time::Duration::ZERO,
+            t_alpha_output: std::time::Duration::ZERO,
+            t_wire: std::time::Duration::ZERO,
         })
     }
 
@@ -782,6 +793,12 @@ impl DistributedMaskedReq {
             "target.feed timing"
         );
 
+        // Per-task accumulators for the spec_decode summary line.
+        self.t_alpha_setup += std::time::Duration::from_micros(setup_us as u64);
+        self.t_alpha_infer += std::time::Duration::from_micros(infer_us as u64);
+        self.t_alpha_output += std::time::Duration::from_micros(output_us as u64);
+        self.t_wire += std::time::Duration::from_micros(wire_us as u64);
+
         self.cache_len += n;
         self.logical_pos += n;
         let s3 = if hidden_shape.len() == 3 {
@@ -845,6 +862,10 @@ pub fn spec_decode_greedy(
     let mut t_draft = std::time::Duration::ZERO;
     let t_total = std::time::Instant::now();
     target.reset()?;
+    target.t_alpha_setup = std::time::Duration::ZERO;
+    target.t_alpha_infer = std::time::Duration::ZERO;
+    target.t_alpha_output = std::time::Duration::ZERO;
+    target.t_wire = std::time::Duration::ZERO;
     draft.reset()?;
 
     let _ts = std::time::Instant::now();
@@ -957,6 +978,14 @@ pub fn spec_decode_greedy(
         draft_ms = t_draft.as_millis() as u64,
         other_ms = other.as_millis() as u64,
         total_ms = total.as_millis() as u64,
+        // Per-task target.feed breakdown:
+        // alpha_setup (set_input) + alpha_infer (stage_0 GPU compute)
+        // + alpha_output (read stage_0 output) + wire (send +
+        // charlie stage_1 + recv).
+        target_alpha_setup_ms = target.t_alpha_setup.as_millis() as u64,
+        target_alpha_infer_ms = target.t_alpha_infer.as_millis() as u64,
+        target_alpha_output_ms = target.t_alpha_output.as_millis() as u64,
+        target_wire_ms = target.t_wire.as_millis() as u64,
         "spec_decode timing"
     );
     Ok(out)
