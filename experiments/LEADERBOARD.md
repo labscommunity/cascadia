@@ -15,5 +15,6 @@ Best measured tok/s per (model × workload × topology). Updated after each camp
 | Topology | Engine | Config | tok/s | Notes |
 |----------|--------|--------|------:|-------|
 | Single-node alpha B390 (12 GB GPU) | `ov-genai` | LLMPipeline | **0.54** | Spilled to shared system memory — usable but glacial. Distributed has huge upside here once shards exist. |
-| Distributed alpha+charlie/TB4 (factual workload) | `ov-dist-spec` | **K=1**, FastDraft 150M, v5 16/16 | **15.81** | e8 |
+| Distributed alpha+charlie/TB4 (factual workload) | `ov-dist-spec` | **K=3**, **Llama 3.2 1B INT4 draft**, v5 16/16 | **18.42** | Q3.X |
+| Distributed alpha+charlie/TB4 (factual workload) | `ov-dist-spec` | K=1, FastDraft 150M, v5 16/16 | 15.81 | e8 |
 | Distributed alpha+charlie/TB4 | `ov-dist-spec` | K=1, FastDraft 150M, v5 16/16 | 11.78 | e2 |
