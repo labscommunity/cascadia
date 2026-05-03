@@ -41,3 +41,21 @@ Everything load-bearing in pipeline-parallel inference:
 - [INDEX.md](INDEX.md) — chronological list of every campaign with one-line result
 - [LEADERBOARD.md](LEADERBOARD.md) — best-of for each (model × workload × topology) tuple
 - [DISCOVERIES.md](DISCOVERIES.md) — novel / surprising findings worth saving forever
+
+## Session-1 status (2026-05-03)
+
+After 11 campaigns the central finding is **D2** in DISCOVERIES.md: for Llama 3.1 8B INT4 on alpha (B390 dGPU) + charlie (LL 140V iGPU) over TB4, single-user sequential 2-stage PP is structurally bounded at ~17-18 tok/s vs single-node alpha at 23 tok/s. The bar (28 tok/s) is unreachable on this model+hardware without changing one of: model size, hardware concurrency model, speculation regime.
+
+Levers tried + results:
+- spec K-sweep on creative + factual workloads (e2, e8): K=1 wins; higher K wastes target compute when accept rate is low. Drop default K from 5 → 1 for the dist_spec engine — modest free win.
+- Layer rebalance 22/10 (e4): no-op — bottleneck shifts but doesn't shrink.
+- U8 KV cache plugin config (e6): -13% regression without paged-attention in the IR.
+- NPU stage_1 (e7-side): can't compile — dynamic shape rejected.
+- NPU draft (e9-side): -67% — cross-device sync too expensive.
+- Paged-attention re-export (e9): blocked at the OV transformation level — D1 in DISCOVERIES.
+
+Levers NOT yet tried (in scope for session 2):
+- **Models that don't fit single-node** (Mixtral 8x7B INT4 — download stalled on cas-bridge / Llama 70B INT4 — not downloaded). Cleanest moonshot: distributed wins by default because single-node OOMs.
+- **Within-host hardware concurrency**: alpha NPU + alpha GPU running different attention heads of the same forward in parallel. Multi-week engineering, biggest potential.
+- **Early-exit pseudo-head speculation**: project stage_0 hidden via embed matrix → speculative pseudo_token → pipeline next stage_0 while charlie verifies. Multi-day, quality risk.
+- **Async draft + target overlap**: estimated +5-15% on factual K=1, marginal on creative. Engineered, then deferred — real win but doesn't cross the bar (needs to compose with one of the above).
