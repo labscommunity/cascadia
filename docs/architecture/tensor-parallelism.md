@@ -6,11 +6,10 @@ PP and TP compose. A typical exo-style cluster of four nodes might run as `total
 
 ## Status
 
-This commit ships the foundation:
-
-- `tahoma.parallel.TPGroup` — ring-based all-reduce-sum over TCP (validated against numpy ground truth for tp_size in {2, 3, 4}, fp16 + fp32).
-- `ShardSpec.tp_size` / `ShardSpec.tp_rank` carried through CLI as `--tp-size` / `--tp-rank`.
-- Engine ABCs unchanged. Engines that don't opt in to TP must reject `tp_size > 1` with a clear error.
+The Python prototype shipped a `TPGroup` (ring all-reduce over TCP) plus
+`ShardSpec.tp_size` / `tp_rank` plumbing. The Rust port has not yet
+re-landed TP — `--tp-size` / `--tp-rank` flags do not exist on
+`tahoma worker` today. Re-introducing TP requires:
 
 What's **not** here yet (per-engine work, requires re-exported shards):
 
@@ -54,4 +53,4 @@ The TP group's listen ports are sequential from `--listen` (one per peer). Disco
 - Multi-node TP over a high-bandwidth fabric (Thunderbolt 4/5, 10 GbE+): cuts per-token latency for very large layers when network bandwidth ≫ layer compute.
 - TP over Wi-Fi / LAN: usually a loss. The all-reduce traffic is `2 × (1 - 1/tp_size) × hidden_size × bytes_per_token`, which dominates when bandwidth is < ~1 Gbps.
 
-The placement engine in `tahoma/master/` does not yet model TP cost. It's a follow-up: a TP edge is `2x` the per-link bandwidth use of a PP edge, and the placement search should account for that.
+A future placement engine should model TP cost: a TP edge is `2x` the per-link bandwidth use of a PP edge, and the placement search should account for that.

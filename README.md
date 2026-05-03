@@ -8,28 +8,43 @@ Tahoma distributes LLM inference across Intel laptops, desktops, and AI PCs. Sha
 
 ## Status
 
-**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake). The runtime ships five engines today; see `tahoma engines`. Intel Arc discrete GPUs and Xeon CPU-only nodes are on the roadmap.
+**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime. Four engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`. Intel Arc-only Xeon CPU-only nodes are on the roadmap.
+
+The Rust port is the only implementation as of 2026-05-02. The earlier Python prototype was removed at the end of Phase 12.
 
 ## Why Tahoma
 
 Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, and require sending your data offsite. Tahoma lets you point a few Intel machines at each other and run models that none of them could handle alone.
 
-## Install
+## Build from source
+
+Tahoma is a Cargo workspace under `rust/`. Two build modes:
 
 ```bash
-pip install -e .             # core (PyTorch path)
-pip install -e '.[ov]'       # adds OpenVINO + optimum-intel for the OV engines
+# Stub mode — no OpenVINO link required. Good for dev / CI on macOS / Linux.
+# Engines that need OV will return a clean runtime error.
+cd rust && cargo build --release -p tahoma
+
+# Real OV mode — links against openvino-genai 2026.1.0+. Required to run
+# the OV engines on real Intel hardware.
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
+  cargo build --release -p tahoma --features openvino
 ```
 
-Requires Python 3.11+. The OpenVINO engines run on Intel iGPU/NPU/CPU; PyTorch paths work on any platform.
+The resulting binary lands at `rust/target/release/tahoma` (`tahoma.exe` on Windows). It is statically linked apart from the OV dynamic libraries — copy the binary plus `INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and `runtime/3rdparty/tbb/bin/` to the worker host's PATH.
+
+Build prerequisites:
+
+- Rust 1.75+ (`rustup default stable`)
+- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK download from intel.com
 
 ## Quick start
 
-### Single machine, one shot
+### Single machine
 
 ```bash
-# Local OpenAI-style int4 export auto-pulled on first run.
-tahoma worker --rank 0 --total 1 --engine ov-optimum --device GPU \
+# Single-stage OV-GenAI engine (auto-export from HF model id):
+tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --model unsloth/Meta-Llama-3.1-8B-Instruct \
               --api :8000
 
@@ -42,17 +57,17 @@ curl http://localhost:8000/v1/chat/completions -d '{
 
 ### Two machines (pipeline parallel)
 
-Pre-export per-stage shards once with `optimum-cli` or rainier's exporter, then:
+Pre-export per-stage shards once with rainier's exporter, then:
 
 ```bash
 # On node B (last stage, listens for activations):
 tahoma worker --rank 1 --total 2 --engine ov-runtime --device GPU \
-              --model /path/to/shards_2stage_v5_beam \
+              --model /path/to/shards \
               --listen 10.0.0.2:9100
 
 # On node A (first stage, serves the API):
 tahoma worker --rank 0 --total 2 --engine ov-runtime --device GPU \
-              --model /path/to/shards_2stage_v5_beam \
+              --model /path/to/shards \
               --next 10.0.0.2:9100 --api :8000
 ```
 
@@ -62,46 +77,49 @@ Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 
 
 ```
 $ tahoma engines
-  ov-dist-spec    multi-stage OV spec decode with mask-based rewind; v5 shards
-  ov-optimum      single-stage OV via optimum-intel; auto-export
-  ov-runtime      multi-stage OV with stateful KV cache; pre-exported pipeline dir
-  ov-spec         single-stage OV spec decode; requires --draft-model
-  pytorch         distributed PyTorch (default)
+  mock           deterministic word-echo engine for tests
+  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup
+  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards
+  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards
 ```
 
 ## Architecture
 
-See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key seams:
+See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key crates:
 
-- `tahoma/api/` — OpenAI-compatible HTTP
-- `tahoma/worker/` — runner + Engine plugin (one per engine in `worker/engines/`)
-- `tahoma/worker/engines/registry.py` — register a new engine in three lines
-- `tahoma/shared/` — topology graph (per-link latency + bandwidth) and message types
+- `tahoma-api/` — OpenAI-compatible HTTP (axum)
+- `tahoma-runner/` — Per-stage runner; concurrent-safe chunk streaming
+- `tahoma-engine/` — `Engine` + `Builder` traits — the plugin seam
+- `tahoma-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
+- `tahoma-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
+- `tahoma-transport/` — TCP activation relay (length-prefixed tensor wire format)
+- `tahoma-topology/` — Per-link latency + bandwidth measurements
+- `tahoma-discovery/` — mDNS peer discovery on `_tahoma._tcp.local.`
 
-## Per-engine guides
+Per-engine guides:
 
 - [ov-runtime](docs/engines/ov-runtime.md) — multi-stage stateful KV cache
-- [ov-spec](docs/engines/ov-spec.md) — single-stage speculative decoding
 - [ov-dist-spec](docs/engines/ov-dist-spec.md) — multi-stage spec with mask-based rewind
 
 ## Cluster
 
-- Auto-discovery: `tahoma worker --discover ...` (requires `pip install tahoma[discovery]`) advertises this node via mDNS on `_tahoma._tcp.local.` and browses for siblings in the same `TAHOMA_NAMESPACE`. Discovered peers feed `/state` and `/instance/previews` for placement suggestions.
+- Auto-discovery: `--discover` (mDNS) advertises this node and browses for siblings in the same `TAHOMA_NAMESPACE`.
 - Master election: lowest-lexicographic node id in a namespace wins; no explicit messaging.
-- Placement: `POST /instance/previews` returns the top-N pipeline orderings ranked by sum-of-edge-latency (using the per-link measurements in the topology graph — exo's graph stores socket vs RDMA *types* but no measurements).
-- Tensor parallelism: foundation only — see [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md). Engines opt in by calling `TPGroup.all_reduce_sum_inplace` after attention and MLP outputs; today's v5 shards aren't TP-split, so no built-in engine ships TP yet.
+- Tensor parallelism: foundation only — see [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
 
 ## Deploying
 
-Tahoma does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Tahoma handles `SIGTERM` cleanly (`runner.close()` then exit 0) and supports `--pid-file` for supervisor integration.
+Tahoma does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Tahoma handles `SIGTERM` cleanly (`runner.close()` then exit 0).
+
+**Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [`rust/docs/STATUS.md`](rust/docs/STATUS.md) "Security model" for the threat model and Phase 14 hardening details.
 
 ## Troubleshooting
 
-**`Tokenizer class TokenizersBackend does not exist`** — Some shard exports bundle a tokenizer config that current `transformers` can't import. Tahoma falls back to the model id's HF cache; ensure you've run `hf download <model-id> --include tokenizer.json tokenizer_config.json special_tokens_map.json` on each node.
+**`config.json not in <model dir>`** — `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. v5 shards from rainier do not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root.
 
 **`could not connect to … within 30s`** — Start the downstream worker first; the upstream waits for the upstream socket to bind. Check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
-**Worker dies silently when SSH session closes** — On Windows OpenSSH the python child runs in Session 0 and is tied to the SSH parent. Run workers under systemd / nssm / Task Scheduler in production; for ad-hoc testing, keep the SSH session attached or use `nohup` / `screen`.
+**Worker dies silently when SSH session closes** — On Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production; for ad-hoc testing keep the SSH session attached.
 
 ## License
 

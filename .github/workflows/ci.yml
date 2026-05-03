@@ -14,33 +14,40 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (py${{ matrix.python }})
+    name: cargo test (stub)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          components: rustfmt, clippy
 
-      - name: Install (CPU-only torch + dev deps)
-        run: |
-          python -m pip install --upgrade pip
-          # CPU-only torch keeps the runner image small and avoids the CUDA
-          # download. The OpenVINO engines are skipped because [ov] requires
-          # Intel hardware that GitHub-hosted runners don't have.
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install -e '.[dev]'
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
 
-      - name: Lint (ruff)
-        run: ruff check tahoma/ tests/
+      - name: Format check
+        run: cargo fmt --all -- --check
 
-      - name: Test (pytest)
-        run: pytest tests/ -v
+      - name: Lint (clippy)
+        # Warnings tolerated for now — the engine crates have a few
+        # dead-code fields kept around for serde compatibility with
+        # rainier shard configs. Promote to `-D warnings` once those
+        # are tagged with `#[allow(dead_code)]` or actually used.
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test (workspace)
+        # Stub-mode build — engines that need OpenVINO link return a
+        # clean runtime error. Runs every unit test except the e2e
+        # tests that require real Intel hardware.
+        run: cargo test --workspace --all-targets
