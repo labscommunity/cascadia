@@ -42,7 +42,16 @@ Everything load-bearing in pipeline-parallel inference:
 - [LEADERBOARD.md](LEADERBOARD.md) — best-of for each (model × workload × topology) tuple
 - [DISCOVERIES.md](DISCOVERIES.md) — novel / surprising findings worth saving forever
 
-## Session-1 final (2026-05-03, ~5 hours, 14 commits, 12 campaigns, 3 discoveries)
+## At a glance — what to read first
+
+If you're picking this up cold:
+1. **DISCOVERIES.md D2** — the central finding: distributed PP for 8B INT4 is structurally bounded below single-node on this hardware.
+2. **MOONSHOT_PROPOSALS.md M1** — the cleanest moonshot remaining: distributed Mixtral 8x7B (won't fit single-node alpha B390 12GB GPU).
+3. **LEADERBOARD.md** — final perf numbers across (model × workload × topology).
+
+In progress at session-1 close: Mixtral 8x7B INT4 OV-format download via raw curl on alpha (HF huggingface_hub + cas-bridge stalled at 16 MB; curl is at ~18 GB / ~28 GB total at session close, ETA 15 more minutes). Once complete, the M1 experiment is bench-ready — see `MOONSHOT_PROPOSALS.md` and `/tmp/m1_mixtral_singlenode.sh` for the entry-point script.
+
+## Session-1 final (2026-05-03, ~6.5 hours, 15 commits, 12 campaigns, 3 discoveries)
 
 The headline story: **distributed pipeline-parallel inference of Llama 3.1 8B INT4 on alpha (B390 dGPU) + charlie (LL 140V iGPU) over Thunderbolt 4 cannot beat single-node alpha for single-user sequential decode**, regardless of layer split, K-tuning, plugin config, NPU experiments, or speculation regime tested.
 
