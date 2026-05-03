@@ -30,7 +30,27 @@ Either of the first two clears or comes very close to the bar. **Async overlap i
 
 Distributed alpha+charlie/TB4 (factual workload): **18.42 tok/s** (1B draft K=3, no engine changes). +16% over previous best.
 
-## Next: implement async overlap (Q3.2)
+## Q3.2 implementation result — async overlap of speculative post-round draft.feed during target wait
+
+Added `feed_send_async` / `feed_recv_async` to `DistributedMaskedReq` (split alpha-side stage_0 work from network round-trip — alpha computes stage_0 sync, then `runtime_handle.spawn` the network task, returns `TargetSendHandle`). In `spec_decode_greedy`, between target_send and target_recv we run **one speculative `draft.feed(drafts.last())`** — which is needed in the all-accepted case anyway. Reconcile: if speculation right (joint accept K), keep state; else rewind +1.
+
+| K | sync tok/s | **async tok/s** | gain |
+|---|----------:|----------------:|-----:|
+| 1 | 15.84 | **19.07** | +20% |
+| 2 | 17.70 | **19.49** | +10% |
+| 3 | **18.42** | **19.69** | +7% |
+| 4 | 17.47 | 18.26 | +5% |
+
+**Async overlap baseline: K=3 + 1B draft + async = 19.69 tok/s.**
+
+Gain is real but modest because we only speculate ONE draft.feed per round (~25 ms saved when joint accept holds, which is 25% for K=3). To push higher we'd need either:
+- Multiple speculative draft.feeds (pipeline more work into the wait window) — bounded by draft.feed time vs charlie wait
+- Faster charlie stage_1 compute (PA-equivalent) — Q2.X path
+- Tree-spec — blocked on 4D attention_mask in v5 IR
+
+## Next: PA-equivalent on charlie stage_1
+
+Per Q2.1 research, PA on per-stage IRs needs `num_kv_blocks=256` to bypass GPU OOM. If charlie stage_1 with PA gives ~25 ms per round (matching LLMPipeline-class on a half-model) instead of current 43 ms, total per-round ≈ 130 ms → 22 tok/s. Combined with bigger drafts or further async, may clear 28.
 
 The change in `dist_spec.rs` `spec_decode_greedy`:
 1. Refactor target.feed to expose async send + recv halves
