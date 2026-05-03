@@ -15,3 +15,4 @@ Chronological. Status legend: ✓ WIN (≥20%), ⚠ NEUTRAL (<10%), ✗ LOSS, �
 | 9 | e8-factual-k-sweep | e8 | K-sweep on factual workload | alpha+charlie | ✓ K=1 wins at 15.81 tok/s (+3% over K=3) | dist 68% of single, -43% vs bar |
 | 10 | e9-paged-attention | e9 | PA re-export to engage LLMPipeline runtime optimizations | (export failure) | ✗ PA transform requires optimum-cli-shape IR; un-retrofittable to per-stage trace export — see DISCOVERIES D1 | (no perf data) |
 | 11 | e10-stage-breakdown | e10 | full per-stage timing of dist_spec K=1 factual | alpha+charlie | 📊 alpha 27 / wire 43 / draft 17 ms/round → optimal-overlap ceiling 17.9 tok/s; bar (28) is structurally unreachable on this model+hardware — see D2 | n/a |
+| 12 | m3-pseudohead-feasibility | M3.1 | embed-projection of stage_0 hidden as speculation source | alpha | ✗ 0/32 = 0% agreement — layer-16 hidden encodes input token, not next; M3 moonshot DEAD — see D3 | n/a |
