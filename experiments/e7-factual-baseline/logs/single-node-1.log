@@ -1,0 +1,36 @@
+[2m2026-05-03T05:24:12.695373Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvGenai [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m1 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\models\llama-3.1-8b-int4
+[2m2026-05-03T05:24:12.695488Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mNone
+[2m2026-05-03T05:24:12.695695Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T05:24:38.702468Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress locating IR at C:\cascadia\models\llama-3.1-8b-int4
+[2m2026-05-03T05:24:38.703240Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading draft model C:\cascadia\models\fastdraft-150m-int8-ov
+[2m2026-05-03T05:24:38.703302Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling LLMPipeline + draft on GPU
+[2m2026-05-03T05:24:38.703312Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T05:24:38.703326Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T05:24:38.704787Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T05:24:39.542822Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m ov-genai warmup ok [3mspec_k[0m[2m=[0m5 [3mprompt_lookup[0m[2m=[0m0
+[2m2026-05-03T05:24:39.542890Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T05:24:39.543427Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T05:24:50.580864Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m task done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m257 [3melapsed_s[0m[2m=[0m11.0305424 [3mtok_s[0m[2m=[0m23.298944936742185
+**RISC (Reduced Instruction Set Computing) vs CISC (Complex Instruction Set Computing) Processors**
+
+RISC and CISC are two distinct approaches to designing computer processors. The primary differences between them lie in instruction encoding, pipeline depth, and typical use cases.
+
+**RISC Processors**
+
+Key characteristics of RISC processors:
+
+1.  **Simple Instruction Set**: RISC processors have a smaller, more straightforward instruction set, typically consisting of a few dozen instructions.
+2.  **Load-Store Architecture**: RISC processors use a load-store architecture, where data is loaded into registers and then stored back to memory.
+3.  **Pipelined Design**: RISC processors often employ a deeper pipeline to improve instruction-level parallelism and increase clock speeds.
+4.  **Typical Use Cases**: RISC processors are commonly used in mobile devices, embedded systems, and servers, where power efficiency and high-performance are crucial.
+
+Examples of RISC processors include:
+
+* ARM (Advanced RISC Machines) processors, which are widely used in mobile devices, such as smartphones and tablets.
+* PowerPC processors, which are used in some Apple devices and high-performance computing applications.
+
+**CISC Processors**
+
+Key characteristics of CISC processors:
+
+1.  **Complex Instruction

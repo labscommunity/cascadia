@@ -1,0 +1,1 @@
+Explain the key differences between RISC and CISC processors. Be specific about pipeline depth, instruction encoding, and typical use cases. Include comparisons to ARM and x86.

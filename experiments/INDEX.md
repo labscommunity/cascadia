@@ -11,3 +11,4 @@ Chronological. Status legend: ✓ WIN (≥20%), ⚠ NEUTRAL (<10%), ✗ LOSS, �
 | 5 | e4-layer-rebalance | e4 | 22/10 alpha-heavy split (bottleneck=charlie hypothesis) | alpha+charlie | ✗ 12.23 tok/s (in noise vs 16/16) — bottleneck is per-step OV overhead | -47% vs e0; -56% vs bar |
 | 6 | e5-profile | e5 | instrument ov-runtime engine for per-task alpha_ms / wire_ms | alpha+charlie | 📊 alpha=34ms/tok, wire=55ms/tok, 11.19 tok/s — wire (charlie+net) is 62% of total | (instrumentation) |
 | 7 | e6-u8kv | e6 | --ov-kv-precision u8 + --ov-dyn-quant-group 32 plugin config | alpha+charlie | ✗ 10.56 tok/s (-13%) — u8 KV regresses without PA in the IR | -54% vs e0; -62% vs bar |
+| 8 | e7-factual-baseline | e7 | factual workload baseline single-node + distributed (single trial) | alpha + alpha+charlie | 📊 single 23.30 / dist 15.30 (accept 0.205) | dist 66% of single |
