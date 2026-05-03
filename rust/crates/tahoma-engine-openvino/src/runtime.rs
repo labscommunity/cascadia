@@ -228,22 +228,24 @@ impl OvRuntimeEngine {
         self.runtime
             .set_input(&names[0], ShimDType::I64, &[1, seq_len], &bytes)
             .map_err(map_ov_err)?;
-        // cos (f32, [1, seq_len, head_dim])
-        let cos_bytes = f32_to_bytes(&cos);
+        // cos (f16, [1, seq_len, head_dim]) — v3 shards exported with
+        // default_dtype=fp16 so the cos/sin graph inputs are f16. The
+        // OV GPU plugin won't auto-cast f32 inputs to an f16 port.
+        let cos_bytes = f32_to_f16_bytes(&cos);
         self.runtime
             .set_input(
                 &names[1],
-                ShimDType::F32,
+                ShimDType::F16,
                 &[1, seq_len, self.rotary.head_dim()],
                 &cos_bytes,
             )
             .map_err(map_ov_err)?;
-        // sin (f32, [1, seq_len, head_dim])
-        let sin_bytes = f32_to_bytes(&sin);
+        // sin (f16, [1, seq_len, head_dim])
+        let sin_bytes = f32_to_f16_bytes(&sin);
         self.runtime
             .set_input(
                 &names[2],
-                ShimDType::F32,
+                ShimDType::F16,
                 &[1, seq_len, self.rotary.head_dim()],
                 &sin_bytes,
             )
@@ -262,25 +264,25 @@ impl OvRuntimeEngine {
                 names
             )));
         }
-        // hidden_states (f32, [1, seq_len, hidden_size])
-        let hs_bytes = f32_to_bytes(hidden);
+        // hidden_states (f16) — same reason as cos/sin above
+        let hs_bytes = f32_to_f16_bytes(hidden);
         self.runtime
-            .set_input(&names[0], ShimDType::F32, &shape, &hs_bytes)
+            .set_input(&names[0], ShimDType::F16, &shape, &hs_bytes)
             .map_err(map_ov_err)?;
-        let cos_bytes = f32_to_bytes(&cos);
+        let cos_bytes = f32_to_f16_bytes(&cos);
         self.runtime
             .set_input(
                 &names[1],
-                ShimDType::F32,
+                ShimDType::F16,
                 &[1, seq_len, self.rotary.head_dim()],
                 &cos_bytes,
             )
             .map_err(map_ov_err)?;
-        let sin_bytes = f32_to_bytes(&sin);
+        let sin_bytes = f32_to_f16_bytes(&sin);
         self.runtime
             .set_input(
                 &names[2],
-                ShimDType::F32,
+                ShimDType::F16,
                 &[1, seq_len, self.rotary.head_dim()],
                 &sin_bytes,
             )
@@ -332,10 +334,13 @@ impl OvRuntimeEngine {
     }
 
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
-        // Engine::step is sync but transport is async; wait via the runtime
-        // handle captured at build time. The runner wraps step() in
-        // spawn_blocking so this is safe.
-        self.runtime_handle.block_on(f)
+        // The runner's ChunkStream::poll_next is itself an async fn —
+        // calling block_on inside an async context panics with "Cannot
+        // start a runtime from within a runtime". Use the same
+        // dispatch the dist_spec engine uses (block_in_place when on
+        // the async worker thread, naked block_on when on a
+        // spawn_blocking thread or off-runtime).
+        crate::dist_spec::run_async_pub(&self.runtime_handle, f)
     }
 
     fn send_hidden_downstream(&mut self, hidden: &[f32], shape: [usize; 3]) -> EngineResult<()> {

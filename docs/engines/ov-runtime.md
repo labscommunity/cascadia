@@ -10,11 +10,21 @@ Pipeline-parallel inference using pre-exported per-stage OpenVINO IRs with inter
 
 ## Shard format
 
-Pre-export with rainier's `scripts/export_cached_shards_v5.py` — produces:
+Pre-export with rainier's `scripts/export_cached_shards_v3.py`:
+
+```bash
+python scripts/export_cached_shards_v3.py \
+    --model-dir /path/to/Llama-3.1-8B-Instruct \
+    --output-dir /shards/shards_2stage_v3 \
+    --num-stages 2 --layer-split 16 --quantization int4
+```
+
+Produces:
 
 ```
 <pipeline_dir>/
   pipeline_config.json
+  config.json              # copy from the source HF model dir
   tokenizer/
   stage_<i>/
     openvino_model.xml
@@ -22,19 +32,28 @@ Pre-export with rainier's `scripts/export_cached_shards_v5.py` — produces:
     stage_config.json
 ```
 
-Each stage IR has `(input_ids|hidden_states, attention_mask, position_ids, beam_idx)` inputs and stateful KV cache.
+Each stage IR has `(input_ids|hidden_states, cos, sin)` positional
+inputs and stateful KV cache. The Rust port sends `cos` / `sin` /
+`hidden_states` as f16 to match the export's default dtype — v3 shards
+exported with `--default-dtype fp32` are not currently supported.
+
+`config.json` (the source model's HF config) is required at the
+pipeline root or under `tokenizer/` so the Rust runtime can derive
+`head_dim`, `rope_theta`, and `rope_scaling` for its on-the-fly RoPE.
+
+For `ov-dist-spec` you need v5 shards instead — see [ov-dist-spec.md](ov-dist-spec.md).
 
 ## Example
 
 ```bash
 # Last stage (rank 1):
 tahoma worker --rank 1 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v5_beam \
+              --model /shards/shards_2stage_v3 \
               --listen 10.10.10.2:9100
 
 # First stage (rank 0):
 tahoma worker --rank 0 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v5_beam \
+              --model /shards/shards_2stage_v3 \
               --next 10.10.10.2:9100 --api :8000
 ```
 

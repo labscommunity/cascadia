@@ -167,6 +167,13 @@ pub const MAX_PENDING_TASKS: usize = 256;
 /// Workers acquire the guard once per `step()` (idempotent within a
 /// single thread); the guard is RAII-scoped so the flag never leaks
 /// across spawn_blocking thread reuse boundaries.
+pub(crate) fn run_async_pub<F: std::future::Future>(
+    handle: &tokio::runtime::Handle,
+    fut: F,
+) -> F::Output {
+    run_async(handle, fut)
+}
+
 fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
     if BLOCKING_CONTEXT.with(|f| f.get()) {
         // We're on a spawn_blocking thread (worker relay loop); naked

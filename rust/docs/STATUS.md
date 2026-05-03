@@ -8,7 +8,7 @@ Tracking the Python → Rust hard rewrite landed under `rust/` on the
 | Engine | Port | Mac unit tests | Real OV build | Real-model e2e | A/B vs Python |
 |---|---|:-:|:-:|:-:|---|
 | `ov-genai` | ✅ | ✅ 5 | ✅ alpha + charlie | ✅ | **at parity** (Rust 20.5 vs Python 20.3 plain; 22.3 vs 22.6 FastDraft; 29.3 vs 29.4 PL) |
-| `ov-runtime` | ✅ | ✅ 3 | ✅ alpha + charlie | ⏳ no v3 shards on hand | n/a |
+| `ov-runtime` | ✅ | ✅ 3 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 (13.55 tok/s, 64 tokens) | n/a (no Python A/B yet) |
 | `ov-dist-spec` | ✅ | ✅ 9 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 | **Rust 1.29× slower** (21.70 vs 28.05 tok/s in `--release`; was 2.21× in debug) |
 
 ### Perf-gap investigation (commits b396709, 655f6b8)
