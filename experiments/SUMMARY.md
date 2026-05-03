@@ -46,10 +46,18 @@ Everything load-bearing in pipeline-parallel inference:
 
 If you're picking this up cold:
 1. **DISCOVERIES.md D2** — the central finding: distributed PP for 8B INT4 is structurally bounded below single-node on this hardware.
-2. **MOONSHOT_PROPOSALS.md M1** — the cleanest moonshot remaining: distributed Mixtral 8x7B (won't fit single-node alpha B390 12GB GPU).
-3. **LEADERBOARD.md** — final perf numbers across (model × workload × topology).
+2. **DISCOVERIES.md D4** — the M1 reframe: Mixtral 8x7B fits alpha at 0.54 tok/s via memory spillage (not OOM). Distributed Mixtral has huge upside but needs export-pipeline work.
+3. **MOONSHOT_PROPOSALS.md** — M1-M4 with concrete next steps.
+4. **LEADERBOARD.md** — final perf numbers across (model × workload × topology).
 
-In progress at session-1 close: Mixtral 8x7B INT4 OV-format download via raw curl on alpha (HF huggingface_hub + cas-bridge stalled at 16 MB; curl is at ~18 GB / ~28 GB total at session close, ETA 15 more minutes). Once complete, the M1 experiment is bench-ready — see `MOONSHOT_PROPOSALS.md` and `/tmp/m1_mixtral_singlenode.sh` for the entry-point script.
+## Session-2 entry point
+
+The cleanest moonshot to pursue next is **distributed Mixtral 8x7B INT4** (huge potential gain over the 0.54 tok/s single-node baseline established in D4). Two paths to unlock it:
+
+- **Path A (multi-hour, low risk):** download Mixtral 8x7B raw safetensors from HF (~90 GB; will take 3-6 hours over wifi via curl with `-C -` for resume). Then run `rainier/scripts/export_cached_shards_v6_mixtral.py --model-dir <hf-dir> --output-dir C:\cascadia\shards_2stage_v6_mixtral --num-stages 2 --layer-split 16 --quantization int4` on alpha (~30 min). Distribute stage_1 to charlie. Bench.
+- **Path B (multi-day, higher risk):** write a custom splitter for the existing OV monolithic IR at `C:\cascadia\models\mixtral-8x7b-int4-ov-fresh\openvino_model.xml`. The python autolab tried this in `split_ov_model.py` and didn't complete. OV `model.split_at_node` or graph-walking API is needed.
+
+Path A is recommended — known-good code, just slow. Kick off the download with: `curl.exe -L -C - -o /path/to.bin https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1/resolve/main/<each-shard>` for each safetensors shard (consolidated_*.safetensors typically).
 
 ## Session-1 final (2026-05-03, ~6.5 hours, 15 commits, 12 campaigns, 3 discoveries)
 
