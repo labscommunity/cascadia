@@ -2,7 +2,17 @@
 
 Novel / surprising / undocumented findings worth saving forever. Format: cite the experiment that produced the evidence, give the surprise plainly, explain why it's saveable.
 
-## D1 — OV 2026.1 PagedAttention transform requires optimum-cli-shaped IRs and is not retrofittable to per-stage trace exports
+## D1 (REVISED 2026-05-03 evening) — PA transform DOES apply to per-stage IRs at compile time; the export-time path I tried first was the wrong API
+
+**Update:** Q2 (`experiments/q2-pa-compile-time/`) verified that `paged_attention_transformation()` from `openvino._offline_transformations` runs successfully on a v5 stage_0 IR loaded via `core.read_model()` (NOT via the export script). With the dangling-Parameter quirk worked around, the PA-transformed model compiles on GPU and runs inference end-to-end.
+
+**What's now blocking** is GPU memory pressure during the decode loop — PA's paged KV cache pool preallocation OOMs alpha B390's 12 GB GPU. Workarounds (cap cache size via plugin properties, use openvino-genai's higher-level `apply_paged_attention_transformations()` which strips problematic ReadValue nodes, or test on charlie's higher-mem-budget setup) were not exhausted this session — pivoted to Q3.
+
+The original D1 finding ("PA un-retrofittable") was based on the WRONG API call sequence. The runtime / compile-time path is what openvino-genai actually uses (per agent research of openvino-genai's `src/cpp/src/continuous_batching/paged_attention_transformations.hpp`), and it does work on our IRs. **D1 downgraded from structural-blocker to engineering-workaround-needed.**
+
+---
+
+## D1-original (DEPRECATED) — PA un-retrofittable to per-stage trace exports
 
 **Setup:** OpenVINO 2026.1.0 + openvino-genai 2026.1.0 on alpha (Battlemage Arc B390). Llama 3.1 8B Instruct INT4, exported per-stage via rainier's `scripts/export_cached_shards_v5.py` (torch.jit.trace + nncf + apply_make_stateful_transformation). Tried to apply `openvino._offline_transformations.paged_attention_transformation` at the end of the export to engage LLMPipeline-class GPU-plugin optimizations on multi-stage IRs.
 
