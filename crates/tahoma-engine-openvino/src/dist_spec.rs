@@ -574,13 +574,19 @@ impl MaskedReq {
 // -------- DistributedMaskedReq (driver-side wrapper for multi-stage target) --------
 
 /// Handle to a target.feed network round-trip in flight. Created by
-/// `feed_send_async`, awaited by `feed_recv_async`. Drop-safe — if dropped
-/// without await, the spawned task is cancelled (`tokio::task::JoinHandle`
-/// behavior).
+/// `feed_send_async`, awaited by `feed_recv_async`.
+///
+/// **Drop semantics**: dropping a `TargetSendHandle` without calling
+/// `feed_recv_async` does NOT cancel the spawned network task — tokio's
+/// `JoinHandle::drop` only discards the result, the task itself continues
+/// to completion. The bytes are still sent and received over the wire,
+/// and the next operation on the same `DistributedMaskedReq` will queue
+/// behind the orphan via the `downstream` mutex. To actually cancel,
+/// call `JoinHandle::abort` (not currently exposed). In practice
+/// `spec_decode_greedy` always awaits the handle, so this is a
+/// theoretical concern for unusual callers.
 pub struct TargetSendHandle {
-    join: tokio::task::JoinHandle<
-        Result<(Vec<f32>, [usize; 3]), tahoma_transport::TransportError>,
-    >,
+    join: tokio::task::JoinHandle<Result<(Vec<f32>, [usize; 3]), tahoma_transport::TransportError>>,
 }
 
 pub struct DistributedMaskedReq {
@@ -652,10 +658,7 @@ impl DistributedMaskedReq {
     /// drafts, post-round draft.feed) DURING the charlie wait window.
     /// State (cache_len, logical_pos) is updated on send so back-to-back
     /// `feed_send_async` calls stay consistent.
-    pub fn feed_send_async(
-        &mut self,
-        input_ids: &[i64],
-    ) -> Result<TargetSendHandle, EngineError> {
+    pub fn feed_send_async(&mut self, input_ids: &[i64]) -> Result<TargetSendHandle, EngineError> {
         let n = input_ids.len();
         let total = self.cache_len + n;
         if total > self.valid_mask.len() {
@@ -679,7 +682,12 @@ impl DistributedMaskedReq {
             .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
             .map_err(map_ov_err)?;
         self.stage0
-            .set_input(&attn_name, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
+            .set_input(
+                &attn_name,
+                ShimDType::I64,
+                &[1, total],
+                &i64_to_bytes(&attn),
+            )
             .map_err(map_ov_err)?;
         self.stage0
             .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(&pos))
@@ -742,15 +750,15 @@ impl DistributedMaskedReq {
             let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
             g.send(&hidden_tensor).await?;
             let kind_bytes = g.recv_raw(4).await?;
-            let kind = u32::from_be_bytes([
-                kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3],
-            ]);
+            let kind =
+                u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
             if kind != FrameKind::LogitsResponse as u32 {
                 return Err(tahoma_transport::TransportError::SocketClosed);
             }
             let (t, _) = g.recv().await?;
             let logits_f32 = match t.dtype {
-                WireDType::F32 => t.data
+                WireDType::F32 => t
+                    .data
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect::<Vec<_>>(),
@@ -759,7 +767,11 @@ impl DistributedMaskedReq {
             };
             Ok::<_, tahoma_transport::TransportError>((
                 logits_f32,
-                [t.shape[0] as usize, t.shape[1] as usize, t.shape[2] as usize],
+                [
+                    t.shape[0] as usize,
+                    t.shape[1] as usize,
+                    t.shape[2] as usize,
+                ],
             ))
         });
         Ok(TargetSendHandle { join })
