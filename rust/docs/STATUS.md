@@ -237,6 +237,24 @@ Mac via SSH.
   `tahoma/worker/transport.py`** — Python and Rust ranks can interop
   during the migration. dtype codes: 0=f32, 1=f16, 2=i8, 3=i32, 4=i64.
 
+## Phase 14 hardening — perf validation
+
+Re-ran the distributed bench on alpha (rank 0, B390 GPU, FastDraft 150M) +
+charlie (rank 1, Lunar Lake 140V) over Thunderbolt 4 with the
+hardened `--release` build:
+
+| Metric | Pre-Phase-14 | Post-Phase-14 |
+|---|---:|---:|
+| Tokens generated | 64 | 64 |
+| Wall-clock | — | 2.226 s |
+| Acceptance rate | 0.83 | 0.83 |
+| **Throughput** | **~28-29 tok/s** | **28.75 tok/s** |
+
+No measurable regression from the hardening. The hot-path additions
+(NaN-aware argmax, Rotary clamp, transport recv timeout wrapper,
+shim null checks) are all O(1) per call and well below the noise
+floor of single-token timing.
+
 ## Security model (production hardening, Phase 14)
 
 Tahoma's network surface is designed for **trusted LAN deployment** —
