@@ -15,7 +15,9 @@ Best measured tok/s per (model × workload × topology). Updated after each camp
 | Topology | Engine | Config | tok/s | Notes |
 |----------|--------|--------|------:|-------|
 | Single-node alpha B390 (12 GB GPU) | `ov-genai` | LLMPipeline | **0.54** | Spilled to shared system memory — usable but glacial. Distributed has huge upside here once shards exist. |
-| **Distributed alpha+charlie/TB4 (factual, 4096-tok output)** | `ov-dist-spec` | **K=4, Llama 3.2 1B INT4 draft, async overlap, v5 16/16** | **28.46** | **Q3.4 (BAR CLEARED)** |
+| **Distributed alpha+charlie/TB4 (factual, 4096-tok output)** | `ov-dist-spec` | **K=5, Llama 3.2 1B INT4 draft, async overlap, v5 16/16** | **29.47** | **Q3.4 (BAR CLEARED, +5.2%)** |
+| Distributed alpha+charlie/TB4 (factual, 4096-tok) | `ov-dist-spec` | K=4, Llama 3.2 1B INT4 draft, async overlap | 28.46 | Q3.4 |
+| Distributed alpha+charlie/TB4 (creative, 4096-tok) | `ov-dist-spec` | K=5, Llama 3.2 1B INT4 draft, async overlap | 25.96 | Q3.4 (under bar) |
 | Distributed alpha+charlie/TB4 (factual workload, 256-tok) | `ov-dist-spec` | K=3, Llama 3.2 1B INT4 draft, async overlap | 19.69 | Q3.2 |
 | Distributed alpha+charlie/TB4 (factual workload, 256-tok) | `ov-dist-spec` | K=3, Llama 3.2 1B INT4 draft, sync, v5 16/16 | 18.42 | Q3.X |
 | Distributed alpha+charlie/TB4 (factual workload) | `ov-dist-spec` | K=1, FastDraft 150M, v5 16/16 | 15.81 | e8 |
