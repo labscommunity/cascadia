@@ -1,0 +1,46 @@
+=== K=1 trial=1 ===
+START: [2m2026-05-03T04:31:23.056830Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m1
+END: [2m2026-05-03T04:31:44.940145Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.1538461595773697
+=== K=1 trial=2 ===
+START: [2m2026-05-03T04:32:27.988200Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m1
+END: [2m2026-05-03T04:32:49.686468Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.1538461595773697
+=== K=1 trial=3 ===
+START: [2m2026-05-03T04:33:32.525462Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m1
+END: [2m2026-05-03T04:33:54.248496Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.1538461595773697
+=== K=2 trial=1 ===
+START: [2m2026-05-03T04:34:37.138121Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m2
+END: [2m2026-05-03T04:35:01.143820Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.0793650820851326
+=== K=2 trial=2 ===
+START: [2m2026-05-03T04:35:43.990817Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m2
+END: [2m2026-05-03T04:36:07.620151Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.0793650820851326
+=== K=2 trial=3 ===
+START: [2m2026-05-03T04:36:51.033568Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m2
+END: [2m2026-05-03T04:37:14.659273Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m221 [3maccept[0m[2m=[0m0.0793650820851326
+=== K=4 trial=1 ===
+START: [2m2026-05-03T04:37:57.496788Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m4
+END: [2m2026-05-03T04:38:26.260787Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m215 [3maccept[0m[2m=[0m0.046783626079559326
+=== K=4 trial=2 ===
+START: [2m2026-05-03T04:39:13.447165Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m4
+END: [2m2026-05-03T04:39:43.520639Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m215 [3maccept[0m[2m=[0m0.046783626079559326
+=== K=4 trial=3 ===
+START: [2m2026-05-03T04:40:26.736443Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m4
+END: [2m2026-05-03T04:40:54.540060Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m215 [3maccept[0m[2m=[0m0.046783626079559326
+=== K=5 trial=1 ===
+START: [2m2026-05-03T04:41:37.570607Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m5
+END: [2m2026-05-03T04:42:05.698980Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m199 [3maccept[0m[2m=[0m0.05786801874637604
+=== K=5 trial=2 ===
+START: [2m2026-05-03T04:42:48.847947Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m5
+END: [2m2026-05-03T04:43:17.154414Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m199 [3maccept[0m[2m=[0m0.05786801874637604
+=== K=5 trial=3 ===
+START: [2m2026-05-03T04:44:00.337955Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m5
+END: [2m2026-05-03T04:44:29.269231Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m199 [3maccept[0m[2m=[0m0.05786801874637604
+=== K=6 trial=1 ===
+START: [2m2026-05-03T04:45:14.307015Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m6
+END: [2m2026-05-03T04:45:43.832119Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m192 [3maccept[0m[2m=[0m0.05502183362841606
+=== K=6 trial=2 ===
+START: [2m2026-05-03T04:46:27.094627Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m6
+END: [2m2026-05-03T04:46:56.832472Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m192 [3maccept[0m[2m=[0m0.05502183362841606
+=== K=6 trial=3 ===
+START: [2m2026-05-03T04:47:40.178678Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m6
+END: [2m2026-05-03T04:48:10.179453Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m192 [3maccept[0m[2m=[0m0.05502183362841606
+done
