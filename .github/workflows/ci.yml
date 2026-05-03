@@ -46,8 +46,14 @@ jobs:
         # are tagged with `#[allow(dead_code)]` or actually used.
         run: cargo clippy --workspace --all-targets
 
+      - name: Build tahoma binary (needed by e2e tests)
+        # tests-e2e exec the tahoma binary directly; without this they
+        # panic with "tahoma binary not built". Stub mode is fine —
+        # the e2e tests use the mock engine.
+        run: cargo build -p tahoma
+
       - name: Test (workspace)
         # Stub-mode build — engines that need OpenVINO link return a
-        # clean runtime error. Runs every unit test except the e2e
-        # tests that require real Intel hardware.
+        # clean runtime error. Runs every unit test plus the binary
+        # e2e tests against the mock engine.
         run: cargo test --workspace --all-targets
