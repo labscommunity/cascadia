@@ -1,0 +1,28 @@
+[2m2026-05-03T05:49:01.891572Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvDistSpec [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m2 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\shards_2stage_v5_beam
+[2m2026-05-03T05:49:01.891793Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mSome(PeerEndpoint { host: "10.10.10.2", port: 9100 })
+[2m2026-05-03T05:49:01.894663Z[0m [32m INFO[0m [2mtahoma_transport[0m[2m:[0m ActivationClient connected [3mhost[0m[2m=[0m10.10.10.2 [3mport[0m[2m=[0m9100
+[2m2026-05-03T05:49:01.894914Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T05:49:05.389459Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling target stage 0
+[2m2026-05-03T05:49:05.389553Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading tokenizer
+[2m2026-05-03T05:49:05.389566Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling draft C:\cascadia\models\fastdraft-150m-int8-ov
+[2m2026-05-03T05:49:05.389576Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T05:49:05.389585Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T05:49:05.389701Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T05:49:11.043472Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m5514 [3mdraft_ms[0m[2m=[0m137 [3mother_ms[0m[2m=[0m1 [3mtotal_ms[0m[2m=[0m5653 [3mtarget_alpha_setup_ms[0m[2m=[0m0 [3mtarget_alpha_infer_ms[0m[2m=[0m336 [3mtarget_alpha_output_ms[0m[2m=[0m0 [3mtarget_wire_ms[0m[2m=[0m5177
+[2m2026-05-03T05:49:11.043591Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec warmup ok [3mk[0m[2m=[0m1
+[2m2026-05-03T05:49:11.043612Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T05:49:11.043646Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T05:49:11.044812Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m35 [3mk[0m[2m=[0m1
+[2m2026-05-03T05:49:27.206994Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m12876 [3mdraft_ms[0m[2m=[0m3214 [3mother_ms[0m[2m=[0m71 [3mtotal_ms[0m[2m=[0m16162 [3mtarget_alpha_setup_ms[0m[2m=[0m7 [3mtarget_alpha_infer_ms[0m[2m=[0m4980 [3mtarget_alpha_output_ms[0m[2m=[0m2 [3mtarget_wire_ms[0m[2m=[0m7872
+[2m2026-05-03T05:49:27.208438Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m185 [3maccept[0m[2m=[0m0.37837839126586914
+**RISC (Reduced Instruction Set Computing) and CISC (Complex Instruction Set Computing) are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications.
+
+**RISC Processors:**
+
+RISC processors are designed to execute a limited set of instructions quickly and efficiently. They typically have a simple instruction set, a deep pipeline, and a focus on executing a large number of instructions per clock cycle. This approach is based on the idea that a small set of instructions can be executed quickly and efficiently, rather than trying to execute a large number of complex instructions.
+
+**Key Features of RISC Processors:**
+
+*   **Deep Pipeline:** RISC processors have a deep pipeline, which allows them to execute a large number of instructions per clock cycle. This is achieved by breaking down the instruction execution process into multiple stages, each of which is executed in a single clock cycle.
+*   **Simple Instruction Set:** RISC processors have a simple instruction set, which consists of a limited set of instructions that can be executed quickly and efficiently. This simplicity allows for faster execution times and lower power consumption.
+*   **Typical Use Cases:** RISC processors are commonly used in
