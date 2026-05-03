@@ -8,8 +8,9 @@
 - alpha ↔ charlie via direct Thunderbolt 4 (8.75 Gbps measured, 0.142 ms RTT)
 - beta — third Intel AI PC, wifi-connected (no TB to alpha/charlie)
 **Software:** OpenVINO 2026.1.0 + openvino-genai 2026.1.0 + Rust port (post-PR-3)
-**Primary baseline:** single-node `ov-genai + FastDraft K=5` ≈ 27 tok/s on alpha
-**Bar to beat:** single-node best × 1.20 — i.e. ~33 tok/s distributed, sustained
+**Primary baseline:** single-node `ov-genai + FastDraft K=5` (re-measured in e0; see leaderboard)
+**Bar to beat:** single-node best × 1.20, sustained, on the same workload
+**Workload assumption:** **single-user sequential requests.** Micro-batching / continuous batching wins do **not** count toward the bar — the primary user of this codebase issues prompts one at a time. Multi-tenant strategies (CB, request fan-in) are out of scope for the perf bar; they may still appear as informational side notes if discovered.
 
 ## What this autolab is allowed to change
 
