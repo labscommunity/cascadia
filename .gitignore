@@ -4,9 +4,11 @@ target/
 *.pdb
 # Cargo.lock IS tracked (binary project — pinned for reproducibility)
 
-# Tahoma scratch dirs (bench logs, ad-hoc experiments)
+# Tahoma scratch dirs (ad-hoc bench logs)
 tmp/
-experiments/
+
+# experiments/ IS tracked on autolab branches (campaign notes + result logs).
+# It was previously gitignored when only the Python prototype lived here.
 
 # Editors
 .idea/
