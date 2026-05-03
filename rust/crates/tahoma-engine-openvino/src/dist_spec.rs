@@ -1805,7 +1805,7 @@ mod tests {
 
     #[test]
     fn dtype_conversions_roundtrip() {
-        let f = vec![1.0f32, -2.5, 3.14, 0.0];
+        let f = vec![1.0f32, -2.5, 3.5, 0.0];
         let bytes16 = f32_to_f16_bytes(&f);
         assert_eq!(bytes16.len(), f.len() * 2);
         let back = f16_bytes_to_f32(&bytes16);
