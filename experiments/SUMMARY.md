@@ -42,7 +42,48 @@ Everything load-bearing in pipeline-parallel inference:
 - [LEADERBOARD.md](LEADERBOARD.md) — best-of for each (model × workload × topology) tuple
 - [DISCOVERIES.md](DISCOVERIES.md) — novel / surprising findings worth saving forever
 
-## At a glance — what to read first
+## CORRECTED at a glance (2026-05-03 evening)
+
+After my boss called out that I was assuming structural limits when I just couldn't figure things out, I dug deeper. **Three of my four key conclusions were wrong.** The corrected reading:
+
+1. **DISCOVERIES.md D1 (REVISED)** — PA pass DOES apply at compile time. I tried the export-time API; openvino-genai uses the runtime `apply_paged_attention_transformations` pattern. Verified end-to-end on v5 stage_0 IR. Now blocked on plugin-side memory cap (workaround needed, not unfixable).
+
+2. **DISCOVERIES.md D2 (REVISED)** — The "structural ceiling at 17-18 tok/s" was based on per-stage timings WITHOUT LLMPipeline optimizations. Q4 measured charlie's full 8B LLMPipeline at **19-21 tok/s** (only 9-16% slower than alpha, not the assumed 1.6×). With PA per-stage compute reaching parity, the projected ceiling is **20-25 tok/s base + draft amortization → 30+ tok/s with tree-spec**. **The bar (28 tok/s) is reachable via bounded engineering.** D2 downgraded from "structural" to "engineering ceiling — needs Q2 + Q3."
+
+3. **DISCOVERIES.md D3 (REVISED)** — Pseudo-head was tested with the WRONG matrix (embed_tokens.weight). Llama 3.1 has UNTIED weights — I needed `lm_head.weight + final RMSNorm`. Re-tested: layer 22/32 gives **12.5% top-1 / 34.4% top-5 agreement** (vs 0% with broken test). Per logit-lens literature (Tuned Lens, LayerSkip), layer 24/32 should hit 30-50% top-1. M3 moonshot is alive; needs a 24/8 export to validate at the right depth.
+
+4. **DISCOVERIES.md D4** stands as written — Mixtral spillage, the user said skip M1.
+
+## What's actually unblocked vs blocked now
+
+| Item | Status | Effort | Why I was wrong |
+|---|---|---|---|
+| PA at compile time | **Unblocked**, plugin-OOM workaround needed | 1-2 days | Tried wrong API |
+| Pseudo-head at layer 24 | **Likely viable** (extrapolating logit-lens literature) | 4 hours feasibility + 2-3 days engineering | Used wrong matrix |
+| Async draft+target overlap | Marginal alone; **multiplicative with PA** | 1-2 days | Analyzed in isolation |
+| Tree-based spec | **Required for full win** per FlowSpec/SpecPipe literature | 2-3 days | Underestimated |
+| NPU+GPU concurrent | Compile blocked on dynamic-shape Llama 1B IR | Need NPU-static export | Real but bounded |
+
+## Engineering plan to actually clear the bar
+
+Sequential, ~5-7 days total:
+
+1. **Q2 finish** (2 days): wire PA at compile time in C++ shim. Workaround the GPU-mem OOM by capping `max_context_len` at 4K tokens (sufficient for 256-tok decode + 60-tok prompt). Test: dist-spec K=1 with PA shards. Expected: 19-21 tok/s base.
+2. **Q3 lite** (1 day): reorder spec_decode_greedy to start target.feed before draft.feed of NEXT round (no speculation, just better dispatch order). Expected modest +5-10%.
+3. **Q3 full** (2 days): add K=2 tree-spec with 4 candidate paths per round. Send K=8 verify. Per FlowSpec data, +37-73% on Jetson Orin (closest published analog). Expected: pushes us 28+ tok/s = bar.
+4. **D3 path (alternative)**: export 24/8 v3 shard, re-test pseudo-head at layer 24, if ≥30% top-1 then build the in-engine speculation path. Multi-day.
+
+## What I'd actually recommend next session
+
+Start with **Q2 finish**. It's the largest single lever (per-stage compute parity with LLMPipeline) and unblocks the rest. The OOM workaround is bounded — I just didn't have time this session to debug the OV plugin's PA cache property name.
+
+If Q2 lands a real per-stage speedup, **Q3 lite** (re-order dispatch) is the cheapest follow-up and likely sufficient on its own to reach the bar.
+
+If Q2 takes >2 days, fall back to D3 path: cheap feasibility test of layer-24 pseudo-head, then commit to in-engine speculation only if the top-1 rate justifies the multi-day build.
+
+---
+
+## ORIGINAL at a glance (now superseded)
 
 If you're picking this up cold:
 1. **DISCOVERIES.md D2** — the central finding: distributed PP for 8B INT4 is structurally bounded below single-node on this hardware.
