@@ -2,6 +2,22 @@
 
 Novel / surprising / undocumented findings worth saving forever. Format: cite the experiment that produced the evidence, give the surprise plainly, explain why it's saveable.
 
+## D5 — PagedAttention is NOT a per-token speedup for single-user single-token decode; vLLM/openvino-genai's 2-4× wins are all THROUGHPUT under batching, not latency
+
+After further research (Q2.1) into openvino-genai's actual usage of `SDPAToPagedAttention`:
+
+1. **No documented per-token speedup of PA-vs-SDPA on single-user single-stream workloads.** The vLLM paper (arxiv 2309.06180) reports 2-4× *throughput* under batching, not single-user single-token latency. PA's value is decoupling KV layout from `[B, H, S, D]` — it's an *enabler* for tree-spec / sequence-parallel / continuous batching, not a direct compute optimization. PA can in fact be slightly slower per-token than SDPA on the same forward (block-table indirection overhead).
+
+2. **OOM cause is `num_kv_blocks` defaulting to dynamic in OV's CB scheduler config.** When unset, the plugin sizes the paged KV pool against available GPU memory — for a 12 GB GPU with INT4 8B weights (~5 GB) it tries to allocate the remaining ~7 GB as cache pool. Fix: pin `SchedulerConfig.num_kv_blocks = 256` (or `cache_size_gb = 0.5`). For Battlemage `gpu_block_size = 16 tokens/block`, so 256 blocks = 4096 tokens of KV — sufficient for our 60-prompt + 256-decode workload.
+
+3. **CPU compile failure (`ReadValue_36864 contains less parent edges than 0`) is from orphaned ReadValue/Assign nodes that `SDPAToPagedAttention`'s `StateManagementPattern` did not match.** Per-stage Llama IRs sometimes break the SDPA→Concat→Assign pattern the pass keys off. Fix: either start stateless and run `stateful_to_stateless_transformation` first, OR sweep `model->get_sinks()` post-pass and `remove_sink()` orphans.
+
+4. **Implication:** Q2 (wire PA at compile time) is **NOT a direct path to clearing the bar**. It only matters as a prerequisite for tree-spec / sequence-parallel patterns that need PA's flexible KV layout. Skipping Q2 in this autolab — going straight to **tree-spec on top of the existing SDPA path**, which doesn't require PA.
+
+**Source:** openvino-genai's `src/cpp/src/continuous_batching/pipeline_impl.cpp:83-180`, `cache_manager.hpp:76-165`, `scheduler_config.hpp:18-26`. OpenVINO's `src/core/src/pass/sdpa_to_paged_attention.cpp:72-196`.
+
+---
+
 ## D1 (REVISED 2026-05-03 evening) — PA transform DOES apply to per-stage IRs at compile time; the export-time path I tried first was the wrong API
 
 **Update:** Q2 (`experiments/q2-pa-compile-time/`) verified that `paged_attention_transformation()` from `openvino._offline_transformations` runs successfully on a v5 stage_0 IR loaded via `core.read_model()` (NOT via the export script). With the dangling-Parameter quirk worked around, the PA-transformed model compiles on GPU and runs inference end-to-end.
