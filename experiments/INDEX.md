@@ -9,3 +9,5 @@ Chronological. Status legend: ✓ WIN (≥20%), ⚠ NEUTRAL (<10%), ✗ LOSS, �
 | 3 | e2-k-sweep | e2 | sweep K∈{1,2,4,5,6} on creative workload | alpha+charlie | ⚠ K=1 wins at 11.78 tok/s (+19% over K=3) | -49% vs e0; -57% vs bar |
 | 4 | e3-no-spec-distributed | e3 | pure PP without spec decode (ov-runtime) on creative | alpha+charlie | ⚠ 12.15 tok/s (slightly better than K=1 spec) | -47% vs e0; -56% vs bar |
 | 5 | e4-layer-rebalance | e4 | 22/10 alpha-heavy split (bottleneck=charlie hypothesis) | alpha+charlie | ✗ 12.23 tok/s (in noise vs 16/16) — bottleneck is per-step OV overhead | -47% vs e0; -56% vs bar |
+| 6 | e5-profile | e5 | instrument ov-runtime engine for per-task alpha_ms / wire_ms | alpha+charlie | 📊 alpha=34ms/tok, wire=55ms/tok, 11.19 tok/s — wire (charlie+net) is 62% of total | (instrumentation) |
+| 7 | e6-u8kv | e6 | --ov-kv-precision u8 + --ov-dyn-quant-group 32 plugin config | alpha+charlie | ✗ 10.56 tok/s (-13%) — u8 KV regresses without PA in the IR | -54% vs e0; -62% vs bar |

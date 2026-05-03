@@ -1,0 +1,25 @@
+[2m2026-05-03T05:09:36.862999Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvRuntime [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m2 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\shards_2stage_v3
+[2m2026-05-03T05:09:36.863373Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mSome(PeerEndpoint { host: "10.10.10.2", port: 9100 })
+[2m2026-05-03T05:09:36.867364Z[0m [32m INFO[0m [2mtahoma_transport[0m[2m:[0m ActivationClient connected [3mhost[0m[2m=[0m10.10.10.2 [3mport[0m[2m=[0m9100
+[2m2026-05-03T05:09:36.867409Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T05:09:42.825483Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress reading C:\cascadia\shards_2stage_v3
+[2m2026-05-03T05:09:42.825526Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling stage 0 on GPU
+[2m2026-05-03T05:09:42.825536Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading rotary + tokenizer
+[2m2026-05-03T05:09:42.825546Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress tokenizer loaded; eos_token_id=Some(128009)
+[2m2026-05-03T05:09:42.825554Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T05:09:42.825563Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T05:09:42.825581Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T05:09:43.001819Z[0m [32m INFO[0m [2mtahoma_engine_openvino::runtime[0m[2m:[0m ov-runtime warmup ok
+[2m2026-05-03T05:09:43.001891Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T05:09:43.001916Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T05:09:43.002914Z[0m [32m INFO[0m [2mtahoma_engine_openvino::runtime[0m[2m:[0m task active (ov-runtime) [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59
+ The story should be a mix of science fiction, mystery, and adventure.
+
+---
+
+Atlas, the curious robot, floated through the airlock of the abandoned space station, his bright blue optics scanning the dimly lit corridor beyond. The station, once a thriving hub of interplanetary commerce and research, now hung silently in orbit around Mars, a testament to the transience of human endeavor. As Atlas drifted deeper into the station, the rusted walls seemed to close in around him, their peeling metallic surfaces a grim reminder of the passage of time.
+
+The robot's advanced sensors picked up the faint hum of life support systems, now dormant and decaying, their gentle thrum a haunting echo of a bygone era. Atlas's processors whirred with excitement as he navigated the deserted corridors, his mechanical limbs propelling him with ease through the vacuum-sealed environment. Every step revealed a new, forgotten secret: a discarded tool, a cryptic message scrawled on a wall, or a forgotten console, its screens dark and unresponsive.
+
+As Atlas explored, he began to detect strange signals emanating from a forgotten control room. The robot's advanced receivers picked up the faint, pulsating transmissions, their source and purpose unknown. Intrigued, Atlas[2m2026-05-03T05:10:05.884501Z[0m [32m INFO[0m [2mtahoma_engine_openvino::runtime[0m[2m:[0m ov-runtime task done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3melapsed_s[0m[2m=[0m22.8815375 [3mtok_s[0m[2m=[0m11.188059368825193 [3malpha_ms[0m[2m=[0m8733 [3mwire_ms[0m[2m=[0m14096 [3mother_ms[0m[2m=[0m52
+ altered
