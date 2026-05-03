@@ -195,7 +195,9 @@ pub fn default_registry_path() -> Result<PathBuf> {
 /// `~/.cache/huggingface/hub/`; the registry only stores a pointer.
 pub async fn pull(registry: &Registry, repo_id: &str) -> Result<PathBuf> {
     use hf_hub::api::tokio::ApiBuilder;
-    let api = ApiBuilder::new().build().map_err(|e| Error::Hub(e.to_string()))?;
+    let api = ApiBuilder::new()
+        .build()
+        .map_err(|e| Error::Hub(e.to_string()))?;
     let repo = api.model(repo_id.to_string());
     // hf-hub doesn't expose snapshot_download(); pulling at least one file
     // populates the local cache. For real use the API caller pulls each

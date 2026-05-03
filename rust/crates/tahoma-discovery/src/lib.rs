@@ -65,7 +65,10 @@ fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
 fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<NodeInfo> {
     let props = srv.get_properties();
     let get = |k: &str| -> Option<String> {
-        props.iter().find(|p| p.key() == k).map(|p| p.val_str().to_string())
+        props
+            .iter()
+            .find(|p| p.key() == k)
+            .map(|p| p.val_str().to_string())
     };
 
     let node_id = get("node_id")?;

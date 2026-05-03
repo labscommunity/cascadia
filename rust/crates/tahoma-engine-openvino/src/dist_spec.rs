@@ -131,9 +131,9 @@ fn argmax(slice: &[f32]) -> usize {
 
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
-        OvError::Stub => EngineError::Backend(
-            "openvino shim built without --features openvino".into(),
-        ),
+        OvError::Stub => {
+            EngineError::Backend("openvino shim built without --features openvino".into())
+        }
         OvError::Utf8(s) => EngineError::InvalidConfig(s),
         OvError::Native(s) => EngineError::Backend(s),
     }
@@ -488,10 +488,20 @@ impl MaskedReq {
 
         let _ts_setup = std::time::Instant::now();
         self.runtime
-            .set_input(&in_ids_name, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
+            .set_input(
+                &in_ids_name,
+                ShimDType::I64,
+                &[1, n],
+                &i64_to_bytes(input_ids),
+            )
             .map_err(map_ov_err)?;
         self.runtime
-            .set_input(&attn_name, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
+            .set_input(
+                &attn_name,
+                ShimDType::I64,
+                &[1, total],
+                &i64_to_bytes(&attn),
+            )
             .map_err(map_ov_err)?;
         self.runtime
             .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(&pos))
@@ -530,7 +540,12 @@ impl MaskedReq {
         };
         let convert_us = _ts_conv.elapsed().as_micros();
         tracing::debug!(
-            n, setup_us, infer_us, output_us, convert_us, vocab = floats.len(),
+            n,
+            setup_us,
+            infer_us,
+            output_us,
+            convert_us,
+            vocab = floats.len(),
             "draft.feed timing"
         );
         self.cache_len += n;
@@ -597,11 +612,11 @@ impl DistributedMaskedReq {
         self.stage0.reset_state().map_err(map_ov_err)?;
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
-                let mut g = downstream.lock().await;
-                let raw = (FrameKind::Reset as u32).to_be_bytes();
-                g.send_raw(&raw).await
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut g = downstream.lock().await;
+            let raw = (FrameKind::Reset as u32).to_be_bytes();
+            g.send_raw(&raw).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         for v in self.valid_mask.iter_mut() {
             *v = 1;
         }
@@ -622,8 +637,7 @@ impl DistributedMaskedReq {
         for v in attn[self.cache_len..].iter_mut() {
             *v = 1;
         }
-        let pos: Vec<i64> =
-            (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
+        let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
         // Run stage 0 locally.
         let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
@@ -635,7 +649,12 @@ impl DistributedMaskedReq {
             .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
             .map_err(map_ov_err)?;
         self.stage0
-            .set_input(&attn_name, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
+            .set_input(
+                &attn_name,
+                ShimDType::I64,
+                &[1, total],
+                &i64_to_bytes(&attn),
+            )
             .map_err(map_ov_err)?;
         self.stage0
             .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(&pos))
@@ -649,8 +668,7 @@ impl DistributedMaskedReq {
         self.stage0.infer().map_err(map_ov_err)?;
         let infer_us = _ts.elapsed().as_micros();
         let _ts = std::time::Instant::now();
-        let (dtype, hidden_shape, hidden_bytes) =
-            self.stage0.output(0).map_err(map_ov_err)?;
+        let (dtype, hidden_shape, hidden_bytes) = self.stage0.output(0).map_err(map_ov_err)?;
         let output_us = _ts.elapsed().as_micros();
         let hidden_f32 = match dtype {
             ShimDType::F32 => hidden_bytes
@@ -681,72 +699,76 @@ impl DistributedMaskedReq {
         let mut t_lock = std::time::Duration::ZERO;
         let _ts_lock = std::time::Instant::now();
         let (logits, _logits_shape, send_d, recv_d) = run_async(&self.runtime_handle, async move {
-                let mut g = downstream.lock().await;
-                // We need raw socket access. The ActivationClient exposes
-                // send_raw/recv_raw + send_tensor/recv_tensor; build the
-                // FORWARD frame inline (kind+pos via send_raw, then
-                // attention_mask + hidden via send_tensor).
-                let _ts_send = std::time::Instant::now();
-                let mut header = [0u8; 8];
-                header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-                header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-                g.send_raw(&header).await?;
-                let attn_tensor = WireTensor::new(
-                    WireDType::I64,
-                    [1, 1, total as u32],
-                    i64_to_bytes(&attn_clone),
-                );
-                g.send(&attn_tensor).await?;
-                let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
-                g.send(&hidden_tensor).await?;
-                let send_dur = _ts_send.elapsed();
+            let mut g = downstream.lock().await;
+            // We need raw socket access. The ActivationClient exposes
+            // send_raw/recv_raw + send_tensor/recv_tensor; build the
+            // FORWARD frame inline (kind+pos via send_raw, then
+            // attention_mask + hidden via send_tensor).
+            let _ts_send = std::time::Instant::now();
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+            header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+            g.send_raw(&header).await?;
+            let attn_tensor = WireTensor::new(
+                WireDType::I64,
+                [1, 1, total as u32],
+                i64_to_bytes(&attn_clone),
+            );
+            g.send(&attn_tensor).await?;
+            let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
+            g.send(&hidden_tensor).await?;
+            let send_dur = _ts_send.elapsed();
 
-                // Read LOGITS_RESPONSE.
-                let _ts_kind = std::time::Instant::now();
-                let kind_bytes = g.recv_raw(4).await?;
-                let recv_kind_dur = _ts_kind.elapsed();
-                let kind = u32::from_be_bytes([
-                    kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3],
-                ]);
-                if kind != FrameKind::LogitsResponse as u32 {
-                    return Err(tahoma_transport::TransportError::SocketClosed);
-                }
-                let _ts_payload = std::time::Instant::now();
-                let (t, _) = g.recv().await?;
-                let recv_payload_dur = _ts_payload.elapsed();
-                let _ts_conv = std::time::Instant::now();
-                let logits_f32 = match t.dtype {
-                    WireDType::F32 => t
-                        .data
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect::<Vec<_>>(),
-                    WireDType::F16 => f16_bytes_to_f32(&t.data),
-                    _ => return Err(tahoma_transport::TransportError::SocketClosed),
-                };
-                let convert_dur = _ts_conv.elapsed();
-                tracing::debug!(
-                    recv_kind_us = recv_kind_dur.as_micros() as u64,
-                    recv_payload_us = recv_payload_dur.as_micros() as u64,
-                    convert_us = convert_dur.as_micros() as u64,
-                    payload_bytes = t.data.len(),
-                    "driver recv breakdown"
-                );
-                let recv_dur = _ts_send.elapsed() - send_dur;
-                Ok::<_, tahoma_transport::TransportError>((
-                    logits_f32,
-                    [t.shape[0] as usize, t.shape[1] as usize, t.shape[2] as usize],
-                    send_dur,
-                    recv_dur,
-                ))
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            // Read LOGITS_RESPONSE.
+            let _ts_kind = std::time::Instant::now();
+            let kind_bytes = g.recv_raw(4).await?;
+            let recv_kind_dur = _ts_kind.elapsed();
+            let kind =
+                u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+            if kind != FrameKind::LogitsResponse as u32 {
+                return Err(tahoma_transport::TransportError::SocketClosed);
+            }
+            let _ts_payload = std::time::Instant::now();
+            let (t, _) = g.recv().await?;
+            let recv_payload_dur = _ts_payload.elapsed();
+            let _ts_conv = std::time::Instant::now();
+            let logits_f32 = match t.dtype {
+                WireDType::F32 => t
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<_>>(),
+                WireDType::F16 => f16_bytes_to_f32(&t.data),
+                _ => return Err(tahoma_transport::TransportError::SocketClosed),
+            };
+            let convert_dur = _ts_conv.elapsed();
+            tracing::debug!(
+                recv_kind_us = recv_kind_dur.as_micros() as u64,
+                recv_payload_us = recv_payload_dur.as_micros() as u64,
+                convert_us = convert_dur.as_micros() as u64,
+                payload_bytes = t.data.len(),
+                "driver recv breakdown"
+            );
+            let recv_dur = _ts_send.elapsed() - send_dur;
+            Ok::<_, tahoma_transport::TransportError>((
+                logits_f32,
+                [
+                    t.shape[0] as usize,
+                    t.shape[1] as usize,
+                    t.shape[2] as usize,
+                ],
+                send_dur,
+                recv_dur,
+            ))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         t_lock = _ts_lock.elapsed();
         let wire_us = _ts.elapsed().as_micros();
         t_send = send_d;
         t_recv = recv_d;
         tracing::debug!(
-            wire_us, send_us = t_send.as_micros() as u64,
+            wire_us,
+            send_us = t_send.as_micros() as u64,
             recv_us = t_recv.as_micros() as u64,
             lock_us = t_lock.as_micros() as u64,
             "wire breakdown"
@@ -772,11 +794,7 @@ impl DistributedMaskedReq {
         let _ = s3;
         Ok((
             logits,
-            [
-                _logits_shape[0],
-                _logits_shape[1],
-                _logits_shape[2],
-            ],
+            [_logits_shape[0], _logits_shape[1], _logits_shape[2]],
         ))
     }
 
@@ -901,7 +919,10 @@ pub fn spec_decode_greedy(
             t_greedy[drafts.len()]
         };
 
-        for &t in drafts[..accepted].iter().chain(std::iter::once(&correction)) {
+        for &t in drafts[..accepted]
+            .iter()
+            .chain(std::iter::once(&correction))
+        {
             if out.len() >= max_tokens {
                 break;
             }
@@ -1042,10 +1063,7 @@ impl Engine for OvDistSpecEngine {
                 }
                 Ok(tokens) => {
                     let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-                    let text = self
-                        .tokenizer
-                        .decode(&ids, true)
-                        .unwrap_or_default();
+                    let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
                     info!(
                         task = %task.task_id,
                         tokens = tokens.len(),
@@ -1181,10 +1199,16 @@ impl Builder for OvDistSpecBuilder {
         }
         let plugin = self.plugin();
 
-        events.push(LoadProgress::message("compiling target stage 0".to_string()));
+        events.push(LoadProgress::message(
+            "compiling target stage 0".to_string(),
+        ));
         let stage0_xml = stage_dir.join("openvino_model.xml");
-        let stage0 = OvRuntime::compile(stage0_xml.to_str().unwrap_or_default(), &self.device, &plugin)
-            .map_err(map_ov_err)?;
+        let stage0 = OvRuntime::compile(
+            stage0_xml.to_str().unwrap_or_default(),
+            &self.device,
+            &plugin,
+        )
+        .map_err(map_ov_err)?;
         self.stage0 = Some(stage0);
 
         events.push(LoadProgress::message("loading tokenizer".to_string()));
@@ -1193,8 +1217,8 @@ impl Builder for OvDistSpecBuilder {
             let tok = Tokenizer::from_file(&tok_path)
                 .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
             self.tokenizer = Some(Arc::new(tok));
-            self.eos_token_id =
-                lookup_eos(&self.pipeline_dir.join("tokenizer")).or_else(|| lookup_eos(&self.pipeline_dir));
+            self.eos_token_id = lookup_eos(&self.pipeline_dir.join("tokenizer"))
+                .or_else(|| lookup_eos(&self.pipeline_dir));
         } else {
             return Err(EngineError::Backend(format!(
                 "tokenizer.json not found at {tok_path:?}"
@@ -1223,7 +1247,8 @@ impl Builder for OvDistSpecBuilder {
         let draft = self.draft.ok_or(EngineError::NotLoaded)?;
         let tokenizer = self.tokenizer.ok_or(EngineError::NotLoaded)?;
         let downstream = self.downstream.ok_or(EngineError::NotConnected)?;
-        let target = DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
+        let target =
+            DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
         Ok(Box::new(OvDistSpecEngine {
             target,
@@ -1276,14 +1301,11 @@ impl Engine for OvDistSpecWorkerEngine {
             if msg.contains("socket closed") || msg.contains("not connected") {
                 warn!("ov-dist-spec worker: upstream closed, exiting");
                 // Mark engine as drained by clearing connections.
-                let _ = self
-                    .runtime_handle
-                    .clone()
-                    .block_on(async {
-                        let mut g = self.upstream.lock().await;
-                        g.close().await;
-                        Ok::<_, tahoma_transport::TransportError>(())
-                    });
+                let _ = self.runtime_handle.clone().block_on(async {
+                    let mut g = self.upstream.lock().await;
+                    g.close().await;
+                    Ok::<_, tahoma_transport::TransportError>(())
+                });
                 if let Some(d) = &self.downstream {
                     let _ = self.runtime_handle.clone().block_on(async {
                         let mut g = d.lock().await;
@@ -1310,12 +1332,12 @@ impl OvDistSpecWorkerEngine {
         // 1. Read kind from upstream.
         let _ts_recv_kind = std::time::Instant::now();
         let kind = run_async(&self.runtime_handle, async {
-                let mut g = upstream.lock().await;
-                g.recv_raw(4).await.map(|b| {
-                    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-                })
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+            let mut g = upstream.lock().await;
+            g.recv_raw(4)
+                .await
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
         let recv_kind_us = _ts_recv_kind.elapsed().as_micros();
         let kind = FrameKind::from_u32(kind)
             .ok_or_else(|| EngineError::Backend(format!("bad kind {kind}")))?;
@@ -1328,7 +1350,7 @@ impl OvDistSpecWorkerEngine {
                         let mut dg = d.lock().await;
                         dg.send_raw(&(FrameKind::Reset as u32).to_be_bytes()).await
                     })
-                        .map_err(|e| EngineError::Backend(e.to_string()))?;
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
                 Ok(())
             }
@@ -1343,11 +1365,15 @@ impl OvDistSpecWorkerEngine {
                 //    impl did per spec round.
                 let upstream2 = upstream.clone();
                 let _ts_recv_body = std::time::Instant::now();
-                let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) = run_async(&self.runtime_handle, async move {
+                let (logical_pos_start, attn, hidden_bytes, hidden_dtype, hidden_shape) =
+                    run_async(&self.runtime_handle, async move {
                         let mut g = upstream2.lock().await;
                         let pos_bytes = g.recv_raw(4).await?;
                         let logical_pos_start = u32::from_be_bytes([
-                            pos_bytes[0], pos_bytes[1], pos_bytes[2], pos_bytes[3],
+                            pos_bytes[0],
+                            pos_bytes[1],
+                            pos_bytes[2],
+                            pos_bytes[3],
                         ]);
                         let (attn_t, _) = g.recv().await?;
                         let attn_i64 = bytes_to_i64(&attn_t.data);
@@ -1372,16 +1398,14 @@ impl OvDistSpecWorkerEngine {
                 let pos: Vec<i64> = (logical_pos_start as i64
                     ..(logical_pos_start as i64 + new_tokens as i64))
                     .collect();
-                let in_hs = self
-                    .inputs
-                    .get("hidden_states")
-                    .cloned()
-                    .ok_or_else(|| EngineError::Backend("missing hidden_states input".into()))?;
-                let in_attn = self
-                    .inputs
-                    .get("attention_mask")
-                    .cloned()
-                    .ok_or_else(|| EngineError::Backend("missing attention_mask input".into()))?;
+                let in_hs =
+                    self.inputs.get("hidden_states").cloned().ok_or_else(|| {
+                        EngineError::Backend("missing hidden_states input".into())
+                    })?;
+                let in_attn =
+                    self.inputs.get("attention_mask").cloned().ok_or_else(|| {
+                        EngineError::Backend("missing attention_mask input".into())
+                    })?;
                 let in_pos = self
                     .inputs
                     .get("position_ids")
@@ -1398,9 +1422,11 @@ impl OvDistSpecWorkerEngine {
                 let shim_dtype = match hidden_dtype {
                     WireDType::F16 => ShimDType::F16,
                     WireDType::F32 => ShimDType::F32,
-                    _ => return Err(EngineError::Backend(format!(
-                        "unexpected hidden dtype on wire {hidden_dtype:?}"
-                    ))),
+                    _ => {
+                        return Err(EngineError::Backend(format!(
+                            "unexpected hidden dtype on wire {hidden_dtype:?}"
+                        )))
+                    }
                 };
                 let _ts_setup = std::time::Instant::now();
                 self.runtime
@@ -1415,7 +1441,12 @@ impl OvDistSpecWorkerEngine {
                     )
                     .map_err(map_ov_err)?;
                 self.runtime
-                    .set_input(&in_pos, ShimDType::I64, &[1, new_tokens], &i64_to_bytes(&pos))
+                    .set_input(
+                        &in_pos,
+                        ShimDType::I64,
+                        &[1, new_tokens],
+                        &i64_to_bytes(&pos),
+                    )
                     .map_err(map_ov_err)?;
                 self.runtime
                     .set_input(&in_beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
@@ -1429,7 +1460,10 @@ impl OvDistSpecWorkerEngine {
                     self.runtime.output(0).map_err(map_ov_err)?;
                 let output_us = _ts_out.elapsed().as_micros();
                 tracing::debug!(
-                    n = new_tokens, setup_us, infer_us, output_us,
+                    n = new_tokens,
+                    setup_us,
+                    infer_us,
+                    output_us,
                     "worker.frame timing"
                 );
                 let out_f16_bytes = match out_dtype {
@@ -1467,7 +1501,9 @@ impl OvDistSpecWorkerEngine {
                     .map_err(|e| EngineError::Backend(e.to_string()))?;
                     let send_us = _ts_send.elapsed().as_micros();
                     tracing::debug!(
-                        recv_kind_us, recv_body_us, send_us,
+                        recv_kind_us,
+                        recv_body_us,
+                        send_us,
                         "worker.frame wire timing (last stage)"
                     );
                 } else {
@@ -1476,42 +1512,44 @@ impl OvDistSpecWorkerEngine {
                         downstream.ok_or_else(|| EngineError::Backend("no downstream".into()))?;
                     let upstream3 = upstream.clone();
                     run_async(&self.runtime_handle, async move {
-                            // Send FORWARD downstream
-                            let attn_t = WireTensor::new(
-                                WireDType::I64,
-                                [1, 1, attn.len() as u32],
-                                i64_to_bytes(&attn),
+                        // Send FORWARD downstream
+                        let attn_t = WireTensor::new(
+                            WireDType::I64,
+                            [1, 1, attn.len() as u32],
+                            i64_to_bytes(&attn),
+                        );
+                        let mut header = [0u8; 8];
+                        header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+                        header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+                        {
+                            let mut dg = downstream.lock().await;
+                            dg.send_raw(&header).await?;
+                            dg.send(&attn_t).await?;
+                            let t = WireTensor::new(
+                                WireDType::F16,
+                                out_shape_wire,
+                                out_f16_bytes.clone(),
                             );
-                            let mut header = [0u8; 8];
-                            header[0..4]
-                                .copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
-                            header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
-                            {
-                                let mut dg = downstream.lock().await;
-                                dg.send_raw(&header).await?;
-                                dg.send(&attn_t).await?;
-                                let t = WireTensor::new(
-                                    WireDType::F16,
-                                    out_shape_wire,
-                                    out_f16_bytes.clone(),
-                                );
-                                dg.send(&t).await?;
-                                let kind_bytes = dg.recv_raw(4).await?;
-                                let kv = u32::from_be_bytes([
-                                    kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3],
-                                ]);
-                                if kv != FrameKind::LogitsResponse as u32 {
-                                    return Err(tahoma_transport::TransportError::SocketClosed);
-                                }
-                                let (logits_t, _) = dg.recv().await?;
-                                let mut g = upstream3.lock().await;
-                                g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
-                                    .await?;
-                                g.send(&logits_t).await?;
+                            dg.send(&t).await?;
+                            let kind_bytes = dg.recv_raw(4).await?;
+                            let kv = u32::from_be_bytes([
+                                kind_bytes[0],
+                                kind_bytes[1],
+                                kind_bytes[2],
+                                kind_bytes[3],
+                            ]);
+                            if kv != FrameKind::LogitsResponse as u32 {
+                                return Err(tahoma_transport::TransportError::SocketClosed);
                             }
-                            Ok::<_, tahoma_transport::TransportError>(())
-                        })
-                        .map_err(|e| EngineError::Backend(e.to_string()))?;
+                            let (logits_t, _) = dg.recv().await?;
+                            let mut g = upstream3.lock().await;
+                            g.send_raw(&(FrameKind::LogitsResponse as u32).to_be_bytes())
+                                .await?;
+                            g.send(&logits_t).await?;
+                        }
+                        Ok::<_, tahoma_transport::TransportError>(())
+                    })
+                    .map_err(|e| EngineError::Backend(e.to_string()))?;
                 }
                 Ok(())
             }
@@ -1595,9 +1633,9 @@ impl Builder for OvDistSpecWorkerBuilder {
     }
 
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
-        let _ = peers.upstream.ok_or_else(|| {
-            EngineError::PeerRejected("worker requires upstream".into())
-        })?;
+        let _ = peers
+            .upstream
+            .ok_or_else(|| EngineError::PeerRejected("worker requires upstream".into()))?;
         let port = self
             .listen_port
             .ok_or_else(|| EngineError::PeerRejected("configure_listen() required".into()))?;
@@ -1660,14 +1698,16 @@ impl Builder for OvDistSpecWorkerBuilder {
             self.rank
         )));
         let xml_path = stage_dir.join("openvino_model.xml");
-        let runtime = OvRuntime::compile(
-            xml_path.to_str().unwrap_or_default(),
-            &self.device,
-            &plugin,
-        )
-        .map_err(map_ov_err)?;
+        let runtime =
+            OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
+                .map_err(map_ov_err)?;
         self.inputs = v5_inputs(&runtime)?;
-        for k in ["hidden_states", "attention_mask", "position_ids", "beam_idx"] {
+        for k in [
+            "hidden_states",
+            "attention_mask",
+            "position_ids",
+            "beam_idx",
+        ] {
             if !self.inputs.contains_key(k) {
                 return Err(EngineError::Backend(format!(
                     "stage {} IR is missing v5 input: {k}",
@@ -1733,7 +1773,11 @@ mod tests {
 
     #[test]
     fn frame_kind_roundtrip() {
-        for k in [FrameKind::Forward, FrameKind::Reset, FrameKind::LogitsResponse] {
+        for k in [
+            FrameKind::Forward,
+            FrameKind::Reset,
+            FrameKind::LogitsResponse,
+        ] {
             let bytes = (k as u32).to_be_bytes();
             let v = u32::from_be_bytes(bytes);
             assert_eq!(FrameKind::from_u32(v), Some(k));
@@ -1788,10 +1832,8 @@ mod tests {
         let h = tokio::spawn(async move {
             server.accept().await.unwrap();
             let kb = server.recv_raw(4).await.unwrap();
-            let kind = FrameKind::from_u32(u32::from_be_bytes([
-                kb[0], kb[1], kb[2], kb[3],
-            ]))
-            .unwrap();
+            let kind =
+                FrameKind::from_u32(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])).unwrap();
             let pos_b = server.recv_raw(4).await.unwrap();
             let pos = u32::from_be_bytes([pos_b[0], pos_b[1], pos_b[2], pos_b[3]]);
             let (attn, _) = server.recv().await.unwrap();
@@ -1846,10 +1888,8 @@ mod tests {
         let h = tokio::spawn(async move {
             server.accept().await.unwrap();
             let kb = server.recv_raw(4).await.unwrap();
-            let kind = FrameKind::from_u32(u32::from_be_bytes([
-                kb[0], kb[1], kb[2], kb[3],
-            ]))
-            .unwrap();
+            let kind =
+                FrameKind::from_u32(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]])).unwrap();
             let (logits, _) = server.recv().await.unwrap();
             (kind, logits.data)
         });

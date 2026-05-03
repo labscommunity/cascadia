@@ -39,10 +39,7 @@ impl Engine for MockEngine {
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
         if emitted >= max || emitted >= words.len() {
-            return vec![(
-                task.task_id.clone(),
-                Chunk::final_marker(task.task_id, ""),
-            )];
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
         }
         let token = words[emitted].to_string();
         let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");

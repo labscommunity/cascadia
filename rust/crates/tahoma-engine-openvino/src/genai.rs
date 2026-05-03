@@ -129,9 +129,10 @@ impl Builder for OvGenaiBuilder {
             }
         }
 
-        let mut progress = vec![
-            LoadProgress::message(format!("locating IR at {}", self.model_path)),
-        ];
+        let mut progress = vec![LoadProgress::message(format!(
+            "locating IR at {}",
+            self.model_path
+        ))];
 
         let plugin = self.build_plugin_config();
         let pipe = if let Some(dpath) = &self.draft_model_path {
@@ -184,9 +185,9 @@ impl Builder for OvGenaiBuilder {
 
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
-        OvError::Stub => EngineError::Backend(
-            "openvino-genai shim built without the `openvino` feature".into(),
-        ),
+        OvError::Stub => {
+            EngineError::Backend("openvino-genai shim built without the `openvino` feature".into())
+        }
         OvError::Utf8(s) => EngineError::InvalidConfig(s),
         OvError::Native(s) => EngineError::Backend(s),
     }

@@ -319,24 +319,27 @@ async fn stream_completion(
     };
     // Move the permit into the stream so it's released only when the
     // SSE stream is dropped (client disconnect or final chunk).
-    let mapped = StreamWithPermit { inner: chunk_stream, _permit: permit }
-        .map(move |chunk| {
-            let payload = serde_json::json!({
-                "id": task_id,
-                "object": "chat.completion.chunk",
-                "created": now_unix(),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "content": chunk.text,
-                    },
-                    "finish_reason": if chunk.is_final { Some("stop") } else { None },
-                }],
-            });
-            Ok::<_, std::convert::Infallible>(Event::default().data(payload.to_string()))
+    let mapped = StreamWithPermit {
+        inner: chunk_stream,
+        _permit: permit,
+    }
+    .map(move |chunk| {
+        let payload = serde_json::json!({
+            "id": task_id,
+            "object": "chat.completion.chunk",
+            "created": now_unix(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": chunk.text,
+                },
+                "finish_reason": if chunk.is_final { Some("stop") } else { None },
+            }],
         });
+        Ok::<_, std::convert::Infallible>(Event::default().data(payload.to_string()))
+    });
     let final_event = stream::once(async {
         Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]".to_string()))
     });
@@ -377,13 +380,13 @@ fn engine_error_response(err: tahoma_engine::EngineError) -> axum::response::Res
     (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }
 
-async fn cancel(
-    State(state): State<AppState>,
-    Path(task_id): Path<String>,
-) -> impl IntoResponse {
+async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
     state.runner.cancel(&task_id);
     info!(task = %task_id, "cancelled");
-    (StatusCode::OK, Json(serde_json::json!({"cancelled": task_id})))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"cancelled": task_id})),
+    )
 }
 
 #[cfg(test)]
@@ -412,7 +415,12 @@ mod tests {
     async fn health_returns_ok() {
         let app = make_app().await;
         let response = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

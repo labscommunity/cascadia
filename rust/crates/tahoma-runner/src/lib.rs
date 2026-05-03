@@ -63,11 +63,7 @@ impl Runner {
         shard: ShardSpec,
         listen_addr: Option<(&str, u16)>,
     ) -> Result<(), EngineError> {
-        let mut builder = self
-            .builder
-            .lock()
-            .take()
-            .ok_or(EngineError::NotLoaded)?;
+        let mut builder = self.builder.lock().take().ok_or(EngineError::NotLoaded)?;
         if let Some((host, port)) = listen_addr {
             builder.configure_listen(host, port);
         }

@@ -175,9 +175,9 @@ fn argmax_last_row(logits: &[f32], vocab: usize) -> i32 {
 
 fn map_ov_err(err: OvError) -> EngineError {
     match err {
-        OvError::Stub => EngineError::Backend(
-            "openvino shim built without --features openvino".into(),
-        ),
+        OvError::Stub => {
+            EngineError::Backend("openvino shim built without --features openvino".into())
+        }
         OvError::Utf8(s) => EngineError::InvalidConfig(s),
         OvError::Native(s) => EngineError::Backend(s),
     }
@@ -253,7 +253,12 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    fn build_feed_relay(&mut self, hidden: &[f32], shape: [usize; 3], position: i64) -> EngineResult<()> {
+    fn build_feed_relay(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+    ) -> EngineResult<()> {
         let seq_len = shape[1];
         let (cos, sin) = self.rotary.compute(position, seq_len);
         let names = &self.input_names;
@@ -290,7 +295,11 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    fn run_first(&mut self, input_ids: &[i64], position: i64) -> EngineResult<(Vec<f32>, Vec<usize>)> {
+    fn run_first(
+        &mut self,
+        input_ids: &[i64],
+        position: i64,
+    ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
         self.build_feed_first(input_ids, position)?;
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
@@ -380,7 +389,10 @@ impl OvRuntimeEngine {
             )));
         }
         let token = i32::from_le_bytes([
-            tensor.data[0], tensor.data[1], tensor.data[2], tensor.data[3],
+            tensor.data[0],
+            tensor.data[1],
+            tensor.data[2],
+            tensor.data[3],
         ]);
         Ok(token)
     }
@@ -679,7 +691,12 @@ pub struct OvRuntimeBuilder {
 }
 
 impl OvRuntimeBuilder {
-    pub fn new(pipeline_dir: impl Into<PathBuf>, rank: u32, total: u32, device: impl Into<String>) -> Self {
+    pub fn new(
+        pipeline_dir: impl Into<PathBuf>,
+        rank: u32,
+        total: u32,
+        device: impl Into<String>,
+    ) -> Self {
         Self {
             pipeline_dir: pipeline_dir.into(),
             rank,
@@ -797,12 +814,9 @@ impl Builder for OvRuntimeBuilder {
         )));
         let plugin = self.plugin();
         let xml_path = stage_dir.join("openvino_model.xml");
-        let runtime = OvRuntime::compile(
-            xml_path.to_str().unwrap_or_default(),
-            &self.device,
-            &plugin,
-        )
-        .map_err(map_ov_err)?;
+        let runtime =
+            OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
+                .map_err(map_ov_err)?;
         self.input_names = runtime.input_names().map_err(map_ov_err)?;
         self.runtime = Some(runtime);
 
@@ -835,7 +849,8 @@ impl Builder for OvRuntimeBuilder {
                 let tok = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
                 self.tokenizer = Some(Arc::new(tok));
-                self.eos_token_id = lookup_eos(&tokenizer_dir).or_else(|| lookup_eos(&self.pipeline_dir));
+                self.eos_token_id =
+                    lookup_eos(&tokenizer_dir).or_else(|| lookup_eos(&self.pipeline_dir));
                 events.push(LoadProgress::message(format!(
                     "tokenizer loaded; eos_token_id={:?}",
                     self.eos_token_id

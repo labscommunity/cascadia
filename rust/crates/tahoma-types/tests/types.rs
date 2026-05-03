@@ -102,7 +102,10 @@ fn shard_plan_rejects_too_many_stages() {
 
 #[test]
 fn peer_endpoint_display() {
-    assert_eq!(PeerEndpoint::new("127.0.0.1", 9100).to_string(), "127.0.0.1:9100");
+    assert_eq!(
+        PeerEndpoint::new("127.0.0.1", 9100).to_string(),
+        "127.0.0.1:9100"
+    );
 }
 
 #[test]

@@ -99,9 +99,7 @@ impl Topology {
     pub fn remove_node(&self, node_id: &str) {
         let mut inner = self.inner.write();
         inner.nodes.remove(node_id);
-        inner
-            .edges
-            .retain(|(s, d), _| s != node_id && d != node_id);
+        inner.edges.retain(|(s, d), _| s != node_id && d != node_id);
     }
 
     pub fn measure(

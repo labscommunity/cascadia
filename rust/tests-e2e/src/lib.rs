@@ -29,7 +29,11 @@ pub fn binary_path() -> PathBuf {
         .parent()
         .unwrap()
         .join("target")
-        .join(if cfg!(debug_assertions) { "debug" } else { "release" })
+        .join(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        })
         .join("tahoma")
 }
 
@@ -169,7 +173,11 @@ mod tests {
 
         for fut in futures {
             let r = fut.await.unwrap().expect("request");
-            assert!(r.status().is_success(), "concurrent req status {}", r.status());
+            assert!(
+                r.status().is_success(),
+                "concurrent req status {}",
+                r.status()
+            );
         }
     }
 }

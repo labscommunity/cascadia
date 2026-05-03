@@ -134,8 +134,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -213,8 +212,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                     .draft_model
                     .as_deref()
                     .ok_or_else(|| anyhow!("ov-dist-spec rank 0 requires --draft-model"))?;
-                let mut b =
-                    OvDistSpecBuilder::new(&args.model, draft, &args.device, args.spec_k);
+                let mut b = OvDistSpecBuilder::new(&args.model, draft, &args.device, args.spec_k);
                 if let Some(dir) = &args.ov_cache_dir {
                     b = b.with_cache_dir(dir);
                 }
@@ -226,12 +224,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 }
                 Ok(Box::new(b))
             } else {
-                let mut b = OvDistSpecWorkerBuilder::new(
-                    &args.model,
-                    args.rank,
-                    args.total,
-                    &args.device,
-                );
+                let mut b =
+                    OvDistSpecWorkerBuilder::new(&args.model, args.rank, args.total, &args.device);
                 if let Some(dir) = &args.ov_cache_dir {
                     b = b.with_cache_dir(dir);
                 }

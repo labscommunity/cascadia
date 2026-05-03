@@ -108,17 +108,17 @@ impl Rotary {
         Ok(Self { head_dim, inv_freq })
     }
 
-    fn apply_llama3_scaling(
-        inv_freq: &mut [f32],
-        scale: &RopeScalingConfig,
-    ) -> Result<(), String> {
+    fn apply_llama3_scaling(inv_freq: &mut [f32], scale: &RopeScalingConfig) -> Result<(), String> {
         let factor = scale.factor.ok_or("llama3 scaling needs factor")?;
-        let low = scale.low_freq_factor.ok_or("llama3 needs low_freq_factor")?;
-        let high = scale.high_freq_factor.ok_or("llama3 needs high_freq_factor")?;
+        let low = scale
+            .low_freq_factor
+            .ok_or("llama3 needs low_freq_factor")?;
+        let high = scale
+            .high_freq_factor
+            .ok_or("llama3 needs high_freq_factor")?;
         let old_ctx = scale
             .original_max_position_embeddings
-            .ok_or("llama3 needs original_max_position_embeddings")?
-            as f32;
+            .ok_or("llama3 needs original_max_position_embeddings")? as f32;
 
         let low_freq_wavelen = old_ctx / low;
         let high_freq_wavelen = old_ctx / high;

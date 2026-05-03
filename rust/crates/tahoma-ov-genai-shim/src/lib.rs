@@ -137,47 +137,73 @@ mod sys {
         pub fn tahoma_runtime_output_count(handle: *mut tahoma_runtime_t) -> usize;
 
         pub fn tahoma_runtime_input_name(
-            handle: *mut tahoma_runtime_t, idx: usize,
-            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            idx: usize,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
         ) -> c_int;
         pub fn tahoma_runtime_output_name(
-            handle: *mut tahoma_runtime_t, idx: usize,
-            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            idx: usize,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
         ) -> c_int;
 
         pub fn tahoma_runtime_input_name_all(
-            handle: *mut tahoma_runtime_t, idx: usize,
-            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            idx: usize,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
         ) -> c_int;
         pub fn tahoma_runtime_output_name_all(
-            handle: *mut tahoma_runtime_t, idx: usize,
-            out_buf: *mut c_char, out_cap: usize, out_len: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            idx: usize,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
         ) -> c_int;
 
         pub fn tahoma_runtime_set_input(
-            handle: *mut tahoma_runtime_t, tensor_name: *const c_char,
-            dtype: u32, shape: *const usize, rank: usize,
-            data: *const u8, data_size: usize,
+            handle: *mut tahoma_runtime_t,
+            tensor_name: *const c_char,
+            dtype: u32,
+            shape: *const usize,
+            rank: usize,
+            data: *const u8,
+            data_size: usize,
         ) -> c_int;
 
         pub fn tahoma_runtime_infer(handle: *mut tahoma_runtime_t) -> c_int;
 
         pub fn tahoma_runtime_output_rank(
-            handle: *mut tahoma_runtime_t, output_idx: usize, out_rank: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            output_idx: usize,
+            out_rank: *mut usize,
         ) -> c_int;
         pub fn tahoma_runtime_output_shape(
-            handle: *mut tahoma_runtime_t, output_idx: usize,
-            out_shape: *mut usize, shape_cap: usize,
+            handle: *mut tahoma_runtime_t,
+            output_idx: usize,
+            out_shape: *mut usize,
+            shape_cap: usize,
         ) -> c_int;
         pub fn tahoma_runtime_output_dtype(
-            handle: *mut tahoma_runtime_t, output_idx: usize, out_dtype: *mut u32,
+            handle: *mut tahoma_runtime_t,
+            output_idx: usize,
+            out_dtype: *mut u32,
         ) -> c_int;
         pub fn tahoma_runtime_output_byte_size(
-            handle: *mut tahoma_runtime_t, output_idx: usize, out: *mut usize,
+            handle: *mut tahoma_runtime_t,
+            output_idx: usize,
+            out: *mut usize,
         ) -> c_int;
         pub fn tahoma_runtime_output_copy(
-            handle: *mut tahoma_runtime_t, output_idx: usize,
-            out_buf: *mut u8, out_buf_size: usize,
+            handle: *mut tahoma_runtime_t,
+            output_idx: usize,
+            out_buf: *mut u8,
+            out_buf_size: usize,
         ) -> c_int;
     }
 }
@@ -487,8 +513,11 @@ impl Runtime {
         let mut handle: *mut sys::tahoma_runtime_t = ptr::null_mut();
         let rc = unsafe {
             sys::tahoma_runtime_compile(
-                path_c.as_ptr(), device_c.as_ptr(),
-                ptrs.as_ptr(), plugin.entries.len(), &mut handle,
+                path_c.as_ptr(),
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
             )
         };
         if rc != 0 {
@@ -529,9 +558,17 @@ impl Runtime {
     }
 
     #[cfg(feature = "openvino")]
-    fn name_at(&self, getter: unsafe extern "C" fn(
-        *mut sys::tahoma_runtime_t, usize, *mut c_char, usize, *mut usize,
-    ) -> c_int, idx: usize) -> Result<String> {
+    fn name_at(
+        &self,
+        getter: unsafe extern "C" fn(
+            *mut sys::tahoma_runtime_t,
+            usize,
+            *mut c_char,
+            usize,
+            *mut usize,
+        ) -> c_int,
+        idx: usize,
+    ) -> Result<String> {
         unsafe {
             let mut needed: usize = 0;
             let rc = getter(self.handle, idx, ptr::null_mut(), 0, &mut needed);
@@ -539,8 +576,13 @@ impl Runtime {
                 return Err(Error::Native(last_native_error()));
             }
             let mut buf = vec![0u8; needed + 1];
-            let rc = getter(self.handle, idx, buf.as_mut_ptr() as *mut c_char,
-                            buf.len(), &mut needed);
+            let rc = getter(
+                self.handle,
+                idx,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len(),
+                &mut needed,
+            );
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
             }
@@ -604,7 +646,13 @@ impl Runtime {
     }
 
     /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes.
-    pub fn set_input(&mut self, name: &str, dtype: DType, shape: &[usize], data: &[u8]) -> Result<()> {
+    pub fn set_input(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        data: &[u8],
+    ) -> Result<()> {
         #[cfg(not(feature = "openvino"))]
         {
             let _ = (name, dtype, shape, data);
@@ -614,9 +662,13 @@ impl Runtime {
         unsafe {
             let name_c = cstr(name)?;
             let rc = sys::tahoma_runtime_set_input(
-                self.handle, name_c.as_ptr(),
-                dtype as u32, shape.as_ptr(), shape.len(),
-                data.as_ptr(), data.len(),
+                self.handle,
+                name_c.as_ptr(),
+                dtype as u32,
+                shape.as_ptr(),
+                shape.len(),
+                data.as_ptr(),
+                data.len(),
             );
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
