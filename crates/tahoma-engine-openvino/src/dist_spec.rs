@@ -153,6 +153,47 @@ fn build_chain_mask_f16(valid_mask: &[i64], cache_len: usize, query_len: usize) 
     out
 }
 
+/// Build a "two parallel chains" attention mask in additive f16 form.
+/// Used by parallel-draft tree-spec: at each depth iteration we feed
+/// `[L_i, R_i]` together and need each token to see only its own chain's
+/// past entries plus prev-round (valid_mask) cache.
+///
+/// `chain_owner`: per cache slot in `[round_base, cache_len)`, 0 if owned
+/// by the LEFT chain (visible to L_i but blocked from R_i), 1 if owned
+/// by the RIGHT chain (vice versa).
+/// `round_base`: cache_len at the start of THIS spec-decode round (entries
+/// before this index are common past, after are this round's chain entries).
+/// Returns f16 bytes for shape `[1, 1, 2, cache_len + 2]` (two queries, the
+/// pair `[L_i, R_i]`).
+fn build_pair_mask_f16(
+    valid_mask: &[i64],
+    cache_len: usize,
+    round_base: usize,
+    chain_owner: &[u8],
+) -> Vec<u8> {
+    use half::f16;
+    let total = cache_len + 2;
+    let mut out = Vec::with_capacity(2 * total * 2);
+    let zero = f16::from_f32(0.0_f32);
+    let blk = f16::from_f32(F16_NEG_INF_F32);
+    for query_chain in 0..2u8 {
+        for k in 0..total {
+            let allowed = if k < round_base {
+                valid_mask[k] != 0
+            } else if k < cache_len {
+                let owner = chain_owner[k - round_base];
+                valid_mask[k] != 0 && owner == query_chain
+            } else {
+                // New query slots: each query sees only itself.
+                k == cache_len + query_chain as usize
+            };
+            let v = if allowed { zero } else { blk };
+            out.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Build a tree-spec attention mask in additive f16 form.
 ///
 /// `valid_mask` / `cache_len`: same as chain.
@@ -536,6 +577,9 @@ pub struct MaskedReq {
     cache_len: usize,
     logical_pos: usize,
     inputs: std::collections::HashMap<String, String>,
+    /// True when this IR was exported with v6 4D additive f16 mask.
+    /// Set externally via `set_v6` based on stage_config.json detection.
+    pub is_v6: bool,
 }
 
 impl MaskedReq {
@@ -566,7 +610,20 @@ impl MaskedReq {
             cache_len: 0,
             logical_pos: 0,
             inputs,
+            is_v6: false,
         })
+    }
+
+    pub fn set_v6(&mut self, v: bool) {
+        self.is_v6 = v;
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache_len
+    }
+
+    pub fn logical_pos(&self) -> usize {
+        self.logical_pos
     }
 
     pub fn reset(&mut self) -> Result<(), EngineError> {
@@ -618,14 +675,21 @@ impl MaskedReq {
                 &i64_to_bytes(input_ids),
             )
             .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(
-                &attn_name,
-                ShimDType::I64,
-                &[1, total],
-                &i64_to_bytes(&attn),
-            )
-            .map_err(map_ov_err)?;
+        if self.is_v6 {
+            let attn_f16 = build_chain_mask_f16(&self.valid_mask, self.cache_len, n);
+            self.runtime
+                .set_input(&attn_name, ShimDType::F16, &[1, 1, n, total], &attn_f16)
+                .map_err(map_ov_err)?;
+        } else {
+            self.runtime
+                .set_input(
+                    &attn_name,
+                    ShimDType::I64,
+                    &[1, total],
+                    &i64_to_bytes(&attn),
+                )
+                .map_err(map_ov_err)?;
+        }
         self.runtime
             .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(&pos))
             .map_err(map_ov_err)?;
@@ -691,6 +755,202 @@ impl MaskedReq {
             self.valid_mask[i] = 0;
         }
         self.logical_pos = self.logical_pos.saturating_sub(k);
+    }
+
+    /// Invalidate the last `n` cache entries WITHOUT touching `logical_pos`.
+    /// Use when cache entries don't map 1:1 to logical positions (e.g.
+    /// `feed_pair` writes 2 cache entries but advances logical_pos by 1
+    /// because the siblings share their absolute position).
+    pub fn invalidate_recent(&mut self, n: usize) {
+        let lo = self.cache_len.saturating_sub(n);
+        for i in lo..self.cache_len {
+            self.valid_mask[i] = 0;
+        }
+    }
+
+    /// Tree-feed: process a flat tree of `n` tokens in a single batched
+    /// forward, with topology determined by `parents`. Requires v6 IR
+    /// (4D mask). Returns logits at every tree position so the caller
+    /// can walk arbitrary chains.
+    ///
+    /// `input_ids`, `position_ids`, `parents` must all have the same length.
+    /// `parents[i]` is the index of token `i`'s parent in the same flat
+    /// sequence, or -1 if its parent is the most recent cached entry.
+    ///
+    /// Cache management: `cache_len` advances by `n`; `logical_pos` is NOT
+    /// updated (caller advances it via `confirm_tree_path` after picking
+    /// the winning path).
+    pub fn feed_tree(
+        &mut self,
+        input_ids: &[i64],
+        position_ids: &[i64],
+        parents: &[i32],
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        if !self.is_v6 {
+            return Err(EngineError::Backend(
+                "MaskedReq.feed_tree requires v6 IR".into(),
+            ));
+        }
+        let n = input_ids.len();
+        if position_ids.len() != n || parents.len() != n {
+            return Err(EngineError::Backend(format!(
+                "feed_tree length mismatch: ids={}, pos={}, parents={}",
+                n, position_ids.len(), parents.len(),
+            )));
+        }
+        let total = self.cache_len + n;
+        if total > self.valid_mask.len() {
+            let new_size = (total * 2).max(self.valid_mask.len() * 2);
+            self.valid_mask.resize(new_size, 1);
+        }
+        for v in self.valid_mask[self.cache_len..total].iter_mut() {
+            *v = 1;
+        }
+        let attn_f16 = build_tree_mask_f16(&self.valid_mask, self.cache_len, parents);
+
+        let in_ids_name = self.inputs.get("input_ids").unwrap().clone();
+        let attn_name = self.inputs.get("attention_mask").unwrap().clone();
+        let pos_name = self.inputs.get("position_ids").unwrap().clone();
+
+        self.runtime
+            .set_input(&in_ids_name, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&attn_name, ShimDType::F16, &[1, 1, n, total], &attn_f16)
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(position_ids))
+            .map_err(map_ov_err)?;
+        if self.has_beam {
+            if let Some(beam_name) = self.inputs.get("beam_idx").cloned() {
+                let bytes = 0i32.to_le_bytes().to_vec();
+                self.runtime
+                    .set_input(&beam_name, ShimDType::I32, &[1], &bytes)
+                    .map_err(map_ov_err)?;
+            }
+        }
+
+        self.runtime.infer().map_err(map_ov_err)?;
+        let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
+        let floats = match dtype {
+            ShimDType::F32 => bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>(),
+            ShimDType::F16 => f16_bytes_to_f32(&bytes),
+            other => {
+                return Err(EngineError::Backend(format!(
+                    "unexpected output dtype {other:?}"
+                )))
+            }
+        };
+        self.cache_len += n;
+        let out_shape = if shape.len() == 3 {
+            [shape[0], shape[1], shape[2]]
+        } else if shape.len() == 2 {
+            [1, shape[0], shape[1]]
+        } else {
+            [1, 1, floats.len()]
+        };
+        Ok((floats, out_shape))
+    }
+
+    /// Mirror of `DistributedMaskedReq::confirm_tree_path` for the local
+    /// draft. Invalidate non-winning entries; advance logical_pos by the
+    /// accepted path length.
+    pub fn confirm_tree_path(&mut self, tree_size: usize, accepted_path_offsets: &[usize]) {
+        let tree_base = self.cache_len.saturating_sub(tree_size);
+        for i in tree_base..self.cache_len {
+            self.valid_mask[i] = 0;
+        }
+        for &off in accepted_path_offsets {
+            self.valid_mask[tree_base + off] = 1;
+        }
+        self.logical_pos += accepted_path_offsets.len();
+    }
+
+    /// Feed a `[L_i, R_i]` pair simultaneously: one batched forward call
+    /// that returns logits at both positions. Each token sees its own
+    /// chain's prior entries (since `round_base`) plus all valid past
+    /// cache entries before `round_base`. Requires v6 IR.
+    ///
+    /// `position_l`, `position_r` are the absolute logical positions of
+    /// L_i and R_i (siblings — same value).
+    /// `round_base` = cache_len at the start of THIS round (before any
+    /// pair feeds for this round). All entries in [round_base, cache_len)
+    /// are this-round chain entries with owners from `chain_owner`.
+    /// `chain_owner[k]` = 0 if cache slot `round_base + k` is on LEFT, 1 if RIGHT.
+    pub fn feed_pair(
+        &mut self,
+        l_token: i64,
+        r_token: i64,
+        position_l: i64,
+        position_r: i64,
+        round_base: usize,
+        chain_owner: &[u8],
+    ) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
+        if !self.is_v6 {
+            return Err(EngineError::Backend("MaskedReq.feed_pair requires v6".into()));
+        }
+        let total = self.cache_len + 2;
+        if total > self.valid_mask.len() {
+            let new_size = (total * 2).max(self.valid_mask.len() * 2);
+            self.valid_mask.resize(new_size, 1);
+        }
+        // Mark the two new slots provisionally valid (they get invalidated
+        // when the round ends if their chain loses).
+        self.valid_mask[self.cache_len] = 1;
+        self.valid_mask[self.cache_len + 1] = 1;
+
+        let attn_f16 = build_pair_mask_f16(&self.valid_mask, self.cache_len, round_base, chain_owner);
+        let in_ids_name = self.inputs.get("input_ids").unwrap().clone();
+        let attn_name = self.inputs.get("attention_mask").unwrap().clone();
+        let pos_name = self.inputs.get("position_ids").unwrap().clone();
+
+        let pair_ids = [l_token, r_token];
+        let pair_pos = [position_l, position_r];
+        self.runtime
+            .set_input(&in_ids_name, ShimDType::I64, &[1, 2], &i64_to_bytes(&pair_ids))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&attn_name, ShimDType::F16, &[1, 1, 2, total], &attn_f16)
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&pos_name, ShimDType::I64, &[1, 2], &i64_to_bytes(&pair_pos))
+            .map_err(map_ov_err)?;
+        if self.has_beam {
+            if let Some(beam_name) = self.inputs.get("beam_idx").cloned() {
+                let bytes = 0i32.to_le_bytes().to_vec();
+                self.runtime
+                    .set_input(&beam_name, ShimDType::I32, &[1], &bytes)
+                    .map_err(map_ov_err)?;
+            }
+        }
+
+        self.runtime.infer().map_err(map_ov_err)?;
+        let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
+        let floats = match dtype {
+            ShimDType::F32 => bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>(),
+            ShimDType::F16 => f16_bytes_to_f32(&bytes),
+            other => {
+                return Err(EngineError::Backend(format!(
+                    "unexpected output dtype {other:?}"
+                )))
+            }
+        };
+        // Output shape should be [1, 2, vocab].
+        let vocab = if shape.len() == 3 {
+            shape[2]
+        } else {
+            floats.len() / 2
+        };
+        let l_logit = floats[..vocab].to_vec();
+        let r_logit = floats[vocab..2 * vocab].to_vec();
+        self.cache_len += 2;
+        Ok((l_logit, r_logit))
     }
 }
 
@@ -1566,6 +1826,13 @@ pub fn spec_decode_greedy_tree(
     }
     // Preset 99 = chain-only via tree code path (debug: should match chain spec).
     let skip_right_chain = tree_preset == 99;
+    // Preset 2 = parallel-draft tree (feed_pair); requires v6 draft.
+    let parallel_draft = tree_preset == 2;
+    if parallel_draft && !draft.is_v6 {
+        return Err(EngineError::Backend(
+            "tree_preset=2 (parallel draft) requires v6 draft model".into(),
+        ));
+    }
     let mut out: Vec<i64> = Vec::new();
     let mut t_target = std::time::Duration::ZERO;
     let mut t_draft = std::time::Duration::ZERO;
@@ -1605,47 +1872,80 @@ pub fn spec_decode_greedy_tree(
     while out.len() < max_tokens {
         stats.n_steps += 1;
 
-        // -------- Build LEFT chain (top-1 from root) --------
-        let mut left: Vec<i64> = vec![argmax(&d_last_logit) as i64];
-        for _i in 1..k {
-            let prev = *left.last().unwrap();
-            let _ts = std::time::Instant::now();
-            let (l, sh) = draft.feed(&[prev])?;
-            t_draft += _ts.elapsed();
-            let dv2 = sh[2];
-            left.push(argmax(&l[l.len() - dv2..]) as i64);
-        }
-        // After this loop, draft KV cache has k-1 NEW entries (the build loop
-        // does k-1 feeds; L_0 came from the previous d_last_logit without a feed).
-        let left_feeds = k - 1; // entries added to draft cache during left build
-
-        let right: Vec<i64> = if skip_right_chain {
-            Vec::new()
-        } else {
-            // Rewind exactly the entries added by the build loop.
-            draft.rewind(left_feeds);
-
-            // -------- Build RIGHT chain: top-2 root + top-1 chain (k feeds total) --------
-            let alt_root = top2(&d_last_logit) as i64;
-            let mut right: Vec<i64> = vec![alt_root];
-            let _ts = std::time::Instant::now();
-            let (l, sh) = draft.feed(&[alt_root])?;
-            t_draft += _ts.elapsed();
-            let dv_r = sh[2];
-            let mut r_last: Vec<f32> = l[l.len() - dv_r..].to_vec();
-            for _i in 1..k {
-                let next = argmax(&r_last) as i64;
-                right.push(next);
+        // -------- Build LEFT and RIGHT chains --------
+        let (left, right, left_feeds, right_feeds) = if parallel_draft && !skip_right_chain {
+            // Parallel build via feed_pair: K-1 batched 2-token forward calls.
+            // L_0 = top-1 of d_last_logit (free), R_0 = top-2 (free).
+            // chain_owner records which chain each cache slot belongs to so
+            // the pair-mask isolates siblings.
+            let mut left = vec![argmax(&d_last_logit) as i64];
+            let mut right = vec![top2(&d_last_logit) as i64];
+            let p_root_draft = draft.logical_pos() as i64;
+            let round_base = draft.cache_len();
+            let mut owners: Vec<u8> = Vec::with_capacity(2 * (k - 1));
+            for i in 1..k {
+                let l_token = *left.last().unwrap();
+                let r_token = *right.last().unwrap();
+                // Both new entries land at logical position p_root_draft + i.
+                let pos = p_root_draft + i as i64;
                 let _ts = std::time::Instant::now();
-                let (l2, sh2) = draft.feed(&[next])?;
+                let (l_logit, r_logit) = draft.feed_pair(
+                    l_token,
+                    r_token,
+                    pos,
+                    pos,
+                    round_base,
+                    &owners,
+                )?;
                 t_draft += _ts.elapsed();
-                let dv_r2 = sh2[2];
-                r_last = l2[l2.len() - dv_r2..].to_vec();
+                // After this feed: 2 new cache entries appended. Owner 0 = L, 1 = R.
+                owners.push(0);
+                owners.push(1);
+                left.push(argmax(&l_logit) as i64);
+                right.push(argmax(&r_logit) as i64);
             }
-            right
+            // Build phase added 2*(k-1) entries; owners describes them.
+            // For the catchup logic, treat as: left "feeds" = right "feeds" = k-1
+            // (each chain extended k-1 times).
+            (left, right, k - 1, k - 1)
+        } else {
+            // Sequential build: LEFT chain first, then RIGHT.
+            let mut left: Vec<i64> = vec![argmax(&d_last_logit) as i64];
+            for _i in 1..k {
+                let prev = *left.last().unwrap();
+                let _ts = std::time::Instant::now();
+                let (l, sh) = draft.feed(&[prev])?;
+                t_draft += _ts.elapsed();
+                let dv2 = sh[2];
+                left.push(argmax(&l[l.len() - dv2..]) as i64);
+            }
+            let left_feeds = k - 1;
+
+            let right: Vec<i64> = if skip_right_chain {
+                Vec::new()
+            } else {
+                draft.rewind(left_feeds);
+                let alt_root = top2(&d_last_logit) as i64;
+                let mut right: Vec<i64> = vec![alt_root];
+                let _ts = std::time::Instant::now();
+                let (l, sh) = draft.feed(&[alt_root])?;
+                t_draft += _ts.elapsed();
+                let dv_r = sh[2];
+                let mut r_last: Vec<f32> = l[l.len() - dv_r..].to_vec();
+                for _i in 1..k {
+                    let next = argmax(&r_last) as i64;
+                    right.push(next);
+                    let _ts = std::time::Instant::now();
+                    let (l2, sh2) = draft.feed(&[next])?;
+                    t_draft += _ts.elapsed();
+                    let dv_r2 = sh2[2];
+                    r_last = l2[l2.len() - dv_r2..].to_vec();
+                }
+                right
+            };
+            let right_feeds = if skip_right_chain { 0 } else { k };
+            (left, right, left_feeds, right_feeds)
         };
-        // Right chain added `k` entries (1 feed for alt_root + k-1 feeds for the chain).
-        let right_feeds = if skip_right_chain { 0 } else { k };
         let drafted = left.len() + right.len();
         stats.total_drafts += drafted as u32;
 
@@ -1783,18 +2083,19 @@ pub fn spec_decode_greedy_tree(
         target.confirm_tree_path(tree_ids.len(), &accepted_offsets);
 
         // -------- Reconcile draft state --------
-        // Rewind exactly what we added since the start of this round, so the
-        // draft cache is back to root state before the catchup feed re-fills
-        // it with the WINNING chain's prefix.
-        let to_rewind = if skip_right_chain {
-            left_feeds
+        // Reset the draft cache back to round-base state. Use `invalidate_recent`
+        // (which doesn't touch logical_pos) for the parallel_draft path because
+        // feed_pair adds 2 cache slots per logical-position step.
+        if parallel_draft {
+            // 2 cache entries per pair iteration × (k-1) iterations.
+            draft.invalidate_recent(left_feeds + right_feeds);
+        } else if skip_right_chain {
+            draft.rewind(left_feeds);
         } else {
-            // After right build, draft has left_feeds (invalidated by earlier rewind)
-            // + right_feeds (live). The earlier rewind already invalidated left_feeds,
-            // so we only need to rewind right_feeds here.
-            right_feeds
-        };
-        draft.rewind(to_rewind);
+            // Sequential: after right build, draft has left_feeds (invalidated
+            // by earlier rewind) + right_feeds (live). Only rewind right_feeds.
+            draft.rewind(right_feeds);
+        }
         let mut catchup: Vec<i64> = Vec::with_capacity(accepted + 1);
         catchup.extend_from_slice(chosen_drafts);
         catchup.push(correction);
@@ -2200,7 +2501,29 @@ impl Builder for OvDistSpecBuilder {
         let mut target =
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         target.set_v6(self.is_v6);
-        let masked_draft = MaskedReq::new(draft)?;
+        // Detect whether the draft was exported with a v6 4D additive mask.
+        // We check both `stage_0/stage_config.json` and `stage_config.json`
+        // to handle single-stage and 1-stage-as-stage-0 layouts.
+        let draft_path = std::path::Path::new(&self.draft_model_path);
+        let draft_v6 = {
+            let cfg_paths = [
+                draft_path.join("stage_config.json"),
+                draft_path.join("stage_0").join("stage_config.json"),
+            ];
+            cfg_paths.iter().any(|p| {
+                std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<StageConfig>(&s).ok())
+                    .and_then(|c| c.export_version)
+                    .map(|v| v.starts_with("v6"))
+                    .unwrap_or(false)
+            })
+        };
+        let mut masked_draft = MaskedReq::new(draft)?;
+        masked_draft.set_v6(draft_v6);
+        if draft_v6 {
+            info!("draft model detected as v6 (4D additive mask)");
+        }
         Ok(Box::new(OvDistSpecEngine {
             target,
             draft: masked_draft,

@@ -1,0 +1,17 @@
+{
+  "stage": 0,
+  "layer_start": 0,
+  "layer_end": 16,
+  "has_embed": true,
+  "has_head": true,
+  "quantization": "fp16",
+  "hidden_size": 2048,
+  "vocab_size": 128256,
+  "num_layers_total": 16,
+  "num_kv_heads": 8,
+  "head_dim": 64,
+  "stateful": true,
+  "rope_theta": 500000.0,
+  "inputs": "input_ids/hidden_states, attention_mask[4D f16], position_ids, beam_idx (KV cache is internal state)",
+  "export_version": "v6_4d_additive_mask_for_tree_spec"
+}

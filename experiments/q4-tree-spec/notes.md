@@ -142,6 +142,82 @@ single-user sequential.
 - Driver loop: `spec_decode_greedy_tree` (tree_preset 1)
 - Tree-preset 99 = chain via tree code path (debug / sanity)
 
+## Q5 — option 1 attempted: parallel draft via v6 4D mask
+
+Re-exported Llama 3.2 1B Instruct as a v6 IR (single stage, embed + 16
+layers + tied lm_head). Two patches were needed:
+
+- **Tied embeddings**: 1B/3B Llamas share `embed_tokens.weight` with
+  `lm_head.weight`. The v5 export script only handled separate weights;
+  added detection + reuse. (Works for INT8/FP16 but the INT4 path hangs
+  in NNCF compression for tied weights — likely a known NNCF interaction.
+  Used FP16 quantization instead, ~2.5 GB vs ~700 MB INT4. Trade-off:
+  bigger memory footprint + slower per-token compute, but the v6 mask
+  path works.)
+- **`MaskedReq.feed_pair` + `build_pair_mask_f16`**: new draft API that
+  processes `[L_i, R_i]` in a single batched forward, with a per-query
+  mask that isolates each chain from its sibling. Requires v6 draft.
+- **`MaskedReq.invalidate_recent`**: rewind without touching `logical_pos`
+  (needed because `feed_pair` writes 2 cache entries per logical-position
+  step, so the standard `rewind(k)` would corrupt position tracking).
+- **`spec_decode_greedy_tree` preset 2**: uses `feed_pair` instead of
+  sequentially building LEFT then RIGHT. K-1 batched 2-token feeds per
+  round instead of 2K-1 single-token feeds.
+
+### Result
+
+| Config | tok/s | tokens/step | accept | draft_ms/step |
+|--------|------:|------------:|-------:|--------------:|
+| Chain K=5 (v6, baseline) | **18.46** | 3.55 | 0.51 | 128 |
+| Tree K=5 sequential (preset 1, INT4 1B draft) | 7.81 | 3.82 | 0.28 | 248 |
+| **Tree K=5 parallel (preset 2, FP16 1B v6 draft)** | **11.20** | 3.82 | 0.28 | 186 |
+
+Parallel draft saves **25% on draft cost** (248 → 186 ms/step), giving
+**+43% throughput vs sequential tree** (7.81 → 11.20 tok/s). Generation
+is correct (verified via round traces — chain spec K=5 final corrections
+match).
+
+### Why it still loses to chain spec
+
+The wire/charlie cost is the dominant bottleneck:
+
+| | Chain K=5 (v6) | Tree K=5 parallel (preset 2) |
+|---|--------------:|----------------------------:|
+| target_alpha_infer_ms / step | 28 | 33 |
+| target_wire_ms / step | 34 | 118 (3.5×) |
+| draft_ms / step | 128 | 186 (1.45×) |
+| total ms / step | 192 | 341 |
+
+Tree's wire jumps **3.5×** for only ~2× more data. Looking at the
+rough math: tree sends `[1, 11, total]` mask vs chain's `[1, 6, total]`
+(1.83× bigger), tree hidden is `[1, 11, 4096]` vs `[1, 6, 4096]`
+(1.83×), tree logits are `[1, 11, 128k]` vs `[1, 6, 128k]` (1.83×).
+At TB4 ~10 Gbps the extra ~1.3 MB/round should add ~1 ms; the actual
+~80 ms extra per step is mostly charlie's stage_1 attention compute
+plus OV's per-call overhead growing super-linearly with seq_len.
+
+Net per-step time: tree 341 ms vs chain 192 ms. Tree's +8% tokens-per-step
+(3.82 vs 3.55) is dwarfed by the +78% step time.
+
+### Two further wins available, both deferred
+
+1. **Re-export 1B draft as INT4 v6** — would cut draft cost ~3× (memory
+   bandwidth-bound), giving tree a draft cost of ~60 ms/step. Per-step
+   becomes max(60, 152) = 152 ms ≈ chain step time. Throughput parity
+   with chain (~18 tok/s), still not a win.
+   - Blocked on the NNCF tied-embeddings hang. Would need to either patch
+     NNCF, fork the script to skip lm_head compression, or train an EAGLE
+     head whose lm_head isn't tied.
+
+2. **Reduce wire/charlie scaling** — the 3.5× wire growth for 1.83×
+   data is the real killer. Possible mitigations:
+   - Bit-packed boolean mask instead of f16 additive (16× smaller).
+   - Per-stage PA — would need the OV plugin OOM workaround we deferred
+     in Q2.1.
+   - Fixed mask-shape preallocation in OV to avoid per-call shape rebinding.
+
+   These are multi-day investigations. Not pursued.
+
 ## Recommendation
 
 Do **not** enable `--spec-tree 1` for production benchmarks on this

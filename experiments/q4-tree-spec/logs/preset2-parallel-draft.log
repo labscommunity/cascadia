@@ -1,0 +1,32 @@
+[2m2026-05-03T19:31:04.144710Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvDistSpec [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m2 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\shards_2stage_v6_treemask
+[2m2026-05-03T19:31:04.144865Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mSome(PeerEndpoint { host: "10.10.10.2", port: 9100 })
+[2m2026-05-03T19:31:04.158602Z[0m [32m INFO[0m [2mtahoma_transport[0m[2m:[0m ActivationClient connected [3mhost[0m[2m=[0m10.10.10.2 [3mport[0m[2m=[0m9100
+[2m2026-05-03T19:31:04.158669Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T19:31:12.386744Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling target stage 0
+[2m2026-05-03T19:31:12.386849Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading tokenizer
+[2m2026-05-03T19:31:12.386863Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling draft C:\cascadia\shards_1stage_v6_1b_fp16\stage_0
+[2m2026-05-03T19:31:12.386873Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T19:31:12.386882Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T19:31:12.387313Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m draft model detected as v6 (4D additive mask)
+[2m2026-05-03T19:31:12.387336Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T19:31:13.517475Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m921 [3mdraft_ms[0m[2m=[0m236 [3mother_ms[0m[2m=[0m0 [3mtotal_ms[0m[2m=[0m1129 [3mtarget_alpha_setup_ms[0m[2m=[0m0 [3mtarget_alpha_infer_ms[0m[2m=[0m311 [3mtarget_alpha_output_ms[0m[2m=[0m0 [3mtarget_wire_ms[0m[2m=[0m579
+[2m2026-05-03T19:31:13.517571Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec warmup ok [3mk[0m[2m=[0m5 [3mtree[0m[2m=[0m2
+[2m2026-05-03T19:31:13.517600Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T19:31:13.517630Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T19:31:13.519106Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m35 [3mk[0m[2m=[0m5
+[2m2026-05-03T19:31:15.837382Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m1 [3mleft[0m[2m=[0m[62, 16533, 25, 13220, 9] [3mright[0m[2m=[0m[1432, 567, 15166, 220, 16] [3mt_greedy_first[0m[2m=[0m49 [3mleft_accept[0m[2m=[0m0 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m0 [3mcorrection[0m[2m=[0m49
+[2m2026-05-03T19:31:16.107624Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m2 [3mleft[0m[2m=[0m[28729, 320, 17020, 291, 30151] [3mright[0m[2m=[0m[3510, 85, 374, 264, 502] [3mt_greedy_first[0m[2m=[0m28729 [3mleft_accept[0m[2m=[0m5 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m5 [3mcorrection[0m[2m=[0m2638
+[2m2026-05-03T19:31:16.373450Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m3 [3mleft[0m[2m=[0m[46879, 8, 37686, 527, 6319] [3mright[0m[2m=[0m[17863, 8, 37686, 527, 6319] [3mt_greedy_first[0m[2m=[0m46879 [3mleft_accept[0m[2m=[0m2 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m2 [3mcorrection[0m[2m=[0m323
+[2m2026-05-03T19:31:36.366928Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode_tree timing [3mtarget_ms[0m[2m=[0m10153 [3mdraft_ms[0m[2m=[0m12487 [3mother_ms[0m[2m=[0m207 [3mtotal_ms[0m[2m=[0m22847 [3mtarget_alpha_setup_ms[0m[2m=[0m4 [3mtarget_alpha_infer_ms[0m[2m=[0m2241 [3mtarget_alpha_output_ms[0m[2m=[0m4 [3mtarget_wire_ms[0m[2m=[0m7899
+[2m2026-05-03T19:31:36.368517Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m67 [3maccept[0m[2m=[0m0.28208956122398376
+**RISC (Reduced Instruction Set Computing) and CISC (Complex Instruction Set Computing) are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications.
+
+**RISC Processors:**
+
+RISC processors are designed to execute a limited set of instructions quickly and efficiently. They typically have a simple instruction set, a deep pipeline, and a focus on executing a large number of instructions per clock cycle. This approach is based on the idea that a small set of instructions can be executed quickly and efficiently, rather than trying to execute a large number of complex instructions.
+
+**Key Features of RISC Processors:**
+
+*   **Deep Pipeline:** RISC processors have a deep pipeline, which allows them to execute a large number of instructions per clock cycle. This is achieved by breaking down the instruction execution process into multiple stages, each of which is executed in a single clock cycle.
+*   **Simple Instruction Set:** RISC processors have a simple instruction set, which consists of a limited set of instructions that can be executed quickly and efficiently. This simplicity allows for faster execution times and lower power consumption.
+*   **Typical Use Cases:** RISC processors are commonly used in
