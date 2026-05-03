@@ -192,6 +192,14 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    /// Wall-clock when the task became active. Used to compute the
+    /// final tok/s the engine prints in its `task done` log line.
+    started: std::time::Instant,
+    /// Cumulative time inside `run_first` (stage_0 compute + read).
+    t_alpha_compute: std::time::Duration,
+    /// Cumulative time inside `send_hidden_downstream` +
+    /// `recv_token_from_downstream` — i.e. wire send + charlie wait + recv.
+    t_wire: std::time::Duration,
 }
 
 pub struct OvRuntimeEngine {
@@ -469,6 +477,9 @@ impl OvRuntimeEngine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
+                started: std::time::Instant::now(),
+                t_alpha_compute: std::time::Duration::ZERO,
+                t_wire: std::time::Duration::ZERO,
             });
         }
 
@@ -485,11 +496,14 @@ impl OvRuntimeEngine {
         };
 
         let position = self.position;
+        let _ts = std::time::Instant::now();
         let (out, shape) = self.run_first(&input_ids, position)?;
+        let alpha_dur = _ts.elapsed();
         self.position += input_ids.len() as i64;
 
         // Resolve next_token: if 1-stage IR also produced logits; else send hs
         // downstream and recv next_token back.
+        let mut wire_dur = std::time::Duration::ZERO;
         let next_token = if self.spec.is_first_stage && self.spec.is_last_stage {
             // Single-stage: out is logits [1, seq_len, vocab]
             let vocab = shape[shape.len() - 1];
@@ -500,9 +514,16 @@ impl OvRuntimeEngine {
             } else {
                 [1, shape[0], shape[1]]
             };
+            let _ts = std::time::Instant::now();
             self.send_hidden_downstream(&out, s3)?;
-            self.recv_token_from_downstream()?
+            let token = self.recv_token_from_downstream()?;
+            wire_dur = _ts.elapsed();
+            token
         };
+        if let Some(a) = self.active.as_mut() {
+            a.t_alpha_compute += alpha_dur;
+            a.t_wire += wire_dur;
+        }
 
         // Decode delta + check stop.
         let active = self.active.as_mut().unwrap();
@@ -546,9 +567,20 @@ impl OvRuntimeEngine {
         };
 
         if is_final {
+            let elapsed = active.started.elapsed();
+            let tok_s = active.generated.len() as f64 / elapsed.as_secs_f64();
+            let alpha_ms = active.t_alpha_compute.as_millis() as u64;
+            let wire_ms = active.t_wire.as_millis() as u64;
+            let total_ms = elapsed.as_millis() as u64;
+            let other_ms = total_ms.saturating_sub(alpha_ms).saturating_sub(wire_ms);
             info!(
                 task = %task_id,
                 tokens = active.generated.len(),
+                elapsed_s = elapsed.as_secs_f64(),
+                tok_s,
+                alpha_ms,
+                wire_ms,
+                other_ms,
                 "ov-runtime task done"
             );
             self.active = None;
