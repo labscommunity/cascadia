@@ -1,0 +1,26 @@
+[2m2026-05-03T04:25:37.871664Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvDistSpec [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m2 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\shards_2stage_v5_beam
+[2m2026-05-03T04:25:37.872031Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mSome(PeerEndpoint { host: "10.10.10.2", port: 9100 })
+[2m2026-05-03T04:25:37.874670Z[0m [32m INFO[0m [2mtahoma_transport[0m[2m:[0m ActivationClient connected [3mhost[0m[2m=[0m10.10.10.2 [3mport[0m[2m=[0m9100
+[2m2026-05-03T04:25:37.875303Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T04:25:41.677366Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling target stage 0
+[2m2026-05-03T04:25:41.677461Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading tokenizer
+[2m2026-05-03T04:25:41.677475Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling draft C:\cascadia\models\fastdraft-150m-int8-ov
+[2m2026-05-03T04:25:41.677484Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T04:25:41.677494Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T04:25:41.677637Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T04:25:47.044233Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m5213 [3mdraft_ms[0m[2m=[0m152 [3mother_ms[0m[2m=[0m0 [3mtotal_ms[0m[2m=[0m5366
+[2m2026-05-03T04:25:47.044333Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec warmup ok [3mk[0m[2m=[0m3
+[2m2026-05-03T04:25:47.044351Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T04:25:47.044375Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T04:25:47.045992Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m59 [3mk[0m[2m=[0m3
+[2m2026-05-03T04:26:12.205756Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m18029 [3mdraft_ms[0m[2m=[0m6902 [3mother_ms[0m[2m=[0m227 [3mtotal_ms[0m[2m=[0m25159
+[2m2026-05-03T04:26:12.207802Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m256 [3msteps[0m[2m=[0m220 [3maccept[0m[2m=[0m0.054711245000362396
+ The story should be a mix of science fiction, mystery, and adventure.
+
+---
+
+Atlas, the curious robot, floated through the airlock of the abandoned space station, his bright blue optics scanning the dimly lit corridor beyond. The station, once a thriving hub of interplanetary commerce and research, now hung silently in orbit around Mars, a testament to the transience of human endeavor. As Atlas drifted deeper into the station, the rusted walls seemed to close in around him, their peeling metallic surfaces a grim reminder of the passage of time.
+
+The robot's advanced sensors picked up a faint hum, a residual echo of the station's once-thriving life support systems. Atlas followed the signal, his magnetic feet clicking against the cold metal floor as he navigated the deserted corridors. He passed by rows of empty bunks, their mattresses sagging like the station itself, and entered a room that seemed to have been left untouched for decades.
+
+A bank of flickering screens and consoles lined one wall, their displays dark and unresponsive. Yet, as Atlas approached, a faint, pulsating glow emanated from a single console in the center. The robot's optics locked onto the screen, and he detected a low-frequency signal, almost imperceptible. It was
