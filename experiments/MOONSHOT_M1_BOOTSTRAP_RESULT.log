@@ -1,0 +1,15 @@
+[2m2026-05-03T06:37:08.059115Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvGenai [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m1 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\models\mixtral-8x7b-int4-ov-fresh
+[2m2026-05-03T06:37:08.059478Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mNone
+[2m2026-05-03T06:37:08.059952Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T06:39:38.616395Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress locating IR at C:\cascadia\models\mixtral-8x7b-int4-ov-fresh
+[2m2026-05-03T06:39:38.618834Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling LLMPipeline on GPU
+[2m2026-05-03T06:39:38.618855Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T06:39:38.618942Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T06:39:38.619168Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T06:39:56.503960Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m ov-genai warmup ok [3mspec_k[0m[2m=[0m0 [3mprompt_lookup[0m[2m=[0m0
+[2m2026-05-03T06:39:56.504501Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T06:39:56.504753Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T06:41:00.162817Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m task done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m34 [3melapsed_s[0m[2m=[0m63.441816 [3mtok_s[0m[2m=[0m0.5359241292840671
+
+
+RISC and CISC are two different types of processor architectures. RISC stands for Reduced Instruction Set Computing, while

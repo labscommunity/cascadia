@@ -68,3 +68,21 @@ This is consistent with published interpretability work showing the "next-token 
 **Why this is worth saving:** the obvious-sounding "use embed as pseudo-head" trick is a TRAP for low-effort distributed-PP speculation. Anyone trying to revive this idea on Llama-class models should use deeper-layer cuts — and even then, accept rates will trade off against per-stage compute time.
 
 **Source experiments:** `experiments/m3-pseudohead-feasibility/`.
+
+---
+
+## D4 — Mixtral 8x7B INT4 (28 GB OV format) RUNS on alpha B390 12 GB GPU at 0.54 tok/s via implicit shared-system-memory spillage; proves M1's "doesn't fit single-node" premise needs more nuance
+
+**Setup:** alpha (Battlemage Arc B390 dGPU, 12 GB GPU memory, 32 GB system RAM). Model `OpenVINO/Mixtral-8x7B-Instruct-v0.1-int4-ov`, `openvino_model.bin` size 28.7 GB (larger than the headline "INT4" suggests because of unpacked scales + zero points + tokenizer artifacts). Loaded via tahoma `ov-genai` engine (LLMPipeline path).
+
+**Finding:** **Single-node monolithic loaded successfully and ran 34-token generation in 63.4 seconds = 0.54 tok/s.** Did NOT OOM. The OV GPU plugin transparently spills weights between GPU memory and shared system memory; spillage is functional but ~25-50× slower than fully-on-GPU inference for a model of this scale.
+
+**Why this matters:**
+
+1. The M1 moonshot ("distributed wins because single-node OOMs") is **partially wrong** — single-node doesn't OOM, it just gets ~0.5 tok/s. The real value prop is "distributed gives **usable** tok/s for big models that single-node makes unusably slow."
+2. To beat 0.54 tok/s with distributed Mixtral is trivially easy — anything above 1 tok/s is a 2× win. The real bar should be "make Mixtral feel responsive": ~5-10 tok/s would unlock a chat-quality experience.
+3. The blocker for landing this win is the **export pipeline**: rainier's `export_cached_shards_v6_mixtral.py` requires raw HF safetensors (~90 GB to download), and our OV-format INT4 .bin can't be split with our existing tooling. Either: (a) download HF weights and rebuild via rainier (~hours over wifi), or (b) write a custom splitter for the existing OV monolithic IR (multi-day, the python autolab d6 attempted this and didn't complete).
+
+**Implication for the moonshot stack:** M1 is **viable and high-value** (current 0.54 tok/s is a real pain point on this hardware) but **larger lift than initially scoped**. The cleanest path is downloading HF Mixtral safetensors and using rainier v6 to produce 2-stage shards, then running ov-runtime distributed.
+
+**Source experiments:** session-1 close, M1 bootstrap log at `experiments/MOONSHOT_M1_BOOTSTRAP_RESULT.log`.
