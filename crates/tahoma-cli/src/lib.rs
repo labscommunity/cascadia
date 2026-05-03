@@ -213,6 +213,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                     .as_deref()
                     .ok_or_else(|| anyhow!("ov-dist-spec rank 0 requires --draft-model"))?;
                 let mut b = OvDistSpecBuilder::new(&args.model, draft, &args.device, args.spec_k);
+                if let Some(d) = &args.draft_device {
+                    b = b.with_draft_device(d);
+                }
                 if let Some(dir) = &args.ov_cache_dir {
                     b = b.with_cache_dir(dir);
                 }

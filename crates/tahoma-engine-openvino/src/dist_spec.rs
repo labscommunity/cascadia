@@ -573,6 +573,22 @@ impl MaskedReq {
 
 // -------- DistributedMaskedReq (driver-side wrapper for multi-stage target) --------
 
+/// Handle to a target.feed network round-trip in flight. Created by
+/// `feed_send_async`, awaited by `feed_recv_async`.
+///
+/// **Drop semantics**: dropping a `TargetSendHandle` without calling
+/// `feed_recv_async` does NOT cancel the spawned network task — tokio's
+/// `JoinHandle::drop` only discards the result, the task itself continues
+/// to completion. The bytes are still sent and received over the wire,
+/// and the next operation on the same `DistributedMaskedReq` will queue
+/// behind the orphan via the `downstream` mutex. To actually cancel,
+/// call `JoinHandle::abort` (not currently exposed). In practice
+/// `spec_decode_greedy` always awaits the handle, so this is a
+/// theoretical concern for unusual callers.
+pub struct TargetSendHandle {
+    join: tokio::task::JoinHandle<Result<(Vec<f32>, [usize; 3]), tahoma_transport::TransportError>>,
+}
+
 pub struct DistributedMaskedReq {
     stage0: OvRuntime,
     stage0_inputs: std::collections::HashMap<String, String>,
@@ -581,6 +597,13 @@ pub struct DistributedMaskedReq {
     valid_mask: Vec<i64>,
     cache_len: usize,
     logical_pos: usize,
+    // Per-task accumulators — `spec_decode_greedy` resets these at task
+    // start so the final `spec_decode timing` line attributes target
+    // time correctly between alpha-side compute and wire (charlie+net).
+    pub t_alpha_setup: std::time::Duration,
+    pub t_alpha_infer: std::time::Duration,
+    pub t_alpha_output: std::time::Duration,
+    pub t_wire: std::time::Duration,
 }
 
 impl DistributedMaskedReq {
@@ -605,6 +628,10 @@ impl DistributedMaskedReq {
             valid_mask: vec![1i64; 4096],
             cache_len: 0,
             logical_pos: 0,
+            t_alpha_setup: std::time::Duration::ZERO,
+            t_alpha_infer: std::time::Duration::ZERO,
+            t_alpha_output: std::time::Duration::ZERO,
+            t_wire: std::time::Duration::ZERO,
         })
     }
 
@@ -623,6 +650,148 @@ impl DistributedMaskedReq {
         self.cache_len = 0;
         self.logical_pos = 0;
         Ok(())
+    }
+
+    /// Async-split: does sync alpha-side stage_0 work then spawns the network
+    /// round-trip as a tokio task. Returns a handle the caller awaits via
+    /// `feed_recv_async`. Lets the caller do other alpha work (next-round
+    /// drafts, post-round draft.feed) DURING the charlie wait window.
+    /// State (cache_len, logical_pos) is updated on send so back-to-back
+    /// `feed_send_async` calls stay consistent.
+    pub fn feed_send_async(&mut self, input_ids: &[i64]) -> Result<TargetSendHandle, EngineError> {
+        let n = input_ids.len();
+        let total = self.cache_len + n;
+        if total > self.valid_mask.len() {
+            let new_size = (total * 2).max(self.valid_mask.len() * 2);
+            self.valid_mask.resize(new_size, 1);
+        }
+        let mut attn = vec![0i64; total];
+        attn[..self.cache_len].copy_from_slice(&self.valid_mask[..self.cache_len]);
+        for v in attn[self.cache_len..].iter_mut() {
+            *v = 1;
+        }
+        let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
+
+        // Run stage 0 locally (sync — alpha GPU compute).
+        let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
+        let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
+        let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
+        let beam_name = self.stage0_inputs.get("beam_idx").unwrap().clone();
+        let _ts = std::time::Instant::now();
+        self.stage0
+            .set_input(&in_ids, ShimDType::I64, &[1, n], &i64_to_bytes(input_ids))
+            .map_err(map_ov_err)?;
+        self.stage0
+            .set_input(
+                &attn_name,
+                ShimDType::I64,
+                &[1, total],
+                &i64_to_bytes(&attn),
+            )
+            .map_err(map_ov_err)?;
+        self.stage0
+            .set_input(&pos_name, ShimDType::I64, &[1, n], &i64_to_bytes(&pos))
+            .map_err(map_ov_err)?;
+        let beam_bytes = 0i32.to_le_bytes().to_vec();
+        self.stage0
+            .set_input(&beam_name, ShimDType::I32, &[1], &beam_bytes)
+            .map_err(map_ov_err)?;
+        let setup_us = _ts.elapsed().as_micros();
+        let _ts = std::time::Instant::now();
+        self.stage0.infer().map_err(map_ov_err)?;
+        let infer_us = _ts.elapsed().as_micros();
+        let _ts = std::time::Instant::now();
+        let (dtype, hidden_shape, hidden_bytes) = self.stage0.output(0).map_err(map_ov_err)?;
+        let output_us = _ts.elapsed().as_micros();
+        // Pass-through f16 if possible (avoid f16→f32→f16 round-trip).
+        let hidden_f16: Vec<u8> = match dtype {
+            ShimDType::F32 => {
+                let f = hidden_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<_>>();
+                f32_to_f16_bytes(&f)
+            }
+            ShimDType::F16 => hidden_bytes,
+            other => {
+                return Err(EngineError::Backend(format!(
+                    "unexpected stage0 dtype {other:?}"
+                )))
+            }
+        };
+        let mut hidden_shape_wire = [1u32; MAX_RANK];
+        for (i, d) in hidden_shape.iter().enumerate().take(MAX_RANK) {
+            hidden_shape_wire[i] = *d as u32;
+        }
+
+        let logical_pos_start = self.logical_pos as u32;
+        self.cache_len += n;
+        self.logical_pos += n;
+
+        self.t_alpha_setup += std::time::Duration::from_micros(setup_us as u64);
+        self.t_alpha_infer += std::time::Duration::from_micros(infer_us as u64);
+        self.t_alpha_output += std::time::Duration::from_micros(output_us as u64);
+
+        let downstream = self.downstream.clone();
+        let attn_clone = attn;
+        let total_clone = total;
+        let join = self.runtime_handle.spawn(async move {
+            let mut g = downstream.lock().await;
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+            header[4..8].copy_from_slice(&logical_pos_start.to_be_bytes());
+            g.send_raw(&header).await?;
+            let attn_tensor = WireTensor::new(
+                WireDType::I64,
+                [1, 1, total_clone as u32],
+                i64_to_bytes(&attn_clone),
+            );
+            g.send(&attn_tensor).await?;
+            let hidden_tensor = WireTensor::new(WireDType::F16, hidden_shape_wire, hidden_f16);
+            g.send(&hidden_tensor).await?;
+            let kind_bytes = g.recv_raw(4).await?;
+            let kind =
+                u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+            if kind != FrameKind::LogitsResponse as u32 {
+                return Err(tahoma_transport::TransportError::SocketClosed);
+            }
+            let (t, _) = g.recv().await?;
+            let logits_f32 = match t.dtype {
+                WireDType::F32 => t
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<_>>(),
+                WireDType::F16 => f16_bytes_to_f32(&t.data),
+                _ => return Err(tahoma_transport::TransportError::SocketClosed),
+            };
+            Ok::<_, tahoma_transport::TransportError>((
+                logits_f32,
+                [
+                    t.shape[0] as usize,
+                    t.shape[1] as usize,
+                    t.shape[2] as usize,
+                ],
+            ))
+        });
+        Ok(TargetSendHandle { join })
+    }
+
+    /// Block on the network round-trip started by `feed_send_async`.
+    pub fn feed_recv_async(
+        &mut self,
+        handle: TargetSendHandle,
+    ) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
+        let _ts = std::time::Instant::now();
+        let result = run_async(&self.runtime_handle, async move {
+            handle
+                .join
+                .await
+                .map_err(|e| tahoma_transport::TransportError::Io(std::io::Error::other(e)))?
+        });
+        let wire_us = _ts.elapsed().as_micros();
+        self.t_wire += std::time::Duration::from_micros(wire_us as u64);
+        result.map_err(|e| EngineError::Backend(e.to_string()))
     }
 
     pub fn feed(&mut self, input_ids: &[i64]) -> Result<(Vec<f32>, [usize; 3]), EngineError> {
@@ -782,6 +951,12 @@ impl DistributedMaskedReq {
             "target.feed timing"
         );
 
+        // Per-task accumulators for the spec_decode summary line.
+        self.t_alpha_setup += std::time::Duration::from_micros(setup_us as u64);
+        self.t_alpha_infer += std::time::Duration::from_micros(infer_us as u64);
+        self.t_alpha_output += std::time::Duration::from_micros(output_us as u64);
+        self.t_wire += std::time::Duration::from_micros(wire_us as u64);
+
         self.cache_len += n;
         self.logical_pos += n;
         let s3 = if hidden_shape.len() == 3 {
@@ -845,6 +1020,10 @@ pub fn spec_decode_greedy(
     let mut t_draft = std::time::Duration::ZERO;
     let t_total = std::time::Instant::now();
     target.reset()?;
+    target.t_alpha_setup = std::time::Duration::ZERO;
+    target.t_alpha_infer = std::time::Duration::ZERO;
+    target.t_alpha_output = std::time::Duration::ZERO;
+    target.t_wire = std::time::Duration::ZERO;
     draft.reset()?;
 
     let _ts = std::time::Instant::now();
@@ -887,22 +1066,45 @@ pub fn spec_decode_greedy(
         let d_advanced = drafts.len() - 1;
         stats.total_drafts += drafts.len() as u32;
 
-        // Verify [prev_correction, drafts...] in one forward
+        // Verify [prev_correction, drafts...] — ASYNC SPLIT.
+        // Send target verify (alpha stage_0 sync, then spawn network task).
+        // While charlie computes stage_1 (~43ms), do the SPECULATIVE first
+        // half of post-round draft work: draft.feed(drafts.last()) is needed
+        // in the all-accepted case anyway. If speculation is wrong (some
+        // drafts rejected), we'll rewind the draft state.
         let mut verify = Vec::with_capacity(drafts.len() + 1);
         verify.push(prev_correction);
         verify.extend_from_slice(&drafts);
         let _ts = std::time::Instant::now();
-        let (t_logits, t_shape) = target.feed(&verify)?;
+        let target_handle = target.feed_send_async(&verify)?;
+
+        // Speculative draft.feed during target wait. Saves ~draft.feed time
+        // when all K drafts are accepted (joint = p_single^K). For K=1 with
+        // p=0.8 this is 80% beneficial; for K=3 with p=0.6 it's ~22%.
+        // Cost when wrong: extra rewind (~free, just decrements counter).
+        let speculative_draft_done = if !drafts.is_empty() {
+            let _ts_d = std::time::Instant::now();
+            let last_draft = *drafts.last().unwrap();
+            let (l, sh) = draft.feed(&[last_draft])?;
+            t_draft += _ts_d.elapsed();
+            let dv = sh[2];
+            // Save the would-be d_last_logit if all accepted
+            Some(l[l.len() - dv..].to_vec())
+        } else {
+            None
+        };
+
+        // Now block on target.
+        let (t_logits, t_shape) = target.feed_recv_async(target_handle)?;
         t_target += _ts.elapsed();
         let v = t_shape[2];
-        // Greedy per row
         let mut t_greedy = Vec::with_capacity(verify.len());
         for i in 0..verify.len() {
             let row = &t_logits[i * v..(i + 1) * v];
             t_greedy.push(argmax(row) as i64);
         }
 
-        // Acceptance: longest matching prefix
+        // Acceptance
         let mut accepted = 0;
         for i in 0..drafts.len() {
             if t_greedy[i] == drafts[i] {
@@ -931,17 +1133,24 @@ pub fn spec_decode_greedy(
 
         target.rewind(drafts.len() - accepted);
 
-        // Draft rewind / catch-up
-        if accepted < drafts.len() {
-            draft.rewind(d_advanced - accepted);
+        // Draft rewind / catch-up — RECONCILE WITH SPECULATION
+        if accepted == drafts.len() {
+            // ALL ACCEPTED — speculative draft.feed(drafts.last()) was correct.
+            // Skip the redundant draft.feed and use cached d_last_logit if we have it,
+            // OR just compute draft.feed(correction).
             let _ts = std::time::Instant::now();
             let (l, sh) = draft.feed(&[correction])?;
             t_draft += _ts.elapsed();
             let dv = sh[2];
             d_last_logit = l[l.len() - dv..].to_vec();
+            let _ = speculative_draft_done; // discard saved logit
         } else {
+            // Speculation wrong: drafts.last() wasn't on the accepted path.
+            // Rewind 1 (for the speculative draft.feed) + (d_advanced - accepted)
+            // for the rejected drafts already in cache.
+            let total_rewind = 1 + d_advanced - accepted;
+            draft.rewind(total_rewind);
             let _ts = std::time::Instant::now();
-            let (_, _) = draft.feed(&[*drafts.last().unwrap()])?;
             let (l, sh) = draft.feed(&[correction])?;
             t_draft += _ts.elapsed();
             let dv = sh[2];
@@ -957,6 +1166,14 @@ pub fn spec_decode_greedy(
         draft_ms = t_draft.as_millis() as u64,
         other_ms = other.as_millis() as u64,
         total_ms = total.as_millis() as u64,
+        // Per-task target.feed breakdown:
+        // alpha_setup (set_input) + alpha_infer (stage_0 GPU compute)
+        // + alpha_output (read stage_0 output) + wire (send +
+        // charlie stage_1 + recv).
+        target_alpha_setup_ms = target.t_alpha_setup.as_millis() as u64,
+        target_alpha_infer_ms = target.t_alpha_infer.as_millis() as u64,
+        target_alpha_output_ms = target.t_alpha_output.as_millis() as u64,
+        target_wire_ms = target.t_wire.as_millis() as u64,
         "spec_decode timing"
     );
     Ok(out)
@@ -1090,6 +1307,10 @@ pub struct OvDistSpecBuilder {
     pub pipeline_dir: PathBuf,
     pub draft_model_path: String,
     pub device: String,
+    /// Device for the draft model. Defaults to `device` if unset.
+    /// Setting CPU here lets the draft run concurrent with target stage_0
+    /// on the GPU — frees the GPU during draft compute.
+    pub draft_device: String,
     pub k: u32,
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
@@ -1108,10 +1329,12 @@ impl OvDistSpecBuilder {
         device: impl Into<String>,
         k: u32,
     ) -> Self {
+        let device_s: String = device.into();
         Self {
             pipeline_dir: pipeline_dir.into(),
             draft_model_path: draft_model_path.into(),
-            device: device.into(),
+            device: device_s.clone(),
+            draft_device: device_s,
             k,
             cache_dir: None,
             kv_cache_precision: None,
@@ -1122,6 +1345,11 @@ impl OvDistSpecBuilder {
             eos_token_id: None,
             downstream: None,
         }
+    }
+
+    pub fn with_draft_device(mut self, device: impl Into<String>) -> Self {
+        self.draft_device = device.into();
+        self
     }
 
     pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
@@ -1232,7 +1460,7 @@ impl Builder for OvDistSpecBuilder {
         let draft_xml = std::path::Path::new(&self.draft_model_path).join("openvino_model.xml");
         let draft = OvRuntime::compile(
             draft_xml.to_str().unwrap_or_default(),
-            &self.device,
+            &self.draft_device,
             &plugin,
         )
         .map_err(map_ov_err)?;
