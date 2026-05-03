@@ -18,12 +18,12 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 ## Build from source
 
-Tahoma is a Cargo workspace under `rust/`. Two build modes:
+Tahoma is a Cargo workspace at the repo root. Two build modes:
 
 ```bash
 # Stub mode — no OpenVINO link required. Good for dev / CI on macOS / Linux.
 # Engines that need OV will return a clean runtime error.
-cd rust && cargo build --release -p tahoma
+cargo build --release -p tahoma
 
 # Real OV mode — links against openvino-genai 2026.1.0+. Required to run
 # the OV engines on real Intel hardware.
@@ -31,7 +31,7 @@ INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
   cargo build --release -p tahoma --features openvino
 ```
 
-The resulting binary lands at `rust/target/release/tahoma` (`tahoma.exe` on Windows). It is statically linked apart from the OV dynamic libraries — copy the binary plus `INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and `runtime/3rdparty/tbb/bin/` to the worker host's PATH.
+The resulting binary lands at `target/release/tahoma` (`tahoma.exe` on Windows). It is statically linked apart from the OV dynamic libraries — copy the binary plus `INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and `runtime/3rdparty/tbb/bin/` to the worker host's PATH.
 
 Build prerequisites:
 
@@ -111,7 +111,7 @@ Per-engine guides:
 
 Tahoma does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Tahoma handles `SIGTERM` cleanly (`runner.close()` then exit 0).
 
-**Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [`rust/docs/STATUS.md`](rust/docs/STATUS.md) "Security model" for the threat model and Phase 14 hardening details.
+**Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [`docs/STATUS.md`](docs/STATUS.md) "Security model" for the threat model and Phase 14 hardening details.
 
 ## Troubleshooting
 

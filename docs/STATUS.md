@@ -1,6 +1,6 @@
 # tahoma Rust port — status
 
-Tracking the Python → Rust hard rewrite landed under `rust/` on the
+Tracking the Python → Rust hard rewrite (Cargo workspace at the repo root) on the
 `feat/rust-port` branch. Updated whenever a phase lands.
 
 ## Engine port status (alpha + charlie hardware)
@@ -109,7 +109,7 @@ End-to-end smoke: the `tahoma` binary serves valid OpenAI
 chat-completions JSON against the mock engine.
 
 ```bash
-cd rust && cargo build -p tahoma
+cargo build -p tahoma
 ./target/debug/tahoma worker --rank 0 --total 1 \
     --model mock --engine mock --api :8000
 
@@ -307,7 +307,7 @@ of the `--api` port, and firewall the inter-stage TCP ports
 Per the design constraint ("cascadia may depend on tahoma; tahoma may
 not depend on cascadia"):
 
-* **No cascadia imports anywhere in `rust/`.** Verified by grep.
+* **No cascadia imports anywhere in the workspace.** Verified by grep.
 * Tahoma's crates have stable public APIs (no `pub(crate)` on items
   that should be exported); cascadia could add tahoma crates as
   Cargo dependencies in the future.

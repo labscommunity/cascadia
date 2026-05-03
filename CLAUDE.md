@@ -16,23 +16,24 @@ Run any model on Intel hardware. Shard models across Intel AI PCs using pipeline
 
 ## Architecture
 
-Tahoma is a Rust workspace under `rust/`. The Python source tree was
-removed at the end of Phase 12 (2026-05-02) — the Rust port is the
-only implementation. Module seams (one concern per crate):
+Tahoma is a Cargo workspace at the repo root. The Python source tree
+was removed at the end of Phase 12 (2026-05-02); the `rust/`
+subdirectory was hoisted to the root in Phase 12.1. Module seams
+(one concern per crate):
 
-- `rust/crates/tahoma-api/` — OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`)
-- `rust/crates/tahoma-runner/` — Per-stage Runner: connects transports, drives the engine, streams chunks
-- `rust/crates/tahoma-engine/` — `Engine` + `Builder` traits (the plugin seam)
-- `rust/crates/tahoma-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
-- `rust/crates/tahoma-engine-mock/` — Deterministic test engine
-- `rust/crates/tahoma-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
-- `rust/crates/tahoma-transport/` — TCP activation relay (length-prefixed tensor wire format)
-- `rust/crates/tahoma-topology/` — Topology graph with per-link latency + bandwidth
-- `rust/crates/tahoma-types/` — Zero-dep wire/value types
-- `rust/crates/tahoma-discovery/` — mDNS peer discovery (`_tahoma._tcp.local.`)
-- `rust/crates/tahoma-download/` — Model registry, HuggingFace pull
-- `rust/crates/tahoma-cli/` — `tahoma worker`, `tahoma engines`
-- `rust/crates/tahoma/` — `tahoma` binary entry point
+- `crates/tahoma-api/` — OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`)
+- `crates/tahoma-runner/` — Per-stage Runner: connects transports, drives the engine, streams chunks
+- `crates/tahoma-engine/` — `Engine` + `Builder` traits (the plugin seam)
+- `crates/tahoma-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
+- `crates/tahoma-engine-mock/` — Deterministic test engine
+- `crates/tahoma-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
+- `crates/tahoma-transport/` — TCP activation relay (length-prefixed tensor wire format)
+- `crates/tahoma-topology/` — Topology graph with per-link latency + bandwidth
+- `crates/tahoma-types/` — Zero-dep wire/value types
+- `crates/tahoma-discovery/` — mDNS peer discovery (`_tahoma._tcp.local.`)
+- `crates/tahoma-download/` — Model registry, HuggingFace pull
+- `crates/tahoma-cli/` — `tahoma worker`, `tahoma engines`
+- `crates/tahoma/` — `tahoma` binary entry point
 
 ## Design decisions (locked 2026-05-01)
 

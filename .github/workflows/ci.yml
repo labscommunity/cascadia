@@ -16,9 +16,6 @@ jobs:
   test:
     name: cargo test (stub)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@v4
 
@@ -33,8 +30,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Format check
         run: cargo fmt --all -- --check
