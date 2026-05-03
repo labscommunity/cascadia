@@ -1,0 +1,13 @@
+[package]
+name = "tahoma-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Engine + Builder traits — the plugin interface every inference engine implements."
+
+[dependencies]
+tahoma-types = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }

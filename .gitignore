@@ -1,52 +1,26 @@
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-*.egg
-MANIFEST
+# Rust
+target/
+*.rs.bk
+*.pdb
+# Cargo.lock IS tracked (binary project — pinned for reproducibility)
 
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
+# Tahoma scratch dirs (bench logs, ad-hoc experiments)
+tmp/
+experiments/
 
-.venv/
-venv/
-env/
-ENV/
-
-.env
-.env.local
-
+# Editors
 .idea/
 .vscode/
 *.swp
 *.swo
 
+# OS
 .DS_Store
 Thumbs.db
 
+# Local model cache (never commit weights)
 models/
 *.safetensors
 *.gguf
-*.bin
-*.xml
 shards/
 shards_cached/

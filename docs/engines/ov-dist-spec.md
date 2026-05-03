@@ -34,7 +34,7 @@ Workers can hold just their own stage as a flat dir:
 
 ## Wire protocol
 
-`tahoma/worker/engines/openvino/dist_spec_protocol.py` defines three frames:
+`crates/tahoma-engine-openvino/src/dist_spec.rs` defines three frames:
 
 - **FORWARD** (driver → worker → next worker): `[kind=1][logical_pos_start]` + `attention_mask` (int64 `[1, total_seq_len]`) + `hidden_states` (float16 `[1, new_tokens, hidden_size]`)
 - **RESET** (driver → workers, propagated): `[kind=3]`

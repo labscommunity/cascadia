@@ -1,0 +1,29 @@
+[package]
+name = "tahoma-engine-openvino"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenVINO-backed engines for tahoma — wraps tahoma-ov-genai-shim into the Engine + Builder traits."
+
+[features]
+default = []
+openvino = ["tahoma-ov-genai-shim/openvino"]
+
+[dependencies]
+tahoma-types = { workspace = true }
+tahoma-engine = { workspace = true }
+tahoma-transport = { workspace = true }
+tahoma-ov-genai-shim = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokenizers = { workspace = true }
+half = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tahoma-types",
+    "crates/tahoma-topology",
+    "crates/tahoma-transport",
+    "crates/tahoma-engine",
+    "crates/tahoma-engine-mock",
+    "crates/tahoma-ov-genai-shim",
+    "crates/tahoma-engine-openvino",
+    "crates/tahoma-runner",
+    "crates/tahoma-discovery",
+    "crates/tahoma-download",
+    "crates/tahoma-api",
+    "crates/tahoma-cli",
+    "crates/tahoma",
+    "tests-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/labscommunity/tahoma"
+
+[workspace.dependencies]
+# Internal crates
+tahoma-types = { path = "crates/tahoma-types" }
+tahoma-topology = { path = "crates/tahoma-topology" }
+tahoma-transport = { path = "crates/tahoma-transport" }
+tahoma-engine = { path = "crates/tahoma-engine" }
+tahoma-engine-mock = { path = "crates/tahoma-engine-mock" }
+tahoma-ov-genai-shim = { path = "crates/tahoma-ov-genai-shim" }
+tahoma-engine-openvino = { path = "crates/tahoma-engine-openvino" }
+tahoma-runner = { path = "crates/tahoma-runner" }
+tahoma-discovery = { path = "crates/tahoma-discovery" }
+tahoma-download = { path = "crates/tahoma-download" }
+tahoma-api = { path = "crates/tahoma-api" }
+tahoma-cli = { path = "crates/tahoma-cli" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
+futures = "0.3"
+parking_lot = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+
+# HTTP
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+
+# OpenVINO
+openvino = "0.10"
+openvino-genai = "0.10"
+openvino-genai-sys = "0.10"
+
+# Discovery + downloads
+mdns-sd = "0.13"
+hf-hub = { version = "0.4", features = ["tokio"] }
+
+# Tokenizers (workaround for missing OV-GenAI Tokenizer in C API)
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Build deps
+cc = "1"
+bindgen = "0.71"
+
+# Dev / test
+pretty_assertions = "1"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "debuginfo"

@@ -1,0 +1,12 @@
+[package]
+name = "tahoma-topology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cluster topology graph: nodes + measured edges (latency, bandwidth)."
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }

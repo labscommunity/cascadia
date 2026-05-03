@@ -1,42 +1,54 @@
 # Architecture
 
-Tahoma's seven modules mirror exo's seams. Each has a single responsibility and a stable interface; engines and discovery backends are swappable.
+Tahoma is a Rust workspace under `rust/`. Each crate has a single responsibility and a stable interface; engines and discovery backends are swappable.
 
-## `tahoma/api/`
+## `tahoma-api`
 
-OpenAI-compatible HTTP server. `/v1/chat/completions`, `/v1/completions`, `/v1/models`. Non-streaming first; streaming after MVP. Talks to `master/` to schedule generation tasks.
+OpenAI-compatible HTTP server (axum). Routes: `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + SSE streaming), `/v1/cancel/<task_id>`. Backpressure via a concurrent-request semaphore (default 16); request body cap (default 64 KiB) and prompt cap (default 32 KiB) enforce 413 / 503 responses on oversized or over-capacity input.
 
-## `tahoma/master/`
+## `tahoma-runner`
 
-The control plane. Decides which nodes run which shards of which model (placement), tracks instance lifecycle (loading, ready, generating), and runs leader election so any node can become master if the current master goes down.
+Per-stage `Runner`. Connects upstream + downstream transports, loads weights, builds the engine, warms it up, and exposes `submit` / `generate` / `cancel`. Concurrent-safe — multiple `generate()` callers share one engine through a `Mutex`; chunks for other tasks emitted during one caller's `step()` are buffered for their owners.
 
-Placement scoring: `(download_score, available_RAM, link_latency)`. `download_score` favors nodes that already have weights cached (avoid re-pull). `link_latency` is measured, not assumed — see `shared/topology.py`.
+## `tahoma-engine`
 
-## `tahoma/worker/`
+Two trait definitions — the plugin seam:
 
-The execution side. A `Runner` supervises an `Engine` plugin. The runner handles the lifecycle (connect to peers, load shard, warmup, generate); the engine handles the per-token math.
+- `Engine`: `warmup`, `submit`, `step`, `cancel`, `close`. `submit` returns `EngineError::QueueFull` when the per-engine pending cap is reached.
+- `Builder`: `configure_listen`, `connect`, `load`, `build`, `close`.
 
-`worker/engines/base.py` defines two ABCs:
+## `tahoma-engine-openvino`
 
-- `Engine`: `warmup`, `submit`, `step`, `close`, `serve_prefill`
-- `Builder`: `connect`, `load`, `build`, `close`
+Three engines:
 
-`worker/engines/openvino/` is the only engine in the MVP. It ports rainier's per-stage INT4 OV IR pipeline.
+- `ov-genai` — single-stage `openvino_genai.LLMPipeline` via the C++ FFI shim. FastDraft + Prompt Lookup variants.
+- `ov-runtime` — multi-stage stateful KV cache. Pre-exported per-stage v3+ shards; each stage owns its layer range and runs SDPA attention with internal RoPE.
+- `ov-dist-spec` — multi-stage spec decode with mask-based KV-cache rewind on rejected drafts. v5 shards (canonical optimum-style inputs).
 
-## `tahoma/routing/`
+## `tahoma-engine-mock`
 
-Internal pub/sub message bus. Topic-based; used for control messages between master and workers.
+Deterministic word-echo engine — splits the prompt and emits one word per `step()`. Used by API / runner / CLI tests.
 
-## `tahoma/shared/`
+## `tahoma-ov-genai-shim`
 
-Common types, the `Topology` graph, leader election protocol, logging.
+C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.1+ SDK.
 
-The topology graph stores per-link latency and bandwidth — measured, not assumed. This is where Tahoma diverges from exo, whose topology only tracks edge type (Socket vs RDMA).
+## `tahoma-transport`
 
-## `tahoma/discovery/`
+TCP activation relay between pipeline stages. Wire format is byte-identical to rainier's reference Python relay: 20-byte header (`payload_len`, `dtype`, `dim0`, `dim1`, `dim2`) then row-major payload. dtype codes: `0=f32, 1=f16, 2=i8, 3=i32, 4=i64`. Caps incoming payloads at 256 MiB and applies a 60 s read timeout per recv.
 
-Peer discovery. libp2p or mDNS-based. Zero-config: spin up a worker and the master finds it automatically. No tokens, no IPs to configure (in OSS — the productized version layers on top with auth).
+## `tahoma-topology`
 
-## `tahoma/download/`
+Topology graph with per-link latency and bandwidth measurements. This is where Tahoma diverges from exo, whose topology only tracks edge type (Socket vs RDMA). Empirically, latency is the dominant placement signal on Intel fleets — a 50 ms WAN hop drops throughput 65%.
 
-Model registry plus on-demand HuggingFace pull. Each node only pulls the weight ranges it owns.
+## `tahoma-discovery`
+
+mDNS peer discovery via the `mdns-sd` crate. Advertises `_tahoma._tcp.local.` and browses for siblings in the same `TAHOMA_NAMESPACE`. Zero-config: spin up a worker and the master finds it.
+
+## `tahoma-download`
+
+Model registry plus on-demand HuggingFace pull. Registry lives at `~/.cache/tahoma/registry.json`; writes are atomic (`.tmp` + `fsync` + rename). Symlinks at the registry path are rejected to prevent path-substitution attacks.
+
+## `tahoma-cli` + `tahoma`
+
+`tahoma worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the only subcommand that does work. `tahoma engines` lists registered engines. The `tahoma` crate is the binary entry point and depends on `tahoma-cli`.

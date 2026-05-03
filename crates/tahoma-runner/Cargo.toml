@@ -1,0 +1,21 @@
+[package]
+name = "tahoma-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-stage Runner — owns Builder/Engine, drives the generate loop and relay loop."
+
+[dependencies]
+tahoma-types = { workspace = true }
+tahoma-engine = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tahoma-engine-mock = { workspace = true }
