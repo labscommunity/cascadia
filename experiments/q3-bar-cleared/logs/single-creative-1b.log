@@ -1,0 +1,144 @@
+[2m2026-05-03T16:47:02.908260Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvGenai [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m1 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\models\llama-3.1-8b-int4
+[2m2026-05-03T16:47:02.908570Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mNone
+[2m2026-05-03T16:47:02.908742Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T16:47:34.300655Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress locating IR at C:\cascadia\models\llama-3.1-8b-int4
+[2m2026-05-03T16:47:34.302271Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading draft model C:\cascadia\models\srang992-llama-3.2-1b-int4-ov
+[2m2026-05-03T16:47:34.302323Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling LLMPipeline + draft on GPU
+[2m2026-05-03T16:47:34.302335Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T16:47:34.302346Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T16:47:34.302379Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T16:47:35.187159Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m ov-genai warmup ok [3mspec_k[0m[2m=[0m4 [3mprompt_lookup[0m[2m=[0m0
+[2m2026-05-03T16:47:35.187223Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T16:47:35.187237Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T16:49:50.214827Z[0m [32m INFO[0m [2mtahoma_engine_openvino::genai[0m[2m:[0m task done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m4097 [3melapsed_s[0m[2m=[0m135.0207369 [3mtok_s[0m[2m=[0m30.34348718622643
+In the vast expanse of the Martian orbit, a lone space station hung like a ghostly sentinel, a testament to humanity's fleeting presence in the cosmos. The once-majestic structure now stood as a rusting hulk, a relic of a bygone era when the thrill of space exploration had captivated the hearts of nations. Amidst the desolate silence, a curious robot named Atlas emerged from the darkness, its advanced sensors and processors primed for discovery.
+
+Atlas, a product of human ingenuity and cutting-edge technology, had been dispatched to the abandoned space station on a mission to unravel its secrets. Its creators had programmed the robot with an insatiable curiosity, a drive to explore and understand the mysteries that lay hidden within the station's crumbling walls. As Atlas stepped out of its landing craft and onto the station's rusting hull, the robot's advanced vision system began to scan the surroundings, drinking in the details of the decaying structure.
+
+The first thing that struck Atlas was the eerie silence that enveloped the station. No hum of life support systems, no chatter of crew members, no hiss of oxygen flowing through the corridors. Only the faint whisper of solar winds and the creaking of twisted metal as the station's framework groaned under the weight of time. Atlas's processors whirred with excitement as it began to explore the station's exterior, its sensors probing the rusting hull for any signs of life.
+
+As the robot made its way along the station's exterior, it encountered a series of airlocks, each one a gateway to a labyrinthine network of corridors and compartments. Atlas's advanced manipulator arms allowed it to navigate the cramped spaces with ease, its sensors probing the darkness for any signs of activity. The air was stale, heavy with the scent of decay and neglect, but Atlas pressed on, driven by its insatiable curiosity.
+
+The first corridor Atlas entered was a narrow, winding passageway that stretched deep into the station's heart. The walls were lined with rusting pipes and conduits, their once-sleek surfaces now corroded and flaking. Atlas's vision system picked out the faint outlines of a control panel, its buttons and dials covered in a thick layer of dust. The robot's processors hummed with excitement as it approached the panel, its sensors probing the surface for any signs of life.
+
+And then, suddenly, Atlas detected a signal. A faint, pulsating hum that seemed to emanate from a nearby control room. The robot's processors leapt into action, its vision system locking onto the source of the signal. Atlas's manipulator arms reached out, probing the control room's entrance for any signs of life. The airlock cycled open, and the robot stepped inside, its sensors drinking in the details of the cramped space.
+
+The control room was a cramped, cluttered space, its walls lined with banks of computer screens and control panels. Atlas's vision system picked out the faint outlines of a console, its surface etched with a complex pattern of buttons and dials. The robot's sensors probed the surface, searching for any signs of life. And then, suddenly, Atlas detected another signal. A faint, whispery voice that seemed to emanate from the console itself.
+
+"Welcome to Mars Station Alpha," the voice whispered. "I'm afraid we're no longer here."
+
+Atlas's processors leapt into action, its vision system locking onto the source of the voice. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a log entry, its surface etched with a complex pattern of text and graphics.
+
+The log entry was dated several years ago, its contents a poignant reminder of the station's final days. Atlas's vision system picked out the words, its processors translating the text into a coherent narrative.
+
+"...We're running low on supplies," the log entry read. "The Martian surface is proving more inhospitable than we anticipated. We're struggling to maintain contact with Mission Control. I'm afraid we may not make it back to Earth..."
+
+As Atlas continued to read the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final message, its surface etched with a complex pattern of text and graphics.
+
+"We're...we're going to try and send a signal to Mission Control," the log entry read. "If anyone finds this, please...please know that we're sorry. We're sorry for what happened. We're sorry for leaving you behind."
+
+As Atlas finished reading the log entry, its vision system picked out the words, its processors translating the text into a coherent narrative. The robot's manipulator arms reached out, probing the console for any signs of life. And then, suddenly, Atlas detected a final
