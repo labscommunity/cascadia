@@ -103,13 +103,28 @@ fn bytes_to_i64(bytes: &[u8]) -> Vec<i64> {
 }
 
 fn argmax(slice: &[f32]) -> usize {
+    // NaN propagates: `*v > best_v` is false for any NaN, so an all-NaN
+    // logits row would silently return index 0 (often EOS-adjacent or
+    // <bos> in Llama tokenizers — easy to miss). Track whether we ever
+    // saw a finite value; if not, log and return 0 explicitly so the
+    // failure is observable.
     let mut best_i = 0usize;
     let mut best_v = f32::NEG_INFINITY;
+    let mut saw_finite = false;
     for (i, v) in slice.iter().enumerate() {
-        if *v > best_v {
-            best_v = *v;
-            best_i = i;
+        if v.is_finite() {
+            saw_finite = true;
+            if *v > best_v {
+                best_v = *v;
+                best_i = i;
+            }
         }
+    }
+    if !saw_finite {
+        warn!(
+            "argmax: all logits non-finite (NaN/Inf); returning token 0 — \
+             likely indicates a numerically broken forward pass"
+        );
     }
     best_i
 }
@@ -123,6 +138,14 @@ fn map_ov_err(err: OvError) -> EngineError {
         OvError::Native(s) => EngineError::Backend(s),
     }
 }
+
+/// Maximum tasks an engine will queue. The HTTP layer applies its own
+/// concurrency cap upstream; this is a defense-in-depth bound so a
+/// caller that bypasses the HTTP layer (e.g. tests, scripts) can't
+/// drive `pending` to OOM with cheap submit() calls. 256 is far
+/// above the steady-state queue any single-engine deployment will
+/// see.
+pub const MAX_PENDING_TASKS: usize = 256;
 
 /// Bridge sync code to an async future.
 ///
@@ -140,9 +163,10 @@ fn map_ov_err(err: OvError) -> EngineError {
 ///   (empirically ~20 ms per call vs ~5–30 µs the docs would suggest;
 ///   adds ~60 ms per worker frame round-trip with 3 wire I/O calls).
 ///
-/// We dispatch via a thread-local flag set by [`enter_blocking_context`].
-/// Workers call it once at engine init; ChunkStream callers don't and
-/// fall through to the safe block_in_place path.
+/// We dispatch via a thread-local flag managed by [`BlockingContextGuard`].
+/// Workers acquire the guard once per `step()` (idempotent within a
+/// single thread); the guard is RAII-scoped so the flag never leaks
+/// across spawn_blocking thread reuse boundaries.
 fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
     if BLOCKING_CONTEXT.with(|f| f.get()) {
         // We're on a spawn_blocking thread (worker relay loop); naked
@@ -161,11 +185,32 @@ thread_local! {
     static BLOCKING_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Mark the current thread as a blocking-pool thread. Called by the
-/// worker's `run_relay_loop` so subsequent [`run_async`] calls skip
-/// the expensive `block_in_place` wrap.
-pub fn enter_blocking_context() {
-    BLOCKING_CONTEXT.with(|f| f.set(true));
+/// RAII guard that marks the current thread as a blocking-pool thread
+/// for the duration of its scope. Acquired by the worker engine at the
+/// top of each `step()`. Scoped so that if the spawn_blocking thread
+/// pool ever reuses this thread for non-blocking work later, the flag
+/// is cleared correctly. The previous `pub fn enter_blocking_context()`
+/// was a one-way door; this guard fixes that.
+pub(crate) struct BlockingContextGuard {
+    prev: bool,
+}
+
+impl BlockingContextGuard {
+    pub(crate) fn enter() -> Self {
+        let prev = BLOCKING_CONTEXT.with(|f| {
+            let old = f.get();
+            f.set(true);
+            old
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for BlockingContextGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        BLOCKING_CONTEXT.with(|f| f.set(prev));
+    }
 }
 
 // -------- pipeline / stage config --------
@@ -932,16 +977,28 @@ impl Engine for OvDistSpecEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) {
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
                 .active
                 .as_ref()
                 .is_some_and(|(t, ..)| t.task_id == task.task_id)
         {
-            return;
+            return Ok(());
+        }
+        if self.pending.len() >= MAX_PENDING_TASKS {
+            warn!(
+                queued = self.pending.len(),
+                cap = MAX_PENDING_TASKS,
+                "ov-dist-spec: pending queue at cap; rejecting task"
+            );
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: MAX_PENDING_TASKS,
+            });
         }
         self.pending.push(task);
+        Ok(())
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -1189,14 +1246,20 @@ impl Engine for OvDistSpecWorkerEngine {
         info!("ov-dist-spec worker warmup skipped");
     }
 
-    fn submit(&mut self, _task: GenerationTask) {
+    fn submit(&mut self, _task: GenerationTask) -> EngineResult<()> {
         warn!("ov-dist-spec worker cannot accept tasks directly");
+        Err(EngineError::Backend(
+            "worker stage does not accept tasks directly".into(),
+        ))
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
-        // First call from a spawn_blocking thread marks the thread
-        // for the cheap block_on path in run_async. Idempotent.
-        enter_blocking_context();
+        // RAII guard: marks the current thread as blocking-pool for
+        // the duration of this step so run_async takes the cheap
+        // bare-block_on path. The guard restores the previous flag
+        // value on drop, preventing stale state if the spawn_blocking
+        // pool ever migrates this thread to non-blocking work.
+        let _guard = BlockingContextGuard::enter();
         let result = self.handle_one_frame();
         if let Err(e) = result {
             // Transport-closed errors signal the driver disconnected;

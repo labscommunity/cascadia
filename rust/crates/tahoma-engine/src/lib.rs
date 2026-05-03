@@ -41,6 +41,9 @@ pub enum EngineError {
     #[error("backend error: {0}")]
     Backend(String),
 
+    #[error("queue full ({queued} pending, cap {cap})")]
+    QueueFull { queued: usize, cap: usize },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -61,7 +64,9 @@ pub trait Engine: Send {
 
     /// Enqueue a task. The engine is free to defer execution to a later
     /// `step()` call. Submitting an already-pending task is a no-op.
-    fn submit(&mut self, task: GenerationTask);
+    /// Returns [`EngineError::QueueFull`] when the engine's pending
+    /// queue is at capacity.
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()>;
 
     /// Make progress on at most one pending task and return any chunks
     /// emitted. Returns an empty Vec when no work is in flight.

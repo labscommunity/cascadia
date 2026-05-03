@@ -237,6 +237,53 @@ Mac via SSH.
   `tahoma/worker/transport.py`** — Python and Rust ranks can interop
   during the migration. dtype codes: 0=f32, 1=f16, 2=i8, 3=i32, 4=i64.
 
+## Security model (production hardening, Phase 14)
+
+Tahoma's network surface is designed for **trusted LAN deployment** —
+think a closet or rack of Intel AI PCs on an isolated subnet, not the
+public internet. The hardening in Phase 14 closes the worst failure
+modes (panics, OOM, crash on malformed input) but does **not** add
+authentication or transport encryption.
+
+**What you get out of the box:**
+* HTTP API: 64 KiB request body cap, 32 KiB prompt cap, 16 concurrent
+  request semaphore. Oversized prompt → 413; over-capacity → 503.
+  Unhandled engine errors no longer panic — they are mapped to 5xx.
+* Engine queue: defense-in-depth 256-task pending cap. `EngineError::QueueFull`
+  surfaces as 503 to the API caller.
+* TCP relay: 256 MiB cap on incoming tensor payloads, 64 KiB cap on
+  raw control-byte recvs, shape × dtype overflow check before alloc,
+  60 s read timeout on every recv. A wedged or hostile peer cannot
+  pin a worker thread forever or trick it into a multi-GB allocation.
+* C++ shim (`tahoma-ov-genai-shim`): null pointer guards on every
+  exported function, bounded property dictionaries (256 pairs max),
+  uniform `catch (...)` around every entry point so a C++ exception
+  cannot unwind into Rust UB, tensor-shape overflow check before
+  `set_input`. Tokenizer destroy added (no leak on `count_tokens`).
+* Numerics: `argmax` is now NaN-aware (warns rather than silently
+  returning token 0 on a broken forward pass). Rotary `compute()`
+  clamps `start` to 16 M positions and `seq_len` to 1 M tokens — no
+  i64/f32 silent overflow on adversarial inputs.
+* Registry (`tahoma-download`): atomic write (.tmp + fsync + rename),
+  reject symlink at registry path, 16 MiB file size cap, parse errors
+  are hard failures (not silent reset).
+
+**What you do NOT get:**
+* No TLS — both the OpenAI-compatible HTTP API and the inter-stage
+  TCP relay are plaintext. Run only on a trusted network or behind
+  a TLS-terminating proxy.
+* No client authentication on the HTTP API. Anyone who can reach the
+  port can submit prompts.
+* No mDNS authentication. Any host on the same multicast domain can
+  publish a `_tahoma._tcp.local.` advertisement.
+* No supply-chain pinning beyond `Cargo.lock`. Audit dependencies
+  before any production rollout.
+
+If you need to expose tahoma to an untrusted network, terminate TLS
+and apply auth (mTLS / OIDC / API key) at a reverse proxy in front
+of the `--api` port, and firewall the inter-stage TCP ports
+(`--listen` / `--next`) so only sibling worker hosts can reach them.
+
 ## Decoupling from cascadia
 
 Per the design constraint ("cascadia may depend on tahoma; tahoma may

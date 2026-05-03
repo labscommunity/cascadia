@@ -107,8 +107,7 @@ impl Runner {
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
         let mut guard = self.engine.lock();
         let engine = guard.as_mut().ok_or(EngineError::NotLoaded)?;
-        engine.submit(task);
-        Ok(())
+        engine.submit(task)
     }
 
     /// Cooperatively cancel a task.
@@ -258,6 +257,14 @@ impl Stream for ChunkStream {
 
 impl Drop for ChunkStream {
     fn drop(&mut self) {
+        // Tell the engine to abandon this task. Without this an SSE
+        // client that disconnects mid-generation leaves the engine
+        // grinding through max_tokens worth of chunks that no one
+        // will ever drain — the chunk buffer for this task accretes
+        // until close() and the engine slot stays busy.
+        if let Some(engine) = self.engine.lock().as_mut() {
+            engine.cancel(&self.task_id);
+        }
         let mut bufs = self.buffers.lock();
         bufs.chunks.remove(&self.task_id);
         bufs.cancelled.remove(&self.task_id);

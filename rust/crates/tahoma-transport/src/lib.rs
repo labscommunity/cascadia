@@ -29,6 +29,21 @@ pub const MAX_RANK: usize = 3;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum tensor payload accepted on the wire. Caps the worst-case
+/// allocation when reading a length-prefixed tensor from an untrusted
+/// peer. 256 MiB is far above any legitimate hidden-state shard for
+/// the model sizes we run (Llama 3.1 8B INT4 ⇒ logits f16
+/// `4 * 128k * 2 = 1 MiB`; 70B-class hidden states even at very long
+/// sequence lengths fit well under 256 MiB).
+pub const MAX_TENSOR_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum bytes accepted by [`ActivationServer::recv_raw`] /
+/// [`ActivationClient::recv_raw`] in a single call. The dist-spec
+/// frame protocol uses recv_raw for control bytes (4 or 8 bytes); a
+/// generous cap here defends against a peer claiming to send a
+/// gigabyte of "control bytes".
+pub const MAX_RAW_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("socket closed during recv")]
@@ -36,6 +51,12 @@ pub enum TransportError {
 
     #[error("tensor rank > {MAX_RANK} not supported (got {0} dims)")]
     RankTooHigh(usize),
+
+    #[error("payload size {0} exceeds MAX_TENSOR_BYTES ({})", MAX_TENSOR_BYTES)]
+    PayloadTooLarge(u64),
+
+    #[error("recv_raw size {0} exceeds MAX_RAW_BYTES ({})", MAX_RAW_BYTES)]
+    RawSizeTooLarge(usize),
 
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -101,8 +122,13 @@ impl Tensor {
         Self::new(dtype, [1, rows, cols], data)
     }
 
-    pub fn elements(&self) -> u64 {
-        self.shape.iter().map(|d| *d as u64).product()
+    /// Element count using checked multiplication. Returns `None` if
+    /// the shape product would overflow `u64` (defense against
+    /// adversarially-large shape headers).
+    pub fn elements(&self) -> Option<u64> {
+        self.shape
+            .iter()
+            .try_fold(1u64, |acc, d| acc.checked_mul(*d as u64))
     }
 }
 
@@ -134,6 +160,12 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 }
 
 /// Receive a tensor from a connected stream.
+///
+/// Bounds the per-call allocation at [`MAX_TENSOR_BYTES`] to defend
+/// against a malicious or malformed peer claiming a multi-GB payload.
+/// Also cross-checks the per-element count against the declared
+/// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
+/// trigger overflow downstream.
 pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
@@ -145,10 +177,30 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
     let d1 = u32::from_be_bytes(header[12..16].try_into().unwrap());
     let d2 = u32::from_be_bytes(header[16..20].try_into().unwrap());
 
+    if (payload_len as usize) > MAX_TENSOR_BYTES {
+        return Err(TransportError::PayloadTooLarge(payload_len as u64));
+    }
+
+    // Sanity check shape × dtype.bytes_per_element against payload_len
+    // to catch malformed/forged headers before we allocate. Use
+    // checked_mul to avoid silent u64 wrap on adversarial shapes.
+    let dtype = DType::from_code(dtype_code);
+    let elems = (d0 as u64)
+        .checked_mul(d1 as u64)
+        .and_then(|x| x.checked_mul(d2 as u64));
+    if let Some(e) = elems {
+        let expected = e.checked_mul(dtype.bytes_per_element() as u64);
+        if expected != Some(payload_len as u64) {
+            return Err(TransportError::PayloadTooLarge(payload_len as u64));
+        }
+    } else {
+        return Err(TransportError::PayloadTooLarge(payload_len as u64));
+    }
+
     let mut data = vec![0u8; payload_len as usize];
     recv_exact(sock, &mut data).await?;
 
-    let tensor = Tensor::new(DType::from_code(dtype_code), [d0, d1, d2], data);
+    let tensor = Tensor::new(dtype, [d0, d1, d2], data);
     let stats = TransferStats {
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         bytes: HEADER_SIZE + payload_len as usize,
@@ -157,15 +209,30 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
 }
 
 async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
-    let mut read = 0;
-    while read < buf.len() {
-        let n = sock.read(&mut buf[read..]).await?;
-        if n == 0 {
-            return Err(TransportError::SocketClosed);
+    // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
+    // to fill. A peer that opens a connection and stops sending — or
+    // sends one byte per second — must not be able to pin a worker
+    // thread forever. 60 s is generous for a single tensor frame on a
+    // multi-MB Llama hidden state over Thunderbolt, and small enough
+    // that a wedged peer is detected within one or two heartbeats.
+    let read_fut = async {
+        let mut read = 0;
+        while read < buf.len() {
+            let n = sock.read(&mut buf[read..]).await?;
+            if n == 0 {
+                return Err(TransportError::SocketClosed);
+            }
+            read += n;
         }
-        read += n;
+        Ok(())
+    };
+    match tokio::time::timeout(DEFAULT_TIMEOUT, read_fut).await {
+        Ok(res) => res,
+        Err(_) => Err(TransportError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("recv_exact timed out after {DEFAULT_TIMEOUT:?}"),
+        ))),
     }
-    Ok(())
 }
 
 /// TCP server that receives activations from upstream.
@@ -237,7 +304,12 @@ impl ActivationServer {
     }
 
     /// Receive exactly `n` raw bytes from the established connection.
+    /// Capped at [`MAX_RAW_BYTES`] to bound allocation when an
+    /// untrusted caller picks `n`.
     pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
+        if n > MAX_RAW_BYTES {
+            return Err(TransportError::RawSizeTooLarge(n));
+        }
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         recv_exact(sock, &mut buf).await?;
@@ -317,6 +389,9 @@ impl ActivationClient {
     }
 
     pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
+        if n > MAX_RAW_BYTES {
+            return Err(TransportError::RawSizeTooLarge(n));
+        }
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         recv_exact(sock, &mut buf).await?;

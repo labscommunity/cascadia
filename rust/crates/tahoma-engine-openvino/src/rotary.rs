@@ -147,7 +147,18 @@ impl Rotary {
     /// Compute `(cos, sin)` for positions `[start, start + seq_len)`.
     /// Each output is `[1, seq_len, head_dim]` row-major f32, matching the
     /// HF transformers convention used by Python's ov-runtime engine.
+    ///
+    /// `start` is clamped to `[0, i64::MAX/2]` and `seq_len` is clamped
+    /// to a hard upper bound to keep `start + seq_len` from overflowing
+    /// i64 and to keep allocation tractable. Beyond f32's ~16M-integer
+    /// precision the rotary angles lose accuracy anyway, so very large
+    /// position IDs are not useful in practice.
     pub fn compute(&self, start: i64, seq_len: usize) -> (Vec<f32>, Vec<f32>) {
+        const MAX_POS: i64 = 1 << 24; // 16M, beyond f32-int precision
+        const MAX_SEQ: usize = 1 << 20; // 1M, well above any realistic ctx
+        let start = start.clamp(0, MAX_POS);
+        let seq_len = seq_len.min(MAX_SEQ);
+
         let head_dim = self.head_dim;
         let mut cos = vec![0.0f32; seq_len * head_dim];
         let mut sin = vec![0.0f32; seq_len * head_dim];

@@ -21,7 +21,16 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "tahoma", about = "Distributed LLM inference for Intel hardware")]
+#[command(
+    name = "tahoma",
+    about = "Distributed LLM inference for Intel hardware",
+    long_about = "Distributed LLM inference for Intel hardware.\n\n\
+        SECURITY: tahoma's HTTP API and inter-stage TCP relay are \
+        plaintext and unauthenticated. Bind only to trusted networks \
+        (LAN, loopback) or terminate TLS + auth at a reverse proxy in \
+        front of `--api`. See rust/docs/STATUS.md \"Security model\" \
+        for the full threat model."
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Command,

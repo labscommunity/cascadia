@@ -113,6 +113,12 @@ pub struct DiscoveryService {
     advertised: Mutex<Option<String>>,
     topology: Topology,
     namespace: String,
+    /// JoinHandle for the background browse-loop thread. Held so we
+    /// don't lose the handle (preventing it from being silently
+    /// orphaned on drop) and so close() can wait for the thread to
+    /// exit cleanly after the daemon shutdown causes its receiver
+    /// channel to close.
+    browse_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DiscoveryService {
@@ -122,6 +128,7 @@ impl DiscoveryService {
             advertised: Mutex::new(None),
             topology,
             namespace: namespace.into(),
+            browse_thread: None,
         }
     }
 
@@ -145,7 +152,7 @@ impl DiscoveryService {
         let receiver = daemon.browse(SERVICE_TYPE)?;
         let topology = self.topology.clone();
         let namespace = self.namespace.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             for event in receiver.iter() {
                 match event {
                     ServiceEvent::ServiceResolved(srv) => {
@@ -164,6 +171,7 @@ impl DiscoveryService {
                 }
             }
         });
+        self.browse_thread = Some(handle);
 
         self.daemon = Some(daemon);
         Ok(())
@@ -177,6 +185,13 @@ impl DiscoveryService {
             if let Err(e) = daemon.shutdown() {
                 warn!(error = ?e, "mdns shutdown failed");
             }
+        }
+        // Best-effort join of the browse loop. Once the daemon is
+        // shut down its sender drops and `receiver.iter()` returns
+        // None, which lets the thread exit. We don't fail close() on
+        // a panicked thread.
+        if let Some(handle) = self.browse_thread.take() {
+            let _ = handle.join();
         }
     }
 }

@@ -29,9 +29,18 @@ void set_last_error(const char* msg) {
 
 void set_last_error(const std::exception& e) { g_last_error = e.what(); }
 
+// Hard cap on plugin property pairs. OpenVINO plugin configs never
+// exceed a few dozen keys in practice; this caps allocation at ~4 KB
+// even if the caller passes a poisoned count.
+static constexpr size_t MAX_PROPERTY_PAIRS = 256;
+
 ov::AnyMap collect_properties(const char* const* kv, size_t count) {
     ov::AnyMap props;
     if (!kv) return props;
+    if (count > MAX_PROPERTY_PAIRS) {
+        set_last_error("properties_count exceeds MAX_PROPERTY_PAIRS=256");
+        return props;
+    }
     for (size_t i = 0; i < count; ++i) {
         const char* key = kv[2 * i];
         const char* val = kv[2 * i + 1];
@@ -42,14 +51,30 @@ ov::AnyMap collect_properties(const char* const* kv, size_t count) {
     return props;
 }
 
+// Hard caps for input-tensor sanity. set_input is called with
+// caller-supplied (rank, shape, data_size); validate they're sane to
+// avoid wild reads on `shape`/`data` and gigantic allocations.
+static constexpr size_t MAX_TENSOR_RANK = 16;
+static constexpr size_t MAX_TENSOR_BYTES = 256 * 1024 * 1024; // 256 MiB
+
+// Cap returned text size from generate(). At 4 bytes/UTF-8 char and
+// 4096 max_new_tokens, even a UTF-8-heavy alphabet tops out around
+// 16 KiB. 64 MiB is a generous overshoot but blocks OOM-by-model.
+static constexpr size_t MAX_GENERATED_TEXT_BYTES = 64 * 1024 * 1024;
+
+// Convert dtype code to OV element type. Throws on unknown codes so
+// the caller's try/catch turns it into a typed error rather than
+// silently using the wrong dtype (which would produce garbage output).
 ov::element::Type dtype_from_code(uint32_t code) {
     switch (code) {
+        case TAHOMA_DTYPE_F32: return ov::element::f32;
         case TAHOMA_DTYPE_F16: return ov::element::f16;
         case TAHOMA_DTYPE_I8:  return ov::element::i8;
         case TAHOMA_DTYPE_I32: return ov::element::i32;
         case TAHOMA_DTYPE_I64: return ov::element::i64;
-        case TAHOMA_DTYPE_F32:
-        default: return ov::element::f32;
+        default:
+            throw std::invalid_argument(
+                "unknown dtype code in dtype_from_code");
     }
 }
 
@@ -120,6 +145,9 @@ int32_t tahoma_pipeline_create(
     const char* model_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
     tahoma_pipeline_t** out_handle) {
+    if (!model_path || !device || !out_handle) {
+        set_last_error("null arg in pipeline_create"); return 1;
+    }
     try {
         auto props = collect_properties(properties_kv, properties_count);
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
@@ -138,6 +166,9 @@ int32_t tahoma_pipeline_create_with_draft(
     const char* draft_model_path, const char* draft_device,
     const char* const* properties_kv, size_t properties_count,
     tahoma_pipeline_t** out_handle) {
+    if (!model_path || !device || !draft_model_path || !out_handle) {
+        set_last_error("null arg in pipeline_create_with_draft"); return 1;
+    }
     try {
         auto props = collect_properties(properties_kv, properties_count);
         const std::string draft_dev =
@@ -162,6 +193,9 @@ int32_t tahoma_pipeline_create_with_prompt_lookup(
     const char* model_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
     tahoma_pipeline_t** out_handle) {
+    if (!model_path || !device || !out_handle) {
+        set_last_error("null arg in pipeline_create_with_prompt_lookup"); return 1;
+    }
     try {
         auto props = collect_properties(properties_kv, properties_count);
         props[ov::genai::prompt_lookup.name()] = true;
@@ -203,14 +237,20 @@ void tahoma_genconfig_set_max_ngram_size(tahoma_genconfig_t* cfg, uint32_t v) {
 int32_t tahoma_pipeline_generate(
     tahoma_pipeline_t* handle, const char* prompt, const tahoma_genconfig_t* cfg,
     char** out_text, uint32_t* out_token_count) {
-    if (!handle || !handle->pipe) {
-        set_last_error("null pipeline handle"); return 1;
+    if (!handle || !handle->pipe || !prompt || !out_text) {
+        set_last_error("null arg in pipeline_generate"); return 1;
     }
     try {
         ov::genai::DecodedResults results = cfg
             ? handle->pipe->generate(std::string(prompt), cfg->cfg)
             : handle->pipe->generate(std::string(prompt));
         std::string text = results;
+        if (text.size() > MAX_GENERATED_TEXT_BYTES) {
+            set_last_error(
+                "generate produced text larger than MAX_GENERATED_TEXT_BYTES "
+                "(64 MiB) — refusing to allocate");
+            return 1;
+        }
         char* buf = static_cast<char*>(std::malloc(text.size() + 1));
         if (!buf) { set_last_error("malloc failure for output text"); return 1; }
         std::memcpy(buf, text.data(), text.size());
@@ -232,19 +272,28 @@ int32_t tahoma_pipeline_generate(
 
 void tahoma_free_string(char* s) { std::free(s); }
 
+// Tokenizer ownership: the returned handle is heap-allocated and the
+// caller MUST free it via tahoma_tokenizer_destroy() before destroying
+// the parent pipeline. The Tokenizer object inside is a refcount on
+// model resources; outliving the pipeline triggers UB.
 tahoma_tokenizer_t* tahoma_pipeline_get_tokenizer(tahoma_pipeline_t* handle) {
     if (!handle || !handle->pipe) return nullptr;
     try {
         return new tahoma_tokenizer_t{handle->pipe->get_tokenizer()};
     } catch (const std::exception& e) {
         set_last_error(e); return nullptr;
+    } catch (...) {
+        set_last_error("unknown C++ exception in pipeline_get_tokenizer");
+        return nullptr;
     }
 }
 
+void tahoma_tokenizer_destroy(tahoma_tokenizer_t* tok) { delete tok; }
+
 int32_t tahoma_tokenizer_count_tokens(
     tahoma_tokenizer_t* tok, const char* text, uint32_t* out_count) {
-    if (!tok || !out_count) {
-        set_last_error("null tokenizer or out_count"); return 1;
+    if (!tok || !text || !out_count) {
+        set_last_error("null arg in tokenizer_count_tokens"); return 1;
     }
     try {
         auto enc = tok->tok.encode(std::string(text));
@@ -253,6 +302,9 @@ int32_t tahoma_tokenizer_count_tokens(
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in tokenizer_count_tokens");
+        return 1;
     }
 }
 
@@ -262,7 +314,9 @@ int32_t tahoma_runtime_compile(
     const char* model_xml_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
     tahoma_runtime_t** out_handle) {
-    if (!out_handle) { set_last_error("null out_handle"); return 1; }
+    if (!model_xml_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_compile"); return 1;
+    }
     try {
         auto handle = std::make_unique<tahoma_runtime_t>();
         auto props = collect_properties(properties_kv, properties_count);
@@ -371,8 +425,32 @@ int32_t tahoma_runtime_set_input(
     tahoma_runtime_t* handle, const char* tensor_name,
     uint32_t dtype, const size_t* shape, size_t rank,
     const void* data, size_t data_size) {
-    if (!handle || !handle->request) {
-        set_last_error("null runtime"); return 1;
+    if (!handle || !handle->request || !tensor_name) {
+        set_last_error("null arg in set_input"); return 1;
+    }
+    if (rank > MAX_TENSOR_RANK) {
+        set_last_error("set_input: rank exceeds MAX_TENSOR_RANK=16"); return 1;
+    }
+    if (rank > 0 && !shape) {
+        set_last_error("set_input: null shape with rank>0"); return 1;
+    }
+    if (data_size > 0 && !data) {
+        set_last_error("set_input: null data with data_size>0"); return 1;
+    }
+    if (data_size > MAX_TENSOR_BYTES) {
+        set_last_error("set_input: data_size exceeds MAX_TENSOR_BYTES=256MiB");
+        return 1;
+    }
+    // Bound the shape product so we don't construct a tensor that
+    // would attempt a multi-terabyte allocation.
+    size_t total_elems = 1;
+    for (size_t i = 0; i < rank; ++i) {
+        if (shape[i] == 0) { total_elems = 0; break; }
+        if (total_elems > SIZE_MAX / shape[i]) {
+            set_last_error("set_input: shape product overflows size_t");
+            return 1;
+        }
+        total_elems *= shape[i];
     }
     try {
         ov::Shape ov_shape(shape, shape + rank);
@@ -389,6 +467,8 @@ int32_t tahoma_runtime_set_input(
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in set_input"); return 1;
     }
 }
 
@@ -396,6 +476,9 @@ int32_t tahoma_runtime_infer(tahoma_runtime_t* handle) {
     if (!handle || !handle->request) { set_last_error("null runtime"); return 1; }
     try { handle->request->infer(); return 0; }
     catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) {
+        set_last_error("unknown C++ exception in infer"); return 1;
+    }
 }
 
 int32_t tahoma_runtime_output_rank(
@@ -408,12 +491,15 @@ int32_t tahoma_runtime_output_rank(
         *out_rank = t.get_shape().size();
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in output_rank"); return 1; }
 }
 
 int32_t tahoma_runtime_output_shape(
     tahoma_runtime_t* handle, size_t output_idx,
     size_t* out_shape, size_t shape_cap) {
-    if (!handle || !handle->request) { set_last_error("null runtime"); return 1; }
+    if (!handle || !handle->request || (shape_cap > 0 && !out_shape)) {
+        set_last_error("null arg"); return 1;
+    }
     try {
         auto t = handle->request->get_output_tensor(output_idx);
         auto shp = t.get_shape();
@@ -423,6 +509,7 @@ int32_t tahoma_runtime_output_shape(
         for (size_t i = 0; i < shp.size(); ++i) out_shape[i] = shp[i];
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in output_shape"); return 1; }
 }
 
 int32_t tahoma_runtime_output_dtype(
@@ -435,6 +522,7 @@ int32_t tahoma_runtime_output_dtype(
         *out_dtype = code_from_dtype(t.get_element_type());
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in output_dtype"); return 1; }
 }
 
 int32_t tahoma_runtime_output_byte_size(
@@ -447,6 +535,7 @@ int32_t tahoma_runtime_output_byte_size(
         *out_byte_size = t.get_byte_size();
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in output_byte_size"); return 1; }
 }
 
 int32_t tahoma_runtime_output_copy(
@@ -463,6 +552,7 @@ int32_t tahoma_runtime_output_copy(
         std::memcpy(out_buf, t.data(), out_buf_size);
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in output_copy"); return 1; }
 }
 
 }  // extern "C"

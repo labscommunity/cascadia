@@ -85,7 +85,14 @@ void tahoma_free_string(char* s);
 
 // ---- Tokenizer (workaround for missing C API) -----------------------------
 
+/// Borrow the pipeline's tokenizer. The returned handle is heap-allocated
+/// and the caller MUST free it via tahoma_tokenizer_destroy() before
+/// destroying the parent pipeline. The Tokenizer object inside is a
+/// refcount on the pipeline's model resources; outliving the pipeline
+/// triggers undefined behaviour.
 tahoma_tokenizer_t* tahoma_pipeline_get_tokenizer(tahoma_pipeline_t* handle);
+
+void tahoma_tokenizer_destroy(tahoma_tokenizer_t* tok);
 
 int32_t tahoma_tokenizer_count_tokens(
     tahoma_tokenizer_t* tok,

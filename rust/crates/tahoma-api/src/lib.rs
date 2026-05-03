@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -20,19 +20,70 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tahoma_runner::Runner;
 use tahoma_types::GenerationTask;
-use tracing::info;
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Maximum HTTP request body the chat-completions endpoint accepts. 64
+/// KiB is plenty for any legitimate chat completion (prompt + system +
+/// few past turns); 1 MiB-class adversarial bodies are rejected with
+/// 413 Payload Too Large. Increase only with awareness of the
+/// downstream KV-cache cost (attention is O(seq²)).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Default cap on concurrent chat-completion requests. The single
+/// engine processes one task at a time anyway, so a small queue is
+/// healthier than unbounded admission. Adjustable via
+/// [`Config::max_concurrent_requests`].
+pub const DEFAULT_MAX_CONCURRENT: usize = 16;
+
+/// Default cap on tokenized prompt length passed to the engine.
+/// Bounded so a 64 KiB JSON body of "a"*N characters that compresses
+/// to a multi-million-token prompt cannot trigger O(seq²) GPU work.
+/// Mirrors the Llama-3.1 default 128 K context window minus headroom.
+pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
     pub runner: Arc<Runner>,
     pub model_id: String,
+    pub permits: Arc<Semaphore>,
+    pub max_prompt_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub max_body_bytes: usize,
+    pub max_concurrent_requests: usize,
+    pub max_prompt_bytes: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
+            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+        }
+    }
+}
+
+/// Build the router with default request-size + concurrency limits.
+/// For custom limits use [`make_router_with_config`].
 pub fn make_router(runner: Arc<Runner>, model_id: impl Into<String>) -> Router {
+    make_router_with_config(runner, model_id, Config::default())
+}
+
+pub fn make_router_with_config(
+    runner: Arc<Runner>,
+    model_id: impl Into<String>,
+    cfg: Config,
+) -> Router {
     let state = AppState {
         runner,
         model_id: model_id.into(),
+        permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+        max_prompt_bytes: cfg.max_prompt_bytes,
     };
     Router::new()
         .route("/health", get(health))
@@ -40,6 +91,10 @@ pub fn make_router(runner: Arc<Runner>, model_id: impl Into<String>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
+        // Cap the JSON body so an attacker can't OOM the server with
+        // a multi-GB request. Apply at router level so it applies to
+        // every route, not just chat_completions.
+        .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
 }
 
 #[derive(Serialize)]
@@ -155,6 +210,19 @@ async fn chat_completions(
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let prompt = render_prompt(&req.messages);
+    if prompt.len() > state.max_prompt_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                    prompt.len(),
+                    state.max_prompt_bytes,
+                )
+            })),
+        )
+            .into_response();
+    }
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
@@ -165,20 +233,36 @@ async fn chat_completions(
         trust_remote_code: false,
     };
 
-    if req.stream {
-        return stream_completion(state, req.model, task).await.into_response();
-    }
-
-    // Non-streaming: collect full output.
-    let mut chunk_stream = match state.runner.generate(task.clone()) {
-        Ok(s) => s,
-        Err(err) => {
+    // Acquire a request slot before touching the engine. Without this
+    // a flood of concurrent SSE callers would hammer one engine mutex
+    // and starve everyone (the `MAX_CONSECUTIVE_EMPTY_STEPS=3` guard
+    // in the runner would then truncate streams). Backpressure is
+    // 503; clients should retry with backoff.
+    let permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "engine at capacity; retry after current requests complete"
+                })),
             )
                 .into_response();
         }
+    };
+
+    if req.stream {
+        return stream_completion(state, req.model, task, permit)
+            .await
+            .into_response();
+    }
+
+    // Non-streaming: collect full output. Hold the permit until the
+    // task completes; drop frees the slot.
+    let _permit = permit;
+    let mut chunk_stream = match state.runner.generate(task.clone()) {
+        Ok(s) => s,
+        Err(err) => return engine_error_response(err),
     };
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
@@ -218,32 +302,79 @@ async fn stream_completion(
     state: AppState,
     model: String,
     task: GenerationTask,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
 
-    let chunk_stream = state.runner.generate(task).expect("generate");
-    let mapped = chunk_stream.map(move |chunk| {
-        let payload = serde_json::json!({
-            "id": task_id,
-            "object": "chat.completion.chunk",
-            "created": now_unix(),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": chunk.text,
-                },
-                "finish_reason": if chunk.is_final { Some("stop") } else { None },
-            }],
+    let chunk_stream = match state.runner.generate(task) {
+        Ok(s) => s,
+        Err(err) => {
+            // Surface engine errors as 5xx; previously this was
+            // .expect("generate") which would panic the axum task and
+            // poison the connection.
+            warn!(error = %err, "ov-stream: generate failed");
+            return engine_error_response(err);
+        }
+    };
+    // Move the permit into the stream so it's released only when the
+    // SSE stream is dropped (client disconnect or final chunk).
+    let mapped = StreamWithPermit { inner: chunk_stream, _permit: permit }
+        .map(move |chunk| {
+            let payload = serde_json::json!({
+                "id": task_id,
+                "object": "chat.completion.chunk",
+                "created": now_unix(),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": chunk.text,
+                    },
+                    "finish_reason": if chunk.is_final { Some("stop") } else { None },
+                }],
+            });
+            Ok::<_, std::convert::Infallible>(Event::default().data(payload.to_string()))
         });
-        Ok(Event::default().data(payload.to_string()))
-    });
     let final_event = stream::once(async {
-        Ok(Event::default().data("[DONE]".to_string()))
+        Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]".to_string()))
     });
-    Sse::new(mapped.chain(final_event)).keep_alive(KeepAlive::default())
+    Sse::new(mapped.chain(final_event))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// Wraps a [`tahoma_runner::ChunkStream`] so it carries its concurrency
+/// permit and the permit is released when the stream is dropped (which
+/// happens on client disconnect — axum drops the SSE response).
+struct StreamWithPermit {
+    inner: tahoma_runner::ChunkStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Stream for StreamWithPermit {
+    type Item = tahoma_types::Chunk;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+fn engine_error_response(err: tahoma_engine::EngineError) -> axum::response::Response {
+    use tahoma_engine::EngineError;
+    let status = match &err {
+        EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
+        EngineError::InvalidConfig(_)
+        | EngineError::PeerRejected(_)
+        | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
+        EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+        EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }
 
 async fn cancel(

@@ -151,13 +151,24 @@ fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
 
 fn argmax_last_row(logits: &[f32], vocab: usize) -> i32 {
     let row = &logits[logits.len() - vocab..];
+    // NaN-aware (see crate::dist_spec::argmax for rationale).
     let mut best_i = 0usize;
     let mut best_v = f32::NEG_INFINITY;
+    let mut saw_finite = false;
     for (i, v) in row.iter().enumerate() {
-        if *v > best_v {
-            best_v = *v;
-            best_i = i;
+        if v.is_finite() {
+            saw_finite = true;
+            if *v > best_v {
+                best_v = *v;
+                best_i = i;
+            }
         }
+    }
+    if !saw_finite {
+        warn!(
+            "argmax_last_row: all logits non-finite; returning token 0 — \
+             likely indicates a numerically broken forward pass"
+        );
     }
     best_i as i32
 }
@@ -357,7 +368,15 @@ impl OvRuntimeEngine {
                 guard.recv().await
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
-        let token = i32::from_le_bytes([tensor.data[0], tensor.data[1], tensor.data[2], tensor.data[3]]);
+        if tensor.data.len() < 4 {
+            return Err(EngineError::Backend(format!(
+                "downstream sent {}-byte token tensor; need at least 4",
+                tensor.data.len()
+            )));
+        }
+        let token = i32::from_le_bytes([
+            tensor.data[0], tensor.data[1], tensor.data[2], tensor.data[3],
+        ]);
         Ok(token)
     }
 
@@ -478,7 +497,15 @@ impl OvRuntimeEngine {
         let full_text = tok
             .decode(&all_ids, true)
             .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        let delta = full_text[active.last_text.len()..].to_string();
+        // Use strip_prefix instead of byte-slice indexing — `last_text`
+        // is not always a clean byte-prefix of `full_text` (BPE can
+        // emit a partial UTF-8 sequence on token N and complete the
+        // glyph on token N+1, in which case the prefix bytes change).
+        // Slicing past a UTF-8 boundary panics.
+        let delta = full_text
+            .strip_prefix(active.last_text.as_str())
+            .unwrap_or(&full_text)
+            .to_string();
         active.last_text = full_text;
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
@@ -574,10 +601,12 @@ impl Engine for OvRuntimeEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) {
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if !self.spec.is_first_stage {
             warn!("ov-runtime submit() ignored on non-first stage");
-            return;
+            return Err(EngineError::Backend(
+                "non-first stage does not accept tasks directly".into(),
+            ));
         }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
@@ -585,9 +614,21 @@ impl Engine for OvRuntimeEngine {
                 .as_ref()
                 .is_some_and(|a| a.task.task_id == task.task_id)
         {
-            return;
+            return Ok(());
+        }
+        if self.pending.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            warn!(
+                queued = self.pending.len(),
+                cap = crate::dist_spec::MAX_PENDING_TASKS,
+                "ov-runtime: pending queue at cap; rejecting task"
+            );
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            });
         }
         self.pending.push(task);
+        Ok(())
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {

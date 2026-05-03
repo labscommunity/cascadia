@@ -213,11 +213,23 @@ impl Engine for OvGenaiEngine {
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) {
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
-            return;
+            return Ok(());
+        }
+        if self.pending.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            tracing::warn!(
+                queued = self.pending.len(),
+                cap = crate::dist_spec::MAX_PENDING_TASKS,
+                "ov-genai: pending queue at cap; rejecting task"
+            );
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            });
         }
         self.pending.push(task);
+        Ok(())
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {

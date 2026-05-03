@@ -23,11 +23,12 @@ impl MockEngine {
 impl Engine for MockEngine {
     fn warmup(&mut self) {}
 
-    fn submit(&mut self, task: GenerationTask) {
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
-            return;
+            return Ok(());
         }
         self.pending.push((task, 0));
+        Ok(())
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -115,7 +116,8 @@ mod tests {
     #[test]
     fn submit_then_step_emits_words() {
         let mut e = MockEngine::new();
-        e.submit(GenerationTask::new("t1", "the quick brown fox").with_max_tokens(2));
+        e.submit(GenerationTask::new("t1", "the quick brown fox").with_max_tokens(2))
+            .unwrap();
         let mut emitted = Vec::new();
         for _ in 0..6 {
             for (_, chunk) in e.step() {
@@ -132,8 +134,8 @@ mod tests {
     #[test]
     fn duplicate_submit_is_noop() {
         let mut e = MockEngine::new();
-        e.submit(GenerationTask::new("t1", "hi"));
-        e.submit(GenerationTask::new("t1", "hi"));
+        e.submit(GenerationTask::new("t1", "hi")).unwrap();
+        e.submit(GenerationTask::new("t1", "hi")).unwrap();
         // We should still have exactly one task pending.
         let chunks = e.step();
         assert!(!chunks.is_empty());

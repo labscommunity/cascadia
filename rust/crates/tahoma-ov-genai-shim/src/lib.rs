@@ -114,6 +114,8 @@ mod sys {
             handle: *mut tahoma_pipeline_t,
         ) -> *mut tahoma_tokenizer_t;
 
+        pub fn tahoma_tokenizer_destroy(tok: *mut tahoma_tokenizer_t);
+
         pub fn tahoma_tokenizer_count_tokens(
             tok: *mut tahoma_tokenizer_t,
             text: *const c_char,
@@ -396,8 +398,11 @@ impl LlmPipeline {
             if tok.is_null() {
                 return None;
             }
+            // Always destroy the borrowed tokenizer handle, even on
+            // count failure — otherwise we leak heap on every call.
             let mut out: u32 = 0;
             let rc = sys::tahoma_tokenizer_count_tokens(tok, text_c.as_ptr(), &mut out);
+            sys::tahoma_tokenizer_destroy(tok);
             if rc != 0 {
                 return None;
             }

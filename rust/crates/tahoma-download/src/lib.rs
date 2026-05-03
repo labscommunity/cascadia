@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
 
+/// Hard cap on the registry file size we'll read into memory.
+/// 16 MiB is far above any reasonable model registry: even with a few
+/// thousand entries (<200 bytes each) we stay under a megabyte. A
+/// pathological / corrupted registry won't OOM the process.
+pub const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("io error: {0}")]
@@ -26,6 +32,8 @@ pub enum Error {
     Hub(String),
     #[error("model not found: {0}")]
     NotFound(String),
+    #[error("registry corrupted: {0}")]
+    Corrupted(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -86,8 +94,34 @@ impl Registry {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let inner = if path.exists() {
+            // Reject following symlinks: an attacker who can place a
+            // symlink at the registry path would otherwise be able to
+            // read arbitrary files into our process memory or have us
+            // overwrite arbitrary files on flush.
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::Corrupted(format!(
+                    "registry path {path:?} is a symlink — refusing to follow"
+                )));
+            }
+            // Bound allocation against MAX_REGISTRY_BYTES.
+            if meta.len() > MAX_REGISTRY_BYTES {
+                return Err(Error::Corrupted(format!(
+                    "registry file {path:?} is {} bytes; max allowed is {}",
+                    meta.len(),
+                    MAX_REGISTRY_BYTES
+                )));
+            }
             let bytes = fs::read(&path)?;
-            serde_json::from_slice::<RegistryFile>(&bytes).unwrap_or_default()
+            // Treat parse errors as hard failures rather than silently
+            // discarding a registry the user spent time populating.
+            // Better to refuse to start than to nuke their data.
+            serde_json::from_slice::<RegistryFile>(&bytes).map_err(|e| {
+                Error::Corrupted(format!(
+                    "registry {path:?} failed to parse: {e}; \
+                     move it aside and re-register your models"
+                ))
+            })?
         } else {
             RegistryFile::default()
         };
@@ -102,7 +136,27 @@ impl Registry {
             fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(&*self.inner.read())?;
-        fs::write(&self.path, bytes)?;
+        // Atomic write: write to a sibling .tmp, fsync, then rename
+        // over the destination. A crash partway through fs::write()
+        // would otherwise leave the registry truncated/empty.
+        let tmp = {
+            let mut p = self.path.clone();
+            let base = p
+                .file_name()
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| std::ffi::OsString::from("registry.json"));
+            let mut name = base.to_string_lossy().into_owned();
+            name.push_str(".tmp");
+            p.set_file_name(name);
+            p
+        };
+        {
+            let mut f = fs::File::create(&tmp)?;
+            use std::io::Write;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 
