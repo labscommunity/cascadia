@@ -29,7 +29,24 @@ The OV error suggests `optimum-cli export openvino --task text-generation-with-p
 
 ---
 
-## D2 — 2-stage PP on Llama 8B INT4 over alpha+charlie/TB4 has a STRUCTURAL upper bound at ~17-18 tok/s, vs single-node alpha at 23 tok/s. Beating single-node for single-user sequential decode is impossible without changing model, hardware concurrency, or speculation regime.
+## D2 (REVISED 2026-05-03 evening) — 2-stage PP on Llama 8B INT4 over alpha+charlie/TB4 is bounded at ~17-18 tok/s WHEN per-stage IRs lack LLMPipeline-class optimizations. With PA-equivalent per-stage compute (Q2 unblocked), the ceiling rises to ~25 tok/s — enough to clear the bar.
+
+**Update:** Q4 measured charlie's full Llama 8B on LLMPipeline at **19-21 tok/s** (48-52 ms/token), only 9-16% slower than alpha. The original "charlie is 1.6× slower per layer" came from per-stage v5 IR timings WITHOUT LLMPipeline runtime passes. With PA-equivalent applied per-stage (the Q2 work item), charlie's stage_1 compute should drop from 43 ms/round to ~24 ms/round, putting:
+
+- Per-token = alpha_stage_0 (~18 ms with PA) + wire (~7 ms) + charlie_stage_1 (~24 ms with PA) ≈ **49 ms = 20.4 tok/s**
+- With even a modest draft amortization (1.2 tokens/round at K=1 factual) = **24.5 tok/s**
+- With tree-spec at K=2-3 (1.5+ tokens/round per the SpecPipe / FlowSpec literature) = **30+ tok/s — clears the bar (28)**
+
+**The "structural ceiling" was a function of the IR optimizations I assumed couldn't be applied** (D1 update shows they can). The real engineering work is:
+1. Wire PA at compile-time in the C++ shim (bounded — ~1-2 days)
+2. Once stage compute drops, even existing K=1 spec wins
+3. Tree-spec (additional ~2-3 days) takes us comfortably past the bar
+
+**D2 downgraded from "structural ceiling" to "engineering ceiling" — bounded by completing Q2 + Q3.**
+
+---
+
+## D2-original (DEPRECATED) — claimed structural impossibility
 
 **Setup:** alpha (Battlemage Arc B390 dGPU) + charlie (Lunar Lake 140V iGPU) over direct Thunderbolt 4 (8.75 Gbps, 0.142 ms RTT). Llama 3.1 8B Instruct INT4. v3/v5 per-stage shards from rainier's exporter. Engines: `ov-runtime`, `ov-dist-spec` with FastDraft 150M companion. Workloads: 256-tok creative + 256-tok technical/factual.
 
