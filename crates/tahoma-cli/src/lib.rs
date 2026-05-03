@@ -46,6 +46,9 @@ pub enum Command {
     Worker(WorkerArgs),
     /// List registered inference engines.
     Engines,
+    /// Shard a HuggingFace causal-LM model into per-stage OpenVINO IRs
+    /// for distributed inference. See `tahoma shard --help`.
+    Shard(ShardArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -125,11 +128,76 @@ pub struct WorkerArgs {
     pub max_tokens: u32,
 }
 
+#[derive(Parser, Debug, Clone)]
+pub struct ShardArgs {
+    /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct)
+    /// or path to a local directory containing safetensors + config.json.
+    #[arg(long)]
+    pub model: String,
+
+    /// Output directory for the shard tree (will be created).
+    #[arg(long, short = 'o')]
+    pub output_dir: String,
+
+    /// Number of pipeline stages to split the model into.
+    #[arg(long)]
+    pub num_stages: u32,
+
+    /// Weight quantization. INT4 is the typical choice for Intel
+    /// hardware; FP16 if NNCF is unavailable or you want max quality.
+    #[arg(long, value_enum, default_value_t = ShardQuant::Int4)]
+    pub quantization: ShardQuant,
+
+    /// Explicit per-stage layer boundaries, comma-separated. With
+    /// `--num-stages 3 --layer-split 16,24` on a 32-layer model:
+    /// stage 0 = [0,16), stage 1 = [16,24), stage 2 = [24,32).
+    /// If omitted, layers are split uniformly.
+    #[arg(long)]
+    pub layer_split: Option<String>,
+
+    /// Export only this stage index (debug). Useful for re-exporting
+    /// one stage after a config tweak without re-running the others.
+    #[arg(long)]
+    pub stage: Option<u32>,
+
+    /// Override the python interpreter used to run the bundled exporter.
+    /// Defaults to `python3` then `python` on PATH.
+    #[arg(long)]
+    pub python: Option<String>,
+
+    /// Skip the Python interpreter detection check (assumes the chosen
+    /// interpreter has nncf, openvino, transformers, torch, safetensors
+    /// installed). Use this if you know your env is good and want a
+    /// faster start.
+    #[arg(long)]
+    pub skip_check: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum ShardQuant {
+    Fp16,
+    Int4,
+    Int4Asym,
+    Int8,
+}
+
+impl ShardQuant {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Int4 => "int4",
+            Self::Int4Asym => "int4_asym",
+            Self::Int8 => "int8",
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
     match cli.cmd {
         Command::Engines => cmd_engines(),
         Command::Worker(args) => cmd_worker(args).await,
+        Command::Shard(args) => cmd_shard(args).await,
     }
 }
 
@@ -354,5 +422,142 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// The bundled Python exporter, included into the binary at build time.
+/// Written to a temp file at runtime and invoked as a subprocess.
+/// `CARGO_MANIFEST_DIR` is `<workspace>/crates/tahoma-cli`; jumping two
+/// levels up reaches the workspace root reliably on both Unix and Windows
+/// (raw `../../../tools/...` mixes path separators on Windows and breaks
+/// `include_str!`).
+const EXPORT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/export_shards.py"
+));
+
+async fn cmd_shard(args: ShardArgs) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let python = if let Some(p) = args.python.as_deref() {
+        p.to_string()
+    } else {
+        // Try `python3` then `python`. clap doesn't run them — we just pick one.
+        if Command::new("python3").arg("--version").output().is_ok() {
+            "python3".into()
+        } else if Command::new("python").arg("--version").output().is_ok() {
+            "python".into()
+        } else {
+            return Err(anyhow!(
+                "no Python interpreter found on PATH. Install Python 3.10+ or pass --python <path>."
+            ));
+        }
+    };
+
+    if !args.skip_check {
+        eprintln!("Checking Python environment for required packages...");
+        let probe = Command::new(&python)
+            .args([
+                "-c",
+                "import torch, openvino, transformers, safetensors, huggingface_hub; \
+                 print('python', __import__('sys').version.split()[0]); \
+                 print('torch', torch.__version__); \
+                 print('openvino', openvino.__version__); \
+                 print('transformers', transformers.__version__);",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for line in stdout.lines() {
+                    eprintln!("  {line}");
+                }
+                // NNCF is optional but warn if missing for INT4 quant.
+                let nncf = Command::new(&python)
+                    .args(["-c", "import nncf; print('nncf', nncf.__version__)"])
+                    .output();
+                match nncf {
+                    Ok(o) if o.status.success() => {
+                        eprintln!("  {}", String::from_utf8_lossy(&o.stdout).trim());
+                    }
+                    _ => {
+                        if matches!(
+                            args.quantization,
+                            ShardQuant::Int4 | ShardQuant::Int4Asym | ShardQuant::Int8
+                        ) {
+                            eprintln!("  WARNING: nncf not installed; falls back to FP16 weights");
+                        }
+                    }
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow!(
+                    "python environment check failed:\n{}\n\
+                     Install: pip install torch openvino transformers safetensors \
+                     huggingface_hub nncf",
+                    stderr.trim()
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow!("couldn't run python interpreter {python:?}: {e}"));
+            }
+        }
+    }
+
+    // Write the embedded script to a temp file so we have a real path.
+    let mut tmp = tempfile::Builder::new()
+        .prefix("tahoma-export-")
+        .suffix(".py")
+        .tempfile()
+        .context("creating temp file for embedded exporter")?;
+    tmp.write_all(EXPORT_SCRIPT.as_bytes())
+        .context("writing embedded exporter to temp file")?;
+    tmp.flush().ok();
+    let script_path = tmp.path().to_owned();
+
+    // Build python argv.
+    let mut cmd = Command::new(&python);
+    cmd.arg("-u")
+        .arg(&script_path)
+        .arg("--model")
+        .arg(&args.model)
+        .arg("--output-dir")
+        .arg(&args.output_dir)
+        .arg("--num-stages")
+        .arg(args.num_stages.to_string())
+        .arg("--quantization")
+        .arg(args.quantization.as_arg());
+    if let Some(s) = &args.layer_split {
+        cmd.arg("--layer-split").arg(s);
+    }
+    if let Some(s) = args.stage {
+        cmd.arg("--stage").arg(s.to_string());
+    }
+    eprintln!(
+        "Running exporter: {} -u <embedded> --model {} --output-dir {} --num-stages {}",
+        python, args.model, args.output_dir, args.num_stages
+    );
+    let status = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("spawning python exporter")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "exporter exited with {} — see output above",
+            status
+        ));
+    }
+    eprintln!(
+        "\nShard tree written to {}. Run with:\n  tahoma worker --rank 0 --total {} \
+         --engine ov-runtime --device GPU --model {} \
+         --next <next-host>:9100 --api :8000",
+        args.output_dir, args.num_stages, args.output_dir
+    );
     Ok(())
 }

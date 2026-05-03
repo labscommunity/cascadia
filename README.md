@@ -57,21 +57,39 @@ curl http://localhost:8000/v1/chat/completions -d '{
 
 ### Two machines (pipeline parallel)
 
-Pre-export per-stage shards once with rainier's exporter, then:
+Tahoma ships its own sharder. One time, on whichever machine has the
+RAM + a Python install (any node, or your laptop):
 
 ```bash
-# On node B (last stage, listens for activations):
-tahoma worker --rank 1 --total 2 --engine ov-runtime --device GPU \
-              --model /path/to/shards \
-              --listen 10.0.0.2:9100
+# Pip-install the export-time deps once (~3 GB; not needed at runtime):
+pip install torch transformers openvino safetensors huggingface_hub nncf
 
-# On node A (first stage, serves the API):
+# Shard a HuggingFace model into 2 stages with INT4 weights:
+tahoma shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
+             --output-dir ~/tahoma/llama-8b-2stage \
+             --num-stages 2 --quantization int4
+```
+
+This produces `~/tahoma/llama-8b-2stage/` with `pipeline_config.json`,
+`tokenizer/`, and `stage_0/` + `stage_1/`. Copy the directory to each
+node (`scp -r` / `rsync`), or re-shard separately on each node — pick
+whichever is faster on your network.
+
+Then run a worker on each node:
+
+```bash
+# Node B (last stage, listens for activations):
+tahoma worker --rank 1 --total 2 --engine ov-runtime --device GPU \
+              --model ~/tahoma/llama-8b-2stage \
+              --listen :9100
+
+# Node A (first stage, serves the API):
 tahoma worker --rank 0 --total 2 --engine ov-runtime --device GPU \
-              --model /path/to/shards \
+              --model ~/tahoma/llama-8b-2stage \
               --next 10.0.0.2:9100 --api :8000
 ```
 
-Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding (see [docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
+Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding (see [docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)). See [docs/SHARDING.md](docs/SHARDING.md) for supported architectures and tuning.
 
 ### List engines
 
