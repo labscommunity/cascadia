@@ -1,0 +1,50 @@
+[2m2026-05-03T18:54:16.151633Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mOvDistSpec [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m2 [3mdevice[0m[2m=[0mGPU [3mmodel[0m[2m=[0mC:\cascadia\shards_2stage_v6_treemask
+[2m2026-05-03T18:54:16.151985Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mSome(PeerEndpoint { host: "10.10.10.2", port: 9100 })
+[2m2026-05-03T18:54:16.157046Z[0m [32m INFO[0m [2mtahoma_transport[0m[2m:[0m ActivationClient connected [3mhost[0m[2m=[0m10.10.10.2 [3mport[0m[2m=[0m9100
+[2m2026-05-03T18:54:16.158172Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-03T18:54:22.093721Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling target stage 0
+[2m2026-05-03T18:54:22.093818Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading tokenizer
+[2m2026-05-03T18:54:22.093830Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress compiling draft C:\cascadia\models\srang992-llama-3.2-1b-int4-ov
+[2m2026-05-03T18:54:22.093840Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress ready
+[2m2026-05-03T18:54:22.093848Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-03T18:54:22.093978Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-03T18:54:25.029122Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode timing [3mtarget_ms[0m[2m=[0m2809 [3mdraft_ms[0m[2m=[0m145 [3mother_ms[0m[2m=[0m0 [3mtotal_ms[0m[2m=[0m2934 [3mtarget_alpha_setup_ms[0m[2m=[0m0 [3mtarget_alpha_infer_ms[0m[2m=[0m291 [3mtarget_alpha_output_ms[0m[2m=[0m0 [3mtarget_wire_ms[0m[2m=[0m2496
+[2m2026-05-03T18:54:25.029215Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec warmup ok [3mk[0m[2m=[0m5 [3mtree[0m[2m=[0m1
+[2m2026-05-03T18:54:25.029230Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-03T18:54:25.029242Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m stdin mode: type a prompt and press enter
+[2m2026-05-03T18:54:25.030008Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec task active [3mtask[0m[2m=[0mstdin-1 [3mprompt_tokens[0m[2m=[0m35 [3mk[0m[2m=[0m5
+[2m2026-05-03T18:54:26.966367Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m1 [3mleft[0m[2m=[0m[62, 49, 28729, 320, 17020] [3mright[0m[2m=[0m[2028, 3575, 7612, 264, 11944] [3mt_greedy_first[0m[2m=[0m49 [3mleft_accept[0m[2m=[0m0 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m0 [3mcorrection[0m[2m=[0m49
+[2m2026-05-03T18:54:27.286705Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m2 [3mleft[0m[2m=[0m[28729, 320, 17020, 291, 30151] [3mright[0m[2m=[0m[3510, 323, 356, 3510, 37686] [3mt_greedy_first[0m[2m=[0m28729 [3mleft_accept[0m[2m=[0m5 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m5 [3mcorrection[0m[2m=[0m2638
+[2m2026-05-03T18:54:27.606708Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m tree-spec round trace [3mstep[0m[2m=[0m3 [3mleft[0m[2m=[0m[46879, 8, 323, 356, 28729] [3mright[0m[2m=[0m[8, 37686, 334, 527, 264] [3mt_greedy_first[0m[2m=[0m46879 [3mleft_accept[0m[2m=[0m5 [3mright_accept[0m[2m=[0m0 [3mwinning_left[0m[2m=[0mtrue [3maccepted[0m[2m=[0m5 [3mcorrection[0m[2m=[0m320
+[2m2026-05-03T18:56:13.902126Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m spec_decode_tree timing [3mtarget_ms[0m[2m=[0m50656 [3mdraft_ms[0m[2m=[0m57491 [3mother_ms[0m[2m=[0m723 [3mtotal_ms[0m[2m=[0m108872 [3mtarget_alpha_setup_ms[0m[2m=[0m11 [3mtarget_alpha_infer_ms[0m[2m=[0m6660 [3mtarget_alpha_output_ms[0m[2m=[0m10 [3mtarget_wire_ms[0m[2m=[0m43957
+[2m2026-05-03T18:56:13.903894Z[0m [32m INFO[0m [2mtahoma_engine_openvino::dist_spec[0m[2m:[0m ov-dist-spec done [3mtask[0m[2m=[0mstdin-1 [3mtokens[0m[2m=[0m1024 [3msteps[0m[2m=[0m227 [3maccept[0m[2m=[0m0.3515418469905853
+**RISC (Reduced Instruction Set Computing) and CISC (Complex Instruction Set Computing) are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications.
+
+**RISC Processors:**
+
+RISC processors are designed to execute a limited set of instructions quickly and efficiently. They typically have a simple instruction set, a deep pipeline, and a focus on executing a large number of instructions per clock cycle. This approach is based on the idea that a small set of instructions can be executed quickly and efficiently, rather than trying to execute a large number of complex instructions.
+
+**Key Features of RISC Processors:**
+
+*   **Deep Pipeline:** RISC processors have a deep pipeline, which allows them to execute a large number of instructions per clock cycle. This is achieved by breaking down the instruction execution process into multiple stages, each of which is executed in a single clock cycle.
+*   **Simple Instruction Set:** RISC processors have a simple instruction set, which consists of a limited set of instructions that can be executed quickly and efficiently. This simplicity allows for faster execution times and lower power consumption.
+*   **Typical Use Cases:** RISC processors are commonly used in mobile devices, such as smartphones and tablets, as well as in embedded systems and other applications where low power consumption and high performance are critical.
+
+**CISC Processors:**
+
+CISC processors, on the other hand, are designed to execute a wide range of instructions quickly and efficiently. They typically have a complex instruction set, a shallow pipeline, and a focus on executing a small number of complex instructions. This approach is based on the idea that a large set of instructions can be executed quickly and efficiently, rather than trying to execute a small set of simple instructions.
+
+**Key Features of CISC Processors:**
+
+*   **Shallow Pipeline:** CISC processors have a shallow pipeline, which allows them to execute a small number of complex instructions quickly. This is achieved by breaking down the instruction execution process into fewer stages, each of which is executed in a single clock cycle.
+*   **Complex Instruction Set:** CISC processors have a complex instruction set, which consists of a large set of instructions that can be executed quickly and efficiently. This complexity allows for faster execution times and higher performance.
+*   **Typical Use Cases:** CISC processors are commonly used in desktop computers, laptops, and servers, as well as in applications where high performance and large memory capacity are critical.
+
+**Comparison to ARM and x86:**
+
+ARM and x86 are two popular processor architectures that are commonly used in a wide range of applications. ARM processors are typically used in mobile devices, while x86 processors are commonly used in desktop computers and laptops.
+
+*   **ARM Processors:** ARM processors are RISC-based and are commonly used in mobile devices, such as smartphones and tablets. They are known for their low power consumption and high performance, making them ideal for mobile applications.
+*   **x86 Processors:** x86 processors are CISC-based and are commonly used in desktop computers and laptops. They are known for their high performance and large memory capacity, making them ideal for applications that require high processing power and large storage capacity.
+
+In conclusion, RISC and CISC processors are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications. By considering factors such as pipeline depth, instruction encoding, and typical use cases, developers can choose the right processor for their needs and create high-performance applications that meet the demands of modern computing.**RISC and CISC processors are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications.**RISC processors are designed to execute a limited set of instructions quickly and efficiently. They typically have a simple instruction set, a deep pipeline, and a focus on executing a large number of instructions per clock cycle.**CISC processors, on the other hand, are designed to execute a wide range of instructions quickly and efficiently. They typically have a complex instruction set, a shallow pipeline, and a focus on executing a small number of complex instructions.**ARM processors are RISC-based and are commonly used in mobile devices, such as smartphones and tablets. They are known for their low power consumption and high performance, making them ideal for mobile applications.**x86 processors are CISC-based and are commonly used in desktop computers and laptops. They are known for their high performance and large memory capacity, making them ideal for applications that require high processing power and large storage capacity.**RISC and CISC processors are two distinct approaches to processor design, each with its own strengths and weaknesses. Understanding the differences between these two architectures is crucial for selecting the right processor for specific applications.**RISC processors are designed to execute a limited set of instructions quickly and efficiently. They typically have a simple instruction set

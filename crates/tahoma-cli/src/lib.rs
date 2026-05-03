@@ -115,6 +115,11 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 5)]
     pub spec_k: u32,
 
+    /// Tree-spec topology preset (0 = chain spec, 1 = width-2-at-root tree).
+    /// Requires v6 shards. See ov-dist-spec docs.
+    #[arg(long, default_value_t = 0)]
+    pub spec_tree: u32,
+
     /// Enable Prompt Lookup decoding with n-gram size N. Mutually
     /// exclusive with --draft-model.
     #[arg(long, default_value_t = 0)]
@@ -224,6 +229,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 }
                 if let Some(group) = &args.ov_dyn_quant_group {
                     b = b.with_dyn_quant_group(group);
+                }
+                if args.spec_tree > 0 {
+                    b = b.with_tree_preset(args.spec_tree);
                 }
                 Ok(Box::new(b))
             } else {
