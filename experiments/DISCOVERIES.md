@@ -50,7 +50,30 @@ Single-node alpha with `ov-genai + FastDraft K=5` does the same workload at 23.3
 
 ---
 
-## D3 — early-exit pseudo-head via embed-matrix projection at layer 16/32 has 0% agreement with full forward — kills the M3 moonshot at validation
+## D3 (REVISED 2026-05-03 evening) — pseudo-head via embed_tokens.weight is the wrong matrix; the real `lm_head + RMSNorm` projection at layer 22 gives 12.5% top-1 / 34.4% top-5 — M3 is ALIVE at deeper cuts
+
+**Original (incorrect) finding:** projected stage_0 hidden through `embed_tokens.weight^T` at layers 16 and 22; got 0/32 = 0% agreement; declared M3 dead.
+
+**What I missed:** Llama 3.1 8B has **untied weights** — `lm_head.weight` is a SEPARATE 1 GB matrix from `embed_tokens.weight`, with different values, trained for the specific job of projecting the *final* layer's hidden state to logits. Using `embed.T` is not the logit-lens projection at all; it's a different (and much worse) approximation. Additionally, the standard logit-lens applies the model's final `model.norm` (RMSNorm) to the intermediate hidden state before lm_head, which I skipped.
+
+**Re-test (`m3_pseudo_head_v2.py`) with the correct projection** `lm_head( model.norm( hidden_at_L ) )`:
+
+| Layer | top-1 agreement | real-token-in-pseudo's-top-5 |
+|---|---:|---:|
+| 16/32 (50% depth) | 3.1% (1/32) | 6.2% (2/32) |
+| **22/32 (69% depth)** | **12.5% (4/32)** | **34.4% (11/32)** |
+
+Layer 22's top-5 agreement of 34% is enough to be useful for **tree-based speculative decode** — sending top-5 candidates from the pseudo-head per round, expected accepted-prefix length is ~0.34 (vs 0% with the broken embed projection). On a workload where charlie's stage_1 wait is the bottleneck (e10's 43 ms/round), even a 15% per-round speedup from amortizing K=2-3 free draft tokens beats the prior structural ceiling claim.
+
+**This consistent with published logit-lens / early-exit literature:** Belrose et al. *Tuned Lens* and the LayerSkip paper find Llama-class top-1 prediction "crystallizes" around 75% depth (layer 24/32 for 8B). Layer 16 is too shallow; layer 22 is in the transition zone; layer 24 should give 30-50% top-1 per published results.
+
+**Next concrete step:** Export a 24/8 v3 shard cut and re-run. If layer 24 hits ≥30% top-1, the M3 moonshot is high-value: we get free in-engine speculation that requires NO separate draft model + has model-faithful predictions.
+
+The earlier "killed" verdict was overstated. **D3 should be read as: "embed-as-pseudo-head is dead; real-lm_head-with-norm is alive at layer 22+ and very likely strong at layer 24."**
+
+---
+
+## D3-original (DEPRECATED) — embed-projection at layer 16/22 gives 0% (the wrong test)
 
 **Setup:** alpha B390 dGPU. Llama 3.1 8B INT4 v3 stage_0 (16 layers + embed) compared against full 32-layer Llama 3.1 8B INT4 single-step decode. After each token, project stage_0's last hidden state through `embed_tokens.weight^T` (bf16 → f16) to get pseudo-logits; argmax; compare to argmax of full-model output. 10-token prompt + 32 generated tokens.
 
