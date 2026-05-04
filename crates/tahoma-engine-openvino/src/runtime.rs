@@ -214,12 +214,33 @@ pub struct OvRuntimeEngine {
     runtime_handle: tokio::runtime::Handle,
     position: i64,
     input_names: Vec<String>,
+    /// Map of canonical name (e.g. "input_ids", "attention_mask") to the
+    /// IR's primary port name. Resolved at engine build time via the
+    /// alias lookup (the IR's primary name is sometimes an internal
+    /// node id, not the canonical name). Empty for v3 IRs.
+    canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
 }
 
 impl OvRuntimeEngine {
+    /// True if the loaded IR uses v5+ canonical inputs (attention_mask +
+    /// position_ids) instead of legacy v3 (cos + sin). Determined from
+    /// the alias-resolved canonical_inputs map populated at build time.
+    fn is_v5_layout(&self) -> bool {
+        self.canonical_inputs.contains_key("attention_mask")
+            && self.canonical_inputs.contains_key("position_ids")
+    }
+
+    /// Resolve a canonical input name to the IR's primary port name.
+    fn input_named(&self, canonical: &str) -> Option<&str> {
+        self.canonical_inputs.get(canonical).map(|s| s.as_str())
+    }
+
     fn build_feed_first(&mut self, input_ids: &[i64], position: i64) -> EngineResult<()> {
+        if self.is_v5_layout() {
+            return self.build_feed_first_v5(input_ids, position);
+        }
         let seq_len = input_ids.len();
         let (cos, sin) = self.rotary.compute(position, seq_len);
         // v3 inputs are positional: (input_ids|hs, cos, sin).
@@ -261,12 +282,57 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    fn build_feed_first_v5(&mut self, input_ids: &[i64], position: i64) -> EngineResult<()> {
+        let seq_len = input_ids.len();
+        let total = position as usize + seq_len;
+        let attn = vec![1i64; total];
+        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
+
+        let in_ids = self
+            .input_named("input_ids")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing input_ids".into()))?
+            .to_string();
+        let in_attn = self
+            .input_named("attention_mask")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing attention_mask".into()))?
+            .to_string();
+        let in_pos = self
+            .input_named("position_ids")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing position_ids".into()))?
+            .to_string();
+        let in_beam = self.input_named("beam_idx").map(|s| s.to_string());
+
+        self.runtime
+            .set_input(
+                &in_ids,
+                ShimDType::I64,
+                &[1, seq_len],
+                &i64_to_bytes(input_ids),
+            )
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
+            .map_err(map_ov_err)?;
+        if let Some(beam) = in_beam {
+            self.runtime
+                .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
+                .map_err(map_ov_err)?;
+        }
+        Ok(())
+    }
+
     fn build_feed_relay(
         &mut self,
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
     ) -> EngineResult<()> {
+        if self.is_v5_layout() {
+            return self.build_feed_relay_v5(hidden, shape, position);
+        }
         let seq_len = shape[1];
         let (cos, sin) = self.rotary.compute(position, seq_len);
         let names = &self.input_names;
@@ -300,6 +366,49 @@ impl OvRuntimeEngine {
                 &sin_bytes,
             )
             .map_err(map_ov_err)?;
+        Ok(())
+    }
+
+    fn build_feed_relay_v5(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+    ) -> EngineResult<()> {
+        let seq_len = shape[1];
+        let total = position as usize + seq_len;
+        let attn = vec![1i64; total];
+        let pos: Vec<i64> = (position..position + seq_len as i64).collect();
+
+        let in_hs = self
+            .input_named("hidden_states")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing hidden_states".into()))?
+            .to_string();
+        let in_attn = self
+            .input_named("attention_mask")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing attention_mask".into()))?
+            .to_string();
+        let in_pos = self
+            .input_named("position_ids")
+            .ok_or_else(|| EngineError::Backend("v5 IR missing position_ids".into()))?
+            .to_string();
+        let in_beam = self.input_named("beam_idx").map(|s| s.to_string());
+
+        let hs_bytes = f32_to_f16_bytes(hidden);
+        self.runtime
+            .set_input(&in_hs, ShimDType::F16, &shape, &hs_bytes)
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_attn, ShimDType::I64, &[1, total], &i64_to_bytes(&attn))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
+            .map_err(map_ov_err)?;
+        if let Some(beam) = in_beam {
+            self.runtime
+                .set_input(&beam, ShimDType::I32, &[1], &0i32.to_le_bytes())
+                .map_err(map_ov_err)?;
+        }
         Ok(())
     }
 
@@ -903,6 +1012,32 @@ impl Builder for OvRuntimeBuilder {
         let spec = self.spec.ok_or(EngineError::NotLoaded)?;
         let rotary = self.rotary.ok_or(EngineError::NotLoaded)?;
 
+        // Resolve canonical port names via the alias list. v5 IRs export
+        // input ports under conventional names ("input_ids", "attention_mask",
+        // ...) but the IR's "primary" name is sometimes an internal node id;
+        // the alias list is what carries the canonical name.
+        let mut canonical_inputs = std::collections::HashMap::new();
+        let n_inputs = runtime.input_count();
+        for canonical in [
+            "input_ids",
+            "hidden_states",
+            "attention_mask",
+            "position_ids",
+            "beam_idx",
+        ] {
+            for idx in 0..n_inputs {
+                let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
+                let primary = runtime.input_name(idx).map_err(map_ov_err)?;
+                if aliases
+                    .iter()
+                    .any(|a| a == canonical || a.contains(canonical))
+                {
+                    canonical_inputs.insert(canonical.to_string(), primary);
+                    break;
+                }
+            }
+        }
+
         Ok(Box::new(OvRuntimeEngine {
             spec,
             runtime,
@@ -915,6 +1050,7 @@ impl Builder for OvRuntimeBuilder {
             runtime_handle: tokio::runtime::Handle::current(),
             position: 0,
             input_names: self.input_names,
+            canonical_inputs,
             pending: Vec::new(),
             active: None,
         }))

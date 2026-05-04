@@ -2214,6 +2214,7 @@ dependencies = [
  "tahoma-engine-openvino",
  "tahoma-runner",
  "tahoma-types",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
