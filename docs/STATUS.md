@@ -1,316 +1,265 @@
-# tahoma Rust port — status
+# tahoma — current status
 
-Tracking the Python → Rust hard rewrite (Cargo workspace at the repo root) on the
-`feat/rust-port` branch. Updated whenever a phase lands.
+Snapshot of what works today. Updated whenever something material
+ships on `main`.
 
-## Engine port status (alpha + charlie hardware)
+## What it is
 
-| Engine | Port | Mac unit tests | Real OV build | Real-model e2e | A/B vs Python |
-|---|---|:-:|:-:|:-:|---|
-| `ov-genai` | ✅ | ✅ 5 | ✅ alpha + charlie | ✅ | **at parity** (Rust 20.5 vs Python 20.3 plain; 22.3 vs 22.6 FastDraft; 29.3 vs 29.4 PL) |
-| `ov-runtime` | ✅ | ✅ 3 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 (13.55 tok/s, 64 tokens) | n/a (no Python A/B yet) |
-| `ov-dist-spec` | ✅ | ✅ 9 | ✅ alpha + charlie | ✅ alpha+charlie/TB4 | **Rust 1.29× slower** (21.70 vs 28.05 tok/s in `--release`; was 2.21× in debug) |
+Distributed LLM inference for Intel hardware. Single Rust binary per
+node. Sharding + serving + tokenizer + HTTP API are all in the same
+~7 MB executable. Pipeline parallelism over TCP between nodes. The
+OSS / hobbyist counterpart to cascadia (the enterprise track —
+multi-tenant, auth, fault tolerance, separate repo).
 
-### Perf-gap investigation (commits b396709, 655f6b8)
+Closest comparable in the ecosystem: [exo](https://github.com/exo-explore/exo),
+but for Intel devices (Lunar Lake / Arrow Lake / Panther Lake / Battlemage
+Arc) using OpenVINO instead of MLX.
 
-Original assumption ("FFI memcpy is the bottleneck") was **wrong** —
-empirical instrumentation per spec round on alpha+charlie/TB4 found:
+## Engines
 
-| Component (debug profile) | Time/round | % of round |
-|---|---:|---:|
-| Driver stage_0 GPU infer | 27 ms | 25% |
-| Worker stage_1 GPU compute (waited for) | 32 ms | 30% |
-| TCP send + recv | 1 ms | 1% |
-| **f16 → f32 of 1 MB logits payload** | **70 ms** | **65%** ← root cause |
-| Per-round total | ~110 ms | |
+All four engines build clean, run on real hardware (Intel Arc B390 +
+Lunar Lake 140V iGPU connected over Thunderbolt 4), and are exercised
+end-to-end in CI plus on-hardware benches.
 
-The half crate's `f16::to_f32` runs unoptimized in debug builds (no
-SIMD); release builds use AVX2/F16C intrinsics and the same conversion
-takes 2 ms instead of 70 ms. Building tahoma with `--release` collapses
-the dist-spec perf gap from 2.21× to 1.29×.
+| Engine | Stages | Spec decode | Shards required | Status |
+|--------|-------:|-------------|-----------------|--------|
+| `mock` | 1 | – | none | reference / test fixture |
+| `ov-genai` | 1 only | optional (FastDraft / Prompt Lookup) | off-the-shelf HF or `tahoma shard` | production-ready |
+| `ov-runtime` | N | – | v3 OR v5 (`tahoma shard` produces v5) | production-ready |
+| `ov-dist-spec` | N | required (chain spec) | v5 (`tahoma shard`) | production-ready |
 
-### Building for performance — IMPORTANT
+`ov-runtime` auto-detects v3 vs v5 IR layouts and dispatches to the
+right input-binding path (added in PR #6 so user-sharded models work
+with both `ov-runtime` and `ov-dist-spec`).
 
-The dist-spec engine **must be built with `--release`** for production
-use. Default `cargo build` produces a 2× slower binary on this engine.
+## What you can do today
 
-```powershell
-cd C:\Users\cascadia\tahoma-rust
-cargo build --release -p tahoma --features openvino
-.\target\release\tahoma.exe ...
-```
-
-The single-node `ov-genai` engine is much less affected by the build
-profile because most of its work is inside the openvino-genai C++
-library; LLMPipeline takes only one `generate()` call per task so
-per-call Rust overhead is amortized.
-
-### Remaining ~23% gap on dist-spec
-
-Profiled in release mode; remaining costs:
-
-* **35 ms/round** waiting for the worker's stage_1 inference (intrinsic
-  to OV + iGPU; not a Rust-side issue)
-* **2 ms/round** for the 1 MB f16 → f32 logit conversion (could be
-  eliminated by doing argmax directly on f16; saves ~36 ms/task ~ 1%)
-* Smaller (per-call OV overhead, per-call ov::Tensor allocation in the
-  FFI shim) that would each save single-digit % at most
-
-The **structural fix** for the next ~10-20% would be the zero-copy
-borrowing-tensor constructor in the C++ shim:
-
-```cpp
-// Current shim (alloc + memcpy):
-ov::Tensor t(element_type, shape);
-memcpy(t.data(), input, byte_size);
-request->set_tensor(name, t);
-
-// Zero-copy alternative:
-ov::Tensor t(element_type, shape, input);   // borrows; no alloc, no copy
-request->set_tensor(name, t);
-```
-
-The wrapping constructor is documented and stable in OV; the safety
-contract is that `input` must outlive the inference call. This is
-straightforward to satisfy by holding the input bytes (`Vec<u8>` from
-the Rust side) for the duration of `infer()` and dropping after
-`get_output_tensor()` is consumed.
-
-### Decision: Python tree removal
-
-The 1.29× gap on distributed is no longer a hard "most performant for
-the user" blocker; it's a tradeoff. Single-binary deployment + memory
-safety + tokio concurrency vs 23% slower distributed inference. Bench
-the user's actual workload mix before deciding. For now Python remains
-on this branch.
-
-## What's working today
-
-`cargo test --workspace` on macOS — **63 passing, 0 failures.**
-
-| Crate | Tests | What it does |
-|---|---:|---|
-| `tahoma-types` | 13 | GenerationTask, Chunk, ShardSpec, ShardPlan, PeerLayout |
-| `tahoma-topology` | 4 | NodeInfo, EdgeMetrics, in-memory graph |
-| `tahoma-transport` | 5 | Async tokio TCP relay; **wire-format identical to Python** |
-| `tahoma-engine` | 0 | Engine + Builder traits |
-| `tahoma-engine-mock` | 4 | Deterministic word-echo engine |
-| `tahoma-ov-genai-shim` | 3 | C++ FFI shim around openvino-genai |
-| `tahoma-engine-openvino` | 5 | OvGenaiEngine using the shim |
-| `tahoma-runner` | 3 | Per-stage Runner; concurrent `generate()` |
-| `tahoma-api` | 3 | axum: /health, /v1/models, /v1/chat/completions (+SSE) |
-| `tahoma-cli` | 0 | clap CLI; `tahoma worker` flag set |
-| `tahoma-discovery` | 2 | mDNS via mdns-sd; populates Topology |
-| `tahoma-download` | 3 | Local registry + HF snapshot pull (hf-hub) |
-| `tahoma` | — | Binary entry point |
-| `tahoma-tests-e2e` | 2 | **Real binary spawn** — built `tahoma` exe, /health poll, /v1/models, /v1/chat/completions, concurrent request fan-out |
-
-End-to-end smoke: the `tahoma` binary serves valid OpenAI
-chat-completions JSON against the mock engine.
+### One-command sharding (PR #6, May 2026)
 
 ```bash
-cargo build -p tahoma
-./target/debug/tahoma worker --rank 0 --total 1 \
-    --model mock --engine mock --api :8000
-
-curl -s -X POST http://localhost:8000/v1/chat/completions \
-    -H 'content-type: application/json' \
-    -d '{"model":"mock","messages":[{"role":"user","content":"hi"}],"max_tokens":4}'
+pip install torch transformers openvino safetensors huggingface_hub nncf
+tahoma shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
+             --output-dir ~/tahoma/llama-8b-2stage \
+             --num-stages 2 --quantization int4
 ```
 
-## What's deferred
+Drops the previous dependency on rainier (the sister Python repo). The
+exporter is bundled into the tahoma binary via `include_str!` and
+written to a temp file at runtime — no extra files to deploy.
 
-In rough priority order:
+Architectures explicitly tested: Llama (1, 2, 3, 3.1, 3.2), Mistral 7B+,
+Qwen2 / 2.5. Phi-3 and Gemma 2 work best-effort. Mixtral and other MoE
+models are not yet supported. Full table + tuning guide in
+[docs/SHARDING.md](SHARDING.md).
 
-1. **`ov-runtime` + `ov-dist-spec` engines.** Need lower-level `openvino`
-   crate (Core/CompiledModel/InferRequest) + the v5-stage-shard wire
-   protocol. Significant work; tracked separately.
-2. **Real OpenVINO build on alpha.** Blocked on Windows toolchain
-   prereqs (see Windows Setup below).
-3. **Full pytest parity.** Currently 45 Rust tests vs Python's 123.
-   Most gaps are in the engines + dist-spec protocol not yet ported.
-4. **A/B benchmark Python vs Rust** on alpha — needs the real OV build
-   first.
-5. **Discovery + download integration tests.** Crates compile + unit-test
-   today; full mDNS round-trip + HF pull e2e are runtime tests deferred.
+### Distributed serving
 
-## Windows setup (alpha + charlie)
+```bash
+# Node B (last stage):
+tahoma worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
+              --model ~/tahoma/llama-8b-2stage --listen :9100
 
-### What's already installed (autonomous, this session)
-
-* **Rust toolchain 1.95.0** on both alpha and charlie via headless
-  `rustup-init.exe -y --default-toolchain stable`.
-* **MSVC C++ build tools** on alpha (Visual Studio 2022 BuildTools
-  with `Microsoft.VisualStudio.Workload.VCTools;includeRecommended`
-  + Windows 11 SDK 22621) installed via the silent
-  `vs_buildtools.exe modify` path. Verified `cl.exe` + `vcvars64.bat`
-  present.
-* **OpenVINO GenAI 2026.1 Windows SDK** (~208 MB, includes C++ headers
-  for `llm_pipeline.hpp`, `generation_config.hpp`, `tokenizer.hpp` plus
-  `openvino_genai.lib` import library) downloaded from
-  `https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.1/windows/openvino_genai_windows_2026.1.0.0_x86_64.zip`
-  and extracted to
-  `C:\tahoma\ov_genai_sdk\openvino_genai_windows_2026.1.0.0_x86_64\`.
-  Set `INTEL_OPENVINO_DIR` to that directory before building.
-* **Tahoma source synced** to `C:\Users\cascadia\tahoma-rust\` (also at
-  `C:\tahoma\rust\` but that path is SAC-blocked — see below).
-
-### Hard blockers requiring user intervention
-
-These prevent the autonomous run from completing on-hardware e2e
-validation. Both alpha and charlie are **Windows 11 Home** with
-**Smart App Control** (SAC) enforced (Code Integrity status `2` on
-both). SAC blocks every unsigned `.exe` cargo produces in
-`target/debug/build/...` with `(os error 4551)` — including the
-`thiserror` and `getrandom` proc-macro build scripts that every Rust
-crate depends on.
-
-Tested paths that all hit the same SAC block:
-
-* Build under `C:\tahoma\rust\` — blocked.
-* Build under `C:\Users\cascadia\tahoma-rust\` — blocked.
-* `cargo check` (no link, just type-check) — also blocked because
-  proc-macro crates still need build-script execution.
-
-Possible fixes the user needs to choose:
-
-1. **Disable Smart App Control** on at least one AI PC.
-   *Caveat:* SAC is one-way. Once disabled it cannot be re-enabled
-   without reinstalling Windows. Settings → Privacy & security →
-   Windows Security → App & browser control → Smart App Control →
-   "Off". This is the **fastest unblock**.
-2. **Use WSL2** instead of native Windows. WSL Linux processes are
-   not subject to SAC. `Ubuntu-24.04` is registered on alpha but the
-   ext4 disk is missing (`HCS/ERROR_PATH_NOT_FOUND`); `wsl --install
-   -d Ubuntu-24.04` started but hit an `HCS_E_CONNECTION_TIMEOUT`
-   creating the VM. A Windows reboot typically clears that. After
-   reboot:
-   ```powershell
-   wsl --unregister Ubuntu-24.04
-   wsl --install -d Ubuntu-24.04
-   wsl -d Ubuntu-24.04 -- bash
-   # inside Ubuntu:
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-   ```
-   Then download the **Linux** OpenVINO 2026.1 archive (separate URL,
-   `openvino_genai_ubuntu24_2026.1.0.0_x86_64.tgz`) and build with
-   `--features openvino` from inside WSL.
-3. **Use a different machine** without SAC (any Windows 11 Pro/
-   Enterprise install, any Linux box).
-
-### Build command (once unblocked)
-
-```powershell
-$env:INTEL_OPENVINO_DIR = 'C:\tahoma\ov_genai_sdk\openvino_genai_windows_2026.1.0.0_x86_64'
-cd C:\Users\cascadia\tahoma-rust
-& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
-cargo build -p tahoma --release --features openvino
+# Node A (first stage + API):
+tahoma worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
+              --model ~/tahoma/llama-8b-2stage \
+              --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 5 \
+              --next 10.0.0.2:9100 --api :8000
 ```
 
-### Run (once built)
+OpenAI-compatible `/v1/chat/completions` endpoint with SSE streaming.
 
-```powershell
-.\target\release\tahoma.exe worker --rank 0 --total 1 `
-    --engine ov-genai --device GPU `
-    --model C:\cascadia\models\llama-3.1-8b-int4 `
-    --ov-cache-dir C:\cascadia\ov_cache_genai `
-    --api :8000
+### Single-node serving (no sharding)
+
+```bash
+tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
+              --model unsloth/Meta-Llama-3.1-8B-Instruct \
+              --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 5 \
+              --api :8000
 ```
 
-Once any of the unblock paths above is taken, the e2e validation
-(equivalent to the Python PR #2 e2e matrix) becomes scriptable from
-Mac via SSH.
+## Performance (on-hardware bench, May 2026)
 
-## Architectural notes
+Llama 3.1 8B Instruct INT4 on alpha (Battlemage Arc B390 dGPU, 12 GB) +
+charlie (Lunar Lake 140V iGPU) over Thunderbolt 4. Llama 3.2 1B INT4
+draft model. Numbers are tok/s, single trial each unless noted.
 
-* Workspace layout follows cascadia's "one concern per crate"
-  discipline (see `/Users/tatef/Workspaces/cascadia/Cargo.toml`).
-  `tahoma-types` plays the role cascadia's `cascadia-protocol` plays
-  (zero-dep wire/value types).
-* Trait bounds: `Engine` and `Builder` are `Send` (not `Sync`); Runner
-  wraps them in `parking_lot::Mutex` so the runner itself is `Sync`
-  and shareable across axum handlers via `Arc<Runner>`.
-* The OpenVINO C++ FFI shim defaults to **stub mode** (no link, runtime
-  errors only) so dev iteration on macOS / CI Linux without OpenVINO
-  installed stays fast. Real link is gated behind `--features openvino`.
-* Wire format for activation transport is **byte-identical to
-  `tahoma/worker/transport.py`** — Python and Rust ranks can interop
-  during the migration. dtype codes: 0=f32, 1=f16, 2=i8, 3=i32, 4=i64.
+| Engine | Workload | Tokens | tok/s |
+|--------|----------|-------:|------:|
+| `ov-genai` (single-node, no draft) | factual | 605 (EOS) | 20.83 |
+| `ov-genai` (single-node, FastDraft 150M K=5) | factual | 605 (EOS) | **28.04** |
+| `ov-genai` (single-node, 1B INT4 draft K=5) | factual | 605 (EOS) | 26.93 |
+| `ov-dist-spec` 2-stage (1B INT4 draft, K=5) | factual short | 256 | 18.90 |
+| `ov-dist-spec` 2-stage (1B INT4 draft, K=5) | factual long | 1024 | 23.85 |
+| `ov-dist-spec` 2-stage (1B INT4 draft, K=5) | **factual long-form** | **4096** | **29.62** |
+| `ov-dist-spec` 2-stage (1B INT4 draft, K=1) | factual short | 256 | 18.98 (+19% vs main pre-PR-#5) |
 
-## Phase 14 hardening — perf validation
+PR #5 added async overlap of the target wire round-trip with the draft
+compute step (`feed_send_async` / `feed_recv_async` + a speculative
+`draft.feed` during the network wait). Benefit ranges from +6% (K=5
+short prompts) to +19% (K=1) over the prior sequential implementation.
 
-Re-ran the distributed bench on alpha (rank 0, B390 GPU, FastDraft 150M) +
-charlie (rank 1, Lunar Lake 140V) over Thunderbolt 4 with the
-hardened `--release` build:
+### When distributed beats single-node
 
-| Metric | Pre-Phase-14 | Post-Phase-14 |
-|---|---:|---:|
-| Tokens generated | 64 | 64 |
-| Wall-clock | — | 2.226 s |
-| Acceptance rate | 0.83 | 0.83 |
-| **Throughput** | **~28-29 tok/s** | **28.75 tok/s** |
+Distributed `ov-dist-spec` (29.62 tok/s) beats the best single-node
+config (`ov-genai` + FastDraft 150M, 28.04 tok/s) only on **long-form
+generation** (≥ 1000 tokens). Below that, single-node wins because the
+per-round network coordination overhead doesn't amortize. See
+[experiments on the autolab branch](https://github.com/labscommunity/tahoma/tree/autolab/distributed-perf)
+for the full investigation.
 
-No measurable regression from the hardening. The hot-path additions
-(NaN-aware argmax, Rotary clamp, transport recv timeout wrapper,
-shim null checks) are all O(1) per call and well below the noise
-floor of single-token timing.
+## Recent changes
 
-## Security model (production hardening, Phase 14)
+* **PR #6 (`feat/standalone-sharding`, May 3, 2026)** — adds `tahoma
+  shard` subcommand, drops the rainier dependency. Generalized
+  exporter for Llama-family architectures. `ov-runtime` engine now
+  handles both v3 and v5 IR input layouts. New `docs/SHARDING.md`.
+* **PR #5 (`perf/dist-spec-async-overlap`, May 3, 2026)** — async
+  overlap of target wire with draft compute in `ov-dist-spec`. +9%
+  on long-form factual K=5, +19% on K=1. Per-task timing instrumentation
+  (`target_alpha_setup_ms`, `target_alpha_infer_ms`,
+  `target_alpha_output_ms`, `target_wire_ms`) added to the
+  `spec_decode timing` log line.
+* **PR #3 (`feat/rust-port`, May 2, 2026)** — Rust port of the
+  Python prototype landed and the Python tree was removed. Phase 14
+  hardening (security model below).
+
+## Tests
+
+`cargo test --workspace` on macOS — **49 passing, 0 failures.**
+
+Per-crate breakdown:
+
+| Crate | Tests |
+|---|---:|
+| `tahoma-types` | 13 |
+| `tahoma-topology` | 4 |
+| `tahoma-transport` | 5 |
+| `tahoma-engine-mock` | 4 |
+| `tahoma-ov-genai-shim` | 3 |
+| `tahoma-engine-openvino` | 5 |
+| `tahoma-runner` | 3 |
+| `tahoma-api` | 3 |
+| `tahoma-discovery` | 2 |
+| `tahoma-download` | 3 |
+| `tahoma-tests-e2e` | 2 |
+
+The e2e crate spawns the real `tahoma` binary, polls `/health`, and
+issues concurrent fan-out requests against the mock engine.
+
+## Build
+
+Two profiles:
+
+```bash
+# Stub mode (no OV link). Engines that need OV return a clean runtime error.
+cargo build --release -p tahoma
+
+# Real OV (Intel hardware). Requires the OpenVINO GenAI 2026.1 SDK download.
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
+  cargo build --release -p tahoma --features openvino
+```
+
+Binary at `target/release/tahoma` (`tahoma.exe` on Windows). Static
+apart from the OV dynamic libraries; copy the binary plus
+`INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and
+`runtime/3rdparty/tbb/bin/` to the worker host's PATH.
+
+## Security model
 
 Tahoma's network surface is designed for **trusted LAN deployment** —
 think a closet or rack of Intel AI PCs on an isolated subnet, not the
-public internet. The hardening in Phase 14 closes the worst failure
-modes (panics, OOM, crash on malformed input) but does **not** add
-authentication or transport encryption.
+public internet. The Phase 14 hardening (PR #3) closed the worst
+failure modes (panics, OOM, crash on malformed input) but does NOT
+add authentication or transport encryption.
 
 **What you get out of the box:**
 * HTTP API: 64 KiB request body cap, 32 KiB prompt cap, 16 concurrent
   request semaphore. Oversized prompt → 413; over-capacity → 503.
-  Unhandled engine errors no longer panic — they are mapped to 5xx.
-* Engine queue: defense-in-depth 256-task pending cap. `EngineError::QueueFull`
-  surfaces as 503 to the API caller.
-* TCP relay: 256 MiB cap on incoming tensor payloads, 64 KiB cap on
-  raw control-byte recvs, shape × dtype overflow check before alloc,
-  60 s read timeout on every recv. A wedged or hostile peer cannot
-  pin a worker thread forever or trick it into a multi-GB allocation.
-* C++ shim (`tahoma-ov-genai-shim`): null pointer guards on every
-  exported function, bounded property dictionaries (256 pairs max),
-  uniform `catch (...)` around every entry point so a C++ exception
-  cannot unwind into Rust UB, tensor-shape overflow check before
-  `set_input`. Tokenizer destroy added (no leak on `count_tokens`).
-* Numerics: `argmax` is now NaN-aware (warns rather than silently
-  returning token 0 on a broken forward pass). Rotary `compute()`
-  clamps `start` to 16 M positions and `seq_len` to 1 M tokens — no
-  i64/f32 silent overflow on adversarial inputs.
-* Registry (`tahoma-download`): atomic write (.tmp + fsync + rename),
-  reject symlink at registry path, 16 MiB file size cap, parse errors
-  are hard failures (not silent reset).
+  Engine errors map cleanly to 5xx (no panics).
+* Engine queue: 256-task pending cap; `EngineError::QueueFull` → 503.
+* TCP relay: 256 MiB cap on tensor payloads, 64 KiB cap on raw control
+  recvs, shape × dtype overflow check before alloc, 60 s read timeout
+  on every recv. Wedged or hostile peer can't pin a worker thread or
+  trigger a multi-GB allocation.
+* C++ shim: null pointer guards on every exported function, bounded
+  property dicts (256 pairs max), uniform `catch (...)` so C++
+  exceptions can't unwind into Rust UB, tensor-shape overflow check.
+* Numerics: NaN-aware `argmax` (warns instead of silently returning
+  token 0 on a broken forward pass). Rotary `compute()` clamps `start`
+  to 16 M positions and `seq_len` to 1 M tokens.
+* Registry (`tahoma-download`): atomic write (tmp + fsync + rename),
+  reject symlink at registry path, 16 MiB cap, parse errors are hard
+  failures.
 
 **What you do NOT get:**
-* No TLS — both the OpenAI-compatible HTTP API and the inter-stage
-  TCP relay are plaintext. Run only on a trusted network or behind
-  a TLS-terminating proxy.
-* No client authentication on the HTTP API. Anyone who can reach the
-  port can submit prompts.
-* No mDNS authentication. Any host on the same multicast domain can
-  publish a `_tahoma._tcp.local.` advertisement.
-* No supply-chain pinning beyond `Cargo.lock`. Audit dependencies
-  before any production rollout.
+* No TLS on either the HTTP API or the inter-stage TCP relay.
+* No client authentication on the HTTP API.
+* No mDNS authentication.
+* No supply-chain pinning beyond `Cargo.lock`.
 
-If you need to expose tahoma to an untrusted network, terminate TLS
-and apply auth (mTLS / OIDC / API key) at a reverse proxy in front
-of the `--api` port, and firewall the inter-stage TCP ports
-(`--listen` / `--next`) so only sibling worker hosts can reach them.
+For untrusted-network exposure: terminate TLS + auth at a reverse
+proxy in front of the `--api` port, firewall the inter-stage TCP ports
+(`--listen` / `--next`) so only sibling workers can reach them. The
+threat model and defense-in-depth limits are summarized in the
+binary's `--help` long_about.
 
-## Decoupling from cascadia
+Cascadia (the enterprise repo) is where multi-tenancy, auth, fault
+tolerance, and the rest of the production-grade story live. Tahoma's
+job is to be the hobbyist-friendly OSS substrate.
 
-Per the design constraint ("cascadia may depend on tahoma; tahoma may
-not depend on cascadia"):
+## Known limitations / not yet done
 
-* **No cascadia imports anywhere in the workspace.** Verified by grep.
-* Tahoma's crates have stable public APIs (no `pub(crate)` on items
-  that should be exported); cascadia could add tahoma crates as
-  Cargo dependencies in the future.
-* Specifically `tahoma-types`, `tahoma-topology`, `tahoma-transport`,
-  `tahoma-engine` are the most reusable surface — they encode patterns
-  cascadia's full-model-per-node design doesn't have today.
+In rough order of "how often this comes up":
+
+1. **mDNS auto-discovery is built but not wired** into the worker CLI.
+   `tahoma-discovery` advertises `_tahoma._tcp.local.` and populates
+   `tahoma-topology` (latency + bandwidth per edge), but `tahoma
+   worker` still requires explicit `--listen` / `--next host:port`. A
+   follow-up PR will let workers auto-resolve peers by node id.
+2. **No automatic placement** across discovered nodes. The operator
+   picks which rank goes where.
+3. **Pure-Rust exporter** would drop the Python pip-install
+   requirement for `tahoma shard`. Significant effort; deferred until
+   the supported-architecture set settles.
+4. **Tensor parallelism** (`tp_size > 1`) is in the type system but no
+   engine implements it — pure pipeline parallelism only.
+5. **No multi-tenant batching across requests.** Engines process one
+   task at a time. Concurrency happens at the API admission layer
+   (16-request semaphore) but not inside the engine. Acceptable for
+   the single-user OSS target; cascadia will own the batching story.
+6. **Mixtral / MoE export** is not supported by the bundled exporter
+   (the script assumes one MLP per layer). Llama / Mistral / Qwen2 /
+   Phi-3 / Gemma 2 cover most current OSS deployments.
+7. **NNCF can hang on tied-embedding INT4** (Llama 3.2 1B/3B). Workaround:
+   `--quantization fp16` (documented in SHARDING.md). Llama 3.1 8B and
+   most other production targets don't tie embeddings, so INT4 works
+   normally there.
+8. **Performance gap to optimum-intel ov-genai** on identical workloads
+   is ~5% in `--release` builds (single-node, single-stage). Acceptable
+   for the OSS target.
+
+## Architecture position
+
+Per the design constraint (cascadia may depend on tahoma; tahoma may
+not depend on cascadia):
+
+* No cascadia imports anywhere in the workspace.
+* Stable public APIs on the most-reusable crates (`tahoma-types`,
+  `tahoma-topology`, `tahoma-transport`, `tahoma-engine`).
+* The OpenVINO C++ FFI shim defaults to **stub mode** (no link, runtime
+  errors only) so dev iteration on macOS / CI Linux without OpenVINO
+  installed stays fast. Real link is gated behind `--features openvino`.
+* Wire format for activation transport is **byte-identical to the
+  removed Python prototype's `tahoma/worker/transport.py`** — Python
+  ranks could in principle still interop. dtype codes: 0=f32, 1=f16,
+  2=i8, 3=i32, 4=i64.
+
+## Where to look next
+
+* [README.md](../README.md) — quickstart and links
+* [docs/SHARDING.md](SHARDING.md) — the full sharding flow + arch table
+* [docs/engines/ov-dist-spec.md](engines/ov-dist-spec.md) — the
+  speculative-decode engine in depth (if present)
+* [docs/ARCHITECTURE.md](ARCHITECTURE.md) — workspace layout + crate
+  responsibilities
+* [docs/ROADMAP.md](ROADMAP.md) — what's coming
