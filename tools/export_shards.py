@@ -959,7 +959,17 @@ def main():
     model_dir = maybe_download(args.model)
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=False)
     arch_tag = detect_architecture(config)
-    rope_theta = float(getattr(config, "rope_theta", 500000.0))
+    # transformers 4.x exposes rope_theta directly; 5.x moved it under
+    # config.rope_parameters = {"rope_theta": ..., "rope_type": ...}.
+    # Handle both — wrong rope_theta gets silently baked into the traced
+    # rotary inv_freq buffer and produces garbage output at inference.
+    rope_theta_raw = getattr(config, "rope_theta", None)
+    if rope_theta_raw is None:
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        rope_theta_raw = rope_params.get("rope_theta")
+    if rope_theta_raw is None:
+        rope_theta_raw = 500000.0
+    rope_theta = float(rope_theta_raw)
 
     print(
         f"\nModel: {config.num_hidden_layers} layers,"
