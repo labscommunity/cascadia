@@ -74,6 +74,8 @@ def detect_architecture(config) -> str:
         return "llama"
     if "mistral" in model_type or "mistral" in arch_first:
         return "mistral"
+    if "qwen3" in model_type or "qwen3" in arch_first:
+        return "qwen3"
     if "qwen2" in model_type or "qwen2" in arch_first:
         return "qwen2"
     if "phi" in model_type or "phi" in arch_first:
@@ -102,6 +104,10 @@ def get_decoder_layer_cls(arch_tag: str):
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
         return Qwen2DecoderLayer
+    if arch_tag == "qwen3":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        return Qwen3DecoderLayer
     if arch_tag == "phi":
         # Phi-3 lives in transformers.models.phi3 in newer transformers
         try:
@@ -138,6 +144,10 @@ def get_norm_cls(arch_tag: str):
         from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
         return Qwen2RMSNorm
+    if arch_tag == "qwen3":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+        return Qwen3RMSNorm
     if arch_tag == "gemma":
         try:
             from transformers.models.gemma2.modeling_gemma2 import Gemma2RMSNorm
@@ -292,6 +302,13 @@ def cached_layer_forward_sdpa(
     q = q.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
     k = k.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
     v = v.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
+
+    # Some architectures (e.g. Qwen3) apply RMSNorm to Q/K before RoPE.
+    # RMSNorm operates on the last dim (head_dim), so post-transpose is equivalent.
+    if hasattr(layer.self_attn, "q_norm"):
+        q = layer.self_attn.q_norm(q)
+    if hasattr(layer.self_attn, "k_norm"):
+        k = layer.self_attn.k_norm(k)
 
     q, k = apply_rotary(q, k, cos, sin)
 
@@ -497,7 +514,9 @@ def build_wrapper(
 
     num_heads = config.num_attention_heads
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-    head_dim = config.hidden_size // num_heads
+    # Most LLMs have head_dim = hidden_size / num_heads, but Qwen3 (and some
+    # others) decouple them — config.head_dim is the source of truth when set.
+    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // num_heads)
 
     layers = []
     for i in range(layer_start, layer_end):
@@ -603,7 +622,7 @@ def export_single_stage(
     num_layers = layer_end - layer_start
     num_heads = config.num_attention_heads
     num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-    head_dim = config.hidden_size // num_heads
+    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // num_heads)
 
     print(f"\n{'=' * 60}", flush=True)
     print(
