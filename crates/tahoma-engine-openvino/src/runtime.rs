@@ -592,6 +592,28 @@ impl OvRuntimeEngine {
             });
         }
 
+        // Run the actual step in an inner method so we can catch any
+        // error and clear engine state. Without this, a single
+        // transport / OV-runtime failure leaves `self.active = Some(...)`
+        // and `self.position` stale; the next submit() pushes to pending
+        // but step_first's "if active.is_none()" gate is false, so the
+        // new task is never picked up — runner.poll_next sees empty
+        // steps and the API returns `data: [DONE]` with zero chunks.
+        let res = self.step_first_body();
+        if let Err(ref e) = res {
+            warn!(
+                error = %e,
+                "step_first failed; clearing active + reset_state so next \
+                 task starts fresh (downstream socket may still be dead)"
+            );
+            self.active = None;
+            let _ = self.runtime.reset_state();
+            self.position = 0;
+        }
+        res
+    }
+
+    fn step_first_body(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let active = match self.active.as_mut() {
             Some(a) => a,
             None => return Ok(Vec::new()),

@@ -8,12 +8,14 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
@@ -310,41 +312,76 @@ async fn stream_completion(
     let chunk_stream = match state.runner.generate(task) {
         Ok(s) => s,
         Err(err) => {
-            // Surface engine errors as 5xx; previously this was
-            // .expect("generate") which would panic the axum task and
-            // poison the connection.
             warn!(error = %err, "ov-stream: generate failed");
             return engine_error_response(err);
         }
     };
     // Move the permit into the stream so it's released only when the
-    // SSE stream is dropped (client disconnect or final chunk).
-    let mapped = StreamWithPermit {
+    // body is dropped (client disconnect or final chunk).
+    let permit_carrier = StreamWithPermit {
         inner: chunk_stream,
         _permit: permit,
-    }
-    .map(move |chunk| {
-        let payload = serde_json::json!({
-            "id": task_id,
-            "object": "chat.completion.chunk",
-            "created": now_unix(),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": chunk.text,
-                },
-                "finish_reason": if chunk.is_final { Some("stop") } else { None },
-            }],
-        });
-        Ok::<_, std::convert::Infallible>(Event::default().data(payload.to_string()))
-    });
-    let final_event = stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]".to_string()))
-    });
-    Sse::new(mapped.chain(final_event))
-        .keep_alive(KeepAlive::default())
+    };
+    // Format each chunk as a raw SSE frame `data: <json>\n\n` and send
+    // it as a one-byte-shy-of-MTU frame via `Body::from_stream`.
+    //
+    // Why raw bytes instead of `axum::response::sse::Sse`:
+    // `Sse::new(stream).keep_alive(KeepAlive::default())` wraps the
+    // stream in a KeepAlive forwarder that, per measurement at the
+    // raw-socket level, accumulates ~16 events (~3500 B) before the
+    // body framer flushes — so an audience watching the chat sees
+    // mega-bursts every ~1 s instead of one token at the engine's
+    // ~12 tok/s natural cadence. Going straight to `Body::from_stream`
+    // makes each chunk its own HTTP/1.1 chunked-encoding frame, which
+    // Hyper writes immediately (combined with TCP_NODELAY set on the
+    // accepted connection in tahoma-cli's serve loop, this lands the
+    // per-token chunk on the wire as a separate ~220 B packet).
+    let body_stream = permit_carrier
+        .then(move |chunk| {
+            let model = model.clone();
+            let task_id = task_id.clone();
+            async move {
+                let payload = serde_json::json!({
+                    "id": task_id,
+                    "object": "chat.completion.chunk",
+                    "created": now_unix(),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": chunk.text,
+                        },
+                        "finish_reason": if chunk.is_final { Some("stop") } else { None },
+                    }],
+                });
+                let line = format!("data: {payload}\n\n");
+                // Yield between chunks so the body-sink task can drain
+                // this frame to TCP. tahoma_runner::ChunkStream::poll_next
+                // calls engine.step() inside a parking_lot::Mutex, which
+                // blocks the tokio worker for ~80 ms per chunk without
+                // yielding. Without an explicit yield here, tokio's
+                // cooperative scheduling lets this task hog its worker
+                // for ~1 s at a time, and the per-chunk body writes
+                // accumulate in Hyper's buffer and flush as one ~3500 B
+                // burst — visible in the demo as 16 tokens at once
+                // every ~1 s. Yielding here lets the body sink run
+                // between chunks so each frame goes to TCP individually.
+                tokio::task::yield_now().await;
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from(line))
+            }
+        })
+        .chain(stream::once(async {
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+        }));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
         .into_response()
 }
 

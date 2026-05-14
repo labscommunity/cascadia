@@ -312,6 +312,64 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     }
 }
 
+/// Per-connection accept loop that calls `set_nodelay(true)` on every
+/// accepted stream and serves it via hyper directly. axum 0.7's
+/// `axum::serve(TcpListener, app)` doesn't expose any TCP_NODELAY
+/// hook (no `Listener` trait until axum 0.8), so we drive hyper
+/// ourselves. Per-token SSE chunks then arrive on the wire as
+/// individual ~220 B packets at the engine's natural ~12 tok/s
+/// cadence instead of being Nagle-aggregated into ~3500 B bursts
+/// every ~1 s — the original demo's bursty token feel was driven
+/// almost entirely by this default.
+async fn serve_with_nodelay(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+) -> Result<()> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use tower::Service;
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed; retrying after 50ms");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::warn!(error = %e, "set_nodelay failed on accepted stream");
+        }
+        let io = TokioIo::new(stream);
+        let app_for_conn = app.clone();
+        // Adapt axum::Router (a tower::Service<Request>) to a hyper
+        // service. We clone the router PER REQUEST inside the Fn
+        // closure (hyper's service_fn requires Fn, not FnMut, but
+        // tower::Service::call needs &mut self — clone is the cheap
+        // workaround since axum::Router is Arc-backed).
+        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut router = app_for_conn.clone();
+            let req = req.map(axum::body::Body::new);
+            let fut = router.call(req);
+            async move {
+                let res = fut.await;
+                Ok::<_, Infallible>(res.unwrap_or_else(|e: Infallible| match e {}))
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(io, svc)
+                .await
+            {
+                tracing::debug!(error = %e, "connection serve ended");
+            }
+        });
+    }
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -389,7 +447,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let app = tahoma_api::make_router(runner.clone(), args.model.clone());
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
         info!(host = %api_host, port = api_port, "API serving");
-        axum::serve(listener, app).await.context("axum serve")?;
+        // NODELAY-on-accept wrapper. tokio's TcpStream defaults to
+        // NODELAY=false (Nagle on); for SSE streaming small per-token
+        // chunks, Nagle aggregates them into ~3500 B bursts every
+        // ~1 s — the demo experiences this as bursty token arrival
+        // in the browser. Wrap the listener so every accepted stream
+        // gets set_nodelay(true). Per-event flush on the body side
+        // is in tahoma_api::stream_completion (Body::from_stream of
+        // raw bytes, not the axum::Sse wrapper which has its own
+        // KeepAlive batching).
+        serve_with_nodelay(listener, app)
+            .await
+            .context("serve_with_nodelay")?;
         return Ok(());
     }
 

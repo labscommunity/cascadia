@@ -22,6 +22,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -2181,6 +2181,7 @@ name = "tahoma-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "futures",
  "parking_lot",
@@ -2206,6 +2207,8 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "tahoma-api",
@@ -2216,6 +2219,7 @@ dependencies = [
  "tahoma-types",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
