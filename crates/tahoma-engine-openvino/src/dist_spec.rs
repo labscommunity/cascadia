@@ -1181,6 +1181,29 @@ pub fn spec_decode_greedy(
 
 // -------- Driver-side Engine + Builder --------
 
+/// In-flight spec-decode state. The whole spec_decode_greedy loop is
+/// rebuilt into a per-`step()` state machine so the engine emits one
+/// chunk per spec round (1 + accepted-drafts tokens at a time) instead
+/// of buffering all output and emitting one giant final chunk.
+struct ActiveSpec {
+    task: GenerationTask,
+    /// Accumulated accepted tokens (including the first sampled token).
+    out: Vec<i64>,
+    /// Cumulative byte-length of the detokenized text emitted so far.
+    /// Used to compute the streaming delta on each step.
+    last_text_len: usize,
+    /// Token id that became the "always-accepted" prefix for the next
+    /// verify call (i.e. the correction from the previous round, or
+    /// the first sampled token on the very first round).
+    prev_correction: i64,
+    /// Last draft logits (so we can argmax for the next round's first
+    /// draft without re-feeding draft).
+    d_last_logit: Vec<f32>,
+    stats: SpecDecodeStats,
+    /// Whether we already emitted the first sampled token's chunk.
+    initialized: bool,
+}
+
 pub struct OvDistSpecEngine {
     target: DistributedMaskedReq,
     draft: MaskedReq,
@@ -1190,7 +1213,7 @@ pub struct OvDistSpecEngine {
     eos_token_ids: Vec<u32>,
     k: usize,
     pending: Vec<GenerationTask>,
-    active: Option<(GenerationTask, Vec<i64>, String, SpecDecodeStats)>,
+    active: Option<ActiveSpec>,
 }
 
 impl Engine for OvDistSpecEngine {
@@ -1229,7 +1252,7 @@ impl Engine for OvDistSpecEngine {
             || self
                 .active
                 .as_ref()
-                .is_some_and(|(t, ..)| t.task_id == task.task_id)
+                .is_some_and(|s| s.task.task_id == task.task_id)
         {
             return Ok(());
         }
@@ -1249,70 +1272,258 @@ impl Engine for OvDistSpecEngine {
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
-        if self.active.is_none() && !self.pending.is_empty() {
+        // ---- Activate next pending task (one-time prompt feed + first sample).
+        if self.active.is_none() {
+            if self.pending.is_empty() {
+                return Vec::new();
+            }
             let task = self.pending.remove(0);
             let enc = match self.tokenizer.encode(task.prompt.clone(), false) {
                 Ok(e) => e,
                 Err(e) => {
                     warn!(error = %e, "tokenize failed");
-                    return Vec::new();
+                    let task_id = task.task_id.clone();
+                    return vec![(task_id, Chunk::final_marker(task.task_id, ""))];
                 }
             };
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-            info!(task = %task.task_id, prompt_tokens = prompt_ids.len(), k = self.k, "ov-dist-spec task active");
-            // Run the full spec decode loop in this single step (Python did the
-            // same — per-token streaming wasn't free either since drafts are
-            // generated per-round, not per-token).
-            let mut stats = SpecDecodeStats::default();
-            let max_tokens = task.max_tokens.max(1) as usize;
-            let result = spec_decode_greedy(
-                &mut self.target,
-                &mut self.draft,
-                &prompt_ids,
-                max_tokens,
-                self.k,
-                &mut stats,
+            info!(
+                task = %task.task_id,
+                prompt_tokens = prompt_ids.len(),
+                k = self.k,
+                "ov-dist-spec task active"
             );
+
             let task_id = task.task_id.clone();
-            match result {
+            match self.start_task(task, &prompt_ids) {
+                Ok(active) => self.active = Some(active),
                 Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "ov-dist-spec failed");
-                    let chunk = Chunk::final_marker(task.task_id, "");
-                    return vec![(task_id, chunk)];
-                }
-                Ok(tokens) => {
-                    // Truncate at first EOS token. spec_decode_greedy doesn't
-                    // know about EOS so it generates up to max_tokens; we drop
-                    // anything from the first EOS onward (including EOS itself
-                    // — clients shouldn't see special end-of-turn tokens).
-                    let truncated: Vec<i64> = match tokens.iter().position(|&t| {
-                        self.eos_token_ids.contains(&(t as u32))
-                    }) {
-                        Some(idx) => tokens[..idx].to_vec(),
-                        None => tokens,
-                    };
-                    let ids: Vec<u32> = truncated.iter().map(|&t| t as u32).collect();
-                    let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
-                    info!(
-                        task = %task.task_id,
-                        tokens = truncated.len(),
-                        steps = stats.n_steps,
-                        accept = stats.accept_rate(),
-                        "ov-dist-spec done"
-                    );
-                    let chunk = Chunk {
-                        task_id: task.task_id.clone(),
-                        token_id: 0,
-                        text,
-                        is_final: true,
-                        logprobs: None,
-                    };
-                    return vec![(task_id, chunk)];
+                    warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
+                    return vec![(task_id.clone(), Chunk::final_marker(task_id, ""))];
                 }
             }
         }
-        Vec::new()
+
+        // ---- Drive one spec round (or emit the first-token chunk).
+        let active = self.active.as_mut().expect("just-set above");
+        let task_id = active.task.task_id.clone();
+        let max_tokens = active.task.max_tokens.max(1) as usize;
+
+        // First step after init: emit a chunk for the first sampled token.
+        if !active.initialized {
+            active.initialized = true;
+            let new_text = decode_delta(&self.tokenizer, &active.out, &mut active.last_text_len);
+            // If the first token already hits max_tokens or EOS, finalize now.
+            let hit_eos = self.eos_token_ids.contains(&(active.out[0] as u32));
+            let finished = active.out.len() >= max_tokens || hit_eos;
+            if finished {
+                self.finish_task(task_id.clone(), new_text)
+            } else {
+                vec![(task_id, Chunk {
+                    task_id: active.task.task_id.clone(),
+                    token_id: active.out[0],
+                    text: new_text,
+                    is_final: false,
+                    logprobs: None,
+                })]
+            }
+        } else {
+            // Subsequent steps: do one full spec round.
+            match self.do_one_round(max_tokens) {
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
+                    self.finish_task(task_id, String::new())
+                }
+                Ok(RoundResult { delta, finished }) => {
+                    if finished {
+                        self.finish_task(task_id, delta)
+                    } else {
+                        let active_ref = self.active.as_ref().unwrap();
+                        let last_id = *active_ref.out.last().unwrap_or(&0);
+                        vec![(task_id.clone(), Chunk {
+                            task_id,
+                            token_id: last_id,
+                            text: delta,
+                            is_final: false,
+                            logprobs: None,
+                        })]
+                    }
+                }
+            }
+        }
     }
+}
+
+struct RoundResult {
+    delta: String,
+    finished: bool,
+}
+
+impl OvDistSpecEngine {
+    /// Initial setup for a new task: reset target+draft, feed the prompt,
+    /// sample the first token (always-accepted), and prime the draft for
+    /// the first round.
+    fn start_task(
+        &mut self,
+        task: GenerationTask,
+        prompt_ids: &[i64],
+    ) -> Result<ActiveSpec, EngineError> {
+        self.target.reset()?;
+        self.target.t_alpha_setup = std::time::Duration::ZERO;
+        self.target.t_alpha_infer = std::time::Duration::ZERO;
+        self.target.t_alpha_output = std::time::Duration::ZERO;
+        self.target.t_wire = std::time::Duration::ZERO;
+        self.draft.reset()?;
+
+        let (t_logits, t_shape) = self.target.feed(prompt_ids)?;
+        self.draft.feed(prompt_ids)?;
+        let vocab = t_shape[2];
+        let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
+
+        let (d_logits, d_shape) = self.draft.feed(&[first])?;
+        let dv = d_shape[2];
+        let d_last_logit = d_logits[d_logits.len() - dv..].to_vec();
+
+        Ok(ActiveSpec {
+            task,
+            out: vec![first],
+            last_text_len: 0,
+            prev_correction: first,
+            d_last_logit,
+            stats: SpecDecodeStats::default(),
+            initialized: false,
+        })
+    }
+
+    /// Run one spec round: generate K drafts → target verifies → emit
+    /// accepted tokens (truncated at EOS) → set up state for next round.
+    fn do_one_round(&mut self, max_tokens: usize) -> Result<RoundResult, EngineError> {
+        let active = self.active.as_mut().expect("active set");
+        active.stats.n_steps += 1;
+
+        // Generate K drafts greedily off the draft model.
+        let mut drafts: Vec<i64> = vec![argmax(&active.d_last_logit) as i64];
+        for _ in 1..self.k {
+            if active.out.len() + drafts.len() >= max_tokens {
+                break;
+            }
+            let prev = *drafts.last().unwrap();
+            let (l, sh) = self.draft.feed(&[prev])?;
+            let dv = sh[2];
+            drafts.push(argmax(&l[l.len() - dv..]) as i64);
+        }
+        let d_advanced = drafts.len() - 1;
+        active.stats.total_drafts += drafts.len() as u32;
+
+        // Target verifies [prev_correction, drafts...].
+        let mut verify = Vec::with_capacity(drafts.len() + 1);
+        verify.push(active.prev_correction);
+        verify.extend_from_slice(&drafts);
+        let (t_logits, t_shape) = self.target.feed(&verify)?;
+        let v = t_shape[2];
+        let mut t_greedy = Vec::with_capacity(verify.len());
+        for i in 0..verify.len() {
+            t_greedy.push(argmax(&t_logits[i * v..(i + 1) * v]) as i64);
+        }
+
+        // Greedy acceptance: accept consecutive matches.
+        let mut accepted = 0usize;
+        for i in 0..drafts.len() {
+            if t_greedy[i] == drafts[i] {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        active.stats.total_accepted += accepted as u32;
+
+        let correction = if accepted < drafts.len() {
+            t_greedy[accepted]
+        } else {
+            t_greedy[drafts.len()]
+        };
+
+        // Append [drafts[..accepted], correction] to out, but truncate at first EOS.
+        let mut hit_eos = false;
+        let mut hit_max = false;
+        for &t in drafts[..accepted].iter().chain(std::iter::once(&correction)) {
+            if active.out.len() >= max_tokens {
+                hit_max = true;
+                break;
+            }
+            if self.eos_token_ids.contains(&(t as u32)) {
+                hit_eos = true;
+                break;
+            }
+            active.out.push(t);
+        }
+
+        // Rewind any rejected drafts from the target's KV cache.
+        self.target.rewind(drafts.len() - accepted);
+
+        // Reconcile the draft's KV cache to match what the target accepted,
+        // then re-prime with the correction so next round's drafts continue
+        // from the right state.
+        if !hit_eos && !hit_max {
+            self.draft.rewind(d_advanced - accepted);
+            let (l, sh) = self.draft.feed(&[correction])?;
+            let dv = sh[2];
+            active.d_last_logit = l[l.len() - dv..].to_vec();
+            active.prev_correction = correction;
+        }
+
+        let delta = decode_delta(&self.tokenizer, &active.out, &mut active.last_text_len);
+        Ok(RoundResult {
+            delta,
+            finished: hit_eos || hit_max,
+        })
+    }
+
+    /// Drop the active task, log the spec-decode summary, and return a
+    /// final-marker chunk carrying the last text delta.
+    fn finish_task(&mut self, task_id: TaskId, last_delta: String) -> Vec<(TaskId, Chunk)> {
+        let Some(active) = self.active.take() else {
+            return vec![(task_id.clone(), Chunk::final_marker(task_id, last_delta))];
+        };
+        info!(
+            task = %active.task.task_id,
+            tokens = active.out.len(),
+            steps = active.stats.n_steps,
+            accept = active.stats.accept_rate(),
+            "ov-dist-spec done"
+        );
+        vec![(
+            task_id.clone(),
+            Chunk {
+                task_id,
+                token_id: *active.out.last().unwrap_or(&0),
+                text: last_delta,
+                is_final: true,
+                logprobs: None,
+            },
+        )]
+    }
+}
+
+/// Detokenize `tokens` and return only the text that's been added since
+/// the last call. `last_text_len` is updated in place to the new total
+/// byte length so the next call sees only the next delta.
+fn decode_delta(
+    tokenizer: &Tokenizer,
+    tokens: &[i64],
+    last_text_len: &mut usize,
+) -> String {
+    let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+    let full = tokenizer.decode(&ids, true).unwrap_or_default();
+    if full.len() <= *last_text_len {
+        // Detokenizer changed its mind about prefix bytes (rare but
+        // possible with BPE tokens). Just emit nothing this round; the
+        // next round will catch up.
+        return String::new();
+    }
+    let delta = full[*last_text_len..].to_string();
+    *last_text_len = full.len();
+    delta
 }
 
 pub struct OvDistSpecBuilder {
