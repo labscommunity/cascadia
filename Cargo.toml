@@ -9,6 +9,7 @@ members = [
     "crates/tahoma-ov-genai-shim",
     "crates/tahoma-engine-openvino",
     "crates/tahoma-engine-sparse-moe",
+    "crates/tahoma-int4-gemm",
     "crates/tahoma-runner",
     "crates/tahoma-discovery",
     "crates/tahoma-download",
@@ -35,6 +36,7 @@ tahoma-engine-mock = { path = "crates/tahoma-engine-mock" }
 tahoma-ov-genai-shim = { path = "crates/tahoma-ov-genai-shim" }
 tahoma-engine-openvino = { path = "crates/tahoma-engine-openvino" }
 tahoma-engine-sparse-moe = { path = "crates/tahoma-engine-sparse-moe" }
+tahoma-int4-gemm = { path = "crates/tahoma-int4-gemm" }
 tahoma-runner = { path = "crates/tahoma-runner" }
 tahoma-discovery = { path = "crates/tahoma-discovery" }
 tahoma-download = { path = "crates/tahoma-download" }

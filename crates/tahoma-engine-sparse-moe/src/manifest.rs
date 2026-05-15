@@ -41,6 +41,19 @@ pub struct Manifest {
     pub vocab_size: u32,
     /// EOS token IDs. Generation stops on any of these.
     pub eos_token_ids: Vec<u32>,
+    /// Expert dispatch backend. "ov_ir" (default) loads one OV-compiled
+    /// model per (layer, expert) and runs inference via the OpenVINO
+    /// CPU plugin. "int4_bin" mmap's a single flat binary per expert
+    /// matching the compressed-tensors on-disk format and runs the
+    /// tahoma-int4-gemm AVX-512 kernel directly. The int4_bin path
+    /// skips the ~5 ms OV per-call overhead and is ~6x faster on the
+    /// miner Xeon for tiny experts like K2.6's 2048×7168 MLPs.
+    #[serde(default = "default_experts_format")]
+    pub experts_format: String,
+}
+
+fn default_experts_format() -> String {
+    "ov_ir".to_string()
 }
 
 impl Manifest {
@@ -78,6 +91,15 @@ impl Manifest {
             .join(format!("layer_{:02}", lid))
             .join(format!("expert_{:03}", eid))
             .join("openvino_model.xml")
+    }
+
+    /// Path to one per-(layer, expert) flat int4 binary (for the
+    /// `experts_format = "int4_bin"` path).
+    pub fn expert_bin(&self, model_dir: &Path, lid: u32, eid: u32) -> PathBuf {
+        model_dir
+            .join("experts")
+            .join(format!("layer_{:02}", lid))
+            .join(format!("expert_{:03}.bin", eid))
     }
 
     /// Convenience: the list of MoE layer indices (everything not in dense_layers).

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use half::bf16;
+use tahoma_int4_gemm::{expert_forward as int4_expert_forward, ExpertWeights};
 use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
 use tracing::{debug, info};
@@ -100,8 +102,16 @@ impl LayerState {
     }
 }
 
-/// Lazy-load cache: compiled per-(layer, expert) IR.
-struct ExpertCache {
+/// Two-mode expert cache: either compiled OV IR per (layer, expert), or
+/// mmap'd flat int4 binaries served by the tahoma-int4-gemm AVX-512
+/// kernel. The mode is fixed at construction time based on the
+/// manifest's `experts_format` field.
+enum ExpertCache {
+    OvIr(OvIrExpertCache),
+    Int4Bin(Int4BinExpertCache),
+}
+
+struct OvIrExpertCache {
     model_dir: PathBuf,
     manifest_layer_xml: Box<dyn Fn(&PathBuf, u32, u32) -> PathBuf + Send>,
     device: String,
@@ -111,24 +121,16 @@ struct ExpertCache {
     compile_secs: f64,
 }
 
-impl ExpertCache {
-    fn new(
-        model_dir: PathBuf,
-        manifest_layer_xml: impl Fn(&PathBuf, u32, u32) -> PathBuf + Send + 'static,
-        device: String,
-        plugin: PluginConfig,
-    ) -> Self {
-        Self {
-            model_dir,
-            manifest_layer_xml: Box::new(manifest_layer_xml),
-            device,
-            plugin,
-            map: HashMap::new(),
-            compile_count: 0,
-            compile_secs: 0.0,
-        }
-    }
+struct Int4BinExpertCache {
+    model_dir: PathBuf,
+    manifest_layer_bin: Box<dyn Fn(&PathBuf, u32, u32) -> PathBuf + Send>,
+    /// Mmap'd expert weights — cheap to hold many of these since the OS
+    /// pages them in lazily, so we keep all (layer, expert) pairs we've
+    /// touched.
+    map: HashMap<(u32, u32), ExpertWeights>,
+}
 
+impl OvIrExpertCache {
     fn get(&mut self, lid: u32, eid: u32) -> Result<&mut Runtime, RunnerError> {
         let key = (lid, eid);
         if !self.map.contains_key(&key) {
@@ -143,6 +145,20 @@ impl ExpertCache {
             self.map.insert(key, rt);
         }
         Ok(self.map.get_mut(&key).unwrap())
+    }
+}
+
+impl Int4BinExpertCache {
+    fn get(&mut self, lid: u32, eid: u32) -> Result<&ExpertWeights, RunnerError> {
+        let key = (lid, eid);
+        if !self.map.contains_key(&key) {
+            let path = (self.manifest_layer_bin)(&self.model_dir, lid, eid);
+            let w = ExpertWeights::open(&path).map_err(|e| {
+                RunnerError::Internal(format!("open expert.bin {}: {}", path.display(), e))
+            })?;
+            self.map.insert(key, w);
+        }
+        Ok(self.map.get(&key).unwrap())
     }
 }
 
@@ -217,12 +233,38 @@ impl Runner {
         }
 
         let manifest_clone = manifest.clone();
-        let experts = ExpertCache::new(
-            model_dir.clone(),
-            move |md, lid, eid| manifest_clone.expert_xml(md, lid, eid),
-            device.to_string(),
-            plugin.clone(),
-        );
+        let experts = match manifest.experts_format.as_str() {
+            "int4_bin" => {
+                info!("expert backend: int4_bin (mmap + AVX-512 kernel)");
+                ExpertCache::Int4Bin(Int4BinExpertCache {
+                    model_dir: model_dir.clone(),
+                    manifest_layer_bin: Box::new(move |md, lid, eid| {
+                        manifest_clone.expert_bin(md, lid, eid)
+                    }),
+                    map: HashMap::new(),
+                })
+            }
+            other => {
+                if other != "ov_ir" {
+                    return Err(RunnerError::Internal(format!(
+                        "unknown experts_format {:?}; expected 'ov_ir' or 'int4_bin'",
+                        other
+                    )));
+                }
+                info!("expert backend: ov_ir (per-expert OV CPU plugin call)");
+                ExpertCache::OvIr(OvIrExpertCache {
+                    model_dir: model_dir.clone(),
+                    manifest_layer_xml: Box::new(move |md, lid, eid| {
+                        manifest_clone.expert_xml(md, lid, eid)
+                    }),
+                    device: device.to_string(),
+                    plugin: plugin.clone(),
+                    map: HashMap::new(),
+                    compile_count: 0,
+                    compile_secs: 0.0,
+                })
+            }
+        };
 
         Ok(Self {
             manifest,
@@ -234,6 +276,54 @@ impl Runner {
             layers,
             experts,
         })
+    }
+
+    /// Run one expert. Returns the f32 output vector (length = hidden_size).
+    /// `attn_row` is the f32 hidden state for one token (length =
+    /// hidden_size). Backend is chosen by the manifest's experts_format.
+    fn dispatch_expert(
+        &mut self,
+        lid: u32,
+        eid: u32,
+        attn_row: &[f32],
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        match &mut self.experts {
+            ExpertCache::OvIr(c) => {
+                let attn_bf16 = f32_to_bf16_bytes(attn_row);
+                let rt = c.get(lid, eid)?;
+                rt.set_input("x", DType::Bf16, &[1, 1, hidden], &attn_bf16)?;
+                rt.infer()?;
+                let (e_dt, _, e_bytes) = rt.output(0)?;
+                Ok(match e_dt {
+                    DType::F32 => read_f32(&e_bytes),
+                    DType::Bf16 => bf16_bytes_to_f32(&e_bytes),
+                    DType::F16 => f16_bytes_to_f32(&e_bytes),
+                    _ => {
+                        return Err(RunnerError::Internal(format!(
+                            "expert dtype {:?} not f32-castable",
+                            e_dt
+                        )))
+                    }
+                })
+            }
+            ExpertCache::Int4Bin(c) => {
+                let w = c.get(lid, eid)?;
+                let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+                let mut out_bf16 = vec![bf16::ZERO; hidden];
+                int4_expert_forward(
+                    &x_bf16,
+                    w.gate_packed_bytes(),
+                    w.gate_scale_bits(),
+                    w.up_packed_bytes(),
+                    w.up_scale_bits(),
+                    w.down_packed_bytes(),
+                    w.down_scale_bits(),
+                    &mut out_bf16,
+                );
+                Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+            }
+        }
     }
 
     /// Reset all per-layer KV caches. Call between independent generations.
@@ -429,25 +519,10 @@ impl Runner {
             let mut moe = vec![0.0f32; residual_f32.len()];
             for tok_idx in 0..tail_len {
                 let attn_row = &attn_out_f32[tok_idx * hidden..(tok_idx + 1) * hidden];
-                let attn_bf16 = f32_to_bf16_bytes(attn_row);
                 for k in 0..top_k {
                     let eid = routing_ids[tok_idx * top_k + k] as u32;
                     let w = routing_weights_f32[tok_idx * top_k + k];
-                    let rt = self.experts.get(lid, eid)?;
-                    rt.set_input("x", DType::Bf16, &[1, 1, hidden], &attn_bf16)?;
-                    rt.infer()?;
-                    let (e_dt, _e_shape, e_bytes) = rt.output(0)?;
-                    let y_f32 = match e_dt {
-                        DType::F32 => read_f32(&e_bytes),
-                        DType::Bf16 => bf16_bytes_to_f32(&e_bytes),
-                        DType::F16 => f16_bytes_to_f32(&e_bytes),
-                        _ => {
-                            return Err(RunnerError::Internal(format!(
-                                "expert output dtype {:?} not f32-castable",
-                                e_dt
-                            )));
-                        }
-                    };
+                    let y_f32 = self.dispatch_expert(lid, eid, attn_row)?;
                     let dst_off = tok_idx * hidden;
                     for j in 0..hidden {
                         moe[dst_off + j] += w * y_f32[j];
@@ -545,7 +620,10 @@ impl Runner {
                 step = step_i,
                 token = next,
                 elapsed_ms = t_step.elapsed().as_secs_f64() * 1000.0,
-                cached_experts = self.experts.map.len(),
+                cached_experts = match &self.experts {
+                    ExpertCache::OvIr(c) => c.map.len(),
+                    ExpertCache::Int4Bin(c) => c.map.len(),
+                },
                 "decode step"
             );
         }
