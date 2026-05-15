@@ -1185,7 +1185,9 @@ pub struct OvDistSpecEngine {
     target: DistributedMaskedReq,
     draft: MaskedReq,
     tokenizer: Arc<Tokenizer>,
-    eos_token_id: Option<u32>,
+    /// All EOS token ids configured for the model. Generation truncates
+    /// at the first token that matches ANY of these.
+    eos_token_ids: Vec<u32>,
     k: usize,
     pending: Vec<GenerationTask>,
     active: Option<(GenerationTask, Vec<i64>, String, SpecDecodeStats)>,
@@ -1279,11 +1281,21 @@ impl Engine for OvDistSpecEngine {
                     return vec![(task_id, chunk)];
                 }
                 Ok(tokens) => {
-                    let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+                    // Truncate at first EOS token. spec_decode_greedy doesn't
+                    // know about EOS so it generates up to max_tokens; we drop
+                    // anything from the first EOS onward (including EOS itself
+                    // — clients shouldn't see special end-of-turn tokens).
+                    let truncated: Vec<i64> = match tokens.iter().position(|&t| {
+                        self.eos_token_ids.contains(&(t as u32))
+                    }) {
+                        Some(idx) => tokens[..idx].to_vec(),
+                        None => tokens,
+                    };
+                    let ids: Vec<u32> = truncated.iter().map(|&t| t as u32).collect();
                     let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
                     info!(
                         task = %task.task_id,
-                        tokens = tokens.len(),
+                        tokens = truncated.len(),
                         steps = stats.n_steps,
                         accept = stats.accept_rate(),
                         "ov-dist-spec done"
@@ -1318,7 +1330,7 @@ pub struct OvDistSpecBuilder {
     stage0: Option<OvRuntime>,
     draft: Option<OvRuntime>,
     tokenizer: Option<Arc<Tokenizer>>,
-    eos_token_id: Option<u32>,
+    eos_token_ids: Vec<u32>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
 }
 
@@ -1342,7 +1354,7 @@ impl OvDistSpecBuilder {
             stage0: None,
             draft: None,
             tokenizer: None,
-            eos_token_id: None,
+            eos_token_ids: Vec::new(),
             downstream: None,
         }
     }
@@ -1445,8 +1457,12 @@ impl Builder for OvDistSpecBuilder {
             let tok = Tokenizer::from_file(&tok_path)
                 .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
             self.tokenizer = Some(Arc::new(tok));
-            self.eos_token_id = lookup_eos(&self.pipeline_dir.join("tokenizer"))
-                .or_else(|| lookup_eos(&self.pipeline_dir));
+            let eos_in_tok = lookup_eos(&self.pipeline_dir.join("tokenizer"));
+            self.eos_token_ids = if eos_in_tok.is_empty() {
+                lookup_eos(&self.pipeline_dir)
+            } else {
+                eos_in_tok
+            };
         } else {
             return Err(EngineError::Backend(format!(
                 "tokenizer.json not found at {tok_path:?}"
@@ -1482,7 +1498,7 @@ impl Builder for OvDistSpecBuilder {
             target,
             draft: masked_draft,
             tokenizer,
-            eos_token_id: self.eos_token_id,
+            eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
             pending: Vec::new(),
             active: None,
@@ -1978,20 +1994,26 @@ enum EosId {
     Many(Vec<u32>),
 }
 
-fn lookup_eos(model_dir: &std::path::Path) -> Option<u32> {
+/// Return ALL EOS token ids configured for the model. Mirrors the same
+/// fix applied to runtime.rs — Llama 3.x lists multiple EOS tokens
+/// (`<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`) and the chat-end one
+/// is usually the LAST entry. spec_decode_greedy itself doesn't check
+/// EOS (no parameter), so the caller (OvDistSpecEngine::step) truncates
+/// the returned token vector at the first match.
+fn lookup_eos(model_dir: &std::path::Path) -> Vec<u32> {
     for fname in ["generation_config.json", "config.json"] {
         let p = model_dir.join(fname);
         if let Ok(bytes) = std::fs::read(&p) {
             if let Ok(g) = serde_json::from_slice::<GenerationCfg>(&bytes) {
                 return match g.eos_token_id {
-                    Some(EosId::One(id)) => Some(id),
-                    Some(EosId::Many(ids)) => ids.first().copied(),
-                    None => None,
+                    Some(EosId::One(id)) => vec![id],
+                    Some(EosId::Many(ids)) => ids,
+                    None => Vec::new(),
                 };
             }
         }
     }
-    None
+    Vec::new()
 }
 
 #[cfg(test)]
