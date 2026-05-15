@@ -311,6 +311,19 @@ pub fn shell_forward_decode(
     }
 }
 
+/// Pub wrapper for use by `shell_int4`.
+pub fn rmsnorm_apply_pub(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
+    rmsnorm_apply(x, weight_bf16, dim)
+}
+
+pub fn rope_cos_sin_pub(pos: usize) -> (Vec<f32>, Vec<f32>) {
+    rope_cos_sin(pos)
+}
+
+pub fn apply_rope_kimi_pub(x: &[f32], cos: &[f32], sin: &[f32], out: &mut [f32]) {
+    apply_rope_kimi(x, cos, sin, out)
+}
+
 /// Apply RMSNorm with bf16 weights to an f32 vector, return f32.
 fn rmsnorm_apply(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
     assert_eq!(x.len(), dim);

@@ -119,6 +119,14 @@ pub struct TahomaShell {
     inner: SafetensorsShell,
 }
 
+/// Same data, but quantized to int4 + bf16 scales and heap-resident.
+/// Smaller working set (~77 MB/shell vs 295 MB), survives page cache
+/// eviction pressure.
+#[repr(C)]
+pub struct TahomaShellInt4 {
+    inner: crate::shell_int4::Int4Shell,
+}
+
 /// Load shell weights for layer `layer` from the source. Caller owns
 /// the handle and must free via `tahoma_int4_destroy_shell`.
 #[no_mangle]
@@ -165,6 +173,79 @@ pub unsafe extern "C" fn tahoma_int4_destroy_shell(h: *mut TahomaShell) {
 ///   present_v:          [NUM_HEADS * V_HEAD_DIM] f32  (seq=1 only)
 ///
 /// Returns 0 on success.
+/// Build an int4-quantized variant of one shell from the safetensors
+/// (read once, quantize on the fly, store in heap-resident buffers).
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_open_shell_int4(
+    handle: *mut TahomaInt4Source,
+    layer: u32,
+    out: *mut *mut TahomaShellInt4,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return -1;
+    }
+    let src = &(*handle).inner;
+    match src.shell(layer) {
+        Ok(s) => {
+            let q = crate::shell_int4::Int4Shell::from_safetensors(&s);
+            let boxed = Box::new(TahomaShellInt4 { inner: q });
+            *out = Box::into_raw(boxed);
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_destroy_shell_int4(h: *mut TahomaShellInt4) {
+    if h.is_null() {
+        return;
+    }
+    drop(Box::from_raw(h));
+}
+
+/// Run int4 shell forward.
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
+    shell: *mut TahomaShellInt4,
+    x_f32: *const f32,
+    past_k: *const f32,
+    past_v: *const f32,
+    past_seq_len: usize,
+    out_post_norm: *mut f32,
+    out_residual: *mut f32,
+    out_shared: *mut f32,
+    out_ids: *mut i64,
+    out_weights: *mut f32,
+    out_present_k: *mut f32,
+    out_present_v: *mut f32,
+) -> c_int {
+    if shell.is_null() {
+        return -1;
+    }
+    let s = &(*shell).inner;
+    let x = std::slice::from_raw_parts(x_f32, SHELL_HIDDEN);
+    let pk = std::slice::from_raw_parts(past_k, NUM_HEADS * past_seq_len * QK_HEAD_DIM);
+    let pv = std::slice::from_raw_parts(past_v, NUM_HEADS * past_seq_len * V_HEAD_DIM);
+    let ShellOutputs {
+        attn_out_post_norm,
+        attn_residual,
+        shared_expert_out,
+        routing_ids,
+        routing_weights,
+        present_k,
+        present_v,
+    } = crate::shell_int4::shell_forward_decode_int4(s, x, pk, pv, past_seq_len);
+    std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN).copy_from_slice(&attn_out_post_norm);
+    std::slice::from_raw_parts_mut(out_residual, SHELL_HIDDEN).copy_from_slice(&attn_residual);
+    std::slice::from_raw_parts_mut(out_shared, SHELL_HIDDEN).copy_from_slice(&shared_expert_out);
+    std::slice::from_raw_parts_mut(out_ids, TOPK).copy_from_slice(&routing_ids);
+    std::slice::from_raw_parts_mut(out_weights, TOPK).copy_from_slice(&routing_weights);
+    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM).copy_from_slice(&present_k);
+    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM).copy_from_slice(&present_v);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn tahoma_int4_shell_forward(
     shell: *mut TahomaShell,

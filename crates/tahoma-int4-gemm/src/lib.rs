@@ -33,6 +33,7 @@ pub mod kernel_avx512;
 pub mod kernel_bf16;
 pub mod safetensors_source;
 pub mod shell;
+pub mod shell_int4;
 
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
