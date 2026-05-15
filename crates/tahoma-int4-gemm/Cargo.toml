@@ -9,7 +9,9 @@ description = "Hand-rolled int4 GEMM for the K2.6 expert path — group-32 symme
 [dependencies]
 half = "2"
 memmap2 = "0.9"
+parking_lot = { workspace = true }
 rayon = "1"
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

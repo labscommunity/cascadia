@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use half::bf16;
-use tahoma_int4_gemm::{expert_forward as int4_expert_forward, ExpertWeights};
+use tahoma_int4_gemm::{
+    expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
+    SafetensorsExpertSource,
+};
 use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
 use tracing::{debug, info};
@@ -109,6 +112,7 @@ impl LayerState {
 enum ExpertCache {
     OvIr(OvIrExpertCache),
     Int4Bin(Int4BinExpertCache),
+    SafetensorsBin(SafetensorsExpertCache),
 }
 
 struct OvIrExpertCache {
@@ -128,6 +132,14 @@ struct Int4BinExpertCache {
     /// pages them in lazily, so we keep all (layer, expert) pairs we've
     /// touched.
     map: HashMap<(u32, u32), ExpertWeights>,
+}
+
+/// Variant that reads experts directly from the safetensors shards
+/// (`<model_dir>/safetensors/<shard>`) — no on-disk duplication.
+struct SafetensorsExpertCache {
+    source: SafetensorsExpertSource,
+    /// Cached SafetensorsExpert holders. Each pins its shard mmaps.
+    map: HashMap<(u32, u32), SafetensorsExpert>,
 }
 
 impl OvIrExpertCache {
@@ -244,10 +256,25 @@ impl Runner {
                     map: HashMap::new(),
                 })
             }
+            "safetensors_bin" => {
+                info!("expert backend: safetensors_bin (direct safetensors mmap + AVX-512)");
+                let st_dir = model_dir.join("safetensors");
+                let st_dir = if st_dir.exists() {
+                    st_dir
+                } else {
+                    model_dir.clone()
+                };
+                let source = SafetensorsExpertSource::open(st_dir)
+                    .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?;
+                ExpertCache::SafetensorsBin(SafetensorsExpertCache {
+                    source,
+                    map: HashMap::new(),
+                })
+            }
             other => {
                 if other != "ov_ir" {
                     return Err(RunnerError::Internal(format!(
-                        "unknown experts_format {:?}; expected 'ov_ir' or 'int4_bin'",
+                        "unknown experts_format {:?}; expected 'ov_ir', 'int4_bin', or 'safetensors_bin'",
                         other
                     )));
                 }
@@ -319,6 +346,29 @@ impl Runner {
                     w.up_scale_bits(),
                     w.down_packed_bytes(),
                     w.down_scale_bits(),
+                    &mut out_bf16,
+                );
+                Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+            }
+            ExpertCache::SafetensorsBin(c) => {
+                let key = (lid, eid);
+                if !c.map.contains_key(&key) {
+                    let e = c.source.expert(lid, eid).map_err(|e| {
+                        RunnerError::Internal(format!("safetensors expert {lid}/{eid}: {e}"))
+                    })?;
+                    c.map.insert(key, e);
+                }
+                let w = c.map.get(&key).unwrap();
+                let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+                let mut out_bf16 = vec![bf16::ZERO; hidden];
+                int4_expert_forward(
+                    &x_bf16,
+                    w.gate_packed,
+                    w.gate_scale,
+                    w.up_packed,
+                    w.up_scale,
+                    w.down_packed,
+                    w.down_scale,
                     &mut out_bf16,
                 );
                 Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
@@ -623,6 +673,7 @@ impl Runner {
                 cached_experts = match &self.experts {
                     ExpertCache::OvIr(c) => c.map.len(),
                     ExpertCache::Int4Bin(c) => c.map.len(),
+                    ExpertCache::SafetensorsBin(c) => c.map.len(),
                 },
                 "decode step"
             );

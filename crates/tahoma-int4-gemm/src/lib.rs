@@ -29,10 +29,12 @@
 pub mod format;
 pub mod kernel;
 pub mod kernel_avx512;
+pub mod safetensors_source;
 
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;
+pub use safetensors_source::{SafetensorsExpert, SafetensorsExpertSource};
 
 // Architecture constants for K2.6 — exposed as constants so the kernel
 // and the on-disk format agree.
