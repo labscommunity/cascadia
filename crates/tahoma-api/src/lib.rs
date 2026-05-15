@@ -272,6 +272,13 @@ fn render_prompt_with_template(
     use minijinja::{context, Environment, Error, ErrorKind};
 
     let mut env = Environment::new();
+    // HF chat templates were authored against transformers' Jinja2 env,
+    // which calls Python string methods (.startswith, .endswith, .strip,
+    // .split, .find, .replace, …). Minijinja doesn't ship those by
+    // default, so we install the pycompat unknown-method callback —
+    // Qwen3's template, for example, calls messages[0].role.startswith
+    // and would otherwise fail.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     // HF templates throw via raise_exception("...") on malformed input
     // (e.g. a system message after the first user message). We surface
     // the message as a render error so the caller can decide whether to
@@ -457,11 +464,17 @@ async fn stream_completion(
             let model = model.clone();
             let task_id = task_id.clone();
             async move {
+                // Custom (non-OpenAI) `n_tokens` field: how many model
+                // tokens this chunk carries. Spec-decode emits 1..=K+1
+                // tokens per chunk; downstream tok/s would be wrong if
+                // it counted chunks. Standard clients ignore unknown
+                // fields; our orchestrator reads it.
                 let payload = serde_json::json!({
                     "id": task_id,
                     "object": "chat.completion.chunk",
                     "created": now_unix(),
                     "model": model,
+                    "n_tokens": chunk.n_tokens.unwrap_or(1),
                     "choices": [{
                         "index": 0,
                         "delta": {

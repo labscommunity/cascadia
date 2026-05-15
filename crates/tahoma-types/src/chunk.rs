@@ -31,6 +31,13 @@ pub struct Chunk {
     /// Filled when the engine supports it AND the task asked for it.
     #[serde(default)]
     pub logprobs: Option<TokenLogprobs>,
+    /// Number of model tokens condensed into this chunk's `text`. Most
+    /// engines emit one token per chunk so this is None (consumers
+    /// treat None as 1). Spec-decode emits 1..=K+1 tokens per chunk
+    /// (one full spec round) and sets this so downstream tok/s metrics
+    /// don't undercount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_tokens: Option<u32>,
 }
 
 impl Chunk {
@@ -41,6 +48,7 @@ impl Chunk {
             text: text.into(),
             is_final: false,
             logprobs: None,
+            n_tokens: None,
         }
     }
 
@@ -51,6 +59,7 @@ impl Chunk {
             text: text.into(),
             is_final: true,
             logprobs: None,
+            n_tokens: None,
         }
     }
 }

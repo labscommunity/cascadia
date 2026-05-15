@@ -1317,7 +1317,7 @@ impl Engine for OvDistSpecEngine {
             let hit_eos = self.eos_token_ids.contains(&(active.out[0] as u32));
             let finished = active.out.len() >= max_tokens || hit_eos;
             if finished {
-                self.finish_task(task_id.clone(), new_text)
+                self.finish_task(task_id.clone(), new_text, 1)
             } else {
                 vec![(task_id, Chunk {
                     task_id: active.task.task_id.clone(),
@@ -1325,6 +1325,7 @@ impl Engine for OvDistSpecEngine {
                     text: new_text,
                     is_final: false,
                     logprobs: None,
+                    n_tokens: Some(1),
                 })]
             }
         } else {
@@ -1332,11 +1333,11 @@ impl Engine for OvDistSpecEngine {
             match self.do_one_round(max_tokens) {
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
-                    self.finish_task(task_id, String::new())
+                    self.finish_task(task_id, String::new(), 0)
                 }
-                Ok(RoundResult { delta, finished }) => {
+                Ok(RoundResult { delta, finished, n_tokens }) => {
                     if finished {
-                        self.finish_task(task_id, delta)
+                        self.finish_task(task_id, delta, n_tokens)
                     } else {
                         let active_ref = self.active.as_ref().unwrap();
                         let last_id = *active_ref.out.last().unwrap_or(&0);
@@ -1346,6 +1347,7 @@ impl Engine for OvDistSpecEngine {
                             text: delta,
                             is_final: false,
                             logprobs: None,
+                            n_tokens: Some(n_tokens),
                         })]
                     }
                 }
@@ -1357,6 +1359,10 @@ impl Engine for OvDistSpecEngine {
 struct RoundResult {
     delta: String,
     finished: bool,
+    /// How many model tokens this round added to `out`. Used to fill
+    /// Chunk::n_tokens so downstream tok/s metrics stay accurate when
+    /// each chunk carries multiple tokens (1..=K+1).
+    n_tokens: u32,
 }
 
 impl OvDistSpecEngine {
@@ -1444,6 +1450,7 @@ impl OvDistSpecEngine {
         };
 
         // Append [drafts[..accepted], correction] to out, but truncate at first EOS.
+        let out_len_before = active.out.len();
         let mut hit_eos = false;
         let mut hit_max = false;
         for &t in drafts[..accepted].iter().chain(std::iter::once(&correction)) {
@@ -1457,6 +1464,7 @@ impl OvDistSpecEngine {
             }
             active.out.push(t);
         }
+        let n_tokens_added = (active.out.len() - out_len_before) as u32;
 
         // Rewind any rejected drafts from the target's KV cache.
         self.target.rewind(drafts.len() - accepted);
@@ -1476,12 +1484,18 @@ impl OvDistSpecEngine {
         Ok(RoundResult {
             delta,
             finished: hit_eos || hit_max,
+            n_tokens: n_tokens_added,
         })
     }
 
     /// Drop the active task, log the spec-decode summary, and return a
-    /// final-marker chunk carrying the last text delta.
-    fn finish_task(&mut self, task_id: TaskId, last_delta: String) -> Vec<(TaskId, Chunk)> {
+    /// final-marker chunk carrying the last text delta + token count.
+    fn finish_task(
+        &mut self,
+        task_id: TaskId,
+        last_delta: String,
+        n_tokens: u32,
+    ) -> Vec<(TaskId, Chunk)> {
         let Some(active) = self.active.take() else {
             return vec![(task_id.clone(), Chunk::final_marker(task_id, last_delta))];
         };
@@ -1500,6 +1514,7 @@ impl OvDistSpecEngine {
                 text: last_delta,
                 is_final: true,
                 logprobs: None,
+                n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
             },
         )]
     }
