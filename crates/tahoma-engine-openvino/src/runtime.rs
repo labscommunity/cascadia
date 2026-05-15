@@ -94,20 +94,27 @@ enum EosId {
     Many(Vec<u32>),
 }
 
-fn lookup_eos(model_dir: &Path) -> Option<u32> {
+/// Return ALL EOS token ids configured for the model. Many recent
+/// instruct models (Llama 3.x, Qwen3, Gemma 2) list multiple EOS:
+/// `[<|end_of_text|>, <|eom_id|>, <|eot_id|>]` for Llama 3.3, for
+/// example. The chat-end token is usually the LAST entry, not the
+/// first — keeping only `ids.first()` made the model run past
+/// `<|eot_id|>` and start hallucinating fake "assistant\n\n…" turns.
+/// Caller stops generation if the next token matches any of these.
+fn lookup_eos(model_dir: &Path) -> Vec<u32> {
     for fname in ["generation_config.json", "config.json"] {
         let p = model_dir.join(fname);
         if let Ok(bytes) = std::fs::read(&p) {
             if let Ok(g) = serde_json::from_slice::<GenerationCfg>(&bytes) {
                 return match g.eos_token_id {
-                    Some(EosId::One(id)) => Some(id),
-                    Some(EosId::Many(ids)) => ids.first().copied(),
-                    None => None,
+                    Some(EosId::One(id)) => vec![id],
+                    Some(EosId::Many(ids)) => ids,
+                    None => Vec::new(),
                 };
             }
         }
     }
-    None
+    Vec::new()
 }
 
 // -------- helpers: bytes <-> typed slices --------
@@ -208,7 +215,9 @@ pub struct OvRuntimeEngine {
     rotary: Rotary,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
-    eos_token_id: Option<u32>,
+    /// All EOS token ids configured for the model. Generation stops on
+    /// the first token that matches ANY of these. See `lookup_eos`.
+    eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
@@ -678,10 +687,7 @@ impl OvRuntimeEngine {
         active.last_text = full_text;
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
-        let is_eos = self
-            .eos_token_id
-            .map(|eos| next_token as u32 == eos)
-            .unwrap_or(false);
+        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
         let is_final = active.generated.len() >= max_tokens || is_eos;
 
         let task_id = active.task.task_id.clone();
@@ -845,7 +851,7 @@ pub struct OvRuntimeBuilder {
     rotary: Option<Rotary>,
     hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
-    eos_token_id: Option<u32>,
+    eos_token_ids: Vec<u32>,
     input_names: Vec<String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
@@ -1012,11 +1018,15 @@ impl Builder for OvRuntimeBuilder {
                 let tok = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("tokenizer load: {e}")))?;
                 self.tokenizer = Some(Arc::new(tok));
-                self.eos_token_id =
-                    lookup_eos(&tokenizer_dir).or_else(|| lookup_eos(&self.pipeline_dir));
+                let eos_in_tok = lookup_eos(&tokenizer_dir);
+                self.eos_token_ids = if eos_in_tok.is_empty() {
+                    lookup_eos(&self.pipeline_dir)
+                } else {
+                    eos_in_tok
+                };
                 events.push(LoadProgress::message(format!(
-                    "tokenizer loaded; eos_token_id={:?}",
-                    self.eos_token_id
+                    "tokenizer loaded; eos_token_ids={:?}",
+                    self.eos_token_ids
                 )));
             } else {
                 events.push(LoadProgress::message(format!(
@@ -1066,7 +1076,7 @@ impl Builder for OvRuntimeBuilder {
             rotary,
             hidden_size: self.hidden_size,
             tokenizer: self.tokenizer,
-            eos_token_id: self.eos_token_id,
+            eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
