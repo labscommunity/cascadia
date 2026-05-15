@@ -456,6 +456,7 @@ pub enum DType {
     I8 = 2,
     I32 = 3,
     I64 = 4,
+    Bf16 = 5,
 }
 
 impl DType {
@@ -465,13 +466,14 @@ impl DType {
             2 => Self::I8,
             3 => Self::I32,
             4 => Self::I64,
+            5 => Self::Bf16,
             _ => Self::F32,
         }
     }
     pub fn bytes_per_element(&self) -> usize {
         match self {
             Self::F32 | Self::I32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::Bf16 => 2,
             Self::I8 => 1,
             Self::I64 => 8,
         }
