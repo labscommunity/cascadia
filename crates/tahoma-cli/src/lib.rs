@@ -444,7 +444,28 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
 
     if let Some(api_addr) = &args.api {
         let (api_host, api_port) = parse_addr(api_addr, "0.0.0.0")?;
-        let app = tahoma_api::make_router(runner.clone(), args.model.clone());
+        // Read the model's HF chat_template + bos/eos tokens at startup
+        // so /v1/chat/completions can render multi-turn prompts in the
+        // exact format the model was trained on. Falls back gracefully
+        // to the legacy "role: content" join if the file or fields are
+        // missing.
+        let chat_template = tahoma_api::load_chat_template_config(std::path::Path::new(&args.model));
+        if chat_template.template.is_some() {
+            info!(
+                model = %args.model,
+                bos = chat_template.bos_token.is_some(),
+                eos = chat_template.eos_token.is_some(),
+                "loaded chat_template from tokenizer_config.json"
+            );
+        } else {
+            info!(
+                model = %args.model,
+                "no chat_template found; /v1/chat/completions will use legacy formatting"
+            );
+        }
+        let mut cfg = tahoma_api::Config::default();
+        cfg.chat_template = chat_template;
+        let app = tahoma_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
         info!(host = %api_host, port = api_port, "API serving");
         // NODELAY-on-accept wrapper. tokio's TcpStream defaults to

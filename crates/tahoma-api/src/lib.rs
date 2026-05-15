@@ -51,6 +51,20 @@ pub struct AppState {
     pub model_id: String,
     pub permits: Arc<Semaphore>,
     pub max_prompt_bytes: usize,
+    /// Optional Jinja2 chat template (from tokenizer_config.json's
+    /// `chat_template` field). When set, /v1/chat/completions renders
+    /// messages through it; when None, falls back to the legacy
+    /// "role: content\n…" join.
+    pub chat_template: Option<Arc<str>>,
+    pub bos_token: Arc<str>,
+    pub eos_token: Arc<str>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChatTemplateConfig {
+    pub template: Option<String>,
+    pub bos_token: Option<String>,
+    pub eos_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +72,7 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub max_concurrent_requests: usize,
     pub max_prompt_bytes: usize,
+    pub chat_template: ChatTemplateConfig,
 }
 
 impl Default for Config {
@@ -66,7 +81,40 @@ impl Default for Config {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+            chat_template: ChatTemplateConfig::default(),
         }
+    }
+}
+
+/// Read tokenizer_config.json from the shard's `tokenizer/` subdir and
+/// extract the chat_template + bos/eos token strings. Returns Default
+/// (all None) if any step fails — the caller falls back to the legacy
+/// "role: content" formatting in that case. Some HF tokenizer configs
+/// store special tokens as objects ({"content": "...", ...}) rather than
+/// strings; both shapes are handled.
+pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
+    let p = model_dir.join("tokenizer").join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&p) else {
+        return ChatTemplateConfig::default();
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return ChatTemplateConfig::default();
+    };
+    let template = v
+        .get("chat_template")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_owned());
+    let extract_token = |key: &str| -> Option<String> {
+        let val = v.get(key)?;
+        if let Some(s) = val.as_str() {
+            return Some(s.to_owned());
+        }
+        val.get("content").and_then(|c| c.as_str()).map(|s| s.to_owned())
+    };
+    ChatTemplateConfig {
+        template,
+        bos_token: extract_token("bos_token"),
+        eos_token: extract_token("eos_token"),
     }
 }
 
@@ -86,6 +134,9 @@ pub fn make_router_with_config(
         model_id: model_id.into(),
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
         max_prompt_bytes: cfg.max_prompt_bytes,
+        chat_template: cfg.chat_template.template.map(Arc::from),
+        bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
+        eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
     };
     Router::new()
         .route("/health", get(health))
@@ -191,9 +242,11 @@ fn now_unix() -> i64 {
     Utc::now().timestamp()
 }
 
-fn render_prompt(messages: &[ChatMessage]) -> String {
-    // Minimal chat formatting — caller's model is expected to accept the
-    // raw concatenation. Matches the Python "no chat template" engines.
+/// Last-resort formatting when no chat template is available. Matches
+/// the Python "no chat template" engines and what tahoma shipped pre-
+/// minijinja. Coherent on permissive base models, brittle on instruct
+/// models that expect their own prompt format.
+fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
     let mut buf = String::new();
     for m in messages {
         if !buf.is_empty() {
@@ -206,12 +259,75 @@ fn render_prompt(messages: &[ChatMessage]) -> String {
     buf
 }
 
+/// Render messages through the model's HF Jinja2 chat_template. Returns
+/// Err on any template parse/render error so the caller can fall back to
+/// [`render_prompt_legacy`] rather than fail the request entirely.
+fn render_prompt_with_template(
+    template_src: &str,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+) -> Result<String, String> {
+    use minijinja::value::Value;
+    use minijinja::{context, Environment, Error, ErrorKind};
+
+    let mut env = Environment::new();
+    // HF templates throw via raise_exception("...") on malformed input
+    // (e.g. a system message after the first user message). We surface
+    // the message as a render error so the caller can decide whether to
+    // fall back; either way the request shouldn't 500.
+    env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
+        Err(Error::new(ErrorKind::InvalidOperation, msg))
+    });
+    // Some templates (Llama 3) call strftime_now() to embed the current
+    // date in the system prompt. We don't actually need a real date for
+    // inference correctness — a fixed empty string is a safe stand-in.
+    env.add_function("strftime_now", |_fmt: String| -> String { String::new() });
+
+    env.add_template("chat", template_src)
+        .map_err(|e| format!("template parse: {e}"))?;
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| format!("template lookup: {e}"))?;
+
+    let messages_value: Vec<Value> = messages
+        .iter()
+        .map(|m| {
+            Value::from_serialize(&serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+            }))
+        })
+        .collect();
+
+    let ctx = context! {
+        messages => messages_value,
+        add_generation_prompt => true,
+        bos_token => bos_token,
+        eos_token => eos_token,
+    };
+
+    tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+}
+
+fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
+    if let Some(tmpl) = &state.chat_template {
+        match render_prompt_with_template(tmpl, messages, &state.bos_token, &state.eos_token) {
+            Ok(s) => return s,
+            Err(e) => {
+                warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+            }
+        }
+    }
+    render_prompt_legacy(messages)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(&req.messages);
+    let prompt = render_prompt(&state, &req.messages);
     if prompt.len() > state.max_prompt_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,

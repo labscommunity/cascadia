@@ -23,6 +23,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
