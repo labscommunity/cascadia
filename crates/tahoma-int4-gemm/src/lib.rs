@@ -26,10 +26,13 @@
 //! and [`expert_forward`] runs the full silu(gate*x) ⊙ up*x → down*y
 //! pipeline.
 
+pub mod c_ffi;
 pub mod format;
 pub mod kernel;
 pub mod kernel_avx512;
+pub mod kernel_bf16;
 pub mod safetensors_source;
+pub mod shell;
 
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};

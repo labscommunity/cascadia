@@ -105,6 +105,109 @@ pub unsafe extern "C" fn tahoma_int4_prewarm(
 
 static SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ---- Shell forward C-FFI ---------------------------------------------------
+
+use crate::shell::{
+    shell_forward_decode, ShellOutputs, HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM,
+    TOPK, V_HEAD_DIM,
+};
+use crate::safetensors_source::SafetensorsShell;
+
+/// Holds one layer's shell weights pinned to its safetensors mmaps.
+#[repr(C)]
+pub struct TahomaShell {
+    inner: SafetensorsShell,
+}
+
+/// Load shell weights for layer `layer` from the source. Caller owns
+/// the handle and must free via `tahoma_int4_destroy_shell`.
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_open_shell(
+    handle: *mut TahomaInt4Source,
+    layer: u32,
+    out: *mut *mut TahomaShell,
+) -> c_int {
+    if handle.is_null() || out.is_null() {
+        return -1;
+    }
+    let src = &(*handle).inner;
+    match src.shell(layer) {
+        Ok(s) => {
+            let boxed = Box::new(TahomaShell { inner: s });
+            *out = Box::into_raw(boxed);
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_destroy_shell(h: *mut TahomaShell) {
+    if h.is_null() {
+        return;
+    }
+    drop(Box::from_raw(h));
+}
+
+/// Run one shell forward (decode, seq=1). Caller provides:
+///   x_f32:      [HIDDEN] f32 layer input
+///   past_k:     [NUM_HEADS * past_seq_len * QK_HEAD_DIM] f32
+///   past_v:     [NUM_HEADS * past_seq_len * V_HEAD_DIM] f32
+///   past_seq_len: usize
+///
+/// And output buffers:
+///   attn_out_post_norm: [HIDDEN] f32
+///   attn_residual:      [HIDDEN] f32
+///   shared_expert_out:  [HIDDEN] f32
+///   routing_ids:        [TOPK=8] i64
+///   routing_weights:    [TOPK=8] f32
+///   present_k:          [NUM_HEADS * QK_HEAD_DIM] f32 (seq=1 only)
+///   present_v:          [NUM_HEADS * V_HEAD_DIM] f32  (seq=1 only)
+///
+/// Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn tahoma_int4_shell_forward(
+    shell: *mut TahomaShell,
+    x_f32: *const f32,
+    past_k: *const f32,
+    past_v: *const f32,
+    past_seq_len: usize,
+    out_post_norm: *mut f32,
+    out_residual: *mut f32,
+    out_shared: *mut f32,
+    out_ids: *mut i64,
+    out_weights: *mut f32,
+    out_present_k: *mut f32,
+    out_present_v: *mut f32,
+) -> c_int {
+    if shell.is_null() {
+        return -1;
+    }
+    let s = &(*shell).inner;
+    let x = std::slice::from_raw_parts(x_f32, SHELL_HIDDEN);
+    let pk = std::slice::from_raw_parts(past_k, NUM_HEADS * past_seq_len * QK_HEAD_DIM);
+    let pv = std::slice::from_raw_parts(past_v, NUM_HEADS * past_seq_len * V_HEAD_DIM);
+    let ShellOutputs {
+        attn_out_post_norm,
+        attn_residual,
+        shared_expert_out,
+        routing_ids,
+        routing_weights,
+        present_k,
+        present_v,
+    } = shell_forward_decode(s, x, pk, pv, past_seq_len);
+
+    std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)
+        .copy_from_slice(&attn_out_post_norm);
+    std::slice::from_raw_parts_mut(out_residual, SHELL_HIDDEN).copy_from_slice(&attn_residual);
+    std::slice::from_raw_parts_mut(out_shared, SHELL_HIDDEN).copy_from_slice(&shared_expert_out);
+    std::slice::from_raw_parts_mut(out_ids, TOPK).copy_from_slice(&routing_ids);
+    std::slice::from_raw_parts_mut(out_weights, TOPK).copy_from_slice(&routing_weights);
+    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM).copy_from_slice(&present_k);
+    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM).copy_from_slice(&present_v);
+    0
+}
+
 /// Run one expert. Caller provides x_f32 (HIDDEN floats) and an output
 /// buffer (HIDDEN floats). Returns 0 on success.
 #[no_mangle]

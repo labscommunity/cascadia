@@ -22,3 +22,7 @@ thiserror = { workspace = true }
 [[bench]]
 name = "expert_gemm"
 harness = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+

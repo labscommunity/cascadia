@@ -239,3 +239,105 @@ pub struct SafetensorsExpert {
 
 unsafe impl Send for SafetensorsExpert {}
 unsafe impl Sync for SafetensorsExpert {}
+
+impl SafetensorsExpertSource {
+    /// Generic tensor lookup: returns raw bytes for any named tensor in
+    /// the model. Useful for fetching shell weights (attention,
+    /// layernorm, router, shared expert) which aren't expert-indexed.
+    pub fn tensor_bytes(&self, tensor_name: &str) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
+        self.slice(tensor_name)
+    }
+}
+
+/// One shell's weights for layer L. All bf16 except for one f32 bias
+/// (`gate_correction_bias`). The Arc shards in `_pins` keep the
+/// safetensors mmaps alive while these slices are in use.
+pub struct SafetensorsShell {
+    _pins: Vec<Arc<Shard>>,
+    pub layer: u32,
+
+    /// `input_layernorm.weight` — bf16 [hidden].
+    pub input_norm: &'static [u8],
+    /// `self_attn.q_a_proj.weight` — bf16 [q_lora_rank=1536, hidden=7168].
+    pub q_a_proj: &'static [u8],
+    /// `self_attn.q_a_layernorm.weight` — bf16 [q_lora_rank].
+    pub q_a_norm: &'static [u8],
+    /// `self_attn.q_b_proj.weight` — bf16 [heads*qk_head_dim, q_lora_rank].
+    pub q_b_proj: &'static [u8],
+    /// `self_attn.kv_a_proj_with_mqa.weight` — bf16 [kv_lora_rank+qk_rope, hidden].
+    pub kv_a_proj: &'static [u8],
+    /// `self_attn.kv_a_layernorm.weight` — bf16 [kv_lora_rank=512].
+    pub kv_a_norm: &'static [u8],
+    /// `self_attn.kv_b_proj.weight` — bf16 [heads*(qk_nope+v_head), kv_lora_rank].
+    pub kv_b_proj: &'static [u8],
+    /// `self_attn.o_proj.weight` — bf16 [hidden, heads*v_head].
+    pub o_proj: &'static [u8],
+
+    /// `post_attention_layernorm.weight` — bf16 [hidden].
+    pub post_norm: &'static [u8],
+
+    /// `mlp.gate.weight` — bf16 [n_routed_experts=384, hidden].
+    pub router_weight: &'static [u8],
+    /// `mlp.gate.e_score_correction_bias` — f32 [n_routed_experts].
+    pub router_bias: &'static [u8],
+
+    /// `mlp.shared_experts.gate_proj.weight` — bf16 [intermediate=2048, hidden].
+    pub shared_gate: &'static [u8],
+    /// `mlp.shared_experts.up_proj.weight` — bf16 [intermediate, hidden].
+    pub shared_up: &'static [u8],
+    /// `mlp.shared_experts.down_proj.weight` — bf16 [hidden, intermediate].
+    pub shared_down: &'static [u8],
+}
+
+unsafe impl Send for SafetensorsShell {}
+unsafe impl Sync for SafetensorsShell {}
+
+impl SafetensorsExpertSource {
+    /// Fetch one layer's shell tensors. Mmaps the relevant safetensors
+    /// shards lazily (with internal caching).
+    pub fn shell(&self, layer: u32) -> Result<SafetensorsShell, GemmError> {
+        let base = format!("language_model.model.layers.{layer}");
+        let names: [&str; 14] = [
+            "input_layernorm.weight",
+            "self_attn.q_a_proj.weight",
+            "self_attn.q_a_layernorm.weight",
+            "self_attn.q_b_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_a_layernorm.weight",
+            "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate.weight",
+            "mlp.gate.e_score_correction_bias",
+            "mlp.shared_experts.gate_proj.weight",
+            "mlp.shared_experts.up_proj.weight",
+            "mlp.shared_experts.down_proj.weight",
+        ];
+        let mut pins = Vec::with_capacity(names.len());
+        let mut slices: [&'static [u8]; 14] = [&[]; 14];
+        for (i, suf) in names.iter().enumerate() {
+            let full = format!("{}.{}", base, suf);
+            let (shard, bytes) = self.slice(&full)?;
+            pins.push(shard);
+            slices[i] = bytes;
+        }
+        Ok(SafetensorsShell {
+            _pins: pins,
+            layer,
+            input_norm: slices[0],
+            q_a_proj: slices[1],
+            q_a_norm: slices[2],
+            q_b_proj: slices[3],
+            kv_a_proj: slices[4],
+            kv_a_norm: slices[5],
+            kv_b_proj: slices[6],
+            o_proj: slices[7],
+            post_norm: slices[8],
+            router_weight: slices[9],
+            router_bias: slices[10],
+            shared_gate: slices[11],
+            shared_up: slices[12],
+            shared_down: slices[13],
+        })
+    }
+}
