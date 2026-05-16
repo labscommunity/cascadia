@@ -1,6 +1,6 @@
-# Tahoma
-
-[![ci](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml/badge.svg)](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml)
+<p align="center">
+  <img src="docs/assets/logo.jpg" alt="Tahoma" width="520">
+</p>
 
 > Run any model on Intel hardware.
 
@@ -8,9 +8,9 @@ Tahoma distributes LLM inference across Intel laptops, desktops, and AI PCs. Sha
 
 ## Status
 
-**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime. Four engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`. Intel Arc-only Xeon CPU-only nodes are on the roadmap.
+[![ci](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml/badge.svg)](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml)
 
-The Rust port is the only implementation as of 2026-05-02. The earlier Python prototype was removed at the end of Phase 12.
+**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime at the worker. Four engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
 
 ## Why Tahoma
 
@@ -116,14 +116,14 @@ See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key crates:
 
 Per-engine guides:
 
+- [ov-genai](docs/engines/ov-genai.md) — single-stage `openvino_genai.LLMPipeline`; FastDraft + Prompt Lookup
 - [ov-runtime](docs/engines/ov-runtime.md) — multi-stage stateful KV cache
 - [ov-dist-spec](docs/engines/ov-dist-spec.md) — multi-stage spec with mask-based rewind
 
 ## Cluster
 
-- Auto-discovery: `--discover` (mDNS) advertises this node and browses for siblings in the same `TAHOMA_NAMESPACE`.
-- Master election: lowest-lexicographic node id in a namespace wins; no explicit messaging.
-- Tensor parallelism: foundation only — see [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
+- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. mDNS auto-discovery is implemented as a library (`tahoma-discovery` advertises `_tahoma._tcp.local.` and populates the topology graph with measured per-link latency + bandwidth) but is not yet wired into the `tahoma worker` CLI — see [docs/STATUS.md](docs/STATUS.md) "Known limitations".
+- **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
 
 ## Deploying
 
