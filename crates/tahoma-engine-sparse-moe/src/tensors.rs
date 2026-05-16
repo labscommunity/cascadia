@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn bf16_roundtrip() {
-        let xs = vec![0.0_f32, 1.0, -1.5, 3.14, -42.7];
+        let xs = vec![0.0_f32, 1.0, -1.5, 3.125, -42.7];
         let bytes = f32_to_bf16_bytes(&xs);
         assert_eq!(bytes.len(), xs.len() * 2);
         let back = bf16_bytes_to_f32(&bytes);
