@@ -159,11 +159,13 @@ impl Engine for SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        let started = std::time::Instant::now();
         let prompt_ids: Vec<i64> = match self.tokenizer.encode(task.prompt.as_str(), true) {
             Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                return Vec::new();
+                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                return vec![(task.task_id, final_chunk)];
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
@@ -178,15 +180,31 @@ impl Engine for SparseMoEEngine {
             Ok(g) => g,
             Err(e) => {
                 warn!(task = %task.task_id, "runner failed: {e}");
-                return Vec::new();
+                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                return vec![(task.task_id, final_chunk)];
             }
         };
+        let n_tokens = generated.len() as u32;
         let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
-        let text = self
+        let mut text = self
             .tokenizer
             .decode(&ids_u32, true)
             .unwrap_or_else(|_| String::new());
-        let chunk = Chunk::final_marker(task.task_id.clone(), text);
+        // The HF tokenizer's decoder doesn't echo the prompt, but a
+        // chat-template-prepended encode would. Strip defensively.
+        if let Some(stripped) = text.strip_prefix(&task.prompt) {
+            text = stripped.trim_start().to_string();
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        info!(
+            task = %task.task_id,
+            tokens = n_tokens,
+            elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            "task done"
+        );
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
+        chunk.n_tokens = Some(n_tokens);
         vec![(task.task_id.clone(), chunk)]
     }
 }
