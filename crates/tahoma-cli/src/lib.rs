@@ -316,10 +316,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
         }
         EngineKind::SparseMoe => {
-            if args.total != 1 {
-                return Err(anyhow!("sparse-moe is single-stage only; use --total 1"));
-            }
-            let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device);
+            let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
+                .with_rank(args.rank, args.total);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }

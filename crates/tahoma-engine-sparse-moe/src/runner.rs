@@ -174,24 +174,58 @@ impl Int4BinExpertCache {
     }
 }
 
+/// Per-rank slice of the model the Runner should hold.
+///
+/// `layer_start..layer_end` is the half-open range of *MoE layer ids*
+/// (1-based, matching the manifest convention) this Runner is
+/// responsible for. The dense layer 0 is implicit and tracked
+/// separately via `is_first` (only rank 0 needs it).
+#[derive(Clone, Debug)]
+pub struct LayerRange {
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub is_first: bool,
+    pub is_last: bool,
+}
+
+impl LayerRange {
+    /// Range that loads everything — single-stage default.
+    pub fn full() -> Self {
+        Self {
+            layer_start: 0,
+            layer_end: u32::MAX,
+            is_first: true,
+            is_last: true,
+        }
+    }
+}
+
 /// Main inference runner.
 pub struct Runner {
     pub manifest: Manifest,
     _model_dir: PathBuf,
     _device: String,
     _plugin: PluginConfig,
-    layer0: Runtime,
-    head: Runtime,
+    pub range: LayerRange,
+    layer0: Option<Runtime>,
+    head: Option<Runtime>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
 }
 
 impl Runner {
-    /// Compile all shells + layer0 + head. Experts are loaded lazily.
+    /// Compile only the layers + head + layer0 needed for this rank.
+    ///
+    /// Single-stage callers can pass `LayerRange::full()` to keep the
+    /// pre-pipeline-parallel behavior. Distributed callers pass a
+    /// range covering just their stage's layers, with `is_first` /
+    /// `is_last` set accordingly — non-first stages skip layer 0
+    /// compilation; non-last stages skip the head.
     pub fn load(
         model_dir: PathBuf,
         device: &str,
         plugin: PluginConfig,
+        range: LayerRange,
     ) -> Result<Self, RunnerError> {
         let manifest = Manifest::load(&model_dir)?;
         info!(
@@ -199,6 +233,10 @@ impl Runner {
             num_layers = manifest.num_layers,
             num_experts = manifest.num_experts,
             top_k = manifest.top_k,
+            layer_start = range.layer_start,
+            layer_end = range.layer_end,
+            is_first = range.is_first,
+            is_last = range.is_last,
             "loading sparse-MoE model"
         );
 
@@ -208,23 +246,45 @@ impl Runner {
                 .ok_or_else(|| RunnerError::Internal(format!("non-UTF-8 path: {}", p.display())))
         };
 
-        let layer0_xml = manifest.layer0_xml(&model_dir);
-        if !layer0_xml.exists() {
-            return Err(RunnerError::MissingFile(layer0_xml));
-        }
-        let layer0 = Runtime::compile(&utf8(&layer0_xml)?, device, &plugin)?;
-        info!("compiled layer 0 (stateless embed+dense)");
+        let layer0 = if range.is_first {
+            let layer0_xml = manifest.layer0_xml(&model_dir);
+            if !layer0_xml.exists() {
+                return Err(RunnerError::MissingFile(layer0_xml));
+            }
+            let rt = Runtime::compile(&utf8(&layer0_xml)?, device, &plugin)?;
+            info!("compiled layer 0 (stateless embed+dense)");
+            Some(rt)
+        } else {
+            info!("skipping layer 0 (not first stage)");
+            None
+        };
 
-        let head_xml = manifest.head_xml(&model_dir);
-        if !head_xml.exists() {
-            return Err(RunnerError::MissingFile(head_xml));
-        }
-        let head = Runtime::compile(&utf8(&head_xml)?, device, &plugin)?;
-        info!("compiled head (RMSNorm + lm_head)");
+        let head = if range.is_last {
+            let head_xml = manifest.head_xml(&model_dir);
+            if !head_xml.exists() {
+                return Err(RunnerError::MissingFile(head_xml));
+            }
+            let rt = Runtime::compile(&utf8(&head_xml)?, device, &plugin)?;
+            info!("compiled head (RMSNorm + lm_head)");
+            Some(rt)
+        } else {
+            info!("skipping head (not last stage)");
+            None
+        };
 
-        let moe_layer_ids = manifest.moe_layer_ids();
-        let mut layers = Vec::with_capacity(moe_layer_ids.len());
-        for (i, &lid) in moe_layer_ids.iter().enumerate() {
+        let all_moe_ids = manifest.moe_layer_ids();
+        let in_range: Vec<u32> = all_moe_ids
+            .iter()
+            .copied()
+            .filter(|&lid| lid >= range.layer_start && lid < range.layer_end)
+            .collect();
+        info!(
+            "this rank holds {} MoE layers (of {} total)",
+            in_range.len(),
+            all_moe_ids.len()
+        );
+        let mut layers = Vec::with_capacity(in_range.len());
+        for (i, &lid) in in_range.iter().enumerate() {
             let xml = manifest.shell_xml(&model_dir, lid);
             if !xml.exists() {
                 return Err(RunnerError::MissingFile(xml));
@@ -237,8 +297,8 @@ impl Runner {
                 manifest.qk_head_dim,
                 manifest.v_head_dim,
             )?);
-            if (i + 1) % 10 == 0 || i + 1 == moe_layer_ids.len() {
-                info!("compiled shells {}/{}", i + 1, moe_layer_ids.len());
+            if (i + 1) % 10 == 0 || i + 1 == in_range.len() {
+                info!("compiled shells {}/{}", i + 1, in_range.len());
             }
         }
 
@@ -296,6 +356,7 @@ impl Runner {
             _model_dir: model_dir,
             _device: device.to_string(),
             _plugin: plugin,
+            range,
             layer0,
             head,
             layers,
@@ -388,7 +449,9 @@ impl Runner {
     /// - `full_ids` is the FULL prefix-so-far (1D i64), used by stateless
     ///   layer 0.
     /// - The shells consume just the trailing `tail_len` tokens, with the
-    ///   per-layer KV state representing the prior `past_seq_len = full_ids.len - tail_len` tokens.
+    ///   per-layer KV state representing the prior
+    ///   `past_seq_len = full_ids.len - tail_len` tokens.
+    ///
     /// Returns the FP32 logits for the last position (`vocab_size` elements).
     fn step(&mut self, full_ids: &[i64], tail_len: usize) -> Result<Vec<f32>, RunnerError> {
         if tail_len == 0 || tail_len > full_ids.len() {
@@ -400,17 +463,43 @@ impl Runner {
         }
         let past_seq_len = full_ids.len() - tail_len;
         let hidden = self.manifest.hidden_size as usize;
-        let top_k = self.manifest.top_k as usize;
 
-        // 1) Layer 0 (stateless): hidden out for the full prefix.
+        // 1) Layer 0 (stateless) → tail of hidden state.
+        let h_f32 = self.embed_layer0_tail(full_ids, tail_len)?;
+        let h_shape = vec![1usize, tail_len, hidden];
+
+        // 2) Run all my shells.
+        let h_f32 = self.forward_shells(&h_f32, &h_shape, past_seq_len)?;
+
+        // 3) Head on the LAST token.
+        self.forward_head_last(&h_f32, tail_len)
+    }
+
+    /// Run layer 0 on the full prefix and return only the trailing
+    /// `tail_len` rows. First-stage only.
+    pub fn embed_layer0_tail(
+        &mut self,
+        full_ids: &[i64],
+        tail_len: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        if tail_len == 0 || tail_len > full_ids.len() {
+            return Err(RunnerError::Internal(format!(
+                "invalid tail_len {}, full_ids.len={}",
+                tail_len,
+                full_ids.len()
+            )));
+        }
+        let layer0 = self
+            .layer0
+            .as_mut()
+            .ok_or_else(|| RunnerError::Internal("embed_layer0 on non-first stage".into()))?;
         let ids_bytes = i64_to_bytes(full_ids);
         let ids_shape = [1usize, full_ids.len()];
-        let input_name = self.layer0.input_name(0)?;
-        self.layer0
-            .set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
-        self.layer0.infer()?;
-        let (l0_dtype, l0_shape, l0_bytes) = self.layer0.output(0)?;
-        // l0_shape: [1, full_ids.len(), 7168]
+        let input_name = layer0.input_name(0)?;
+        layer0.set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
+        layer0.infer()?;
+        let (l0_dtype, l0_shape, l0_bytes) = layer0.output(0)?;
         if l0_shape.len() != 3
             || l0_shape[0] != 1
             || l0_shape[1] != full_ids.len()
@@ -432,19 +521,36 @@ impl Runner {
                 )))
             }
         };
-        // Slice the last `tail_len` positions.
-        let row_off = past_seq_len * hidden;
-        let mut h_f32 = l0_f32[row_off..].to_vec();
-        let mut h_shape = vec![1usize, tail_len, hidden];
+        let row_off = (full_ids.len() - tail_len) * hidden;
+        Ok(l0_f32[row_off..].to_vec())
+    }
 
-        // 2) Each MoE shell + experts.
+    /// Forward `tail_len` tokens through the shells this rank owns.
+    /// `h_f32` is the input hidden state shaped `[1, tail_len, hidden]`
+    /// (row-major). Returns the same shape after this rank's MoE
+    /// layers, with per-layer KV cache updated.
+    pub fn forward_shells(
+        &mut self,
+        h_in: &[f32],
+        h_shape: &[usize],
+        past_seq_len: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        let top_k = self.manifest.top_k as usize;
+        if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[2] != hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells: unexpected hidden shape {:?}",
+                h_shape
+            )));
+        }
+        let tail_len = h_shape[1];
+        let mut h_f32 = h_in.to_vec();
+        let mut h_shape = h_shape.to_vec();
+
         let (mask_f32, mask_shape) = causal_mask_f32(tail_len, past_seq_len);
         let mask_bytes = f32_to_bytes(&mask_f32);
         let past_len_bytes = (past_seq_len as i64).to_le_bytes().to_vec();
 
-        // We need to iterate layers in order; for each, compile or
-        // reuse expert IRs. The `experts` cache borrow-conflicts with
-        // the &mut self.layers borrow, so do them by index.
         let n_layers = self.layers.len();
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
@@ -564,14 +670,37 @@ impl Runner {
             h_shape = vec![1, tail_len, hidden];
         }
 
-        // 3) Head on the LAST token.
+        let _ = h_shape;
+        Ok(h_f32)
+    }
+
+    /// Take the last position of `h_f32` (shape `[1, tail_len, hidden]`,
+    /// row-major) and run the head IR. Returns the vocab-sized logits
+    /// at that position. Last-stage only.
+    pub fn forward_head_last(
+        &mut self,
+        h_f32: &[f32],
+        tail_len: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        if tail_len == 0 || h_f32.len() < tail_len * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_head_last: tail_len={} h.len={} hidden={}",
+                tail_len,
+                h_f32.len(),
+                hidden
+            )));
+        }
+        let head = self
+            .head
+            .as_mut()
+            .ok_or_else(|| RunnerError::Internal("forward_head on non-last stage".into()))?;
         let last_off = (tail_len - 1) * hidden;
         let last_h_bf16 = f32_to_bf16_bytes(&h_f32[last_off..last_off + hidden]);
-        let head_in = self.head.input_name(0)?;
-        self.head
-            .set_input(&head_in, DType::Bf16, &[1, 1, hidden], &last_h_bf16)?;
-        self.head.infer()?;
-        let (head_dt, head_shape, head_bytes) = self.head.output(0)?;
+        let head_in = head.input_name(0)?;
+        head.set_input(&head_in, DType::Bf16, &[1, 1, hidden], &last_h_bf16)?;
+        head.infer()?;
+        let (head_dt, head_shape, head_bytes) = head.output(0)?;
         if head_shape.last() != Some(&(self.manifest.vocab_size as usize)) {
             return Err(RunnerError::Internal(format!(
                 "head output shape {:?} doesn't end with vocab_size {}",
@@ -693,16 +822,4 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_le_bytes(a));
     }
     out
-}
-
-fn argmax(xs: &[f32]) -> i64 {
-    let mut best = 0i64;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in xs.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i as i64;
-        }
-    }
-    best
 }
