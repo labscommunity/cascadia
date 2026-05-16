@@ -67,11 +67,12 @@ static constexpr size_t MAX_GENERATED_TEXT_BYTES = 64 * 1024 * 1024;
 // silently using the wrong dtype (which would produce garbage output).
 ov::element::Type dtype_from_code(uint32_t code) {
     switch (code) {
-        case TAHOMA_DTYPE_F32: return ov::element::f32;
-        case TAHOMA_DTYPE_F16: return ov::element::f16;
-        case TAHOMA_DTYPE_I8:  return ov::element::i8;
-        case TAHOMA_DTYPE_I32: return ov::element::i32;
-        case TAHOMA_DTYPE_I64: return ov::element::i64;
+        case TAHOMA_DTYPE_F32:  return ov::element::f32;
+        case TAHOMA_DTYPE_F16:  return ov::element::f16;
+        case TAHOMA_DTYPE_I8:   return ov::element::i8;
+        case TAHOMA_DTYPE_I32:  return ov::element::i32;
+        case TAHOMA_DTYPE_I64:  return ov::element::i64;
+        case TAHOMA_DTYPE_BF16: return ov::element::bf16;
         default:
             throw std::invalid_argument(
                 "unknown dtype code in dtype_from_code");
@@ -79,10 +80,11 @@ ov::element::Type dtype_from_code(uint32_t code) {
 }
 
 uint32_t code_from_dtype(const ov::element::Type& t) {
-    if (t == ov::element::f16) return TAHOMA_DTYPE_F16;
-    if (t == ov::element::i8)  return TAHOMA_DTYPE_I8;
-    if (t == ov::element::i32) return TAHOMA_DTYPE_I32;
-    if (t == ov::element::i64) return TAHOMA_DTYPE_I64;
+    if (t == ov::element::f16)  return TAHOMA_DTYPE_F16;
+    if (t == ov::element::i8)   return TAHOMA_DTYPE_I8;
+    if (t == ov::element::i32)  return TAHOMA_DTYPE_I32;
+    if (t == ov::element::i64)  return TAHOMA_DTYPE_I64;
+    if (t == ov::element::bf16) return TAHOMA_DTYPE_BF16;
     return TAHOMA_DTYPE_F32;
 }
 

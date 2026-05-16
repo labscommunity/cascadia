@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

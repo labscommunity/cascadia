@@ -144,12 +144,13 @@ int32_t tahoma_runtime_output_name_all(
     char* out_buf, size_t out_cap, size_t* out_len);
 
 /// Element type codes — keep in sync with tahoma-transport's DType.
-/// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64.
-#define TAHOMA_DTYPE_F32 0u
-#define TAHOMA_DTYPE_F16 1u
-#define TAHOMA_DTYPE_I8  2u
-#define TAHOMA_DTYPE_I32 3u
-#define TAHOMA_DTYPE_I64 4u
+/// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64, 5 = bf16.
+#define TAHOMA_DTYPE_F32  0u
+#define TAHOMA_DTYPE_F16  1u
+#define TAHOMA_DTYPE_I8   2u
+#define TAHOMA_DTYPE_I32  3u
+#define TAHOMA_DTYPE_I64  4u
+#define TAHOMA_DTYPE_BF16 5u
 
 /// Bind an input tensor by name. `shape` is `rank` element counts (no
 /// padding); `data` is row-major raw bytes whose total length must equal
