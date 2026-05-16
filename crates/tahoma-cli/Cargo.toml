@@ -8,13 +8,17 @@ description = "tahoma CLI — clap-based, mirrors the Python `python -m tahoma w
 
 [features]
 default = []
-openvino = ["tahoma-engine-openvino/openvino"]
+openvino = [
+    "tahoma-engine-openvino/openvino",
+    "tahoma-engine-sparse-moe/openvino",
+]
 
 [dependencies]
 tahoma-types = { workspace = true }
 tahoma-engine = { workspace = true }
 tahoma-engine-mock = { workspace = true }
 tahoma-engine-openvino = { workspace = true }
+tahoma-engine-sparse-moe = { workspace = true }
 tahoma-runner = { workspace = true }
 tahoma-api = { workspace = true }
 tokio = { workspace = true }

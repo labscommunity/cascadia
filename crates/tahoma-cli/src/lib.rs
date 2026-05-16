@@ -15,6 +15,7 @@ use tahoma_engine_mock::MockBuilder;
 use tahoma_engine_openvino::{
     OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
 };
+use tahoma_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use tahoma_runner::Runner;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use tracing::info;
@@ -57,6 +58,10 @@ pub enum EngineKind {
     OvGenai,
     OvRuntime,
     OvDistSpec,
+    /// Kimi K2.6-style sparse-MoE engine. Routes only the top-k experts
+    /// per token (not all 384) and runs the expert matmuls through the
+    /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
+    SparseMoe,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -214,6 +219,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
+    println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
     Ok(())
 }
 
@@ -308,6 +314,16 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 }
                 Ok(Box::new(b))
             }
+        }
+        EngineKind::SparseMoe => {
+            if args.total != 1 {
+                return Err(anyhow!("sparse-moe is single-stage only; use --total 1"));
+            }
+            let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device);
+            if let Some(dir) = &args.ov_cache_dir {
+                cfg.cache_dir = Some(dir.clone());
+            }
+            Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }
 }
