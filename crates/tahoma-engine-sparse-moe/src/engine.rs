@@ -80,7 +80,8 @@ impl Builder for SparseMoEBuilder {
         let plugin_for_worker = plugin.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
-            tx.send(LoadProgress::message("loading sparse-MoE model")).ok();
+            tx.send(LoadProgress::message("loading sparse-MoE model"))
+                .ok();
             Runner::load(cfg.model_dir.clone(), &cfg.device, plugin_for_worker)
         });
 
@@ -99,9 +100,8 @@ impl Builder for SparseMoEBuilder {
         // BPEs would need a converter; out of scope here.)
         let tok_path = self.config.model_dir.join("tokenizer.json");
         if tok_path.exists() {
-            let t = Tokenizer::from_file(&tok_path).map_err(|e| {
-                EngineError::Backend(format!("load tokenizer.json: {e}"))
-            })?;
+            let t = Tokenizer::from_file(&tok_path)
+                .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?;
             self.tokenizer = Some(t);
         } else {
             warn!(

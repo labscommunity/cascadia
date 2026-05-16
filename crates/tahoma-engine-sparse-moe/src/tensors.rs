@@ -179,7 +179,12 @@ mod tests {
         let back = bf16_bytes_to_f32(&bytes);
         // bf16 has ~7-bit mantissa; allow generous tolerance.
         for (a, b) in xs.iter().zip(back.iter()) {
-            assert!((a - b).abs() <= a.abs() * 0.01 + 0.01, "roundtrip {} -> {}", a, b);
+            assert!(
+                (a - b).abs() <= a.abs() * 0.01 + 0.01,
+                "roundtrip {} -> {}",
+                a,
+                b
+            );
         }
     }
 
@@ -189,8 +194,7 @@ mod tests {
         // b: [1, 2, 3, 1] of i8 — values 10,11,12,13,14,15
         let a = vec![0u8, 1, 2, 3];
         let b = vec![10u8, 11, 12, 13, 14, 15];
-        let (out, shape) =
-            concat_along_axis(&a, &[1, 2, 2, 1], &b, &[1, 2, 3, 1], 2, 1);
+        let (out, shape) = concat_along_axis(&a, &[1, 2, 2, 1], &b, &[1, 2, 3, 1], 2, 1);
         // Expected layout: [batch=1][heads=2][seq=5][head=1]
         // head 0: a[0,1] + b[0,1,2] = 0,1,10,11,12
         // head 1: a[2,3] + b[3,4,5] = 2,3,13,14,15

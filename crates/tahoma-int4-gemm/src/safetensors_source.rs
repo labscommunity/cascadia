@@ -64,10 +64,16 @@ impl Shard {
         }
         let json_bytes = &mmap[8..8 + header_len];
         let json: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
-            GemmError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("safetensors json parse: {e}")))
+            GemmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("safetensors json parse: {e}"),
+            ))
         })?;
         let map = json.as_object().ok_or_else(|| {
-            GemmError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "safetensors json not object"))
+            GemmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "safetensors json not object",
+            ))
         })?;
         let mut tensors = HashMap::with_capacity(map.len());
         for (k, v) in map {
@@ -132,7 +138,10 @@ impl SafetensorsExpertSource {
         let idx_path = model_dir.join("model.safetensors.index.json");
         let idx_bytes = std::fs::read(&idx_path)?;
         let idx: serde_json::Value = serde_json::from_slice(&idx_bytes).map_err(|e| {
-            GemmError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("safetensors index json parse: {e}")))
+            GemmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("safetensors index json parse: {e}"),
+            ))
         })?;
         let weight_map = idx
             .get("weight_map")
@@ -169,7 +178,9 @@ impl SafetensorsExpertSource {
         // Race: another thread may insert it; tolerated.
         let path = self.model_dir.join(shard_name);
         let s = Arc::new(Shard::open(&path)?);
-        self.shards.write().insert(shard_name.clone(), Arc::clone(&s));
+        self.shards
+            .write()
+            .insert(shard_name.clone(), Arc::clone(&s));
         Ok(s)
     }
 
@@ -244,7 +255,10 @@ impl SafetensorsExpertSource {
     /// Generic tensor lookup: returns raw bytes for any named tensor in
     /// the model. Useful for fetching shell weights (attention,
     /// layernorm, router, shared expert) which aren't expert-indexed.
-    pub fn tensor_bytes(&self, tensor_name: &str) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
+    pub fn tensor_bytes(
+        &self,
+        tensor_name: &str,
+    ) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
         self.slice(tensor_name)
     }
 }

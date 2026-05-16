@@ -206,11 +206,7 @@ impl Runner {
         if !layer0_xml.exists() {
             return Err(RunnerError::MissingFile(layer0_xml));
         }
-        let layer0 = Runtime::compile(
-            layer0_xml.to_str().unwrap(),
-            device,
-            &plugin,
-        )?;
+        let layer0 = Runtime::compile(layer0_xml.to_str().unwrap(), device, &plugin)?;
         info!("compiled layer 0 (stateless embed+dense)");
 
         let head_xml = manifest.head_xml(&model_dir);
@@ -236,11 +232,7 @@ impl Runner {
                 manifest.v_head_dim,
             )?);
             if (i + 1) % 10 == 0 || i + 1 == moe_layer_ids.len() {
-                info!(
-                    "compiled shells {}/{}",
-                    i + 1,
-                    moe_layer_ids.len()
-                );
+                info!("compiled shells {}/{}", i + 1, moe_layer_ids.len());
             }
         }
 
@@ -392,11 +384,7 @@ impl Runner {
     /// - The shells consume just the trailing `tail_len` tokens, with the
     ///   per-layer KV state representing the prior `past_seq_len = full_ids.len - tail_len` tokens.
     /// Returns the FP32 logits for the last position (`vocab_size` elements).
-    fn step(
-        &mut self,
-        full_ids: &[i64],
-        tail_len: usize,
-    ) -> Result<Vec<f32>, RunnerError> {
+    fn step(&mut self, full_ids: &[i64], tail_len: usize) -> Result<Vec<f32>, RunnerError> {
         if tail_len == 0 || tail_len > full_ids.len() {
             return Err(RunnerError::Internal(format!(
                 "invalid tail_len {}, full_ids.len={}",
@@ -412,7 +400,8 @@ impl Runner {
         let ids_bytes = i64_to_bytes(full_ids);
         let ids_shape = [1usize, full_ids.len()];
         let input_name = self.layer0.input_name(0)?;
-        self.layer0.set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
+        self.layer0
+            .set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
         self.layer0.infer()?;
         let (l0_dtype, l0_shape, l0_bytes) = self.layer0.output(0)?;
         // l0_shape: [1, full_ids.len(), 7168]
@@ -430,7 +419,12 @@ impl Runner {
             DType::F32 => read_f32(&l0_bytes),
             DType::Bf16 => bf16_bytes_to_f32(&l0_bytes),
             DType::F16 => f16_bytes_to_f32(&l0_bytes),
-            _ => return Err(RunnerError::Internal(format!("layer0 dtype {:?}", l0_dtype))),
+            _ => {
+                return Err(RunnerError::Internal(format!(
+                    "layer0 dtype {:?}",
+                    l0_dtype
+                )))
+            }
         };
         // Slice the last `tail_len` positions.
         let row_off = past_seq_len * hidden;
@@ -457,54 +451,43 @@ impl Runner {
             let past_v_bytes = std::mem::take(&mut self.layers[i].past_v);
             let past_v_shape = self.layers[i].past_v_shape.clone();
 
-            self.layers[i].shell.set_input(
-                "x.1",
-                DType::Bf16,
-                &h_shape_now,
-                &h_bf16,
-            )?;
-            self.layers[i].shell.set_input(
-                "past_k",
-                DType::F32,
-                &past_k_shape,
-                &past_k_bytes,
-            )?;
-            self.layers[i].shell.set_input(
-                "past_v",
-                DType::F32,
-                &past_v_shape,
-                &past_v_bytes,
-            )?;
+            self.layers[i]
+                .shell
+                .set_input("x.1", DType::Bf16, &h_shape_now, &h_bf16)?;
+            self.layers[i]
+                .shell
+                .set_input("past_k", DType::F32, &past_k_shape, &past_k_bytes)?;
+            self.layers[i]
+                .shell
+                .set_input("past_v", DType::F32, &past_v_shape, &past_v_bytes)?;
             self.layers[i].shell.set_input(
                 "attn_mask_ext",
                 DType::F32,
                 &mask_shape,
                 &mask_bytes,
             )?;
-            self.layers[i].shell.set_input(
-                "past_seq_len",
-                DType::I64,
-                &[],
-                &past_len_bytes,
-            )?;
+            self.layers[i]
+                .shell
+                .set_input("past_seq_len", DType::I64, &[], &past_len_bytes)?;
             self.layers[i].shell.infer()?;
 
             // 2b) Read outputs.
-            let read_f32_out = |layer: &Runtime, idx: usize| -> Result<(Vec<usize>, Vec<f32>), RunnerError> {
-                let (dt, shape, bytes) = layer.output(idx)?;
-                let v = match dt {
-                    DType::F32 => read_f32(&bytes),
-                    DType::Bf16 => bf16_bytes_to_f32(&bytes),
-                    DType::F16 => f16_bytes_to_f32(&bytes),
-                    _ => {
-                        return Err(RunnerError::Internal(format!(
-                            "shell L{} output dtype {:?} not f32-castable",
-                            idx, dt
-                        )));
-                    }
+            let read_f32_out =
+                |layer: &Runtime, idx: usize| -> Result<(Vec<usize>, Vec<f32>), RunnerError> {
+                    let (dt, shape, bytes) = layer.output(idx)?;
+                    let v = match dt {
+                        DType::F32 => read_f32(&bytes),
+                        DType::Bf16 => bf16_bytes_to_f32(&bytes),
+                        DType::F16 => f16_bytes_to_f32(&bytes),
+                        _ => {
+                            return Err(RunnerError::Internal(format!(
+                                "shell L{} output dtype {:?} not f32-castable",
+                                idx, dt
+                            )));
+                        }
+                    };
+                    Ok((shape, v))
                 };
-                Ok((shape, v))
-            };
             let attn_out_idx = self.layers[i].out_idx("attn_out_post_norm");
             let residual_idx = self.layers[i].out_idx("attn_residual");
             let shared_idx = self.layers[i].out_idx("shared_expert_out");
@@ -513,20 +496,18 @@ impl Runner {
             let present_k_idx = self.layers[i].out_idx("present_k");
             let present_v_idx = self.layers[i].out_idx("present_v");
 
-            let (_, attn_out_f32) =
-                read_f32_out(&self.layers[i].shell, attn_out_idx)?;
-            let (_, residual_f32) =
-                read_f32_out(&self.layers[i].shell, residual_idx)?;
+            let (_, attn_out_f32) = read_f32_out(&self.layers[i].shell, attn_out_idx)?;
+            let (_, residual_f32) = read_f32_out(&self.layers[i].shell, residual_idx)?;
             let (_, shared_f32) = read_f32_out(&self.layers[i].shell, shared_idx)?;
-            let (routing_ids_shape, routing_ids_bytes) =
-                self.layers[i].shell.output(routing_ids_idx).map(|(_, s, b)| (s, b))?;
+            let (routing_ids_shape, routing_ids_bytes) = self.layers[i]
+                .shell
+                .output(routing_ids_idx)
+                .map(|(_, s, b)| (s, b))?;
             let routing_ids = bytes_to_i64(&routing_ids_bytes);
             let (_, routing_weights_f32) =
                 read_f32_out(&self.layers[i].shell, routing_weights_idx)?;
-            let (pk_dt, pk_shape, pk_bytes) =
-                self.layers[i].shell.output(present_k_idx)?;
-            let (pv_dt, pv_shape, pv_bytes) =
-                self.layers[i].shell.output(present_v_idx)?;
+            let (pk_dt, pk_shape, pk_bytes) = self.layers[i].shell.output(present_k_idx)?;
+            let (pv_dt, pv_shape, pv_bytes) = self.layers[i].shell.output(present_v_idx)?;
             if pk_dt != DType::F32 || pv_dt != DType::F32 {
                 return Err(RunnerError::Internal(format!(
                     "present_k/v dtype not f32 ({:?}, {:?})",
@@ -535,22 +516,10 @@ impl Runner {
             }
 
             // 2c) Append the freshly-computed present_k/v onto the running cache.
-            let (new_past_k, new_past_k_shape) = concat_along_axis(
-                &past_k_bytes,
-                &past_k_shape,
-                &pk_bytes,
-                &pk_shape,
-                2,
-                4,
-            );
-            let (new_past_v, new_past_v_shape) = concat_along_axis(
-                &past_v_bytes,
-                &past_v_shape,
-                &pv_bytes,
-                &pv_shape,
-                2,
-                4,
-            );
+            let (new_past_k, new_past_k_shape) =
+                concat_along_axis(&past_k_bytes, &past_k_shape, &pk_bytes, &pk_shape, 2, 4);
+            let (new_past_v, new_past_v_shape) =
+                concat_along_axis(&past_v_bytes, &past_v_shape, &pv_bytes, &pv_shape, 2, 4);
             self.layers[i].past_k = new_past_k;
             self.layers[i].past_k_shape = new_past_k_shape;
             self.layers[i].past_v = new_past_v;
@@ -593,7 +562,8 @@ impl Runner {
         let last_off = (tail_len - 1) * hidden;
         let last_h_bf16 = f32_to_bf16_bytes(&h_f32[last_off..last_off + hidden]);
         let head_in = self.head.input_name(0)?;
-        self.head.set_input(&head_in, DType::Bf16, &[1, 1, hidden], &last_h_bf16)?;
+        self.head
+            .set_input(&head_in, DType::Bf16, &[1, 1, hidden], &last_h_bf16)?;
         self.head.infer()?;
         let (head_dt, head_shape, head_bytes) = self.head.output(0)?;
         if head_shape.last() != Some(&(self.manifest.vocab_size as usize)) {
@@ -619,7 +589,12 @@ impl Runner {
         max_tokens: usize,
     ) -> Result<Vec<i64>, RunnerError> {
         self.reset_kv();
-        let eos: Vec<i64> = self.manifest.eos_token_ids.iter().map(|&x| x as i64).collect();
+        let eos: Vec<i64> = self
+            .manifest
+            .eos_token_ids
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
         let mut generated = Vec::with_capacity(max_tokens);
 
         // Prefill token-by-token to keep shell input shapes uniform (avoids

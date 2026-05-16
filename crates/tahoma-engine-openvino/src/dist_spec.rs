@@ -1319,14 +1319,17 @@ impl Engine for OvDistSpecEngine {
             if finished {
                 self.finish_task(task_id.clone(), new_text, 1)
             } else {
-                vec![(task_id, Chunk {
-                    task_id: active.task.task_id.clone(),
-                    token_id: active.out[0],
-                    text: new_text,
-                    is_final: false,
-                    logprobs: None,
-                    n_tokens: Some(1),
-                })]
+                vec![(
+                    task_id,
+                    Chunk {
+                        task_id: active.task.task_id.clone(),
+                        token_id: active.out[0],
+                        text: new_text,
+                        is_final: false,
+                        logprobs: None,
+                        n_tokens: Some(1),
+                    },
+                )]
             }
         } else {
             // Subsequent steps: do one full spec round.
@@ -1335,20 +1338,27 @@ impl Engine for OvDistSpecEngine {
                     warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
                     self.finish_task(task_id, String::new(), 0)
                 }
-                Ok(RoundResult { delta, finished, n_tokens }) => {
+                Ok(RoundResult {
+                    delta,
+                    finished,
+                    n_tokens,
+                }) => {
                     if finished {
                         self.finish_task(task_id, delta, n_tokens)
                     } else {
                         let active_ref = self.active.as_ref().unwrap();
                         let last_id = *active_ref.out.last().unwrap_or(&0);
-                        vec![(task_id.clone(), Chunk {
-                            task_id,
-                            token_id: last_id,
-                            text: delta,
-                            is_final: false,
-                            logprobs: None,
-                            n_tokens: Some(n_tokens),
-                        })]
+                        vec![(
+                            task_id.clone(),
+                            Chunk {
+                                task_id,
+                                token_id: last_id,
+                                text: delta,
+                                is_final: false,
+                                logprobs: None,
+                                n_tokens: Some(n_tokens),
+                            },
+                        )]
                     }
                 }
             }
@@ -1453,7 +1463,10 @@ impl OvDistSpecEngine {
         let out_len_before = active.out.len();
         let mut hit_eos = false;
         let mut hit_max = false;
-        for &t in drafts[..accepted].iter().chain(std::iter::once(&correction)) {
+        for &t in drafts[..accepted]
+            .iter()
+            .chain(std::iter::once(&correction))
+        {
             if active.out.len() >= max_tokens {
                 hit_max = true;
                 break;
@@ -1523,11 +1536,7 @@ impl OvDistSpecEngine {
 /// Detokenize `tokens` and return only the text that's been added since
 /// the last call. `last_text_len` is updated in place to the new total
 /// byte length so the next call sees only the next delta.
-fn decode_delta(
-    tokenizer: &Tokenizer,
-    tokens: &[i64],
-    last_text_len: &mut usize,
-) -> String {
+fn decode_delta(tokenizer: &Tokenizer, tokens: &[i64], last_text_len: &mut usize) -> String {
     let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
     let full = tokenizer.decode(&ids, true).unwrap_or_default();
     if full.len() <= *last_text_len {

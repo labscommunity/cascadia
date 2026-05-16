@@ -98,7 +98,13 @@ pub fn shell_forward_decode(
     bf16_gemv_auto(shell.q_a_proj, &h_norm, Q_LORA_RANK, HIDDEN, &mut q_a);
     let q_a_n = rmsnorm_apply(&q_a, shell.q_a_norm, Q_LORA_RANK);
     let mut q = vec![0.0f32; NUM_HEADS * QK_HEAD_DIM];
-    bf16_gemv_auto(shell.q_b_proj, &q_a_n, NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, &mut q);
+    bf16_gemv_auto(
+        shell.q_b_proj,
+        &q_a_n,
+        NUM_HEADS * QK_HEAD_DIM,
+        Q_LORA_RANK,
+        &mut q,
+    );
     // q is laid out [NUM_HEADS, QK_HEAD_DIM] = [NUM_HEADS, QK_NOPE + QK_ROPE].
 
     // ---- KV projection ----
@@ -172,10 +178,9 @@ pub fn shell_forward_decode(
     // Layout of past_k: [num_heads, past_seq_len, qk_head_dim] (row-major).
     for h in 0..NUM_HEADS {
         let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
-        let past_k_h = &past_k[h * past_seq_len * QK_HEAD_DIM
-            ..(h + 1) * past_seq_len * QK_HEAD_DIM];
-        let past_v_h = &past_v[h * past_seq_len * V_HEAD_DIM
-            ..(h + 1) * past_seq_len * V_HEAD_DIM];
+        let past_k_h =
+            &past_k[h * past_seq_len * QK_HEAD_DIM..(h + 1) * past_seq_len * QK_HEAD_DIM];
+        let past_v_h = &past_v[h * past_seq_len * V_HEAD_DIM..(h + 1) * past_seq_len * V_HEAD_DIM];
         let new_k_h = &new_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
         let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
 
@@ -235,7 +240,13 @@ pub fn shell_forward_decode(
 
     // ---- o_proj ----
     let mut o_out = vec![0.0f32; HIDDEN];
-    bf16_gemv_auto(shell.o_proj, &attn_out, HIDDEN, NUM_HEADS * V_HEAD_DIM, &mut o_out);
+    bf16_gemv_auto(
+        shell.o_proj,
+        &attn_out,
+        HIDDEN,
+        NUM_HEADS * V_HEAD_DIM,
+        &mut o_out,
+    );
 
     // ---- residual = x + o_out ----
     let mut residual = vec![0.0f32; HIDDEN];
@@ -248,7 +259,13 @@ pub fn shell_forward_decode(
 
     // ---- Router ----
     let mut router_logits = vec![0.0f32; N_ROUTED_EXPERTS];
-    bf16_gemv_auto(shell.router_weight, &post, N_ROUTED_EXPERTS, HIDDEN, &mut router_logits);
+    bf16_gemv_auto(
+        shell.router_weight,
+        &post,
+        N_ROUTED_EXPERTS,
+        HIDDEN,
+        &mut router_logits,
+    );
     // sigmoid scores
     let mut scores = vec![0.0f32; N_ROUTED_EXPERTS];
     for i in 0..N_ROUTED_EXPERTS {
@@ -257,10 +274,7 @@ pub fn shell_forward_decode(
     // noaux_tc: scores_for_choice = scores + bias
     // bias is f32 [N_ROUTED_EXPERTS]
     let bias = unsafe {
-        std::slice::from_raw_parts(
-            shell.router_bias.as_ptr() as *const f32,
-            N_ROUTED_EXPERTS,
-        )
+        std::slice::from_raw_parts(shell.router_bias.as_ptr() as *const f32, N_ROUTED_EXPERTS)
     };
     let mut scores_for_choice = vec![0.0f32; N_ROUTED_EXPERTS];
     for i in 0..N_ROUTED_EXPERTS {
@@ -268,11 +282,7 @@ pub fn shell_forward_decode(
     }
     // For K2.6 N_GROUPS=1, so no group masking needed — top-k directly.
     // top-8 by scores_for_choice. Get indices.
-    let mut idx_score: Vec<(usize, f32)> = scores_for_choice
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut idx_score: Vec<(usize, f32)> = scores_for_choice.iter().copied().enumerate().collect();
     idx_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut topk_ids = vec![0i64; TOPK];
     let mut topk_w = vec![0.0f32; TOPK];
@@ -288,9 +298,21 @@ pub fn shell_forward_decode(
 
     // ---- Shared expert ----
     let mut shared_gate_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    bf16_gemv_auto(shell.shared_gate, &post, INTERMEDIATE_SHARED, HIDDEN, &mut shared_gate_out);
+    bf16_gemv_auto(
+        shell.shared_gate,
+        &post,
+        INTERMEDIATE_SHARED,
+        HIDDEN,
+        &mut shared_gate_out,
+    );
     let mut shared_up_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    bf16_gemv_auto(shell.shared_up, &post, INTERMEDIATE_SHARED, HIDDEN, &mut shared_up_out);
+    bf16_gemv_auto(
+        shell.shared_up,
+        &post,
+        INTERMEDIATE_SHARED,
+        HIDDEN,
+        &mut shared_up_out,
+    );
     let mut shared_inter = vec![0.0f32; INTERMEDIATE_SHARED];
     for i in 0..INTERMEDIATE_SHARED {
         let g = shared_gate_out[i];
@@ -298,7 +320,13 @@ pub fn shell_forward_decode(
         shared_inter[i] = silu * shared_up_out[i];
     }
     let mut shared_out = vec![0.0f32; HIDDEN];
-    bf16_gemv_auto(shell.shared_down, &shared_inter, HIDDEN, INTERMEDIATE_SHARED, &mut shared_out);
+    bf16_gemv_auto(
+        shell.shared_down,
+        &shared_inter,
+        HIDDEN,
+        INTERMEDIATE_SHARED,
+        &mut shared_out,
+    );
 
     ShellOutputs {
         attn_out_post_norm: post,
@@ -472,10 +500,18 @@ mod tests {
         apply_rope_kimi(&x, &cos, &sin, &mut y);
         let half = QK_ROPE_HEAD_DIM / 2;
         for i in 0..half {
-            assert!((y[i] - (2 * i) as f32).abs() < 1e-4, "y[{i}]={} expected {}", y[i], 2 * i);
+            assert!(
+                (y[i] - (2 * i) as f32).abs() < 1e-4,
+                "y[{i}]={} expected {}",
+                y[i],
+                2 * i
+            );
             assert!(
                 (y[i + half] - (2 * i + 1) as f32).abs() < 1e-4,
-                "y[{}]={} expected {}", i + half, y[i + half], 2 * i + 1,
+                "y[{}]={} expected {}",
+                i + half,
+                y[i + half],
+                2 * i + 1,
             );
         }
     }

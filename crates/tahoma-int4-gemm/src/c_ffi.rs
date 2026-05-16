@@ -107,11 +107,11 @@ static SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 
 // ---- Shell forward C-FFI ---------------------------------------------------
 
-use crate::shell::{
-    shell_forward_decode, ShellOutputs, HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM,
-    TOPK, V_HEAD_DIM,
-};
 use crate::safetensors_source::SafetensorsShell;
+use crate::shell::{
+    shell_forward_decode, ShellOutputs, HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM, TOPK,
+    V_HEAD_DIM,
+};
 
 /// Holds one layer's shell weights pinned to its safetensors mmaps.
 #[repr(C)]
@@ -236,13 +236,16 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
         present_k,
         present_v,
     } = crate::shell_int4::shell_forward_decode_int4(s, x, pk, pv, past_seq_len);
-    std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN).copy_from_slice(&attn_out_post_norm);
+    std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)
+        .copy_from_slice(&attn_out_post_norm);
     std::slice::from_raw_parts_mut(out_residual, SHELL_HIDDEN).copy_from_slice(&attn_residual);
     std::slice::from_raw_parts_mut(out_shared, SHELL_HIDDEN).copy_from_slice(&shared_expert_out);
     std::slice::from_raw_parts_mut(out_ids, TOPK).copy_from_slice(&routing_ids);
     std::slice::from_raw_parts_mut(out_weights, TOPK).copy_from_slice(&routing_weights);
-    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM).copy_from_slice(&present_k);
-    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM).copy_from_slice(&present_v);
+    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM)
+        .copy_from_slice(&present_k);
+    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM)
+        .copy_from_slice(&present_v);
     0
 }
 
@@ -284,8 +287,10 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward(
     std::slice::from_raw_parts_mut(out_shared, SHELL_HIDDEN).copy_from_slice(&shared_expert_out);
     std::slice::from_raw_parts_mut(out_ids, TOPK).copy_from_slice(&routing_ids);
     std::slice::from_raw_parts_mut(out_weights, TOPK).copy_from_slice(&routing_weights);
-    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM).copy_from_slice(&present_k);
-    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM).copy_from_slice(&present_v);
+    std::slice::from_raw_parts_mut(out_present_k, NUM_HEADS * QK_HEAD_DIM)
+        .copy_from_slice(&present_k);
+    std::slice::from_raw_parts_mut(out_present_v, NUM_HEADS * V_HEAD_DIM)
+        .copy_from_slice(&present_v);
     0
 }
 

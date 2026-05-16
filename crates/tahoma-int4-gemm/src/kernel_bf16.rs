@@ -93,13 +93,7 @@ mod avx512 {
 #[cfg(target_arch = "x86_64")]
 pub use avx512::bf16_gemv_avx512;
 
-pub fn bf16_gemv_auto(
-    weight_bf16: &[u8],
-    x: &[f32],
-    n_rows: usize,
-    k_cols: usize,
-    y: &mut [f32],
-) {
+pub fn bf16_gemv_auto(weight_bf16: &[u8], x: &[f32], n_rows: usize, k_cols: usize, y: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512f")
@@ -159,7 +153,13 @@ mod tests {
         bf16_gemv_scalar(&w, &x, n, k, &mut y_scalar);
         bf16_gemv_auto(&w, &x, n, k, &mut y_auto);
         for r in 0..n {
-            assert!((y_scalar[r] - y_auto[r]).abs() < 1e-4, "row {}: {} vs {}", r, y_scalar[r], y_auto[r]);
+            assert!(
+                (y_scalar[r] - y_auto[r]).abs() < 1e-4,
+                "row {}: {} vs {}",
+                r,
+                y_scalar[r],
+                y_auto[r]
+            );
         }
     }
 }

@@ -42,7 +42,10 @@ fn main() {
 
     let t0 = Instant::now();
     let source = SafetensorsExpertSource::open(&model_dir).expect("open safetensors");
-    eprintln!("opened source in {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    eprintln!(
+        "opened source in {:.2}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     let t0 = Instant::now();
     let w = source.expert(layer, expert).expect("fetch expert");
@@ -62,7 +65,13 @@ fn main() {
 
     // Warm
     expert_forward(
-        &x_bf16, w.gate_packed, w.gate_scale, w.up_packed, w.up_scale, w.down_packed, w.down_scale,
+        &x_bf16,
+        w.gate_packed,
+        w.gate_scale,
+        w.up_packed,
+        w.up_scale,
+        w.down_packed,
+        w.down_scale,
         &mut out_bf16,
     );
 

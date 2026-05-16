@@ -321,10 +321,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
 /// cadence instead of being Nagle-aggregated into ~3500 B bursts
 /// every ~1 s — the original demo's bursty token feel was driven
 /// almost entirely by this default.
-async fn serve_with_nodelay(
-    listener: tokio::net::TcpListener,
-    app: axum::Router,
-) -> Result<()> {
+async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {
     use hyper::server::conn::http1;
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
@@ -449,7 +446,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // exact format the model was trained on. Falls back gracefully
         // to the legacy "role: content" join if the file or fields are
         // missing.
-        let chat_template = tahoma_api::load_chat_template_config(std::path::Path::new(&args.model));
+        let chat_template =
+            tahoma_api::load_chat_template_config(std::path::Path::new(&args.model));
         if chat_template.template.is_some() {
             info!(
                 model = %args.model,

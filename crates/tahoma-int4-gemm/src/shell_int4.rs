@@ -13,9 +13,9 @@ use crate::kernel_avx512::dequant_gemv_int4_auto;
 use crate::kernel_bf16::bf16_gemv_auto;
 use crate::safetensors_source::SafetensorsShell;
 use crate::shell::{
-    self, ShellOutputs, HIDDEN, INTERMEDIATE_SHARED, KV_LORA_RANK, NUM_HEADS,
-    N_ROUTED_EXPERTS, QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, Q_LORA_RANK,
-    ROUTED_SCALING_FACTOR, TOPK, V_HEAD_DIM,
+    self, ShellOutputs, HIDDEN, INTERMEDIATE_SHARED, KV_LORA_RANK, NUM_HEADS, N_ROUTED_EXPERTS,
+    QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, Q_LORA_RANK, ROUTED_SCALING_FACTOR, TOPK,
+    V_HEAD_DIM,
 };
 
 const GROUP_SIZE: usize = 32;
@@ -26,11 +26,7 @@ const GROUP_SIZE: usize = 32;
 /// Output layout:
 ///   packed: u8 [n_rows * k_cols / 2], byte i holds nibbles for cols 2i, 2i+1
 ///   scales: u8 [n_rows * (k_cols / GROUP_SIZE) * 2], bf16 little-endian
-fn quantize_int4_group(
-    weight_bf16: &[u8],
-    n_rows: usize,
-    k_cols: usize,
-) -> (Vec<u8>, Vec<u8>) {
+fn quantize_int4_group(weight_bf16: &[u8], n_rows: usize, k_cols: usize) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(weight_bf16.len(), n_rows * k_cols * 2);
     assert!(k_cols.is_multiple_of(GROUP_SIZE));
     let n_groups = k_cols / GROUP_SIZE;
@@ -53,7 +49,11 @@ fn quantize_int4_group(
             }
             // Symmetric int4 range is [-8, 7]. Use 7 as the scale denominator
             // so the +max maps exactly to 7 (matches NNCF INT4_SYM behavior).
-            let scale = if max_abs == 0.0 { 1.0e-10 } else { max_abs / 7.0 };
+            let scale = if max_abs == 0.0 {
+                1.0e-10
+            } else {
+                max_abs / 7.0
+            };
             // Store scale as bf16: round-to-nearest-even of f32 -> bf16.
             let scale_bits = bf16_round(scale);
             let s_off = (r * n_groups + g) * 2;
@@ -130,16 +130,17 @@ impl Int4Shell {
     /// to int4 + bf16 scales, leaves layer-norm weights bf16. The
     /// resulting buffers are owned (Vec) so they're heap-resident.
     pub fn from_safetensors(shell: &SafetensorsShell) -> Self {
-        let (q_a_packed, q_a_scale) =
-            quantize_int4_group(shell.q_a_proj, Q_LORA_RANK, HIDDEN);
+        let (q_a_packed, q_a_scale) = quantize_int4_group(shell.q_a_proj, Q_LORA_RANK, HIDDEN);
         let (q_b_packed, q_b_scale) =
             quantize_int4_group(shell.q_b_proj, NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK);
         let (kv_a_packed, kv_a_scale) =
             quantize_int4_group(shell.kv_a_proj, KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN);
-        let (kv_b_packed, kv_b_scale) =
-            quantize_int4_group(shell.kv_b_proj, NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK);
-        let (o_packed, o_scale) =
-            quantize_int4_group(shell.o_proj, HIDDEN, NUM_HEADS * V_HEAD_DIM);
+        let (kv_b_packed, kv_b_scale) = quantize_int4_group(
+            shell.kv_b_proj,
+            NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM),
+            KV_LORA_RANK,
+        );
+        let (o_packed, o_scale) = quantize_int4_group(shell.o_proj, HIDDEN, NUM_HEADS * V_HEAD_DIM);
         let (router_packed, router_scale) =
             quantize_int4_group(shell.router_weight, N_ROUTED_EXPERTS, HIDDEN);
         let (sg_packed, sg_scale) =
@@ -179,16 +180,28 @@ impl Int4Shell {
     /// Total bytes resident in heap (sum of all the Vec<u8> fields).
     pub fn footprint_bytes(&self) -> usize {
         self.input_norm.len()
-            + self.q_a_proj_packed.len() + self.q_a_proj_scale.len() + self.q_a_norm.len()
-            + self.q_b_proj_packed.len() + self.q_b_proj_scale.len()
-            + self.kv_a_proj_packed.len() + self.kv_a_proj_scale.len() + self.kv_a_norm.len()
-            + self.kv_b_proj_packed.len() + self.kv_b_proj_scale.len()
-            + self.o_proj_packed.len() + self.o_proj_scale.len()
+            + self.q_a_proj_packed.len()
+            + self.q_a_proj_scale.len()
+            + self.q_a_norm.len()
+            + self.q_b_proj_packed.len()
+            + self.q_b_proj_scale.len()
+            + self.kv_a_proj_packed.len()
+            + self.kv_a_proj_scale.len()
+            + self.kv_a_norm.len()
+            + self.kv_b_proj_packed.len()
+            + self.kv_b_proj_scale.len()
+            + self.o_proj_packed.len()
+            + self.o_proj_scale.len()
             + self.post_norm.len()
-            + self.router_packed.len() + self.router_scale.len() + self.router_bias.len()
-            + self.shared_gate_packed.len() + self.shared_gate_scale.len()
-            + self.shared_up_packed.len() + self.shared_up_scale.len()
-            + self.shared_down_packed.len() + self.shared_down_scale.len()
+            + self.router_packed.len()
+            + self.router_scale.len()
+            + self.router_bias.len()
+            + self.shared_gate_packed.len()
+            + self.shared_gate_scale.len()
+            + self.shared_up_packed.len()
+            + self.shared_up_scale.len()
+            + self.shared_down_packed.len()
+            + self.shared_down_scale.len()
     }
 }
 
@@ -212,22 +225,50 @@ pub fn shell_forward_decode_int4(
 
     // q_a_proj (int4)
     let mut q_a = vec![0.0f32; Q_LORA_RANK];
-    dequant_gemv_int4_auto(&shell.q_a_proj_packed, &shell.q_a_proj_scale, &h_norm, Q_LORA_RANK, HIDDEN, &mut q_a);
+    dequant_gemv_int4_auto(
+        &shell.q_a_proj_packed,
+        &shell.q_a_proj_scale,
+        &h_norm,
+        Q_LORA_RANK,
+        HIDDEN,
+        &mut q_a,
+    );
     let q_a_n = rmsnorm_apply(&q_a, &shell.q_a_norm, Q_LORA_RANK);
 
     // q_b_proj (int4)
     let mut q = vec![0.0f32; NUM_HEADS * QK_HEAD_DIM];
-    dequant_gemv_int4_auto(&shell.q_b_proj_packed, &shell.q_b_proj_scale, &q_a_n, NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK, &mut q);
+    dequant_gemv_int4_auto(
+        &shell.q_b_proj_packed,
+        &shell.q_b_proj_scale,
+        &q_a_n,
+        NUM_HEADS * QK_HEAD_DIM,
+        Q_LORA_RANK,
+        &mut q,
+    );
 
     // kv_a_proj (int4)
     let mut kv_a_with_rope = vec![0.0f32; KV_LORA_RANK + QK_ROPE_HEAD_DIM];
-    dequant_gemv_int4_auto(&shell.kv_a_proj_packed, &shell.kv_a_proj_scale, &h_norm, KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN, &mut kv_a_with_rope);
+    dequant_gemv_int4_auto(
+        &shell.kv_a_proj_packed,
+        &shell.kv_a_proj_scale,
+        &h_norm,
+        KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        HIDDEN,
+        &mut kv_a_with_rope,
+    );
     let (kv_a, k_rope_in) = kv_a_with_rope.split_at(KV_LORA_RANK);
     let kv_a_n = rmsnorm_apply(kv_a, &shell.kv_a_norm, KV_LORA_RANK);
 
     // kv_b_proj (int4)
     let mut kv_b = vec![0.0f32; NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)];
-    dequant_gemv_int4_auto(&shell.kv_b_proj_packed, &shell.kv_b_proj_scale, &kv_a_n, NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK, &mut kv_b);
+    dequant_gemv_int4_auto(
+        &shell.kv_b_proj_packed,
+        &shell.kv_b_proj_scale,
+        &kv_a_n,
+        NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM),
+        KV_LORA_RANK,
+        &mut kv_b,
+    );
 
     // RoPE + assemble Q/K/V (same as bf16 path)
     let (cos, sin) = shell::rope_cos_sin_pub(past_seq_len);
@@ -243,7 +284,8 @@ pub fn shell_forward_decode_int4(
             .copy_from_slice(&q[h * QK_HEAD_DIM..h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM]);
         let q_rope_src = &q[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
         shell::apply_rope_kimi_pub(q_rope_src, &cos, &sin, &mut q_rope_buf);
-        q_full[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM].copy_from_slice(&q_rope_buf);
+        q_full[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM]
+            .copy_from_slice(&q_rope_buf);
         let k_nope_src = &kv_b[h * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)
             ..h * (QK_NOPE_HEAD_DIM + V_HEAD_DIM) + QK_NOPE_HEAD_DIM];
         new_k[h * QK_HEAD_DIM..h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM].copy_from_slice(k_nope_src);
@@ -260,7 +302,8 @@ pub fn shell_forward_decode_int4(
     let kv_len = past_seq_len + 1;
     for h in 0..NUM_HEADS {
         let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
-        let past_k_h = &past_k[h * past_seq_len * QK_HEAD_DIM..(h + 1) * past_seq_len * QK_HEAD_DIM];
+        let past_k_h =
+            &past_k[h * past_seq_len * QK_HEAD_DIM..(h + 1) * past_seq_len * QK_HEAD_DIM];
         let past_v_h = &past_v[h * past_seq_len * V_HEAD_DIM..(h + 1) * past_seq_len * V_HEAD_DIM];
         let new_k_h = &new_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
         let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
@@ -281,7 +324,9 @@ pub fn shell_forward_decode_int4(
         scores[past_seq_len] = s * scale;
         let mut max_s = scores[0];
         for &v in scores.iter().skip(1) {
-            if v > max_s { max_s = v; }
+            if v > max_s {
+                max_s = v;
+            }
         }
         let mut sum_e = 0.0f32;
         for v in scores.iter_mut() {
@@ -309,15 +354,31 @@ pub fn shell_forward_decode_int4(
 
     // o_proj (int4)
     let mut o_out = vec![0.0f32; HIDDEN];
-    dequant_gemv_int4_auto(&shell.o_proj_packed, &shell.o_proj_scale, &attn_out, HIDDEN, NUM_HEADS * V_HEAD_DIM, &mut o_out);
+    dequant_gemv_int4_auto(
+        &shell.o_proj_packed,
+        &shell.o_proj_scale,
+        &attn_out,
+        HIDDEN,
+        NUM_HEADS * V_HEAD_DIM,
+        &mut o_out,
+    );
 
     let mut residual = vec![0.0f32; HIDDEN];
-    for i in 0..HIDDEN { residual[i] = x_f32[i] + o_out[i]; }
+    for i in 0..HIDDEN {
+        residual[i] = x_f32[i] + o_out[i];
+    }
     let post = rmsnorm_apply(&residual, &shell.post_norm, HIDDEN);
 
     // Router (int4)
     let mut router_logits = vec![0.0f32; N_ROUTED_EXPERTS];
-    dequant_gemv_int4_auto(&shell.router_packed, &shell.router_scale, &post, N_ROUTED_EXPERTS, HIDDEN, &mut router_logits);
+    dequant_gemv_int4_auto(
+        &shell.router_packed,
+        &shell.router_scale,
+        &post,
+        N_ROUTED_EXPERTS,
+        HIDDEN,
+        &mut router_logits,
+    );
     let mut scores_raw = vec![0.0f32; N_ROUTED_EXPERTS];
     for i in 0..N_ROUTED_EXPERTS {
         scores_raw[i] = 1.0f32 / (1.0f32 + (-router_logits[i]).exp());
@@ -344,9 +405,23 @@ pub fn shell_forward_decode_int4(
 
     // Shared expert (int4 ×3)
     let mut shared_gate_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    dequant_gemv_int4_auto(&shell.shared_gate_packed, &shell.shared_gate_scale, &post, INTERMEDIATE_SHARED, HIDDEN, &mut shared_gate_out);
+    dequant_gemv_int4_auto(
+        &shell.shared_gate_packed,
+        &shell.shared_gate_scale,
+        &post,
+        INTERMEDIATE_SHARED,
+        HIDDEN,
+        &mut shared_gate_out,
+    );
     let mut shared_up_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    dequant_gemv_int4_auto(&shell.shared_up_packed, &shell.shared_up_scale, &post, INTERMEDIATE_SHARED, HIDDEN, &mut shared_up_out);
+    dequant_gemv_int4_auto(
+        &shell.shared_up_packed,
+        &shell.shared_up_scale,
+        &post,
+        INTERMEDIATE_SHARED,
+        HIDDEN,
+        &mut shared_up_out,
+    );
     let mut shared_inter = vec![0.0f32; INTERMEDIATE_SHARED];
     for i in 0..INTERMEDIATE_SHARED {
         let g = shared_gate_out[i];
@@ -354,7 +429,14 @@ pub fn shell_forward_decode_int4(
         shared_inter[i] = silu * shared_up_out[i];
     }
     let mut shared_out = vec![0.0f32; HIDDEN];
-    dequant_gemv_int4_auto(&shell.shared_down_packed, &shell.shared_down_scale, &shared_inter, HIDDEN, INTERMEDIATE_SHARED, &mut shared_out);
+    dequant_gemv_int4_auto(
+        &shell.shared_down_packed,
+        &shell.shared_down_scale,
+        &shared_inter,
+        HIDDEN,
+        INTERMEDIATE_SHARED,
+        &mut shared_out,
+    );
 
     ShellOutputs {
         attn_out_post_norm: post,

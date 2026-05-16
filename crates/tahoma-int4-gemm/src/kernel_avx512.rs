@@ -54,9 +54,8 @@ mod imp {
                 // pk: 16 i8 bytes. Low nibble holds even columns, high nibble odd.
                 let lo_mask = _mm_set1_epi8(0x0F);
                 let low_nibbles = _mm_and_si128(pk, lo_mask); // 16 even columns
-                let high_nibbles =
-                    _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask); // 16 odd columns
-                // sign: subtract 8
+                let high_nibbles = _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask); // 16 odd columns
+                                                                                    // sign: subtract 8
                 let bias = _mm_set1_epi8(8);
                 let low_signed = _mm_sub_epi8(low_nibbles, bias);
                 let high_signed = _mm_sub_epi8(high_nibbles, bias);
@@ -64,7 +63,7 @@ mod imp {
                 // We want lanes [low0, high0, low1, high1, ..., low15, high15].
                 let interleaved_lo = _mm_unpacklo_epi8(low_signed, high_signed); // cols 0..15
                 let interleaved_hi = _mm_unpackhi_epi8(low_signed, high_signed); // cols 16..31
-                // Convert 16 i8 → 16 i32 via sign extend
+                                                                                 // Convert 16 i8 → 16 i32 via sign extend
                 let lo_i32 = _mm512_cvtepi8_epi32(interleaved_lo);
                 let hi_i32 = _mm512_cvtepi8_epi32(interleaved_hi);
                 // Convert to f32

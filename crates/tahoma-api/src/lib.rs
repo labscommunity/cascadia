@@ -109,7 +109,9 @@ pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateCon
         if let Some(s) = val.as_str() {
             return Some(s.to_owned());
         }
-        val.get("content").and_then(|c| c.as_str()).map(|s| s.to_owned())
+        val.get("content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_owned())
     };
     ChatTemplateConfig {
         template,
@@ -314,7 +316,8 @@ fn render_prompt_with_template(
         eos_token => eos_token,
     };
 
-    tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+    tmpl.render(ctx)
+        .map_err(|e| format!("template render: {e}"))
 }
 
 fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {

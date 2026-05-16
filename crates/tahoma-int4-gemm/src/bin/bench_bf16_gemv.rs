@@ -24,20 +24,32 @@ fn bench(name: &str, n: usize, k: usize, iters: usize) {
 fn main() {
     let iters = 50;
     println!("=== K2.6 shell projections (bf16 weight) ===");
-    bench("q_a_proj",          1536,  7168, iters);
-    bench("q_b_proj",          12288, 1536, iters);
-    bench("kv_a_proj_with_mqa", 576,  7168, iters);
-    bench("kv_b_proj",          16384, 512, iters);
-    bench("o_proj",             7168, 8192, iters);
-    bench("mlp.gate (router)",   384, 7168, iters);
-    bench("shared.gate_proj",   2048, 7168, iters);
-    bench("shared.up_proj",     2048, 7168, iters);
-    bench("shared.down_proj",   7168, 2048, iters);
+    bench("q_a_proj", 1536, 7168, iters);
+    bench("q_b_proj", 12288, 1536, iters);
+    bench("kv_a_proj_with_mqa", 576, 7168, iters);
+    bench("kv_b_proj", 16384, 512, iters);
+    bench("o_proj", 7168, 8192, iters);
+    bench("mlp.gate (router)", 384, 7168, iters);
+    bench("shared.gate_proj", 2048, 7168, iters);
+    bench("shared.up_proj", 2048, 7168, iters);
+    bench("shared.down_proj", 7168, 2048, iters);
 
-    let total_bytes_per_shell: u64 = (
-        1536u64*7168 + 12288u64*1536 + 576u64*7168 + 16384u64*512 + 7168u64*8192
-        + 384u64*7168 + 2048u64*7168 + 2048u64*7168 + 7168u64*2048
-    ) * 2;
-    println!("\ntotal per shell:        {} MB", total_bytes_per_shell / 1_000_000);
-    println!("for 60 shells:          {} GB", 60 * total_bytes_per_shell / 1_000_000_000);
+    let total_bytes_per_shell: u64 = (1536u64 * 7168
+        + 12288u64 * 1536
+        + 576u64 * 7168
+        + 16384u64 * 512
+        + 7168u64 * 8192
+        + 384u64 * 7168
+        + 2048u64 * 7168
+        + 2048u64 * 7168
+        + 7168u64 * 2048)
+        * 2;
+    println!(
+        "\ntotal per shell:        {} MB",
+        total_bytes_per_shell / 1_000_000
+    );
+    println!(
+        "for 60 shells:          {} GB",
+        60 * total_bytes_per_shell / 1_000_000_000
+    );
 }

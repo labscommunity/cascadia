@@ -94,9 +94,21 @@ pub fn expert_forward(
     let mut gate_out = vec![0.0f32; intermediate];
     let mut up_out = vec![0.0f32; intermediate];
     crate::kernel_avx512::dequant_gemv_int4_auto(
-        gate_packed, gate_scale, &x_f32, intermediate, hidden, &mut gate_out);
+        gate_packed,
+        gate_scale,
+        &x_f32,
+        intermediate,
+        hidden,
+        &mut gate_out,
+    );
     crate::kernel_avx512::dequant_gemv_int4_auto(
-        up_packed, up_scale, &x_f32, intermediate, hidden, &mut up_out);
+        up_packed,
+        up_scale,
+        &x_f32,
+        intermediate,
+        hidden,
+        &mut up_out,
+    );
 
     // intermediate = silu(gate_out) * up_out
     let mut inter = vec![0.0f32; intermediate];
