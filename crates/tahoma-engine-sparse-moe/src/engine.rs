@@ -167,7 +167,14 @@ impl Engine for SparseMoEEngine {
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
-        let generated = match self.runner.generate_argmax(&prompt_ids, max_new) {
+        let sampling_cfg = crate::sampling::SamplingConfig {
+            temperature: task.temperature.max(0.0),
+            top_p: 1.0,
+            repetition_penalty: 1.05,
+            repetition_window: 64,
+            seed: None,
+        };
+        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
             Ok(g) => g,
             Err(e) => {
                 warn!(task = %task.task_id, "runner failed: {e}");

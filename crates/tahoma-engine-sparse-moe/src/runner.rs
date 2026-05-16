@@ -202,18 +202,24 @@ impl Runner {
             "loading sparse-MoE model"
         );
 
+        let utf8 = |p: &PathBuf| -> Result<String, RunnerError> {
+            p.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| RunnerError::Internal(format!("non-UTF-8 path: {}", p.display())))
+        };
+
         let layer0_xml = manifest.layer0_xml(&model_dir);
         if !layer0_xml.exists() {
             return Err(RunnerError::MissingFile(layer0_xml));
         }
-        let layer0 = Runtime::compile(layer0_xml.to_str().unwrap(), device, &plugin)?;
+        let layer0 = Runtime::compile(&utf8(&layer0_xml)?, device, &plugin)?;
         info!("compiled layer 0 (stateless embed+dense)");
 
         let head_xml = manifest.head_xml(&model_dir);
         if !head_xml.exists() {
             return Err(RunnerError::MissingFile(head_xml));
         }
-        let head = Runtime::compile(head_xml.to_str().unwrap(), device, &plugin)?;
+        let head = Runtime::compile(&utf8(&head_xml)?, device, &plugin)?;
         info!("compiled head (RMSNorm + lm_head)");
 
         let moe_layer_ids = manifest.moe_layer_ids();
@@ -223,7 +229,7 @@ impl Runner {
             if !xml.exists() {
                 return Err(RunnerError::MissingFile(xml));
             }
-            let rt = Runtime::compile(xml.to_str().unwrap(), device, &plugin)?;
+            let rt = Runtime::compile(&utf8(&xml)?, device, &plugin)?;
             layers.push(LayerState::new(
                 lid,
                 rt,
@@ -581,12 +587,15 @@ impl Runner {
         Ok(logits)
     }
 
-    /// Greedy argmax generation. Returns the vector of generated token IDs
-    /// (excluding the prompt). Stops on EOS or after `max_tokens`.
-    pub fn generate_argmax(
+    /// Generate tokens with full sampling (temperature / top-p /
+    /// repetition penalty / EOS stop). Returns the vector of generated
+    /// token IDs **excluding** the prompt and **excluding** the EOS
+    /// token that triggered termination.
+    pub fn generate(
         &mut self,
         prompt_ids: &[i64],
         max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
     ) -> Result<Vec<i64>, RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
@@ -595,6 +604,7 @@ impl Runner {
             .iter()
             .map(|&x| x as i64)
             .collect();
+        let mut rng = crate::sampling::init_rng(cfg.seed);
         let mut generated = Vec::with_capacity(max_tokens);
 
         // Prefill token-by-token to keep shell input shapes uniform (avoids
@@ -626,19 +636,23 @@ impl Runner {
 
         // First generated token from the LAST prefill step's logits.
         if let Some(l) = last_logits {
-            let next = argmax(&l);
+            let next = crate::sampling::sample(&l, &history, cfg, &mut rng);
+            if eos.contains(&next) {
+                return Ok(generated);
+            }
             history.push(next);
             generated.push(next);
         }
 
         // Decode.
         for step_i in 1..max_tokens {
-            if !generated.is_empty() && eos.contains(generated.last().unwrap()) {
-                break;
-            }
             let t_step = Instant::now();
             let logits = self.step(&history, 1)?;
-            let next = argmax(&logits);
+            let next = crate::sampling::sample(&logits, &history, cfg, &mut rng);
+            if eos.contains(&next) {
+                debug!(step = step_i, token = next, "EOS — stopping");
+                break;
+            }
             history.push(next);
             generated.push(next);
             debug!(
@@ -654,6 +668,19 @@ impl Runner {
             );
         }
         Ok(generated)
+    }
+
+    /// Back-compat: equivalent to `generate(..., &SamplingConfig::default())`.
+    pub fn generate_argmax(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+    ) -> Result<Vec<i64>, RunnerError> {
+        self.generate(
+            prompt_ids,
+            max_tokens,
+            &crate::sampling::SamplingConfig::default(),
+        )
     }
 }
 
