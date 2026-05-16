@@ -2,15 +2,13 @@
   <img src="docs/assets/logo.jpg" alt="Tahoma" width="520">
 </p>
 
-<p align="center">
-  <a href="https://github.com/labscommunity/tahoma/actions/workflows/ci.yml"><img src="https://github.com/labscommunity/tahoma/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-</p>
-
 > Run any model on Intel hardware.
 
 Tahoma distributes LLM inference across Intel laptops, desktops, and AI PCs. Shard a model across the machines you already have and serve it through an OpenAI-compatible API — no cloud, no NVIDIA GPUs required.
 
 ## Status
+
+[![ci](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml/badge.svg)](https://github.com/labscommunity/tahoma/actions/workflows/ci.yml)
 
 **Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime at the worker. Four engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
 
