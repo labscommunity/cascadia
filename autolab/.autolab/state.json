@@ -1,5 +1,5 @@
 {
-  "iteration": 1,
+  "iteration": 3,
   "moonshots_attempted": 0,
   "moonshots_target": 100,
   "moonshot_class_counts": {
@@ -28,5 +28,17 @@
     "measured_at_utc": "2026-05-17T20:36:29Z"
   },
   "started_at_utc": "2026-05-17T19:45:00Z",
-  "last_iteration_at_utc": "2026-05-17T20:36:29Z"
+  "last_iteration_at_utc": "2026-05-17T21:34:00Z",
+  "q1_breakdown_per_token_decode_ms": {
+    "rank0_layer0": 81,
+    "rank0_shells_attn": 728,
+    "rank0_shells_experts": 3229,
+    "wire_pure": 60,
+    "rank1_shells_attn": 578,
+    "rank1_shells_experts": 4151,
+    "rank1_head": 139,
+    "total": 9005,
+    "implied_decode_tok_s": 0.111,
+    "expert_dispatch_pct_of_decode": 82
+  }
 }

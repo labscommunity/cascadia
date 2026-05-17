@@ -43,19 +43,48 @@ version bump).
 - Direct UDP between matias boxes blocked by Intel firewall — DERP is forced.
 - K2.6 model: 553 GB original, ~290 GB per box after 2-stage split. 60 MoE layers, 384 experts/layer, top-8 dispatch. Hidden 7168 bf16. 64 heads, qk_head_dim 192, v_head_dim 128.
 
-## Where the time goes (current 2-box steady-state ~17-20 s/tok)
+## Where the time goes (MEASURED 2026-05-17 in autolab iteration 003)
 
-From [[k26-state]] + code reading. Order-of-magnitude only; the loop should re-measure.
+Median of 24 late-bench steady-state samples on the 2-box matias
+K2.6 pipeline (instrumented binary, see commit d539d3d). Per-token
+**decode** wall-clock (excludes prefill). Total per token = 9.0 s;
+end-to-end with prefill = ~17 s/tok matching observed 0.055 tok/s.
 
-| Stage | Time/token (rough) | Notes |
-|---|---|---|
-| Shell attention × 30 layers/rank | ~2-3 s | Rust int4 GEMM on Lunar Lake CPU; bf16 path |
-| Expert dispatch × 30 × top-8 | ~10-12 s | Disk-page-bound on cold experts; AVX-512 int4 kernel |
-| RMSNorm + router × 30 | <0.1 s | Negligible |
-| Layer 0 / head | <0.2 s | Once per token; OV IR |
-| Cross-rank Forward send/recv | ~0.05 s | 28 KB / 22 ms DERP |
-| Sampler | <0.001 s | Greedy argmax |
+| Stage | ms | % of decode |
+|---|---:|------------:|
+| Rank-0 layer 0 (embed + dense attn + KV) | 81 | 0.9% |
+| Rank-0 shell attention (30 layers) | 728 | 8.1% |
+| **Rank-0 shell expert dispatch (30 × top-8)** | **3,229** | **35.9%** |
+| Rank-0 shells combine | <1 | <0.1% |
+| Pure wire latency (Tailscale DERP) | 60 | 0.7% |
+| Rank-1 shell attention (30 layers) | 578 | 6.4% |
+| **Rank-1 shell expert dispatch (30 × top-8)** | **4,151** | **46.1%** |
+| Rank-1 head (RMSNorm + lm_head OV IR) | 139 | 1.5% |
+| **TOTAL DECODE PER TOKEN** | **9,005** | **100%** |
 
-**The big rocks are expert-page latency and shell compute.** Anything
-that reduces top-K, prefetches experts, compresses experts, or
-overlaps attention with expert page-in is likely to move the needle.
+**Expert dispatch is 82% of per-token decode time.** 5.9× variance
+on rank-1 experts (1.5s–9.0s across 46 samples) is dominated by
+disk-page-in on cold expert pages.
+
+**Implications for moonshot ranking (loop-derived, updates the lit-only
+Tier-S in MOONSHOTS.md):**
+
+- **Tier-S #1 = A3 expert reduction (top-K=8 → K=4/6).** Directly
+  attacks the 82% bucket. 10-25% expected throughput per lit.
+- **Tier-S #2 = D4 async pipeline overlap.** Can hide rank-1's
+  54% of per-token wall behind rank-0's next-token compute.
+- **Tier-S #3 = F4 multi-thread per shell (rayon over 64 heads).**
+  Second-biggest bucket (14.5% attention).
+- **D1 BF16 wire DROPPED from Tier-S** — wire is only 0.7%.
+- **Layer 0, head, combine — skip.** All <2% each.
+
+Previous "rough" estimates are below for posterity:
+
+~~| Shell attention × 30 layers/rank | ~2-3 s | Rust int4 GEMM... |~~
+~~| Expert dispatch × 30 × top-8 | ~10-12 s | Disk-page-bound... |~~
+~~| Cross-rank Forward send/recv | ~0.05 s | 28 KB / 22 ms DERP |~~
+
+The estimate overshot shell attention by 4× (estimated 2-3s, measured
+0.7-1.3s combined across both ranks) and overshot total expert dispatch
+by ~50% (estimated 10-12s, measured 7.4s combined). The wire estimate
+of "~0.05s" was almost exact (actual 60 ms).

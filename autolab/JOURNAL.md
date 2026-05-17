@@ -18,16 +18,71 @@ Entry template:
 
 ---
 
-## 003 — q1 instrumentation EXECUTE (LAUNCHED 2026-05-17 ~14:00 PT, fix-forward from 002)
+## 003 — q1 instrumentation COMPLETE (2026-05-17 ~14:34 PT)
 
-**Picked up from iteration 002's infrastructure blocker.** Instrumentation
-patch in `crates/tahoma-engine-sparse-moe/src/{runner,engine}.rs` is
-committed and built (8.87 MB binary on both matias boxes, +40 KB vs
-baseline). Missing `model-00001-of-000064.safetensors` (949 MB on
-miner, contains `language_model.model.embed_tokens.weight` per the
-PR-#10 Int4Layer0 contract) is transferring miner→Mac→matias-02 in
-background. Once landed: restart both ranks, run 3-prompt bench,
-parse per-stage timings.
+**Hypothesis:** Per-stage breakdown will show expert dispatch >60% of
+per-token wall time.
+
+**Result: VERIFIED + over-shot.** Expert dispatch is **82%** of per-token
+decode time (much higher than predicted 60%). Other stages much smaller
+than estimated.
+
+**Bucket / candidate:** q1 — instrumentation (not a moonshot)
+**Campaign:** `campaigns/001_instrumentation_breakdown.yaml`
+**Bench:** `experiments/003_q1_instrumentation/bench.jsonl` —
+0.0550 tok/s aggregate, 3/3 quality (Paris/Pacific/four).
+Instrumentation overhead vs baseline 0.0553 = **-0.5%** (within noise,
+well below 5% budget).
+
+**Per-token decode breakdown (median of 24 late-sample steady-state events):**
+
+| Stage | ms | % of total |
+|-------|---:|-----------:|
+| Rank-0 layer 0 (embed + dense attn + KV) | 81 | 0.9% |
+| Rank-0 shell attention (30 layers) | 728 | 8.1% |
+| Rank-0 shell expert dispatch (30 × top-8) | 3,229 | 35.9% |
+| Rank-0 shells combine (residual + shared + moe) | <1 | <0.1% |
+| **Rank-0 compute subtotal** | **3,974** | **44.1%** |
+| Pure wire latency (Tailscale DERP) | 60 | 0.7% |
+| Rank-1 shell attention (30 layers) | 578 | 6.4% |
+| Rank-1 shell expert dispatch (30 × top-8) | 4,151 | 46.1% |
+| Rank-1 head (RMSNorm + lm_head OV IR) | 139 | 1.5% |
+| **Rank-1 compute subtotal** | **4,889** | **54.3%** |
+| **TOTAL PER-TOKEN DECODE** | **9,005** | **100%** |
+| **→ Implied decode tok/s (no prefill)** | | **0.111** |
+
+End-to-end bench tok/s = 0.055 because the API count includes prefill
+(prompts of 3-9 tokens, similar per-token cost as decode).
+
+**Variance** (min vs max over 46 samples):
+- Rank-0 experts: 2,098–7,770 ms (3.7× range)
+- Rank-1 experts: 1,517–9,003 ms (5.9× range)
+- All other stages: <1.5× range
+**→ Expert variance is dominated by disk-page-in on cold expert pages.**
+
+**Learning — re-ranking moonshots:**
+
+| Stage | % of decode | Tier-S re-rank | Rationale |
+|-------|------------:|----------------|-----------|
+| Expert dispatch | **82%** | **#1** | Single biggest knob. A2/A3 expert reduction directly attacks this. C1/C7 prefetch + prewarm reduce its variance. |
+| Shell attention | 14.5% | #3 | Second-biggest. F4 multi-thread per shell (rayon over 64 heads) is the obvious win. |
+| Wire | 0.7% | dropped | **D1 BF16 wire is not worth pursuing** — saving half of 0.7% = 0.35% delta. |
+| Async overlap | hides rank-1 | **#2** | D4 (start T+1 on rank-0 while rank-1 still on T) can hide the 4,889 ms of rank-1 compute — **up to 54%** of per-token time recovered. |
+| Layer 0 | 0.9% | skip | Negligible. |
+| Head | 1.5% | skip | Negligible. |
+
+**Next iteration (004):** First real moonshot = A3 (top-K reduction
+K=8 → K=4 or K=6). Lit (DeepSeek-V3 paper, KTransformers V0.3) reports
+10-25% throughput improvement at K=6 with negligible quality cost on
+sigmoid-router MoE. K2.6 is sigmoid-router family. Direct attack on
+the 82% bucket.
+
+---
+
+## 003-pre — q1 instrumentation EXECUTE (DEFERRED & RESOLVED 2026-05-17 ~14:00-14:34 PT)
+
+*Original deferred entry; superseded by the COMPLETE entry above. Kept
+for traceability of the multi-step iteration.*
 
 ---
 

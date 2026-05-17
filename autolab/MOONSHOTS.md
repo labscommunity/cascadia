@@ -10,12 +10,19 @@ required code-change scope, and the campaign ID it ultimately runs as
 After the baseline + iteration 001 (instrumentation), the loop attacks
 in this priority order. Tiers re-rank after each measured win/negative.
 
-### Tier S (start here — all three lit agents converged)
+### Tier S (RE-RANKED 2026-05-17 after q1 measurement — iteration 003)
+
+Measured per-token decode breakdown showed expert dispatch = 82% of
+wall time, wire = 0.7%. Tier-S now ranks by measured attack surface,
+not by lit consensus alone.
+
 | Order | ID | Note |
 |-:|----|------|
-| 1 | A2/A3 | Per-token expert reduction (sigmoid-threshold prune AND/OR top-K reduction K=8→K=6/K=4). Best-published 10-50% tok/s at <1% quality cost on DeepSeek-V3 (sigmoid router family, same as K2.6). |
-| 2 | D1   | F32 → BF16 inter-rank wire. Halves frame, essentially lossless per lit. |
-| 3 | D4   | Async pipeline overlap. PipeInfer/SpecPipe report 1.5-5x; expect ~2x on 2-stage. |
+| 1 | A3 | **Per-token top-K reduction (K=8 → K=6 / K=4).** Direct attack on the 82%-of-decode expert bucket. Lit says 10-25% (DeepSeek-V3 paper, KTransformers V0.3 `-ser`). K2.6 sigmoid router = same family. |
+| 2 | D4 | **Async pipeline overlap.** Rank-1 compute = 54% of per-token wall. Hide it by computing rank-0's token T+1 while rank-1 finishes T. PipeInfer style; expect 30-50% gain on 2-stage. |
+| 3 | F4 | **Multi-thread per shell (rayon over 64 heads).** Shell attention = 14.5%. AVX-512 + 8-thread parallelism could halve it. |
+| 4 | A2 | Per-token sigmoid-threshold pruning (variant of A3). Drop experts whose weight < threshold rather than fixed K. Lit says up to 50% with adaptive threshold; combine with A3 once K3 lands. |
+| - | ~~D1~~ | **DROPPED from Tier-S** — wire is only 0.7% of decode; even halving it = 0.35% gain. Not worth the integration risk. |
 
 ### Tier A (after Tier S)
 | Order | ID | Note |
