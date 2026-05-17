@@ -24,7 +24,7 @@ $prompts = @(
 function Try-Health {
     param([string]$Url)
     try {
-        $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 5 -ErrorAction Stop
+        $r = Invoke-WebRequest -Uri "$Url/health" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         return $r.StatusCode -eq 200
     } catch { return $false }
 }
