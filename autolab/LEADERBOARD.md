@@ -6,8 +6,10 @@ Best result per topology. Updated whenever a verified win lands.
 
 | Rank | tok/s | Config | Date | Campaign |
 |-----:|------:|--------|------|----------|
-| 1 | **0.1116** | **A3: K2.6 single-stage, --top-k-override 6** (3/3 quality) | 2026-05-17 | [005_a3_topk_miner](experiments/005_a3_topk_miner/) |
-| 2 | 0.0797 | K2.6 single-stage, top-8 baseline (3/3 quality) | 2026-05-17 | 005 K=8 reference run |
+| 1 | **0.1667** | **A3: K2.6 single-stage, --top-k-override 4** (3/3 quality, +109% vs K=8) | 2026-05-17 | [006_a3_topk_sweep](experiments/006_a3_topk_sweep/) |
+| 2 | 0.1116 | A3: K2.6 single-stage, --top-k-override 6 (3/3 quality, +40% vs K=8) | 2026-05-17 | [005_a3_topk_miner](experiments/005_a3_topk_miner/) |
+| 3 | 0.0797 | K2.6 single-stage, top-8 baseline (3/3 quality) | 2026-05-17 | 005 K=8 reference run |
+| (excl) | 0.2716 | A3 K=2 — +241% but 2/3 quality (substring fail on "four") | 2026-05-17 | 006 K=2 cliff probe |
 | - | ~0.11 | (historical) main @ 208104e single-stage from PR #7 | 2026-05-16 | (older reference) |
 
 ## 2-box (matias-02 + matias-03, Lunar Lake 258V × 2, Tailscale DERP)

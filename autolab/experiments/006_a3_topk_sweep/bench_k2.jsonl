@@ -1,0 +1,4 @@
+{"prompt":"The capital of France is","substr":"paris","content":" Paris. The capital of the United Kingdom","completion_tokens":8,"wall_ms":30461,"tok_per_sec":0.2626,"quality_pass":true}
+{"prompt":"The largest ocean on Earth is the","substr":"pacific","content":" Pacific Ocean, which covers an area of","completion_tokens":8,"wall_ms":32476,"tok_per_sec":0.2463,"quality_pass":true}
+{"prompt":"Two plus two equals","substr":"four","content":"? (A) 4 (B","completion_tokens":8,"wall_ms":25426,"tok_per_sec":0.3146,"quality_pass":false}
+{"aggregate":true,"total_tokens":24,"total_wall_ms":88363,"tok_per_sec":0.2716,"quality_pass":"2/3","timestamp_utc":"2026-05-17T23:37:50Z"}

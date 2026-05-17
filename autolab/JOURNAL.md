@@ -18,6 +18,38 @@ Entry template:
 
 ---
 
+## 006 — A3 top-K Pareto sweep on miner — K=4 LEADER (2026-05-17 ~18:38 PT)
+
+**Hypothesis:** Push K further than K=6 to find quality cliff.
+
+**Result:**
+| K | tok/s | Δ vs K=8 | Quality | Outcome |
+|--:|------:|---------:|---------|---------|
+| 8 | 0.0797 | (ref) | 3/3 | baseline |
+| 6 | 0.1116 | +40% | 3/3 | 005 win |
+| **4** | **0.1667** | **+109%** | **3/3** | **006 win** (new leader, L-magnitude) |
+| 2 | 0.2716 | +241% | 2/3 | quality cliff — "four" prompt format break |
+
+**K=4 is the productionizable sweet spot.** +109% throughput, no
+quality loss per substring eval, no code change needed by end users
+(just `--top-k-override 4`). Lit (DeepSeek-V3 paper) predicted this
+direction; we now have the concrete K2.6 / Intel CPU number.
+
+K=2 is interesting but breaks the substring quality gate (the model
+answered "Two plus two equals" with "? (A) 4 (B" — digit answer
+rather than word "four"; semantically correct, format wrong for our
+eval).
+
+Bench: `experiments/006_a3_topk_sweep/{bench_k4,bench_k2}.jsonl`
+Notes: `experiments/006_a3_topk_sweep/result.md`
+
+**Next (iteration 007):** A2 sigmoid-threshold pruning (drop experts
+whose routing weight < threshold rather than fixed K). Lit suggests
+this can outperform fixed-K reduction at same average K-active.
+Implementation: ~30 LOC in forward_shells; doesn't need 2-box.
+
+---
+
 ## 005 — A3 top-K reduction VERIFIED WIN on miner (2026-05-17 ~18:30 PT)
 
 **Hypothesis:** K=8→K=6 yields 15-25% tok/s improvement at <1% quality cost.
