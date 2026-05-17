@@ -57,6 +57,7 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            top_k_override: None,
         }
     }
 
