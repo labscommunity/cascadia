@@ -353,6 +353,20 @@ pub fn apply_rope_kimi_pub(x: &[f32], cos: &[f32], sin: &[f32], out: &mut [f32])
     apply_rope_kimi(x, cos, sin, out)
 }
 
+/// SwiGLU intermediate: `out[i] = silu(gate[i]) * up[i]` where
+/// `silu(g) = g / (1 + exp(-g))`. Used by every K2.6 MLP path —
+/// shell's shared expert, layer-0's dense MLP, and each routed
+/// expert. Lengths must match.
+pub fn swiglu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    for i in 0..gate.len() {
+        let g = gate[i];
+        let silu = g / (1.0f32 + (-g).exp());
+        out[i] = silu * up[i];
+    }
+}
+
 /// Apply RMSNorm with bf16 weights to an f32 vector, return f32.
 fn rmsnorm_apply(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
     assert_eq!(x.len(), dim);

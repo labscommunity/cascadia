@@ -469,11 +469,7 @@ pub fn shell_forward_decode_int4_with_capacity(
         &mut shared_up_out,
     );
     let mut shared_inter = vec![0.0f32; INTERMEDIATE_SHARED];
-    for i in 0..INTERMEDIATE_SHARED {
-        let g = shared_gate_out[i];
-        let silu = g / (1.0f32 + (-g).exp());
-        shared_inter[i] = silu * shared_up_out[i];
-    }
+    shell::swiglu_mul(&shared_gate_out, &shared_up_out, &mut shared_inter);
     let mut shared_out = vec![0.0f32; HIDDEN];
     dequant_gemv_int4_auto(
         &shell.shared_down_packed,
