@@ -525,6 +525,7 @@ impl Runner {
     /// The shape contract matches `forward_shells`: returns `[HIDDEN]`,
     /// already passed through attention + dense MLP + residual.
     pub fn forward_layer0_step(&mut self, token_id: i64) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
         let l0 = self.layer0.as_mut().ok_or_else(|| {
             RunnerError::Internal("forward_layer0_step on non-first stage".into())
         })?;
@@ -564,6 +565,8 @@ impl Runner {
         );
         l0.past_seq_len = past_seq_len + 1;
 
+        // autolab/k26-perf q1 instrumentation: per-token layer-0 timing.
+        info!(stage = "layer0", duration_us = _t0.elapsed().as_micros() as u64, past_seq_len, "stage_timing");
         Ok(outs.hidden_out)
     }
 
@@ -583,6 +586,10 @@ impl Runner {
         h_shape: &[usize],
         past_seq_len: usize,
     ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
+        let mut shell_attn_total_us: u64 = 0;
+        let mut experts_total_us: u64 = 0;
+        let mut combine_total_us: u64 = 0;
         let hidden = self.manifest.hidden_size as usize;
         let top_k = self.manifest.top_k as usize;
         if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != 1 || h_shape[2] != hidden {
@@ -616,6 +623,7 @@ impl Runner {
             // the same Cargo workspace. The `_with_capacity` variant
             // lets us pass a pre-allocated [H, capacity, D] buffer
             // with only the first `past_seq_len` slots populated.
+            let shell_t0 = Instant::now();
             let outs = shell_forward_decode_int4_with_capacity(
                 &self.layers[i].int4_shell,
                 &h_f32,
@@ -624,6 +632,7 @@ impl Runner {
                 past_seq_len,
                 capacity,
             );
+            shell_attn_total_us += shell_t0.elapsed().as_micros() as u64;
 
             // Write present_k / present_v into the existing capacity
             // buffer at slot `past_seq_len` for each head. No alloc.
@@ -655,6 +664,7 @@ impl Runner {
                     top_k
                 )));
             }
+            let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
             for k in 0..top_k {
                 let eid = outs.routing_ids[k] as u32;
@@ -664,13 +674,27 @@ impl Runner {
                     moe[j] += w * y_f32[j];
                 }
             }
+            experts_total_us += experts_t0.elapsed().as_micros() as u64;
 
             // Combine: h_next = residual + shared + moe (single token).
+            let combine_t0 = Instant::now();
             for j in 0..hidden {
                 h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
             }
+            combine_total_us += combine_t0.elapsed().as_micros() as u64;
         }
 
+        // autolab/k26-perf q1 instrumentation: per-token shells breakdown.
+        info!(
+            stage = "shells",
+            n_layers,
+            top_k,
+            shell_attn_us = shell_attn_total_us,
+            experts_us = experts_total_us,
+            combine_us = combine_total_us,
+            total_us = _t0.elapsed().as_micros() as u64,
+            "stage_timing"
+        );
         Ok(h_f32)
     }
 
@@ -682,6 +706,7 @@ impl Runner {
         h_f32: &[f32],
         tail_len: usize,
     ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
         let hidden = self.manifest.hidden_size as usize;
         if tail_len == 0 || h_f32.len() < tail_len * hidden {
             return Err(RunnerError::Internal(format!(
@@ -713,6 +738,8 @@ impl Runner {
             DType::Bf16 => bf16_bytes_to_f32(&head_bytes),
             _ => return Err(RunnerError::Internal(format!("head dtype {:?}", head_dt))),
         };
+        // autolab/k26-perf q1 instrumentation: per-token head timing.
+        info!(stage = "head", duration_us = _t0.elapsed().as_micros() as u64, tail_len, "stage_timing");
         Ok(logits)
     }
 

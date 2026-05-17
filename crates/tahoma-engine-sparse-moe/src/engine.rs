@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -673,7 +673,9 @@ impl SparseMoEEngine {
             .map_err(|e| format!("forward_shells: {e}"))?;
 
         // Send hidden downstream and wait for token to come back.
-        self.block_on(async {
+        // autolab/k26-perf q1 instrumentation: split timing of send vs round-trip.
+        let wire_t0 = Instant::now();
+        let result = self.block_on(async {
             send_forward(
                 downstream,
                 past_seq_len,
@@ -683,18 +685,33 @@ impl SparseMoEEngine {
             )
             .await
             .map_err(|e| format!("send_forward: {e}"))?;
+            let send_done_us = wire_t0.elapsed().as_micros() as u64;
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => {
                     let token = recv_token_body_client(downstream)
                         .await
                         .map_err(|e| format!("recv_token: {e}"))?;
-                    Ok(token)
+                    Ok((token, send_done_us))
                 }
                 Ok(Some(other)) => Err(format!("unexpected frame after forward: {other:?}")),
                 Ok(None) => Err("downstream closed during recv_kind".into()),
                 Err(e) => Err(format!("recv_kind: {e}")),
             }
-        })
+        });
+        match result {
+            Ok((token, send_done_us)) => {
+                let total_wire_us = wire_t0.elapsed().as_micros() as u64;
+                info!(
+                    stage = "rank0_wire",
+                    send_done_us,
+                    total_wire_us,
+                    downstream_compute_us = total_wire_us.saturating_sub(send_done_us),
+                    "stage_timing"
+                );
+                Ok(token)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Worker step: process exactly one frame from upstream and emit

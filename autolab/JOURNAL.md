@@ -18,33 +18,83 @@ Entry template:
 
 ---
 
-## 002 — q1 instrumentation (LAUNCHED 2026-05-17 ~13:40 PT, awaiting fresh-context execution)
+## 003 — q1 instrumentation EXECUTE (LAUNCHED 2026-05-17 ~14:00 PT, fix-forward from 002)
 
-**Hypothesis (to be tested):** Per-stage time breakdown on the 2-box K2.6
-pipeline will show expert dispatch dominates >60% of per-token wall time,
-with shell attention ~20%, cross-rank wire <5%, and the remainder split
-between layer 0, head, sampling. The disk-page-in latency on cold
-expert pages is the long-tail variance source.
+**Picked up from iteration 002's infrastructure blocker.** Instrumentation
+patch in `crates/tahoma-engine-sparse-moe/src/{runner,engine}.rs` is
+committed and built (8.87 MB binary on both matias boxes, +40 KB vs
+baseline). Missing `model-00001-of-000064.safetensors` (949 MB on
+miner, contains `language_model.model.embed_tokens.weight` per the
+PR-#10 Int4Layer0 contract) is transferring miner→Mac→matias-02 in
+background. Once landed: restart both ranks, run 3-prompt bench,
+parse per-stage timings.
 
-**Bucket / candidate:** q1 — instrumentation (not a moonshot; ranks
-downstream moonshots by which stage they attack)
+---
+
+## 002 — q1 instrumentation patch + infrastructure discovery (2026-05-17 ~14:00 PT)
+
+**Hypothesis:** Per-stage breakdown on 2-box K2.6 pipeline will show
+expert dispatch >60% of per-token wall time. (Test deferred to 003 —
+this iteration uncovered an infrastructure blocker that had to be
+resolved first.)
+
+**Bucket / candidate:** q1 — instrumentation (not a moonshot)
 **Campaign:** `campaigns/001_instrumentation_breakdown.yaml`
-**Status:** ORIENT + HYPOTHESIS done in iteration-002-launch turn.
-EXECUTE phase to fire in next /loop wake-up (fresh context):
-1. Add `Instant`-based timing in `runner.rs::step()` + `forward_shells()`
-2. `git archive` source to matias-02 + matias-03, `cargo build --release`
-3. Restart workers via `bench/start_workers.sh`
-4. Run `bench/k26_3prompt_eval.ps1` against instrumented binary
-5. Parse rank-0 + rank-1 log per-stage timings
-6. Verify instrumentation overhead < 5% vs baseline 0.0553 tok/s
-7. Update PRIOR_ART.md "Where the time goes" with measured numbers
-8. Reorder MOONSHOTS Tier-S based on stage attribution
-9. Document + commit + maybe push (8 commits since last push as of now)
+**Literature:** none required.
+**Code change:** runner.rs + engine.rs, +48 LOC net
+- `forward_layer0_step`: wrap in `Instant`, log `stage="layer0", duration_us`
+- `forward_shells`: per-layer accumulators for shell_attn_us + experts_us +
+  combine_us, log aggregate at function exit with `stage="shells"`
+- `forward_head_last`: wrap in `Instant`, log `stage="head", duration_us`
+- `engine.rs` rank-0 driver: split timing of `send_forward` vs
+  full round-trip to log `stage="rank0_wire", send_done_us,
+  downstream_compute_us`
+Each emits a `tracing::info!` line per token. ~1 µs overhead each;
+budget << 5%.
 
-**Why deferred to next wake:** Context budget — the setup + baseline
-work in this session is at ~70% of context limit. Iteration 002's
-execution phase (patch + build + deploy + bench + analyze) is best
-done in a fresh ~1M context.
+**Result: PARKED → 003 (infrastructure blocker discovered + mitigation in flight)**
+
+**What happened:**
+1. ✓ Patched runner.rs + engine.rs locally
+2. ✓ Built on matias-02 + matias-03 with `--features openvino`
+   - matias-03 built clean (8.87 MB)
+   - matias-02 failed first attempt because old tahoma.exe was in use
+     (Windows can't overwrite running binary; classic). Killed PID 7620,
+     rebuilt clean (8.87 MB)
+3. ✓ Rank-1 started cleanly on matias-03 (foreground SSH + run_in_background
+   pattern; the original `Start-Process powershell -WindowStyle Hidden`
+   chain was silently dying in the detached powershell — possibly an SSH
+   session/PowerShell lifecycle interaction)
+4. ✗ Rank-0 startup failed: `Error: backend error: runner load: internal:
+   safetensors layer0: io: The system cannot find the file specified
+   (os error 2)`
+5. ✓ Root cause: PR #10's `Int4Layer0` requires the safetensors source
+   for layer-0 dense tensors + `embed_tokens` table. Pre-PR-#10 layer 0
+   used the OV IR (no safetensors needed) which is what matias-02 was
+   originally provisioned for. Inventory showed matias-02 has shards
+   2-31 but is missing model-00001 (the shard with embed_tokens).
+6. ✓ model-00001-of-000064.safetensors on miner is only **949 MB**
+   (much smaller than the typical ~9.3 GB shard — embed_tokens layout
+   compresses it). Initiated transfer miner→Mac→matias-02.
+
+**Learning:**
+- **Deploy contract drift.** PR #10 added a new runtime dependency
+  (safetensors source for layer 0) that wasn't surfaced as a deployment
+  requirement. Future PRs that add asset dependencies should explicitly
+  list the new files in PR description + deploy docs. Added to follow-up.
+- **Start-Process detach over SSH is unreliable** for long-running
+  Windows processes. The pattern `ssh "powershell ... Start-Process -WindowStyle Hidden"`
+  was silently losing the child. Replaced with `ssh "powershell -File <wrapper>" &
+  bash run_in_background` — SSH session stays alive while child runs;
+  log redirection captures all output reliably. Updated `start_workers.sh`
+  semantics for future iterations.
+- **Windows binary swap requires process termination first.** Cargo build
+  errors with "Access is denied" if the .exe is in use. Kill tahoma
+  BEFORE every rebuild on Windows.
+
+**Next:** 003 picks up after transfer completes. Restart workers (matias-02
+rank-0 will now find model-00001), run bench, parse per-stage timing,
+verify <5% instrumentation overhead vs baseline 0.0553 tok/s.
 
 ---
 
