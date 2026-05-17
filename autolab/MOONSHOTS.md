@@ -5,6 +5,39 @@ one-liner, expected delta direction + magnitude class, risk axis,
 required code-change scope, and the campaign ID it ultimately runs as
 (filled in when designed).
 
+## Execution order (refined by [[LITERATURE]] cross-agent consensus, 2026-05-17)
+
+After the baseline + iteration 001 (instrumentation), the loop attacks
+in this priority order. Tiers re-rank after each measured win/negative.
+
+### Tier S (start here — all three lit agents converged)
+| Order | ID | Note |
+|-:|----|------|
+| 1 | A2/A3 | Per-token expert reduction (sigmoid-threshold prune AND/OR top-K reduction K=8→K=6/K=4). Best-published 10-50% tok/s at <1% quality cost on DeepSeek-V3 (sigmoid router family, same as K2.6). |
+| 2 | D1   | F32 → BF16 inter-rank wire. Halves frame, essentially lossless per lit. |
+| 3 | D4   | Async pipeline overlap. PipeInfer/SpecPipe report 1.5-5x; expect ~2x on 2-stage. |
+
+### Tier A (after Tier S)
+| Order | ID | Note |
+|-:|----|------|
+| 4 | D9 | DERP relay → direct WireGuard. 22ms→<10ms RTT. |
+| 5 | C1 | ProMoE-style speculative expert prefetch (MLP predictor). |
+| 6 | A8 | MLA KV INT8 with Hadamard rotation (per MHA2MLA). Bare INT8 without rotation breaks (vLLM Kimi-K2.5 case). |
+| 7 | E2 | Heterogeneous layer split (per-stage profile-driven). |
+
+### Tier B (worthwhile but defer)
+| Order | ID | Note |
+|-:|----|------|
+| 8 | E6 | iGPU offload of layer 0 / shared experts via OV 2026.0 MoE GA. |
+| 9 | E7 | NPU offload of router/gate (Lunar Lake NPU + OV 2026.0). |
+| 10 | A7 | EAQuant per-expert calibration if/when re-quantizing. |
+
+### Tier C — confirmed dead by lit; do NOT re-test
+- ❌ MXFP4 on Intel CPU (no Blackwell, RTN MXFP4 worse than INT4)
+- ❌ Tree-spec on current draft architecture (PR #4 d3)
+- ❌ TP over Lunar-Lake fabric (PR #4 d4)
+- ❌ GPipe-style micro-batching for single-user decode
+
 **Classes:**
 - `XS` <5% expected delta — defensible micro-opt
 - `S` 5-20% — solid eng-level win
