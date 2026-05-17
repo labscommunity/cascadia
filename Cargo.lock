@@ -2342,6 +2342,7 @@ dependencies = [
  "tahoma-engine",
  "tahoma-int4-gemm",
  "tahoma-ov-genai-shim",
+ "tahoma-transport",
  "tahoma-types",
  "tempfile",
  "thiserror 1.0.69",

@@ -15,6 +15,7 @@ tahoma-types = { workspace = true }
 tahoma-engine = { workspace = true }
 tahoma-ov-genai-shim = { workspace = true }
 tahoma-int4-gemm = { workspace = true }
+tahoma-transport = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
