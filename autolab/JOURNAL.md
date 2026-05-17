@@ -18,6 +18,71 @@ Entry template:
 
 ---
 
+## 004 — A3 top-K reduction PARTIAL (2026-05-17 ~14:34 to 15:50 PT, parked on infra)
+
+**Hypothesis:** K=8→K=6 yields 15-25% end-to-end tok/s improvement
+(experts are 82% of decode per q1; reducing 8→6 = -25% experts ≈
+-20% wall time).
+
+**Bucket / candidate:** A3 (Tier-S #1 per iteration 003 ranking)
+**Campaign:** `campaigns/004_a3_topk_reduction.yaml`
+
+**Implementation: SHIPPED + VERIFIED at the per-stage level.**
+- `--top-k-override` CLI flag on `tahoma worker` (commit `db85e74`)
+- Plumbing: `WorkerArgs.top_k_override` → `SparseMoEBuilderConfig.top_k_override`
+  → `Runner::set_top_k_override` → `forward_shells::effective_top_k`
+- `TAHOMA_TOPK` env var in `start_rank{0,1}.ps1` wrappers
+- Per-token shell breakdown CONFIRMS the override is active:
+  `stage_timing shells ... top_k=8 effective_top_k=6 ... experts_us=1,734,411`
+  (vs baseline K=8 experts_us=3,229,000 = **-46%** on the warmup token's experts dispatch)
+
+**Bench: BLOCKED on infrastructure** — could not complete a 3-prompt
+eval. Tailscale DERP relay between matias-02 ↔ matias-03 went into a
+degraded state during this iteration; pattern reproduced at BOTH K=6
+and K=8:
+
+- First request's first token round-trip succeeds (rank-1 logs shells
+  + head completion, sends Token upstream)
+- Second round-trip onward: rank-0's `recv_kind_client` hangs forever
+  (no client-side timeout); rank-1 keeps logging 60-second
+  `recv_kind: recv_exact timed out after 60s` cycles.
+- `Test-NetConnection matias-03:9100` returns True (TCP socket-level
+  works); `tailscale ping -c 3 100.123.40.123` reports "direct
+  connection not established" — DERP-relay-only path, asymmetric byte
+  counts (tx 6.6M / rx 341K cumulative).
+- Restarting Tailscale on both boxes (`tailscale down; tailscale up
+  --reset`) is in flight; will retry bench when peer link is back.
+
+**Learning (infra):**
+1. `recv_kind_client` has no client-side timeout (only the server side
+   has 60s). For autolab iteration robustness, future fix-forward
+   should add a client-side recv timeout so hangs surface as errors
+   instead of indefinite blocks. Filing as follow-up.
+2. Multiple kill/restart cycles of tahoma workers seem to leave
+   Tailscale DERP connection in a degraded state. Resetting Tailscale
+   (`down; up --reset`) before restarting workers may be the right
+   cycle for autolab iterations.
+
+**Status: PARKED** awaiting Tailscale link recovery. Will retry K=6
+bench in iteration 005; if successful and quality 3/3, also try K=4.
+
+**Per-stage data captured (single warmup token, K=6 with effective_top_k=6):**
+
+| Stage | K=6 (this iter) | K=8 baseline (iter 003) | Δ |
+|-------|----------------:|------------------------:|---:|
+| Rank-0 layer 0 | 80 ms | 81 ms | -1% |
+| Rank-0 shell attn | 696 ms | 728 ms | -4% |
+| Rank-0 shell experts | **1,734 ms** | **3,229 ms** | **-46%** |
+| Rank-0 shells total | 2,436 ms | 3,974 ms | -39% |
+
+The 46% drop in expert dispatch time at K=6 (vs the expected 25%
+proportional to expert-count reduction) is probably partly disk-cache
+effects (different runs, different cold-page mix) and partly the smaller
+effective working set. Encouraging signal but needs end-to-end bench to
+confirm.
+
+---
+
 ## 003 — q1 instrumentation COMPLETE (2026-05-17 ~14:34 PT)
 
 **Hypothesis:** Per-stage breakdown will show expert dispatch >60% of
