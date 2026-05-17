@@ -223,6 +223,11 @@ pub struct Runner {
     /// we just skip the dispatch of the tail. Sigmoid-router models
     /// (K2.6 / DeepSeek-V3) tolerate this with minimal quality loss.
     top_k_override: Option<u32>,
+    /// autolab campaign 007 (A2): if Some(t) with t > 0, skip experts
+    /// whose routing weight falls below t. Applied AFTER top_k_override.
+    /// Per-token effective K varies; safer than fixed K if router
+    /// confidence is uneven.
+    routing_threshold: Option<f32>,
 }
 
 impl Runner {
@@ -399,6 +404,7 @@ impl Runner {
             experts,
             _safetensors_source: safetensors_source,
             top_k_override: None,
+            routing_threshold: None,
         })
     }
 
@@ -412,6 +418,14 @@ impl Runner {
             manifest_top_k = self.manifest.top_k,
             "set_top_k_override"
         );
+    }
+
+    /// Set the per-token routing-weight threshold (A2). None / 0.0 = disabled.
+    /// Experts whose routing weight is < threshold are skipped during
+    /// forward_shells dispatch.
+    pub fn set_routing_threshold(&mut self, v: Option<f32>) {
+        self.routing_threshold = v.filter(|t| *t > 0.0);
+        info!(routing_threshold = ?self.routing_threshold, "set_routing_threshold");
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -693,9 +707,16 @@ impl Runner {
             }
             let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
+            // autolab campaign 007 (A2): apply routing-weight threshold.
+            // We still iterate over `effective_top_k` to honor the A3 cap,
+            // but skip experts below the threshold within that range.
+            let threshold = self.routing_threshold.unwrap_or(0.0);
             for k in 0..effective_top_k {
-                let eid = outs.routing_ids[k] as u32;
                 let w = outs.routing_weights[k];
+                if w < threshold {
+                    continue;
+                }
+                let eid = outs.routing_ids[k] as u32;
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];

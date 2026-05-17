@@ -46,6 +46,9 @@ pub struct SparseMoEBuilderConfig {
     /// token are dispatched per shell layer. Plumbed into Runner; effective
     /// at every `forward_shells` call. Used by autolab campaign 004 (A3).
     pub top_k_override: Option<u32>,
+    /// Skip experts whose router weight falls below this threshold (A2).
+    /// 0.0 / None = disabled. Applied AFTER top_k_override.
+    pub routing_threshold: Option<f32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -58,6 +61,7 @@ impl SparseMoEBuilderConfig {
             rank: 0,
             total: 1,
             top_k_override: None,
+            routing_threshold: None,
         }
     }
 
@@ -236,6 +240,9 @@ impl Builder for SparseMoEBuilder {
         // autolab campaign 004 (A3): plumb the top-K override into the runner
         // so per-token forward_shells dispatches only k' experts.
         runner.set_top_k_override(self.config.top_k_override);
+        // autolab campaign 007 (A2): plumb the routing-weight threshold so
+        // forward_shells skips experts below the threshold per token.
+        runner.set_routing_threshold(self.config.routing_threshold);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

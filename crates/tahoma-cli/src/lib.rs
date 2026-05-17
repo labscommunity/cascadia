@@ -140,6 +140,15 @@ pub struct WorkerArgs {
     /// minimal quality loss; see autolab campaign 004.
     #[arg(long)]
     pub top_k_override: Option<u32>,
+
+    /// Skip experts whose router weight falls below this threshold
+    /// (sparse-moe engine only). 0.0 = disabled. Applied after
+    /// top_k_override, so the effective set is the routed top-K whose
+    /// routing weight >= threshold. Variant of A3, lit-supported as
+    /// outperforming fixed-K reduction for sigmoid routers. See
+    /// autolab campaign 007.
+    #[arg(long)]
+    pub routing_threshold: Option<f32>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -331,6 +340,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 cfg.cache_dir = Some(dir.clone());
             }
             cfg.top_k_override = args.top_k_override;
+            cfg.routing_threshold = args.routing_threshold;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }
