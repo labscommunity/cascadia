@@ -12,7 +12,16 @@ Best result per topology. Updated whenever a verified win lands.
 
 | Rank | tok/s | Config | Date | Campaign |
 |-----:|------:|--------|------|----------|
-| 1 | ~0.05 | main @ 208104e, 30/30 split, fp32 KV, K=1, F32 hidden wire | 2026-05-17 | (baseline from PR #9) |
+| 1 | **0.0553** | main @ 208104e, 30/30 split, fp32 KV, K=1, F32 hidden wire | 2026-05-17 | [000_baseline_main](campaigns/000_baseline_main.yaml) |
+
+### Per-prompt detail (campaign 000)
+
+| Prompt | wall (s) | tok | tok/s | quality |
+|--------|---------:|----:|------:|---------|
+| Paris       | 123.06 | 8 | **0.065** | ✓ paris   |
+| Pacific     | 170.09 | 8 | **0.047** | ✓ pacific |
+| four        | 140.93 | 8 | **0.057** | ✓ four    |
+| **AGG**     | **434.09** | **24** | **0.055** | **3/3** |
 
 ## 3-box (matias-02 + 03 + extra cascadia box) — staging required
 

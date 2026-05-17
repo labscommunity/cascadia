@@ -1,0 +1,6 @@
+
+{"content":" Paris. The capital of Germany is Berlin","quality_pass":true,"wall_ms":123064,"completion_tokens":0,"prompt":"The capital of France is","tok_per_sec":0,"substr":"paris"}
+{"content":" Pacific Ocean. The Pacific Ocean covers an","quality_pass":true,"wall_ms":170092,"completion_tokens":0,"prompt":"The largest ocean on Earth is the","tok_per_sec":0,"substr":"pacific"}
+{"content":" four. True or false?\nAssistant:","quality_pass":true,"wall_ms":140929,"completion_tokens":0,"prompt":"Two plus two equals","tok_per_sec":0,"substr":"four"}
+{"total_tokens":0,"aggregate":true,"timestamp_utc":"2026-05-17T20:36:29.1677682Z","tok_per_sec":0,"total_wall_ms":434085,"quality_pass":"3/3"}
+

@@ -1,5 +1,5 @@
 {
-  "iteration": 0,
+  "iteration": 1,
   "moonshots_attempted": 0,
   "moonshots_target": 100,
   "moonshot_class_counts": {
@@ -17,10 +17,16 @@
   "moonshot_ratio": 0.0,
   "consecutive_no_improvement": 0,
   "current_leader": {
-    "tok_per_sec": 0.05,
-    "config": "main @ 208104e, 2-box matias-02+03, K2.6 fp32 KV, top-8, K=1",
-    "campaign": null
+    "tok_per_sec": 0.0553,
+    "config": "main @ 208104e, 2-box matias-02+03, K2.6 fp32 KV, top-8, K=1, F32 hidden wire, 30/30 split",
+    "campaign": "000_baseline_main",
+    "per_prompt": {
+      "paris":   {"wall_s": 123.06, "tokens": 8, "tok_per_sec": 0.0650, "quality": true},
+      "pacific": {"wall_s": 170.09, "tokens": 8, "tok_per_sec": 0.0470, "quality": true},
+      "four":    {"wall_s": 140.93, "tokens": 8, "tok_per_sec": 0.0568, "quality": true}
+    },
+    "measured_at_utc": "2026-05-17T20:36:29Z"
   },
-  "started_at_utc": "2026-05-17T00:00:00Z",
-  "last_iteration_at_utc": null
+  "started_at_utc": "2026-05-17T19:45:00Z",
+  "last_iteration_at_utc": "2026-05-17T20:36:29Z"
 }
