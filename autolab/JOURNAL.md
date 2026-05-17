@@ -18,6 +18,33 @@ Entry template:
 
 ---
 
+## 007 — A2 routing-threshold sweep — NEUTRAL (A3 K=4 still leader, 2026-05-17 ~18:57 PT)
+
+**Hypothesis:** Variable per-token K via sigmoid-weight threshold could
+outperform fixed-K=4 by adapting to per-token router confidence.
+
+**Result: neutral.** A2 works mechanically:
+- `--routing-threshold 0.05`: 0.0645 tok/s (drops 0 experts, noise from K=8)
+- `--routing-threshold 0.2`:  0.1043 tok/s (+31% vs K=8, drops ~2 experts)
+- (vs A3 K=4 leader: 0.1667 tok/s, +109%)
+
+A3 fixed-K=4 dominates the Pareto. K2.6's sigmoid weights appear
+relatively uniform across top-8, so dropping experts by absolute
+threshold is no better than just capping at K=4. The two flags
+compose (`--top-k-override 4 --routing-threshold X`) for future
+adaptive workloads but don't improve the single-prompt sweep here.
+
+Bench: `experiments/007_a2_routing_threshold/{bench_thr05,bench_thr2}.jsonl`
+Notes: `experiments/007_a2_routing_threshold/result.md`
+
+**Next (iteration 008):** F4 multi-thread per shell. Attacks the
+14.5% attention bucket (728 ms rank-0 + 578 ms rank-1 per q1).
+rayon over the 64 attention heads should halve shell_attn time
+on the 24-core Xeon Gold 6252 miner. Different bucket from A3, so
+expected to compose with A3 K=4 leader.
+
+---
+
 ## 006 — A3 top-K Pareto sweep on miner — K=4 LEADER (2026-05-17 ~18:38 PT)
 
 **Hypothesis:** Push K further than K=6 to find quality cliff.

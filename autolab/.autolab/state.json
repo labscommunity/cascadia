@@ -1,22 +1,22 @@
 {
-  "iteration": 6,
-  "moonshots_attempted": 4,
+  "iteration": 7,
+  "moonshots_attempted": 6,
   "moonshots_target": 100,
   "moonshot_class_counts": {
     "win": 2,
-    "neutral": 0,
+    "neutral": 2,
     "negative": 1,
     "parked": 1
   },
   "moonshot_magnitude_counts": {
     "XS": 0,
-    "S": 0,
+    "S": 1,
     "M": 1,
     "L": 1,
     "XL": 0
   },
-  "moonshot_ratio": 0.75,
-  "consecutive_no_improvement": 0,
+  "moonshot_ratio": 0.67,
+  "consecutive_no_improvement": 1,
   "current_leader": {
     "tok_per_sec": 0.1667,
     "config": "A3 K=4 on miner single-stage (--top-k-override 4)",
