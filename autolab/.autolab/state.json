@@ -1,0 +1,26 @@
+{
+  "iteration": 0,
+  "moonshots_attempted": 0,
+  "moonshots_target": 100,
+  "moonshot_class_counts": {
+    "win": 0,
+    "neutral": 0,
+    "negative": 0
+  },
+  "moonshot_magnitude_counts": {
+    "XS": 0,
+    "S": 0,
+    "M": 0,
+    "L": 0,
+    "XL": 0
+  },
+  "moonshot_ratio": 0.0,
+  "consecutive_no_improvement": 0,
+  "current_leader": {
+    "tok_per_sec": 0.05,
+    "config": "main @ 208104e, 2-box matias-02+03, K2.6 fp32 KV, top-8, K=1",
+    "campaign": null
+  },
+  "started_at_utc": "2026-05-17T00:00:00Z",
+  "last_iteration_at_utc": null
+}
