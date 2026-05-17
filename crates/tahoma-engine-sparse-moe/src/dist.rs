@@ -16,6 +16,12 @@
 //!
 //! `Forward` is the workhorse: one per decoded token. Body:
 //!   - 4 B big-endian u32 past_seq_len
+//!   - 28 B SamplingConfig payload (see [`SamplingWire`]):
+//!       - 4 B f32 BE temperature
+//!       - 4 B f32 BE top_p
+//!       - 4 B f32 BE repetition_penalty
+//!       - 8 B u64 BE repetition_window
+//!       - 8 B u64 BE seed (0 sentinel = no seed / use entropy)
 //!   - F32 hidden tensor [1, 1, hidden_size]
 //!
 //! `Reset` clears KV state on downstream for a new generation. No body.
@@ -31,15 +37,27 @@ use tahoma_transport::{
 };
 use tokio::sync::Mutex;
 
+use crate::sampling::SamplingConfig;
+
 /// 4-byte big-endian frame kinds. Chosen to be disjoint from
 /// `dist_spec`'s `FrameKind` so a stray cross-engine connection would
 /// fail fast on an unrecognized code.
+///
+/// Versioning convention: the low byte of `Forward` is bumped whenever
+/// the Forward body layout changes in a wire-incompatible way. Old
+/// peers reject the new code at `parse_kind` rather than mis-parsing
+/// the body. `Reset` / `Token` have stable bodies and don't need
+/// versioning.
+///
+/// History:
+/// - 0x01 — past_seq_len + hidden tensor only (pre-PR #10)
+/// - 0x02 — adds 28-byte SamplingConfig between past_seq_len and tensor (PR #10)
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    Forward = 0x53_4D_45_01, // "SME\x01"
-    Reset = 0x53_4D_45_02,   // "SME\x02"
-    Token = 0x53_4D_45_03,   // "SME\x03"
+    Forward = 0x53_4D_45_02, // "SME\x02"
+    Reset = 0x53_4D_45_10,   // "SME\x10"
+    Token = 0x53_4D_45_20,   // "SME\x20"
 }
 
 impl FrameKind {
@@ -81,13 +99,12 @@ pub async fn recv_kind_client(cli: &Mutex<ActivationClient>) -> TransportResult<
 }
 
 fn parse_kind(bytes: &[u8]) -> TransportResult<FrameKind> {
-    if bytes.len() != 4 {
-        return Err(TransportError::SocketClosed);
-    }
+    // `recv_raw(4)` always returns exactly 4 bytes on success.
+    debug_assert_eq!(bytes.len(), 4);
     let code = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     FrameKind::from_code(code).ok_or_else(|| {
         TransportError::Io(std::io::Error::other(format!(
-            "unknown sparse-MoE frame kind 0x{code:08x}"
+            "unknown sparse-MoE frame kind 0x{code:08x}; peer may be on an older Forward layout"
         )))
     })
 }
@@ -116,16 +133,82 @@ fn tensor_to_hidden(t: &Tensor) -> TransportResult<(Vec<f32>, [u32; 3])> {
     Ok((out, t.shape))
 }
 
-/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + hidden tensor.
+/// On-wire encoding of `SamplingConfig`. Fixed 28 bytes BE; the `seed`
+/// field uses 0 as the sentinel for "no seed" (the engine treats 0 as
+/// invalid anyway — `init_rng` clamps to `max(seed, 1)`).
+pub const SAMPLING_WIRE_BYTES: usize = 28;
+
+pub fn encode_sampling(cfg: &SamplingConfig, out: &mut [u8; SAMPLING_WIRE_BYTES]) {
+    out[0..4].copy_from_slice(&cfg.temperature.to_be_bytes());
+    out[4..8].copy_from_slice(&cfg.top_p.to_be_bytes());
+    out[8..12].copy_from_slice(&cfg.repetition_penalty.to_be_bytes());
+    out[12..20].copy_from_slice(&(cfg.repetition_window as u64).to_be_bytes());
+    let seed = cfg.seed.unwrap_or(0);
+    out[20..28].copy_from_slice(&seed.to_be_bytes());
+}
+
+pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
+    // Defensive: a malformed or out-of-version peer could send NaN /
+    // negative / out-of-range values that would silently poison the
+    // sampler (NaN temperature → 1/NaN → all logits NaN → argmax 0
+    // every step). Clamp each f32 field to its valid domain and drop
+    // NaN to the default.
+    let temperature = sanitize_f32(
+        f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        0.0,
+        0.0,
+    );
+    let top_p = sanitize_f32(
+        f32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        1.0,
+        0.0,
+    )
+    .min(1.0);
+    let repetition_penalty = sanitize_f32(
+        f32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        1.0,
+        0.0,
+    );
+    let rep_window = u64::from_be_bytes([
+        bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
+    ]) as usize;
+    let seed_raw = u64::from_be_bytes([
+        bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
+    ]);
+    SamplingConfig {
+        temperature,
+        top_p,
+        repetition_penalty,
+        repetition_window: rep_window,
+        seed: if seed_raw == 0 { None } else { Some(seed_raw) },
+    }
+}
+
+/// Replace NaN / -inf / values below `min` with `fallback`. Used by
+/// `decode_sampling` to keep wire input from poisoning the sampler.
+fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
+    if x.is_nan() || x < min {
+        fallback
+    } else {
+        x
+    }
+}
+
+/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
+/// SamplingConfig + hidden tensor.
 pub async fn send_forward(
     cli: &Mutex<ActivationClient>,
     past_seq_len: u32,
+    sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
 ) -> TransportResult<()> {
-    let mut header = [0u8; 8];
+    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES];
     header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[8..8 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
     let tensor = hidden_to_tensor(hidden_f32, hidden_shape);
     let mut guard = cli.lock().await;
     guard.send_raw(&header).await?;
@@ -134,20 +217,24 @@ pub async fn send_forward(
 }
 
 /// Receive a Forward frame's body (the kind code has already been
-/// consumed by `recv_kind_*`). Returns `(past_seq_len, hidden_f32, shape)`.
+/// consumed by `recv_kind_*`). Returns
+/// `(past_seq_len, sampling, hidden_f32, shape)`.
 pub async fn recv_forward_body_server(
     srv: &Mutex<ActivationServer>,
-) -> TransportResult<(u32, Vec<f32>, [u32; 3])> {
+) -> TransportResult<(u32, SamplingConfig, Vec<f32>, [u32; 3])> {
     let mut guard = srv.lock().await;
-    let raw = guard.recv_raw(4).await?;
-    if raw.len() != 4 {
+    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 4 + SAMPLING_WIRE_BYTES {
         return Err(TransportError::SocketClosed);
     }
     let past_seq_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[4..4 + SAMPLING_WIRE_BYTES]);
+    let sampling = decode_sampling(&sbytes);
     let (tensor, _) = guard.recv().await?;
     drop(guard);
     let (h, shape) = tensor_to_hidden(&tensor)?;
-    Ok((past_seq_len, h, shape))
+    Ok((past_seq_len, sampling, h, shape))
 }
 
 /// Send a Reset frame downstream — clears KV state for a new task.

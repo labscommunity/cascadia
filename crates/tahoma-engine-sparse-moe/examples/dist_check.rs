@@ -75,7 +75,8 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
                 println!("[server] recv RESET");
             }
             FrameKind::Forward => {
-                let (past_seq_len, hidden, shape) = recv_forward_body_server(&server).await?;
+                let (past_seq_len, _sampling, hidden, shape) =
+                    recv_forward_body_server(&server).await?;
                 let mean: f32 = hidden.iter().copied().sum::<f32>() / hidden.len() as f32;
                 frame_count += 1;
                 // Synthesise a "sampled" token from the input — XOR of
@@ -122,8 +123,9 @@ async fn run_client(peer: &str, port: u16, rounds: u32) -> Result<(), Box<dyn st
         for (i, v) in hidden.iter_mut().enumerate() {
             *v = (i as f32) * 0.0001 + (round as f32) * 0.01;
         }
+        let cfg = tahoma_engine_sparse_moe::SamplingConfig::default();
         let t0 = Instant::now();
-        send_forward(&client, round, &hidden, shape).await?;
+        send_forward(&client, round, &cfg, &hidden, shape).await?;
         let kind = recv_kind_client(&client).await?;
         let Some(FrameKind::Token) = kind else {
             return Err(format!("expected TOKEN, got {kind:?}").into());

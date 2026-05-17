@@ -268,7 +268,25 @@ impl Builder for SparseMoEBuilder {
             runtime_handle,
             rank,
             total,
+            last_rank_history: Vec::new(),
+            last_rank_rng: 0,
+            last_rank_rng_seeded: false,
         }))
+    }
+}
+
+/// Build a SamplingConfig for one task. Currently the only knob the
+/// public `GenerationTask` surface exposes is `temperature`; the rest
+/// are hard-coded to defaults that have worked well in K2.6 evals.
+/// Lifted out so the single-stage and multi-stage entry paths can't
+/// drift.
+fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
+    crate::sampling::SamplingConfig {
+        temperature: task.temperature.max(0.0),
+        top_p: 1.0,
+        repetition_penalty: 1.05,
+        repetition_window: 64,
+        seed: None,
     }
 }
 
@@ -328,15 +346,30 @@ pub struct SparseMoEEngine {
     /// step_worker from hot-spinning on `recv_kind_server` returning
     /// `Ok(None)` over and over.
     peer_disconnected: bool,
+    /// Last-rank only: tokens this rank has sampled since the last
+    /// `Reset`. Used as the `history` argument to `sampling::sample` so
+    /// the repetition penalty has the recent local emit-stream to
+    /// reference. Prompt tokens are NOT mirrored here — the prompt
+    /// flows only as hidden states through the pipeline — so the
+    /// rep-penalty window covers only generated tokens. Acceptable
+    /// limitation for v1; documented in dist.rs.
+    last_rank_history: Vec<i64>,
+    /// xorshift64* state for the last rank's sampler. Seeded lazily
+    /// from the first Forward frame's `SamplingConfig.seed` after a
+    /// `Reset` so deterministic-seed mode reproduces across runs.
+    last_rank_rng: u64,
+    last_rank_rng_seeded: bool,
 }
 
 impl SparseMoEEngine {
+    /// Bridge sync `Engine::step` code to an async transport future.
+    /// Delegates to `tahoma_runner::run_async`, which consults the
+    /// thread-local `BlockingContextGuard` flag — set by
+    /// `Runner::run_relay_loop` for worker ranks — to pick the
+    /// cheapest safe `block_on` variant. On a worker thread that's
+    /// ~250x cheaper than wrapping in `block_in_place`.
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime_handle.block_on(fut))
-        } else {
-            self.runtime_handle.block_on(fut)
-        }
+        tahoma_runner::run_async(&self.runtime_handle, fut)
     }
 
     fn is_last(&self) -> bool {
@@ -441,13 +474,7 @@ impl SparseMoEEngine {
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = crate::sampling::SamplingConfig {
-            temperature: task.temperature.max(0.0),
-            top_p: 1.0,
-            repetition_penalty: 1.05,
-            repetition_window: 64,
-            seed: None,
-        };
+        let sampling_cfg = sampling_from_task(&task);
         let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
             Ok(g) => g,
             Err(e) => {
@@ -500,13 +527,7 @@ impl SparseMoEEngine {
         };
 
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = crate::sampling::SamplingConfig {
-            temperature: task.temperature.max(0.0),
-            top_p: 1.0,
-            repetition_penalty: 1.05,
-            repetition_window: 64,
-            seed: None,
-        };
+        let sampling_cfg = sampling_from_task(&task);
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
             None => {
@@ -568,7 +589,7 @@ impl SparseMoEEngine {
         &mut self,
         prompt_ids: &[i64],
         max_new: usize,
-        _cfg: &crate::sampling::SamplingConfig,
+        cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<Vec<i64>, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
@@ -591,7 +612,7 @@ impl SparseMoEEngine {
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
             let token_back = self
-                .forward_one_token_first(&history, downstream)
+                .forward_one_token_first(&history, cfg, downstream)
                 .map_err(|e| format!("prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
                 // Last prefill step: this is the first generated token.
@@ -608,7 +629,7 @@ impl SparseMoEEngine {
         // Decode loop.
         for step_i in 1..max_new {
             let token_back = self
-                .forward_one_token_first(&history, downstream)
+                .forward_one_token_first(&history, cfg, downstream)
                 .map_err(|e| format!("decode step {step_i}: {e}"))?;
             if eos.contains(&token_back) {
                 break;
@@ -626,16 +647,26 @@ impl SparseMoEEngine {
     fn forward_one_token_first(
         &mut self,
         history: &[i64],
+        cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<i64, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
-        let past_seq_len = (history.len() - 1) as u32;
+        let past_seq_len: u32 = history
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "forward_one_token_first: empty history".to_string())?
+            as u32;
 
-        // Layer 0 over the full history; keep only the trailing row.
+        // Layer 0 (stateful) on the most recently appended token.
+        // The history grows by one each prefill/decode step, so each
+        // step advances the layer-0 KV cache by exactly one slot.
+        let last_id = *history
+            .last()
+            .ok_or_else(|| "forward_one_token_first: empty history".to_string())?;
         let h_tail = self
             .runner
-            .embed_layer0_tail(history, 1)
-            .map_err(|e| format!("embed_layer0: {e}"))?;
+            .forward_layer0_step(last_id)
+            .map_err(|e| format!("layer0_step: {e}"))?;
         let h_after_shells = self
             .runner
             .forward_shells(&h_tail, &[1, 1, hidden], past_seq_len as usize)
@@ -646,6 +677,7 @@ impl SparseMoEEngine {
             send_forward(
                 downstream,
                 past_seq_len,
+                cfg,
                 &h_after_shells,
                 [1, 1, hidden as u32],
             )
@@ -718,6 +750,11 @@ impl SparseMoEEngine {
         match kind {
             FrameKind::Reset => {
                 self.runner.reset_kv();
+                // Last-rank sampling state belongs to this session;
+                // also wipe it so the next prompt starts with empty
+                // rep-penalty history + an unseeded RNG.
+                self.last_rank_history.clear();
+                self.last_rank_rng_seeded = false;
                 if let Some(down) = downstream.as_ref() {
                     self.block_on(forward_reset(down))
                         .map_err(|e| format!("forward_reset: {e}"))?;
@@ -725,7 +762,7 @@ impl SparseMoEEngine {
                 Ok(())
             }
             FrameKind::Forward => {
-                let (past_seq_len, hidden_f32, in_shape) = self
+                let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
                     .block_on(recv_forward_body_server(upstream))
                     .map_err(|e| format!("recv_forward: {e}"))?;
                 let hidden = self.runner.manifest.hidden_size as usize;
@@ -741,19 +778,25 @@ impl SparseMoEEngine {
                     .map_err(|e| format!("forward_shells: {e}"))?;
 
                 if self.is_last() {
-                    // Run head, sample, send TOKEN upstream.
+                    // Run head, sample with the caller's config, send
+                    // TOKEN upstream. The first Forward of a session
+                    // seeds our RNG so deterministic seeds reproduce
+                    // across runs.
                     let logits = self
                         .runner
                         .forward_head_last(&h_after, 1)
                         .map_err(|e| format!("forward_head: {e}"))?;
-                    // **Known limitation**: multi-stage mode ignores the
-                    // caller's `temperature` / `top_p` / `repetition_penalty`
-                    // because the Forward frame body doesn't carry sampling
-                    // params. A `task.temperature = 0.7` request will
-                    // silently produce greedy output on the multi-stage
-                    // path. Fix is a new frame field — punted until a
-                    // user actually asks for it.
-                    let token = argmax_i64(&logits);
+                    if !self.last_rank_rng_seeded {
+                        self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+                        self.last_rank_rng_seeded = true;
+                    }
+                    let token = crate::sampling::sample(
+                        &logits,
+                        &self.last_rank_history,
+                        &sampling_cfg,
+                        &mut self.last_rank_rng,
+                    );
+                    self.last_rank_history.push(token);
                     self.block_on(send_token_upstream(upstream, token))
                         .map_err(|e| format!("send_token: {e}"))?;
                     Ok(())
@@ -761,9 +804,15 @@ impl SparseMoEEngine {
                     let down =
                         downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
                     self.block_on(async {
-                        send_forward(&down, past_seq_len, &h_after, [1, 1, hidden as u32])
-                            .await
-                            .map_err(|e| format!("send_forward: {e}"))?;
+                        send_forward(
+                            &down,
+                            past_seq_len,
+                            &sampling_cfg,
+                            &h_after,
+                            [1, 1, hidden as u32],
+                        )
+                        .await
+                        .map_err(|e| format!("send_forward: {e}"))?;
                         let token = match recv_kind_client(&down).await {
                             Ok(Some(FrameKind::Token)) => recv_token_body_client(&down)
                                 .await
@@ -787,27 +836,6 @@ impl SparseMoEEngine {
             )),
         }
     }
-}
-
-fn argmax_i64(xs: &[f32]) -> i64 {
-    // We sample on the last rank; an empty logits vector here means
-    // forward_head_last returned a malformed buffer (engine bug) or the
-    // caller passed wrong input. Returning 0 silently would dispatch
-    // token id 0 — better to surface a warning and let the caller
-    // diagnose. Empty vocab is never legitimate in practice.
-    if xs.is_empty() {
-        warn!("argmax_i64 called with empty logits; returning 0 as fallback");
-        return 0;
-    }
-    let mut best = 0i64;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in xs.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i as i64;
-        }
-    }
-    best
 }
 
 #[cfg(test)]

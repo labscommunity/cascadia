@@ -14,8 +14,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use half::bf16;
+use tahoma_int4_gemm::layer0_int4::{
+    embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
+};
+use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4, Int4Shell};
+use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -25,7 +29,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::manifest::{Manifest, ManifestError};
-use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes, i64_to_bytes};
+use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -39,28 +43,64 @@ pub enum RunnerError {
     Internal(String),
 }
 
+/// Initial KV-cache slot capacity per layer. Doubles on overflow so
+/// the cumulative alloc/copy traffic is O(N) instead of the old O(N²)
+/// from reallocating on every token. 32 fits the short-prompt eval
+/// without a grow; long-context decodes pay log2(N/32) grows total.
+const INITIAL_KV_CAPACITY: usize = 32;
+
 /// Per-MoE-layer state held across generation steps.
 ///
-/// The shell forward runs through `tahoma_int4_gemm::shell_int4::shell_forward_decode_int4`,
-/// which expects flat KV caches in `[NUM_HEADS, S, D]` row-major layout (not OV's
-/// `[1, NUM_HEADS, S, D]` byte buffer). We track `past_seq_len` so each forward call
-/// has the cache shape it needs without per-call recomputation.
+/// The shell forward runs through `tahoma_int4_gemm::shell_int4::shell_forward_decode_int4_with_capacity`,
+/// which expects flat KV caches in `[NUM_HEADS, capacity, D]` row-major layout where only the
+/// first `past_seq_len` slots per head are populated. We track `kv_capacity` separately
+/// from `past_seq_len` so a steady-state generation never triggers a realloc.
 struct LayerState {
     lid: u32,
     int4_shell: Int4Shell,
+    /// Layout: `[NUM_HEADS, kv_capacity, QK_HEAD_DIM]` row-major.
+    /// Slots `past_seq_len..kv_capacity` per head are reserved but
+    /// unpopulated (their contents don't matter).
+    past_k: Vec<f32>,
+    /// Layout: `[NUM_HEADS, kv_capacity, V_HEAD_DIM]` row-major.
+    past_v: Vec<f32>,
+    past_seq_len: usize,
+    /// Slots allocated per head. Doubles on overflow. Survives across
+    /// generations via `reset_kv` (resetting clears past_seq_len but
+    /// keeps the buffers — the next prompt reuses the allocation).
+    kv_capacity: usize,
+}
+
+/// First-stage layer-0 state: Rust int4 forward + KV cache + a
+/// pinned mmap of the bf16 embed_tokens table.
+///
+/// The original code ran the layer-0 OV IR stateless on the full
+/// prefix for every decode step (O(N²) attention across a generation).
+/// This struct gives layer 0 its own pre-allocated KV cache so it
+/// joins the shells on the O(N) per-token path. The embed_tokens
+/// lookup is done in Rust against a mmap'd safetensors shard.
+struct Layer0State {
+    int4_layer0: Int4Layer0,
+    /// Keeps the embed_tokens mmap alive as long as we hold the slice.
+    _embed_pin: Arc<Shard>,
+    /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
+    embed_tokens_bf16: &'static [u8],
     past_k: Vec<f32>,
     past_v: Vec<f32>,
     past_seq_len: usize,
+    kv_capacity: usize,
 }
 
 impl LayerState {
     fn new(lid: u32, int4_shell: Int4Shell) -> Self {
+        let cap = INITIAL_KV_CAPACITY;
         Self {
             lid,
             int4_shell,
-            past_k: Vec::new(),
-            past_v: Vec::new(),
+            past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
+            past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
             past_seq_len: 0,
+            kv_capacity: cap,
         }
     }
 }
@@ -168,7 +208,7 @@ pub struct Runner {
     _device: String,
     _plugin: PluginConfig,
     pub range: LayerRange,
-    layer0: Option<Runtime>,
+    layer0: Option<Layer0State>,
     head: Option<Runtime>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
@@ -212,18 +252,9 @@ impl Runner {
                 .ok_or_else(|| RunnerError::Internal(format!("non-UTF-8 path: {}", p.display())))
         };
 
-        let layer0 = if range.is_first {
-            let layer0_xml = manifest.layer0_xml(&model_dir);
-            if !layer0_xml.exists() {
-                return Err(RunnerError::MissingFile(layer0_xml));
-            }
-            let rt = Runtime::compile(&utf8(&layer0_xml)?, device, &plugin)?;
-            info!("compiled layer 0 (stateless embed+dense)");
-            Some(rt)
-        } else {
-            info!("skipping layer 0 (not first stage)");
-            None
-        };
+        // layer 0 is constructed below from the safetensors source
+        // (we need it open first). Defer until after.
+        let mut layer0_holder: Option<Layer0State> = None;
 
         let head = if range.is_last {
             let head_xml = manifest.head_xml(&model_dir);
@@ -252,6 +283,33 @@ impl Runner {
             SafetensorsExpertSource::open(st_dir)
                 .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
         );
+
+        if range.is_first {
+            // Construct dense layer 0 from safetensors. The old OV IR
+            // path was stateless — each decode step ran the full prefix
+            // through attention, making prefill O(N²). The Rust path
+            // owns a pre-allocated KV cache that mirrors the shells.
+            let st_layer0 = safetensors_source
+                .layer0()
+                .map_err(|e| RunnerError::Internal(format!("safetensors layer0: {e}")))?;
+            let int4_layer0 = Int4Layer0::from_safetensors(&st_layer0);
+            let (embed_pin, embed_bytes) = safetensors_source
+                .embed_tokens()
+                .map_err(|e| RunnerError::Internal(format!("safetensors embed_tokens: {e}")))?;
+            let cap = INITIAL_KV_CAPACITY;
+            layer0_holder = Some(Layer0State {
+                int4_layer0,
+                _embed_pin: embed_pin,
+                embed_tokens_bf16: embed_bytes,
+                past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
+                past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
+                past_seq_len: 0,
+                kv_capacity: cap,
+            });
+            info!("constructed Rust int4 layer 0 + embed_tokens mmap");
+        } else {
+            info!("skipping layer 0 (not first stage)");
+        }
 
         let all_moe_ids = manifest.moe_layer_ids();
         let in_range: Vec<u32> = all_moe_ids
@@ -329,7 +387,7 @@ impl Runner {
             _device: device.to_string(),
             _plugin: plugin,
             range,
-            layer0,
+            layer0: layer0_holder,
             head,
             layers,
             experts,
@@ -411,9 +469,14 @@ impl Runner {
     /// Reset all per-layer KV caches. Call between independent generations.
     pub fn reset_kv(&mut self) {
         for l in &mut self.layers {
-            l.past_k.clear();
-            l.past_v.clear();
+            // Keep the past_k / past_v allocations — slots
+            // 0..past_seq_len are simply abandoned. Resetting them to
+            // zero is not required because forward_shells only reads
+            // the populated prefix `0..past_seq_len`.
             l.past_seq_len = 0;
+        }
+        if let Some(l0) = self.layer0.as_mut() {
+            l0.past_seq_len = 0;
         }
     }
 
@@ -436,8 +499,16 @@ impl Runner {
         let past_seq_len = full_ids.len() - tail_len;
         let hidden = self.manifest.hidden_size as usize;
 
-        // 1) Layer 0 (stateless) → tail of hidden state.
-        let h_f32 = self.embed_layer0_tail(full_ids, tail_len)?;
+        // 1) Layer 0 (now stateful) → tail of hidden state.
+        // The engine drives prefill + decode token-by-token, so tail_len
+        // is always 1 in practice — but if a future caller passes a
+        // larger tail, we just advance layer 0 one token at a time.
+        let mut h_f32 = vec![0.0f32; tail_len * hidden];
+        for k in 0..tail_len {
+            let id = full_ids[past_seq_len + k];
+            let row = self.forward_layer0_step(id)?;
+            h_f32[k * hidden..(k + 1) * hidden].copy_from_slice(&row);
+        }
         let h_shape = vec![1usize, tail_len, hidden];
 
         // 2) Run all my shells.
@@ -447,54 +518,53 @@ impl Runner {
         self.forward_head_last(&h_f32, tail_len)
     }
 
-    /// Run layer 0 on the full prefix and return only the trailing
-    /// `tail_len` rows. First-stage only.
-    pub fn embed_layer0_tail(
-        &mut self,
-        full_ids: &[i64],
-        tail_len: usize,
-    ) -> Result<Vec<f32>, RunnerError> {
-        let hidden = self.manifest.hidden_size as usize;
-        if tail_len == 0 || tail_len > full_ids.len() {
-            return Err(RunnerError::Internal(format!(
-                "invalid tail_len {}, full_ids.len={}",
-                tail_len,
-                full_ids.len()
-            )));
+    /// Run one stateful step of layer 0 for a single token, updating
+    /// the layer's KV cache and returning the resulting hidden row.
+    /// First-stage only.
+    ///
+    /// The shape contract matches `forward_shells`: returns `[HIDDEN]`,
+    /// already passed through attention + dense MLP + residual.
+    pub fn forward_layer0_step(&mut self, token_id: i64) -> Result<Vec<f32>, RunnerError> {
+        let l0 = self.layer0.as_mut().ok_or_else(|| {
+            RunnerError::Internal("forward_layer0_step on non-first stage".into())
+        })?;
+
+        let x_f32 = embed_token_bf16(l0.embed_tokens_bf16, token_id);
+
+        if l0.past_seq_len + 1 > l0.kv_capacity {
+            grow_layer0_kv_capacity(l0)?;
         }
-        let layer0 = self
-            .layer0
-            .as_mut()
-            .ok_or_else(|| RunnerError::Internal("embed_layer0 on non-first stage".into()))?;
-        let ids_bytes = i64_to_bytes(full_ids);
-        let ids_shape = [1usize, full_ids.len()];
-        let input_name = layer0.input_name(0)?;
-        layer0.set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
-        layer0.infer()?;
-        let (l0_dtype, l0_shape, l0_bytes) = layer0.output(0)?;
-        if l0_shape.len() != 3
-            || l0_shape[0] != 1
-            || l0_shape[1] != full_ids.len()
-            || l0_shape[2] != hidden
-        {
-            return Err(RunnerError::Internal(format!(
-                "layer0 unexpected output shape {:?}",
-                l0_shape
-            )));
-        }
-        let l0_f32: Vec<f32> = match l0_dtype {
-            DType::F32 => read_f32(&l0_bytes),
-            DType::Bf16 => bf16_bytes_to_f32(&l0_bytes),
-            DType::F16 => f16_bytes_to_f32(&l0_bytes),
-            _ => {
-                return Err(RunnerError::Internal(format!(
-                    "layer0 dtype {:?}",
-                    l0_dtype
-                )))
-            }
-        };
-        let row_off = (full_ids.len() - tail_len) * hidden;
-        Ok(l0_f32[row_off..].to_vec())
+        let capacity = l0.kv_capacity;
+        let past_seq_len = l0.past_seq_len;
+
+        let outs = layer0_forward_decode_int4_with_capacity(
+            &l0.int4_layer0,
+            &x_f32,
+            &l0.past_k,
+            &l0.past_v,
+            past_seq_len,
+            capacity,
+        );
+
+        write_present_kv(
+            &mut l0.past_k,
+            &outs.present_k,
+            past_seq_len,
+            capacity,
+            NUM_HEADS,
+            QK_HEAD_DIM,
+        );
+        write_present_kv(
+            &mut l0.past_v,
+            &outs.present_v,
+            past_seq_len,
+            capacity,
+            NUM_HEADS,
+            V_HEAD_DIM,
+        );
+        l0.past_seq_len = past_seq_len + 1;
+
+        Ok(outs.hidden_out)
     }
 
     /// Forward one token through the shells this rank owns.
@@ -532,31 +602,44 @@ impl Runner {
                 )));
             }
 
+            // Ensure the pre-allocated KV buffers have room for the new
+            // slot. Geometric grow when we hit capacity — total
+            // alloc/copy traffic across a full generation is O(N), not
+            // O(N²) like the old `append_kv_inplace`.
+            if past_seq_len + 1 > self.layers[i].kv_capacity {
+                grow_kv_capacity(&mut self.layers[i])?;
+            }
+            let capacity = self.layers[i].kv_capacity;
+
             // Run Rust shell forward — same int4 kernel rainier's eval
             // used via the cdylib, just called directly since we're in
-            // the same Cargo workspace.
-            let outs = shell_forward_decode_int4(
+            // the same Cargo workspace. The `_with_capacity` variant
+            // lets us pass a pre-allocated [H, capacity, D] buffer
+            // with only the first `past_seq_len` slots populated.
+            let outs = shell_forward_decode_int4_with_capacity(
                 &self.layers[i].int4_shell,
                 &h_f32,
                 &self.layers[i].past_k,
                 &self.layers[i].past_v,
                 past_seq_len,
+                capacity,
             );
 
-            // Append present_k / present_v onto the running KV cache.
-            // Layout is [NUM_HEADS, past_seq, HEAD_DIM] flat; need a
-            // per-head interleaved insert (not a simple buffer concat).
-            append_kv_inplace(
+            // Write present_k / present_v into the existing capacity
+            // buffer at slot `past_seq_len` for each head. No alloc.
+            write_present_kv(
                 &mut self.layers[i].past_k,
                 &outs.present_k,
                 past_seq_len,
+                capacity,
                 NUM_HEADS,
                 QK_HEAD_DIM,
             );
-            append_kv_inplace(
+            write_present_kv(
                 &mut self.layers[i].past_v,
                 &outs.present_v,
                 past_seq_len,
+                capacity,
                 NUM_HEADS,
                 V_HEAD_DIM,
             );
@@ -741,37 +824,107 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
-/// Append a single new step's K (or V) onto the running cache, in
-/// `[NUM_HEADS, past_seq, HEAD_DIM]` flat layout. `present` is a flat
-/// slice of length `NUM_HEADS * HEAD_DIM` (the new step's contribution,
-/// one per head).
+/// Double the per-head slot capacity of one layer's KV buffers,
+/// preserving the populated `past_seq_len` rows for each head.
 ///
-/// Why not a simple buffer extend: with the data laid out as
-/// `[head][seq][dim]`, growing `seq` requires interleaving — head 0's
-/// new row sits at offset `past_seq * HEAD_DIM`, head 1's at
-/// `(past_seq + 1) * HEAD_DIM + past_seq * HEAD_DIM`, etc.
-fn append_kv_inplace(
-    past: &mut Vec<f32>,
+/// Old layout: `[NUM_HEADS, old_cap, HEAD_DIM]`, with head h's data
+/// living at offset `h * old_cap * HEAD_DIM`. New layout has the
+/// same head-major arrangement but with `new_cap = 2 * old_cap`, so
+/// every head's base shifts. We allocate a fresh buffer and copy the
+/// populated prefix `[0..past_seq_len]` per head. Returns
+/// `RunnerError::Internal` if either allocation fails — long-context
+/// generations could plausibly OOM mid-decode.
+fn grow_kv_capacity(layer: &mut LayerState) -> Result<(), RunnerError> {
+    let old_cap = layer.kv_capacity;
+    let new_cap = old_cap * 2;
+    let ps = layer.past_seq_len;
+    let new_k = grow_kv_buffer(&layer.past_k, ps, old_cap, new_cap, QK_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L{} grow past_k: {e}", layer.lid)))?;
+    let new_v = grow_kv_buffer(&layer.past_v, ps, old_cap, new_cap, V_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L{} grow past_v: {e}", layer.lid)))?;
+    layer.past_k = new_k;
+    layer.past_v = new_v;
+    layer.kv_capacity = new_cap;
+    Ok(())
+}
+
+/// Same geometric growth as `grow_kv_capacity` but for the first
+/// stage's layer-0 cache. Kept as a sibling rather than generalized
+/// over a trait because layer-0 has different surrounding fields
+/// (embedding pin, no `lid`, no `int4_shell`) and the rare grow call
+/// would not benefit from the abstraction.
+fn grow_layer0_kv_capacity(l0: &mut Layer0State) -> Result<(), RunnerError> {
+    let old_cap = l0.kv_capacity;
+    let new_cap = old_cap * 2;
+    let ps = l0.past_seq_len;
+    let new_k = grow_kv_buffer(&l0.past_k, ps, old_cap, new_cap, QK_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L0 grow past_k: {e}")))?;
+    let new_v = grow_kv_buffer(&l0.past_v, ps, old_cap, new_cap, V_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L0 grow past_v: {e}")))?;
+    l0.past_k = new_k;
+    l0.past_v = new_v;
+    l0.kv_capacity = new_cap;
+    Ok(())
+}
+
+/// Inner helper: allocate a fresh `[NUM_HEADS, new_cap, head_dim]`
+/// buffer, copy the populated `past_seq` prefix per head from a
+/// `[NUM_HEADS, old_cap, head_dim]` source. The rest is zero. Pure
+/// over buffers — no Int4Shell required, which keeps it unit-testable.
+///
+/// Uses `try_reserve_exact` + `resize` so OOM at long context bubbles
+/// up as a recoverable `Err` instead of an abort from the global
+/// allocator.
+fn grow_kv_buffer(
+    src: &[f32],
+    past_seq: usize,
+    old_cap: usize,
+    new_cap: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, String> {
+    debug_assert!(new_cap >= old_cap);
+    debug_assert!(past_seq <= old_cap);
+    debug_assert_eq!(src.len(), NUM_HEADS * old_cap * head_dim);
+    let total = NUM_HEADS * new_cap * head_dim;
+    let mut dst: Vec<f32> = Vec::new();
+    dst.try_reserve_exact(total).map_err(|e| {
+        format!(
+            "alloc {total} f32 ({:.1} MB) failed: {e}",
+            (total * 4) as f64 / 1e6
+        )
+    })?;
+    dst.resize(total, 0.0f32);
+    if past_seq == 0 {
+        return Ok(dst);
+    }
+    for h in 0..NUM_HEADS {
+        let s = h * old_cap * head_dim;
+        let d = h * new_cap * head_dim;
+        dst[d..d + past_seq * head_dim].copy_from_slice(&src[s..s + past_seq * head_dim]);
+    }
+    Ok(dst)
+}
+
+/// Write the new step's per-head K (or V) row at slot `past_seq`
+/// inside a `[NUM_HEADS, capacity, HEAD_DIM]` buffer. No allocation,
+/// no shift — the slot exists because the caller pre-allocated /
+/// grew `capacity` to be `> past_seq`.
+fn write_present_kv(
+    buf: &mut [f32],
     present: &[f32],
     past_seq: usize,
+    capacity: usize,
     num_heads: usize,
     head_dim: usize,
 ) {
-    debug_assert_eq!(past.len(), num_heads * past_seq * head_dim);
+    debug_assert!(past_seq < capacity);
+    debug_assert_eq!(buf.len(), num_heads * capacity * head_dim);
     debug_assert_eq!(present.len(), num_heads * head_dim);
-    let new_seq = past_seq + 1;
-    let mut new_past = vec![0.0f32; num_heads * new_seq * head_dim];
     for h in 0..num_heads {
-        let old_off = h * past_seq * head_dim;
-        let new_off = h * new_seq * head_dim;
-        if past_seq > 0 {
-            new_past[new_off..new_off + past_seq * head_dim]
-                .copy_from_slice(&past[old_off..old_off + past_seq * head_dim]);
-        }
-        new_past[new_off + past_seq * head_dim..new_off + new_seq * head_dim]
+        let dst_off = h * capacity * head_dim + past_seq * head_dim;
+        buf[dst_off..dst_off + head_dim]
             .copy_from_slice(&present[h * head_dim..(h + 1) * head_dim]);
     }
-    *past = new_past;
 }
 
 #[cfg(test)]
@@ -779,22 +932,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_kv_grows_correctly_from_empty() {
-        let mut past: Vec<f32> = Vec::new();
-        let present: Vec<f32> = (0..6).map(|i| i as f32).collect(); // 2 heads × 3 dim
-        append_kv_inplace(&mut past, &present, 0, 2, 3);
-        assert_eq!(past, present);
+    fn write_present_kv_into_empty_slot() {
+        // 2 heads, capacity=3, head_dim=2, past_seq=0.
+        // Buffer starts zero; expect present rows at slot 0 of each head.
+        let mut buf = vec![0.0f32; 2 * 3 * 2];
+        let present = vec![1.0, 2.0, 3.0, 4.0]; // h0=[1,2], h1=[3,4]
+        write_present_kv(&mut buf, &present, 0, 3, 2, 2);
+        // head 0 base = 0,        slot 0 = [1, 2]
+        // head 1 base = capacity*head_dim = 6, slot 0 = [3, 4]
+        assert_eq!(buf[0..2], [1.0, 2.0]);
+        assert_eq!(buf[6..8], [3.0, 4.0]);
+        // Unfilled slots untouched.
+        assert_eq!(buf[2..6], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(buf[8..12], [0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn append_kv_interleaves_by_head() {
-        // 2 heads, head_dim=2, past_seq=1. past_k[h0,0,*] = [10, 11],
-        // past_k[h1,0,*] = [20, 21]. Append present where
-        // present[h0] = [12, 13], present[h1] = [22, 23].
-        // Expected new past: [10, 11, 12, 13, 20, 21, 22, 23].
-        let mut past = vec![10.0, 11.0, 20.0, 21.0];
-        let present = vec![12.0, 13.0, 22.0, 23.0];
-        append_kv_inplace(&mut past, &present, 1, 2, 2);
-        assert_eq!(past, vec![10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0]);
+    fn write_present_kv_into_middle_slot() {
+        // 2 heads, capacity=4, head_dim=2, past_seq=2.
+        // Pre-populate slots 0..2 of each head, then write slot 2.
+        let mut buf = vec![0.0f32; 2 * 4 * 2];
+        // head 0 base=0
+        buf[0..2].copy_from_slice(&[10.0, 11.0]); // slot 0
+        buf[2..4].copy_from_slice(&[12.0, 13.0]); // slot 1
+                                                  // head 1 base = capacity*head_dim = 8
+        buf[8..10].copy_from_slice(&[20.0, 21.0]); // slot 0
+        buf[10..12].copy_from_slice(&[22.0, 23.0]); // slot 1
+        let present = vec![14.0, 15.0, 24.0, 25.0]; // h0=[14,15], h1=[24,25]
+        write_present_kv(&mut buf, &present, 2, 4, 2, 2);
+        // head 0 slot 2
+        assert_eq!(buf[4..6], [14.0, 15.0]);
+        // head 1 slot 2
+        assert_eq!(buf[12..14], [24.0, 25.0]);
+        // Existing slots untouched
+        assert_eq!(buf[0..2], [10.0, 11.0]);
+        assert_eq!(buf[8..10], [20.0, 21.0]);
+    }
+
+    #[test]
+    fn grow_kv_buffer_doubles_and_preserves_data() {
+        // Stamp a unique value at head h, slot 0, dim 0 of a
+        // [NUM_HEADS, 2, QK_HEAD_DIM] buffer, then double to cap=4.
+        // Each head's base offset shifts from h*2*D to h*4*D — the
+        // stamp should still be at the new base offset.
+        let mut src = vec![0.0f32; NUM_HEADS * 2 * QK_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            src[h * 2 * QK_HEAD_DIM] = (h + 1) as f32;
+        }
+        let dst = grow_kv_buffer(&src, 1, 2, 4, QK_HEAD_DIM).expect("alloc");
+        assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
+        for h in 0..NUM_HEADS {
+            assert_eq!(
+                dst[h * 4 * QK_HEAD_DIM],
+                (h + 1) as f32,
+                "head {h} stamp lost"
+            );
+        }
+    }
+
+    #[test]
+    fn grow_kv_buffer_from_empty_is_zero_filled() {
+        let src = vec![0.0f32; NUM_HEADS * 2 * QK_HEAD_DIM];
+        let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
+        assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
+        assert!(dst.iter().all(|&x| x == 0.0));
     }
 }
