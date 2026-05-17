@@ -633,11 +633,16 @@ impl SparseMoEEngine {
         let hidden = self.runner.manifest.hidden_size as usize;
         let past_seq_len = (history.len() - 1) as u32;
 
-        // Layer 0 over the full history; keep only the trailing row.
+        // Layer 0 (stateful) on the most recently appended token.
+        // The history grows by one each prefill/decode step, so each
+        // step advances the layer-0 KV cache by exactly one slot.
+        let last_id = *history
+            .last()
+            .ok_or_else(|| "forward_one_token_first: empty history".to_string())?;
         let h_tail = self
             .runner
-            .embed_layer0_tail(history, 1)
-            .map_err(|e| format!("embed_layer0: {e}"))?;
+            .forward_layer0_step(last_id)
+            .map_err(|e| format!("layer0_step: {e}"))?;
         let h_after_shells = self
             .runner
             .forward_shells(&h_tail, &[1, 1, hidden], past_seq_len as usize)

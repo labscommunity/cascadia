@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use half::bf16;
+use tahoma_int4_gemm::layer0_int4::{
+    embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
+};
+use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
 use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
 use tahoma_int4_gemm::{
@@ -25,7 +29,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::manifest::{Manifest, ManifestError};
-use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes, i64_to_bytes};
+use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -64,6 +68,26 @@ struct LayerState {
     /// Slots allocated per head. Doubles on overflow. Survives across
     /// generations via `reset_kv` (resetting clears past_seq_len but
     /// keeps the buffers — the next prompt reuses the allocation).
+    kv_capacity: usize,
+}
+
+/// First-stage layer-0 state: Rust int4 forward + KV cache + a
+/// pinned mmap of the bf16 embed_tokens table.
+///
+/// The original code ran the layer-0 OV IR stateless on the full
+/// prefix for every decode step (O(N²) attention across a generation).
+/// This struct gives layer 0 its own pre-allocated KV cache so it
+/// joins the shells on the O(N) per-token path. The embed_tokens
+/// lookup is done in Rust against a mmap'd safetensors shard.
+struct Layer0State {
+    int4_layer0: Int4Layer0,
+    /// Keeps the embed_tokens mmap alive as long as we hold the slice.
+    _embed_pin: Arc<Shard>,
+    /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
+    embed_tokens_bf16: &'static [u8],
+    past_k: Vec<f32>,
+    past_v: Vec<f32>,
+    past_seq_len: usize,
     kv_capacity: usize,
 }
 
@@ -184,7 +208,7 @@ pub struct Runner {
     _device: String,
     _plugin: PluginConfig,
     pub range: LayerRange,
-    layer0: Option<Runtime>,
+    layer0: Option<Layer0State>,
     head: Option<Runtime>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
@@ -228,18 +252,9 @@ impl Runner {
                 .ok_or_else(|| RunnerError::Internal(format!("non-UTF-8 path: {}", p.display())))
         };
 
-        let layer0 = if range.is_first {
-            let layer0_xml = manifest.layer0_xml(&model_dir);
-            if !layer0_xml.exists() {
-                return Err(RunnerError::MissingFile(layer0_xml));
-            }
-            let rt = Runtime::compile(&utf8(&layer0_xml)?, device, &plugin)?;
-            info!("compiled layer 0 (stateless embed+dense)");
-            Some(rt)
-        } else {
-            info!("skipping layer 0 (not first stage)");
-            None
-        };
+        // layer 0 is constructed below from the safetensors source
+        // (we need it open first). Defer until after.
+        let mut layer0_holder: Option<Layer0State> = None;
 
         let head = if range.is_last {
             let head_xml = manifest.head_xml(&model_dir);
@@ -268,6 +283,33 @@ impl Runner {
             SafetensorsExpertSource::open(st_dir)
                 .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
         );
+
+        if range.is_first {
+            // Construct dense layer 0 from safetensors. The old OV IR
+            // path was stateless — each decode step ran the full prefix
+            // through attention, making prefill O(N²). The Rust path
+            // owns a pre-allocated KV cache that mirrors the shells.
+            let st_layer0 = safetensors_source
+                .layer0()
+                .map_err(|e| RunnerError::Internal(format!("safetensors layer0: {e}")))?;
+            let int4_layer0 = Int4Layer0::from_safetensors(&st_layer0);
+            let (embed_pin, embed_bytes) = safetensors_source
+                .embed_tokens()
+                .map_err(|e| RunnerError::Internal(format!("safetensors embed_tokens: {e}")))?;
+            let cap = INITIAL_KV_CAPACITY;
+            layer0_holder = Some(Layer0State {
+                int4_layer0,
+                _embed_pin: embed_pin,
+                embed_tokens_bf16: embed_bytes,
+                past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
+                past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
+                past_seq_len: 0,
+                kv_capacity: cap,
+            });
+            info!("constructed Rust int4 layer 0 + embed_tokens mmap");
+        } else {
+            info!("skipping layer 0 (not first stage)");
+        }
 
         let all_moe_ids = manifest.moe_layer_ids();
         let in_range: Vec<u32> = all_moe_ids
@@ -345,7 +387,7 @@ impl Runner {
             _device: device.to_string(),
             _plugin: plugin,
             range,
-            layer0,
+            layer0: layer0_holder,
             head,
             layers,
             experts,
@@ -433,6 +475,9 @@ impl Runner {
             // the populated prefix `0..past_seq_len`.
             l.past_seq_len = 0;
         }
+        if let Some(l0) = self.layer0.as_mut() {
+            l0.past_seq_len = 0;
+        }
     }
 
     /// Run one forward pass:
@@ -454,8 +499,16 @@ impl Runner {
         let past_seq_len = full_ids.len() - tail_len;
         let hidden = self.manifest.hidden_size as usize;
 
-        // 1) Layer 0 (stateless) → tail of hidden state.
-        let h_f32 = self.embed_layer0_tail(full_ids, tail_len)?;
+        // 1) Layer 0 (now stateful) → tail of hidden state.
+        // The engine drives prefill + decode token-by-token, so tail_len
+        // is always 1 in practice — but if a future caller passes a
+        // larger tail, we just advance layer 0 one token at a time.
+        let mut h_f32 = vec![0.0f32; tail_len * hidden];
+        for k in 0..tail_len {
+            let id = full_ids[past_seq_len + k];
+            let row = self.forward_layer0_step(id)?;
+            h_f32[k * hidden..(k + 1) * hidden].copy_from_slice(&row);
+        }
         let h_shape = vec![1usize, tail_len, hidden];
 
         // 2) Run all my shells.
@@ -465,54 +518,53 @@ impl Runner {
         self.forward_head_last(&h_f32, tail_len)
     }
 
-    /// Run layer 0 on the full prefix and return only the trailing
-    /// `tail_len` rows. First-stage only.
-    pub fn embed_layer0_tail(
-        &mut self,
-        full_ids: &[i64],
-        tail_len: usize,
-    ) -> Result<Vec<f32>, RunnerError> {
-        let hidden = self.manifest.hidden_size as usize;
-        if tail_len == 0 || tail_len > full_ids.len() {
-            return Err(RunnerError::Internal(format!(
-                "invalid tail_len {}, full_ids.len={}",
-                tail_len,
-                full_ids.len()
-            )));
+    /// Run one stateful step of layer 0 for a single token, updating
+    /// the layer's KV cache and returning the resulting hidden row.
+    /// First-stage only.
+    ///
+    /// The shape contract matches `forward_shells`: returns `[HIDDEN]`,
+    /// already passed through attention + dense MLP + residual.
+    pub fn forward_layer0_step(&mut self, token_id: i64) -> Result<Vec<f32>, RunnerError> {
+        let l0 = self.layer0.as_mut().ok_or_else(|| {
+            RunnerError::Internal("forward_layer0_step on non-first stage".into())
+        })?;
+
+        let x_f32 = embed_token_bf16(l0.embed_tokens_bf16, token_id);
+
+        if l0.past_seq_len + 1 > l0.kv_capacity {
+            grow_layer0_kv_capacity(l0);
         }
-        let layer0 = self
-            .layer0
-            .as_mut()
-            .ok_or_else(|| RunnerError::Internal("embed_layer0 on non-first stage".into()))?;
-        let ids_bytes = i64_to_bytes(full_ids);
-        let ids_shape = [1usize, full_ids.len()];
-        let input_name = layer0.input_name(0)?;
-        layer0.set_input(&input_name, DType::I64, &ids_shape, &ids_bytes)?;
-        layer0.infer()?;
-        let (l0_dtype, l0_shape, l0_bytes) = layer0.output(0)?;
-        if l0_shape.len() != 3
-            || l0_shape[0] != 1
-            || l0_shape[1] != full_ids.len()
-            || l0_shape[2] != hidden
-        {
-            return Err(RunnerError::Internal(format!(
-                "layer0 unexpected output shape {:?}",
-                l0_shape
-            )));
-        }
-        let l0_f32: Vec<f32> = match l0_dtype {
-            DType::F32 => read_f32(&l0_bytes),
-            DType::Bf16 => bf16_bytes_to_f32(&l0_bytes),
-            DType::F16 => f16_bytes_to_f32(&l0_bytes),
-            _ => {
-                return Err(RunnerError::Internal(format!(
-                    "layer0 dtype {:?}",
-                    l0_dtype
-                )))
-            }
-        };
-        let row_off = (full_ids.len() - tail_len) * hidden;
-        Ok(l0_f32[row_off..].to_vec())
+        let capacity = l0.kv_capacity;
+        let past_seq_len = l0.past_seq_len;
+
+        let outs = layer0_forward_decode_int4_with_capacity(
+            &l0.int4_layer0,
+            &x_f32,
+            &l0.past_k,
+            &l0.past_v,
+            past_seq_len,
+            capacity,
+        );
+
+        write_present_kv(
+            &mut l0.past_k,
+            &outs.present_k,
+            past_seq_len,
+            capacity,
+            NUM_HEADS,
+            QK_HEAD_DIM,
+        );
+        write_present_kv(
+            &mut l0.past_v,
+            &outs.present_v,
+            past_seq_len,
+            capacity,
+            NUM_HEADS,
+            V_HEAD_DIM,
+        );
+        l0.past_seq_len = past_seq_len + 1;
+
+        Ok(outs.hidden_out)
     }
 
     /// Forward one token through the shells this rank owns.
@@ -787,6 +839,20 @@ fn grow_kv_capacity(layer: &mut LayerState) {
     layer.past_k = grow_kv_buffer(&layer.past_k, ps, old_cap, new_cap, QK_HEAD_DIM);
     layer.past_v = grow_kv_buffer(&layer.past_v, ps, old_cap, new_cap, V_HEAD_DIM);
     layer.kv_capacity = new_cap;
+}
+
+/// Same geometric growth as `grow_kv_capacity` but for the first
+/// stage's layer-0 cache. Kept as a sibling rather than generalized
+/// over a trait because layer-0 has different surrounding fields
+/// (embedding pin, no `lid`, no `int4_shell`) and the rare grow call
+/// would not benefit from the abstraction.
+fn grow_layer0_kv_capacity(l0: &mut Layer0State) {
+    let old_cap = l0.kv_capacity;
+    let new_cap = old_cap * 2;
+    let ps = l0.past_seq_len;
+    l0.past_k = grow_kv_buffer(&l0.past_k, ps, old_cap, new_cap, QK_HEAD_DIM);
+    l0.past_v = grow_kv_buffer(&l0.past_v, ps, old_cap, new_cap, V_HEAD_DIM);
+    l0.kv_capacity = new_cap;
 }
 
 /// Inner helper: allocate a fresh `[NUM_HEADS, new_cap, head_dim]`
