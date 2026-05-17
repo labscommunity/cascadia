@@ -14,9 +14,9 @@
 use crate::kernel_avx512::dequant_gemv_int4_auto;
 use crate::safetensors_source::SafetensorsLayer0;
 use crate::shell::{
-    apply_rope_kimi_pub, rmsnorm_apply_pub, rope_cos_sin_pub, HIDDEN, INTERMEDIATE_DENSE,
-    KV_LORA_RANK, NUM_HEADS, QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, Q_LORA_RANK,
-    V_HEAD_DIM,
+    apply_rope_kimi_pub, rmsnorm_apply_pub, rope_cos_sin_pub, swiglu_mul, HIDDEN,
+    INTERMEDIATE_DENSE, KV_LORA_RANK, NUM_HEADS, QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM,
+    Q_LORA_RANK, V_HEAD_DIM,
 };
 use crate::shell_int4::quantize_int4_group;
 
@@ -129,10 +129,16 @@ pub fn embed_token_bf16(embed_table_bf16: &[u8], token_id: i64) -> Vec<f32> {
     assert!(token_id >= 0, "token_id < 0: {token_id}");
     let id = token_id as usize;
     let row_bytes = HIDDEN * 2;
-    let start = id * row_bytes;
-    debug_assert!(
-        start + row_bytes <= embed_table_bf16.len(),
-        "embed lookup out of range: token {token_id} row start {start} table len {}",
+    // Bounds-check in release too. A corrupted vocab id or an
+    // off-by-one in the sampler would otherwise read past the mmap
+    // byte-by-byte in the loop and panic with the much less actionable
+    // `index out of bounds`. Use `checked_*` to defend against the
+    // (impossible-but-cheap) usize overflow.
+    let start = id.checked_mul(row_bytes).expect("embed offset overflow");
+    let end = start.checked_add(row_bytes).expect("embed offset overflow");
+    assert!(
+        end <= embed_table_bf16.len(),
+        "embed lookup out of range: token {token_id} row [{start},{end}) table len {}",
         embed_table_bf16.len()
     );
     let mut out = vec![0.0f32; HIDDEN];
@@ -334,11 +340,7 @@ pub fn layer0_forward_decode_int4_with_capacity(
         &mut up_out,
     );
     let mut inter = vec![0.0f32; INTERMEDIATE_DENSE];
-    for i in 0..INTERMEDIATE_DENSE {
-        let g = gate_out[i];
-        let silu = g / (1.0f32 + (-g).exp());
-        inter[i] = silu * up_out[i];
-    }
+    swiglu_mul(&gate_out, &up_out, &mut inter);
     let mut mlp_out = vec![0.0f32; HIDDEN];
     dequant_gemv_int4_auto(
         &layer.down_proj_packed,

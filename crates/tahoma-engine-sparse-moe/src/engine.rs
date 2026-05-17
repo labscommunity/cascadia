@@ -275,6 +275,21 @@ impl Builder for SparseMoEBuilder {
     }
 }
 
+/// Build a SamplingConfig for one task. Currently the only knob the
+/// public `GenerationTask` surface exposes is `temperature`; the rest
+/// are hard-coded to defaults that have worked well in K2.6 evals.
+/// Lifted out so the single-stage and multi-stage entry paths can't
+/// drift.
+fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
+    crate::sampling::SamplingConfig {
+        temperature: task.temperature.max(0.0),
+        top_p: 1.0,
+        repetition_penalty: 1.05,
+        repetition_window: 64,
+        seed: None,
+    }
+}
+
 fn read_manifest_moe_count(model_dir: &std::path::Path) -> EngineResult<u32> {
     let m = crate::manifest::Manifest::load(model_dir)
         .map_err(|e| EngineError::Backend(format!("read manifest: {e}")))?;
@@ -459,13 +474,7 @@ impl SparseMoEEngine {
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = crate::sampling::SamplingConfig {
-            temperature: task.temperature.max(0.0),
-            top_p: 1.0,
-            repetition_penalty: 1.05,
-            repetition_window: 64,
-            seed: None,
-        };
+        let sampling_cfg = sampling_from_task(&task);
         let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
             Ok(g) => g,
             Err(e) => {
@@ -518,13 +527,7 @@ impl SparseMoEEngine {
         };
 
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = crate::sampling::SamplingConfig {
-            temperature: task.temperature.max(0.0),
-            top_p: 1.0,
-            repetition_penalty: 1.05,
-            repetition_window: 64,
-            seed: None,
-        };
+        let sampling_cfg = sampling_from_task(&task);
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
             None => {
@@ -648,7 +651,11 @@ impl SparseMoEEngine {
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<i64, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
-        let past_seq_len = (history.len() - 1) as u32;
+        let past_seq_len: u32 = history
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "forward_one_token_first: empty history".to_string())?
+            as u32;
 
         // Layer 0 (stateful) on the most recently appended token.
         // The history grows by one each prefill/decode step, so each

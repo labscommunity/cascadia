@@ -532,7 +532,7 @@ impl Runner {
         let x_f32 = embed_token_bf16(l0.embed_tokens_bf16, token_id);
 
         if l0.past_seq_len + 1 > l0.kv_capacity {
-            grow_layer0_kv_capacity(l0);
+            grow_layer0_kv_capacity(l0)?;
         }
         let capacity = l0.kv_capacity;
         let past_seq_len = l0.past_seq_len;
@@ -607,7 +607,7 @@ impl Runner {
             // alloc/copy traffic across a full generation is O(N), not
             // O(N²) like the old `append_kv_inplace`.
             if past_seq_len + 1 > self.layers[i].kv_capacity {
-                grow_kv_capacity(&mut self.layers[i]);
+                grow_kv_capacity(&mut self.layers[i])?;
             }
             let capacity = self.layers[i].kv_capacity;
 
@@ -831,14 +831,21 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
 /// living at offset `h * old_cap * HEAD_DIM`. New layout has the
 /// same head-major arrangement but with `new_cap = 2 * old_cap`, so
 /// every head's base shifts. We allocate a fresh buffer and copy the
-/// populated prefix `[0..past_seq_len]` per head.
-fn grow_kv_capacity(layer: &mut LayerState) {
+/// populated prefix `[0..past_seq_len]` per head. Returns
+/// `RunnerError::Internal` if either allocation fails — long-context
+/// generations could plausibly OOM mid-decode.
+fn grow_kv_capacity(layer: &mut LayerState) -> Result<(), RunnerError> {
     let old_cap = layer.kv_capacity;
     let new_cap = old_cap * 2;
     let ps = layer.past_seq_len;
-    layer.past_k = grow_kv_buffer(&layer.past_k, ps, old_cap, new_cap, QK_HEAD_DIM);
-    layer.past_v = grow_kv_buffer(&layer.past_v, ps, old_cap, new_cap, V_HEAD_DIM);
+    let new_k = grow_kv_buffer(&layer.past_k, ps, old_cap, new_cap, QK_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L{} grow past_k: {e}", layer.lid)))?;
+    let new_v = grow_kv_buffer(&layer.past_v, ps, old_cap, new_cap, V_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L{} grow past_v: {e}", layer.lid)))?;
+    layer.past_k = new_k;
+    layer.past_v = new_v;
     layer.kv_capacity = new_cap;
+    Ok(())
 }
 
 /// Same geometric growth as `grow_kv_capacity` but for the first
@@ -846,39 +853,56 @@ fn grow_kv_capacity(layer: &mut LayerState) {
 /// over a trait because layer-0 has different surrounding fields
 /// (embedding pin, no `lid`, no `int4_shell`) and the rare grow call
 /// would not benefit from the abstraction.
-fn grow_layer0_kv_capacity(l0: &mut Layer0State) {
+fn grow_layer0_kv_capacity(l0: &mut Layer0State) -> Result<(), RunnerError> {
     let old_cap = l0.kv_capacity;
     let new_cap = old_cap * 2;
     let ps = l0.past_seq_len;
-    l0.past_k = grow_kv_buffer(&l0.past_k, ps, old_cap, new_cap, QK_HEAD_DIM);
-    l0.past_v = grow_kv_buffer(&l0.past_v, ps, old_cap, new_cap, V_HEAD_DIM);
+    let new_k = grow_kv_buffer(&l0.past_k, ps, old_cap, new_cap, QK_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L0 grow past_k: {e}")))?;
+    let new_v = grow_kv_buffer(&l0.past_v, ps, old_cap, new_cap, V_HEAD_DIM)
+        .map_err(|e| RunnerError::Internal(format!("L0 grow past_v: {e}")))?;
+    l0.past_k = new_k;
+    l0.past_v = new_v;
     l0.kv_capacity = new_cap;
+    Ok(())
 }
 
 /// Inner helper: allocate a fresh `[NUM_HEADS, new_cap, head_dim]`
 /// buffer, copy the populated `past_seq` prefix per head from a
 /// `[NUM_HEADS, old_cap, head_dim]` source. The rest is zero. Pure
 /// over buffers — no Int4Shell required, which keeps it unit-testable.
+///
+/// Uses `try_reserve_exact` + `resize` so OOM at long context bubbles
+/// up as a recoverable `Err` instead of an abort from the global
+/// allocator.
 fn grow_kv_buffer(
     src: &[f32],
     past_seq: usize,
     old_cap: usize,
     new_cap: usize,
     head_dim: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, String> {
     debug_assert!(new_cap >= old_cap);
     debug_assert!(past_seq <= old_cap);
     debug_assert_eq!(src.len(), NUM_HEADS * old_cap * head_dim);
-    let mut dst = vec![0.0f32; NUM_HEADS * new_cap * head_dim];
+    let total = NUM_HEADS * new_cap * head_dim;
+    let mut dst: Vec<f32> = Vec::new();
+    dst.try_reserve_exact(total).map_err(|e| {
+        format!(
+            "alloc {total} f32 ({:.1} MB) failed: {e}",
+            (total * 4) as f64 / 1e6
+        )
+    })?;
+    dst.resize(total, 0.0f32);
     if past_seq == 0 {
-        return dst;
+        return Ok(dst);
     }
     for h in 0..NUM_HEADS {
         let s = h * old_cap * head_dim;
         let d = h * new_cap * head_dim;
         dst[d..d + past_seq * head_dim].copy_from_slice(&src[s..s + past_seq * head_dim]);
     }
-    dst
+    Ok(dst)
 }
 
 /// Write the new step's per-head K (or V) row at slot `past_seq`
@@ -955,7 +979,7 @@ mod tests {
         for h in 0..NUM_HEADS {
             src[h * 2 * QK_HEAD_DIM] = (h + 1) as f32;
         }
-        let dst = grow_kv_buffer(&src, 1, 2, 4, QK_HEAD_DIM);
+        let dst = grow_kv_buffer(&src, 1, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         for h in 0..NUM_HEADS {
             assert_eq!(
@@ -969,7 +993,7 @@ mod tests {
     #[test]
     fn grow_kv_buffer_from_empty_is_zero_filled() {
         let src = vec![0.0f32; NUM_HEADS * 2 * QK_HEAD_DIM];
-        let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM);
+        let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         assert!(dst.iter().all(|&x| x == 0.0));
     }

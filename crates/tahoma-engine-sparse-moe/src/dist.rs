@@ -42,12 +42,22 @@ use crate::sampling::SamplingConfig;
 /// 4-byte big-endian frame kinds. Chosen to be disjoint from
 /// `dist_spec`'s `FrameKind` so a stray cross-engine connection would
 /// fail fast on an unrecognized code.
+///
+/// Versioning convention: the low byte of `Forward` is bumped whenever
+/// the Forward body layout changes in a wire-incompatible way. Old
+/// peers reject the new code at `parse_kind` rather than mis-parsing
+/// the body. `Reset` / `Token` have stable bodies and don't need
+/// versioning.
+///
+/// History:
+/// - 0x01 — past_seq_len + hidden tensor only (pre-PR #10)
+/// - 0x02 — adds 28-byte SamplingConfig between past_seq_len and tensor (PR #10)
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    Forward = 0x53_4D_45_01, // "SME\x01"
-    Reset = 0x53_4D_45_02,   // "SME\x02"
-    Token = 0x53_4D_45_03,   // "SME\x03"
+    Forward = 0x53_4D_45_02, // "SME\x02"
+    Reset = 0x53_4D_45_10,   // "SME\x10"
+    Token = 0x53_4D_45_20,   // "SME\x20"
 }
 
 impl FrameKind {
@@ -89,13 +99,12 @@ pub async fn recv_kind_client(cli: &Mutex<ActivationClient>) -> TransportResult<
 }
 
 fn parse_kind(bytes: &[u8]) -> TransportResult<FrameKind> {
-    if bytes.len() != 4 {
-        return Err(TransportError::SocketClosed);
-    }
+    // `recv_raw(4)` always returns exactly 4 bytes on success.
+    debug_assert_eq!(bytes.len(), 4);
     let code = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     FrameKind::from_code(code).ok_or_else(|| {
         TransportError::Io(std::io::Error::other(format!(
-            "unknown sparse-MoE frame kind 0x{code:08x}"
+            "unknown sparse-MoE frame kind 0x{code:08x}; peer may be on an older Forward layout"
         )))
     })
 }
@@ -139,9 +148,27 @@ pub fn encode_sampling(cfg: &SamplingConfig, out: &mut [u8; SAMPLING_WIRE_BYTES]
 }
 
 pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
-    let temperature = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let top_p = f32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let repetition_penalty = f32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    // Defensive: a malformed or out-of-version peer could send NaN /
+    // negative / out-of-range values that would silently poison the
+    // sampler (NaN temperature → 1/NaN → all logits NaN → argmax 0
+    // every step). Clamp each f32 field to its valid domain and drop
+    // NaN to the default.
+    let temperature = sanitize_f32(
+        f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        0.0,
+        0.0,
+    );
+    let top_p = sanitize_f32(
+        f32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        1.0,
+        0.0,
+    )
+    .min(1.0);
+    let repetition_penalty = sanitize_f32(
+        f32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        1.0,
+        0.0,
+    );
     let rep_window = u64::from_be_bytes([
         bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
     ]) as usize;
@@ -154,6 +181,16 @@ pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
         repetition_penalty,
         repetition_window: rep_window,
         seed: if seed_raw == 0 { None } else { Some(seed_raw) },
+    }
+}
+
+/// Replace NaN / -inf / values below `min` with `fallback`. Used by
+/// `decode_sampling` to keep wire input from poisoning the sampler.
+fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
+    if x.is_nan() || x < min {
+        fallback
+    } else {
+        x
     }
 }
 
