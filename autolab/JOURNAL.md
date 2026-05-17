@@ -18,6 +18,36 @@ Entry template:
 
 ---
 
+## 002 — q1 instrumentation (LAUNCHED 2026-05-17 ~13:40 PT, awaiting fresh-context execution)
+
+**Hypothesis (to be tested):** Per-stage time breakdown on the 2-box K2.6
+pipeline will show expert dispatch dominates >60% of per-token wall time,
+with shell attention ~20%, cross-rank wire <5%, and the remainder split
+between layer 0, head, sampling. The disk-page-in latency on cold
+expert pages is the long-tail variance source.
+
+**Bucket / candidate:** q1 — instrumentation (not a moonshot; ranks
+downstream moonshots by which stage they attack)
+**Campaign:** `campaigns/001_instrumentation_breakdown.yaml`
+**Status:** ORIENT + HYPOTHESIS done in iteration-002-launch turn.
+EXECUTE phase to fire in next /loop wake-up (fresh context):
+1. Add `Instant`-based timing in `runner.rs::step()` + `forward_shells()`
+2. `git archive` source to matias-02 + matias-03, `cargo build --release`
+3. Restart workers via `bench/start_workers.sh`
+4. Run `bench/k26_3prompt_eval.ps1` against instrumented binary
+5. Parse rank-0 + rank-1 log per-stage timings
+6. Verify instrumentation overhead < 5% vs baseline 0.0553 tok/s
+7. Update PRIOR_ART.md "Where the time goes" with measured numbers
+8. Reorder MOONSHOTS Tier-S based on stage attribution
+9. Document + commit + maybe push (8 commits since last push as of now)
+
+**Why deferred to next wake:** Context budget — the setup + baseline
+work in this session is at ~70% of context limit. Iteration 002's
+execution phase (patch + build + deploy + bench + analyze) is best
+done in a fresh ~1M context.
+
+---
+
 ## 001 — Baseline established (2026-05-17 ~13:36 PT)
 
 **Hypothesis:** 2-box matias-02+03 K2.6 pipeline on main @ 208104e
