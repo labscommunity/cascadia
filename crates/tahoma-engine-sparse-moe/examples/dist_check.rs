@@ -94,17 +94,11 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!(
-        "[server] frames processed: {frame_count} (got_reset={got_reset})"
-    );
+    println!("[server] frames processed: {frame_count} (got_reset={got_reset})");
     Ok(())
 }
 
-async fn run_client(
-    peer: &str,
-    port: u16,
-    rounds: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_client(peer: &str, port: u16, rounds: u32) -> Result<(), Box<dyn std::error::Error>> {
     println!("[client] connecting to {peer}:{port}");
     let t_connect = Instant::now();
     let mut client = ActivationClient::new(peer, port);
@@ -138,9 +132,7 @@ async fn run_client(
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
         rt_ms.push(dt);
         if round < 3 || round.is_power_of_two() {
-            println!(
-                "[client] round {round} rt={dt:.1} ms token={token}"
-            );
+            println!("[client] round {round} rt={dt:.1} ms token={token}");
         }
     }
     let total_ms = total_t0.elapsed().as_secs_f64() * 1000.0;

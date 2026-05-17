@@ -10,9 +10,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use half::bf16;
+use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
+use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4, Int4Shell};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -22,10 +25,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::manifest::{Manifest, ManifestError};
-use crate::tensors::{
-    bf16_bytes_to_f32, bytes_to_i64, causal_mask_f32, concat_along_axis, f16_bytes_to_f32,
-    f32_to_bf16_bytes, f32_to_bytes, i64_to_bytes,
-};
+use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes, i64_to_bytes};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -40,68 +40,28 @@ pub enum RunnerError {
 }
 
 /// Per-MoE-layer state held across generation steps.
+///
+/// The shell forward runs through `tahoma_int4_gemm::shell_int4::shell_forward_decode_int4`,
+/// which expects flat KV caches in `[NUM_HEADS, S, D]` row-major layout (not OV's
+/// `[1, NUM_HEADS, S, D]` byte buffer). We track `past_seq_len` so each forward call
+/// has the cache shape it needs without per-call recomputation.
 struct LayerState {
     lid: u32,
-    shell: Runtime,
-    /// Last shell output names so we can look them up by index. OV inputs
-    /// can have ports addressed by 0-based index OR by name string;
-    /// `Runtime::output` only takes index, so we cache the index for each
-    /// canonical name once.
-    output_idx: HashMap<&'static str, usize>,
-    /// past_k bytes + shape `[1, num_kv_heads, past_seq, qk_head_dim]` f32
-    past_k: Vec<u8>,
-    past_k_shape: Vec<usize>,
-    past_v: Vec<u8>,
-    past_v_shape: Vec<usize>,
+    int4_shell: Int4Shell,
+    past_k: Vec<f32>,
+    past_v: Vec<f32>,
+    past_seq_len: usize,
 }
 
 impl LayerState {
-    fn new(
-        lid: u32,
-        shell: Runtime,
-        num_kv_heads: u32,
-        qk_head_dim: u32,
-        v_head_dim: u32,
-    ) -> Result<Self, RunnerError> {
-        let mut output_idx = HashMap::new();
-        let names = shell.output_names()?;
-        let aliases: Vec<Vec<String>> = (0..names.len())
-            .map(|i| shell.output_aliases(i).unwrap_or_default())
-            .collect();
-        for canonical in [
-            "attn_out_post_norm",
-            "attn_residual",
-            "shared_expert_out",
-            "routing_ids",
-            "routing_weights",
-            "present_k",
-            "present_v",
-        ] {
-            let idx = aliases
-                .iter()
-                .position(|als| als.iter().any(|a| a == canonical))
-                .or_else(|| names.iter().position(|n| n == canonical))
-                .ok_or_else(|| {
-                    RunnerError::Internal(format!(
-                        "shell output `{}` not found in IR (got: {:?})",
-                        canonical, names
-                    ))
-                })?;
-            output_idx.insert(canonical, idx);
-        }
-        Ok(Self {
+    fn new(lid: u32, int4_shell: Int4Shell) -> Self {
+        Self {
             lid,
-            shell,
-            output_idx,
+            int4_shell,
             past_k: Vec::new(),
-            past_k_shape: vec![1, num_kv_heads as usize, 0, qk_head_dim as usize],
             past_v: Vec::new(),
-            past_v_shape: vec![1, num_kv_heads as usize, 0, v_head_dim as usize],
-        })
-    }
-
-    fn out_idx(&self, name: &str) -> usize {
-        self.output_idx[name]
+            past_seq_len: 0,
+        }
     }
 }
 
@@ -137,7 +97,8 @@ struct Int4BinExpertCache {
 /// Variant that reads experts directly from the safetensors shards
 /// (`<model_dir>/safetensors/<shard>`) — no on-disk duplication.
 struct SafetensorsExpertCache {
-    source: SafetensorsExpertSource,
+    /// Shared with the Runner; one mmap set, multiple consumers.
+    source: Arc<SafetensorsExpertSource>,
     /// Cached SafetensorsExpert holders. Each pins its shard mmaps.
     map: HashMap<(u32, u32), SafetensorsExpert>,
 }
@@ -211,6 +172,11 @@ pub struct Runner {
     head: Option<Runtime>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
+    /// Shared safetensors handle used to construct each Int4Shell at
+    /// load time and (when experts_format=safetensors_bin) to serve
+    /// expert weights at runtime. Held in an Arc so the expert cache
+    /// can clone it without duplicating mmaps.
+    _safetensors_source: Arc<SafetensorsExpertSource>,
 }
 
 impl Runner {
@@ -272,6 +238,21 @@ impl Runner {
             None
         };
 
+        // Shells always come from safetensors now (the OV shell IRs are
+        // numerically broken for K2.6 — see k26_output_divergence). The
+        // safetensors source is the same one experts use when
+        // experts_format=safetensors_bin, so we open it once and share.
+        let st_dir = model_dir.join("safetensors");
+        let st_dir = if st_dir.exists() {
+            st_dir
+        } else {
+            model_dir.clone()
+        };
+        let safetensors_source = Arc::new(
+            SafetensorsExpertSource::open(st_dir)
+                .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
+        );
+
         let all_moe_ids = manifest.moe_layer_ids();
         let in_range: Vec<u32> = all_moe_ids
             .iter()
@@ -284,21 +265,20 @@ impl Runner {
             all_moe_ids.len()
         );
         let mut layers = Vec::with_capacity(in_range.len());
+        let shell_load_t0 = Instant::now();
         for (i, &lid) in in_range.iter().enumerate() {
-            let xml = manifest.shell_xml(&model_dir, lid);
-            if !xml.exists() {
-                return Err(RunnerError::MissingFile(xml));
-            }
-            let rt = Runtime::compile(&utf8(&xml)?, device, &plugin)?;
-            layers.push(LayerState::new(
-                lid,
-                rt,
-                manifest.num_kv_heads,
-                manifest.qk_head_dim,
-                manifest.v_head_dim,
-            )?);
+            let st_shell = safetensors_source
+                .shell(lid)
+                .map_err(|e| RunnerError::Internal(format!("safetensors shell L{lid}: {e}")))?;
+            let int4_shell = Int4Shell::from_safetensors(&st_shell);
+            layers.push(LayerState::new(lid, int4_shell));
             if (i + 1) % 10 == 0 || i + 1 == in_range.len() {
-                info!("compiled shells {}/{}", i + 1, in_range.len());
+                info!(
+                    "loaded int4 shells {}/{} ({:.1}s elapsed)",
+                    i + 1,
+                    in_range.len(),
+                    shell_load_t0.elapsed().as_secs_f64()
+                );
             }
         }
 
@@ -315,17 +295,9 @@ impl Runner {
                 })
             }
             "safetensors_bin" => {
-                info!("expert backend: safetensors_bin (direct safetensors mmap + AVX-512)");
-                let st_dir = model_dir.join("safetensors");
-                let st_dir = if st_dir.exists() {
-                    st_dir
-                } else {
-                    model_dir.clone()
-                };
-                let source = SafetensorsExpertSource::open(st_dir)
-                    .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?;
+                info!("expert backend: safetensors_bin (shared with shell source)");
                 ExpertCache::SafetensorsBin(SafetensorsExpertCache {
-                    source,
+                    source: safetensors_source.clone(),
                     map: HashMap::new(),
                 })
             }
@@ -361,6 +333,7 @@ impl Runner {
             head,
             layers,
             experts,
+            _safetensors_source: safetensors_source,
         })
     }
 
@@ -439,9 +412,8 @@ impl Runner {
     pub fn reset_kv(&mut self) {
         for l in &mut self.layers {
             l.past_k.clear();
-            l.past_k_shape[2] = 0;
             l.past_v.clear();
-            l.past_v_shape[2] = 0;
+            l.past_seq_len = 0;
         }
     }
 
@@ -525,10 +497,16 @@ impl Runner {
         Ok(l0_f32[row_off..].to_vec())
     }
 
-    /// Forward `tail_len` tokens through the shells this rank owns.
-    /// `h_f32` is the input hidden state shaped `[1, tail_len, hidden]`
+    /// Forward one token through the shells this rank owns.
+    /// `h_f32` is the input hidden state shaped `[1, 1, hidden]`
     /// (row-major). Returns the same shape after this rank's MoE
     /// layers, with per-layer KV cache updated.
+    ///
+    /// The int4 shell forward only supports seq=1 (decode mode). The
+    /// engine already drives prefill token-by-token, so this is the
+    /// only shape that ever shows up here. The mask is implicit: a
+    /// single token attends to all past + itself, no -inf positions
+    /// needed.
     pub fn forward_shells(
         &mut self,
         h_in: &[f32],
@@ -537,140 +515,79 @@ impl Runner {
     ) -> Result<Vec<f32>, RunnerError> {
         let hidden = self.manifest.hidden_size as usize;
         let top_k = self.manifest.top_k as usize;
-        if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[2] != hidden {
+        if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != 1 || h_shape[2] != hidden {
             return Err(RunnerError::Internal(format!(
-                "forward_shells: unexpected hidden shape {:?}",
-                h_shape
+                "forward_shells: int4 shells require shape [1, 1, {hidden}], got {h_shape:?}"
             )));
         }
-        let tail_len = h_shape[1];
         let mut h_f32 = h_in.to_vec();
-        let mut h_shape = h_shape.to_vec();
-
-        let (mask_f32, mask_shape) = causal_mask_f32(tail_len, past_seq_len);
-        let mask_bytes = f32_to_bytes(&mask_f32);
-        let past_len_bytes = (past_seq_len as i64).to_le_bytes().to_vec();
 
         let n_layers = self.layers.len();
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
-
-            // 2a) Set shell inputs.
-            let h_bf16 = f32_to_bf16_bytes(&h_f32);
-            let h_shape_now = h_shape.clone();
-            let past_k_bytes = std::mem::take(&mut self.layers[i].past_k);
-            let past_k_shape = self.layers[i].past_k_shape.clone();
-            let past_v_bytes = std::mem::take(&mut self.layers[i].past_v);
-            let past_v_shape = self.layers[i].past_v_shape.clone();
-
-            self.layers[i]
-                .shell
-                .set_input("x.1", DType::Bf16, &h_shape_now, &h_bf16)?;
-            self.layers[i]
-                .shell
-                .set_input("past_k", DType::F32, &past_k_shape, &past_k_bytes)?;
-            self.layers[i]
-                .shell
-                .set_input("past_v", DType::F32, &past_v_shape, &past_v_bytes)?;
-            self.layers[i].shell.set_input(
-                "attn_mask_ext",
-                DType::F32,
-                &mask_shape,
-                &mask_bytes,
-            )?;
-            self.layers[i]
-                .shell
-                .set_input("past_seq_len", DType::I64, &[], &past_len_bytes)?;
-            self.layers[i].shell.infer()?;
-
-            // 2b) Read outputs.
-            let read_f32_out =
-                |layer: &Runtime, idx: usize| -> Result<(Vec<usize>, Vec<f32>), RunnerError> {
-                    let (dt, shape, bytes) = layer.output(idx)?;
-                    let v = match dt {
-                        DType::F32 => read_f32(&bytes),
-                        DType::Bf16 => bf16_bytes_to_f32(&bytes),
-                        DType::F16 => f16_bytes_to_f32(&bytes),
-                        _ => {
-                            return Err(RunnerError::Internal(format!(
-                                "shell L{} output dtype {:?} not f32-castable",
-                                idx, dt
-                            )));
-                        }
-                    };
-                    Ok((shape, v))
-                };
-            let attn_out_idx = self.layers[i].out_idx("attn_out_post_norm");
-            let residual_idx = self.layers[i].out_idx("attn_residual");
-            let shared_idx = self.layers[i].out_idx("shared_expert_out");
-            let routing_ids_idx = self.layers[i].out_idx("routing_ids");
-            let routing_weights_idx = self.layers[i].out_idx("routing_weights");
-            let present_k_idx = self.layers[i].out_idx("present_k");
-            let present_v_idx = self.layers[i].out_idx("present_v");
-
-            let (_, attn_out_f32) = read_f32_out(&self.layers[i].shell, attn_out_idx)?;
-            let (_, residual_f32) = read_f32_out(&self.layers[i].shell, residual_idx)?;
-            let (_, shared_f32) = read_f32_out(&self.layers[i].shell, shared_idx)?;
-            let (routing_ids_shape, routing_ids_bytes) = self.layers[i]
-                .shell
-                .output(routing_ids_idx)
-                .map(|(_, s, b)| (s, b))?;
-            let routing_ids = bytes_to_i64(&routing_ids_bytes);
-            let (_, routing_weights_f32) =
-                read_f32_out(&self.layers[i].shell, routing_weights_idx)?;
-            let (pk_dt, pk_shape, pk_bytes) = self.layers[i].shell.output(present_k_idx)?;
-            let (pv_dt, pv_shape, pv_bytes) = self.layers[i].shell.output(present_v_idx)?;
-            if pk_dt != DType::F32 || pv_dt != DType::F32 {
+            if self.layers[i].past_seq_len != past_seq_len {
                 return Err(RunnerError::Internal(format!(
-                    "present_k/v dtype not f32 ({:?}, {:?})",
-                    pk_dt, pv_dt
+                    "L{lid}: past_seq_len mismatch (caller {past_seq_len} vs layer {})",
+                    self.layers[i].past_seq_len
                 )));
             }
 
-            // 2c) Append the freshly-computed present_k/v onto the running cache.
-            let (new_past_k, new_past_k_shape) =
-                concat_along_axis(&past_k_bytes, &past_k_shape, &pk_bytes, &pk_shape, 2, 4);
-            let (new_past_v, new_past_v_shape) =
-                concat_along_axis(&past_v_bytes, &past_v_shape, &pv_bytes, &pv_shape, 2, 4);
-            self.layers[i].past_k = new_past_k;
-            self.layers[i].past_k_shape = new_past_k_shape;
-            self.layers[i].past_v = new_past_v;
-            self.layers[i].past_v_shape = new_past_v_shape;
+            // Run Rust shell forward — same int4 kernel rainier's eval
+            // used via the cdylib, just called directly since we're in
+            // the same Cargo workspace.
+            let outs = shell_forward_decode_int4(
+                &self.layers[i].int4_shell,
+                &h_f32,
+                &self.layers[i].past_k,
+                &self.layers[i].past_v,
+                past_seq_len,
+            );
 
-            // 2d) Expert dispatch. attn_out_f32 has shape [seq, 7168].
-            // Each expert call takes [1, seq_token, 7168] bf16 in.
-            // routing_ids has shape [seq, top_k].
-            if routing_ids_shape.len() != 2 || routing_ids_shape[1] != top_k {
+            // Append present_k / present_v onto the running KV cache.
+            // Layout is [NUM_HEADS, past_seq, HEAD_DIM] flat; need a
+            // per-head interleaved insert (not a simple buffer concat).
+            append_kv_inplace(
+                &mut self.layers[i].past_k,
+                &outs.present_k,
+                past_seq_len,
+                NUM_HEADS,
+                QK_HEAD_DIM,
+            );
+            append_kv_inplace(
+                &mut self.layers[i].past_v,
+                &outs.present_v,
+                past_seq_len,
+                NUM_HEADS,
+                V_HEAD_DIM,
+            );
+            self.layers[i].past_seq_len = past_seq_len + 1;
+
+            // Expert dispatch — top-k weighted sum over the
+            // routing_ids/weights the shell already chose for us.
+            if outs.routing_ids.len() != top_k || outs.routing_weights.len() != top_k {
                 return Err(RunnerError::Internal(format!(
-                    "routing_ids shape unexpected {:?}",
-                    routing_ids_shape
+                    "L{lid} routing shape unexpected: ids={} weights={} (top_k={})",
+                    outs.routing_ids.len(),
+                    outs.routing_weights.len(),
+                    top_k
                 )));
             }
-            // moe accumulator: same shape as residual = [1, seq, 7168] f32, zero.
-            let mut moe = vec![0.0f32; residual_f32.len()];
-            for tok_idx in 0..tail_len {
-                let attn_row = &attn_out_f32[tok_idx * hidden..(tok_idx + 1) * hidden];
-                for k in 0..top_k {
-                    let eid = routing_ids[tok_idx * top_k + k] as u32;
-                    let w = routing_weights_f32[tok_idx * top_k + k];
-                    let y_f32 = self.dispatch_expert(lid, eid, attn_row)?;
-                    let dst_off = tok_idx * hidden;
-                    for j in 0..hidden {
-                        moe[dst_off + j] += w * y_f32[j];
-                    }
+            let mut moe = vec![0.0f32; hidden];
+            for k in 0..top_k {
+                let eid = outs.routing_ids[k] as u32;
+                let w = outs.routing_weights[k];
+                let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
+                for j in 0..hidden {
+                    moe[j] += w * y_f32[j];
                 }
             }
 
-            // 2e) Combine: h_next = residual + shared + moe
-            let mut h_next = vec![0.0f32; residual_f32.len()];
-            for j in 0..residual_f32.len() {
-                h_next[j] = residual_f32[j] + shared_f32[j] + moe[j];
+            // Combine: h_next = residual + shared + moe (single token).
+            for j in 0..hidden {
+                h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
             }
-            h_f32 = h_next;
-            h_shape = vec![1, tail_len, hidden];
         }
 
-        let _ = h_shape;
         Ok(h_f32)
     }
 
@@ -822,4 +739,62 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_le_bytes(a));
     }
     out
+}
+
+/// Append a single new step's K (or V) onto the running cache, in
+/// `[NUM_HEADS, past_seq, HEAD_DIM]` flat layout. `present` is a flat
+/// slice of length `NUM_HEADS * HEAD_DIM` (the new step's contribution,
+/// one per head).
+///
+/// Why not a simple buffer extend: with the data laid out as
+/// `[head][seq][dim]`, growing `seq` requires interleaving — head 0's
+/// new row sits at offset `past_seq * HEAD_DIM`, head 1's at
+/// `(past_seq + 1) * HEAD_DIM + past_seq * HEAD_DIM`, etc.
+fn append_kv_inplace(
+    past: &mut Vec<f32>,
+    present: &[f32],
+    past_seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+) {
+    debug_assert_eq!(past.len(), num_heads * past_seq * head_dim);
+    debug_assert_eq!(present.len(), num_heads * head_dim);
+    let new_seq = past_seq + 1;
+    let mut new_past = vec![0.0f32; num_heads * new_seq * head_dim];
+    for h in 0..num_heads {
+        let old_off = h * past_seq * head_dim;
+        let new_off = h * new_seq * head_dim;
+        if past_seq > 0 {
+            new_past[new_off..new_off + past_seq * head_dim]
+                .copy_from_slice(&past[old_off..old_off + past_seq * head_dim]);
+        }
+        new_past[new_off + past_seq * head_dim..new_off + new_seq * head_dim]
+            .copy_from_slice(&present[h * head_dim..(h + 1) * head_dim]);
+    }
+    *past = new_past;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_kv_grows_correctly_from_empty() {
+        let mut past: Vec<f32> = Vec::new();
+        let present: Vec<f32> = (0..6).map(|i| i as f32).collect(); // 2 heads × 3 dim
+        append_kv_inplace(&mut past, &present, 0, 2, 3);
+        assert_eq!(past, present);
+    }
+
+    #[test]
+    fn append_kv_interleaves_by_head() {
+        // 2 heads, head_dim=2, past_seq=1. past_k[h0,0,*] = [10, 11],
+        // past_k[h1,0,*] = [20, 21]. Append present where
+        // present[h0] = [12, 13], present[h1] = [22, 23].
+        // Expected new past: [10, 11, 12, 13, 20, 21, 22, 23].
+        let mut past = vec![10.0, 11.0, 20.0, 21.0];
+        let present = vec![12.0, 13.0, 22.0, 23.0];
+        append_kv_inplace(&mut past, &present, 1, 2, 2);
+        assert_eq!(past, vec![10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0]);
+    }
 }
