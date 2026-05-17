@@ -9,9 +9,11 @@
 //!   Rank 0 owns the API, layer 0, and the prefill+decode driver loop.
 //!   Last rank owns the head and sampler. Middle ranks just relay.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream;
@@ -169,6 +171,15 @@ impl Builder for SparseMoEBuilder {
         let mut layer_end = shard.layer_end;
         if total > 1 && layer_start == 0 && layer_end == 0 {
             let total_moe = read_manifest_moe_count(&self.config.model_dir)?;
+            // Reject splits that would leave a rank with zero MoE layers
+            // — that rank is dead weight (still on the wire, still pays
+            // every round-trip's latency) and almost certainly a config
+            // mistake. K2.6 has 60 MoE layers, so total > 60 is silly.
+            if total > total_moe {
+                return Err(EngineError::InvalidConfig(format!(
+                    "total={total} > num_moe_layers={total_moe}; some rank would hold zero layers"
+                )));
+            }
             let (s, e) = even_moe_split(total_moe, rank, total);
             layer_start = s;
             layer_end = e;
@@ -251,7 +262,8 @@ impl Builder for SparseMoEBuilder {
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
+            peer_disconnected: false,
             transport: self.transport,
             runtime_handle,
             rank,
@@ -290,14 +302,32 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
     (start, end)
 }
 
+/// Hard cap on the pending-task queue. step() processes one task end-to-end
+/// per call, so the OS-level backpressure of returning QueueFull is
+/// preferable to silently accreting tasks the engine will not reach for
+/// minutes. 8 is high enough that a small burst (e.g. a benchmark looping
+/// over a few prompts) is fine without immediately rejecting.
+const MAX_PENDING_TASKS: usize = 8;
+
+/// Cool-off the worker loop hits on the run_relay_loop tight cycle when
+/// either (a) the upstream peer closed and we're waiting for the runner to
+/// notice we're done, or (b) we just rejected a frame and need to avoid
+/// hot-spinning while a misbehaving peer keeps trying. Matches the cadence
+/// dist_spec uses for the same situation.
+const WORKER_BACKOFF: Duration = Duration::from_millis(200);
+
 pub struct SparseMoEEngine {
     runner: Runner,
     tokenizer: Option<Tokenizer>,
-    pending: Vec<GenerationTask>,
+    pending: VecDeque<GenerationTask>,
     transport: StageTransport,
     runtime_handle: tokio::runtime::Handle,
     rank: u32,
     total: u32,
+    /// Set on a worker rank when the upstream socket closes cleanly. Keeps
+    /// step_worker from hot-spinning on `recv_kind_server` returning
+    /// `Ok(None)` over and over.
+    peer_disconnected: bool,
 }
 
 impl SparseMoEEngine {
@@ -347,7 +377,13 @@ impl Engine for SparseMoEEngine {
                     .into(),
             ));
         }
-        self.pending.push(task);
+        if self.pending.len() >= MAX_PENDING_TASKS {
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: MAX_PENDING_TASKS,
+            });
+        }
+        self.pending.push_back(task);
         Ok(())
     }
 
@@ -361,11 +397,29 @@ impl Engine for SparseMoEEngine {
             self.step_worker()
         }
     }
+
+    fn close(&mut self) {
+        // Best-effort transport teardown. We block_on each socket's close()
+        // sequentially because the engine is being torn down; lock
+        // contention isn't a worry. Errors are logged but swallowed —
+        // close is idempotent and we want every peer to get a clean FIN.
+        if let Some(srv) = self.transport.upstream.take() {
+            let _ = self.block_on(async move {
+                srv.lock().await.close().await;
+            });
+        }
+        if let Some(cli) = self.transport.downstream.take() {
+            let _ = self.block_on(async move {
+                cli.lock().await.close().await;
+            });
+        }
+        self.peer_disconnected = true;
+    }
 }
 
 impl SparseMoEEngine {
     fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
-        let task = match self.pending.pop() {
+        let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -426,7 +480,7 @@ impl SparseMoEEngine {
     /// Rank 0 driver: tokenize, drive prefill + decode through the
     /// transport pipeline, return one final chunk for the task.
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
-        let task = match self.pending.pop() {
+        let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -614,11 +668,22 @@ impl SparseMoEEngine {
     /// Worker step: process exactly one frame from upstream and emit
     /// its response (either FORWARD downstream + TOKEN back upstream
     /// for middle ranks, or TOKEN back upstream for the last rank).
+    ///
+    /// Returning an empty Vec is the worker's normal idle/done signal —
+    /// the runner's `run_relay_loop` calls `step()` in a tight loop, so
+    /// we sleep briefly on disconnect / error to avoid pegging a core
+    /// while the runner is being torn down by the operator.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.peer_disconnected {
+            std::thread::sleep(WORKER_BACKOFF);
+            return Vec::new();
+        }
         let upstream = match self.transport.upstream.clone() {
             Some(u) => u,
             None => {
                 warn!("worker rank has no upstream peer");
+                self.peer_disconnected = true;
+                std::thread::sleep(WORKER_BACKOFF);
                 return Vec::new();
             }
         };
@@ -626,6 +691,9 @@ impl SparseMoEEngine {
             Ok(_) => Vec::new(),
             Err(e) => {
                 warn!(rank = self.rank, "worker frame failed: {e}");
+                // Don't hot-spin on a misbehaving peer. dist_spec uses
+                // the same 200 ms cool-off; same logic applies here.
+                std::thread::sleep(WORKER_BACKOFF);
                 Vec::new()
             }
         }
@@ -640,14 +708,18 @@ impl SparseMoEEngine {
             .block_on(recv_kind_server(upstream))
             .map_err(|e| format!("recv_kind: {e}"))?;
         let Some(kind) = kind else {
-            // Clean shutdown.
+            // Clean upstream close — the driver finished its session.
+            // Latch the flag so subsequent step()s back off without
+            // re-entering the (now-doomed) recv loop.
+            info!(rank = self.rank, "upstream closed cleanly; worker idling");
+            self.peer_disconnected = true;
             return Ok(());
         };
         match kind {
             FrameKind::Reset => {
                 self.runner.reset_kv();
                 if let Some(down) = downstream.as_ref() {
-                    self.block_on(forward_reset(upstream, down))
+                    self.block_on(forward_reset(down))
                         .map_err(|e| format!("forward_reset: {e}"))?;
                 }
                 Ok(())
@@ -674,11 +746,13 @@ impl SparseMoEEngine {
                         .runner
                         .forward_head_last(&h_after, 1)
                         .map_err(|e| format!("forward_head: {e}"))?;
-                    // Greedy for now — distributed sampling will need
-                    // to plumb temperature/top-p in the frame body if
-                    // we want sample diversity on multi-stage. Treat
-                    // it as a follow-up; quality eval target uses
-                    // temperature=0 anyway.
+                    // **Known limitation**: multi-stage mode ignores the
+                    // caller's `temperature` / `top_p` / `repetition_penalty`
+                    // because the Forward frame body doesn't carry sampling
+                    // params. A `task.temperature = 0.7` request will
+                    // silently produce greedy output on the multi-stage
+                    // path. Fix is a new frame field — punted until a
+                    // user actually asks for it.
                     let token = argmax_i64(&logits);
                     self.block_on(send_token_upstream(upstream, token))
                         .map_err(|e| format!("send_token: {e}"))?;
@@ -716,6 +790,15 @@ impl SparseMoEEngine {
 }
 
 fn argmax_i64(xs: &[f32]) -> i64 {
+    // We sample on the last rank; an empty logits vector here means
+    // forward_head_last returned a malformed buffer (engine bug) or the
+    // caller passed wrong input. Returning 0 silently would dispatch
+    // token id 0 — better to surface a warning and let the caller
+    // diagnose. Empty vocab is never legitimate in practice.
+    if xs.is_empty() {
+        warn!("argmax_i64 called with empty logits; returning 0 as fallback");
+        return 0;
+    }
     let mut best = 0i64;
     let mut best_v = f32::NEG_INFINITY;
     for (i, &v) in xs.iter().enumerate() {

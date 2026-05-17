@@ -187,25 +187,11 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
     ]))
 }
 
-/// Middle ranks relay Token upstream when they receive it from
-/// downstream. Reads + re-sends in one call.
-pub async fn relay_token_body(
-    downstream: &Mutex<ActivationClient>,
-    upstream: &Mutex<ActivationServer>,
-) -> TransportResult<i64> {
-    let token = recv_token_body_client(downstream).await?;
-    send_token_upstream(upstream, token).await?;
-    Ok(token)
-}
-
-/// Forward a Reset frame upstream → downstream (mid ranks).
-pub async fn forward_reset(
-    upstream: &Mutex<ActivationServer>,
-    downstream: &Mutex<ActivationClient>,
-) -> TransportResult<()> {
-    // Reset has no body; we've already consumed the kind on upstream.
-    // The downstream send is identical to send_reset.
-    let _ = upstream; // present for symmetry / future control flow
+/// Forward a Reset frame downstream — used by mid ranks after consuming
+/// the kind code from upstream. The body is empty so this is just a
+/// `send_reset` to the next peer; the `upstream` argument is held by the
+/// caller and the kind is already consumed before this point.
+pub async fn forward_reset(downstream: &Mutex<ActivationClient>) -> TransportResult<()> {
     send_reset(downstream).await
 }
 
