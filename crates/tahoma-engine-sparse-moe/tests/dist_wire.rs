@@ -8,9 +8,11 @@
 use std::sync::Arc;
 
 use tahoma_engine_sparse_moe::dist::{
-    recv_forward_body_server, recv_kind_client, recv_kind_server, recv_token_body_client,
-    send_forward, send_reset, send_token_upstream, FrameKind,
+    decode_sampling, encode_sampling, recv_forward_body_server, recv_kind_client, recv_kind_server,
+    recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
+    SAMPLING_WIRE_BYTES,
 };
+use tahoma_engine_sparse_moe::SamplingConfig;
 use tahoma_transport::{ActivationClient, ActivationServer};
 use tokio::sync::Mutex;
 
@@ -43,16 +45,36 @@ async fn forward_frame_round_trips_hidden_state() {
     let (server, client) = make_pair().await;
     let hidden: Vec<f32> = (0..1024).map(|i| (i as f32) * 0.001 - 0.5).collect();
     let shape = [1u32, 1, 1024];
+    let cfg = SamplingConfig {
+        temperature: 0.7,
+        top_p: 0.9,
+        repetition_penalty: 1.15,
+        repetition_window: 256,
+        seed: Some(0x1234_5678_9abc_def0),
+    };
+    let cfg_for_assert = cfg.clone();
 
-    let send_task =
-        tokio::spawn(async move { send_forward(&client, 17, &hidden, shape).await.unwrap() });
+    let send_task = tokio::spawn(async move {
+        send_forward(&client, 17, &cfg, &hidden, shape)
+            .await
+            .unwrap()
+    });
 
     let kind = recv_kind_server(&server).await.unwrap();
     assert_eq!(kind, Some(FrameKind::Forward));
-    let (past_seq_len, h_back, in_shape) = recv_forward_body_server(&server).await.unwrap();
+    let (past_seq_len, cfg_back, h_back, in_shape) =
+        recv_forward_body_server(&server).await.unwrap();
     assert_eq!(past_seq_len, 17);
     assert_eq!(in_shape, shape);
     assert_eq!(h_back.len(), 1024);
+    assert_eq!(cfg_back.temperature, cfg_for_assert.temperature);
+    assert_eq!(cfg_back.top_p, cfg_for_assert.top_p);
+    assert_eq!(
+        cfg_back.repetition_penalty,
+        cfg_for_assert.repetition_penalty
+    );
+    assert_eq!(cfg_back.repetition_window, cfg_for_assert.repetition_window);
+    assert_eq!(cfg_back.seed, cfg_for_assert.seed);
     for (i, &got) in h_back.iter().enumerate() {
         let expected = (i as f32) * 0.001 - 0.5;
         assert!(
@@ -62,6 +84,38 @@ async fn forward_frame_round_trips_hidden_state() {
     }
 
     send_task.await.unwrap();
+}
+
+#[test]
+fn sampling_wire_round_trips_defaults_and_explicit_values() {
+    // Default config (greedy, no rep penalty, no seed) — the seed=0
+    // sentinel must round-trip back to None.
+    let cfg = SamplingConfig::default();
+    let mut bytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(&cfg, &mut bytes);
+    let back = decode_sampling(&bytes);
+    assert_eq!(back.temperature, cfg.temperature);
+    assert_eq!(back.top_p, cfg.top_p);
+    assert_eq!(back.repetition_penalty, cfg.repetition_penalty);
+    assert_eq!(back.repetition_window, cfg.repetition_window);
+    assert_eq!(back.seed, None);
+
+    // Explicit fields including a seed.
+    let cfg = SamplingConfig {
+        temperature: 0.8,
+        top_p: 0.95,
+        repetition_penalty: 1.1,
+        repetition_window: 1024,
+        seed: Some(42),
+    };
+    let mut bytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(&cfg, &mut bytes);
+    let back = decode_sampling(&bytes);
+    assert_eq!(back.temperature, cfg.temperature);
+    assert_eq!(back.top_p, cfg.top_p);
+    assert_eq!(back.repetition_penalty, cfg.repetition_penalty);
+    assert_eq!(back.repetition_window, cfg.repetition_window);
+    assert_eq!(back.seed, cfg.seed);
 }
 
 #[tokio::test]
@@ -129,9 +183,10 @@ async fn sequence_reset_then_forward_then_token() {
     let shape = [1u32, 1, 7168];
 
     let server_for_token = server.clone();
+    let cfg = SamplingConfig::default();
     let send_task = tokio::spawn(async move {
         send_reset(&client).await.unwrap();
-        send_forward(&client, 0, &hidden_for_send, shape)
+        send_forward(&client, 0, &cfg, &hidden_for_send, shape)
             .await
             .unwrap();
     });
@@ -144,7 +199,7 @@ async fn sequence_reset_then_forward_then_token() {
         recv_kind_server(&server).await.unwrap(),
         Some(FrameKind::Forward)
     );
-    let (past, h_back, sh) = recv_forward_body_server(&server).await.unwrap();
+    let (past, _cfg_back, h_back, sh) = recv_forward_body_server(&server).await.unwrap();
     assert_eq!(past, 0);
     assert_eq!(sh, shape);
     assert_eq!(h_back.len(), 7168);
