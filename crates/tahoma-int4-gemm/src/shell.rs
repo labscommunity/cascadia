@@ -30,6 +30,7 @@ pub const QK_ROPE_HEAD_DIM: usize = 64;
 pub const QK_HEAD_DIM: usize = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM; // 192
 pub const V_HEAD_DIM: usize = 128;
 pub const INTERMEDIATE_SHARED: usize = 2048;
+pub const INTERMEDIATE_DENSE: usize = 18432;
 pub const N_ROUTED_EXPERTS: usize = 384;
 pub const N_GROUPS: usize = 1;
 pub const TOPK_GROUP: usize = 1;

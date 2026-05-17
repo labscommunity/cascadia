@@ -36,8 +36,10 @@ use parking_lot::RwLock;
 use crate::format::GemmError;
 
 /// Per-shard mmap + lookup table: tensor name → (data start, length) in
-/// the mmap.
-struct Shard {
+/// the mmap. Public because it appears in the return type of
+/// `tensor_bytes` / `layer0` / `embed_tokens` (callers pin the Arc to
+/// keep the returned slice valid), but the fields are all private.
+pub struct Shard {
     mmap: Mmap,
     data_start: usize,
     tensors: HashMap<String, (usize, usize)>, // (data_offset_in_data_section, length)
@@ -306,6 +308,37 @@ pub struct SafetensorsShell {
 unsafe impl Send for SafetensorsShell {}
 unsafe impl Sync for SafetensorsShell {}
 
+/// Layer 0 of K2.6 is dense (not MoE) — same MLA attention as a shell,
+/// but the MLP is a single SwiGLU instead of a router + 384 experts +
+/// shared expert.
+pub struct SafetensorsLayer0 {
+    _pins: Vec<Arc<Shard>>,
+    pub layer: u32,
+
+    /// `input_layernorm.weight` — bf16 [hidden].
+    pub input_norm: &'static [u8],
+    /// `self_attn.q_a_proj.weight` — bf16 [q_lora_rank, hidden].
+    pub q_a_proj: &'static [u8],
+    pub q_a_norm: &'static [u8],
+    pub q_b_proj: &'static [u8],
+    pub kv_a_proj: &'static [u8],
+    pub kv_a_norm: &'static [u8],
+    pub kv_b_proj: &'static [u8],
+    pub o_proj: &'static [u8],
+
+    pub post_norm: &'static [u8],
+
+    /// `mlp.gate_proj.weight` — bf16 [intermediate_dense=18432, hidden].
+    pub gate_proj: &'static [u8],
+    /// `mlp.up_proj.weight` — bf16 [intermediate_dense, hidden].
+    pub up_proj: &'static [u8],
+    /// `mlp.down_proj.weight` — bf16 [hidden, intermediate_dense].
+    pub down_proj: &'static [u8],
+}
+
+unsafe impl Send for SafetensorsLayer0 {}
+unsafe impl Sync for SafetensorsLayer0 {}
+
 impl SafetensorsExpertSource {
     /// Fetch one layer's shell tensors. Mmaps the relevant safetensors
     /// shards lazily (with internal caching).
@@ -353,5 +386,57 @@ impl SafetensorsExpertSource {
             shared_up: slices[12],
             shared_down: slices[13],
         })
+    }
+
+    /// Fetch the dense layer-0 tensors (attention + SwiGLU MLP).
+    /// Mmaps the relevant safetensors shards lazily.
+    pub fn layer0(&self) -> Result<SafetensorsLayer0, GemmError> {
+        let layer: u32 = 0;
+        let base = format!("language_model.model.layers.{layer}");
+        let names: [&str; 12] = [
+            "input_layernorm.weight",
+            "self_attn.q_a_proj.weight",
+            "self_attn.q_a_layernorm.weight",
+            "self_attn.q_b_proj.weight",
+            "self_attn.kv_a_proj_with_mqa.weight",
+            "self_attn.kv_a_layernorm.weight",
+            "self_attn.kv_b_proj.weight",
+            "self_attn.o_proj.weight",
+            "post_attention_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ];
+        let mut pins = Vec::with_capacity(names.len());
+        let mut slices: [&'static [u8]; 12] = [&[]; 12];
+        for (i, suf) in names.iter().enumerate() {
+            let full = format!("{base}.{suf}");
+            let (shard, bytes) = self.slice(&full)?;
+            pins.push(shard);
+            slices[i] = bytes;
+        }
+        Ok(SafetensorsLayer0 {
+            _pins: pins,
+            layer,
+            input_norm: slices[0],
+            q_a_proj: slices[1],
+            q_a_norm: slices[2],
+            q_b_proj: slices[3],
+            kv_a_proj: slices[4],
+            kv_a_norm: slices[5],
+            kv_b_proj: slices[6],
+            o_proj: slices[7],
+            post_norm: slices[8],
+            gate_proj: slices[9],
+            up_proj: slices[10],
+            down_proj: slices[11],
+        })
+    }
+
+    /// Fetch the model's input embedding table — bf16
+    /// `[vocab_size, hidden_size]`, flat row-major. Returns the
+    /// pinned shard reference plus a slice into the mmap.
+    pub fn embed_tokens(&self) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
+        self.slice("language_model.model.embed_tokens.weight")
     }
 }

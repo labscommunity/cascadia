@@ -26,7 +26,11 @@ const GROUP_SIZE: usize = 32;
 /// Output layout:
 ///   packed: u8 [n_rows * k_cols / 2], byte i holds nibbles for cols 2i, 2i+1
 ///   scales: u8 [n_rows * (k_cols / GROUP_SIZE) * 2], bf16 little-endian
-fn quantize_int4_group(weight_bf16: &[u8], n_rows: usize, k_cols: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn quantize_int4_group(
+    weight_bf16: &[u8],
+    n_rows: usize,
+    k_cols: usize,
+) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(weight_bf16.len(), n_rows * k_cols * 2);
     assert!(k_cols.is_multiple_of(GROUP_SIZE));
     let n_groups = k_cols / GROUP_SIZE;
