@@ -217,6 +217,12 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// autolab campaign 004 (A3): if Some(k') with k' < manifest.top_k,
+    /// forward_shells dispatches only the first k' of the routed top-K
+    /// experts per token. The shell's router still computes full top-K;
+    /// we just skip the dispatch of the tail. Sigmoid-router models
+    /// (K2.6 / DeepSeek-V3) tolerate this with minimal quality loss.
+    top_k_override: Option<u32>,
 }
 
 impl Runner {
@@ -392,7 +398,20 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            top_k_override: None,
         })
+    }
+
+    /// Set the per-token top-K dispatch override. None = use manifest's top_k.
+    /// Values > manifest.top_k are silently clamped down (no point dispatching
+    /// experts the router didn't route to).
+    pub fn set_top_k_override(&mut self, v: Option<u32>) {
+        self.top_k_override = v;
+        info!(
+            top_k_override = ?v,
+            manifest_top_k = self.manifest.top_k,
+            "set_top_k_override"
+        );
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -591,7 +610,15 @@ impl Runner {
         let mut experts_total_us: u64 = 0;
         let mut combine_total_us: u64 = 0;
         let hidden = self.manifest.hidden_size as usize;
-        let top_k = self.manifest.top_k as usize;
+        let manifest_top_k = self.manifest.top_k as usize;
+        // autolab campaign 004 (A3): if an override is set, only dispatch
+        // the first k' of the routed top-K experts per token. The shell's
+        // router still returns the full manifest top_k.
+        let effective_top_k = self
+            .top_k_override
+            .map(|v| (v as usize).min(manifest_top_k))
+            .unwrap_or(manifest_top_k);
+        let top_k = manifest_top_k; // alias for the router contract check below
         if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != 1 || h_shape[2] != hidden {
             return Err(RunnerError::Internal(format!(
                 "forward_shells: int4 shells require shape [1, 1, {hidden}], got {h_shape:?}"
@@ -666,7 +693,7 @@ impl Runner {
             }
             let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
-            for k in 0..top_k {
+            for k in 0..effective_top_k {
                 let eid = outs.routing_ids[k] as u32;
                 let w = outs.routing_weights[k];
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
@@ -689,6 +716,7 @@ impl Runner {
             stage = "shells",
             n_layers,
             top_k,
+            effective_top_k,
             shell_attn_us = shell_attn_total_us,
             experts_us = experts_total_us,
             combine_us = combine_total_us,

@@ -1,0 +1,71 @@
+version: 1
+name: 004_a3_topk_reduction
+hypothesis: |
+  Dropping K2.6 top-K dispatch from K=8 to K=6 will yield 15-25%
+  end-to-end tok/s improvement on the 2-box matias pipeline (the
+  expert dispatch bucket is 82% of per-token decode per q1; reducing
+  from 8 to 6 cuts experts dispatched by 25%, which should cascade to
+  ~20% wall-time reduction). Quality should stay 3/3 on Paris/Pacific/
+  four per DeepSeek-V3 paper's sigmoid-router-tolerates-reduction
+  finding (K2.6 is in that family).
+question: q2
+moonshot_id: A3
+moonshot: true
+prior_art_note: |
+  Two converging sources from LITERATURE.md:
+  - arxiv 2505.03531 "Faster MoE LLM Inference": DeepSeek-V3 sigmoid
+    router tolerates >=10% activated-expert reduction at 0% perf loss;
+    up to ~50% at low concurrency (matches our CPU-bound regime).
+  - KTransformers V0.3 `-ser` knob: 286.55 vs 227 tok/s prefill
+    (K=6 vs K=8) on DeepSeek-V3.
+  K=6 first (conservative); K=4 if K=6 passes 3/3 quality.
+
+runner:
+  backend: ssh
+  rank0_host: cascadia-matias-02
+  rank1_host: cascadia-matias-03
+  command: "powershell -NoProfile -File k26_3prompt_eval.ps1"
+  setup:
+    - kill workers
+    - scp source + wrappers (--top-k-override plumbed)
+    - cargo build --release on both
+    - $env:TAHOMA_TOPK=6 ; start workers
+  timeout_seconds: 5400
+
+defaults:
+  max_tokens: 8
+  temperature: 0
+  prompts: ["The capital of France is", "The largest ocean on Earth is the", "Two plus two equals"]
+  expected_substrs: ["paris", "pacific", "four"]
+
+grid:
+  top_k_override: [6, 4]    # K=6 first; only run K=4 if K=6 passes
+
+metrics:
+  primary: tok_per_sec
+  direction: maximize
+  collect:
+    - name: tok_per_sec
+      source: stdout
+      pattern: '"tok_per_sec":([\d.]+)'
+      type: float
+    - name: quality_pass
+      source: stdout
+      pattern: '"quality_pass":"(\d+)/3"'
+      type: str
+    - name: effective_top_k
+      source: rank0_tahoma_log
+      pattern: 'effective_top_k=(\d+)'
+      type: int
+
+repeats: 1   # primary measurement; can be replicated if delta is small
+
+acceptance:
+  min_quality_pass: 3
+  significance: "delta vs baseline 0.0553 tok/s; win if >=5% and 3/3 quality"
+
+stopping: { max_failures: 2 }
+
+links:
+  spawned_from: q2 in research_plan.yaml
+  productionizable_as: "spinout PR off main with --top-k-override flag + the runner.rs effective_top_k change"

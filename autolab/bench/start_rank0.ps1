@@ -12,4 +12,5 @@ $env:Path = "$ov\runtime\bin\intel64\Release;$ov\runtime\3rdparty\tbb\bin;$env:P
     --listen :9100 `
     --next 100.123.40.123:9100 `
     --api :8000 `
-    --max-tokens 8 *>&1 | Out-File -FilePath "$env:USERPROFILE\tahoma-rank0.log" -Encoding utf8
+    --max-tokens 8 `
+    --top-k-override $(if ($env:TAHOMA_TOPK) { $env:TAHOMA_TOPK } else { 8 }) *>&1 | Out-File -FilePath "$env:USERPROFILE\tahoma-rank0.log" -Encoding utf8

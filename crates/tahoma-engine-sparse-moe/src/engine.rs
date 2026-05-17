@@ -42,6 +42,10 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
+    /// token are dispatched per shell layer. Plumbed into Runner; effective
+    /// at every `forward_shells` call. Used by autolab campaign 004 (A3).
+    pub top_k_override: Option<u32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -219,7 +223,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +232,9 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        // autolab campaign 004 (A3): plumb the top-K override into the runner
+        // so per-token forward_shells dispatches only k' experts.
+        runner.set_top_k_override(self.config.top_k_override);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
