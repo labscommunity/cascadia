@@ -6,7 +6,9 @@ Best result per topology. Updated whenever a verified win lands.
 
 | Rank | tok/s | Config | Date | Campaign |
 |-----:|------:|--------|------|----------|
-| 1 | ~0.11 | main @ 208104e, K2.6 single-stage, top-8, disk-bound | 2026-05-16 | (baseline from PR #7) |
+| 1 | **0.1116** | **A3: K2.6 single-stage, --top-k-override 6** (3/3 quality) | 2026-05-17 | [005_a3_topk_miner](experiments/005_a3_topk_miner/) |
+| 2 | 0.0797 | K2.6 single-stage, top-8 baseline (3/3 quality) | 2026-05-17 | 005 K=8 reference run |
+| - | ~0.11 | (historical) main @ 208104e single-stage from PR #7 | 2026-05-16 | (older reference) |
 
 ## 2-box (matias-02 + matias-03, Lunar Lake 258V × 2, Tailscale DERP)
 

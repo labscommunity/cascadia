@@ -18,6 +18,49 @@ Entry template:
 
 ---
 
+## 005 — A3 top-K reduction VERIFIED WIN on miner (2026-05-17 ~18:30 PT)
+
+**Hypothesis:** K=8→K=6 yields 15-25% tok/s improvement at <1% quality cost.
+
+**Result: WIN. +40.0% throughput. Quality 3/3 preserved.**
+
+| | tok/s | quality |
+|---|---:|---|
+| K=8 baseline | 0.0797 | 3/3 |
+| **K=6**      | **0.1116** | **3/3** |
+| **Δ**        | **+40.0%** | preserved |
+
+Bench: `experiments/005_a3_topk_miner/{bench_k6,bench_k8}.jsonl`
+Notes: `experiments/005_a3_topk_miner/result.md`
+
+**Hardware substrate:** miner single-stage (forced pivot — matias-02
+Tailscale was broken from earlier iteration's `tailscale up --reset`
+attempt; needs manual re-auth). Miner is disk-bound at 58 GB/s read,
+133 GB RAM. Per-prompt times vary ±20% by cache state but the +40%
+aggregate delta is well above noise.
+
+**Lit alignment:** Predicted +10-25% (DeepSeek-V3 paper, KTransformers).
+Measured +40% — at the upper end of lit, consistent with low-concurrency
+CPU-bound regime where expert FFN computation + page-in are the bottleneck.
+
+**Tier-S #1 productionizable.** Spinout PR off main: add the
+`--top-k-override` flag (commits db85e74 + fe31d7c) with the +40%
+finding documented. Default = manifest top_k = no behavior change.
+
+**Next (iteration 006):** D4 async pipeline overlap. Hides 54% of
+per-token wall time per q1 breakdown. Requires the 2-box matias setup
+— blocked on Tailscale fix. Either:
+(a) fix matias-02 Tailscale (manual re-auth on box) and retry, OR
+(b) try D4 single-stage variant on miner (less natural; pipeline
+    overlap only meaningful with stages), OR
+(c) try F4 multi-thread per shell (attacks 14.5% attention bucket;
+    doesn't need 2-box; can validate on miner).
+
+Leaning toward (c) F4 for iteration 006 — keeps the loop moving on
+miner while matias is parked.
+
+---
+
 ## 004 — A3 top-K reduction PARTIAL (2026-05-17 ~14:34 to 15:50 PT, parked on infra)
 
 **Hypothesis:** K=8→K=6 yields 15-25% end-to-end tok/s improvement

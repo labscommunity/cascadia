@@ -1,31 +1,38 @@
 {
-  "iteration": 3,
-  "moonshots_attempted": 0,
+  "iteration": 5,
+  "moonshots_attempted": 2,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 0,
+    "win": 1,
     "neutral": 0,
-    "negative": 0
+    "negative": 0,
+    "parked": 1
   },
   "moonshot_magnitude_counts": {
     "XS": 0,
     "S": 0,
-    "M": 0,
+    "M": 1,
     "L": 0,
     "XL": 0
   },
-  "moonshot_ratio": 0.0,
+  "moonshot_ratio": 0.5,
   "consecutive_no_improvement": 0,
   "current_leader": {
-    "tok_per_sec": 0.0553,
-    "config": "main @ 208104e, 2-box matias-02+03, K2.6 fp32 KV, top-8, K=1, F32 hidden wire, 30/30 split",
-    "campaign": "000_baseline_main",
+    "tok_per_sec": 0.1116,
+    "config": "A3 K=6 on miner single-stage (different topology from baseline 2-box)",
+    "campaign": "005_a3_topk_miner",
     "per_prompt": {
-      "paris":   {"wall_s": 123.06, "tokens": 8, "tok_per_sec": 0.0650, "quality": true},
-      "pacific": {"wall_s": 170.09, "tokens": 8, "tok_per_sec": 0.0470, "quality": true},
-      "four":    {"wall_s": 140.93, "tokens": 8, "tok_per_sec": 0.0568, "quality": true}
+      "paris":   {"wall_s": 66.59, "tokens": 8, "tok_per_sec": 0.1201, "quality": true},
+      "pacific": {"wall_s": 83.48, "tokens": 8, "tok_per_sec": 0.0958, "quality": true},
+      "four":    {"wall_s": 64.93, "tokens": 8, "tok_per_sec": 0.1232, "quality": true}
     },
-    "measured_at_utc": "2026-05-17T20:36:29Z"
+    "delta_vs_k8_same_substrate": 0.40,
+    "measured_at_utc": "2026-05-17T23:19:02Z"
+  },
+  "baseline_2box_matias": {
+    "tok_per_sec": 0.0553,
+    "measured_at_utc": "2026-05-17T20:36:29Z",
+    "note": "matias-02 Tailscale needs manual re-auth; 2-box bench parked"
   },
   "started_at_utc": "2026-05-17T19:45:00Z",
   "last_iteration_at_utc": "2026-05-17T21:34:00Z",
