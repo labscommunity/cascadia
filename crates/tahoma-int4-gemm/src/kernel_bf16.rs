@@ -72,14 +72,13 @@ mod avx512 {
                 c += 16;
             }
             let mut sum = _mm512_reduce_add_ps(acc);
-            // Tail
+            // Tail (k_cols not a multiple of 16). Use `row_ptr` directly,
+            // which already points at byte `r * row_stride`, so we index
+            // from 0 within the row rather than re-computing the absolute
+            // offset.
             while c < k_cols {
-                let off = r * row_stride + c * 2;
-                let lo = *row_ptr.add(c * 2 - r * row_stride);
-                let hi = *row_ptr.add(c * 2 - r * row_stride + 1);
-                let _ = (off, lo, hi);
-                let lo = *weight_bf16.as_ptr().add(off);
-                let hi = *weight_bf16.as_ptr().add(off + 1);
+                let lo = *row_ptr.add(c * 2);
+                let hi = *row_ptr.add(c * 2 + 1);
                 let bits = ((hi as u32) << 8) | (lo as u32);
                 let w_f32 = f32::from_bits(bits << 16);
                 sum += w_f32 * x[c];
@@ -141,11 +140,27 @@ mod tests {
 
     #[test]
     fn gemv_match_scalar_random() {
+        // Sweep a deterministic-but-bounded set of bf16 weights and
+        // compare the AVX-512 path against the scalar reference. The
+        // bound matters: filling the buffer with raw 0..255 bytes
+        // produces bf16 values up to ~3e38, and accumulating 64 of
+        // those gives nominally-1e36-magnitude results where the
+        // AVX-512 parallel reduction and the scalar sequential add
+        // diverge by far more than any "reasonable absolute" tol.
+        // Bound the weights to [-0.5, 0.5] so the running sum stays
+        // O(k * max|w| * max|x|) ≈ O(1) and rounding stays at the ULP
+        // level.
         let n = 32;
         let k = 64;
         let mut w = vec![0u8; n * k * 2];
-        for (i, b) in w.iter_mut().enumerate() {
-            *b = ((i * 7919 + 31) & 0xFF) as u8;
+        for r in 0..n {
+            for c in 0..k {
+                let raw = ((r * 7919 + c * 31 + 17) & 0x7F) as f32; // 0..127
+                let val = raw / 128.0 - 0.5; // [-0.5, ~0.49]
+                let bits = bf16::from_f32(val).to_bits();
+                w[(r * k + c) * 2] = (bits & 0xff) as u8;
+                w[(r * k + c) * 2 + 1] = ((bits >> 8) & 0xff) as u8;
+            }
         }
         let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 0.1).collect();
         let mut y_scalar = vec![0.0f32; n];
@@ -153,12 +168,17 @@ mod tests {
         bf16_gemv_scalar(&w, &x, n, k, &mut y_scalar);
         bf16_gemv_auto(&w, &x, n, k, &mut y_auto);
         for r in 0..n {
+            // Relative tolerance — AVX-512 reduces in parallel pairs,
+            // scalar sums left-to-right, and the two orders disagree in
+            // the last few bits of the mantissa. 1 part in 1e4 is well
+            // inside the bf16-input regime.
+            let denom = y_scalar[r].abs().max(1.0);
+            let rel = (y_scalar[r] - y_auto[r]).abs() / denom;
             assert!(
-                (y_scalar[r] - y_auto[r]).abs() < 1e-4,
-                "row {}: {} vs {}",
-                r,
+                rel < 1e-4,
+                "row {r}: {} vs {} (rel diff {rel})",
                 y_scalar[r],
-                y_auto[r]
+                y_auto[r],
             );
         }
     }
