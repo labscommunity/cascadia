@@ -13,6 +13,7 @@ openvino = ["tahoma-ov-genai-shim/openvino"]
 [dependencies]
 tahoma-types = { workspace = true }
 tahoma-engine = { workspace = true }
+tahoma-runner = { workspace = true }
 tahoma-transport = { workspace = true }
 tahoma-ov-genai-shim = { workspace = true }
 async-trait = { workspace = true }

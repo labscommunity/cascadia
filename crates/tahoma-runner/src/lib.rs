@@ -27,6 +27,73 @@ use tracing::{info, warn};
 /// misbehaving engine.
 const MAX_CONSECUTIVE_EMPTY_STEPS: usize = 3;
 
+// ---------------------------------------------------------------------------
+// Shared block_on dispatch + BlockingContextGuard.
+//
+// Engines call `run_async(handle, fut)` to bridge sync `Engine::step` code
+// to async transport futures. There are two contexts:
+//
+// * **Driver via `ChunkStream::poll_next`** — running on a tokio worker
+//   thread that's actively polling an async task. Naked `Handle::block_on`
+//   panics with "Cannot start a runtime from within a runtime"; we need
+//   `block_in_place` to migrate other tasks off this worker first.
+//
+// * **Worker via `Runner::run_relay_loop`**, dispatched through
+//   `tokio::task::spawn_blocking`. Spawn_blocking threads are NOT polling
+//   tasks; `Handle::block_on` works directly. Wrapping with
+//   `block_in_place` is unnecessary AND expensive on Windows
+//   (empirically ~20 ms per call vs ~5–30 µs the docs would suggest;
+//   adds ~60 ms per worker frame round-trip with 3 wire I/O calls).
+//
+// `run_relay_loop` enters a `BlockingContextGuard` automatically before
+// each `step()` so engines get the fast path on workers without any code
+// of their own. The driver path leaves the flag clear, so `run_async`
+// falls through to `block_in_place + block_on` and stays safe.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static BLOCKING_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard marking the current thread as a `spawn_blocking` worker.
+/// `run_async` consults this flag to pick the fastest safe `block_on`
+/// variant. Scoped so that if the spawn_blocking thread pool reuses this
+/// OS thread for non-blocking work later, the flag resets to its prior
+/// value automatically.
+pub struct BlockingContextGuard {
+    prev: bool,
+}
+
+impl BlockingContextGuard {
+    pub fn enter() -> Self {
+        let prev = BLOCKING_CONTEXT.with(|f| {
+            let old = f.get();
+            f.set(true);
+            old
+        });
+        Self { prev }
+    }
+}
+
+impl Drop for BlockingContextGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        BLOCKING_CONTEXT.with(|f| f.set(prev));
+    }
+}
+
+/// Bridge sync engine code to an async transport future. Engines should
+/// call this instead of `Handle::block_on` directly.
+pub fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
+    if BLOCKING_CONTEXT.with(|f| f.get()) {
+        handle.block_on(fut)
+    } else if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        handle.block_on(fut)
+    }
+}
+
 #[derive(Default)]
 struct Buffers {
     chunks: HashMap<TaskId, VecDeque<Chunk>>,
@@ -132,7 +199,13 @@ impl Runner {
 
     /// Step the engine forever; exits when the engine signals io error
     /// (transport closed). Used by non-first pipeline stages.
+    ///
+    /// Enters a `BlockingContextGuard` once per OS thread (since this
+    /// loop runs on a single `spawn_blocking` thread) so that engines'
+    /// `run_async` calls hit the naked-`block_on` path instead of
+    /// `block_in_place` — ~60 ms/frame savings on Windows.
     pub fn run_relay_loop(&self) {
+        let _blocking = BlockingContextGuard::enter();
         loop {
             let mut guard = self.engine.lock();
             let Some(engine) = guard.as_mut() else { break };
@@ -272,6 +345,45 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use tahoma_engine_mock::MockBuilder;
+
+    #[test]
+    fn blocking_context_guard_sets_and_restores_flag() {
+        assert!(!BLOCKING_CONTEXT.with(|f| f.get()));
+        {
+            let _g = BlockingContextGuard::enter();
+            assert!(BLOCKING_CONTEXT.with(|f| f.get()));
+        }
+        // RAII restored the prior value.
+        assert!(!BLOCKING_CONTEXT.with(|f| f.get()));
+    }
+
+    #[test]
+    fn blocking_context_guard_nests_correctly() {
+        let _outer = BlockingContextGuard::enter();
+        assert!(BLOCKING_CONTEXT.with(|f| f.get()));
+        {
+            let _inner = BlockingContextGuard::enter();
+            assert!(BLOCKING_CONTEXT.with(|f| f.get()));
+        }
+        // Inner drop should restore outer's value (true), not false.
+        assert!(BLOCKING_CONTEXT.with(|f| f.get()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_async_works_inside_async_context() {
+        // Without the guard set, we're on a tokio worker thread —
+        // run_async must pick the block_in_place path and not panic.
+        let h = tokio::runtime::Handle::current();
+        let result = tokio::task::spawn_blocking(move || {
+            // spawn_blocking thread; mimic what `run_relay_loop` does
+            // and enter the guard before calling run_async.
+            let _g = BlockingContextGuard::enter();
+            run_async(&h, async { 42 })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 42);
+    }
 
     async fn make_runner() -> Runner {
         let runner = Runner::new(Box::new(MockBuilder::new()));

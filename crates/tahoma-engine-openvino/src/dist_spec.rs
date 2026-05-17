@@ -167,58 +167,28 @@ pub const MAX_PENDING_TASKS: usize = 256;
 /// Workers acquire the guard once per `step()` (idempotent within a
 /// single thread); the guard is RAII-scoped so the flag never leaks
 /// across spawn_blocking thread reuse boundaries.
+/// Bridge sync engine code to an async transport future. Thin wrapper
+/// around `tahoma_runner::run_async` — the dispatch logic + thread-local
+/// guard now live in the runner crate so both engines (ov-dist-spec and
+/// sparse-moe) share the same fast path on spawn_blocking threads.
 pub(crate) fn run_async_pub<F: std::future::Future>(
     handle: &tokio::runtime::Handle,
     fut: F,
 ) -> F::Output {
-    run_async(handle, fut)
+    tahoma_runner::run_async(handle, fut)
 }
 
+/// Private alias used by call sites within this file — keeps the
+/// existing `run_async(&handle, async move { ... })` ergonomics without
+/// every site importing `tahoma_runner::run_async` directly.
 fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F) -> F::Output {
-    if BLOCKING_CONTEXT.with(|f| f.get()) {
-        // We're on a spawn_blocking thread (worker relay loop); naked
-        // block_on is safe and ~250x cheaper than block_in_place wrap.
-        handle.block_on(fut)
-    } else if tokio::runtime::Handle::try_current().is_ok() {
-        // We're on an async worker thread (driver's ChunkStream poll).
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        // No tokio context at all — naked block_on.
-        handle.block_on(fut)
-    }
+    tahoma_runner::run_async(handle, fut)
 }
 
-thread_local! {
-    static BLOCKING_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// RAII guard that marks the current thread as a blocking-pool thread
-/// for the duration of its scope. Acquired by the worker engine at the
-/// top of each `step()`. Scoped so that if the spawn_blocking thread
-/// pool ever reuses this thread for non-blocking work later, the flag
-/// is cleared correctly. The previous `pub fn enter_blocking_context()`
-/// was a one-way door; this guard fixes that.
-pub(crate) struct BlockingContextGuard {
-    prev: bool,
-}
-
-impl BlockingContextGuard {
-    pub(crate) fn enter() -> Self {
-        let prev = BLOCKING_CONTEXT.with(|f| {
-            let old = f.get();
-            f.set(true);
-            old
-        });
-        Self { prev }
-    }
-}
-
-impl Drop for BlockingContextGuard {
-    fn drop(&mut self) {
-        let prev = self.prev;
-        BLOCKING_CONTEXT.with(|f| f.set(prev));
-    }
-}
+// `BlockingContextGuard` / `BLOCKING_CONTEXT` moved to `tahoma_runner`.
+// `Runner::run_relay_loop` enters the guard once per OS thread, so
+// engines don't need to acquire it inside `step()` anymore.
+pub(crate) use tahoma_runner::BlockingContextGuard;
 
 // -------- pipeline / stage config --------
 

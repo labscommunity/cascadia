@@ -331,12 +331,14 @@ pub struct SparseMoEEngine {
 }
 
 impl SparseMoEEngine {
+    /// Bridge sync `Engine::step` code to an async transport future.
+    /// Delegates to `tahoma_runner::run_async`, which consults the
+    /// thread-local `BlockingContextGuard` flag — set by
+    /// `Runner::run_relay_loop` for worker ranks — to pick the
+    /// cheapest safe `block_on` variant. On a worker thread that's
+    /// ~250x cheaper than wrapping in `block_in_place`.
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime_handle.block_on(fut))
-        } else {
-            self.runtime_handle.block_on(fut)
-        }
+        tahoma_runner::run_async(&self.runtime_handle, fut)
     }
 
     fn is_last(&self) -> bool {
