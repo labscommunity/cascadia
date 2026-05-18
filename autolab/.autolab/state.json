@@ -3,7 +3,7 @@
   "moonshots_attempted": 49,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 12,
+    "win": 13,
     "neutral": 6,
     "negative": 1,
     "parked": 1,
@@ -19,7 +19,16 @@
   },
   "moonshot_ratio": 0.78,
   "consecutive_no_improvement": 0,
-  "current_leader_singlestage": {
+  "current_leader_singlestage_chat_quality_preserving": {
+    "tok_per_sec": 0.202,
+    "config": "iter 044 compound spec-decode (K=6, --prompt-lookup 3 --spec-k 4, mt=64, per-prompt mean) on miner single-stage with all SIMD wins wired through",
+    "campaign": "044_spec_decode_compound",
+    "quality": "9/10 (single substring miss: km vs km/s sci notation, iter 037 substring-eval-weakness applies)",
+    "delta_vs_iter_021_k6_baseline": "1.27x per-prompt mean (1.41x on paired same-worker bench)",
+    "measured_at_utc": "2026-05-18T17:00:00Z",
+    "ceiling_finding": "AVX-VNNI multi-tile only optimizes ~5-6% of shell cost; expert dispatch (~94% of shells) can't batch across tokens. iter 047 better predictor + pipeline-parallel mode are next swings."
+  },
+  "current_leader_singlestage_throughput_max": {
     "tok_per_sec": 0.3253,
     "config": "A3 K=4 long-context (--top-k-override 4, max_tokens=64) on miner single-stage",
     "campaign": "011_a3_k4_longcontext",

@@ -2,6 +2,70 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 044 — Compound spec-decode bench — VERIFIED WIN +19.7% e2e (modest; experts cap it) (2026-05-18 ~17:00 PT)
+
+**FIFTH VERIFIED ARCHITECTURAL WIN** + critical root-cause finding.
+Branch `perf/spec-decode-compound-044` @ `849449a` (3 commits).
+
+This is the **headline integration measurement** — the compound
+chain (036 spec-decode + 039 ForwardBatch wire + 041 multi-token
+seam + 042 SIMD tile + 043 off-by-one fix) actually delivering e2e
+tok/s.
+
+**Merge order (verbatim agent):** "043 (carrying 036+039) → 042
+(carrying 041)". Plus ~270 lines new wiring code in `runner.rs`:
+`step_multi`, `forward_layer0_multi`, `forward_shells_multi`,
+`forward_head_multi`. Rewired `generate_speculative` verify loop to
+call one `step_multi(seq=K)` per round instead of K sequential
+`step()` calls.
+
+**Measured (10-prompt, mt=64, K=6, miner Xeon Gold 6252):**
+
+| Metric | Spec-decode | Baseline (iter 021) | Ratio |
+|--------|-------------|---------------------|-------|
+| Aggregate tok/s | **0.1899** | 0.1587 | **1.20×** |
+| Per-prompt mean | **0.202** | 0.1587 | **1.27×** |
+| Paired (3 prompts, same worker, temp=0.001) | various | various | **1.41× mean** |
+| Quality | 9/10 substring | 10/10 | -1 (km vs km/s sci-notation) |
+| Accept rate | 3.3-100% per prompt, mean ~52% | — | — |
+
+**Below 1.3× target on aggregate, AT/ABOVE on per-prompt mean and
+paired.** Honest mixed verdict.
+
+**Root cause (the bottleneck, verbatim agent):**
+> Multi-token kernel speedup is ~1.16-1.28× on shells (the AVX-
+> VNNI tile only optimizes ~5-6% of shell cost; the other ~94% is
+> expert dispatch which can't batch across tokens). This caps the
+> spec-decode end-to-end win to modest gains in single-stage mode.
+
+**This validates iter 047 (better C1 predictor) as the right next
+move.** Improving expert hit rate is the only way to break the
+expert-dispatch ceiling that 044 just measured.
+
+**Where the BIG spec-decode win lives (out of scope this iter):**
+pipeline-parallel mode where each accepted draft saves a 22ms
+cross-host RT (cascadia Tailscale baseline) or 117ms (current SSH-
+tunnel matias). At K=4, 70% accept = ~3 saved RTs per round =
+~66ms-350ms per round saved. That dominates the modest single-stage
+e2e gain.
+
+**Tests:** 42 sparse-moe + 15 int4-gemm pass. fmt + clippy clean.
+Built on miner with `--features openvino`, ran on port 8060 (F5 was
+on 8000; coordinated, no contention).
+
+**Bench artifacts:** `autolab/experiments/044_spec_decode_compound/`
+includes `bench_spec_compound.jsonl` (complete) + partial paired
+baseline (3 of 10 prompts complete in committed file; full data on
+miner `/tmp/k26-bench-baseline-paired.jsonl`).
+
+**Quality regression note (re iter 037 finding):** the "km" prompt
+failure is the same substring-eval weakness — model output was
+correct scientifically (km/s with sci notation) but failed strict
+substring match on "km". Memory `autolab-substring-eval-too-weak`
+applies.
+
+---
+
 ## 048 — Wire SIMD tiles into engine callsites — SEAM SHIPPED, real bench waits for caller merge (2026-05-18 ~16:55 PT)
 
 The trampoline iter: per-shape dispatcher routes iter 042 + iter 046
