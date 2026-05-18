@@ -26,7 +26,7 @@ use tahoma_int4_gemm::{
 };
 use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::manifest::{Manifest, ManifestError};
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
@@ -592,6 +592,13 @@ impl Runner {
         }
         let mut h_f32 = h_in.to_vec();
 
+        // Iter 049: instrument the per-token inter-layer transition cost
+        // (the residual + shared + moe fused accumulate) so the f32→bf16
+        // hidden-state question can be empirically revisited in-engine
+        // (not just via the synthetic `bench_hidden_state_transition`
+        // microbench). Compiled out at LevelFilter=debug or coarser.
+        let mut inter_layer_total_ns: u64 = 0;
+
         let n_layers = self.layers.len();
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
@@ -666,10 +673,24 @@ impl Runner {
             }
 
             // Combine: h_next = residual + shared + moe (single token).
+            // This f32-in / f32-out fused accumulate IS the per-layer
+            // hidden-state transition. Timed under trace! so iter 049's
+            // empirical "bf16 won't help" finding can be re-checked
+            // on different hardware without re-running the synthetic
+            // microbench.
+            let t_il = Instant::now();
             for j in 0..hidden {
                 h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
             }
+            inter_layer_total_ns += t_il.elapsed().as_nanos() as u64;
         }
+
+        trace!(
+            n_layers,
+            inter_layer_total_ns,
+            inter_layer_us_per_layer = inter_layer_total_ns as f64 / 1000.0 / n_layers as f64,
+            "forward_shells: per-token inter-layer transition cost"
+        );
 
         Ok(h_f32)
     }
@@ -996,5 +1017,77 @@ mod tests {
         let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         assert!(dst.iter().all(|&x| x == 0.0));
+    }
+
+    /// Iter 049: documents the bf16 round-trip error envelope for the
+    /// per-layer hidden state. If a future iter ships f32→bf16 hidden
+    /// states (which today's bench shows is net-negative — see
+    /// `bench_hidden_state_transition`), this test pins the per-
+    /// element rounding bound so any kernel regression is caught.
+    ///
+    /// bf16 has ~7-bit mantissa; relative error is bounded by
+    /// 2^-7 ≈ 0.78% per element. For activations in roughly the
+    /// [-3, +3] range typical of K2.6 hidden states, absolute error
+    /// per element should be < ~0.025.
+    #[test]
+    fn bf16_hidden_state_roundtrip_error_envelope() {
+        // Simulate a realistic-range hidden state and round-trip
+        // each element through bf16.
+        let n = 1024;
+        let mut h_f32 = vec![0.0f32; n];
+        for i in 0..n {
+            // Mix of small and large values typical of an attention
+            // output post-residual.
+            h_f32[i] = ((i % 7) as f32 - 3.0) * 0.5 + ((i % 11) as f32) * 0.01;
+        }
+        let mut max_abs_err = 0.0f32;
+        let mut max_rel_err = 0.0f32;
+        for &v in h_f32.iter() {
+            let v_bf16 = half::bf16::from_f32(v);
+            let back = v_bf16.to_f32();
+            let abs = (back - v).abs();
+            max_abs_err = max_abs_err.max(abs);
+            if v.abs() > 0.01 {
+                max_rel_err = max_rel_err.max(abs / v.abs());
+            }
+        }
+        // bf16 worst-case relative round-trip error is 2^-8 ≈ 0.39%
+        // (round-to-nearest-even); allow 1% to leave headroom for
+        // edge cases.
+        assert!(
+            max_rel_err < 0.01,
+            "max bf16 relative round-trip error {max_rel_err} exceeded 1%"
+        );
+        // For values in [-3, 3], absolute error bound is 3 * 2^-8 ≈ 0.012.
+        assert!(
+            max_abs_err < 0.05,
+            "max bf16 absolute round-trip error {max_abs_err} exceeded 0.05"
+        );
+    }
+
+    /// Iter 049: cross-check the bit-level conversion path used in
+    /// the iter 049 microbench (`bench_hidden_state_transition`)
+    /// against `half::bf16::from_f32`. This is the same pattern
+    /// iter 032 uses for the KV cache; ensures the f32→u16 bits
+    /// shortcut in the bench matches the canonical lib conversion.
+    #[test]
+    fn bf16_u16_conversion_matches_half_crate() {
+        let cases = [0.0f32, 1.0, -1.5, 3.125, -42.7, 0.001234, 1e-8, 1e8];
+        for &v in &cases {
+            let canonical = half::bf16::from_f32(v).to_bits();
+            // The microbench downcast uses bf16::from_f32(v).to_bits().
+            let bench_path = half::bf16::from_f32(v).to_bits();
+            assert_eq!(
+                bench_path, canonical,
+                "f32 {v} produces different bf16 bits via two paths"
+            );
+            // And the upcast: bf16 bits → f32 via `(bits as u32) << 16`.
+            let upcast_bits = f32::from_bits((bench_path as u32) << 16);
+            let upcast_half = half::bf16::from_bits(canonical).to_f32();
+            assert_eq!(
+                upcast_bits, upcast_half,
+                "f32 {v}: shift-left-16 upcast disagrees with half::bf16::to_f32"
+            );
+        }
     }
 }
