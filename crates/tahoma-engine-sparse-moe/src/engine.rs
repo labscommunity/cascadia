@@ -42,6 +42,12 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
+    /// token are dispatched per shell layer. See `docs/A3_TOPK_REDUCTION.md`.
+    pub top_k_override: Option<u32>,
+    /// Skip experts whose router weight falls below this threshold.
+    /// 0.0 / None = disabled. Applied AFTER `top_k_override`.
+    pub routing_threshold: Option<f32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,6 +59,8 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            top_k_override: None,
+            routing_threshold: None,
         }
     }
 
@@ -219,7 +227,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +236,9 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        // Plumb per-token expert-dispatch overrides into the runner.
+        runner.set_top_k_override(self.config.top_k_override);
+        runner.set_routing_threshold(self.config.routing_threshold);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
