@@ -26,6 +26,7 @@ narrative.
 | 018 | 2026-05-18 | K × temperature | K=4 vs K=8 at temp=0.7 | **CAVEAT**: K=4 fragile at temp=0.7 (5/10); K=8 robust (8/10) | 0.2400 (K=4) | 5/10 (K=4) vs 8/10 (K=8) |
 | 020 | 2026-05-18 | K=5 at temp=0.7 | Find exact temp-robust K cliff | borderline 6/10 (closer to K=4 fragility) | 0.1851 | 6/10 |
 | 021 | 2026-05-18 | K=6 long-context | mt=64 sustained-throughput | **PERFECT 10/10 quality + +51% vs K=8** (Pareto-dominant) | **0.1587** | **10/10** |
+| 022 | 2026-05-18 | K=6+thr=0.1 compose | composed flag at K=6 | 10/10 quality, slight tps edge | 0.1482 | 10/10 |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

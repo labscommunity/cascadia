@@ -2,6 +2,22 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 022 — K=6+thr=0.1 = 10/10 quality (composed config) (2026-05-18 ~05:46 PT)
+
+K=6+thr=0.1 at mt=32: 0.1482 tok/s, 10/10 quality. Threshold filter
+doesn't hurt at K=6; composition gives slight edge over K=6 alone
+without quality regression.
+
+K-tuning Pareto is now thoroughly mapped (K=2/3/4/5/6/8 × temp=0/0.7
+× mt=16/32/64). K=6 remains the universal best default; K=6+thr=0.1
+is the optional "max-safety" stack.
+
+Next iter: pivot to genuinely different bucket. F4/A8/multi-prompt-class.
+
+Bench: `experiments/022_k6_thr01/bench_k6_thr01.jsonl`
+
+---
+
 ## 021 — K=6 mt=64 = 10/10 PERFECT QUALITY (strictly beats K=8) (2026-05-18 ~04:50 PT)
 
 **Hypothesis:** K=6 quality holds at long context (mt=64).
