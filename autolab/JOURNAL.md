@@ -18,6 +18,42 @@ Entry template:
 
 ---
 
+## 018 — Temperature × K interaction — K=4 FRAGILE at temp=0.7 (2026-05-18 ~02:14 PT)
+
+**Hypothesis:** K=4 quality (validated at temp=0) holds at production-
+typical temperatures (0.5-0.7).
+
+**Result: HYPOTHESIS REFUTED. K=4 quality collapses at temp=0.7.**
+
+| K | temp | tok/s | quality |
+|--:|-----:|------:|---------|
+| 8 | 0 (iter 009) | 0.0853 | 9/10 |
+| 8 | **0.7** (this iter) | 0.0995 | **8/10** (-1) |
+| 4 | 0 (iter 009) | 0.2100 | 9/10 |
+| 4 | **0.7** (this iter) | 0.2400 | **5/10** (-4) |
+
+K=4 loses 4 prompts at temp=0.7; K=8 loses only 1. K=4 produces
+incoherent output ("Pyth" "Pyth" for Python, "delighted" for
+Washington) — the smaller expert budget can't recover when sampling
+introduces variance.
+
+**Productionization caveat (must add to PR #29 docs):**
+- K=4 is safe at low temperature (≤0.3, probably ≤0.5).
+- For high-temperature chat workloads (temp=0.7+), recommend K=6 or
+  K=8 to preserve quality.
+- The +146% throughput from K=4 carries a temperature-sensitivity cost.
+
+**Update needed:** Add temperature caveat section to
+`docs/A3_TOPK_REDUCTION.md` on perf/a3-topk-override branch (PR #29).
+Will do as follow-up commit.
+
+Bench: `experiments/018_k_x_temperature/{bench_k4_temp07,bench_k8_temp07}.jsonl`
+
+**Next iteration:** A8 KV bf16 (real kernel change), OR more
+K×temperature data points (e.g., K=4 at temp=0.3, K=6 at temp=0.7).
+
+---
+
 ## 017 — K=4 + thr=0.1 at LONG context — NEUTRAL/slight regression (2026-05-18 ~00:32 PT)
 
 **Hypothesis:** The +11% win from iter 016 at mt=16 holds or improves
