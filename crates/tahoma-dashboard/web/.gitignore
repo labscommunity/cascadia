@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.vite/
+*.log
+*.tsbuildinfo
+.DS_Store
+
+# tsc -b emits .js + .d.ts next to .ts inputs of referenced projects when
+# `composite: true` requires emit. We don't want these checked in.
+vite.config.js
+vite.config.d.ts

@@ -69,15 +69,18 @@ impl DashboardStats {
 /// Build the dashboard router. Combine with `tahoma-api`'s router in the
 /// host process; see `crates/tahoma-cli` for the canonical composition.
 pub fn make_router(state: DashboardState) -> Router {
+    // Merge SPA routes (when `embed-spa` is on) before `.with_state` so
+    // both sub-routers carry the same `Router<DashboardState>` state type
+    // when axum unifies them. After `.with_state(state)` the requirement
+    // is fulfilled and we return a plain `Router<()>`.
     let r = Router::new()
         .route("/api/topology", get(get_topology))
-        .route("/api/stats", get(get_stats))
-        .with_state(state);
+        .route("/api/stats", get(get_stats));
 
     #[cfg(feature = "embed-spa")]
     let r = r.merge(spa::router());
 
-    r
+    r.with_state(state)
 }
 
 #[derive(Serialize)]
