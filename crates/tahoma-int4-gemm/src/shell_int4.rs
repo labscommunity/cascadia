@@ -17,6 +17,7 @@ use crate::shell::{
     QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, Q_LORA_RANK, ROUTED_SCALING_FACTOR, TOPK,
     V_HEAD_DIM,
 };
+use rayon::prelude::*;
 
 const GROUP_SIZE: usize = 32;
 
@@ -212,13 +213,17 @@ impl Int4Shell {
 /// Run one shell forward (decode, seq=1) using int4 weights.
 ///
 /// `past_k`/`past_v` must be sized exactly to `[NUM_HEADS, past_seq_len,
-/// HEAD_DIM]`. For callers that pre-allocate to a larger capacity and
-/// avoid per-token Vec realloc, use [`shell_forward_decode_int4_with_capacity`].
+/// HEAD_DIM]`, stored as bf16 bits (`u16`). For callers that pre-allocate
+/// to a larger capacity and avoid per-token Vec realloc, use
+/// [`shell_forward_decode_int4_with_capacity`].
+///
+/// **autolab campaign 029 (A8): KV cache is bf16-quantized in storage.**
+/// The SDPA kernel upconverts to f32 on-the-fly per dot-product element.
 pub fn shell_forward_decode_int4(
     shell: &Int4Shell,
     x_f32: &[f32],
-    past_k: &[f32],
-    past_v: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
     past_seq_len: usize,
 ) -> ShellOutputs {
     shell_forward_decode_int4_with_capacity(
@@ -238,14 +243,17 @@ pub fn shell_forward_decode_int4(
 /// alloc/copy traffic across long-context generations.
 ///
 /// Layout of `past_k`: `[NUM_HEADS, capacity, QK_HEAD_DIM]` flat,
-/// row-major. Head `h`'s populated keys occupy
+/// row-major, **bf16-as-u16** (autolab campaign 029 / A8). Head `h`'s
+/// populated keys occupy
 /// `past_k[h * capacity * QK_HEAD_DIM .. h * capacity * QK_HEAD_DIM + past_seq_len * QK_HEAD_DIM]`.
-/// `past_v` is laid out similarly with `V_HEAD_DIM`.
+/// `past_v` is laid out similarly with `V_HEAD_DIM`. KV halves memory
+/// vs f32 and halves the per-token bandwidth touched at attention time;
+/// the kernel upconverts each bf16 to f32 inline (cheap: `(bits as u32) << 16`).
 pub fn shell_forward_decode_int4_with_capacity(
     shell: &Int4Shell,
     x_f32: &[f32],
-    past_k: &[f32],
-    past_v: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
     past_seq_len: usize,
     capacity: usize,
 ) -> ShellOutputs {
@@ -257,6 +265,7 @@ pub fn shell_forward_decode_int4_with_capacity(
         capacity >= past_seq_len,
         "capacity ({capacity}) must be >= past_seq_len ({past_seq_len})"
     );
+    // bf16 storage: same number of slots, half the byte footprint.
     assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
     assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
 
@@ -336,67 +345,75 @@ pub fn shell_forward_decode_int4_with_capacity(
         new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
     }
 
-    // SDPA
+    // SDPA — autolab campaign 010 (F4): parallelize per-head attention.
+    // Each head's body is independent (writes to a disjoint V_HEAD_DIM
+    // slice of attn_out). Rayon over the 64 heads gives ~core-count
+    // speedup on the attention bucket (14.5% of decode per q1).
+    //
+    // autolab campaign 029 (A8): past_k/past_v are bf16-as-u16. The
+    // upconvert `f32::from_bits((bits as u32) << 16)` is a single shift
+    // per element and stays cheap. The new (this-step) k/v are still
+    // f32 — they are written to the bf16 cache by the caller after this
+    // function returns.
     let scale = 1.0f32 / (QK_HEAD_DIM as f32).sqrt();
     let mut attn_out = vec![0.0f32; NUM_HEADS * V_HEAD_DIM];
-    let kv_len = past_seq_len + 1;
-    for h in 0..NUM_HEADS {
-        let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
-        // Slice with `capacity` as the per-head stride, then take only
-        // the first `past_seq_len` rows. When the caller passes
-        // exact-fit buffers (`capacity == past_seq_len`) this is the
-        // original tight slice; with a pre-allocated capacity buffer
-        // the trailing rows are unused/zero.
-        let pk_base = h * capacity * QK_HEAD_DIM;
-        let pv_base = h * capacity * V_HEAD_DIM;
-        let past_k_h = &past_k[pk_base..pk_base + past_seq_len * QK_HEAD_DIM];
-        let past_v_h = &past_v[pv_base..pv_base + past_seq_len * V_HEAD_DIM];
-        let new_k_h = &new_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
-        let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
+    attn_out
+        .par_chunks_mut(V_HEAD_DIM)
+        .enumerate()
+        .for_each(|(h, out_h)| {
+            let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
+            let pk_base = h * capacity * QK_HEAD_DIM;
+            let pv_base = h * capacity * V_HEAD_DIM;
+            let past_k_h = &past_k[pk_base..pk_base + past_seq_len * QK_HEAD_DIM];
+            let past_v_h = &past_v[pv_base..pv_base + past_seq_len * V_HEAD_DIM];
+            let new_k_h = &new_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
+            let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
 
-        let mut scores = vec![0.0f32; kv_len];
-        for j in 0..past_seq_len {
-            let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
+            let kv_len = past_seq_len + 1;
+            let mut scores = vec![0.0f32; kv_len];
+            for j in 0..past_seq_len {
+                let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
+                let mut s = 0.0f32;
+                for i in 0..QK_HEAD_DIM {
+                    let kf = f32::from_bits((k_row[i] as u32) << 16);
+                    s += q_h[i] * kf;
+                }
+                scores[j] = s * scale;
+            }
             let mut s = 0.0f32;
             for i in 0..QK_HEAD_DIM {
-                s += q_h[i] * k_row[i];
+                s += q_h[i] * new_k_h[i];
             }
-            scores[j] = s * scale;
-        }
-        let mut s = 0.0f32;
-        for i in 0..QK_HEAD_DIM {
-            s += q_h[i] * new_k_h[i];
-        }
-        scores[past_seq_len] = s * scale;
-        let mut max_s = scores[0];
-        for &v in scores.iter().skip(1) {
-            if v > max_s {
-                max_s = v;
+            scores[past_seq_len] = s * scale;
+            let mut max_s = scores[0];
+            for &v in scores.iter().skip(1) {
+                if v > max_s {
+                    max_s = v;
+                }
             }
-        }
-        let mut sum_e = 0.0f32;
-        for v in scores.iter_mut() {
-            *v = (*v - max_s).exp();
-            sum_e += *v;
-        }
-        let inv = 1.0 / sum_e;
-        for v in scores.iter_mut() {
-            *v *= inv;
-        }
-        let out_h = &mut attn_out[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
-        out_h.fill(0.0);
-        for j in 0..past_seq_len {
-            let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
-            let w = scores[j];
+            let mut sum_e = 0.0f32;
+            for v in scores.iter_mut() {
+                *v = (*v - max_s).exp();
+                sum_e += *v;
+            }
+            let inv = 1.0 / sum_e;
+            for v in scores.iter_mut() {
+                *v *= inv;
+            }
+            out_h.fill(0.0);
+            for j in 0..past_seq_len {
+                let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
+                let w = scores[j];
+                for i in 0..V_HEAD_DIM {
+                    let vf = f32::from_bits((v_row[i] as u32) << 16);
+                    out_h[i] += w * vf;
+                }
+            }
+            let w = scores[past_seq_len];
             for i in 0..V_HEAD_DIM {
-                out_h[i] += w * v_row[i];
+                out_h[i] += w * new_v_h[i];
             }
-        }
-        let w = scores[past_seq_len];
-        for i in 0..V_HEAD_DIM {
-            out_h[i] += w * new_v_h[i];
-        }
-    }
+        });
 
     // o_proj (int4)
     let mut o_out = vec![0.0f32; HIDDEN];

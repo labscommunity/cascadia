@@ -30,8 +30,14 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::Mmap;
 use parking_lot::RwLock;
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::format::GemmError;
 
@@ -117,6 +123,79 @@ impl Shard {
             &self.mmap[start..start + len]
         })
     }
+
+    /// Hint the OS that we'll need a tensor's byte range soon. On Unix
+    /// this wraps `madvise(MADV_WILLNEED)`; on Windows it wraps
+    /// `PrefetchVirtualMemory` (kernel32, Win8+). Best-effort: errors
+    /// swallowed because both APIs are advisory and the worst case is
+    /// the read happens on demand later (which is exactly the
+    /// no-prefetch baseline).
+    fn advise_willneed(&self, tensor_name: &str) {
+        let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
+            return;
+        };
+        // memmap2's `advise_range` (Unix) and `PrefetchVirtualMemory`
+        // (Windows) both round the start down and the length up to the
+        // next page boundary internally, so we don't align here.
+        #[cfg(unix)]
+        {
+            let start = self.data_start + _off;
+            let _ = self.mmap.advise_range(Advice::WillNeed, start, _len);
+        }
+        #[cfg(windows)]
+        {
+            self.win_prefetch_range(_off, _len);
+        }
+    }
+
+    /// Windows arm of `advise_willneed`. Resolves a single tensor's
+    /// (offset, length) inside this mmap to a virtual-address range and
+    /// hands it to `PrefetchVirtualMemory` for async page-in.
+    ///
+    /// Semantics MS documents for `PrefetchVirtualMemory`:
+    ///   * "purely a performance optimization … treated as a strong
+    ///     hint by the system and is subject to usual physical memory
+    ///     constraints where it can completely or partially fail under
+    ///     low-memory conditions."
+    ///   * Returns nonzero on success, zero on failure (we ignore both —
+    ///     the read will just happen synchronously on first access).
+    ///   * Available on Windows 8 / Server 2012 and up.
+    ///
+    /// We call it once per tensor (one entry in the
+    /// `WIN32_MEMORY_RANGE_ENTRY` array). The expert-prefetch caller
+    /// invokes us six times per expert (gate/up/down × packed/scale)
+    /// which is consistent with how the Unix path iterates.
+    /// Calling with batches of one keeps the code simple and avoids
+    /// holding a `Vec` of entries that would have to outlive the
+    /// `unsafe` call; the per-call cost is just one cross-DLL hop
+    /// (~µs), same order of magnitude as `madvise` on Linux.
+    #[cfg(windows)]
+    fn win_prefetch_range(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // Tensor offset is within the mmap's data section; compute the
+        // raw virtual address by adding it to the mmap's base ptr.
+        // `Mmap::as_ptr()` returns a `*const u8` aimed at byte 0 of the
+        // mapped view. Adding `data_start + off` lands us at the first
+        // tensor byte. SAFETY: the resulting pointer is inside the live
+        // mmap; we never deref it, only hand it to the kernel.
+        let start = self.data_start + off;
+        let base = self.mmap.as_ptr();
+        let addr = unsafe { base.add(start) } as *mut core::ffi::c_void;
+
+        let entry = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: addr,
+            NumberOfBytes: len,
+        };
+        // SAFETY: hProcess from GetCurrentProcess is a pseudo-handle (no
+        // close required), the entry array lives on the stack for the
+        // duration of the call, and Flags must be 0 per MSDN. Return
+        // value is intentionally ignored (advisory API).
+        unsafe {
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+        }
+    }
 }
 
 /// Source of safetensors-backed expert weights. Caches mmaps lazily.
@@ -198,6 +277,54 @@ impl SafetensorsExpertSource {
         // so caller pins it.
         let static_bytes: &'static [u8] = unsafe { std::mem::transmute(bytes) };
         Ok((s, static_bytes))
+    }
+
+    /// Names of the six tensors that compose one expert. Same enumeration
+    /// `expert()` uses; pulled out so prefetch can iterate them without
+    /// materializing the full `SafetensorsExpert`.
+    fn expert_tensor_names(layer: u32, expert: u32) -> [String; 6] {
+        let base = format!(
+            "language_model.model.layers.{}.mlp.experts.{}",
+            layer, expert
+        );
+        [
+            format!("{}.gate_proj.weight_packed", base),
+            format!("{}.gate_proj.weight_scale", base),
+            format!("{}.up_proj.weight_packed", base),
+            format!("{}.up_proj.weight_scale", base),
+            format!("{}.down_proj.weight_packed", base),
+            format!("{}.down_proj.weight_scale", base),
+        ]
+    }
+
+    /// autolab iter 029 (C1): issue `madvise(MADV_WILLNEED)` on every
+    /// byte slice for one expert. Non-blocking — the kernel queues
+    /// async readahead. Returns the number of slices for which madvise
+    /// succeeded (caller can ignore; useful for instrumentation).
+    ///
+    /// Designed to be called from a dedicated prefetch thread that's
+    /// fed by the inference path. Holds no locks across madvise calls
+    /// (the shard lookup briefly takes the inner RwLock).
+    pub fn prefetch_expert(&self, layer: u32, expert: u32) -> usize {
+        let mut hits = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            // Resolve the shard. If the tensor isn't in the weight map
+            // we silently skip — prefetch is best-effort.
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            // Open-or-clone the shard. We tolerate the open cost because
+            // (a) prefetch runs off the hot path and (b) once cached
+            // every subsequent prefetch on that shard is one HashMap
+            // hit + one madvise syscall.
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            shard.advise_willneed(name);
+            hits += 1;
+        }
+        hits
     }
 
     /// Fetch one expert's six tensor slices (gate/up/down × packed/scale).
