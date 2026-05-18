@@ -439,4 +439,53 @@ impl SafetensorsExpertSource {
     pub fn embed_tokens(&self) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
         self.slice("language_model.model.embed_tokens.weight")
     }
+
+    /// Fetch the final pre-head RMSNorm weight — bf16 `[hidden_size]`.
+    /// Used by the Rust head path (norm + lm_head replacement for the
+    /// OV head IR).
+    pub fn final_norm(&self) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
+        self.slice("language_model.model.norm.weight")
+    }
+
+    /// Fetch a contiguous row-slice of the lm_head weight — bf16
+    /// `[vocab_end - vocab_start, hidden_size]`, flat row-major. The
+    /// slice is byte-contiguous within the safetensors mmap because the
+    /// row index (vocab) is the leading dim.
+    ///
+    /// This is the key primitive for **head tensor parallelism**: each
+    /// rank loads only its slice of the vocab dimension, computes its
+    /// partial logits independently, and the last rank concatenates
+    /// before sampling.
+    ///
+    /// Caller is responsible for `vocab_start < vocab_end <= vocab_size`
+    /// and `hidden_size` consistency — out-of-range slicing returns
+    /// [`GemmError::Truncated`].
+    pub fn lm_head_slice(
+        &self,
+        vocab_start: usize,
+        vocab_end: usize,
+        hidden_size: usize,
+    ) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
+        if vocab_end <= vocab_start {
+            return Err(GemmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("lm_head_slice: vocab_end {vocab_end} <= vocab_start {vocab_start}"),
+            )));
+        }
+        let (shard, full_bytes) = self.slice("language_model.lm_head.weight")?;
+        let row_bytes = hidden_size * 2; // bf16
+        let start = vocab_start
+            .checked_mul(row_bytes)
+            .ok_or_else(|| GemmError::Io(std::io::Error::other("lm_head_slice: start overflow")))?;
+        let end = vocab_end
+            .checked_mul(row_bytes)
+            .ok_or_else(|| GemmError::Io(std::io::Error::other("lm_head_slice: end overflow")))?;
+        if end > full_bytes.len() {
+            return Err(GemmError::Truncated {
+                expected: end,
+                actual: full_bytes.len(),
+            });
+        }
+        Ok((shard, &full_bytes[start..end]))
+    }
 }

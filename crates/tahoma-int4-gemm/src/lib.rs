@@ -28,6 +28,7 @@
 
 pub mod c_ffi;
 pub mod format;
+pub mod head;
 pub mod kernel;
 pub mod kernel_avx512;
 pub mod kernel_bf16;
@@ -37,6 +38,7 @@ pub mod shell;
 pub mod shell_int4;
 
 pub use format::{ExpertWeights, GemmError};
+pub use head::{concat_partials, even_vocab_split, HeadSlice};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;
 pub use safetensors_source::{SafetensorsExpert, SafetensorsExpertSource, SafetensorsLayer0};
