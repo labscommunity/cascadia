@@ -34,6 +34,20 @@ fn engine_name(kind: EngineKind) -> &'static str {
     }
 }
 
+/// Measure round-trip time to a peer via a 1 s-timeout TCP connect.
+/// Returns `None` if the peer is unreachable or the connect timed out.
+/// The connect handshake gives the best low-overhead RTT signal we can
+/// take without speaking the activation-relay protocol.
+async fn probe_peer(host: &str, port: u16) -> Option<f64> {
+    let start = std::time::Instant::now();
+    let addr = format!("{host}:{port}");
+    let connect = tokio::net::TcpStream::connect(&addr);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), connect).await {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
+}
+
 /// Best-effort hostname for the local node. Used as the human-readable
 /// prefix of `node_id`. Falls back to "node" if the `hostname` command is
 /// unavailable or returns something empty.
@@ -533,6 +547,46 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         loop {
             tick.tick().await;
             topology_for_heartbeat.add_node(self_node_for_heartbeat.clone());
+        }
+    });
+
+    // Latency probe loop: every 5 s open a TCP connect to each peer's
+    // advertised port and measure round-trip time. Populates the
+    // dashboard's edge matrix with the cluster's actual measured
+    // latencies (which is the whole topology pitch — we store edges
+    // exo doesn't even have).
+    //
+    // Only outgoing edges from self are populated here, so the matrix
+    // has one row filled per coordinator. A symmetric N×N view would
+    // require cross-host measurement sharing (gossip or query-by-id);
+    // out of scope for the MVP.
+    let topology_for_probe = topology.clone();
+    let self_id_for_probe = self_node.node_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let nodes = topology_for_probe.nodes();
+            let probes: Vec<_> = nodes
+                .into_iter()
+                .filter(|n| n.node_id != self_id_for_probe)
+                .map(|n| {
+                    let host = n.host.clone();
+                    let port = n.port;
+                    let id = n.node_id.clone();
+                    tokio::spawn(async move { (id, probe_peer(&host, port).await) })
+                })
+                .collect();
+            for jh in probes {
+                if let Ok((dst_id, Some(latency_ms))) = jh.await {
+                    topology_for_probe.measure(
+                        self_id_for_probe.clone(),
+                        dst_id,
+                        latency_ms,
+                        0.0,
+                    );
+                }
+            }
         }
     });
 
