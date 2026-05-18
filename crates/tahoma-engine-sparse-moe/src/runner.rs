@@ -8,12 +8,13 @@
 //! Not async, not Send. Each generation owns its own KV state; the
 //! Engine wrapper above this drives one call at a time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use half::bf16;
+use tahoma_int4_gemm::kernel_int2::{expert_forward_int2, Int2Expert};
 use tahoma_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
 };
@@ -24,6 +25,7 @@ use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
 };
+use tahoma_int4_gemm::{HIDDEN, INTERMEDIATE};
 use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
 use tracing::{debug, info};
@@ -143,6 +145,34 @@ struct SafetensorsExpertCache {
     map: HashMap<(u32, u32), SafetensorsExpert>,
 }
 
+/// Per-(layer, expert) re-quantized int2 weights, lazy-built from int4.
+///
+/// Half the bytes per expert vs int4 (~12.6 MB vs ~24 MB). Build cost is
+/// the f32 round-trip in `Int2Expert::from_int4` — one-time per (layer,
+/// expert) and amortized across all decode steps that touch it.
+/// `Box`'d so the HashMap entry is move-cheap during insert.
+struct Int2ExpertCache {
+    /// Layers for which we route to int2 instead of the int4 path. Layers
+    /// not in this set continue to use the parent int4 cache verbatim.
+    layers: HashSet<u32>,
+    map: HashMap<(u32, u32), Box<Int2Expert>>,
+}
+
+impl Int2ExpertCache {
+    fn new(layers: HashSet<u32>) -> Self {
+        Self {
+            layers,
+            map: HashMap::new(),
+        }
+    }
+
+    /// Returns true if (and only if) this layer should be served from
+    /// the int2 cache rather than the parent int4 path.
+    fn contains_layer(&self, lid: u32) -> bool {
+        self.layers.contains(&lid)
+    }
+}
+
 impl OvIrExpertCache {
     fn get(&mut self, lid: u32, eid: u32) -> Result<&mut Runtime, RunnerError> {
         let key = (lid, eid);
@@ -212,6 +242,11 @@ pub struct Runner {
     head: Option<Runtime>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
+    /// Optional int2 sidecar. When set, layers listed in
+    /// `int2.layers` are dispatched via the int2 kernel; other layers
+    /// fall through to `experts`. Lazily re-quantizes from the int4
+    /// source on first touch. Configured via `TAHOMA_INT2_LAYERS=<csv>`.
+    int2: Option<Int2ExpertCache>,
     /// Shared safetensors handle used to construct each Int4Shell at
     /// load time and (when experts_format=safetensors_bin) to serve
     /// expert weights at runtime. Held in an Arc so the expert cache
@@ -392,6 +427,19 @@ impl Runner {
             }
         };
 
+        // Optional int2 override: parse TAHOMA_INT2_LAYERS=<csv> (e.g.
+        // "30" or "30,31,32"). Layers listed here are re-quantized to
+        // int2 lazily on first dispatch; everything else stays int4.
+        // Empty / unset → no int2 layers (engine behaves exactly like
+        // pre-A1).
+        let int2 = parse_int2_layers_env().map(|set| {
+            info!(
+                "int2 experts enabled for layers: {:?} (re-quantized lazily from int4)",
+                set
+            );
+            Int2ExpertCache::new(set)
+        });
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -402,6 +450,7 @@ impl Runner {
             head,
             layers,
             experts,
+            int2,
             _safetensors_source: safetensors_source,
             top_k_override: None,
             routing_threshold: None,
@@ -430,7 +479,11 @@ impl Runner {
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
     /// `attn_row` is the f32 hidden state for one token (length =
-    /// hidden_size). Backend is chosen by the manifest's experts_format.
+    /// hidden_size). Backend is chosen by the manifest's experts_format
+    /// — except when the layer is in the optional int2 override set, in
+    /// which case we route through the int2 path instead (lazily
+    /// re-quantizing on first touch from the corresponding int4
+    /// source).
     fn dispatch_expert(
         &mut self,
         lid: u32,
@@ -438,6 +491,42 @@ impl Runner {
         attn_row: &[f32],
     ) -> Result<Vec<f32>, RunnerError> {
         let hidden = self.manifest.hidden_size as usize;
+
+        // int2 override path. We must split the borrow because building
+        // the Int2Expert lazily reads from the int4 source.
+        let is_int2 = self
+            .int2
+            .as_ref()
+            .map(|c| c.contains_layer(lid))
+            .unwrap_or(false);
+        if is_int2 {
+            let key = (lid, eid);
+            // Lazily build the int2 representation if absent. We do the
+            // build under a separate `if` so the &mut self.int2 borrow
+            // doesn't overlap the &mut self.experts borrow inside
+            // build_int2_from_experts.
+            let need_build = !self.int2.as_ref().unwrap().map.contains_key(&key);
+            if need_build {
+                let i2 = build_int2_from_experts(&mut self.experts, lid, eid)?;
+                self.int2.as_mut().unwrap().map.insert(key, Box::new(i2));
+            }
+            let int2 = self.int2.as_ref().unwrap();
+            let w = int2.map.get(&key).unwrap();
+            let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+            let mut out_bf16 = vec![bf16::ZERO; hidden];
+            expert_forward_int2(
+                &x_bf16,
+                &w.gate_packed,
+                &w.gate_scale,
+                &w.up_packed,
+                &w.up_scale,
+                &w.down_packed,
+                &w.down_scale,
+                &mut out_bf16,
+            );
+            return Ok(out_bf16.iter().map(|b| b.to_f32()).collect());
+        }
+
         match &mut self.experts {
             ExpertCache::OvIr(c) => {
                 let attn_bf16 = f32_to_bf16_bytes(attn_row);
@@ -1000,6 +1089,90 @@ fn write_present_kv(
         let dst_off = h * capacity * head_dim + past_seq * head_dim;
         buf[dst_off..dst_off + head_dim]
             .copy_from_slice(&present[h * head_dim..(h + 1) * head_dim]);
+    }
+}
+
+/// Parse `TAHOMA_INT2_LAYERS=<csv>` into a `HashSet<u32>`. Returns
+/// `None` if the env var is unset or empty (engine behaves exactly
+/// like pre-A1). Returns `Some(empty set)` only if the var is set to
+/// an explicit empty list — treated as "no layers"; we just don't
+/// install the cache.
+fn parse_int2_layers_env() -> Option<HashSet<u32>> {
+    let raw = std::env::var("TAHOMA_INT2_LAYERS").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out: HashSet<u32> = HashSet::new();
+    for piece in trimmed.split(',') {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        match p.parse::<u32>() {
+            Ok(v) => {
+                out.insert(v);
+            }
+            Err(_) => {
+                tracing::warn!("TAHOMA_INT2_LAYERS: skipping unparseable layer id '{p}'");
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Build an `Int2Expert` by reading the int4 representation from the
+/// active expert cache, then calling `Int2Expert::from_int4`. We pull
+/// the raw int4 packed/scale byte slices from whichever backend is
+/// active (`Int4Bin` or `SafetensorsBin`). The `OvIr` path can't
+/// produce raw int4 bytes — we error out cleanly so the operator
+/// can switch backends rather than silently fall through.
+fn build_int2_from_experts(
+    experts: &mut ExpertCache,
+    lid: u32,
+    eid: u32,
+) -> Result<Int2Expert, RunnerError> {
+    match experts {
+        ExpertCache::Int4Bin(c) => {
+            let w = c.get(lid, eid)?;
+            Ok(Int2Expert::from_int4(
+                w.gate_packed_bytes(),
+                w.gate_scale_bits(),
+                w.up_packed_bytes(),
+                w.up_scale_bits(),
+                w.down_packed_bytes(),
+                w.down_scale_bits(),
+                INTERMEDIATE,
+                HIDDEN,
+            ))
+        }
+        ExpertCache::SafetensorsBin(c) => {
+            let key = (lid, eid);
+            if !c.map.contains_key(&key) {
+                let e = c.source.expert(lid, eid).map_err(|e| {
+                    RunnerError::Internal(format!("safetensors expert {lid}/{eid}: {e}"))
+                })?;
+                c.map.insert(key, e);
+            }
+            let w = c.map.get(&key).unwrap();
+            Ok(Int2Expert::from_int4(
+                w.gate_packed,
+                w.gate_scale,
+                w.up_packed,
+                w.up_scale,
+                w.down_packed,
+                w.down_scale,
+                INTERMEDIATE,
+                HIDDEN,
+            ))
+        }
+        ExpertCache::OvIr(_) => Err(RunnerError::Internal(
+            "int2 override requires experts_format=int4_bin or safetensors_bin (cannot recover int4 weights from an OV IR)".into(),
+        )),
     }
 }
 

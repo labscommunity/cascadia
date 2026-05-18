@@ -31,6 +31,7 @@ pub mod format;
 pub mod kernel;
 pub mod kernel_avx512;
 pub mod kernel_bf16;
+pub mod kernel_int2;
 pub mod layer0_int4;
 pub mod safetensors_source;
 pub mod shell;
@@ -39,6 +40,10 @@ pub mod shell_int4;
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;
+pub use kernel_int2::{
+    dequant_gemv_int2, dequant_gemv_int2_auto, expert_forward_int2, quantize_int2_from_int4,
+    quantize_int2_group, Int2Expert,
+};
 pub use safetensors_source::{SafetensorsExpert, SafetensorsExpertSource, SafetensorsLayer0};
 
 // Architecture constants for K2.6 — exposed as constants so the kernel
