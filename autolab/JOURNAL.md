@@ -164,11 +164,53 @@ may need GPTQ-style outlier int4 fallback; native AVX-VNNI
 
 ---
 
-## 030 — Matias 2-box revival (in flight — agent still running) (2026-05-18 ~12:30 PT)
+## 030 — Matias 2-box revival — PIPELINE ALIVE via SSH-tunnel chain (2026-05-18 ~13:55 PT)
 
-(Placeholder — see infra/matias-2box-revival-029 branch when agent
-completes. Working tree has 1952 lines staged including spawn scripts,
-campaign YAML, README, stage timings. Agent transcript at 1.1MB.)
+**HEADLINE INFRASTRUCTURE UNLOCK.** The 2-box K2.6 pipeline is back
+online — this is the literal tahoma killer demo (running a model that
+doesn't fit on one box across two boxes).
+
+Branch `infra/matias-2box-revival-029` @ `61778ef`.
+
+**Tailscale stayed dead.** A previous `tailscale up --reset` flushed
+creds and no authkey was available for re-auth. Per
+[[autolab-loop-autonomy]], agent did NOT wait for manual auth — it
+pivoted to a SSH-tunnel chain through the controller Mac:
+- `matias-02:9100 → Mac:19100 → matias-03:9100` via paired
+  `ssh -R`/`ssh -L`
+- API tunnel: `Mac:18000 → matias-02:8000` for bench harness
+- 117ms median RTT vs ~22ms direct Tailscale DERP — still <2% of
+  K2.6's per-token decode budget
+
+**Workers are persistent:**
+- rank-0 on matias-02 (PID 8332) alive since 10:14 PT
+- rank-1 on matias-03 (PID 4168) alive since 10:14 PT
+- WMI-detached spawn (`Invoke-WmiMethod -Class Win32_Process -Name
+  Create`) survives SSH session disconnect (unlike `Start-Process
+  -PassThru` which inherits the OpenSSH job object)
+
+**Measured tok/s:** **0.0770** (10-prompt eval, mt=32, K=8, 9/10
+substring — the "fail" was a substring artifact, model answered
+correctly).
+
+vs iter 000 baseline 0.0553 (mt=8) — +39% but methodology mismatch
+(mt=32 amortizes prefill differently). Real apples-to-apples comp
+needs same mt.
+
+**Two gotchas captured:**
+1. Use `127.0.0.1` not `localhost` in SSH port-forward targets —
+   `localhost` resolves to `::1` and the `direct-tcpip` channel is
+   freed immediately
+2. Always use WMI Win32_Process for Windows OpenSSH detachment
+
+**Why this matters:** ALL OTHER MOONSHOTS (A8 KV bf16, C1 prefetch,
+F5 windowing, A1 int2) can now be benched on the real 2-box pipeline
+— the actual production target. Single-stage miner is no longer the
+only bench substrate. Iter 034 will run combined-A8+C1 on the 2-box.
+
+---
+
+## 029 — F5 sliding-window attention — IMPL COMPLETE, bench deferred (2026-05-18 ~12:50 PT)
 
 ---
 
