@@ -45,14 +45,31 @@ Source: `autolab/k26-perf` branch experiments `009_a3_robustness_10prompt`,
 `*` K=6 number is from max_tokens=8 eval extrapolated; not directly
 benched at max_tokens=64.
 
-**K=4 is the productionizable sweet spot.** Equal-or-better quality
-than the K=8 baseline (8/10 vs 9/10 — K=8 failed one prompt that K=4
-got right) and 3× the throughput on chat-realistic output lengths.
+**K=4 is the productionizable sweet spot at low temperature.** Equal-
+or-better quality than the K=8 baseline (8/10 vs 9/10 — K=8 failed one
+prompt that K=4 got right) and 3× the throughput on chat-realistic
+output lengths.
 
 **K=3 has a real quality regression** on broader prompts (substantive
 failures: gives multi-choice questions instead of direct answers, gets
 factual details wrong like "Python created by the Dutch" instead of
 "Guido van Rossum"). Stay at K=4 for production.
+
+## K-tiering by temperature
+
+K choice should depend on the inference workload's sampling temperature:
+
+| Workload | Recommended K | Quality | Throughput vs K=8 |
+|----------|--------------:|--------:|-------------------:|
+| Greedy / low-temp (temp ≤ 0.3) | **K=4** | 9/10 | **+146-210%** |
+| Mid/high-temp chat (temp 0.5-0.7) | **K=6** | 8/10 (matches K=8) | **+75%** |
+| Maximum quality | K=8 | 9/10 at temp=0 | (ref) |
+
+**Source:** autolab/k26-perf iter 018/019. At temp=0.7, K=4 quality
+collapses to 5/10 (model outputs become incoherent under sampling
+variance — "Pyth" "Pyth" for Python prompt). K=6 holds 8/10 — same
+as K=8 — at temp=0.7 with +75% throughput. K=6 is the safe default
+for any workload not committed to greedy sampling.
 
 ## Why this works on K2.6
 
