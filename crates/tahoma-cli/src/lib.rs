@@ -341,6 +341,21 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
+            // N-gram speculative decode (sparse-moe single-stage).
+            // The `--prompt-lookup` flag is the canonical opt-in (it
+            // already drives the ov-genai prompt-lookup path); when
+            // set on sparse-moe single-stage, we enable n-gram spec
+            // decode with K = max(prompt_lookup, spec_k). On
+            // multi-stage configs this is ignored — see
+            // `SparseMoEBuilder::build` for the warning.
+            let spec_k = if args.prompt_lookup > 0 {
+                Some(args.spec_k.max(args.prompt_lookup))
+            } else {
+                None
+            };
+            if let Some(k) = spec_k {
+                cfg = cfg.with_spec_decode_k(k);
+            }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }
