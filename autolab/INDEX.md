@@ -33,6 +33,9 @@ narrative.
 | 026 | 2026-05-18 | system prompt | "Answer concisely" on code prompts | neutral: shifts which prompt fails, same 4/5 rate | 0.1624 | 4/5 |
 | 027 | 2026-05-18 | K=6 + sys 10p | completion-style sys prompt | slightly negative (-1 quality, prefill cost) | 0.1162 | 9/10 |
 | 028 | 2026-05-18 | K=6 temp ladder | K=6 quality across temp=0.3, 0.5 | **WIN** (insight): K=6 gentle curve (10/10/9/8) vs K=4 cliff (9→5); K=6 dominates temp>0 | 0.1457 (t=0.3) / 0.1539 (t=0.5) | 10/10 (t=0.3), 9/10 (t=0.5) |
+| 029 | 2026-05-18 | F5 sliding-window | windowed attention via --attention-window W flag | **IMPL DONE** (perf/f5-sparse-attention-029 @ 769c8b0), 8 unit tests pass, bench deferred for sibling-agent miner contention | (bench pending) | (bench pending) |
+| 030 | 2026-05-18 | matias 2-box | revive 2-box pipeline-parallel via SSH-tunnel chain | **IN FLIGHT** (infra/matias-2box-revival-029, agent still running, 1952 lines staged) | (pending) | (pending) |
+| 031 | 2026-05-18 | A1 int2 experts | int4→int2 expert weight quantization | **KERNEL WORKS** (perf/a1-int2-experts-029 @ ae617a6): 1.80× smaller, 2.89× faster in clean run, cosine 0.61, 4/4 quality preserved at layer-30 swap; pipeline bench contaminated by 3-worker contention | 1.722ms (int2) vs 4.977ms (int4) per-expert | 4/4 (substring) |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

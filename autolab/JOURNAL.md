@@ -2,7 +2,91 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
-## 029 — COURSE CORRECTION — 4 real moonshots in parallel (2026-05-18 ~12:00 PT)
+## 031 — A1 int2 expert quantization — KERNEL WORKS, full bench needs clean miner (2026-05-18 ~13:00 PT)
+
+Real moonshot artifact. Branch `perf/a1-int2-experts-029` @ `ae617a6`
+(6 commits, +470 LOC kernel + wiring + tests).
+
+**Kernel-level (clean run):**
+- Footprint: int4 23.62 MB → int2 13.12 MB (**1.80× smaller per
+  expert**)
+- Latency (single expert, clean): int4 4.977ms → int2 1.722ms
+  (**2.89× faster**)
+- Latency (under 3-worker contention): 0.37×–0.55× — sensitive to L3
+  fit; the win is fitting under the 27.5 MB L3 cache
+- AVX-512 SIMD path matches scalar to 1e-4
+- Re-quant cost: ~630ms per (layer, expert) on first touch (amortized
+  across decode)
+- Quality vs int4: per-expert cosine **0.6073**, max abs diff 0.555
+
+**End-to-end pipeline (K=6, temp=0.5, layer-30-only int2 swap):**
+- 4/4 prompts so far passed substring eval (preserved quality on
+  single-layer swap)
+- Mean 0.0735 tok/s vs iter-028 baseline 0.1539 tok/s — **NOT
+  apples-to-apples**: miner had 3 concurrent K2.6 workers (A8 + C1 +
+  this), load avg 117, kswapd at 92% CPU. Per-token decode 8–11s vs
+  iter-003 baseline 3.3s. Bench is contention-contaminated.
+
+**Key empirical finding:** asymmetric ternary {-1, 0, +1}×scale BEATS
+balanced {-3, -1, +1, +3}×scale for K2.6 expert weights (cosine 0.61
+vs 0.39). K2.6 weights have heavy mass near zero, so the asymmetric
+codebook's "0" codepoint is worth more than the balanced codebook's
+extra non-zero level. Two-commit story in the branch: try balanced,
+revert.
+
+**Wiring:** `TAHOMA_INT2_LAYERS=<csv>` env var; lazy-builds int2
+expert at first dispatch from int4 source. Layers not in the set fall
+through to existing int4. Works with both int4_bin and safetensors_bin
+backends. 3 unit tests pass.
+
+**What's left:** clean-miner full-pipeline eval (`TAHOMA_INT2_LAYERS=
+1,2,...,60`); quality sweep with cosine 0.61 per layer × 60 layers
+may need GPTQ-style outlier int4 fallback; native AVX-VNNI
+(int8×uint8→int32) for inner loop.
+
+---
+
+## 030 — Matias 2-box revival (in flight — agent still running) (2026-05-18 ~12:30 PT)
+
+(Placeholder — see infra/matias-2box-revival-029 branch when agent
+completes. Working tree has 1952 lines staged including spawn scripts,
+campaign YAML, README, stage timings. Agent transcript at 1.1MB.)
+
+---
+
+## 029 — F5 sliding-window attention — IMPL COMPLETE, bench deferred (2026-05-18 ~12:50 PT)
+
+First moonshot agent to return. Branch `perf/f5-sparse-attention-029`
+@ `769c8b0`, +561/-23 across 5 files.
+
+**Algorithm:** matches rainier's `scripts/export_gemma4_e2b_shards.py`
+mask (`triu(diagonal=0).tril(diagonal=-(window+1))`) but specialised
+for seq=1 decode — instead of building an explicit -inf mask, the
+QK^T and V-accumulation loops start at
+`j_start = past_seq_len.saturating_sub(W)`. Masked-out slots pay zero
+compute.
+
+**Plumbing:** `--attention-window W` CLI flag on `tahoma worker`
+(0 = full causal, default = back-compat). Threaded through to every
+shell + layer 0 forward call.
+
+**Quality gates:** 8 new unit tests in `windowed_attention_tests`
+(j_start arithmetic + full SDPA reference-match: `window=None` is
+bit-identical to no-mask baseline). Build/fmt/clippy all clean.
+
+**Bench deferred — coordinated multi-agent.** F5 agent verified 3
+sibling tahoma workers active on miner ports 8000/8030/8040 (A3, C1,
+A8 respectively) and correctly declined to launch a competing
+CPU-bound bench. Bench will run once siblings free up.
+
+**Expected win:** at mt=512+ with long prompts; at mt=128 with W=256
+the window is barely active, so this is a long-context unlock more
+than a short-prompt throughput win. Quality cliff risk at small W
+documented (K2.6 has no per-layer attention_type unlike Gemma3).
+
+---
+
+## 029-pre — COURSE CORRECTION — 5 real moonshots in parallel (2026-05-18 ~12:00 PT)
 
 **User pushback** (verbatim): "is it true that the k variable will need
 to be tuned individually for each user? if so tuning k is a complete
