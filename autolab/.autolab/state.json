@@ -3,7 +3,7 @@
   "moonshots_attempted": 43,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 10,
+    "win": 11,
     "neutral": 6,
     "negative": 1,
     "parked": 1,
