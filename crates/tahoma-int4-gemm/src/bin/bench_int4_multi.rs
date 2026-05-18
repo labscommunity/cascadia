@@ -27,6 +27,7 @@
 use std::time::Instant;
 
 use tahoma_int4_gemm::dequant_gemm_int4_multi_auto;
+use tahoma_int4_gemm::dequant_gemm_int4_multi_blocked_auto;
 use tahoma_int4_gemm::dequant_gemv_int4_auto;
 
 fn parse_args() -> (String, usize, Vec<usize>) {
@@ -149,6 +150,23 @@ fn time_multi_tile(
     t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
 }
 
+fn time_blocked_tile(
+    packed: &[u8],
+    scales: &[u8],
+    xs: &[f32],
+    n_rows: usize,
+    k_cols: usize,
+    seq: usize,
+    ys: &mut [f32],
+    iters: usize,
+) -> f64 {
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        dequant_gemm_int4_multi_blocked_auto(packed, scales, xs, n_rows, k_cols, seq, ys);
+    }
+    t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+}
+
 fn main() {
     let (shape_name, iters, seqs) = parse_args();
     let shape_list = shapes(&shape_name);
@@ -171,13 +189,14 @@ fn main() {
             (n_rows * k_cols / 2) as f64 / (1024.0 * 1024.0)
         );
         println!(
-            "{:>6} | {:>10} | {:>10} | {:>10} | {:>8}",
-            "seq", "scalar/ms", "multi/ms", "speedup", "max_diff"
+            "{:>6} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10} | {:>8}",
+            "seq", "scalar/ms", "multi/ms", "blkd/ms", "mult_vs_sc", "blk_vs_mlt", "max_diff"
         );
         for &seq in &seqs {
             let (packed, scales, xs) = make_data(n_rows, k_cols, seq);
             let mut y_scalar = vec![0.0f32; seq * n_rows];
             let mut y_multi = vec![0.0f32; seq * n_rows];
+            let mut y_blocked = vec![0.0f32; seq * n_rows];
 
             // Warmup: one run of each.
             {
@@ -200,17 +219,30 @@ fn main() {
                     seq,
                     &mut y_multi,
                 );
+                dequant_gemm_int4_multi_blocked_auto(
+                    &packed,
+                    &scales,
+                    &xs,
+                    n_rows,
+                    k_cols,
+                    seq,
+                    &mut y_blocked,
+                );
             }
 
-            // Sanity check: outputs must match (within fp rounding; we
-            // compute both sums in the same nibble order, so they
-            // should be bit-identical, but tolerate fp noise just in
-            // case the parallel reduction reorders).
+            // Sanity check across all three paths. Scalar vs multi may
+            // differ due to parallel reduction ordering across rows;
+            // blocked vs multi should be bit-identical (same FMA sum
+            // order per output cell).
             let mut max_diff: f32 = 0.0;
             for i in 0..(seq * n_rows) {
                 let d = (y_scalar[i] - y_multi[i]).abs();
                 if d > max_diff {
                     max_diff = d;
+                }
+                let d2 = (y_blocked[i] - y_multi[i]).abs();
+                if d2 > max_diff {
+                    max_diff = d2;
                 }
             }
 
@@ -235,10 +267,21 @@ fn main() {
                 &mut y_multi,
                 iters,
             );
-            let speedup = scalar_ms / multi_ms;
+            let blocked_ms = time_blocked_tile(
+                &packed,
+                &scales,
+                &xs,
+                n_rows,
+                k_cols,
+                seq,
+                &mut y_blocked,
+                iters,
+            );
+            let multi_vs_sc = scalar_ms / multi_ms;
+            let blk_vs_mlt = multi_ms / blocked_ms;
             println!(
-                "{:>6} | {:>10.3} | {:>10.3} | {:>9.2}x | {:>8.2e}",
-                seq, scalar_ms, multi_ms, speedup, max_diff,
+                "{:>6} | {:>10.3} | {:>10.3} | {:>10.3} | {:>9.2}x | {:>9.2}x | {:>8.2e}",
+                seq, scalar_ms, multi_ms, blocked_ms, multi_vs_sc, blk_vs_mlt, max_diff,
             );
         }
     }
