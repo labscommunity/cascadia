@@ -30,10 +30,14 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::Mmap;
 #[cfg(unix)]
 use memmap2::Advice;
+use memmap2::Mmap;
 use parking_lot::RwLock;
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::format::GemmError;
 
@@ -120,29 +124,76 @@ impl Shard {
         })
     }
 
-    /// Hint the OS that we'll need a tensor's byte range soon. Wraps
-    /// `madvise(MADV_WILLNEED)` on the page-aligned range covering the
-    /// tensor. Best-effort: errors swallowed because madvise is a hint
-    /// and the worst case is the read happens on demand later (which is
-    /// exactly the no-prefetch baseline).
+    /// Hint the OS that we'll need a tensor's byte range soon. On Unix
+    /// this wraps `madvise(MADV_WILLNEED)`; on Windows it wraps
+    /// `PrefetchVirtualMemory` (kernel32, Win8+). Best-effort: errors
+    /// swallowed because both APIs are advisory and the worst case is
+    /// the read happens on demand later (which is exactly the
+    /// no-prefetch baseline).
     fn advise_willneed(&self, tensor_name: &str) {
         let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
             return;
         };
-        // memmap2's `advise_range` takes a (offset, len) within the mmap.
-        // The kernel rounds the start down and the length up to the next
-        // page boundary, so we don't need to align here.
-        //
-        // Unix only: `madvise(MADV_WILLNEED)` is the underlying syscall.
-        // Windows has `PrefetchVirtualMemory` (Win8+) with similar
-        // semantics; not wired up yet — the prefetcher path is a no-op
-        // there. This still compiles cleanly so the rest of C1 (the
-        // background thread + queue + telemetry) ships unchanged. The
-        // performance impact is the same as `TAHOMA_EXPERT_PREFETCH=0`.
+        // memmap2's `advise_range` (Unix) and `PrefetchVirtualMemory`
+        // (Windows) both round the start down and the length up to the
+        // next page boundary internally, so we don't align here.
         #[cfg(unix)]
         {
             let start = self.data_start + _off;
             let _ = self.mmap.advise_range(Advice::WillNeed, start, _len);
+        }
+        #[cfg(windows)]
+        {
+            self.win_prefetch_range(_off, _len);
+        }
+    }
+
+    /// Windows arm of `advise_willneed`. Resolves a single tensor's
+    /// (offset, length) inside this mmap to a virtual-address range and
+    /// hands it to `PrefetchVirtualMemory` for async page-in.
+    ///
+    /// Semantics MS documents for `PrefetchVirtualMemory`:
+    ///   * "purely a performance optimization … treated as a strong
+    ///     hint by the system and is subject to usual physical memory
+    ///     constraints where it can completely or partially fail under
+    ///     low-memory conditions."
+    ///   * Returns nonzero on success, zero on failure (we ignore both —
+    ///     the read will just happen synchronously on first access).
+    ///   * Available on Windows 8 / Server 2012 and up.
+    ///
+    /// We call it once per tensor (one entry in the
+    /// `WIN32_MEMORY_RANGE_ENTRY` array). The expert-prefetch caller
+    /// invokes us six times per expert (gate/up/down × packed/scale)
+    /// which is consistent with how the Unix path iterates.
+    /// Calling with batches of one keeps the code simple and avoids
+    /// holding a `Vec` of entries that would have to outlive the
+    /// `unsafe` call; the per-call cost is just one cross-DLL hop
+    /// (~µs), same order of magnitude as `madvise` on Linux.
+    #[cfg(windows)]
+    fn win_prefetch_range(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // Tensor offset is within the mmap's data section; compute the
+        // raw virtual address by adding it to the mmap's base ptr.
+        // `Mmap::as_ptr()` returns a `*const u8` aimed at byte 0 of the
+        // mapped view. Adding `data_start + off` lands us at the first
+        // tensor byte. SAFETY: the resulting pointer is inside the live
+        // mmap; we never deref it, only hand it to the kernel.
+        let start = self.data_start + off;
+        let base = self.mmap.as_ptr();
+        let addr = unsafe { base.add(start) } as *mut core::ffi::c_void;
+
+        let entry = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: addr,
+            NumberOfBytes: len,
+        };
+        // SAFETY: hProcess from GetCurrentProcess is a pseudo-handle (no
+        // close required), the entry array lives on the stack for the
+        // duration of the call, and Flags must be 0 per MSDN. Return
+        // value is intentionally ignored (advisory API).
+        unsafe {
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
         }
     }
 }
