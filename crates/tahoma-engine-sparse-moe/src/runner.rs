@@ -22,7 +22,10 @@ use tahoma_int4_gemm::layer0_int4::{
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
+use tahoma_int4_gemm::shell_int4::{
+    shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity,
+    Int4Shell,
+};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -940,6 +943,141 @@ impl Runner {
             total_us = _t0.elapsed().as_micros() as u64,
             "stage_timing"
         );
+        Ok(h_f32)
+    }
+
+    /// Multi-token shell forward — seq>=1 entry point that routes the
+    /// int4 projections through the iter 042/046 multi-token AVX-512
+    /// tiles via [`shell_forward_decode_int4_multi_with_capacity`]. At
+    /// seq=1, fast-paths to [`Self::forward_shells`] (the existing seq=1
+    /// hot path is bit-identical, no scalar-loop dispatch overhead).
+    /// At seq>=2 the projections amortize one int4 weight load across
+    /// `seq` tokens.
+    ///
+    /// **Caller contract.**
+    /// - `h_in` is `[1, seq, hidden]` flat, row-major.
+    /// - `past_seq_len` is the populated KV length on entry. Each shell's
+    ///   `past_seq_len` advances by `seq` on return.
+    /// - Returns `[1, seq, hidden]` flat — post-MoE hidden states per
+    ///   input token.
+    ///
+    /// **Why a separate API.** The seq=1 hot path
+    /// ([`Self::forward_shells`]) is untouched — every K2.6 inference
+    /// today runs through it. `forward_shells_multi` is the seam the
+    /// chunked-prefill / spec-decode driver loops plug into to batch
+    /// multiple tokens per shell call and recover the iter 042/046 SIMD
+    /// wins at the engine level.
+    ///
+    /// **Bit-identity.** The underlying multi-token kernels are
+    /// bit-identical per-cell to the scalar seq=1 path (see
+    /// `multi_batched_matches_scalar_seq_8_iter046_dispatch` in
+    /// `tahoma-int4-gemm/src/shell_int4.rs`). Per-token expert dispatch
+    /// applies the same `routing_ids × routing_weights` combination as
+    /// `forward_shells`, so the engine-level path produces
+    /// byte-identical outputs to N sequential `forward_shells` calls.
+    pub fn forward_shells_multi(
+        &mut self,
+        h_in: &[f32],
+        h_shape: &[usize],
+        past_seq_len: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        let top_k = self.manifest.top_k as usize;
+        if seq == 0 {
+            return Err(RunnerError::Internal(
+                "forward_shells_multi: seq must be >= 1".into(),
+            ));
+        }
+        if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != seq || h_shape[2] != hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells_multi: int4 shells require shape [1, {seq}, {hidden}], got {h_shape:?}"
+            )));
+        }
+        if h_in.len() != seq * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells_multi: h_in.len={} != seq*hidden={}*{}={}",
+                h_in.len(),
+                seq,
+                hidden,
+                seq * hidden
+            )));
+        }
+        // Fast-path seq=1: delegate to the existing seq=1 forward to keep
+        // the seq=1 hot path bit-identical and avoid the multi-API
+        // dispatch overhead.
+        if seq == 1 {
+            return self.forward_shells(h_in, &[1, 1, hidden], past_seq_len);
+        }
+
+        let mut h_f32 = h_in.to_vec();
+        let n_layers = self.layers.len();
+        for i in 0..n_layers {
+            let lid = self.layers[i].lid;
+            if self.layers[i].past_seq_len != past_seq_len {
+                return Err(RunnerError::Internal(format!(
+                    "L{lid}: past_seq_len mismatch (caller {past_seq_len} vs layer {})",
+                    self.layers[i].past_seq_len
+                )));
+            }
+            // Grow KV until it fits past_seq_len + seq. Geometric grow
+            // preserves O(N) cumulative alloc traffic.
+            while past_seq_len + seq > self.layers[i].kv_capacity {
+                grow_kv_capacity(&mut self.layers[i])?;
+            }
+            let capacity = self.layers[i].kv_capacity;
+
+            // shell_forward_decode_int4_multi_with_capacity writes
+            // present_k/present_v in place into slots
+            // [past_seq_len, past_seq_len + seq) — no separate
+            // write_present_kv calls needed at the engine boundary.
+            // KV cache is bf16-as-u16 (A8); the conversion happens
+            // inside the kernel.
+            let outs = {
+                let layer = &mut self.layers[i];
+                shell_forward_decode_int4_multi_with_capacity(
+                    &layer.int4_shell,
+                    &h_f32,
+                    &mut layer.past_k,
+                    &mut layer.past_v,
+                    past_seq_len,
+                    capacity,
+                    seq,
+                )
+            };
+            self.layers[i].past_seq_len = past_seq_len + seq;
+
+            // Per-token expert dispatch + residual combine. Same logic
+            // as forward_shells, looped over seq tokens.
+            if outs.routing_ids.len() != seq * top_k || outs.routing_weights.len() != seq * top_k {
+                return Err(RunnerError::Internal(format!(
+                    "L{lid} multi-token routing shape unexpected: ids={} weights={} (expected seq*top_k = {}*{})",
+                    outs.routing_ids.len(),
+                    outs.routing_weights.len(),
+                    seq,
+                    top_k
+                )));
+            }
+            for t in 0..seq {
+                let attn_post_t = &outs.attn_out_post_norm[t * hidden..(t + 1) * hidden];
+                let mut moe = vec![0.0f32; hidden];
+                for k in 0..top_k {
+                    let eid = outs.routing_ids[t * top_k + k] as u32;
+                    let w = outs.routing_weights[t * top_k + k];
+                    let y_f32 = self.dispatch_expert(lid, eid, attn_post_t)?;
+                    for j in 0..hidden {
+                        moe[j] += w * y_f32[j];
+                    }
+                }
+                let attn_res_t = &outs.attn_residual[t * hidden..(t + 1) * hidden];
+                let shared_t = &outs.shared_expert_out[t * hidden..(t + 1) * hidden];
+                let h_next_t = &mut h_f32[t * hidden..(t + 1) * hidden];
+                for j in 0..hidden {
+                    h_next_t[j] = attn_res_t[j] + shared_t[j] + moe[j];
+                }
+            }
+        }
+
         Ok(h_f32)
     }
 

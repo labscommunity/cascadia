@@ -370,6 +370,127 @@ pub fn layer0_forward_decode_int4_with_capacity(
     }
 }
 
+// =====================================================================
+// Multi-token (seq >= 1) entry point (iter 041)
+// =====================================================================
+//
+// Per the iter 048 commit body: "Layer-0 multi still uses the scalar
+// loop. Layer 0 is one call per token (not per layer × per token), so
+// the wiring effort isn't justified yet." Future iter can swap the body
+// for a tile if profiles ever flag layer 0.
+//
+// KV cache here is `[u16]` (bf16 storage, A8) just like the seq=1 path.
+// `write_present_kv_bf16` does the inline f32 -> bf16 round on each
+// per-token KV append.
+
+/// Per-token outputs of a multi-token layer-0 forward (`seq >= 1`).
+///
+/// Layout: `hidden_out` is flat `[seq, HIDDEN]` in token order.
+/// `present_k` / `present_v` are NOT in this struct — the multi-token
+/// kernel writes them in place into the caller's pre-allocated KV
+/// cache buffer (slots `[past_seq_len, past_seq_len + seq)` of each
+/// head), as bf16-as-u16.
+pub struct MultiLayer0Outputs {
+    /// Per-token hidden-state output (after attention + MLP + residual).
+    /// Shape `[seq, HIDDEN]` flat — caller slices
+    /// `[t * HIDDEN .. (t + 1) * HIDDEN]` for token `t`.
+    pub hidden_out: Vec<f32>,
+}
+
+/// Multi-token layer-0 forward — the seq>=1 entry point. The seq=1
+/// path ([`layer0_forward_decode_int4_with_capacity`]) is unchanged.
+///
+/// Currently a scalar loop over `seq` sequential seq=1 calls — the API
+/// seam that future tiled-GEMM work plugs into. Bit-identical to N
+/// sequential seq=1 calls.
+///
+/// **Inputs.**
+/// - `xs_f32`: `[seq, HIDDEN]` flat, the per-token layer inputs.
+/// - `past_k` / `past_v`: pre-allocated **bf16-as-u16** KV cache,
+///   `[NUM_HEADS, capacity, *_HEAD_DIM]`. Only the first `past_seq_len`
+///   slots are populated on entry; the kernel writes slots
+///   `[past_seq_len, past_seq_len + seq)` on exit.
+/// - `past_seq_len`: populated KV length on entry.
+/// - `capacity`: total per-head KV slot capacity. Must be
+///   `>= past_seq_len + seq`.
+/// - `seq`: number of tokens. Must be `>= 1`.
+pub fn layer0_forward_decode_int4_multi_with_capacity(
+    layer: &Int4Layer0,
+    xs_f32: &[f32],
+    past_k: &mut [u16],
+    past_v: &mut [u16],
+    past_seq_len: usize,
+    capacity: usize,
+    seq: usize,
+) -> MultiLayer0Outputs {
+    assert!(seq >= 1, "seq must be >= 1, got {seq}");
+    assert_eq!(
+        xs_f32.len(),
+        seq * HIDDEN,
+        "xs_f32.len() = {} != seq * HIDDEN = {} * {} = {}",
+        xs_f32.len(),
+        seq,
+        HIDDEN,
+        seq * HIDDEN
+    );
+    assert!(
+        capacity >= past_seq_len + seq,
+        "capacity ({capacity}) must be >= past_seq_len ({past_seq_len}) + seq ({seq})",
+    );
+    assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
+    assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
+
+    let mut hidden_out = vec![0.0f32; seq * HIDDEN];
+
+    for t in 0..seq {
+        let x_t = &xs_f32[t * HIDDEN..(t + 1) * HIDDEN];
+        let cur_past = past_seq_len + t;
+        let outs = layer0_forward_decode_int4_with_capacity(
+            layer, x_t, past_k, past_v, cur_past, capacity,
+        );
+        // Write present_k / present_v into slot `cur_past` for each head
+        // (f32 -> bf16 inline).
+        write_present_kv_bf16(past_k, &outs.present_k, cur_past, capacity, QK_HEAD_DIM);
+        write_present_kv_bf16(past_v, &outs.present_v, cur_past, capacity, V_HEAD_DIM);
+        hidden_out[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&outs.hidden_out);
+    }
+
+    MultiLayer0Outputs { hidden_out }
+}
+
+/// f32 -> bf16-as-u16 KV-slot writer; same routine as `shell_int4`'s
+/// `write_present_kv_bf16` but kept here so layer0 stays self-contained.
+fn write_present_kv_bf16(
+    buf: &mut [u16],
+    present: &[f32],
+    slot: usize,
+    capacity: usize,
+    head_dim: usize,
+) {
+    debug_assert!(slot < capacity);
+    debug_assert_eq!(buf.len(), NUM_HEADS * capacity * head_dim);
+    debug_assert_eq!(present.len(), NUM_HEADS * head_dim);
+    for h in 0..NUM_HEADS {
+        let dst_off = h * capacity * head_dim + slot * head_dim;
+        let src_off = h * head_dim;
+        let dst = &mut buf[dst_off..dst_off + head_dim];
+        let src = &present[src_off..src_off + head_dim];
+        for i in 0..head_dim {
+            dst[i] = f32_to_bf16_bits_local(src[i]);
+        }
+    }
+}
+
+#[inline]
+fn f32_to_bf16_bits_local(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
