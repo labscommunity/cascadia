@@ -1,10 +1,9 @@
-import type { NodeInfo, Stats } from "@/lib/api";
-import { isFresh } from "@/lib/format";
+import type { Edge, NodeInfo, Stats } from "@/lib/api";
 
 type Props = {
   nodes: NodeInfo[];
+  edges: Edge[];
   stats: Stats | null;
-  now: number;
 };
 
 /**
@@ -13,8 +12,7 @@ type Props = {
  * tabular numbers, tiny uppercase mono labels, separated by hairlines
  * rather than card edges so the eye reads across.
  */
-export function StatusStrip({ nodes, stats, now }: Props) {
-  const liveCount = nodes.filter((n) => isFresh(n.last_seen, now)).length;
+export function StatusStrip({ nodes, edges, stats }: Props) {
   const deviceTallies = nodes.reduce<Record<string, number>>((acc, n) => {
     acc[n.device] = (acc[n.device] ?? 0) + 1;
     return acc;
@@ -24,10 +22,26 @@ export function StatusStrip({ nodes, stats, now }: Props) {
     .map(([dev, n]) => `${n} ${dev}`)
     .join(" · ") || "—";
 
+  // Median round-trip latency across measured edges — gives one number
+  // that summarises whether the cluster's interconnect is healthy. NaN
+  // when no edges yet (probe loop hasn't populated any).
+  const sortedLatencies = edges.map((e) => e.latency_ms).sort((a, b) => a - b);
+  const medianLatency = sortedLatencies.length
+    ? sortedLatencies[Math.floor(sortedLatencies.length / 2)]
+    : null;
+
   const cells: { label: string; value: string }[] = [
     { label: "Nodes", value: nodes.length.toString() },
-    { label: "Live", value: liveCount.toString() },
     { label: "Devices", value: deviceLabel },
+    {
+      label: "Median RTT",
+      value:
+        medianLatency != null
+          ? medianLatency < 10
+            ? `${medianLatency.toFixed(2)} ms`
+            : `${medianLatency.toFixed(1)} ms`
+          : "—",
+    },
     {
       label: "In flight",
       value: stats ? stats.requests_in_flight.toString() : "—",

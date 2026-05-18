@@ -1,10 +1,15 @@
 import type { NodeInfo } from "@/lib/api";
-import { humanizeMemory, isFresh, relativeAge } from "@/lib/format";
+import { humanizeMemory, relativeAge } from "@/lib/format";
 
 import { DeviceChip } from "./DeviceChip";
 
 export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
-  const fresh = isFresh(node.last_seen, now);
+  // Presence in topology is the liveness signal — the mDNS daemon
+  // removes peers from this list when TTL expires, so anything we render
+  // is by definition currently being heard from. The `last_seen` field
+  // is now decorative ("when we last got a fresh resolution event")
+  // because mdns-sd suppresses ServiceResolved for already-known peers,
+  // making it unreliable as a freshness proxy.
   return (
     <article className="surface p-5 flex flex-col gap-4 hover:shadow-elev transition-shadow">
       <header className="flex items-start justify-between gap-3">
@@ -17,14 +22,7 @@ export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {fresh ? (
-            <span className="pulse-dot" aria-label="fresh heartbeat" />
-          ) : (
-            <span
-              className="w-2 h-2 rounded-full bg-state-cold"
-              aria-label="stale (no recent heartbeat)"
-            />
-          )}
+          <span className="pulse-dot" aria-label="live" />
           <DeviceChip device={node.device} />
         </div>
       </header>

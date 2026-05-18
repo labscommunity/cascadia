@@ -32,7 +32,11 @@ export function Dashboard() {
         </p>
       </header>
 
-      <StatusStrip nodes={nodes} stats={stats.kind === "ready" ? stats.data : null} now={now} />
+      <StatusStrip
+        nodes={nodes}
+        edges={edges}
+        stats={stats.kind === "ready" ? stats.data : null}
+      />
 
       <section className="space-y-4">
         <SectionHeader label="Nodes" hint={`${nodes.length} discovered`} />
