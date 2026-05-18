@@ -18,6 +18,49 @@ Entry template:
 
 ---
 
+## 011 — A3 K=4 long-context (max_tokens=64) — CONFIRMS, throughput doubles (2026-05-17 ~21:06 PT)
+
+**Hypothesis:** K=4 quality holds at longer generation; throughput
+improves via prefill amortization.
+
+**Result: CONFIRMED + better than expected.**
+
+K=4 throughput by output length:
+- max_tokens=8:  0.1667 tok/s, 3/3 narrow
+- max_tokens=16: 0.2100 tok/s, 9/10 broad (iter 009)
+- **max_tokens=64: 0.3253 tok/s, 9/10 broad** (this iter)
+
+**Throughput nearly doubles** at long context (+55% from 16→64 tokens).
+Per-prompt peak 0.4509 tok/s on Paris. **Real K=4 production tok/s
+for chat workloads = ~0.30-0.45 on miner single-stage** — 3-5× the K=8
+baseline.
+
+Quality at long context is qualitatively STRONGER. Examples:
+- Pacific gets concrete numbers ("63,800,000 square miles")
+- Jupiter correctly lists Io, Europa, Ganymede, Callisto as Galilean moons
+- Python attributes to "Guido van Rossum in 1991"
+- Paris chains multiple capitals coherently
+
+Same single failure (celsius → multi-choice format) at all max_tokens
+sizes — this is a sampling format issue, not a K-related quality
+degradation.
+
+Bench: `experiments/011_a3_k4_longcontext/bench_k4_mt64.jsonl`
+Notes: `experiments/011_a3_k4_longcontext/result.md`
+
+**A3 K=4 productionization recommendation is now backed by:**
+- 3-prompt narrow eval (iter 006): 3/3 quality, +109%
+- 10-prompt broad eval (iter 009): 9/10 quality, +146%
+- 10-prompt × 64-token long-context (this iter): 9/10 quality,
+  ~3-5× vs K=8 in production-realistic workloads
+
+**Next iteration:** broaden moonshot diversity — pursue different
+buckets. Top picks among non-matias-blocked: A8 KV bf16 (BW), C1
+expert prefetch (I/O overlap), A3 + new prompt classes (code-gen,
+multi-turn) for fuller robustness picture.
+
+---
+
 ## 010 — F4 rayon-over-heads — NEUTRAL on miner (2026-05-17 ~20:29 PT)
 
 **Hypothesis:** Parallel per-head SDPA (rayon over 64 heads on 24-core

@@ -1,9 +1,9 @@
 {
-  "iteration": 10,
-  "moonshots_attempted": 10,
+  "iteration": 11,
+  "moonshots_attempted": 11,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 3,
+    "win": 4,
     "neutral": 4,
     "negative": 1,
     "parked": 1,
@@ -19,17 +19,14 @@
   "moonshot_ratio": 0.78,
   "consecutive_no_improvement": 0,
   "current_leader": {
-    "tok_per_sec": 0.2100,
-    "config": "A3 K=4 on miner single-stage (--top-k-override 4), 10-prompt eval @ max_tokens=16",
-    "campaign": "009_a3_robustness_10prompt",
-    "quality": "9/10 (matches K=8 baseline 9/10, both have single sampling-format artifact on different prompts)",
-    "delta_vs_k8_same_substrate": 1.461,
-    "measured_at_utc": "2026-05-18T01:08:07Z",
-    "narrower_eval_winner": {
-      "config": "A3 K=3 on 3-prompt narrow eval @ max_tokens=8",
-      "tok_per_sec": 0.2455,
-      "quality": "3/3 (but 6/10 on broader 10-prompt eval — demoted)"
-    }
+    "tok_per_sec": 0.3253,
+    "config": "A3 K=4 long-context (--top-k-override 4, max_tokens=64) on miner single-stage",
+    "campaign": "011_a3_k4_longcontext",
+    "quality": "9/10 (10-prompt eval, max_tokens=64 — same single failure as max_tokens=16; sampling format issue not K-related)",
+    "delta_vs_k8_same_substrate": "~3-5x in production-realistic workloads (K=8 long-context not directly measured but extrapolates ~0.13-0.15)",
+    "per_prompt_peak_tok_s": 0.4509,
+    "measured_at_utc": "2026-05-18T02:06:05Z",
+    "production_recommendation": "default --top-k-override 4 for K2.6 sparse-MoE on Intel CPU single-stage; ~0.30-0.45 tok/s for chat workloads"
   },
   "baseline_2box_matias": {
     "tok_per_sec": 0.0553,

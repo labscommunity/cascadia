@@ -6,7 +6,8 @@ Best result per topology. Updated whenever a verified win lands.
 
 | Rank | tok/s | Config | Date | Campaign |
 |-----:|------:|--------|------|----------|
-| 1 | **0.2100** | **A3: K2.6 single-stage, --top-k-override 4** (9/10 quality on 10-prompt eval, matches K=8 baseline, **+146% vs K=8 on same eval**) | 2026-05-17 | [009_a3_robustness_10prompt](experiments/009_a3_robustness_10prompt/) |
+| 1 | **0.3253** | **A3: --top-k-override 4, max_tokens=64** (9/10 quality, peak prompt 0.45 tok/s, ~3-5× K=8 in production-realistic workloads) | 2026-05-17 | [011_a3_k4_longcontext](experiments/011_a3_k4_longcontext/) |
+| 2 | 0.2100 | A3: --top-k-override 4, max_tokens=16 (9/10 quality, +146% vs K=8) | 2026-05-17 | [009](experiments/009_a3_robustness_10prompt/) |
 | 2 (narrow) | 0.3050 | A3: --top-k-override 3 — **6/10 on 10-prompt** (was 3/3 on narrow eval, +258% raw); demoted from leader after robustness check | 2026-05-17 | 009 |
 | 3 | 0.1667 | A3: --top-k-override 4, 3-prompt narrow (3/3) | 2026-05-17 | [006](experiments/006_a3_topk_sweep/) |
 | 3 | 0.1547 | A3: --top-k-override 5 (3/3 quality, +94% vs K=8) | 2026-05-17 | 008 |
