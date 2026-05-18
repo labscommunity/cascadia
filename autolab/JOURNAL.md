@@ -2,6 +2,24 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 023 — K=6 on code prompts = 4/5 (same as K=4 — single format failure) (2026-05-18 ~06:23 PT)
+
+K=6 on 5 code prompts: 4/5 quality. Same single failure as K=4 (iter 012)
+on "x = 5 + 3; print(x)" — model goes "let me trace through" instead
+of answering "8" within 32 tokens.
+
+Failure is format/style, not capability (K=6 knows arithmetic). Bigger
+max_tokens or different prompt template would likely recover.
+
+K=6 matches K=4 on code prompts (both 4/5). K=6 wins overall because
+it's strictly better on long-context factual prompts (10/10 vs K=4's 9/10).
+
+Bench: `experiments/023_k6_code/bench_k6_code.jsonl`
+
+Next iter: try matias once more OR pivot to genuinely new bucket (A8).
+
+---
+
 ## 022 — K=6+thr=0.1 = 10/10 quality (composed config) (2026-05-18 ~05:46 PT)
 
 K=6+thr=0.1 at mt=32: 0.1482 tok/s, 10/10 quality. Threshold filter
