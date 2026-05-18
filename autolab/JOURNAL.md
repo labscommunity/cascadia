@@ -2,6 +2,66 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 037 — F5 bench retry — REAL +80% TPS at W=32 BUT quality cliff (substring eval too weak) (2026-05-18 ~15:35 PT)
+
+Mixed result + methodology discovery. Branch `perf/f5-bench-results-
+037` @ `f05569b`.
+
+**Measured (miner single-stage, K=8, single-prompt):**
+
+| W   | mt  | tok/s   | substring | qualitative |
+|-----|-----|---------|----------:|-------------|
+| 0   | 64  | 0.1253  | 1/1       | coherent (baseline) |
+| 32  | 64  | 0.1585  | 1/1       | coherent ~25 tok then "Question?" loop |
+| 0   | 128 | 0.1192  | 1/1       | coherent (baseline) |
+| 32  | 128 | **0.2150** | 1/1  | **+80.4% TPS but garbage after ~30 tok** |
+| 128 | 128 | 0.1235  | 1/1       | within noise (+3.6%) |
+
+**The throughput claim is real:** W=32 at mt=128 = +80.4% tok/s. The
+seam works. But:
+
+**🚨 CRITICAL METHODOLOGY FINDING — substring eval is too weak:**
+> Existing substring eval passes "Paris ?? ?? &" because "paris" is
+> in the first sentence. A stricter eval (perplexity vs W=0
+> reference, or first-divergence position) would have flagged W=32.
+
+W=32 output degenerates after ~30 tokens to literal garbage
+(`?? && ..`). But the substring check rewards first-sentence
+correctness, so it scored 1/1.
+
+**K2.6-specific architectural finding:** quality cliff is severe at
+W=32 because K2.6 has no per-layer attention_type (unlike Gemma3's
+mixed full/sliding stack — F5 impl agent had flagged this risk in
+iter 029). Uniform window across all 60 layers can't preserve
+long-range deps.
+
+**W=128 at mt=128 is within noise (+3.6%)** — matches pre-bench
+expectation ("window barely active"). The wider window doesn't hurt
+quality but also doesn't help throughput unless prompts get
+significantly longer.
+
+**Honest verdict:** F5 is neutral-to-negative at production-safe W;
+it's only fast-at-W=32 by sacrificing coherence. Not a shippable win
+for K2.6 without per-layer attention_type retrofit.
+
+**Memory update:** saved
+`autolab-substring-eval-too-weak` — substring eval insufficient for
+attention/KV/sparsity changes; need stricter eval (perplexity,
+first-divergence, or eyeball).
+
+**Operational notes from agent:**
+- Build needed `INTEL_OPENVINO_DIR=/home/tatef/openvino_2026.1.0`
+  for `tahoma-ov-genai-shim`
+- `setupvars.sh` must be sourced before worker start (for
+  `libopenvino_genai.so.2610` on LD_LIBRARY_PATH)
+- F5 branch lacks `--top-k-override` flag (it's in sibling branch),
+  so K=8 manifest default was used instead of K=6 as requested. The
+  W=0 vs W=32 vs W=128 comparison at same K=8 is valid.
+- Miner was clean (killed stale pid 2702179 at start)
+- `mt=256` test infeasible (~32 min/prompt at 0.13 tok/s); skipped
+
+---
+
 ## 042 — AVX-512 multi-token int4 tile — VERIFIED WIN: 1.4-4.75× per projection (2026-05-18 ~15:35 PT)
 
 **THIRD VERIFIED ARCHITECTURAL MOONSHOT.** Real measured speedups
