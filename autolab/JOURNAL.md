@@ -2,6 +2,37 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 028 — K=6 temperature ladder — robust through temp=0.5 (gentle degradation) (2026-05-18 ~11:45 PT)
+
+10-prompt eval at K=6 across temperature ladder, comparing degradation
+profile vs K=4 fragility (iter 018).
+
+| temp | K=6 quality | K=6 tok/s | K=4 quality | K=4 tok/s |
+|-----:|------------:|----------:|------------:|----------:|
+| 0.0  | 10/10 (021) |   0.1587  | 9/10 (009)  |  0.2100   |
+| 0.3  | **10/10**   |   0.1457  | (not run)   |    -      |
+| 0.5  | **9/10**    |   0.1539  | (not run)   |    -      |
+| 0.7  | 8/10 (019)  |   0.1489  | 5/10 (018)  |  0.2400   |
+
+**K=6 temp=0.5 failure:** only "km" prompt failed (model spelled out
+"kilometers" — substring artifact, not a real K-quality issue).
+
+**Key finding:** K=6 has a **gentle quality curve** across temp
+(10→10→9→8), while K=4 has a **sharp cliff** (9→5 between temp=0 and
+0.7). K=6 is the right choice for any chat workload with temp>0.
+
+**Production insight:**
+- Deterministic / temp=0: use K=4 (throughput-max, 0.21-0.32 tok/s,
+  9/10 quality)
+- Chat with diversity / temp=0.3-0.5: use K=6 (still 9-10/10 quality,
+  ~0.15 tok/s)
+- High temp / temp=0.7+: K=6 still 8/10 vs K=4 collapse — K=6
+  dominates entirely
+
+Bench: `experiments/028_k6_temp_ladder/k6_temp{03,05}_10p.jsonl`
+
+---
+
 ## 027 — K=6 + completion-style sys prompt 10p — 9/10 (slightly worse than K=6 baseline) (2026-05-18 ~09:30 PT)
 
 K=6 + system prompt "Answer directly with the most likely word or phrase
