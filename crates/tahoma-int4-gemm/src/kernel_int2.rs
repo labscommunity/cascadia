@@ -6,7 +6,7 @@
 //! count cuts page-in time roughly in proportion. On a memory-bound box the
 //! same logic applies to DRAM bandwidth.
 //!
-//! Storage layout — group_size=32, symmetric, zero_point=2:
+//! Storage layout — group_size=32, symmetric balanced 2-bit codebook:
 //!
 //! ```text
 //!   packed: u8  [n_rows, k_cols / 4]   (4 weights per byte)
@@ -15,8 +15,13 @@
 //!
 //! Each byte holds 4 two-bit nibbles. Convention: bits [0:2] = col 4i,
 //! bits [2:4] = col 4i+1, bits [4:6] = col 4i+2, bits [6:8] = col 4i+3.
-//! Stored as unsigned [0, 3]; subtract 2 to get signed [-2, 1]. The +max
-//! value (1) maps to +scale; -max (-2) maps to -2*scale.
+//! Storage codes 0..3 dequantize to the SYMMETRIC BALANCED codebook
+//! { -3, -1, +1, +3 } × scale via `dequant = (2 * code - 3) * scale`.
+//! With `scale = max_abs / 3`, the +max weight maps to code 3 (dequant=+max)
+//! and -max maps to code 0 (dequant=-max), with quantization step 2*scale
+//! = (2/3)*max — better than the naïve asymmetric {-2, -1, 0, +1} × scale
+//! scheme which wastes the most-negative codepoint for symmetric weight
+//! distributions (the typical case after int4 dequant of NNCF SYM weights).
 //!
 //! Within one group of 32 weights we use 8 bytes packed, matching the
 //! kernel's "load 8 bytes, expand to 32 i8" structure.
@@ -43,13 +48,15 @@ pub fn bf16_round(x: f32) -> u16 {
 }
 
 /// Quantize a bf16 weight matrix `[n_rows, k_cols]` (raw bytes, LE bf16 = u16)
-/// into int2 packed (4 weights per byte) + per-group bf16 scales.
+/// into int2 packed (4 weights per byte) + per-group bf16 scales using the
+/// SYMMETRIC BALANCED codebook { -3, -1, +1, +3 } × scale.
 ///
-/// The asymmetric range [-2, 1] is intentionally biased — symmetric int2 would
-/// give us {-1, 0, 1} (effectively ternary) with 1 bit of resolution wasted.
-/// Using the full 4 codepoints with offset = 2 gives 4 levels: [-2, -1, 0, 1].
-/// We pick the scale so that `max_abs` maps to `1` (the positive max), which
-/// matches our int4 SYM convention.
+/// Encoding (per weight `w`):
+///   1. Compute `t = w / (2 * scale) + 1.5`  — maps [-3*scale, +3*scale] → [0, 3].
+///   2. Round to nearest integer, clamp to [0, 3] — that's the storage code.
+///   3. Dequant: `(2 * code - 3) * scale` recovers one of {-3, -1, +1, +3} × scale.
+///
+/// `scale = max_abs / 3` so the +max weight gets code 3 (dequant=+max).
 ///
 /// Output layout:
 ///   packed: `u8` of length `n_rows * (k_cols / 4)` — byte `i` of row `r`
@@ -76,8 +83,13 @@ pub fn quantize_int2_group(weight_bf16: &[u8], n_rows: usize, k_cols: usize) -> 
                     max_abs = a;
                 }
             }
-            // Scale chosen so +max_abs maps to +1 (signed [-2, 1] range).
-            let scale = if max_abs == 0.0 { 1.0e-10 } else { max_abs };
+            // Scale = max_abs / 3 so dequant range is [-3*scale, +3*scale]
+            // = [-max_abs, +max_abs].
+            let scale = if max_abs == 0.0 {
+                1.0e-10
+            } else {
+                max_abs / 3.0
+            };
             // Store scale as bf16.
             let scale_bits = bf16_round(scale);
             let s_off = (r * n_groups + g) * 2;
@@ -85,20 +97,19 @@ pub fn quantize_int2_group(weight_bf16: &[u8], n_rows: usize, k_cols: usize) -> 
             scales[s_off + 1] = (scale_bits >> 8) as u8;
             // Re-read after rounding for the inv multiplier.
             let scale_q = f32::from_bits((scale_bits as u32) << 16);
-            let inv = 1.0 / scale_q;
-            // Quantize each value.
+            let inv = 0.5 / scale_q; // 1 / (2 * scale)
+                                     // Quantize each value to code in [0, 3].
             for k in 0..GROUP_SIZE {
                 let c = g * GROUP_SIZE + k;
                 let w_off = (r * k_cols + c) * 2;
                 let bits = ((weight_bf16[w_off + 1] as u32) << 8) | (weight_bf16[w_off] as u32);
                 let w = f32::from_bits(bits << 16);
-                let q = (w * inv).round().clamp(-2.0, 1.0) as i32;
-                // Map signed [-2, 1] to unsigned [0, 3] by +2.
-                let two_bit = ((q + 2) & 0x03) as u8;
+                let t = w * inv + 1.5; // map [-3*scale, +3*scale] → [0, 3]
+                let code = t.round().clamp(0.0, 3.0) as u8;
                 let p_off = (r * k_cols + c) / INT2_VALS_PER_BYTE;
-                let sub = c & 0x03; // 0,1,2,3
+                let sub = c & 0x03;
                 let shift = (sub as u8) * 2;
-                packed[p_off] = (packed[p_off] & !(0x03u8 << shift)) | (two_bit << shift);
+                packed[p_off] = (packed[p_off] & !(0x03u8 << shift)) | (code << shift);
             }
         }
     }
@@ -150,7 +161,7 @@ pub fn quantize_int2_from_int4(
                 group_f32[i * 2] = (lo as f32) * s4;
                 group_f32[i * 2 + 1] = (hi as f32) * s4;
             }
-            // Re-quantize this group to int2.
+            // Re-quantize this group to int2 (balanced { -3, -1, +1, +3 } codebook).
             let mut max_abs = 0.0f32;
             for &v in &group_f32 {
                 let a = v.abs();
@@ -158,23 +169,27 @@ pub fn quantize_int2_from_int4(
                     max_abs = a;
                 }
             }
-            let scale = if max_abs == 0.0 { 1.0e-10 } else { max_abs };
+            let scale = if max_abs == 0.0 {
+                1.0e-10
+            } else {
+                max_abs / 3.0
+            };
             let s2_bits = bf16_round(scale);
             let s2_off = (r * n_groups + g) * 2;
             scales[s2_off] = (s2_bits & 0xFF) as u8;
             scales[s2_off + 1] = (s2_bits >> 8) as u8;
             let scale_q = f32::from_bits((s2_bits as u32) << 16);
-            let inv = 1.0 / scale_q;
-            // Pack into int2 bytes.
+            let inv = 0.5 / scale_q; // 1 / (2 * scale)
+                                     // Pack into int2 bytes — code = round(w / (2*scale) + 1.5) clamped to [0,3].
             let p2_row_off = r * (k_cols / INT2_VALS_PER_BYTE);
             for k in 0..GROUP_SIZE {
                 let c = g * GROUP_SIZE + k;
-                let q = (group_f32[k] * inv).round().clamp(-2.0, 1.0) as i32;
-                let two_bit = ((q + 2) & 0x03) as u8;
+                let t = group_f32[k] * inv + 1.5;
+                let code = t.round().clamp(0.0, 3.0) as u8;
                 let p_off = p2_row_off + c / INT2_VALS_PER_BYTE;
                 let sub = c & 0x03;
                 let shift = (sub as u8) * 2;
-                packed[p_off] = (packed[p_off] & !(0x03u8 << shift)) | (two_bit << shift);
+                packed[p_off] = (packed[p_off] & !(0x03u8 << shift)) | (code << shift);
             }
         }
     }
@@ -182,7 +197,9 @@ pub fn quantize_int2_from_int4(
     (packed, scales)
 }
 
-/// Scalar reference: `y[r] = sum_c (signed_int2(W[r, c]) * scale[r, c/32]) * x[c]`.
+/// Scalar reference: `y[r] = sum_c dequant(W[r, c]) * x[c]` where
+/// `dequant(code) = (2 * code - 3) * scale[r, c/32]` for code in [0, 3]
+/// (balanced {-3, -1, +1, +3} × scale codebook).
 pub fn dequant_gemv_int2(
     packed: &[u8],
     scale_bits: &[u8],
@@ -211,10 +228,11 @@ pub fn dequant_gemv_int2(
             let mut group_dot = 0.0f32;
             for i in 0..INT2_BYTES_PER_GROUP {
                 let byte = group_packed[i];
-                let c0 = ((byte & 0x03) as i32) - 2;
-                let c1 = (((byte >> 2) & 0x03) as i32) - 2;
-                let c2 = (((byte >> 4) & 0x03) as i32) - 2;
-                let c3 = (((byte >> 6) & 0x03) as i32) - 2;
+                // Balanced codebook: dequant = 2*code - 3 → values {-3,-1,1,3}.
+                let c0 = ((byte & 0x03) as i32) * 2 - 3;
+                let c1 = (((byte >> 2) & 0x03) as i32) * 2 - 3;
+                let c2 = (((byte >> 4) & 0x03) as i32) * 2 - 3;
+                let c3 = (((byte >> 6) & 0x03) as i32) * 2 - 3;
                 let col = g * GROUP_SIZE + i * 4;
                 group_dot += (c0 as f32) * x[col];
                 group_dot += (c1 as f32) * x[col + 1];
@@ -241,7 +259,7 @@ mod avx512 {
     /// Strategy per group (32 weights = 8 bytes):
     ///   - Load 8 bytes into a __m128i.
     ///   - Expand each byte into 4 lanes (cols 4i..4i+3) via mask + shift.
-    ///   - Subtract 2 → signed i8 in [-2, 1].
+    ///   - Apply BALANCED transform `2*code - 3` → signed i8 in {-3,-1,1,3}.
     ///   - sign-extend to i32, convert to f32.
     ///   - Multiply by scale, fmadd with x.
     ///
@@ -274,59 +292,41 @@ mod avx512 {
                 let scale = bf16_bits_to_f32(scale_u16);
                 let scale_v = _mm512_set1_ps(scale);
                 // Load 8 bytes (32 packed 2-bit codes).
-                // We can't use _mm_loadl_epi64 with an &[u8] cleanly;
-                // copy into a u64 then build the __m128i.
                 let mut buf64 = [0u8; 8];
                 buf64.copy_from_slice(
                     &row_packed[g * INT2_BYTES_PER_GROUP..(g + 1) * INT2_BYTES_PER_GROUP],
                 );
                 let u = u64::from_le_bytes(buf64);
                 let p64 = _mm_set_epi64x(0, u as i64);
-                // Expand 8 bytes × 4 codes = 32 i8 lanes in a 256-bit register.
-                // Strategy: build four __m128i, each holds 16 codes for one
-                // "position-in-byte" (0, 1, 2, 3), then interleave.
-                //
-                // Actually simpler: produce 4 vectors of 8 lanes each
-                // (positions 0,1,2,3), zip them into a 32-lane sequence.
-                //
-                // The cleanest version is to broadcast each byte four times
-                // across 4 lanes — that needs vpshufb on AVX-512BW.
-                //
-                // We'll go with: byte_lane[i] contains 8 copies of byte i;
-                // then take 4 different mask/shift combos to produce 4 8-lane
-                // results that we interleave.
+                // Extract 4 "position" vectors (one per nibble within byte):
+                // each lane[i] holds the i-th 2-bit code of each source byte.
                 let mask03 = _mm_set1_epi8(0x03);
-                let two = _mm_set1_epi8(2);
-                // Position 0: byte & 0x03.
-                let lane0 = _mm_sub_epi8(_mm_and_si128(p64, mask03), two);
-                // Position 1: (byte >> 2) & 0x03.
-                let p_sr2 = _mm_srli_epi16::<2>(p64);
-                let lane1 = _mm_sub_epi8(_mm_and_si128(p_sr2, mask03), two);
-                // Position 2: (byte >> 4) & 0x03.
-                let p_sr4 = _mm_srli_epi16::<4>(p64);
-                let lane2 = _mm_sub_epi8(_mm_and_si128(p_sr4, mask03), two);
-                // Position 3: (byte >> 6) & 0x03.
-                let p_sr6 = _mm_srli_epi16::<6>(p64);
-                let lane3 = _mm_sub_epi8(_mm_and_si128(p_sr6, mask03), two);
-                // Now we have four 8-byte vectors, each with one "position"
-                // per source byte. Interleave to get cols 0..31 in order.
-                //
+                // raw_codes[pos] = code at bit position 2*pos within each byte.
+                let raw0 = _mm_and_si128(p64, mask03);
+                let raw1 = _mm_and_si128(_mm_srli_epi16::<2>(p64), mask03);
+                let raw2 = _mm_and_si128(_mm_srli_epi16::<4>(p64), mask03);
+                let raw3 = _mm_and_si128(_mm_srli_epi16::<6>(p64), mask03);
+                // Balanced transform: signed = 2*code - 3 → {-3, -1, +1, +3}.
+                let three = _mm_set1_epi8(3);
+                let two_codes0 = _mm_add_epi8(raw0, raw0); // = 2*raw0
+                let two_codes1 = _mm_add_epi8(raw1, raw1);
+                let two_codes2 = _mm_add_epi8(raw2, raw2);
+                let two_codes3 = _mm_add_epi8(raw3, raw3);
+                let lane0 = _mm_sub_epi8(two_codes0, three);
+                let lane1 = _mm_sub_epi8(two_codes1, three);
+                let lane2 = _mm_sub_epi8(two_codes2, three);
+                let lane3 = _mm_sub_epi8(two_codes3, three);
+                // Interleave to get cols 0..31 in order.
                 // Cols layout we want: [b0p0, b0p1, b0p2, b0p3, b1p0, b1p1, ...]
-                // — i.e. take byte 0's 4 positions, then byte 1's 4 positions, etc.
-                //
-                // Step 1: interleave lane0/lane1 byte-wise → [b0p0, b0p1, b1p0, b1p1, b2p0, b2p1, ...]
                 let l01 = _mm_unpacklo_epi8(lane0, lane1);
-                // Step 2: interleave lane2/lane3 → [b0p2, b0p3, b1p2, b1p3, ...]
                 let l23 = _mm_unpacklo_epi8(lane2, lane3);
-                // Step 3: interleave the two i16-wise → [b0p0, b0p1, b0p2, b0p3, b1p0, b1p1, b1p2, b1p3, ...]
                 let interleaved_lo = _mm_unpacklo_epi16(l01, l23); // cols 0..15
                 let interleaved_hi = _mm_unpackhi_epi16(l01, l23); // cols 16..31
-                                                                   // Sign-extend to i32, convert to f32.
+                                                                   // Sign-extend i8 → i32 → f32.
                 let lo_i32 = _mm512_cvtepi8_epi32(interleaved_lo);
                 let hi_i32 = _mm512_cvtepi8_epi32(interleaved_hi);
                 let lo_f = _mm512_cvtepi32_ps(lo_i32);
                 let hi_f = _mm512_cvtepi32_ps(hi_i32);
-                // Multiply by scale, fmadd with x.
                 let lo_w = _mm512_mul_ps(lo_f, scale_v);
                 let hi_w = _mm512_mul_ps(hi_f, scale_v);
                 let x_ptr = x.as_ptr().add(g * GROUP_SIZE) as *const f32;
@@ -493,20 +493,35 @@ pub fn expert_forward_int2(
 mod tests {
     use super::*;
 
-    /// All-zero weights produce all-zero output. Zero-point=2 means
-    /// `signed=0` corresponds to two_bit=2 = byte 0xAA (each pair of bits = 10).
+    /// Constant-code test: codes alternating {1, 2} (= signed {-1, +1}, dequant
+    /// = ±scale) summed against an alternating x = ±1 should give k_cols * scale.
+    ///
+    /// Balanced encoding has no "exact zero" codepoint — codes {0,1,2,3} map to
+    /// signed {-3, -1, +1, +3}, so we use codes 1 (= -1) and 2 (= +1) for a
+    /// minimal-magnitude sanity check.
     #[test]
-    fn zero_weight_zero_output() {
-        let n_rows = 4;
+    fn balanced_minimum_codes_dequant() {
+        let n_rows = 2;
         let k_cols = 32; // one group
-        let packed = vec![0xAAu8; n_rows * k_cols / INT2_VALS_PER_BYTE];
-        // scale = 1.0 in bf16 (0x3F80 LE = 0x80, 0x3F)
-        let scale_bits = vec![0x80u8, 0x3F].repeat(n_rows * (k_cols / GROUP_SIZE));
-        let x: Vec<f32> = (0..k_cols).map(|i| i as f32 * 0.1).collect();
+                         // Byte 0x99 = bits 10011001 = 4 codes {1, 2, 1, 2} (low to high).
+        let packed = vec![0x99u8; n_rows * k_cols / INT2_VALS_PER_BYTE];
+        // scale = 0.5 in bf16 (0x3F00).
+        let scale_bits = vec![0x00u8, 0x3F].repeat(n_rows * (k_cols / GROUP_SIZE));
+        // x alternates -1, +1, -1, +1 — pairs cancel with codes -1, +1, ...
+        let x: Vec<f32> = (0..k_cols)
+            .map(|i| if i.is_multiple_of(2) { -1.0 } else { 1.0 })
+            .collect();
         let mut y = vec![999.0f32; n_rows];
         dequant_gemv_int2(&packed, &scale_bits, &x, n_rows, k_cols, &mut y);
+        // Each pair: (-1 * -1) + (+1 * +1) = 2; times scale = 1; per byte = 2.
+        // 32 weights / 2 per pair = 16 pairs → sum = 16 * 1 = 16.
+        // Wait — let's enumerate: codes c0=1, c1=2, c2=1, c3=2 → signed -1, 1, -1, 1.
+        // x for first 4 cols: -1, +1, -1, +1.
+        // Contributions: (-1)*(-1) + (1)*(1) + (-1)*(-1) + (1)*(1) = 4. Per byte → 4 * scale = 2.
+        // 8 bytes × 4 / scale_1 = 8 * 4 * 0.5 = 16.
+        let expected = 16.0f32;
         for &v in &y {
-            assert!(v.abs() < 1e-6, "expected ~0, got {v}");
+            assert!((v - expected).abs() < 1e-5, "expected {expected}, got {v}");
         }
     }
 
