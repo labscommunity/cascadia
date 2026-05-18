@@ -2,6 +2,46 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 053 — Fused RMSNorm + QKV — NEGATIVE RESULT (decisive cost analysis) (2026-05-18 ~17:55 PT)
+
+Honest negative via path (C) investigation. Branch
+`perf/fused-rmsnorm-qkv-053` @ `56401f6`. Killed before any (A) PoC.
+
+**Architectural finding (verbatim agent):**
+> K2.6 has MLA, not standard QKV — the actual fusion sites are
+> `input_norm → (q_a_proj, kv_a_proj)` (2× read) and `post_norm →
+> (router, shared_gate, shared_up)` (3× read).
+
+**Cost analysis (M4 scalar, 500 iters):**
+- RMSNorm = **0.42% of unfused** at Site A (input_norm → q_a/kv_a)
+- RMSNorm = **0.19% of unfused** at Site B (post_norm → router/
+  shared_gate/shared_up)
+- Both ≪ 2% threshold for "worth doing"
+
+**Best-case ceiling (AVX-512 + peak 150 GB/s DRAM): 8% / 4% saving.
+Realistic rainier-effective 60 GB/s: 2.9% / 1.3%.**
+
+**Why it doesn't help (architectural insight worth keeping):**
+> The 28 KB normed buffer fits in L1d and never reaches DRAM; the
+> int4 GEMV weight read (2-18 MB per matmul) dominates by 100×.
+> Fusion saves L1 traffic, not DRAM, and the GEMV is bandwidth-bound
+> on DRAM.
+
+**Deliverable (defensive infra):** `bin/bench_fused_rmsnorm_qkv.rs`
+standalone bench at the actual K2.6 shapes using production
+`dequant_gemv_int4_auto`. Runs on M4 (scalar) + Xeon (AVX-512).
+Reusable for future similar-shape questions.
+
+**Why this is a successful iteration:** the analysis is decisive
+(0.42% << 2% threshold). Saved the implementation cost of a real PoC
+that wouldn't have shipped. The microbench documents the cost ratio
+so future fusion attempts can short-circuit faster.
+
+7 lib tests pass, fmt + clippy clean, no conflict with iter 050 / 052
+(different file, different bin name).
+
+---
+
 ## 051 — Expert dispatch batching across tokens — KEYSTONE BREAKER, code shipped (2026-05-18 ~17:40 PT)
 
 The keystone moonshot that breaks iter 044's 94%-expert ceiling.
