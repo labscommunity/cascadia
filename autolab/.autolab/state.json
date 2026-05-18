@@ -19,7 +19,7 @@
   },
   "moonshot_ratio": 0.78,
   "consecutive_no_improvement": 0,
-  "current_leader": {
+  "current_leader_singlestage": {
     "tok_per_sec": 0.3253,
     "config": "A3 K=4 long-context (--top-k-override 4, max_tokens=64) on miner single-stage",
     "campaign": "011_a3_k4_longcontext",
@@ -32,7 +32,40 @@
   "baseline_2box_matias": {
     "tok_per_sec": 0.0553,
     "measured_at_utc": "2026-05-17T20:36:29Z",
-    "note": "matias-02 Tailscale needs manual re-auth; 2-box bench parked"
+    "note": "iter 000 baseline (K=8, mt=8, 3-prompt). Pipeline revived 2026-05-18 via SSH-tunnel chain (infra/matias-2box-revival-029, iter 030); revived measurement 0.0770 tok/s @ K=8 mt=32 10-prompt."
+  },
+  "verified_architectural_wins_2026_05_18": {
+    "a8_kv_bf16": {
+      "branch": "perf/a8-kv-bf16-029",
+      "commit": "ebd8ac4",
+      "kernel_speedup": "~2.1x attention compute (687ms vs 1456ms f32)",
+      "memory": "KV halved (2.4 MB/tok vs 5 MB/tok across 60 layers)",
+      "quality": "3/3 substring preserved, full coherent outputs"
+    },
+    "c1_expert_prefetch": {
+      "branch": "perf/c1-expert-prefetch-029",
+      "commit": "eb57a9e",
+      "throughput_ab": "+26.8% tok/s (0.0683 -> 0.0866 under 3-worker contention)",
+      "mechanism": "madvise(MADV_WILLNEED) + background thread + same-as-last predictor",
+      "drops_at_cap_4096": 0
+    },
+    "f5_sparse_attention_impl": {
+      "branch": "perf/f5-sparse-attention-029",
+      "commit": "769c8b0",
+      "status": "impl + 8 unit tests pass; bench in flight on iter 035"
+    },
+    "a1_int2_kernel": {
+      "branch": "perf/a1-int2-experts-029",
+      "commit": "ae617a6",
+      "kernel": "2.89x faster (1.722ms vs 4.977ms) + 1.80x smaller per expert",
+      "quality": "cosine 0.61, 4/4 substring at layer-30 swap; full-model needs sweep"
+    },
+    "matias_2box_revival": {
+      "branch": "infra/matias-2box-revival-029",
+      "commit": "61778ef",
+      "infra": "SSH-tunnel chain (Tailscale stayed dead), 117ms RTT, WMI-detached workers persistent",
+      "throughput": "0.0770 tok/s @ K=8 10p mt=32"
+    }
   },
   "started_at_utc": "2026-05-17T19:45:00Z",
   "last_iteration_at_utc": "2026-05-17T21:34:00Z",
