@@ -1,0 +1,4 @@
+{"prompt":"The capital of France is","substr":"paris","content":" Paris. The capital of the United States","completion_tokens":8,"wall_ms":30517,"tok_per_sec":0.2621,"quality_pass":true}
+{"prompt":"The largest ocean on Earth is the","substr":"pacific","content":" Pacific Ocean. It covers about 30","completion_tokens":8,"wall_ms":36950,"tok_per_sec":0.2165,"quality_pass":true}
+{"prompt":"Two plus two equals","substr":"four","content":" four, and the square of the square","completion_tokens":8,"wall_ms":30278,"tok_per_sec":0.2642,"quality_pass":true}
+{"aggregate":true,"total_tokens":24,"total_wall_ms":97745,"tok_per_sec":0.2455,"quality_pass":"3/3","timestamp_utc":"2026-05-18T00:02:19Z"}

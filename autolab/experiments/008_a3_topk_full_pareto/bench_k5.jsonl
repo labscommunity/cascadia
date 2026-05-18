@@ -1,0 +1,4 @@
+{"prompt":"The capital of France is","substr":"paris","content":" Paris. What is the capital of Germany","completion_tokens":8,"wall_ms":42283,"tok_per_sec":0.1892,"quality_pass":true}
+{"prompt":"The largest ocean on Earth is the","substr":"pacific","content":" Pacific Ocean. It covers about 30","completion_tokens":8,"wall_ms":58923,"tok_per_sec":0.1358,"quality_pass":true}
+{"prompt":"Two plus two equals","substr":"four","content":" four. Yes, that is correct.","completion_tokens":8,"wall_ms":53922,"tok_per_sec":0.1484,"quality_pass":true}
+{"aggregate":true,"total_tokens":24,"total_wall_ms":155128,"tok_per_sec":0.1547,"quality_pass":"3/3","timestamp_utc":"2026-05-18T00:06:59Z"}

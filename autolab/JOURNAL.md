@@ -18,6 +18,37 @@ Entry template:
 
 ---
 
+## 008 — A3 K-sweep full Pareto — K=3 NEW LEADER +208% (2026-05-17 ~19:07 PT)
+
+**Hypothesis:** Bench K=3 + K=5 to complete the Pareto curve.
+Expected K=3 in the cliff zone but possibly still passing quality.
+
+**Result: K=3 PASSES, +208% vs K=8 baseline. New leader.**
+
+Full Pareto on miner single-stage:
+| K | tok/s | Δ | Q |
+|--:|------:|--:|--|
+| 8 | 0.0797 | — | 3/3 |
+| 6 | 0.1116 | +40% | 3/3 |
+| 5 | 0.1547 | +94% | 3/3 |
+| 4 | 0.1667 | +109% | 3/3 |
+| **3** | **0.2455** | **+208%** | **3/3** |
+| 2 | 0.2716 | +241% | 2/3 cliff |
+
+Bench: `experiments/008_a3_topk_full_pareto/{bench_k3,bench_k5}.jsonl`
+Notes: `experiments/008_a3_topk_full_pareto/result.md`
+
+**K=4→K=3 is non-linear +47%.** Likely the OS page cache fits a
+higher fraction of active experts when only 3 are dispatched per
+layer — disk I/O cost drops more than proportionally.
+
+**Next (iteration 009):** Multi-prompt robustness check on K=3.
+Before recommending K=3 as production default, validate across 10+
+prompts (not just Paris/Pacific/four). 3-prompt substring eval is
+narrow; want to bound the quality risk more tightly.
+
+---
+
 ## 007 — A2 routing-threshold sweep — NEUTRAL (A3 K=4 still leader, 2026-05-17 ~18:57 PT)
 
 **Hypothesis:** Variable per-token K via sigmoid-weight threshold could
