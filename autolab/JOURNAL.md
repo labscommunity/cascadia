@@ -2,6 +2,64 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 052 — Layer-0 multi-token SIMD lift — SEAM SHIPPED, 8 projections lifted (2026-05-18 ~18:05 PT)
+
+Closes the gap iter 048 explicitly skipped. Branch
+`perf/layer0-multi-simd-052` @ `9b67ad7` (based on iter 048).
+
+**What changed:**
+- `shell_int4.rs`: promoted `dispatch_int4_multi` + `ProjShape` from
+  private to `pub(crate)` — single source of truth for shape→kernel
+  mapping
+- `layer0_int4.rs`: split `layer0_forward_decode_int4_multi_with_
+  capacity` into seq=1 fast path (delegates to existing seq=1 kernel)
+  + seq>=2 batched path. Three-phase structure:
+  - **Phase A:** batched q_a/kv_a/q_b/kv_b
+  - **Phase B:** per-token RoPE + SDPA + KV append (unchanged — these
+    are O(seq·small), not GEMV-shaped)
+  - **Phase C:** batched o_proj + gate + up + down_proj
+
+**Projections lifted (8 total):**
+
+| Projection | Shape | Route |
+|------------|-------|-------|
+| q_a_proj   | N=1536, K=7168 | Generic (iter 042) |
+| q_b_proj   | N=12288, K=1536 | Generic (iter 042) |
+| kv_a_proj  | N=576, K=7168 | Generic (iter 042) |
+| kv_b_proj  | N=16384, K=512 | Generic (iter 042) |
+| **o_proj** | N=7168, K=8192 | **Oproj (iter 046 row-blocked at seq>=4)** |
+| gate_proj  | N=18432, K=7168 | Generic (iter 042) |
+| up_proj    | N=18432, K=7168 | Generic (iter 042) |
+| **down_proj** | N=7168, K=18432 | **Oproj (iter 046 row-blocked at seq>=4)** |
+
+**Stays on seq=1 path:** embedding lookup (bf16 row gather, not
+GEMV), RMSNorm, RoPE, SDPA, SwiGLU (already O(seq·small)).
+
+**Tests:** 5/5 layer-0 tests pass:
+- `multi_layer0_seq_1_matches_seq_1_reference` (regression guard)
+- `multi_layer0_seq_3_matches_sequential_seq_1_calls`
+- `multi_layer0_batched_matches_scalar_seq_4_iter048_dispatch`
+  (NEW — seq=4 with pre-seeded KV; iter 046 row-blocking on o_proj
+  + down_proj)
+- `multi_layer0_batched_matches_scalar_seq_8_iter048_dispatch`
+  (NEW — seq=8 iter 046 sweet spot)
+- `embed_token_bf16_decodes_one_row`
+
+Bit-identity via `assert_eq!` (no fp tolerance needed — iter 042 +
+iter 046 + scalar are bit-identical per cell, same FMA order).
+
+**Workspace:** 25/25 int4-gemm tests pass, no new clippy warnings,
+fmt clean, build clean.
+
+**Expected speedup (theoretical, no miner bench):** per iter 042 +
+iter 046 carry-through, **layer-0 contribution to spec-decode verify
+round drops from K× sequential weight loads to ~1× batched.** At
+K=4, ~245ms recovery per round (~75% of the ~325ms layer-0 spec-
+decode cost at iter 003 baseline). Compounds with iter 048 (shells)
+and iter 051 (expert batching) for the full spec-decode stack.
+
+---
+
 ## 053 — Fused RMSNorm + QKV — NEGATIVE RESULT (decisive cost analysis) (2026-05-18 ~17:55 PT)
 
 Honest negative via path (C) investigation. Branch
