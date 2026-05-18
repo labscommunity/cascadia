@@ -131,6 +131,17 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Cap per-token attention at the most recent W past tokens
+    /// (sparse-moe engine only). 0 = disabled (full causal attention,
+    /// the default and the only path used by every released eval).
+    /// Typical chat values: 256 / 512 / 1024. Lower = faster at long
+    /// context, more quality loss on long-range dependencies. K2.6
+    /// has no per-layer windowed-attention type, so the cap is
+    /// uniform; expect quality cliffs on long-doc reasoning at small
+    /// W. See autolab F5 (iter 029).
+    #[arg(long, default_value_t = 0)]
+    pub attention_window: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -320,6 +331,11 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 .with_rank(args.rank, args.total);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
+            }
+            // autolab F5 (iter 029): 0 means "off" so the engine sees
+            // None (full causal). Any positive value is the cap.
+            if args.attention_window > 0 {
+                cfg.attention_window = Some(args.attention_window as usize);
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }

@@ -249,6 +249,39 @@ pub fn shell_forward_decode_int4_with_capacity(
     past_seq_len: usize,
     capacity: usize,
 ) -> ShellOutputs {
+    shell_forward_decode_int4_windowed(shell, x_f32, past_k, past_v, past_seq_len, capacity, None)
+}
+
+/// Same as [`shell_forward_decode_int4_with_capacity`] but with an optional
+/// sliding-window cap on attention reach. When `window = Some(W)`, the
+/// query at position `past_seq_len` attends only to past slots
+/// `j` in `[past_seq_len - W, past_seq_len]` (the new token always
+/// stays in scope; only old slots beyond W are masked to -inf and
+/// effectively skipped).
+///
+/// This is the rainier export-time mask
+/// (`scripts/export_gemma4_e2b_shards.py:130-136`,
+/// `triu(diagonal=0).tril(diagonal=-(window+1))`) but specialised
+/// for the seq=1 decode path: instead of building an explicit
+/// `-inf` mask, the QK^T and V accumulation loops just start at
+/// `j_start = past_seq_len.saturating_sub(W)`, so masked-out slots
+/// pay no compute. With `window = None`, the loop ranges are
+/// identical to the back-compat path above (full causal attention).
+///
+/// Quality tradeoff: K2.6 has no per-layer windowed-attention type
+/// (unlike Gemma's mixed full/sliding stack), so this is uniformly
+/// lossy on long-range dependencies. For chat workloads with
+/// short effective context (typical W=256-512), the cost is small;
+/// for long-doc reasoning, expect degradation. Off by default.
+pub fn shell_forward_decode_int4_windowed(
+    shell: &Int4Shell,
+    x_f32: &[f32],
+    past_k: &[f32],
+    past_v: &[f32],
+    past_seq_len: usize,
+    capacity: usize,
+    window: Option<usize>,
+) -> ShellOutputs {
     // Reuse the shell.rs forward but swap bf16_gemv_auto -> dequant_gemv_int4_auto.
     // Easiest: copy the body and adapt. (Generic functions over a trait would
     // be cleaner but pure functions are fine here.)
@@ -336,10 +369,15 @@ pub fn shell_forward_decode_int4_with_capacity(
         new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
     }
 
-    // SDPA
+    // SDPA. With a sliding window of W tokens, the query attends to
+    // past slots [j_start..past_seq_len] plus the new token. j_start =
+    // past_seq_len - W when W is set and W < past_seq_len; otherwise
+    // j_start = 0 (full causal attention, the back-compat path).
     let scale = 1.0f32 / (QK_HEAD_DIM as f32).sqrt();
     let mut attn_out = vec![0.0f32; NUM_HEADS * V_HEAD_DIM];
-    let kv_len = past_seq_len + 1;
+    let j_start = windowed_attention_j_start(past_seq_len, window);
+    let attended_past = past_seq_len - j_start;
+    let kv_len = attended_past + 1;
     for h in 0..NUM_HEADS {
         let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
         // Slice with `capacity` as the per-head stride, then take only
@@ -355,19 +393,19 @@ pub fn shell_forward_decode_int4_with_capacity(
         let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
 
         let mut scores = vec![0.0f32; kv_len];
-        for j in 0..past_seq_len {
+        for j in j_start..past_seq_len {
             let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
             let mut s = 0.0f32;
             for i in 0..QK_HEAD_DIM {
                 s += q_h[i] * k_row[i];
             }
-            scores[j] = s * scale;
+            scores[j - j_start] = s * scale;
         }
         let mut s = 0.0f32;
         for i in 0..QK_HEAD_DIM {
             s += q_h[i] * new_k_h[i];
         }
-        scores[past_seq_len] = s * scale;
+        scores[attended_past] = s * scale;
         let mut max_s = scores[0];
         for &v in scores.iter().skip(1) {
             if v > max_s {
@@ -385,14 +423,14 @@ pub fn shell_forward_decode_int4_with_capacity(
         }
         let out_h = &mut attn_out[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
         out_h.fill(0.0);
-        for j in 0..past_seq_len {
+        for j in j_start..past_seq_len {
             let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
-            let w = scores[j];
+            let w = scores[j - j_start];
             for i in 0..V_HEAD_DIM {
                 out_h[i] += w * v_row[i];
             }
         }
-        let w = scores[past_seq_len];
+        let w = scores[attended_past];
         for i in 0..V_HEAD_DIM {
             out_h[i] += w * new_v_h[i];
         }
@@ -494,4 +532,427 @@ pub fn shell_forward_decode_int4_with_capacity(
 /// Re-export the bf16-weight RMSNorm (shell.rs's rmsnorm_apply) for use here.
 fn rmsnorm_apply(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
     shell::rmsnorm_apply_pub(x, weight_bf16, dim)
+}
+
+/// Compute the j_start index for the sliding-window SDPA loop.
+///
+/// This is the single point of truth for which past tokens the
+/// production SDPA hot path attends to: every loop body in
+/// `shell_forward_decode_int4_windowed` and
+/// `layer0_forward_decode_int4_windowed` starts at `j_start` returned
+/// here. Lifted out so the math is unit-testable without instantiating
+/// real Int4Shell weights.
+///
+/// - `window = None` (full causal): returns 0, the existing back-compat
+///   path. Every populated past slot is attended.
+/// - `window = Some(w)` with `w >= past_seq_len`: also returns 0; the
+///   window is wider than the cache, so it's a no-op.
+/// - `window = Some(w)` with `w < past_seq_len`: returns
+///   `past_seq_len - w`, so the loop body skips slots
+///   `[0..past_seq_len - w)` and pays no compute for them.
+///
+/// The current step's new token (at position `past_seq_len`) is
+/// always attended — that's handled as the `attended_past` slot
+/// outside this helper.
+#[inline]
+pub fn windowed_attention_j_start(past_seq_len: usize, window: Option<usize>) -> usize {
+    match window {
+        Some(w) if w < past_seq_len => past_seq_len - w,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod windowed_attention_tests {
+    use super::*;
+
+    // ---- j_start arithmetic ---------------------------------------------
+
+    #[test]
+    fn j_start_none_is_zero() {
+        assert_eq!(windowed_attention_j_start(0, None), 0);
+        assert_eq!(windowed_attention_j_start(1, None), 0);
+        assert_eq!(windowed_attention_j_start(128, None), 0);
+        assert_eq!(windowed_attention_j_start(10_000, None), 0);
+    }
+
+    #[test]
+    fn j_start_window_wider_than_cache_is_zero() {
+        // window >= past_seq_len -> attend everything (no-op cap).
+        assert_eq!(windowed_attention_j_start(0, Some(64)), 0);
+        assert_eq!(windowed_attention_j_start(1, Some(64)), 0);
+        assert_eq!(windowed_attention_j_start(63, Some(64)), 0);
+        assert_eq!(windowed_attention_j_start(64, Some(64)), 0);
+    }
+
+    #[test]
+    fn j_start_window_narrower_than_cache_slides() {
+        // window < past_seq_len -> j_start = past_seq_len - window.
+        assert_eq!(windowed_attention_j_start(65, Some(64)), 1);
+        assert_eq!(windowed_attention_j_start(128, Some(64)), 64);
+        assert_eq!(windowed_attention_j_start(1024, Some(256)), 768);
+    }
+
+    #[test]
+    fn j_start_window_one_keeps_only_previous_token() {
+        // W=1 means "the new token only attends to the prior past
+        // token plus itself", giving attended_past = 1 plus the new
+        // slot = kv_len = 2.
+        let past_seq_len = 100;
+        let js = windowed_attention_j_start(past_seq_len, Some(1));
+        assert_eq!(js, 99);
+        assert_eq!(past_seq_len - js, 1); // 1 past slot attended
+    }
+
+    // ---- Tiny SDPA reference for end-to-end validation ------------------
+    //
+    // Mirrors the loop body in shell_forward_decode_int4_windowed but
+    // operates on a single head with arbitrary D / V dims. Lets us
+    // verify (a) that window=None matches a no-mask reference and
+    // (b) that window=W ignores rows with j < past_seq_len - W in
+    // both the QK^T and the V accumulation.
+
+    #[allow(clippy::too_many_arguments)]
+    fn ref_sdpa_one_head(
+        q: &[f32],
+        past_k: &[f32],
+        past_v: &[f32],
+        new_k: &[f32],
+        new_v: &[f32],
+        past_seq_len: usize,
+        qk_dim: usize,
+        v_dim: usize,
+        window: Option<usize>,
+    ) -> Vec<f32> {
+        assert_eq!(q.len(), qk_dim);
+        assert_eq!(past_k.len(), past_seq_len * qk_dim);
+        assert_eq!(past_v.len(), past_seq_len * v_dim);
+        assert_eq!(new_k.len(), qk_dim);
+        assert_eq!(new_v.len(), v_dim);
+
+        let scale = 1.0f32 / (qk_dim as f32).sqrt();
+        let j_start = windowed_attention_j_start(past_seq_len, window);
+        let attended_past = past_seq_len - j_start;
+        let mut scores = vec![0.0f32; attended_past + 1];
+        for j in j_start..past_seq_len {
+            let k_row = &past_k[j * qk_dim..(j + 1) * qk_dim];
+            let s: f32 = (0..qk_dim).map(|i| q[i] * k_row[i]).sum();
+            scores[j - j_start] = s * scale;
+        }
+        let s: f32 = (0..qk_dim).map(|i| q[i] * new_k[i]).sum();
+        scores[attended_past] = s * scale;
+
+        let max_s = scores.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum_e = 0.0f32;
+        for v in scores.iter_mut() {
+            *v = (*v - max_s).exp();
+            sum_e += *v;
+        }
+        let inv = 1.0 / sum_e;
+        for v in scores.iter_mut() {
+            *v *= inv;
+        }
+
+        let mut out = vec![0.0f32; v_dim];
+        for j in j_start..past_seq_len {
+            let v_row = &past_v[j * v_dim..(j + 1) * v_dim];
+            let w = scores[j - j_start];
+            for i in 0..v_dim {
+                out[i] += w * v_row[i];
+            }
+        }
+        let w = scores[attended_past];
+        for i in 0..v_dim {
+            out[i] += w * new_v[i];
+        }
+        out
+    }
+
+    /// Pure baseline: no-mask SDPA over (past_k + new_k_v). Equivalent
+    /// to `ref_sdpa_one_head` with window=None; used to confirm the
+    /// `window=None` branch is bit-identical to a no-mask reference.
+    #[allow(clippy::too_many_arguments)]
+    fn no_mask_sdpa_one_head(
+        q: &[f32],
+        past_k: &[f32],
+        past_v: &[f32],
+        new_k: &[f32],
+        new_v: &[f32],
+        past_seq_len: usize,
+        qk_dim: usize,
+        v_dim: usize,
+    ) -> Vec<f32> {
+        let scale = 1.0f32 / (qk_dim as f32).sqrt();
+        let mut scores = vec![0.0f32; past_seq_len + 1];
+        for j in 0..past_seq_len {
+            let k_row = &past_k[j * qk_dim..(j + 1) * qk_dim];
+            let s: f32 = (0..qk_dim).map(|i| q[i] * k_row[i]).sum();
+            scores[j] = s * scale;
+        }
+        let s: f32 = (0..qk_dim).map(|i| q[i] * new_k[i]).sum();
+        scores[past_seq_len] = s * scale;
+
+        let max_s = scores.iter().cloned().fold(f32::MIN, f32::max);
+        let mut sum_e = 0.0f32;
+        for v in scores.iter_mut() {
+            *v = (*v - max_s).exp();
+            sum_e += *v;
+        }
+        let inv = 1.0 / sum_e;
+        for v in scores.iter_mut() {
+            *v *= inv;
+        }
+
+        let mut out = vec![0.0f32; v_dim];
+        for j in 0..past_seq_len {
+            let v_row = &past_v[j * v_dim..(j + 1) * v_dim];
+            let w = scores[j];
+            for i in 0..v_dim {
+                out[i] += w * v_row[i];
+            }
+        }
+        let w = scores[past_seq_len];
+        for i in 0..v_dim {
+            out[i] += w * new_v[i];
+        }
+        out
+    }
+
+    fn lcg_rand(seed: &mut u64) -> f32 {
+        // Reproducible PRNG so tests are deterministic across hosts.
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bits = ((*seed >> 32) as u32) & 0x00FF_FFFF;
+        bits as f32 / 16_777_216.0 - 0.5
+    }
+
+    fn fill_random(buf: &mut [f32], seed: &mut u64) {
+        for v in buf.iter_mut() {
+            *v = lcg_rand(seed);
+        }
+    }
+
+    #[test]
+    fn window_none_matches_no_mask_reference() {
+        // Mini head: qk=8, v=8, 32 past tokens. window=None should be
+        // bit-identical to a no-mask SDPA over the same buffers.
+        let past_seq_len = 32;
+        let qk_dim = 8;
+        let v_dim = 8;
+        let mut seed = 0xC0FFEE_DECADE_u64;
+        let mut q = vec![0.0f32; qk_dim];
+        let mut past_k = vec![0.0f32; past_seq_len * qk_dim];
+        let mut past_v = vec![0.0f32; past_seq_len * v_dim];
+        let mut new_k = vec![0.0f32; qk_dim];
+        let mut new_v = vec![0.0f32; v_dim];
+        fill_random(&mut q, &mut seed);
+        fill_random(&mut past_k, &mut seed);
+        fill_random(&mut past_v, &mut seed);
+        fill_random(&mut new_k, &mut seed);
+        fill_random(&mut new_v, &mut seed);
+
+        let with_none = ref_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+            None,
+        );
+        let no_mask = no_mask_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+        );
+        for (a, b) in with_none.iter().zip(no_mask.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b} (drift)");
+        }
+    }
+
+    #[test]
+    fn window_wider_than_cache_matches_no_mask() {
+        // window = past_seq_len => no-op cap. Same expectation as None.
+        let past_seq_len = 16;
+        let qk_dim = 4;
+        let v_dim = 4;
+        let mut seed = 0xBEEF_F00D_u64;
+        let mut q = vec![0.0f32; qk_dim];
+        let mut past_k = vec![0.0f32; past_seq_len * qk_dim];
+        let mut past_v = vec![0.0f32; past_seq_len * v_dim];
+        let mut new_k = vec![0.0f32; qk_dim];
+        let mut new_v = vec![0.0f32; v_dim];
+        fill_random(&mut q, &mut seed);
+        fill_random(&mut past_k, &mut seed);
+        fill_random(&mut past_v, &mut seed);
+        fill_random(&mut new_k, &mut seed);
+        fill_random(&mut new_v, &mut seed);
+
+        let with_window = ref_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+            Some(past_seq_len),
+        );
+        let no_mask = no_mask_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+        );
+        for (a, b) in with_window.iter().zip(no_mask.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn window_ignores_pre_window_slots() {
+        // Build past_k / past_v with two halves: the first half is
+        // garbage values (very large magnitudes), the second half is
+        // tiny values. With W = second-half size, the windowed output
+        // must match a reference computed over only the second half +
+        // new_k_v — the garbage prefix should be invisible.
+        let past_seq_len = 16;
+        let window = 8;
+        let qk_dim = 4;
+        let v_dim = 4;
+        let mut seed = 0x1234_5678_u64;
+        let mut q = vec![0.0f32; qk_dim];
+        let mut past_k = vec![0.0f32; past_seq_len * qk_dim];
+        let mut past_v = vec![0.0f32; past_seq_len * v_dim];
+        let mut new_k = vec![0.0f32; qk_dim];
+        let mut new_v = vec![0.0f32; v_dim];
+        fill_random(&mut q, &mut seed);
+        fill_random(&mut new_k, &mut seed);
+        fill_random(&mut new_v, &mut seed);
+        // First 8 slots = garbage huge values that WOULD dominate
+        // softmax if attended.
+        for j in 0..(past_seq_len - window) {
+            for i in 0..qk_dim {
+                past_k[j * qk_dim + i] = 1e6;
+            }
+            for i in 0..v_dim {
+                past_v[j * v_dim + i] = 1e6;
+            }
+        }
+        // Last 8 slots = sensible small random values.
+        for j in (past_seq_len - window)..past_seq_len {
+            for i in 0..qk_dim {
+                past_k[j * qk_dim + i] = lcg_rand(&mut seed);
+            }
+            for i in 0..v_dim {
+                past_v[j * v_dim + i] = lcg_rand(&mut seed);
+            }
+        }
+
+        let windowed = ref_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+            Some(window),
+        );
+
+        // Reference: re-pack only the last 8 slots into a fresh buffer,
+        // run no-mask SDPA over (8 past + new).
+        let mut ref_past_k = vec![0.0f32; window * qk_dim];
+        let mut ref_past_v = vec![0.0f32; window * v_dim];
+        let off_k = (past_seq_len - window) * qk_dim;
+        let off_v = (past_seq_len - window) * v_dim;
+        ref_past_k.copy_from_slice(&past_k[off_k..off_k + window * qk_dim]);
+        ref_past_v.copy_from_slice(&past_v[off_v..off_v + window * v_dim]);
+        let no_mask = no_mask_sdpa_one_head(
+            &q,
+            &ref_past_k,
+            &ref_past_v,
+            &new_k,
+            &new_v,
+            window,
+            qk_dim,
+            v_dim,
+        );
+
+        for (a, b) in windowed.iter().zip(no_mask.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "{a} != {b} (garbage leaked through window)"
+            );
+        }
+
+        // Sanity: with window=None and a positive q, the output must
+        // be DOMINATED by the 1e6 V garbage (scores against the 1e6 K
+        // prefix saturate the softmax). Use a deterministic positive q
+        // for this branch so the dot products are large + same-sign.
+        let q_pos = vec![1.0f32; qk_dim];
+        let full = ref_sdpa_one_head(
+            &q_pos,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+            None,
+        );
+        let garbage_min = full.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            garbage_min > 1e3,
+            "expected garbage prefix to dominate no-window output, got min={garbage_min}"
+        );
+    }
+
+    #[test]
+    fn window_zero_is_degenerate_identity_on_new_only() {
+        // window=0 means "attend only to the new token". The output
+        // must equal new_v exactly (single-element softmax = 1.0).
+        let past_seq_len = 8;
+        let qk_dim = 4;
+        let v_dim = 4;
+        let mut seed = 0xA5A5_5A5A_u64;
+        let mut q = vec![0.0f32; qk_dim];
+        let mut past_k = vec![0.0f32; past_seq_len * qk_dim];
+        let mut past_v = vec![0.0f32; past_seq_len * v_dim];
+        let mut new_k = vec![0.0f32; qk_dim];
+        let mut new_v = vec![0.0f32; v_dim];
+        fill_random(&mut q, &mut seed);
+        fill_random(&mut past_k, &mut seed);
+        fill_random(&mut past_v, &mut seed);
+        fill_random(&mut new_k, &mut seed);
+        fill_random(&mut new_v, &mut seed);
+
+        let out = ref_sdpa_one_head(
+            &q,
+            &past_k,
+            &past_v,
+            &new_k,
+            &new_v,
+            past_seq_len,
+            qk_dim,
+            v_dim,
+            Some(0),
+        );
+        for (a, b) in out.iter().zip(new_v.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} != {b}");
+        }
+    }
 }

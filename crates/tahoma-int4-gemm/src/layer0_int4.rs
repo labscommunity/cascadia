@@ -169,6 +169,24 @@ pub fn layer0_forward_decode_int4_with_capacity(
     past_seq_len: usize,
     capacity: usize,
 ) -> Layer0Outputs {
+    layer0_forward_decode_int4_windowed(layer, x_f32, past_k, past_v, past_seq_len, capacity, None)
+}
+
+/// Same as [`layer0_forward_decode_int4_with_capacity`] but with an
+/// optional sliding-window cap on attention reach. See the docstring
+/// on [`crate::shell_int4::shell_forward_decode_int4_windowed`] for the
+/// semantics — this is the same masking strategy applied to the dense
+/// layer 0. With `window = None` the loops match the back-compat
+/// path exactly.
+pub fn layer0_forward_decode_int4_windowed(
+    layer: &Int4Layer0,
+    x_f32: &[f32],
+    past_k: &[f32],
+    past_v: &[f32],
+    past_seq_len: usize,
+    capacity: usize,
+    window: Option<usize>,
+) -> Layer0Outputs {
     assert_eq!(x_f32.len(), HIDDEN);
     assert!(
         capacity >= past_seq_len,
@@ -250,7 +268,9 @@ pub fn layer0_forward_decode_int4_with_capacity(
 
     let scale = 1.0f32 / (QK_HEAD_DIM as f32).sqrt();
     let mut attn_out = vec![0.0f32; NUM_HEADS * V_HEAD_DIM];
-    let kv_len = past_seq_len + 1;
+    let j_start = crate::shell_int4::windowed_attention_j_start(past_seq_len, window);
+    let attended_past = past_seq_len - j_start;
+    let kv_len = attended_past + 1;
     for h in 0..NUM_HEADS {
         let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
         let pk_base = h * capacity * QK_HEAD_DIM;
@@ -261,19 +281,19 @@ pub fn layer0_forward_decode_int4_with_capacity(
         let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
 
         let mut scores = vec![0.0f32; kv_len];
-        for j in 0..past_seq_len {
+        for j in j_start..past_seq_len {
             let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
             let mut s = 0.0f32;
             for i in 0..QK_HEAD_DIM {
                 s += q_h[i] * k_row[i];
             }
-            scores[j] = s * scale;
+            scores[j - j_start] = s * scale;
         }
         let mut s = 0.0f32;
         for i in 0..QK_HEAD_DIM {
             s += q_h[i] * new_k_h[i];
         }
-        scores[past_seq_len] = s * scale;
+        scores[attended_past] = s * scale;
         let mut max_s = scores[0];
         for &v in scores.iter().skip(1) {
             if v > max_s {
@@ -291,14 +311,14 @@ pub fn layer0_forward_decode_int4_with_capacity(
         }
         let out_h = &mut attn_out[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
         out_h.fill(0.0);
-        for j in 0..past_seq_len {
+        for j in j_start..past_seq_len {
             let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
-            let w = scores[j];
+            let w = scores[j - j_start];
             for i in 0..V_HEAD_DIM {
                 out_h[i] += w * v_row[i];
             }
         }
-        let w = scores[past_seq_len];
+        let w = scores[attended_past];
         for i in 0..V_HEAD_DIM {
             out_h[i] += w * new_v_h[i];
         }

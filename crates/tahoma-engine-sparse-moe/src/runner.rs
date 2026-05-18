@@ -15,11 +15,11 @@ use std::time::Instant;
 
 use half::bf16;
 use tahoma_int4_gemm::layer0_int4::{
-    embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
+    embed_token_bf16, layer0_forward_decode_int4_windowed, Int4Layer0,
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
+use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_windowed, Int4Shell};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -217,6 +217,12 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// autolab F5 (iter 029): sliding-window attention cap. When
+    /// `Some(w)`, every per-token shell + layer-0 attention call only
+    /// attends to the most-recent `w` past tokens plus the current
+    /// step. `None` (default) is full causal attention. Set from CLI
+    /// `--attention-window`; plumbed through every forward call.
+    attention_window: Option<usize>,
 }
 
 impl Runner {
@@ -392,7 +398,27 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            attention_window: None,
         })
+    }
+
+    /// Set the per-token attention window. None = full causal attention
+    /// (default; matches every shipped commit before iter 029 / F5).
+    /// `Some(w)` caps every shell + layer-0 SDPA to attend only to the
+    /// most recent `w` past tokens plus the current step.
+    ///
+    /// Plumbed from `--attention-window` on the CLI. The cap is global —
+    /// applied uniformly to every layer's attention, not per-layer like
+    /// Gemma3's mixed full/sliding stack. K2.6 doesn't have a per-layer
+    /// `attention_type`, so we don't try to mix.
+    ///
+    /// Values >= current past_seq_len are silently no-ops on a given
+    /// step (the window is wider than the cache). Values of 0 are
+    /// rejected by the CLI but accepted here as "attend only to the
+    /// new token" which is the degenerate identity attention.
+    pub fn set_attention_window(&mut self, window: Option<usize>) {
+        self.attention_window = window;
+        info!(attention_window = ?window, "set_attention_window");
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -537,13 +563,14 @@ impl Runner {
         let capacity = l0.kv_capacity;
         let past_seq_len = l0.past_seq_len;
 
-        let outs = layer0_forward_decode_int4_with_capacity(
+        let outs = layer0_forward_decode_int4_windowed(
             &l0.int4_layer0,
             &x_f32,
             &l0.past_k,
             &l0.past_v,
             past_seq_len,
             capacity,
+            self.attention_window,
         );
 
         write_present_kv(
@@ -613,16 +640,19 @@ impl Runner {
 
             // Run Rust shell forward — same int4 kernel rainier's eval
             // used via the cdylib, just called directly since we're in
-            // the same Cargo workspace. The `_with_capacity` variant
-            // lets us pass a pre-allocated [H, capacity, D] buffer
-            // with only the first `past_seq_len` slots populated.
-            let outs = shell_forward_decode_int4_with_capacity(
+            // the same Cargo workspace. The `_windowed` variant lets us
+            // pass a pre-allocated [H, capacity, D] buffer with only
+            // the first `past_seq_len` slots populated; `window`
+            // delegates to full causal attention when None, otherwise
+            // skips compute for KV slots older than `past_seq_len - W`.
+            let outs = shell_forward_decode_int4_windowed(
                 &self.layers[i].int4_shell,
                 &h_f32,
                 &self.layers[i].past_k,
                 &self.layers[i].past_v,
                 past_seq_len,
                 capacity,
+                self.attention_window,
             );
 
             // Write present_k / present_v into the existing capacity

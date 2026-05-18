@@ -42,6 +42,13 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// autolab F5 (iter 029): per-token sliding-window attention cap.
+    /// `Some(w)` => every shell + layer-0 SDPA attends only to the
+    /// most-recent `w` past tokens. `None` => full causal attention
+    /// (default; preserves shipped behavior). Set from CLI
+    /// `--attention-window`; reads as 0 -> None to match the
+    /// "off by default" convention used by `--top-k-override`.
+    pub attention_window: Option<usize>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,6 +60,7 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            attention_window: None,
         }
     }
 
@@ -219,7 +227,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +236,9 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        // autolab F5 (iter 029): cap shell + layer-0 attention at the
+        // configured sliding window. Setter is a no-op when None.
+        runner.set_attention_window(self.config.attention_window);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
