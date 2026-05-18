@@ -18,6 +18,35 @@ Entry template:
 
 ---
 
+## 010 — F4 rayon-over-heads — NEUTRAL on miner (2026-05-17 ~20:29 PT)
+
+**Hypothesis:** Parallel per-head SDPA (rayon over 64 heads on 24-core
+Xeon Gold) cuts attention bucket from 14.5% → ~1.2%; expect +10-13%
+end-to-end throughput.
+
+**Result: -2.7% (neutral, within bench noise).** Same quality 9/10.
+
+Why miner doesn't show F4 win:
+1. I/O-bound (cold expert pages dominate) — compute reduction in
+   attention bucket doesn't move the bottleneck.
+2. 24 cores already saturated by expert dispatch on cold pages —
+   no spare cores for parallel attention.
+3. Per-head work ~0.4ms is small enough that rayon's task spawning
+   (~10us × 64 = 640us) eats the gain.
+
+Patch kept on branch (5 LOC, composes cleanly, no quality regression)
+in case future infra changes (compute-bound 2-box matias, faster
+storage) flip the verdict.
+
+Bench: `experiments/010_f4_rayon_heads/bench_k4_f4_10p.jsonl`
+Notes: `experiments/010_f4_rayon_heads/result.md`
+
+**Next (iteration 011):** A8 KV cache bf16 (currently f32). Halves
+KV memory + halves KV bandwidth read during attention. Different
+bucket from A3 and F4. ~50 LOC in shell_int4.rs.
+
+---
+
 ## 009 — A3 10-prompt robustness — K=4 is the real leader (2026-05-17 ~20:08 PT)
 
 **Hypothesis:** K=3 (iter 008 leader on 3-prompt eval) holds at 9-10/10 on a broader 10-prompt set.
