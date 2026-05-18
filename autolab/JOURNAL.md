@@ -2,16 +2,67 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
-## 041 — Multi-token int4 shell kernel (in flight) (2026-05-18 ~15:00 PT)
+## 041 — Multi-token int4 shell kernel — SEAM SHIPPED (B), real win still pending SIMD (2026-05-18 ~15:08 PT)
 
-Keystone moonshot — extending the seq=1 int4 kernel to seq>1 (multi-
-token forward). This unlocks REAL wins from spec-decode (iter 036),
-chunked prefill (iter 040), and continuous batching. All prior agents
-identified this as the bottleneck.
+Keystone moonshot **API seam done**, perf win pending. Branch
+`perf/int4-multi-token-041` @ `d9512c1`. Delivered (B): skeleton +
+bit-identity tests, internal scalar loop (functionally equivalent to
+today).
 
-Agent running in background; deliverable scoped (A) working kernel,
-(B) skeleton + bit-identity tests, or (C) plan + scaffolding — honest
-about which.
+**What shipped:**
+- `shell_int4::shell_forward_decode_int4_multi_with_capacity(shell,
+  xs_f32, &mut past_k, &mut past_v, past_seq_len, capacity, seq)
+  -> MultiShellOutputs` (+412 LOC)
+- `layer0_int4::layer0_forward_decode_int4_multi_with_capacity(layer,
+  xs_f32, &mut past_k, &mut past_v, past_seq_len, capacity, seq)
+  -> MultiLayer0Outputs` (+289 LOC)
+- Both internally loop seq times over existing seq=1 entry point,
+  writing present_k/present_v into caller's pre-allocated KV between
+  iterations so each token attends to predecessors
+- Outputs concatenated per-token: `attn_out_post_norm`, `attn_
+  residual`, `shared_expert_out` shape `[seq, HIDDEN]`; `routing_
+  ids` / `routing_weights` shape `[seq, TOPK]`; `hidden_out` for
+  layer-0
+- seq=1 entry points UNCHANGED — today's hot path byte-identical
+
+**Tests (all 4 pass with `assert_eq!`):**
+- `shell_int4::tests::multi_seq_1_matches_seq_1_reference`
+- `shell_int4::tests::multi_seq_3_matches_sequential_seq_1_calls`
+- `layer0_int4::tests::multi_layer0_seq_1_matches_seq_1_reference`
+- `layer0_int4::tests::multi_layer0_seq_3_matches_sequential_seq_1_
+  calls`
+
+seq=3 tests pre-seed `past_seq_len=2` with non-zero history to
+exercise the populated-history path. fmt + clippy clean.
+
+**Honest: NOT a perf win.** Same scalar GEMV iteration; same memory
+motion; same int4 dequant count.
+
+**Real win unlocks via three follow-ups (now all plug into this
+seam):**
+1. **Native tiled GEMM across seq** — replace internal scalar loop
+   with `[seq, K] × [K, N]` GEMMs. AVX-VNNI / AMX. Memory motion
+   drops from `seq × W` to `~W` for the dominant 1536/512/7168
+   projection weights. **Est: 1-2 weeks of SIMD work**.
+2. **Caller adoption** — `runner.rs:619` currently loops `_with_
+   capacity` per token in chunked-prefill / spec-decode scenarios.
+   After SIMD #1 lands, switching to single `_multi(seq=N)` captures
+   the win. Today switching is safe but neutral.
+3. **Native multi-token attention** — token-batched Q·Kᵀ then
+   softmax then ·V across `seq` query rows simultaneously. **Est:
+   3-5 days.**
+
+**This is the keystone seam.** With this in place:
+- iter 036 spec-decode skeleton + iter 039 ForwardBatch(K) wire +
+  this seam = full pipeline-parallel spec-decode path. ONLY needs
+  the SIMD GEMM (#1) to translate into measured tok/s.
+- iter 040 chunked prefill seam + this seam = chunked-prefill
+  unblocked too.
+- Continuous batching becomes possible once seq>1 kernels are real.
+
+---
+
+## 039 — ForwardBatch(K) wire frame for spec-decode — WIRE BATCHING DONE + bug discovered (2026-05-18 ~14:55 PT)
 
 ---
 
