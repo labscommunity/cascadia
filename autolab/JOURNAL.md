@@ -18,6 +18,40 @@ Entry template:
 
 ---
 
+## 013 — K=4 vs K=8 apples-to-apples at mt=64 — K=4 +210% faster, equal-or-better quality (2026-05-17 ~22:01 PT)
+
+**Hypothesis:** Direct K=4 vs K=8 comparison at long context (max_tokens=64)
+to tighten the productionization recommendation.
+
+**Result: STRONG WIN.** K=4 is +210% faster AND slightly higher
+quality (9/10 vs 8/10) at long context.
+
+| Config | tok/s | quality | wall (s) |
+|--------|------:|---------|---------:|
+| K=4 mt=64 (iter 011) | **0.3253** | **9/10** | 1968 |
+| K=8 mt=64 (this iter) | 0.1048 | 8/10 | 5498 |
+| Δ | +210% | +1 prompt | 2.8× faster |
+
+K=8 dropped from 9/10 (mt=16, iter 009) to 8/10 (mt=64) — at long
+context the K=8 model goes off-task more (e.g., "km" prompt → math
+derivation instead of direct answer). K=4 is more consistent on the
+substring eval at long context — possibly because the smaller expert
+budget sharpens the output distribution.
+
+**Spinout PR-ready:** add `--top-k-override` flag (commits db85e74 +
+fe31d7c + f37100b) + docs/A3_TOPK_REDUCTION.md. Default unchanged
+(opt-in flag, manifest top_k = 8 = current behavior).
+
+Bench: `experiments/013_a3_k4_vs_k8_longcontext/bench_k8_mt64.jsonl`
+Notes: `experiments/013_a3_k4_vs_k8_longcontext/result.md`
+
+**Next (iteration 014):** Diversify away from A3. Most-promising
+non-A3 directions on miner: A8 KV bf16 (real code change, attacks
+attention BW). Or — open the K=4 spinout PR to main as a parallel
+workstream.
+
+---
+
 ## 012 — A3 K=4 code-prompt robustness — 4/5 pass (2026-05-17 ~21:30 PT)
 
 **Hypothesis:** K=4 quality (so far validated on factual prompts) holds on
