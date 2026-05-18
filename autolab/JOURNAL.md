@@ -2,6 +2,42 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 021 — K=6 mt=64 = 10/10 PERFECT QUALITY (strictly beats K=8) (2026-05-18 ~04:50 PT)
+
+**Hypothesis:** K=6 quality holds at long context (mt=64).
+
+**Result: K=6 mt=64 = PERFECT 10/10 quality at 0.1587 tok/s.** K=6 is
+strictly Pareto-dominant vs K=8 at long context.
+
+Long-context comparison:
+| K | tok/s | quality | Notes |
+|--:|------:|---------|-------|
+| 8 | 0.1048 | 8/10 | baseline |
+| **6** | **0.1587** | **10/10** | **strictly dominates K=8** (+51% tps, +2 quality) |
+| 4 | 0.3253 | 9/10 | fastest, slightly lower quality |
+
+K=6 even passes the "km" prompt that K=8 and K=4 both failed (gave
+"300,000 km/s. A light-year is the distance that light travels...").
+The model is more thoughtful + on-topic at K=6 long-context than K=8.
+
+**Updated production recommendation:**
+- For long-context chat (typical): **K=6** — strictly Pareto-best
+  (faster AND higher quality than K=8)
+- For maximum throughput with temp=0 / greedy: **K=4** — +210%
+  throughput, 9/10 quality
+- For high-temperature workloads: **K=6** (same as long-context default)
+
+Wait — K=6 is essentially the universal best default. K=4 only wins
+when temp ≤ 0.3 AND output is short (where prefill amortization makes
+K=4's faster decode more impactful).
+
+Bench: `experiments/021_k6_longcontext/bench_k6_mt64.jsonl`
+
+**Updating PR #29:** K=6 should be the default recommendation, with
+K=4 reserved for short-output low-temp throughput-critical workloads.
+
+---
+
 ## 020 — K=5 at temp=0.7 borderline (6/10) — confirms K=6 is temp threshold (2026-05-18 ~03:36 PT)
 
 K × temp=0.7:
