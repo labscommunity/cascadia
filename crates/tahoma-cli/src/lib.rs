@@ -157,6 +157,20 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Override the engines list advertised in the mDNS NodeInfo (comma-
+    /// separated, e.g. "ov-genai,ov-runtime"). Decouples what shows in the
+    /// dashboard from the actually-loaded engine — useful when running a
+    /// mock worker for discovery testing but you want the card to look
+    /// real. Default: derived from --engine.
+    #[arg(long, value_delimiter = ',')]
+    pub advertise_engines: Vec<String>,
+
+    /// Override the device label advertised in mDNS NodeInfo. Distinct
+    /// from --device, which selects the OpenVINO target device; this is
+    /// purely a dashboard cosmetic. Default: copies --device.
+    #[arg(long)]
+    pub advertise_device: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -478,22 +492,49 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // function so its Drop unregisters the mDNS record cleanly on
     // shutdown (relay loop or `serve_with_nodelay`).
     let topology = tahoma_topology::Topology::new();
+    let engines = if !args.advertise_engines.is_empty() {
+        args.advertise_engines.clone()
+    } else {
+        vec![engine_name(args.engine).to_owned()]
+    };
+    let device = args
+        .advertise_device
+        .clone()
+        .unwrap_or_else(|| args.device.clone());
     let self_node = tahoma_topology::NodeInfo {
         node_id: format!("{}-r{}", hostname(), args.rank),
         host: tahoma_discovery::local_ip().to_string(),
         port: listen_port,
         namespace: "default".to_owned(),
-        device: args.device.clone(),
+        device,
         memory_mb: 0,
-        engines: vec![engine_name(args.engine).to_owned()],
+        engines,
         last_seen: 0.0,
     };
     topology.add_node(self_node.clone());
     let mut discovery = tahoma_discovery::DiscoveryService::new(topology.clone(), "default");
-    if let Err(e) = discovery.start(self_node) {
+    if let Err(e) = discovery.start(self_node.clone()) {
         warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
     }
     let _discovery = discovery;
+
+    // Self-heartbeat: re-insert our own NodeInfo every 2 s so last_seen
+    // stays current in the local topology even when no mDNS event has
+    // fired. Without this the dashboard's "live" indicator goes cold
+    // after FRESH_THRESHOLD_S because add_node only sets last_seen once.
+    // mDNS-discovered peers refresh on each ServiceResolved event from
+    // the daemon (TTL-driven, slower); a generous freshness window on
+    // the frontend covers the gap.
+    let topology_for_heartbeat = topology.clone();
+    let self_node_for_heartbeat = self_node.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.tick().await; // skip the immediate first tick — we already added the node above.
+        loop {
+            tick.tick().await;
+            topology_for_heartbeat.add_node(self_node_for_heartbeat.clone());
+        }
+    });
 
     if !is_first {
         info!("entering relay loop");

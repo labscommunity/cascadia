@@ -18,8 +18,17 @@ export function relativeAge(unixSeconds: number, nowSeconds: number = Date.now()
   return `${(delta / 3600).toFixed(0)}h ago`;
 }
 
-/** Considered "live" if we've heard from the node in the last 10 seconds. */
-export const FRESH_THRESHOLD_S = 10;
+/**
+ * Considered "live" if we've heard from the node in the last 60 seconds.
+ *
+ * Why 60 and not 10: each worker self-heartbeats every 2 s into its OWN
+ * local topology, but mDNS-discovered peers refresh only when the
+ * daemon re-resolves them (TTL-driven; up to ~30 s in practice with
+ * mdns-sd defaults). 60 s gives ~2x slack on the slowest realistic
+ * resolution path while still catching a hard-dead worker within a
+ * minute — which is the resolution we want for the "live" indicator.
+ */
+export const FRESH_THRESHOLD_S = 60;
 
 export function isFresh(lastSeen: number, nowSeconds: number = Date.now() / 1000): boolean {
   return nowSeconds - lastSeen < FRESH_THRESHOLD_S;
