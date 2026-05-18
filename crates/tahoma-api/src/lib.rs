@@ -244,21 +244,26 @@ fn now_unix() -> i64 {
     Utc::now().timestamp()
 }
 
-/// Last-resort formatting when no chat template is available. Matches
-/// the Python "no chat template" engines and what tahoma shipped pre-
-/// minijinja. Coherent on permissive base models, brittle on instruct
-/// models that expect their own prompt format.
+/// Last-resort formatting when no chat template is available.
+///
+/// The previous behaviour joined every turn as `role: content\n…`,
+/// which works on permissive base models but produces visibly broken
+/// transcripts on instruct models and on the mock engine — the engine
+/// sees the assistant's prior turn re-inserted as input, and on the
+/// next request the response includes that prior content verbatim.
+///
+/// Without a real chat template we can't reconstruct the model's
+/// multi-turn format honestly, so render only the latest user message.
+/// That gives one-shot prompting (no multi-turn memory) but doesn't
+/// produce confusing duplicated output. Multi-turn coherence requires
+/// a real tokenizer_config.json with `chat_template` populated.
 fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
-    let mut buf = String::new();
-    for m in messages {
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(&m.role);
-        buf.push_str(": ");
-        buf.push_str(&m.content);
-    }
-    buf
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Render messages through the model's HF Jinja2 chat_template. Returns
