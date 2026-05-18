@@ -15,11 +15,17 @@ use std::time::Instant;
 
 use half::bf16;
 use tahoma_int4_gemm::layer0_int4::{
-    embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
+    embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
+    layer0_forward_decode_int4_with_capacity, Int4Layer0,
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
-use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
+use tahoma_int4_gemm::shell::{
+    HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM, TOPK as SHELL_TOPK, V_HEAD_DIM,
+};
+use tahoma_int4_gemm::shell_int4::{
+    shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity,
+    Int4Shell,
+};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -848,6 +854,285 @@ impl Runner {
         Ok(logits)
     }
 
+    /// Multi-token layer-0 step. Advances layer-0 KV by `seq` slots and
+    /// returns the layer-0 hidden output for all `seq` tokens
+    /// concatenated as `[seq, HIDDEN]` flat.
+    ///
+    /// Calls
+    /// [`layer0_forward_decode_int4_multi_with_capacity`]
+    /// once instead of `seq` individual `forward_layer0_step` calls. As
+    /// of iter 042 layer 0's multi path is still a scalar loop (no tiled
+    /// kernel), so the win at this seam is marginal — the speedup is
+    /// concentrated in the shell's multi path. We still wire it through
+    /// here so future tiled-GEMM work on layer 0 hooks in for free.
+    pub fn forward_layer0_multi(
+        &mut self,
+        token_ids: &[i64],
+        seq: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
+        let l0 = self.layer0.as_mut().ok_or_else(|| {
+            RunnerError::Internal("forward_layer0_multi on non-first stage".into())
+        })?;
+        assert!(seq >= 1, "forward_layer0_multi: seq must be >= 1");
+        assert_eq!(token_ids.len(), seq);
+
+        // Grow KV capacity if the next `seq` slots would overflow. Single
+        // grow loop instead of one per token — the geometric grow guarantees
+        // O(log) total grows over a generation, but a multi-token call could
+        // straddle a grow boundary so we may need >1 grow here.
+        while l0.past_seq_len + seq > l0.kv_capacity {
+            grow_layer0_kv_capacity(l0)?;
+        }
+        let capacity = l0.kv_capacity;
+        let past_seq_len = l0.past_seq_len;
+
+        // Build `[seq, HIDDEN]` flat embed input.
+        let mut xs_f32 = vec![0.0f32; seq * SHELL_HIDDEN];
+        for (t, &id) in token_ids.iter().enumerate() {
+            let row = embed_token_bf16(l0.embed_tokens_bf16, id);
+            xs_f32[t * SHELL_HIDDEN..(t + 1) * SHELL_HIDDEN].copy_from_slice(&row);
+        }
+
+        let outs = layer0_forward_decode_int4_multi_with_capacity(
+            &l0.int4_layer0,
+            &xs_f32,
+            &mut l0.past_k,
+            &mut l0.past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        l0.past_seq_len = past_seq_len + seq;
+
+        info!(
+            stage = "layer0_multi",
+            duration_us = _t0.elapsed().as_micros() as u64,
+            seq,
+            past_seq_len,
+            "stage_timing"
+        );
+        Ok(outs.hidden_out)
+    }
+
+    /// Multi-token shell forward over this rank's MoE layers. For each
+    /// layer this rank owns: one
+    /// [`shell_forward_decode_int4_multi_with_capacity`] call (the tiled
+    /// AVX-VNNI multi path from iter 042) followed by per-token expert
+    /// dispatch + combine.
+    ///
+    /// Bit-identical to `forward_shells` invoked `seq` times sequentially
+    /// — the shell's `_multi` path is itself bit-identical to the scalar
+    /// loop (per `multi_seq_3_matches_sequential_seq_1_calls` in
+    /// `shell_int4`), and we still apply A2/A3 routing-threshold + top-K
+    /// override identically per token.
+    ///
+    /// Input `h_in` is `[seq, HIDDEN]` flat. Returns `[seq, HIDDEN]` flat.
+    pub fn forward_shells_multi(
+        &mut self,
+        h_in: &[f32],
+        past_seq_len: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
+        let mut shell_attn_total_us: u64 = 0;
+        let mut experts_total_us: u64 = 0;
+        let mut combine_total_us: u64 = 0;
+        let hidden = self.manifest.hidden_size as usize;
+        let manifest_top_k = self.manifest.top_k as usize;
+        let effective_top_k = self
+            .top_k_override
+            .map(|v| (v as usize).min(manifest_top_k))
+            .unwrap_or(manifest_top_k);
+        let top_k = manifest_top_k;
+        assert!(seq >= 1, "forward_shells_multi: seq must be >= 1");
+        if h_in.len() != seq * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells_multi: h_in.len={} != seq*hidden={}",
+                h_in.len(),
+                seq * hidden
+            )));
+        }
+
+        let mut h_f32 = h_in.to_vec();
+        let n_layers = self.layers.len();
+        for i in 0..n_layers {
+            let lid = self.layers[i].lid;
+            if self.layers[i].past_seq_len != past_seq_len {
+                return Err(RunnerError::Internal(format!(
+                    "L{lid}: past_seq_len mismatch (caller {past_seq_len} vs layer {})",
+                    self.layers[i].past_seq_len
+                )));
+            }
+
+            // Grow KV capacity to fit the next `seq` slots. May need
+            // multiple grows when straddling a doubling boundary.
+            while past_seq_len + seq > self.layers[i].kv_capacity {
+                grow_kv_capacity(&mut self.layers[i])?;
+            }
+            let capacity = self.layers[i].kv_capacity;
+
+            // One multi-token shell forward — this is the iter 042 win.
+            // For seq=1 it dispatches to the scalar path; for seq>=2 the
+            // batched/tiled-GEMM path amortizes weight loads across tokens.
+            //
+            // Borrow-checker dance: `_multi_with_capacity` takes
+            // `&mut past_k/past_v` while also taking `&shell`. We split
+            // the `LayerState` mutable borrow by destructuring through a
+            // temporary `&mut LayerState` so the shell field can be
+            // re-borrowed immutably while the K/V fields are borrowed
+            // mutably.
+            let shell_t0 = Instant::now();
+            let layer = &mut self.layers[i];
+            let outs = shell_forward_decode_int4_multi_with_capacity(
+                &layer.int4_shell,
+                &h_f32,
+                &mut layer.past_k,
+                &mut layer.past_v,
+                past_seq_len,
+                capacity,
+                seq,
+            );
+            shell_attn_total_us += shell_t0.elapsed().as_micros() as u64;
+            self.layers[i].past_seq_len = past_seq_len + seq;
+
+            // Per-token expert dispatch + combine. Same A2 threshold +
+            // A3 top-K override logic as `forward_shells`, just iterated
+            // across `seq` tokens. Expert dispatch cannot batch across
+            // tokens — different tokens route to different experts.
+            let threshold = self.routing_threshold.unwrap_or(0.0);
+            let experts_t0 = Instant::now();
+            for t in 0..seq {
+                let ids = &outs.routing_ids[t * SHELL_TOPK..(t + 1) * SHELL_TOPK];
+                let ws = &outs.routing_weights[t * SHELL_TOPK..(t + 1) * SHELL_TOPK];
+                if ids.len() != top_k || ws.len() != top_k {
+                    return Err(RunnerError::Internal(format!(
+                        "L{lid} t{t} routing shape unexpected: ids={} weights={} (top_k={})",
+                        ids.len(),
+                        ws.len(),
+                        top_k
+                    )));
+                }
+                let attn_t = &outs.attn_out_post_norm[t * hidden..(t + 1) * hidden];
+                let mut moe = vec![0.0f32; hidden];
+                for k in 0..effective_top_k {
+                    let w = ws[k];
+                    if w < threshold {
+                        continue;
+                    }
+                    let eid = ids[k] as u32;
+                    let y_f32 = self.dispatch_expert(lid, eid, attn_t)?;
+                    for j in 0..hidden {
+                        moe[j] += w * y_f32[j];
+                    }
+                }
+
+                // Combine: h_next = residual + shared + moe (per token).
+                let combine_t0 = Instant::now();
+                let residual_t = &outs.attn_residual[t * hidden..(t + 1) * hidden];
+                let shared_t = &outs.shared_expert_out[t * hidden..(t + 1) * hidden];
+                let h_dst = &mut h_f32[t * hidden..(t + 1) * hidden];
+                for j in 0..hidden {
+                    h_dst[j] = residual_t[j] + shared_t[j] + moe[j];
+                }
+                combine_total_us += combine_t0.elapsed().as_micros() as u64;
+            }
+            experts_total_us += experts_t0.elapsed().as_micros() as u64;
+        }
+
+        info!(
+            stage = "shells_multi",
+            n_layers,
+            seq,
+            top_k,
+            effective_top_k,
+            shell_attn_us = shell_attn_total_us,
+            experts_us = experts_total_us,
+            combine_us = combine_total_us,
+            total_us = _t0.elapsed().as_micros() as u64,
+            "stage_timing"
+        );
+        Ok(h_f32)
+    }
+
+    /// Run the head over every position of a `[seq, HIDDEN]` flat input,
+    /// returning `seq` vocab-sized logit rows.
+    ///
+    /// The head IR runs at `[1, 1, HIDDEN]` shape per the existing
+    /// `forward_head_last`; running multi-position means K sequential
+    /// invocations. At K=4 this is ~25 ms × 4 = 100 ms per round, a
+    /// rounding error vs the shell forward's ~7-9 s — but it is fully
+    /// per-token serial, no batching unlock. Future work: a true multi-
+    /// position head IR.
+    pub fn forward_head_multi(
+        &mut self,
+        h_f32: &[f32],
+        seq: usize,
+    ) -> Result<Vec<Vec<f32>>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        if h_f32.len() < seq * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_head_multi: h.len={} < seq*hidden={}",
+                h_f32.len(),
+                seq * hidden
+            )));
+        }
+        let mut out = Vec::with_capacity(seq);
+        for t in 0..seq {
+            // Reuse `forward_head_last` by handing it a single-position
+            // slice — same code path, no special-casing needed.
+            let slice = &h_f32[t * hidden..(t + 1) * hidden];
+            let logits = self.forward_head_last(slice, 1)?;
+            out.push(logits);
+        }
+        Ok(out)
+    }
+
+    /// Multi-token forward pass equivalent to calling [`Self::step`]
+    /// `tail_len` times sequentially.
+    ///
+    /// - `full_ids`: full prefix-so-far. The last `tail_len` entries are
+    ///   the tokens we will advance KV through.
+    /// - Returns `tail_len` vocab-sized logit rows, one per advanced
+    ///   token. `logits[i]` predicts the token AFTER position
+    ///   `past_seq_len + i`, where `past_seq_len = full_ids.len -
+    ///   tail_len`.
+    ///
+    /// **Use case.** Speculative decode's K-token verify pass. The
+    /// iter 042 multi-token shell GEMM amortizes weight loads across
+    /// K tokens, giving the per-projection speedup the entire stack
+    /// was built for. For `tail_len == 1` this is bit-identical to
+    /// (and roughly the same cost as) `step`; for `tail_len >= 2` it
+    /// is meaningfully faster.
+    ///
+    /// First/single stage only — no pipeline parallelism here; the
+    /// pipeline-parallel multi-token path lives in
+    /// [`crate::engine::SparseMoEEngine::step_first`].
+    pub fn step_multi(
+        &mut self,
+        full_ids: &[i64],
+        tail_len: usize,
+    ) -> Result<Vec<Vec<f32>>, RunnerError> {
+        if tail_len == 0 || tail_len > full_ids.len() {
+            return Err(RunnerError::Internal(format!(
+                "step_multi: invalid tail_len {}, full_ids.len={}",
+                tail_len,
+                full_ids.len()
+            )));
+        }
+        let past_seq_len = full_ids.len() - tail_len;
+        let tail = &full_ids[past_seq_len..];
+
+        // 1) Layer 0 over the tail.
+        let h_f32 = self.forward_layer0_multi(tail, tail_len)?;
+
+        // 2) Shells (this is where iter 042's tiled GEMM kicks in).
+        let h_f32 = self.forward_shells_multi(&h_f32, past_seq_len, tail_len)?;
+
+        // 3) Head per position.
+        self.forward_head_multi(&h_f32, tail_len)
+    }
+
     /// Generate tokens with full sampling (temperature / top-p /
     /// repetition penalty / EOS stop). Returns the vector of generated
     /// token IDs **excluding** the prompt and **excluding** the EOS
@@ -1076,25 +1361,43 @@ impl Runner {
                 continue;
             }
 
-            // 2. Verify drafts one-by-one through the target forward.
-            // The int4 shell only supports seq=1, so this runs K
-            // sequential single-token forwards — NOT a batched K-pass.
-            // (Adding a multi-token shell forward is the next perf
-            // unlock; see [`crate::spec_decode`] module docs.) Each
-            // forward conditions on the previous drafted token in
-            // history and produces the target's prediction for the
-            // next position. We compare predictions vs drafts below.
+            // 2. Verify drafts in a single multi-token forward.
+            //
+            // Conceptually the K verify forwards process the K tokens
+            // `[bonus, draft[0], draft[1], ..., draft[K-2]]` and produce
+            // K logit rows — the i-th row predicts the token at position
+            // `past_seq_len + i + 1`, which we compare against `draft[i]`
+            // for the acceptance check.
+            //
+            // Sequentially this would be K independent `step()` calls;
+            // iter 041's `_multi` API + iter 042's tiled AVX-VNNI GEMM
+            // collapse them into one `step_multi(seq=K)` that amortizes
+            // weight loads across the K tokens. Bit-identical to the
+            // K-step path (the shell's `_multi` is bit-identical to its
+            // scalar reference; layer 0's `_multi` is a scalar loop with
+            // the same writes; head runs per-token) — only wall-clock
+            // moves.
+            //
+            // Pending-token convention: before this section history's
+            // last token (the bonus) is in history but its KV slot is
+            // empty. We push the first K-1 drafts so that the K-token
+            // tail of history is exactly `[bonus, draft[0..K-2]]`. The
+            // multi-call fills the bonus's KV slot + the first K-1
+            // drafts' slots, and the last draft (draft[K-1]) gets pushed
+            // post-call to retain the same pending-token drift downstream.
             n_drafts_total += drafts.len() as u32;
-            let mut target_samples: Vec<i64> = Vec::with_capacity(drafts.len() + 1);
-            for &draft_tok in drafts.iter() {
-                let logits = self.step(&history, 1)?;
-                target_samples.push(argmax_i64(&logits));
-                // Push the drafted token into history regardless of
-                // whether it will eventually be accepted — the next
-                // forward needs it to condition correctly. We trim
-                // back any rejected suffix below.
+            for &draft_tok in drafts.iter().take(drafts.len() - 1) {
                 history.push(draft_tok);
             }
+            let logits_rows = self.step_multi(&history, drafts.len())?;
+            let mut target_samples: Vec<i64> = Vec::with_capacity(drafts.len() + 1);
+            for row in &logits_rows {
+                target_samples.push(argmax_i64(row));
+            }
+            // Push the last draft to restore the post-loop history layout
+            // (every draft in history, KV trailing by 1) that the original
+            // K-step loop produced.
+            history.push(drafts[drafts.len() - 1]);
 
             // 3. Acceptance: longest matching prefix between drafts
             // and target_samples. See [`crate::spec_decode::count_accepted`].
