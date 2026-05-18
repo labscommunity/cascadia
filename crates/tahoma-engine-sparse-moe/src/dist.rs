@@ -29,6 +29,26 @@
 //! `Token` returns one sampled token i64 to upstream after the last
 //! rank runs head + sample. Body:
 //!   - 8 B big-endian i64 token_id
+//!
+//! `ForwardBatch` carries K hidden states in one frame, used by the
+//! pipeline-parallel speculative-decode path. Body:
+//!   - 4 B big-endian u32 past_seq_len (KV slot for the FIRST hidden
+//!     in the batch; subsequent hiddens occupy past_seq_len+1, +2, ...)
+//!   - 4 B big-endian u32 batch_count (K — the number of hidden rows
+//!     in the tensor)
+//!   - 28 B SamplingConfig payload (same as `Forward` — the sampler
+//!     applies the same config to all K positions)
+//!   - F32 hidden tensor [1, K, hidden_size]
+//!
+//! `TokenBatch` returns K sampled token ids upstream in one frame —
+//! the response shape that pairs with `ForwardBatch`. Body:
+//!   - 4 B big-endian u32 batch_count (K)
+//!   - K × 8 B big-endian i64 token_ids
+//!
+//! Backward compatibility: an older worker that doesn't recognize the
+//! new codes returns an error from `parse_kind`. The rank-0 driver
+//! defaults to the existing single-token Forward path; the
+//! pipeline-parallel spec-decode caller must explicitly opt in.
 
 use std::sync::Arc;
 
@@ -52,12 +72,19 @@ use crate::sampling::SamplingConfig;
 /// History:
 /// - 0x01 — past_seq_len + hidden tensor only (pre-PR #10)
 /// - 0x02 — adds 28-byte SamplingConfig between past_seq_len and tensor (PR #10)
+/// - 0x03 — adds ForwardBatch + TokenBatch (PR #11, spec-decode forward
+///   batching). Forward / Reset / Token codes unchanged so a pre-0x03
+///   worker is still wire-compatible for the single-token path; only
+///   peers that explicitly send a ForwardBatch trip the unknown-kind
+///   check on an old worker.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    Forward = 0x53_4D_45_02, // "SME\x02"
-    Reset = 0x53_4D_45_10,   // "SME\x10"
-    Token = 0x53_4D_45_20,   // "SME\x20"
+    Forward = 0x53_4D_45_02,      // "SME\x02"
+    Reset = 0x53_4D_45_10,        // "SME\x10"
+    Token = 0x53_4D_45_20,        // "SME\x20"
+    ForwardBatch = 0x53_4D_45_03, // "SME\x03" — batched K-step verify
+    TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
 }
 
 impl FrameKind {
@@ -66,6 +93,8 @@ impl FrameKind {
             x if x == FrameKind::Forward as u32 => Some(FrameKind::Forward),
             x if x == FrameKind::Reset as u32 => Some(FrameKind::Reset),
             x if x == FrameKind::Token as u32 => Some(FrameKind::Token),
+            x if x == FrameKind::ForwardBatch as u32 => Some(FrameKind::ForwardBatch),
+            x if x == FrameKind::TokenBatch as u32 => Some(FrameKind::TokenBatch),
             _ => None,
         }
     }
@@ -272,6 +301,157 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
     Ok(i64::from_be_bytes([
         raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
     ]))
+}
+
+/// Hard cap on the number of hidden positions one ForwardBatch /
+/// TokenBatch frame can carry. Caps the worst-case allocation on the
+/// receiving side so an adversarial / corrupt peer cannot ask us to
+/// allocate megabytes of token-buffer or hidden-state buffer from a
+/// 4-byte count field. 256 is well above any sensible spec-decode K
+/// (the rainier reference uses K=8; even K=64 is extreme).
+pub const MAX_BATCH_COUNT: u32 = 256;
+
+/// Send a ForwardBatch frame downstream: kind + past_seq_len_start
+/// (u32 BE) + batch_count (u32 BE) + 28 B SamplingConfig + hidden tensor.
+///
+/// `hidden_f32` must be `[1, batch_count, hidden_size]` row-major. The
+/// receiver runs `batch_count` sequential single-token forwards
+/// internally, each occupying KV slot `past_seq_len_start + i`.
+pub async fn send_forward_batch(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len_start: u32,
+    batch_count: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    if batch_count == 0 || batch_count > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_forward_batch: batch_count {batch_count} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    if hidden_shape[1] != batch_count {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_forward_batch: shape[1]={} does not match batch_count={batch_count}",
+            hidden_shape[1]
+        ))));
+    }
+    let expected =
+        (hidden_shape[0] as usize) * (hidden_shape[1] as usize) * (hidden_shape[2] as usize);
+    if hidden_f32.len() != expected {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_forward_batch: hidden.len={} != prod(shape)={expected}",
+            hidden_f32.len()
+        ))));
+    }
+    let mut header = [0u8; 12 + SAMPLING_WIRE_BYTES];
+    header[0..4].copy_from_slice(&(FrameKind::ForwardBatch as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&past_seq_len_start.to_be_bytes());
+    header[8..12].copy_from_slice(&batch_count.to_be_bytes());
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    encode_sampling(sampling, &mut sbytes);
+    header[12..12 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
+    let tensor = hidden_to_tensor(hidden_f32, hidden_shape);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Receive a ForwardBatch frame's body (kind already consumed). Returns
+/// `(past_seq_len_start, batch_count, sampling, hidden_f32, shape)`.
+///
+/// The receiver is expected to run `batch_count` sequential forwards
+/// internally, each pulling the corresponding `[hidden_size]` row out of
+/// the returned `hidden_f32` buffer.
+pub async fn recv_forward_batch_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, SamplingConfig, Vec<f32>, [u32; 3])> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8 + SAMPLING_WIRE_BYTES).await?;
+    if raw.len() != 8 + SAMPLING_WIRE_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    let past_seq_len_start = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let batch_count = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    if batch_count == 0 || batch_count > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_forward_batch_body: batch_count {batch_count} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
+    sbytes.copy_from_slice(&raw[8..8 + SAMPLING_WIRE_BYTES]);
+    let sampling = decode_sampling(&sbytes);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    if tensor.shape[1] != batch_count {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_forward_batch_body: tensor shape[1]={} != batch_count={batch_count}",
+            tensor.shape[1]
+        ))));
+    }
+    let (h, shape) = tensor_to_hidden(&tensor)?;
+    Ok((past_seq_len_start, batch_count, sampling, h, shape))
+}
+
+/// Send a TokenBatch frame upstream: K sampled token ids in one frame.
+pub async fn send_token_batch_upstream(
+    srv: &Mutex<ActivationServer>,
+    tokens: &[i64],
+) -> TransportResult<()> {
+    let n = tokens.len();
+    if n == 0 || n > MAX_BATCH_COUNT as usize {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_token_batch_upstream: tokens.len={n} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let mut bytes = Vec::with_capacity(8 + n * 8);
+    bytes.extend_from_slice(&(FrameKind::TokenBatch as u32).to_be_bytes());
+    bytes.extend_from_slice(&(n as u32).to_be_bytes());
+    for &t in tokens {
+        bytes.extend_from_slice(&t.to_be_bytes());
+    }
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a TokenBatch frame's body (kind already consumed). Returns
+/// the K sampled token ids.
+pub async fn recv_token_batch_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<Vec<i64>> {
+    let mut guard = cli.lock().await;
+    let header = guard.recv_raw(4).await?;
+    if header.len() != 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let n = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if n == 0 || n > MAX_BATCH_COUNT {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_token_batch_body: batch_count {n} out of range 1..={MAX_BATCH_COUNT}"
+        ))));
+    }
+    let raw = guard.recv_raw((n as usize) * 8).await?;
+    drop(guard);
+    if raw.len() != (n as usize) * 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let mut tokens = Vec::with_capacity(n as usize);
+    for i in 0..(n as usize) {
+        let off = i * 8;
+        tokens.push(i64::from_be_bytes([
+            raw[off],
+            raw[off + 1],
+            raw[off + 2],
+            raw[off + 3],
+            raw[off + 4],
+            raw[off + 5],
+            raw[off + 6],
+            raw[off + 7],
+        ]));
+    }
+    Ok(tokens)
 }
 
 /// Forward a Reset frame downstream — used by mid ranks after consuming
