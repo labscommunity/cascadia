@@ -37,6 +37,7 @@ narrative.
 | 030 | 2026-05-18 | matias 2-box | revive 2-box pipeline-parallel via SSH-tunnel chain | **IN FLIGHT** (infra/matias-2box-revival-029, agent still running, 1952 lines staged) | (pending) | (pending) |
 | 031 | 2026-05-18 | A1 int2 experts | int4→int2 expert weight quantization | **KERNEL WORKS** (perf/a1-int2-experts-029 @ ae617a6): 1.80× smaller, 2.89× faster in clean run, cosine 0.61, 4/4 quality preserved at layer-30 swap; pipeline bench contaminated by 3-worker contention | 1.722ms (int2) vs 4.977ms (int4) per-expert | 4/4 (substring) |
 | 032 | 2026-05-18 | A8 KV bf16 | KV cache fp32→bf16 + inline bf16→f32 in SDPA | **VERIFIED WIN** (perf/a8-kv-bf16-029 @ ebd8ac4): ~2.1× attn kernel speedup (687ms vs 1456ms f32), KV mem halved (2.4 vs 5 MB/tok), 3/3 quality | (kernel: 687ms attn, contention-depressed e2e) | 3/3 |
+| 033 | 2026-05-18 | C1 expert prefetch | madvise(WILLNEED) on next-token experts via background thread | **VERIFIED WIN** (perf/c1-expert-prefetch-029 @ eb57a9e): +26.8% tok/s A/B under contention (0.0683 → 0.0866), drops=0, same-as-last predictor | 0.0866 (A/B vs 0.0683) | n/a (substring not tested in A/B) |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

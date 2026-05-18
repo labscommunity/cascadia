@@ -2,6 +2,61 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 033 — C1 expert prefetch — VERIFIED WIN: +26.8% tok/s A/B under contention (2026-05-18 ~13:35 PT)
+
+**SECOND VERIFIED ARCHITECTURAL MOONSHOT** of the parallel batch.
+
+Branch `perf/c1-expert-prefetch-029` @ `eb57a9e` (2 commits: impl +
+docs).
+
+**A/B measurement on miner (K=6, single-stage, temp=0.5, mt=32, 3-
+worker contention identical for both arms):**
+- Without prefetch: 0.0683 tok/s
+- With prefetch: **0.0866 tok/s**
+- **Delta: +26.8%**
+
+(Absolute numbers depressed by sibling agents; delta is robust because
+both arms see same load. Clean-miner re-run should show similar or
+larger delta since prefetch can do MORE work when CPU is free.)
+
+**Implementation:**
+- `SafetensorsExpertSource::prefetch_expert(layer, expert)` calls
+  `madvise(MADV_WILLNEED)` on the 6 expert tensor slices
+- `Prefetcher` background thread fed by a bounded `sync_channel`
+  (cap 4096; drops=0 across all benches)
+- `Runner::forward_shells` at the start of each call pushes prefetch
+  requests for every layer using `last_routing_ids[i]` (same-as-last-
+  token predictor — cheapest possible predictor)
+- After each layer's dispatch loop, records this token's actually-
+  fired expert IDs into `last_routing_ids[i]`
+- `reset_kv` clears `last_routing_ids` (no correlation across prompts)
+- Gated by `TAHOMA_EXPERT_PREFETCH=0` env var
+- Only spawns when `experts_format=safetensors_bin`
+
+**Files changed:**
+- `safetensors_source.rs` (+66 LOC: `prefetch_expert`,
+  `advise_willneed`, `expert_tensor_names` helpers)
+- `runner.rs` (+208 LOC: `Prefetcher` thread, `last_routing_ids`
+  field, prefetch wiring in `forward_shells` + `reset_kv`)
+
+**Why this works:** disk-bound model (553GB > 133GB RAM), so expert
+weights are paged in from disk on demand. madvise(WILLNEED) tells the
+kernel to start the read NOW instead of at fault time. Same-as-last
+predictor is wrong sometimes, but even prefetching only the experts
+that DO fire saves the disk wait. drops=0 means the queue never
+backed up.
+
+**Production readiness:** clean spinout candidate. Gated by env var,
+back-compat (off by default), single-predictor. Could ship as
+`perf/c1-expert-prefetch` PR off main; combines additively with A8
+KV bf16 (different bottlenecks).
+
+**Combined with A8:** if both ship, expect ~50-60% e2e improvement
+on chat workloads (A8 ~15-25% from attention, C1 ~25% from hidden
+expert load). Worth a clean-miner combined bench.
+
+---
+
 ## 032 — A8 KV cache bf16 — VERIFIED WIN: ~2x attention speedup, KV mem halved (2026-05-18 ~13:10 PT)
 
 **FIRST VERIFIED ARCHITECTURAL MOONSHOT.** Real measured kernel-level

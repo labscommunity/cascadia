@@ -1,9 +1,9 @@
 {
-  "iteration": 32,
-  "moonshots_attempted": 32,
+  "iteration": 33,
+  "moonshots_attempted": 33,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 9,
+    "win": 10,
     "neutral": 6,
     "negative": 1,
     "parked": 1,
