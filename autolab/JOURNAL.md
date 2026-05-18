@@ -2,6 +2,57 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 038 — C1 Windows port (PrefetchVirtualMemory) — CODE READY, bench gated on source-sync (2026-05-18 ~14:40 PT)
+
+Closes the iter 034 Windows gap. Branch `perf/c1-windows-port-038`
+@ `77650ea`.
+
+**Implementation:**
+- `Cargo.toml`: `[target.'cfg(windows)'.dependencies] windows-sys =
+  "0.59"` with features `Win32_System_Memory` +
+  `Win32_System_Threading`
+- `safetensors_source.rs`: new `#[cfg(windows)] fn
+  win_prefetch_range(off, len)` — computes VA from `Mmap::as_ptr() +
+  data_start + off`, packs into single-entry
+  `WIN32_MEMORY_RANGE_ENTRY`, calls
+  `PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0)`. Return
+  ignored (advisory; matches Unix `let _ =` on madvise). Empty-range
+  short-circuit. Dispatcher now has both `cfg(unix)` and `cfg(windows)`
+  arms.
+
+**Build status (all clean):**
+- Mac native: `cargo build --workspace` ✓
+- Mac → `x86_64-pc-windows-msvc`: `cargo check -p tahoma-int4-gemm` ✓
+- Mac → `x86_64-pc-windows-gnu`: `cargo zigbuild -p tahoma` →
+  163 MB `tahoma.exe` PE32+ produced clean
+- 7/7 unit tests pass, fmt + clippy clean
+
+**Bench NOT run.** Agent found:
+- Matias workers no longer alive (PIDs 8332/4168 stale)
+- Source trees on matias (`C:\tahoma_src`, `~/tahoma-rust`) are
+  pre-K2.6 — missing `tahoma-int4-gemm` and
+  `tahoma-engine-sparse-moe` crates entirely
+- A bench requires full source-sync (~300 MB scp) + rebuild via
+  `__build_wrapper.cmd` (which invokes vcvarsall x64 + cargo) +
+  binary swap + re-spawn workers
+
+**Next-step instructions are in the agent report.** Concretely:
+1. scp K2.6 source tree (or just `tahoma-int4-gemm` +
+   `tahoma-engine-sparse-moe` + workspace meta) to
+   `cascadia@192.168.86.31:C:\tahoma_src`
+2. Run `C:\tahoma_src\__build_wrapper.cmd`
+3. Swap `tahoma.exe` into spawn-script path
+   (`$env:USERPROFILE\tahoma\target\release\tahoma.exe`)
+4. Spawn via `infra/matias-2box-revival-029` scripts; A/B
+   `TAHOMA_EXPERT_PREFETCH=0` vs `=1`
+
+**Why this matters:** the headline 2-box demo runs on Windows. C1's
++27% measured on miner (Linux) doesn't translate to matias without
+this port. With it: combined A8 + C1 should approach the predicted
+~50-60% e2e on matias (still needs bench).
+
+---
+
 ## 034 — A8+C1 combined bench — MERGE LANDED + Windows C1 gap discovered (bench incomplete) (2026-05-18 ~14:30 PT)
 
 Mixed result: the merge succeeded, but the agent died mid-bench
