@@ -18,6 +18,39 @@ Entry template:
 
 ---
 
+## 016 — A3 K=4 + A2 threshold=0.1 — small WIN (+11%, quality preserved) (2026-05-17 ~23:45 PT)
+
+**Hypothesis:** Lower threshold (0.1 vs 0.3) preserves K=4 quality
+while still cutting some experts.
+
+**Result: WIN (S-magnitude).** +11% throughput, 9/10 quality preserved.
+
+| Config | tok/s | quality |
+|--------|------:|---------|
+| K=4 alone (iter 009) | 0.2100 | 9/10 (celsius fails) |
+| **K=4 + threshold=0.1** | **0.2336** | **9/10 (celsius fails — same)** |
+| K=4 + threshold=0.3 (015) | 0.2792 | 8/10 (NEW failure: Guido) |
+
+threshold=0.1 is the sweet spot — the Guido prompt's expert weight is
+above 0.1 so it's not pruned, preserving the Python answer. Threshold
+0.3 was too aggressive.
+
+**Composed-flag recommendation:** `--top-k-override 4 --routing-threshold 0.1`
+is +160% vs K=8 baseline (vs +146% K=4 alone), same quality, no
+quality risk. Safer than K=3 (which loses 4 prompts on the 10-prompt
+broad eval).
+
+**Could include in PR #29?** Yes, the patch is already on perf branch
+(--routing-threshold flag is implemented). Could update docs to
+recommend the combined default. Defer to PR #29 review feedback.
+
+Bench: `experiments/016_a3_a2_thr01/bench_k4_thr1.jsonl`
+
+**Next iteration:** Continue diversifying. Real A8 KV bf16 next, or
+multi-prompt-class evals on the K=4+thr=0.1 winner.
+
+---
+
 ## 015 — A3 K=4 + A2 threshold=0.3 composed — NEUTRAL (+33% but -1 quality) (2026-05-17 ~23:30 PT)
 
 **Hypothesis:** Adaptive per-token K via routing threshold composed

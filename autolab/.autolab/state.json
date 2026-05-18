@@ -1,13 +1,14 @@
 {
-  "iteration": 15,
-  "moonshots_attempted": 15,
+  "iteration": 16,
+  "moonshots_attempted": 16,
   "moonshots_target": 100,
   "moonshot_class_counts": {
-    "win": 4,
-    "neutral": 4,
+    "win": 5,
+    "neutral": 5,
     "negative": 1,
     "parked": 1,
-    "revision": 1
+    "revision": 1,
+    "shipped": 1
   },
   "moonshot_magnitude_counts": {
     "XS": 0,
