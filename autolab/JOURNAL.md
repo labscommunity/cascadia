@@ -2,6 +2,27 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 019 — K=6 at temp=0.7 = TEMP-ROBUST WIN (8/10 matches K=8, +75% tps) (2026-05-18 ~02:57 PT)
+
+K-tiering productionization recommendation:
+- Low temp (≤0.3): K=4 — +146-210% tps, 9/10 quality
+- High temp (≥0.5): K=6 — +75% tps, 8/10 (matches K=8)
+- Max quality: K=8 — baseline
+
+Full K × temp curve:
+| K | temp=0 | temp=0.7 |
+|--:|:------:|:--------:|
+| 8 | 9/10 (0.0853) | 8/10 (0.0995) |
+| 6 | 3/3 narrow (0.1116) | **8/10 (0.1489)** |
+| 4 | 9/10 (0.2100) | 5/10 (0.2400) |
+
+Bench: `experiments/019_k_temp_curve/bench_k6_temp07.jsonl`
+
+K=6 is the safe default for chat workloads with typical sampling
+temps. K=4 reserved for greedy/low-temp use.
+
+Will update PR #29 docs with this K-tiering next iteration.
+
 Entry template:
 ```
 ## NNN — <title> (YYYY-MM-DD HH:MMZ)

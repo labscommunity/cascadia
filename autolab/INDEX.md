@@ -21,6 +21,7 @@ narrative.
 | 014 | 2026-05-17 | spinout PR #29 | productionize K=4 win on main | **SHIPPED** as PR #29 (perf/a3-topk-override) | — | — |
 | 015 | 2026-05-17 | A3+A2 compose | K=4 + threshold=0.3 (adaptive per-token K) | Pareto-incomparable: +33% tok/s but -1 quality (Guido) | 0.2792 | 8/10 |
 | 016 | 2026-05-17 | A3+A2 thr=0.1 | K=4 + lower threshold | **WIN +11%** at same 9/10 quality (Guido prompt preserved) | **0.2336** | 9/10 |
+| 019 | 2026-05-18 | K=6 at temp=0.7 | Fill K×temp curve | **WIN**: K=6=8/10 matches K=8, +75% tps | 0.1489 | 8/10 |
 | 017 | 2026-05-18 | compose longctx | K=4 + thr=0.1 at mt=64 | NEUTRAL: filter is short-context-only (-3% at long ctx) | 0.3150 | 9/10 |
 | 018 | 2026-05-18 | K × temperature | K=4 vs K=8 at temp=0.7 | **CAVEAT**: K=4 fragile at temp=0.7 (5/10); K=8 robust (8/10) | 0.2400 (K=4) | 5/10 (K=4) vs 8/10 (K=8) |
 
