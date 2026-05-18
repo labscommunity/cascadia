@@ -2,6 +2,72 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 048 — Wire SIMD tiles into engine callsites — SEAM SHIPPED, real bench waits for caller merge (2026-05-18 ~16:55 PT)
+
+The trampoline iter: per-shape dispatcher routes iter 042 + iter 046
+SIMD tiles to their right projections inside the engine. Branch
+`perf/wire-simd-multi-tiles-048` @ `beebd0c` (based on iter 046).
+
+**What's wired:**
+- `ProjShape` enum (`Oproj`, `SharedDown`, `Generic`) +
+  `dispatch_int4_multi` helper replaces 9 callsites in
+  `shell_forward_decode_int4_multi_batched`
+- **oproj** (N=7168, K=8192, 28 MB) and **shared_down** (N=7168,
+  K=2048, 7 MB) → iter 046 `dequant_gemm_int4_multi_blocked_auto`
+  at seq≥4 (falls through to iter 042 at seq=2-3, single-token at
+  seq=1)
+- **All other 7 shells projections** → iter 042
+  `dequant_gemm_int4_multi_auto` (auto-falls-through to single-token
+  at seq=1)
+- New `Runner::forward_shells_multi(h_in, h_shape, past_seq_len,
+  seq)` public method calls `_multi_with_capacity`
+- Fast-paths seq=1 → existing `forward_shells` (**seq=1 hot path
+  UNCHANGED**)
+- 3 new unit tests:
+  - `dispatch_int4_multi_seq_1_matches_single_token_kernel` (regression
+    guard for all 3 ProjShape variants)
+  - `multi_batched_matches_scalar_seq_4_iter046_dispatch` (seq=4
+    bit-identical)
+  - `multi_batched_matches_scalar_seq_8_iter046_dispatch` (seq=8
+    bit-identical, iter 046 sweet spot)
+- 23 int4-gemm + 16 sparse-moe tests pass, fmt + clippy clean
+
+**Honest caveats (verbatim agent):**
+> No miner bench run. Miner load avg 46.x on 48 cores; iter 044
+> spec-decode-compound long-running experiment is active. Per task
+> brief + autolab_loop_autonomy.md, I shipped code + tests +
+> theoretical analysis instead. The underlying kernels are pre-
+> benchmarked on miner (iter 042 + iter 046 commits); this iter is
+> a pure trampoline through dispatch_int4_multi, so engine-level
+> performance should be a Σ-of-per-projection-wins multiplier
+> (~2-3× shell time at seq=4, ~3-4× at seq=8) less Amdahl tax from
+> per-token RoPE/SDPA.
+
+> No multi-token driver loop callers in this branch. The
+> forward_shells_multi API is added, but the chunked-prefill (iter
+> 040) and spec-decode-verify (iter 036/039/044) branches that
+> would call it are not merged into iter 046 base. Wiring those
+> callers is a separate merge.
+
+> Layer-0 multi-token kernel intentionally not lifted. Layer 0 is
+> one call per token (not per-layer × per-token), so the wiring
+> effort isn't justified vs the 60-layer shell hot path. Easy
+> follow-up if profiles flag it.
+
+**Conservative per-shape table:** only oproj + shared_down get iter
+046 dispatcher. iter 046's commit body showed +118%/+62%/+28% wins
+on qproj/kvproj/shared_gate at seq=8/16 too, but with "more variable
+seq=4 behavior". Follow-up should run engine-level bench to decide
+whether to lift more shapes.
+
+**This + iter 044 are the key integration steps.** Once both land:
+- iter 044 measures compound spec-decode on miner
+- iter 048 wires the SIMD tiles to actually fire
+- Combined: real e2e number that proves the architectural foundations
+  ship perf, not just unit-tests
+
+---
+
 ## 049 — f16/bf16 inter-layer hidden states — NEGATIVE RESULT (verified by microbench) (2026-05-18 ~16:50 PT)
 
 Honest negative result via path (C) investigation-first. Branch
