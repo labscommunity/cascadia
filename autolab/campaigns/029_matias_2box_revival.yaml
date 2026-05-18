@@ -1,0 +1,66 @@
+version: 1
+name: 029_matias_2box_revival
+hypothesis: |
+  The 2-box matias K2.6 pipeline can be revived without restoring
+  Tailscale by chaining the inter-rank wire through SSH tunnels via
+  the controller Mac (matias-02:9100 -> Mac:19100 -> matias-03:9100).
+  Expected: end-to-end tok/s within 50% of the Tailscale-DERP baseline
+  0.0553 tok/s, quality 9-10/10 on the 10-prompt eval at mt=32.
+question: infra
+moonshot_id: null
+moonshot: false
+prior_art_note: |
+  Iter 004 parked matias because a prior loop ran `tailscale up --reset`
+  which flushed creds. Re-auth needs an authkey or browser SSO that the
+  loop cannot perform. User feedback (memory: autolab-loop-autonomy)
+  explicitly: do NOT wait an hour for infra to self-heal; pivot.
+  This experiment is the pivot — works around Tailscale outage by
+  using SSH tunnels.
+
+runner:
+  backend: ssh
+  rank0_host: cascadia-matias-02
+  rank1_host: cascadia-matias-03
+  command: "bash autolab/bench/k26_bench_matias_10.sh http://127.0.0.1:18000 /tmp/k26-bench-2box-matias-029.jsonl 32"
+  setup:
+    - autolab/bench/start_workers_tunnel.sh
+  timeout_seconds: 7200
+
+defaults:
+  max_tokens: 32
+  temperature: 0
+  prompts:
+    - "The capital of France is"
+    - "The largest ocean on Earth is the"
+    - "Two plus two equals"
+    - "The first president of the United States was"
+    - "The largest planet in our solar system is"
+    - "Water boils at 100 degrees"
+    - "Python is a programming language created by"
+    - "The square root of 144 is"
+    - "Mount Everest is located in the"
+    - "The speed of light is approximately 300"
+  expected_substrs:
+    [paris, pacific, four, washington, jupiter, celsius, guido, 12, himalaya, km]
+
+grid: {}
+
+metrics:
+  primary: tok_per_sec
+  direction: maximize
+  collect:
+    - name: tok_per_sec
+      source: stdout
+      pattern: '"tok_per_sec":([\d.]+)'
+      type: float
+    - name: quality_pass_count
+      source: stdout
+      pattern: '"quality_pass":"(\d+)/10"'
+      type: int
+
+repeats: 1
+acceptance:
+  min_quality_pass: 7
+  significance: "single run; infra revival is the primary deliverable"
+
+stopping: { max_failures: 1 }

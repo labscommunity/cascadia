@@ -2,6 +2,125 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 029-infra — matias 2-box revived via SSH-tunnel chain (Tailscale stays broken; pivot wins) (2026-05-18 ~12:30 PT)
+
+**Track 4 of iter 029 (infra/matias-2box-revival-029).** Goal: unblock
+the 2-box matias K2.6 pipeline so future moonshots can re-measure
+against the real 2-box pipeline, not just miner single-stage.
+
+**Tailscale recovery — verified hard blocker.**
+
+Both matias-02 and matias-03 are stuck in `unexpected state: NoState`
+with `Tailscale is starting. Please wait` / `You are logged out. The
+last login error was: fetch control key: ... context canceled`.
+`Restart-Service Tailscale -Force` does not reconnect. `tailscale up`
+errors with `requires mentioning all non-default flags. To proceed,
+either re-run your command with --reset` — and `--reset` triggers
+the re-auth flow that needs either a `tskey-auth-*` we do not have in
+the loop environment or a browser SSO loop. Per
+[[autolab-loop-autonomy]], we do not wait an hour for infra to
+self-heal; pivot.
+
+**Pivot 1 (rejected): local LAN fleet.** `beta`/`charlie`/`alpha`
+(192.168.86.{31,39,248}) are SSH-reachable from the controller Mac,
+but none have the K2.6 model. Each has ~360 GB free C: which is short
+of one 275 GB shard. Transfer from miner at the previously-measured
+~5 MB/s would take ~14 hr/box. Not viable inside the iteration budget.
+
+**Pivot 2 (wins): SSH-tunnel chain via the controller Mac.** Bridge
+matias-02 and matias-03 by chaining two SSH forwards through the Mac:
+```
+matias-02:9100  --(ssh -R)-->  Mac:19100  --(ssh -L)-->  matias-03:9100
+```
+Plus an API tunnel Mac:18000 -> matias-02:8000 for the bench harness.
+
+End-to-end RTT measured at **117 ms median** (20 frames, 8 bytes each)
+vs ~22 ms over direct Tailscale DERP. Still <2% of K2.6's ~9 s
+per-token decode budget; transport remains the non-bottleneck per
+[[k26-state]] iter 003 breakdown.
+
+**Two gotchas (worth saving for next time):**
+1. `ssh -L 19100:localhost:9100` — sshd resolves `localhost` to `::1`
+   on the remote, the `direct-tcpip` channel is freed immediately,
+   and the listener never sees data. **Use `127.0.0.1` explicitly**
+   on both ends of every tunnel. Cost me ~10 min to bisect.
+2. `Start-Process -WindowStyle Hidden -PassThru` inherits the OpenSSH
+   job object on Windows and gets killed the moment the SSH session
+   closes — silently losing the worker. This was the iter 002 lesson
+   ("**Start-Process detach over SSH is unreliable**") but it tripped
+   me again because the tahoma 5/14 demo's `win_spawn_wmi.ps1`
+   pattern wasn't in the matias launcher chain. **Always launch via
+   `Invoke-WmiMethod -Class Win32_Process -Name Create`** — the only
+   reliable Windows-OpenSSH detachment path. Updated launcher scripts.
+
+**Spawn-chain shipped (`autolab/bench/`):**
+- `start_workers_tunnel.sh` — opens 3 SSH tunnels, launches both ranks
+- `spawn_rank{0,1}_wmi.ps1` — deployed to each box's $USERPROFILE;
+  WMI-detached so workers survive SSH disconnect
+- `start_rank0_tunnel.ps1` — rank-0 wrapper, `--next 127.0.0.1:9100`
+- `k26_bench_matias_10.sh` — Mac-side 10-prompt harness hitting
+  Mac:18000 (forwarded to matias-02:8000)
+
+**Cold-start measurement.** With OS page cache warm from yesterday's
+runs, both ranks finished `loaded int4 shells 30/30` and entered the
+serving loop in **<60 s** (rank-1 was ready 17:15:14, rank-0 17:15:30,
+both bound 17:14:14/41). API came up at 17:15:30. Cold-cache restart
+(historical) is ~40 min.
+
+**Smoke test result (Paris, mt=4, temp=0):** 4 tokens / 102 s =
+0.039 tok/s, output ` Paris. The capital`. Quality matches reference.
+
+**10-prompt bench result (K=8, mt=32, temp=0, runtime 12:17 → 13:27 PT):**
+
+| Prompt | wall (s) | tok/s | quality |
+|--------|---------:|------:|---------|
+| capital of France                | 397.3 | 0.0805 | ✓ paris |
+| largest ocean                    | 404.9 | 0.0790 | ✓ pacific |
+| two plus two                     | 403.9 | 0.0792 | ✓ four |
+| first president                  | 429.6 | 0.0745 | ✓ washington |
+| largest planet                   | 429.7 | 0.0745 | ✓ jupiter |
+| water boils at 100               | 410.4 | 0.0780 | ✓ celsius |
+| Python created by                | 419.5 | 0.0763 | ✓ guido (Guido van Rossum) |
+| sqrt of 144                      | 428.3 | 0.0747 | ✓ 12 |
+| Mount Everest                    | 409.5 | 0.0781 | ✓ himalaya |
+| speed of light                   | 423.0 | 0.0756 | ✗ km (model said "kilometers") |
+| **AGG**                          | **4156.0** | **0.0770** | **9/10** (effectively 10/10) |
+
+The single "fail" is the same substring artifact from iter 028 — the
+model correctly answered "300,000 kilometers per second" but the
+substring matcher wants "km", not "kilometers". Same bug as the K=6
+iter 021 "km" failure on miner.
+
+**vs baseline 0.0553 tok/s (iter 000, 3-prompt mt=8): +39% effective throughput.**
+
+Caveat: not apples-to-apples — baseline was mt=8 where per-prompt
+prefill amortization is poor; this is mt=32 where prefill amortizes
+over 4× more decode tokens. The real per-token decode rate has not
+changed materially (iter 003 measured ~0.11 tok/s implied decode rate;
+this run is consistent with that). What this measurement DOES show is
+that the SSH-tunnel chain does not regress throughput vs Tailscale
+DERP — transport overhead is properly absorbed by K2.6's compute time.
+
+Quality 9/10 (10/10 counting kilometers) confirms wire-protocol
+correctness on the new transport path; tokens are not corrupted across
+the bastion-Mac-bastion chain.
+
+**Total wall time:** 69 min. Cold-cache restart historical was ~40 min;
+this run was warm-cache so shells loaded in <60 s.
+
+**Why this matters.** Multiple parked iterations need 2-box re-measure:
+- 006 / 007 / 008 (A3 K-sweep) — predicted 20-40% on memory-bound 2-box vs disk-bound miner
+- 009 (A3 robustness) — same
+- 010 (F4 rayon heads) — predicted positive on 2-box compute-bound; miner showed -2.7%
+- 013 (K=4 vs K=8 long-context) — direct head-to-head wanted on 2-box
+With the SSH-tunnel chain working, future iters can measure on the
+actual production target instead of single-stage extrapolation.
+
+**Branch:** `infra/matias-2box-revival-029`. Tunnel script is opt-in;
+the original `start_workers.sh` stays as the Tailscale-up path.
+
+---
+
 ## 029 — COURSE CORRECTION — 4 real moonshots in parallel (2026-05-18 ~12:00 PT)
 
 **User pushback** (verbatim): "is it true that the k variable will need

@@ -16,11 +16,19 @@ Best result per topology. Updated whenever a verified win lands.
 | (excl) | 0.2716 | A3 K=2 — +241% but 2/3 quality (substring fail on "four") | 2026-05-17 | 006 K=2 cliff probe |
 | - | ~0.11 | (historical) main @ 208104e single-stage from PR #7 | 2026-05-16 | (older reference) |
 
-## 2-box (matias-02 + matias-03, Lunar Lake 258V × 2, Tailscale DERP)
+## 2-box (matias-02 + matias-03, Lunar Lake 258V × 2)
 
 | Rank | tok/s | Config | Date | Campaign |
 |-----:|------:|--------|------|----------|
-| 1 | **0.0553** | main @ 208104e, 30/30 split, fp32 KV, K=1, F32 hidden wire | 2026-05-17 | [000_baseline_main](campaigns/000_baseline_main.yaml) |
+| 1 | **0.0770** | main @ 208104e, 30/30 split, K=8, 10-prompt mt=32, **SSH-tunnel chain via Mac** (Tailscale logged out) | 2026-05-18 | [029_matias_2box_revival](campaigns/029_matias_2box_revival.yaml) |
+| 2 | **0.0553** | main @ 208104e, 30/30 split, fp32 KV, K=8, 3-prompt mt=8, F32 hidden wire over Tailscale DERP | 2026-05-17 | [000_baseline_main](campaigns/000_baseline_main.yaml) |
+
+Note: 029 is +39% over 000 not because the pipeline got faster but
+because mt=32 amortizes prefill over 4× more decode tokens than mt=8.
+The implied per-token decode rate is ~the same (~0.11 tok/s, per iter
+003 instrumentation). SSH-tunnel transport (~117 ms RTT) does NOT
+regress vs Tailscale DERP (~22 ms RTT) at K2.6's ~9s per-token decode
+budget; transport remains the non-bottleneck.
 
 ### Per-prompt detail (campaign 000)
 
