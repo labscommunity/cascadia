@@ -382,6 +382,36 @@ pub struct Runner {
     /// instrumentation log and tests.
     prefetch_hits: u64,
     prefetch_chances: u64,
+    /// autolab iter 054 (expert pinning): per-layer per-expert hit
+    /// counts accumulated across every dispatched expert in
+    /// `forward_shells`. Indexed by position in `self.layers` (same as
+    /// `last_routing_ids`); the inner map is `expert_id → fire_count`.
+    /// Used by `pin_top_n_per_layer` to identify the hot-set per layer
+    /// for `mlock`. Persists across resets so steady-state pinning
+    /// reflects the full workload distribution, not just one prompt.
+    expert_hits: Vec<HashMap<u32, u64>>,
+    /// autolab iter 054 (expert pinning): when `Some(n)`, after the
+    /// first prompt completes (or `n` decoded tokens, whichever comes
+    /// first) the runner pins the top-`n` experts *per layer* via
+    /// `pin_top_n_per_layer`. Composes with C1 prefetch: pinned
+    /// experts are immune to eviction; the prefetcher handles the
+    /// long-tail unpinned experts. Default `None` ⇒ feature off.
+    pin_top_n: Option<u32>,
+    /// autolab iter 054: set to `true` after the first pin pass runs;
+    /// gates re-pinning so we don't repeatedly call `mlock` across
+    /// every generation. Re-pinning can be forced via
+    /// `unpin_all_experts() + force_pin_top_n_per_layer`.
+    pin_pass_done: bool,
+    /// autolab iter 054: number of decoded tokens to accumulate hit
+    /// data before the first pin pass fires. Lower = pins sooner but
+    /// on less data (early prompt biased); higher = better hot-set
+    /// quality but you eat the disk-IO penalty for longer. Default
+    /// = 16 (one full sentence worth of router decisions, ~16 × 60
+    /// = 960 dispatch events per layer ≈ heavy-tail emerges).
+    pin_after_tokens: u32,
+    /// autolab iter 054: count of forward_shells calls since the most
+    /// recent `reset_kv`. Drives `pin_after_tokens` gating.
+    decoded_tokens_since_reset: u32,
 }
 
 impl Runner {
@@ -566,6 +596,8 @@ impl Runner {
             _ => None,
         };
         let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
+        let expert_hits: Vec<HashMap<u32, u64>> =
+            (0..layers.len()).map(|_| HashMap::new()).collect();
 
         Ok(Self {
             manifest,
@@ -593,6 +625,15 @@ impl Runner {
             prefetch_n: TOPK as u32,
             prefetch_hits: 0,
             prefetch_chances: 0,
+            expert_hits,
+            pin_top_n: None,
+            pin_pass_done: false,
+            // 16 tokens ≈ 1 sentence; the heavy-tail expert distribution
+            // emerges after ~10 tokens × 60 layers × ~K experts =
+            // ~5000+ dispatch events, which is enough to make the
+            // top-N stable. Configurable via `set_pin_after_tokens`.
+            pin_after_tokens: 16,
+            decoded_tokens_since_reset: 0,
         })
     }
 
@@ -644,6 +685,161 @@ impl Runner {
     /// the previous token's predicted top-N. Hit-rate = hits / chances.
     pub fn prefetch_stats(&self) -> (u64, u64) {
         (self.prefetch_hits, self.prefetch_chances)
+    }
+
+    /// autolab iter 054 (expert pinning): set the per-layer top-N hot
+    /// experts to `mlock` after the warmup window. `None` (default) =
+    /// pinning off. Composes with C1 prefetch — pinning makes the
+    /// top-N immune to page eviction; the prefetcher hides the tail.
+    ///
+    /// Pins do NOT fire on `set_pin_top_n` — they fire after
+    /// `pin_after_tokens` decoded tokens have accumulated hit data
+    /// for `forward_shells` to choose a stable hot-set. To pin
+    /// immediately on data you control (e.g. after a warmup prompt),
+    /// call `pin_top_n_per_layer(n)` directly.
+    ///
+    /// Pre-flight: log a warn if `RLIMIT_MEMLOCK` is below the
+    /// estimated need (`n × num_layers × ~21 MB`). On miner the
+    /// memlock rlimit should be `unlimited` for root or a Xeon SKU
+    /// preset — when running as non-root use `ulimit -l unlimited`
+    /// or `prlimit --pid $PID --memlock=unlimited:unlimited` before
+    /// process start.
+    pub fn set_pin_top_n(&mut self, v: Option<u32>) {
+        self.pin_top_n = v;
+        if let Some(n) = v {
+            // Per-expert size ≈ 21 MB on K2.6 int4 (six tensor slices).
+            // We don't know the actual size until pin time but use this
+            // for the rlimit pre-flight warning.
+            let estimated_per_expert_bytes: u64 = 21 * 1024 * 1024;
+            let num_layers = self.layers.len() as u64;
+            let estimated_total_bytes = (n as u64)
+                .saturating_mul(num_layers)
+                .saturating_mul(estimated_per_expert_bytes);
+            match SafetensorsExpertSource::rlimit_memlock_soft() {
+                Some(soft) if soft >= estimated_total_bytes => {
+                    info!(
+                        pin_top_n = n,
+                        num_layers,
+                        estimated_total_mb = estimated_total_bytes / (1024 * 1024),
+                        rlimit_memlock_soft_mb = if soft == u64::MAX {
+                            u64::MAX
+                        } else {
+                            soft / (1024 * 1024)
+                        },
+                        "set_pin_top_n: rlimit_memlock OK"
+                    );
+                }
+                Some(soft) => {
+                    tracing::warn!(
+                        pin_top_n = n,
+                        num_layers,
+                        estimated_total_mb = estimated_total_bytes / (1024 * 1024),
+                        rlimit_memlock_soft_mb = soft / (1024 * 1024),
+                        "set_pin_top_n: RLIMIT_MEMLOCK too low — pins will fail silently. \
+                         Run `ulimit -l unlimited` (or `prlimit --pid <pid> --memlock=unlimited:unlimited`) \
+                         and restart."
+                    );
+                }
+                None => {
+                    info!(
+                        pin_top_n = n,
+                        num_layers,
+                        estimated_total_mb = estimated_total_bytes / (1024 * 1024),
+                        "set_pin_top_n: rlimit check unavailable on this platform"
+                    );
+                }
+            }
+        } else {
+            info!("set_pin_top_n: disabled");
+        }
+    }
+
+    /// autolab iter 054: override the number of decoded tokens to wait
+    /// for hit data before the first pin pass. Default 16. Setting to
+    /// 0 will trigger pinning on the very first `forward_shells` call
+    /// — useful for benchmarks where the prompt distribution is known
+    /// to be representative.
+    pub fn set_pin_after_tokens(&mut self, v: u32) {
+        self.pin_after_tokens = v;
+        info!(pin_after_tokens = v, "set_pin_after_tokens");
+    }
+
+    /// autolab iter 054: pin the top-N experts *per layer* by current
+    /// hit count via `mlock` / `VirtualLock`. Idempotent at the per-
+    /// expert level — pinning an already-pinned expert is a no-op.
+    /// Returns `(experts_pinned_this_call, bytes_pinned_this_call)`.
+    /// Bumps `self.pin_pass_done = true`.
+    ///
+    /// Strategy: for each layer position `i` in `self.layers`, sort
+    /// `expert_hits[i]` by descending fire count and take the first N
+    /// `(expert_id, _count)` pairs. Layers with fewer than N distinct
+    /// experts pin all observed ones (e.g. if a layer only saw 12
+    /// experts fire during warmup we still get those 12 locked).
+    ///
+    /// Threadsafe to call from any context; the pinning syscalls don't
+    /// block on the inference path. However, the actual `mlock` calls
+    /// **do** block during the page-in (kernel reads every page from
+    /// disk before returning), so for a 47 GB top-set this can take
+    /// tens of seconds on a cold cache. Call it during a warmup window
+    /// the user is happy to wait through.
+    pub fn pin_top_n_per_layer(&mut self, n: u32) -> (usize, u64) {
+        let mut experts_pinned = 0usize;
+        let mut bytes_pinned = 0u64;
+        // Borrow split: hold an Arc clone of source and read expert_hits
+        // by position — we don't need &mut self after we read pin_top_n.
+        let source = self._safetensors_source.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let lid = layer.lid;
+            let empty_map = HashMap::new();
+            let hits = self.expert_hits.get(i).unwrap_or(&empty_map);
+            for eid in select_top_n_by_hits(hits, n) {
+                let pinned = source.pin_expert(lid, eid);
+                if pinned > 0 {
+                    experts_pinned += 1;
+                    bytes_pinned += pinned as u64;
+                }
+            }
+        }
+        self.pin_pass_done = true;
+        info!(
+            n,
+            experts_pinned,
+            bytes_pinned,
+            total_pinned_experts = source.pinned_expert_count(),
+            total_pinned_bytes = source.pinned_bytes(),
+            "pin_top_n_per_layer done"
+        );
+        (experts_pinned, bytes_pinned)
+    }
+
+    /// autolab iter 054: convenience wrapper — unpin everything this
+    /// runner has pinned (delegates to the source's `unpin_all_experts`)
+    /// and clears `pin_pass_done` so a subsequent pin pass can re-arm.
+    pub fn unpin_all_experts(&mut self) -> (usize, u64) {
+        let (n, released) = self._safetensors_source.unpin_all_experts();
+        self.pin_pass_done = false;
+        info!(
+            experts_unpinned = n,
+            bytes_released = released,
+            "unpin_all_experts"
+        );
+        (n, released)
+    }
+
+    /// autolab iter 054: snapshot of (pinned_experts_count, pinned_bytes).
+    /// Used by the instrumentation log + tests.
+    pub fn pinned_stats(&self) -> (usize, u64) {
+        (
+            self._safetensors_source.pinned_expert_count(),
+            self._safetensors_source.pinned_bytes(),
+        )
+    }
+
+    /// autolab iter 054: clone of the per-layer hit map. Used by tests
+    /// and external callers that want to inspect the heavy-tail shape
+    /// without taking `&mut self`.
+    pub fn expert_hits_snapshot(&self) -> Vec<HashMap<u32, u64>> {
+        self.expert_hits.clone()
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -741,6 +937,17 @@ impl Runner {
         // stats aren't confused with the previous prompt's tail.
         self.prefetch_hits = 0;
         self.prefetch_chances = 0;
+        // iter 054 (expert pinning): zero the per-reset token counter
+        // so the next prompt's `pin_after_tokens` window starts fresh.
+        // The pin state itself (pin_pass_done + the locked pages) is
+        // NOT cleared — pinning is a long-lived process-wide property
+        // we want to survive prompt boundaries. The per-layer
+        // `expert_hits` map is also NOT cleared: hot experts identified
+        // on prompt 1 stay hot across prompts (the heavy-tail is a
+        // model-level property, not a prompt-level one), and keeping
+        // the data means re-pin passes (after `unpin_all_experts`) get
+        // increasingly accurate top-Ns rather than starting from zero.
+        self.decoded_tokens_since_reset = 0;
     }
 
     /// Run one forward pass:
@@ -990,6 +1197,18 @@ impl Runner {
                         self.prefetch_hits += 1;
                     }
                 }
+                // autolab iter 054: bump per-(layer-position, expert)
+                // fire count for the pin-top-N heuristic. Persists
+                // across reset_kv so steady-state pin sets reflect the
+                // full workload, not a single prompt. Negligible cost:
+                // one HashMap entry update per dispatched expert
+                // (~K=8 per layer per token).
+                *self
+                    .expert_hits
+                    .get_mut(i)
+                    .expect("layer-indexed hit map")
+                    .entry(eid)
+                    .or_insert(0) += 1;
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
@@ -1022,6 +1241,33 @@ impl Runner {
             combine_total_us += combine_t0.elapsed().as_micros() as u64;
         }
 
+        // autolab iter 054 (expert pinning): bump the per-reset token
+        // counter, and if it's crossed the pin threshold AND the user
+        // requested pinning AND we haven't pinned yet — fire the pin
+        // pass now. We do this AFTER the layer loop so the very same
+        // token that triggers pinning has its hit data folded in
+        // before we choose the top-N. The pin call may take seconds
+        // on a cold cache (kernel reads every page to RAM); the
+        // caller's per-token tok/s will dip on this single token then
+        // recover with the hot-set locked.
+        self.decoded_tokens_since_reset = self.decoded_tokens_since_reset.saturating_add(1);
+        if let Some(n) = self.pin_top_n {
+            if !self.pin_pass_done && self.decoded_tokens_since_reset >= self.pin_after_tokens {
+                info!(
+                    n,
+                    decoded_tokens_since_reset = self.decoded_tokens_since_reset,
+                    pin_after_tokens = self.pin_after_tokens,
+                    "expert pinning: firing pin_top_n_per_layer (warmup window reached)"
+                );
+                let (pinned, bytes) = self.pin_top_n_per_layer(n);
+                info!(
+                    pinned,
+                    bytes_mb = bytes / (1024 * 1024),
+                    "expert pinning: pin pass complete"
+                );
+            }
+        }
+
         // autolab/k26-perf q1 instrumentation: per-token shells breakdown.
         // iter 029 (C1): also log prefetch counters so we can see how the
         // submit/drop ratio evolves across a generation. Counters are
@@ -1030,11 +1276,14 @@ impl Runner {
         // iter 047 (better predictor): log hit-rate (predict-only-correct
         // = good prefetch; predict-mostly-wrong = wasted bandwidth) and
         // the active prefetch_n so A/B campaigns can correlate.
+        // iter 054 (pinning): log pinned-experts count + bytes for A/B
+        // campaigns to correlate hit-rate with pinning coverage.
         let (pf_submits, pf_drops, pf_processed) = self
             .prefetcher
             .as_ref()
             .map(|p| p.snapshot())
             .unwrap_or((0, 0, 0));
+        let (pinned_count, pinned_bytes) = self.pinned_stats();
         info!(
             stage = "shells",
             n_layers,
@@ -1050,6 +1299,8 @@ impl Runner {
             prefetch_total_processed = pf_processed,
             prefetch_hits = self.prefetch_hits,
             prefetch_chances = self.prefetch_chances,
+            pinned_experts = pinned_count,
+            pinned_bytes_mb = pinned_bytes / (1024 * 1024),
             total_us = _t0.elapsed().as_micros() as u64,
             "stage_timing"
         );
@@ -1212,6 +1463,30 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_le_bytes(a));
     }
     out
+}
+
+/// autolab iter 054 (expert pinning): pure helper — pick the top-`n`
+/// expert IDs from a hit map, breaking ties on ascending expert id
+/// for determinism. Returns at most `n` IDs (fewer if the map has
+/// fewer distinct entries). Stable across runs so A/B campaigns
+/// reproduce identical pin sets when fed identical hit histograms.
+///
+/// Separated from `Runner::pin_top_n_per_layer` so unit tests can
+/// exercise the selection logic without spinning up a full Runner
+/// (which would require K2.6 weights on disk).
+fn select_top_n_by_hits(hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
+    if n == 0 || hits.is_empty() {
+        return Vec::new();
+    }
+    let mut by_count: Vec<(u32, u64)> = hits.iter().map(|(&k, &v)| (k, v)).collect();
+    // Sort descending by count, ascending by id on ties.
+    by_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let take = (n as usize).min(by_count.len());
+    by_count
+        .into_iter()
+        .take(take)
+        .map(|(eid, _)| eid)
+        .collect()
 }
 
 /// Double the per-head slot capacity of one layer's KV buffers,
@@ -1445,5 +1720,103 @@ mod tests {
         let nan_ours = super::f32_to_bf16_bits(f32::NAN);
         let nan_back = f32::from_bits((nan_ours as u32) << 16);
         assert!(nan_back.is_nan(), "ours: 0x{nan_ours:04x} not NaN");
+    }
+
+    /// autolab iter 054 (expert pinning): pure-function tests for the
+    /// selection helper. We can't exercise `Runner::pin_top_n_per_layer`
+    /// directly from a unit test (it needs a loaded Runner ⇒ K2.6 IRs
+    /// on disk) but the selection logic is the load-bearing part and
+    /// is straightforward to test in isolation.
+    #[test]
+    fn select_top_n_picks_highest_counts() {
+        let mut hits = HashMap::new();
+        hits.insert(10u32, 50u64);
+        hits.insert(20, 100);
+        hits.insert(30, 75);
+        hits.insert(40, 25);
+        let top = super::select_top_n_by_hits(&hits, 2);
+        assert_eq!(top, vec![20, 30], "top-2 should be highest two counts");
+    }
+
+    #[test]
+    fn select_top_n_breaks_ties_on_ascending_id() {
+        let mut hits = HashMap::new();
+        // Three experts tied at 50 hits each; we expect ascending id order.
+        hits.insert(7u32, 50u64);
+        hits.insert(3, 50);
+        hits.insert(11, 50);
+        // One expert with strictly higher count.
+        hits.insert(99, 100);
+        let top = super::select_top_n_by_hits(&hits, 3);
+        // 99 first (highest count), then 3, 7 (tied, ascending id).
+        assert_eq!(top, vec![99, 3, 7]);
+    }
+
+    #[test]
+    fn select_top_n_returns_all_when_fewer_distinct_experts_than_n() {
+        let mut hits = HashMap::new();
+        hits.insert(1u32, 5u64);
+        hits.insert(2, 10);
+        // Asking for top-100 from only 2 entries returns both.
+        let top = super::select_top_n_by_hits(&hits, 100);
+        assert_eq!(top, vec![2, 1]);
+    }
+
+    #[test]
+    fn select_top_n_with_zero_n_returns_empty() {
+        let mut hits = HashMap::new();
+        hits.insert(1u32, 100u64);
+        assert!(super::select_top_n_by_hits(&hits, 0).is_empty());
+    }
+
+    #[test]
+    fn select_top_n_with_empty_hits_returns_empty() {
+        let hits: HashMap<u32, u64> = HashMap::new();
+        assert!(super::select_top_n_by_hits(&hits, 10).is_empty());
+    }
+
+    #[test]
+    fn select_top_n_deterministic_across_call_order() {
+        // Same logical histogram inserted in different orders should
+        // produce identical results (HashMap iteration is otherwise
+        // nondeterministic). This is the property A/B campaigns rely on.
+        let mut a = HashMap::new();
+        a.insert(5u32, 50u64);
+        a.insert(1, 50);
+        a.insert(9, 50);
+        let mut b = HashMap::new();
+        b.insert(9u32, 50u64);
+        b.insert(5, 50);
+        b.insert(1, 50);
+        assert_eq!(
+            super::select_top_n_by_hits(&a, 3),
+            super::select_top_n_by_hits(&b, 3),
+            "tie-breaking must be insertion-order-independent"
+        );
+    }
+
+    /// autolab iter 054: a heavy-tailed distribution like K2.6's real
+    /// router output should pick the long-tail-head exactly. Mocks the
+    /// canonical "10% of experts cover 80% of fires" shape and verifies
+    /// the top-N selection captures the hot-set.
+    #[test]
+    fn select_top_n_captures_heavy_tail_head() {
+        let mut hits = HashMap::new();
+        // 38 hot experts each at 100 hits ⇒ 3800 fires.
+        for eid in 0..38u32 {
+            hits.insert(eid, 100);
+        }
+        // 346 cold experts each at 3 hits ⇒ 1038 fires. Total ~4838.
+        // The 38 hot experts cover 3800/4838 = 78.5%, matching the
+        // "~80% with 10%" heuristic the task description cites.
+        for eid in 38..384u32 {
+            hits.insert(eid, 3);
+        }
+        let top = super::select_top_n_by_hits(&hits, 38);
+        assert_eq!(top.len(), 38);
+        // Sorted ascending after the heavy-tail head (tied at 100), so
+        // the result is exactly 0..38 in order.
+        let expected: Vec<u32> = (0..38).collect();
+        assert_eq!(top, expected);
     }
 }

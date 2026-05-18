@@ -162,6 +162,30 @@ pub struct WorkerArgs {
     /// hit-rate. See autolab campaign 047.
     #[arg(long)]
     pub prefetch_n: Option<u32>,
+
+    /// Expert pinning top-N per layer (sparse-moe engine only): after
+    /// a brief warmup window the runner identifies the top-N most-
+    /// frequently-fired experts per layer (by hit count) and pins them
+    /// via `mlock` (Unix) / `VirtualLock` (Windows) so they can never
+    /// page out under memory pressure. Composes with `--prefetch-n` —
+    /// pinning protects the hot-set, prefetch hides page-in latency for
+    /// the cold tail. K2.6 expert distribution is heavy-tailed: pinning
+    /// the top 10% (N = 38 of 384) per layer covers ~80% of dispatches
+    /// at ~47 GB total (well within miner's 133 GB). Default = pinning
+    /// off. **Requires `ulimit -l unlimited` on Linux** (default 64
+    /// KiB ⇒ all pins fail silently; runner logs a warn at startup).
+    /// See autolab campaign 054.
+    #[arg(long)]
+    pub pin_top_n: Option<u32>,
+
+    /// Override the pin-warmup window (sparse-moe engine only): number
+    /// of decoded tokens to accumulate hit data before the first pin
+    /// pass fires. Default 16 ≈ one sentence of router decisions.
+    /// 0 = pin on the very first forward_shells call. Higher = more
+    /// accurate top-N selection at the cost of N more disk-bound
+    /// tokens. Only meaningful with `--pin-top-n`.
+    #[arg(long)]
+    pub pin_after_tokens: Option<u32>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -355,6 +379,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
             cfg.prefetch_n = args.prefetch_n;
+            cfg.pin_top_n = args.pin_top_n;
+            cfg.pin_after_tokens = args.pin_after_tokens;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

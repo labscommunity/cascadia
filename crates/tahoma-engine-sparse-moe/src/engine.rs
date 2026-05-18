@@ -56,6 +56,18 @@ pub struct SparseMoEBuilderConfig {
     /// behavior). N > TOPK pre-pages additional experts the next
     /// token is likely to fire on K2.6's sigmoid-router distribution.
     pub prefetch_n: Option<u32>,
+    /// autolab iter 054 (expert pinning): if `Some(n)`, after the
+    /// warmup window (default 16 decoded tokens) `mlock` the top-`n`
+    /// experts *per layer* by observed hit count so they never page
+    /// out. Composes with C1 prefetch — the prefetcher handles the
+    /// long-tail unpinned experts. Estimated cost ≈ n × num_layers ×
+    /// 21 MB; requires `RLIMIT_MEMLOCK` >= that on Unix (or root /
+    /// `prlimit --memlock=unlimited`). `None` = pinning off.
+    pub pin_top_n: Option<u32>,
+    /// autolab iter 054: override the warmup window before the first
+    /// pin pass fires. Default 16 decoded tokens (one sentence worth
+    /// of router decisions). 0 = pin on the first forward_shells call.
+    pub pin_after_tokens: Option<u32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -70,6 +82,8 @@ impl SparseMoEBuilderConfig {
             top_k_override: None,
             routing_threshold: None,
             prefetch_n: None,
+            pin_top_n: None,
+            pin_after_tokens: None,
         }
     }
 
@@ -255,6 +269,15 @@ impl Builder for SparseMoEBuilder {
         // width so the C1 prefetcher gets the top-N expert ids per
         // layer per token instead of just the actually-fired TOPK.
         runner.set_prefetch_n(self.config.prefetch_n);
+        // autolab iter 054 (expert pinning): plumb the pin-top-N and
+        // optional warmup-window override. set_pin_top_n only stores
+        // the target N + emits the RLIMIT_MEMLOCK pre-flight; the
+        // actual pin pass fires from inside forward_shells after the
+        // warmup window has accumulated hit data.
+        if let Some(n) = self.config.pin_after_tokens {
+            runner.set_pin_after_tokens(n);
+        }
+        runner.set_pin_top_n(self.config.pin_top_n);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
