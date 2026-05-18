@@ -2,6 +2,72 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 046 — Row-blocked AVX-512 for oproj — VERIFIED WIN: +40% over iter 042 (2026-05-18 ~16:30 PT)
+
+**FOURTH VERIFIED ARCHITECTURAL MOONSHOT.** AND a critical
+methodology finding: iter 042's "DRAM-bandwidth-bound" claim for
+oproj was wrong — perf stat shows 97.7% L3 hit rate.
+
+Branch `perf/oproj-amx-or-avx512-blocked-046` @ `77bc56f`. Path:
+(B) row-blocked AVX-512 + partial (C) perf-stat investigation.
+
+**Measured (miner Xeon Gold 6252, taskset -c 0-23, 100 iters,
+oproj N=7168 K=8192):**
+
+| seq | scalar/ms | iter042/ms | iter046/ms | vs iter042 | vs scalar |
+|----:|----------:|-----------:|-----------:|-----------:|----------:|
+|  1  |  1.778    |  0.629     |  0.626     | 1.00× (→042) | 2.83× |
+|  2  |  1.424    |  1.171     |  1.169     | 1.00× (→042) | 1.22× |
+|  4  |  2.974    |  2.277     |  **1.617** | **1.41×**  | **1.84×** |
+|  8  |  9.174    |  5.815     |  **4.150** | **1.40×**  | **2.21×** |
+| 16  | 20.585    | 10.280     |  **7.292** | **1.41×**  | **2.83×** |
+
+**~40% faster than iter 042 SIMD tile on oproj at seq 4-16.** Wins
+also seen on qproj, kvproj, shared_gate, shared_down at seq 8-16.
+
+**Key hardware finding (option C work product — verbatim agent):**
+> perf stat on miner Xeon Gold 6252 disproved iter 042's "DRAM-
+> bandwidth-bound" claim for oproj: LLC miss rate is only **2.27%**
+> (97.7% of weight loads hit L3 — the 14 MB int4 weight fits in
+> 35.8 MiB L3). Real bottleneck is L2/L3 latency + redundant xs
+> reads (IPC=1.10).
+
+The win comes from RB=2 row-blocking: each xs load reused across 2
+output rows, halving the redundant L2/L3 traffic. NOT from
+prefetching, NOT from DRAM bandwidth.
+
+**Honest negative result (also documented):** an explicit
+`_mm_prefetch` variant LOST across all seq (0.63-0.87× of iter 042).
+HW prefetcher already handles sequential packed stream; prefetch
+instructions added front-end pressure. Did not ship.
+
+**Tests:** 5 new correctness tests (bit-identical per cell vs iter
+042). Pass on miner AVX-512 + arm64 scalar fallback.
+
+**Auto-dispatch:** `dequant_gemm_int4_multi_blocked_auto` routes:
+- seq>=4 → blocked tile (this iter's win)
+- seq=2-3 → iter 042 multi tile
+- seq=1 → scalar single-token
+
+**What's left:**
+- AMX implementation skipped: no AMX hardware in fleet (Xeon 6252
+  Cascade Lake; matias Lunar Lake also lacks AMX; AMX is Sapphire/
+  Granite Rapids Xeon or Lunar Lake-X only)
+- NOT wired into `shell_int4.rs` yet — per-shape thresholding
+  needed (oproj benefits at seq=4 but qproj/kvproj more variable
+  at seq=4). Follow-up should benchmark engine-level integration.
+- iter 044 worker shared miner cores; ±15% variance run-to-run
+  without `taskset -c 0-23`
+
+**Architectural impact:** the 4 SIMD wins now compound:
+- iter 042 AVX-512 multi-token tile: 1.4-4.75× per projection at
+  seq=4-16
+- iter 046 row-blocked variant: another 40% on top for oproj +
+  other large shapes at seq>=4
+- Combined: ~2-6× per projection at production seq sizes
+
+---
+
 ## 047 — Better C1 predictor (top-N pre-softmax) — CODE + INSTRUMENTATION shipped, bench deferred (2026-05-18 ~16:25 PT)
 
 Code + measurement instrumentation done. Branch
