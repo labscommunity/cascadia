@@ -14,6 +14,7 @@ members = [
     "crates/tahoma-discovery",
     "crates/tahoma-download",
     "crates/tahoma-api",
+    "crates/tahoma-dashboard",
     "crates/tahoma-cli",
     "crates/tahoma",
     "tests-e2e",
@@ -41,6 +42,7 @@ tahoma-runner = { path = "crates/tahoma-runner" }
 tahoma-discovery = { path = "crates/tahoma-discovery" }
 tahoma-download = { path = "crates/tahoma-download" }
 tahoma-api = { path = "crates/tahoma-api" }
+tahoma-dashboard = { path = "crates/tahoma-dashboard" }
 tahoma-cli = { path = "crates/tahoma-cli" }
 
 # Async runtime
