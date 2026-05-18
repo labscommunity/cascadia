@@ -2,6 +2,54 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 043 — spec_decode off-by-one fix — BUG CONFIRMED + FIXED (2026-05-18 ~15:20 PT)
+
+Real bug fix, real correctness improvement. Branch
+`fix/spec-decode-reconcile-off-by-one-043` @ `19c61cd` (based on iter
+039 `a4245db`).
+
+**The bug, confirmed (verbatim agent finding):**
+> The runner pre-pushes `first_gen` to history before round 1 and
+> appends each round's `bonus` to history at end-of-round — both ride
+> ahead of KV by 1 slot. The K-loop's first verify forward absorbs
+> the previous round's pending token's KV slot as a side effect, so
+> the helper must rewind one less than the clean-convention formula:
+> - Partial accept (A < K): runner needs `K - A - 1`, helper returned `K - A`
+> - All-accepted with bonus forward: runner needs `0`, helper returned `1`
+
+The existing helper tests used a clean "no-first-gen" convention so
+the bug was hidden. The runner's `kv_invariant_holds` debug_assert
+would fire on round 2 in debug builds, but no integration test
+exercised the full path.
+
+**Fix:**
+- Added `pending_token_in_history: bool` param to
+  `reconcile_after_round`
+- Both conventions documented in helper
+- 4 new tests (spec_decode 10→14, sparse-moe lib 38→42):
+  `reconcile_pending_token_partial_accept`,
+  `reconcile_pending_token_all_accepted`,
+  `reconcile_pending_token_zero_accepted`,
+  `simulated_runner_pending_session_matches_sequential_greedy`
+- `runner.rs::generate_speculative` now passes `pending=true`
+- `kv_invariant_holds` takes `pending_drift: usize` (drift=1 if bonus
+  pushed, drift=0 if round cut by EOS/max_tokens)
+- iter 039 `engine.rs::drive_generation_first_spec` now defers to
+  the helper instead of computing rewind inline — 30-line inline
+  math comment replaced with pointer to helper's docstring
+
+**Bug-catching verification:** agent temporarily flipped to call with
+`pending=false` (simulating unfixed helper) and confirmed test fails
+with `kv_len=4, history.len()=6` (drift=2, expected=1). With
+`pending=true`, all 14 tests pass.
+
+**Impact:** single-stage spec-decode now works past round 1 in debug
+builds. Pipeline-parallel driver is also cleaner (defers to helper).
+This is the prerequisite correctness fix for any future spec-decode
+bench attempt.
+
+---
+
 ## 041 — Multi-token int4 shell kernel — SEAM SHIPPED (B), real win still pending SIMD (2026-05-18 ~15:08 PT)
 
 Keystone moonshot **API seam done**, perf win pending. Branch
