@@ -18,6 +18,41 @@ Entry template:
 
 ---
 
+## 017 — K=4 + thr=0.1 at LONG context — NEUTRAL/slight regression (2026-05-18 ~00:32 PT)
+
+**Hypothesis:** The +11% win from iter 016 at mt=16 holds or improves
+at mt=64 (production-realistic length).
+
+**Result: REFUTED. The threshold filter is short-context-only.**
+
+| max_tokens | K=4 alone | K=4 + thr=0.1 | Δ |
+|---:|---:|---:|---:|
+| 16 (iter 016) | 0.2100 | 0.2336 | **+11%** |
+| 64 (iter 017) | 0.3253 | 0.3150 | **-3%** |
+
+Same 9/10 quality at both contexts. Throughput delta flips sign with
+context length:
+- Short context: threshold cuts per-token overhead, net win.
+- Long context: prefill is amortized over decode tokens; the filter
+  loop just adds CPU work without changing the dominant compute, net
+  small regression.
+
+**Production implication:** For chat workloads (typical 100+ tokens),
+**K=4 alone (no threshold) is the right default.** The threshold flag
+is exposed for short-output / single-shot workloads where short-context
+amortization matters.
+
+Updating PR #29 docs to clarify: `--routing-threshold` is workload-
+dependent; recommend leaving omitted for chat unless benched on a
+specific use case.
+
+Bench: `experiments/017_compose_longcontext/bench_k4_thr1_mt64.jsonl`
+
+**Next iteration:** Real A8 KV bf16 or other non-A3-bucket moonshot.
+A3 family is now well-mapped.
+
+---
+
 ## 016 — A3 K=4 + A2 threshold=0.1 — small WIN (+11%, quality preserved) (2026-05-17 ~23:45 PT)
 
 **Hypothesis:** Lower threshold (0.1 vs 0.3) preserves K=4 quality
