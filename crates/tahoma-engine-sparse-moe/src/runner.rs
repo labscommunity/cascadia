@@ -10,7 +10,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use half::bf16;
@@ -181,6 +184,108 @@ impl Int4BinExpertCache {
     }
 }
 
+/// autolab iter 029 (C1): one prefetch request — kindly hint the kernel
+/// to start reading the weights for expert `eid` on layer `lid`. The
+/// prefetcher thread translates this into `madvise(MADV_WILLNEED)` calls
+/// on the six safetensors slices that make up the expert. Sent on a
+/// bounded `sync_channel`; if the prefetcher falls behind we drop the
+/// request (the read happens on demand later, which is the no-prefetch
+/// baseline).
+#[derive(Copy, Clone, Debug)]
+struct PrefetchReq {
+    lid: u32,
+    eid: u32,
+}
+
+/// Background thread that consumes [`PrefetchReq`] from a channel and
+/// issues `madvise(MADV_WILLNEED)` on each expert's six tensor byte
+/// ranges. Owned by [`Runner`]; the channel sender is dropped on
+/// `Runner` drop, terminating the consumer.
+///
+/// One thread is plenty — madvise is cheap (~µs per call) and the goal
+/// is just to kick off async page-in. The bottleneck is the OS's
+/// readahead queue, not our scheduler.
+struct Prefetcher {
+    /// SyncSender so we have bounded backpressure; if we overrun the
+    /// queue we silently drop (the request just becomes a cache miss).
+    tx: Option<SyncSender<PrefetchReq>>,
+    join: Option<JoinHandle<()>>,
+    /// Diagnostic counters (per-Runner lifetime).
+    drops: Arc<AtomicU64>,
+    submits: Arc<AtomicU64>,
+    processed: Arc<AtomicU64>,
+}
+
+impl Prefetcher {
+    fn spawn(source: Arc<SafetensorsExpertSource>) -> Self {
+        // 4096 slots = ~22 tokens of 6 experts × 30 layers at K=6.
+        // Plenty of headroom; if we overrun this we're either way ahead
+        // of the consumer or producing more prefetches than we should.
+        let (tx, rx) = mpsc::sync_channel::<PrefetchReq>(4096);
+        let drops = Arc::new(AtomicU64::new(0));
+        let submits = Arc::new(AtomicU64::new(0));
+        let processed = Arc::new(AtomicU64::new(0));
+        let source_for_thread = source.clone();
+        let processed_thread = processed.clone();
+        let join = thread::Builder::new()
+            .name("expert-prefetch".into())
+            .spawn(move || {
+                // Plain blocking recv loop. Terminates when the sender
+                // side is dropped (i.e. when the Runner is being torn
+                // down).
+                while let Ok(req) = rx.recv() {
+                    let _hits = source_for_thread.prefetch_expert(req.lid, req.eid);
+                    processed_thread.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            })
+            .expect("spawn expert-prefetch thread");
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+            drops,
+            submits,
+            processed,
+        }
+    }
+
+    /// Non-blocking enqueue. Drops the request on overflow rather than
+    /// stalling the inference path. Bumps the `submits` counter on
+    /// success and `drops` on overflow/disconnect.
+    fn try_submit(&self, lid: u32, eid: u32) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(PrefetchReq { lid, eid }) {
+            Ok(()) => {
+                self.submits.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.drops.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// Snapshot the (submits, drops, processed) counters. Used by the
+    /// instrumentation log emitted every few tokens.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.submits.load(AtomicOrdering::Relaxed),
+            self.drops.load(AtomicOrdering::Relaxed),
+            self.processed.load(AtomicOrdering::Relaxed),
+        )
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        // Close the sender so the thread's recv loop terminates.
+        drop(self.tx.take());
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
 /// Per-rank slice of the model the Runner should hold.
 ///
 /// `layer_start..layer_end` is the half-open range of *MoE layer ids*
@@ -234,6 +339,19 @@ pub struct Runner {
     /// Per-token effective K varies; safer than fixed K if router
     /// confidence is uneven.
     routing_threshold: Option<f32>,
+    /// autolab iter 029 (C1): cache of the *previous* token's routed
+    /// expert IDs per layer (indexed by position in `self.layers`, not
+    /// by `lid`). Empty `Vec<u32>` means "no history yet" (just after
+    /// `reset_kv` or first prefill token). Used as a simple
+    /// same-as-last-token predictor: at the start of each
+    /// `forward_shells` we push these IDs to the prefetcher so the OS
+    /// can start pulling pages while this token's earlier layers run.
+    last_routing_ids: Vec<Vec<u32>>,
+    /// autolab iter 029 (C1): background prefetcher fed by
+    /// `last_routing_ids` at the start of each `forward_shells`. `None`
+    /// when prefetching is disabled (env var `TAHOMA_EXPERT_PREFETCH=0`
+    /// or experts_format != safetensors_bin).
+    prefetcher: Option<Prefetcher>,
 }
 
 impl Runner {
@@ -398,6 +516,27 @@ impl Runner {
             }
         };
 
+        // autolab iter 029 (C1): spin up the prefetcher thread when we're
+        // serving experts directly from safetensors mmaps. Disabled when
+        // TAHOMA_EXPERT_PREFETCH=0 so it's easy to A/B at runtime. Other
+        // expert backends (ov_ir, int4_bin) don't benefit from madvise
+        // because their weights aren't served from the safetensors mmaps,
+        // so the prefetcher would do nothing useful there.
+        let prefetcher = match (&experts, std::env::var("TAHOMA_EXPERT_PREFETCH").as_deref()) {
+            (ExpertCache::SafetensorsBin(_), Ok("0")) => {
+                info!("expert prefetch: disabled via TAHOMA_EXPERT_PREFETCH=0");
+                None
+            }
+            (ExpertCache::SafetensorsBin(_), _) => {
+                info!(
+                    "expert prefetch: enabled (madvise(WILLNEED) on predicted next-token experts)"
+                );
+                Some(Prefetcher::spawn(safetensors_source.clone()))
+            }
+            _ => None,
+        };
+        let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -411,6 +550,8 @@ impl Runner {
             _safetensors_source: safetensors_source,
             top_k_override: None,
             routing_threshold: None,
+            last_routing_ids,
+            prefetcher,
         })
     }
 
@@ -516,6 +657,13 @@ impl Runner {
         }
         if let Some(l0) = self.layer0.as_mut() {
             l0.past_seq_len = 0;
+        }
+        // autolab iter 029 (C1): a fresh prompt has zero correlation
+        // with the previous prompt's expert routing — wipe the
+        // same-as-last-token predictor so we don't waste prefetch
+        // bandwidth on irrelevant experts.
+        for hist in self.last_routing_ids.iter_mut() {
+            hist.clear();
         }
     }
 
@@ -652,6 +800,29 @@ impl Runner {
         let mut h_f32 = h_in.to_vec();
 
         let n_layers = self.layers.len();
+
+        // autolab iter 029 (C1): kick off madvise(WILLNEED) for every
+        // predicted next-token expert before we run any layer's attn.
+        // Predictor is "same as last token" — i.e. the IDs we stored in
+        // `last_routing_ids[i]` after the previous call. This races the
+        // OS readahead against this token's compute, so by the time we
+        // hit each layer's dispatch_expert the pages are (hopefully)
+        // already warm. Skipped for the very first token after
+        // `reset_kv` when last_routing_ids[i] is still empty.
+        let mut prefetch_submitted: u64 = 0;
+        if let Some(pf) = self.prefetcher.as_ref() {
+            for (i, hist) in self.last_routing_ids.iter().enumerate() {
+                if hist.is_empty() {
+                    continue;
+                }
+                let lid = self.layers[i].lid;
+                for &eid in hist.iter() {
+                    pf.try_submit(lid, eid);
+                    prefetch_submitted += 1;
+                }
+            }
+        }
+
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
             if self.layers[i].past_seq_len != past_seq_len {
@@ -722,17 +893,27 @@ impl Runner {
             // We still iterate over `effective_top_k` to honor the A3 cap,
             // but skip experts below the threshold within that range.
             let threshold = self.routing_threshold.unwrap_or(0.0);
+            // autolab iter 029 (C1): collect this layer's actually-fired
+            // expert IDs so the next forward_shells call can use them as
+            // its prefetch predictor. Same-as-last-token heuristic.
+            let mut this_token_ids: Vec<u32> = Vec::with_capacity(effective_top_k);
             for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
                 if w < threshold {
                     continue;
                 }
                 let eid = outs.routing_ids[k] as u32;
+                this_token_ids.push(eid);
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
                 }
             }
+            // Stash the IDs for the next token's prefetch. We do this
+            // regardless of whether prefetching is currently enabled;
+            // tracking it costs ~k*u32 per layer per token (negligible)
+            // and makes it cheaper to toggle the prefetcher mid-run.
+            self.last_routing_ids[i] = this_token_ids;
             experts_total_us += experts_t0.elapsed().as_micros() as u64;
 
             // Combine: h_next = residual + shared + moe (single token).
@@ -744,6 +925,15 @@ impl Runner {
         }
 
         // autolab/k26-perf q1 instrumentation: per-token shells breakdown.
+        // iter 029 (C1): also log prefetch counters so we can see how the
+        // submit/drop ratio evolves across a generation. Counters are
+        // cumulative-since-Runner-load, so the deltas across consecutive
+        // tokens tell us submits-per-token and drops-per-token.
+        let (pf_submits, pf_drops, pf_processed) = self
+            .prefetcher
+            .as_ref()
+            .map(|p| p.snapshot())
+            .unwrap_or((0, 0, 0));
         info!(
             stage = "shells",
             n_layers,
@@ -752,6 +942,10 @@ impl Runner {
             shell_attn_us = shell_attn_total_us,
             experts_us = experts_total_us,
             combine_us = combine_total_us,
+            prefetch_submitted_this_call = prefetch_submitted,
+            prefetch_total_submits = pf_submits,
+            prefetch_total_drops = pf_drops,
+            prefetch_total_processed = pf_processed,
             total_us = _t0.elapsed().as_micros() as u64,
             "stage_timing"
         );
