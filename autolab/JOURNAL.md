@@ -2,6 +2,27 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 027 — K=6 + completion-style sys prompt 10p — 9/10 (slightly worse than K=6 baseline) (2026-05-18 ~09:30 PT)
+
+K=6 + system prompt "Answer directly with the most likely word or phrase
+that completes the user's statement" on 10-prompt eval mt=32.
+
+Result: 9/10, 0.1162 tok/s. Only "four" fails (model said "4" — sys
+prompt encouraged numeric completion).
+
+Comparison to K=6 baseline at mt=64 (iter 021): 10/10 quality.
+Sys prompt slightly WORSE (-1 quality) and slower (sys prompt prefix
+adds prefill tokens).
+
+**Takeaway:** completion-style sys prompts don't help K=6 — it already
+behaves well without them. Sys prompts add prefill cost without
+quality benefit at K=6. (For K=4 at code prompts iter 026, sys prompts
+shifted which prompt fails but didn't change rate.)
+
+Bench: `experiments/027_k6_sys10/bench_k6_sys10.jsonl`
+
+---
+
 ## 026 — System prompt test — NEUTRAL (shifts which prompt fails) (2026-05-18 ~08:55 PT)
 
 K=4 on 5 code prompts with system prompt "Answer directly and concisely
