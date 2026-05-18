@@ -18,6 +18,34 @@ Entry template:
 
 ---
 
+## 014 — Spinout PR #29 opened (A3 productionization on main) (2026-05-17 ~22:35 PT)
+
+**Hypothesis:** Crystallize the validated K=4 win into a small focused
+PR off main, per branch policy.
+
+**Result: SHIPPED** — https://github.com/labscommunity/tahoma/pull/29
+`perf(sparse-moe): add --top-k-override + --routing-threshold flags (A3)`
+- 3 code files (cli + engine + runner), 1 new docs page
+- 165 insertions, 4 deletions
+- Default behavior unchanged; opt-in flag only
+
+Deliberately excluded from spinout (kept on autolab branch):
+- F4 rayon-over-heads (iter 010 was neutral on miner — not universally
+  validated, defer to per-host config)
+- Per-stage timing instrumentation (iter 002/003 — adds log noise; would
+  ship in a separate observability PR if needed)
+
+Per tahoma-git-conventions: single-author commit, no Co-Authored-By,
+conventional commit prefix, hook bypass for own-repo gh pr create.
+
+**Loop policy fulfilled:** verified wins → separate small spinout PRs
+off main. PR #29 is the first such spinout from this branch.
+
+**Next iteration:** diversify away from A3 — try A8 (KV bf16) or
+multi-prompt class evals.
+
+---
+
 ## 013 — K=4 vs K=8 apples-to-apples at mt=64 — K=4 +210% faster, equal-or-better quality (2026-05-17 ~22:01 PT)
 
 **Hypothesis:** Direct K=4 vs K=8 comparison at long context (max_tokens=64)

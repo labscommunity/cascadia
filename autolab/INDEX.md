@@ -18,6 +18,7 @@ narrative.
 | 011 | 2026-05-17 | A3 K=4 long-context | max_tokens=64 sustained-throughput | **CONFIRMS**: 0.3253 tok/s, peak 0.45, 9/10 | **0.3253** | 9/10 |
 | 012 | 2026-05-17 | A3 K=4 code prompts | 5 code/programming prompts at K=4 | 4/5 (consistent ~80-90% across prompt classes) | 0.2298 | 4/5 |
 | 013 | 2026-05-17 | K=4 vs K=8 apples-to-apples mt=64 | Direct head-to-head at long context | **K=4 +210% AND higher quality (9 vs 8/10)** | 0.3253 (K=4) | 9/10 (K=4) vs 8/10 (K=8) |
+| 014 | 2026-05-17 | spinout PR #29 | productionize K=4 win on main | **SHIPPED** as PR #29 (perf/a3-topk-override) | — | — |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.
