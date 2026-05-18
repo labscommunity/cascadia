@@ -149,6 +149,19 @@ pub struct WorkerArgs {
     /// autolab campaign 007.
     #[arg(long)]
     pub routing_threshold: Option<f32>,
+
+    /// C1 expert prefetch width: number of top-by-router-score experts
+    /// to record per layer per token for the next-token prefetcher
+    /// (sparse-moe engine only). Default = manifest top_k (= 8 on
+    /// K2.6), which is the iter 033 same-as-last-token predictor.
+    /// Values > 8 widen the prediction net: the actually-fired top-8
+    /// stay in (no quality change), the extra N - 8 are insurance
+    /// experts pre-paged in case the next token's routing shifts.
+    /// Clamped to `[manifest.top_k, 384]`. Wider N = more
+    /// `madvise(WILLNEED)` calls + more page-cache churn but higher
+    /// hit-rate. See autolab campaign 047.
+    #[arg(long)]
+    pub prefetch_n: Option<u32>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -341,6 +354,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
+            cfg.prefetch_n = args.prefetch_n;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

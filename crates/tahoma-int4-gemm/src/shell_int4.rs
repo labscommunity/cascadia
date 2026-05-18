@@ -236,6 +236,40 @@ pub fn shell_forward_decode_int4(
     )
 }
 
+/// Variant of [`shell_forward_decode_int4_with_capacity`] that also
+/// emits the top-N expert ids by router score for next-token C1
+/// prefetch prediction (autolab iter 047). `predict_top_n` must be
+/// >= [`TOPK`]; the first `TOPK` entries of the returned
+/// `predicted_top_n_ids` are exactly `routing_ids`. Passing
+/// `predict_top_n == TOPK` yields exactly the same observable behavior
+/// as the back-compat path (still emits `predicted_top_n_ids`, but
+/// it's just a copy of `routing_ids`).
+///
+/// This is the seam the engine's C1 prefetcher uses to anticipate the
+/// next token's likely-different expert selection: the actually-fired
+/// TOPK are guaranteed in the top-N, and the extra `N - K` provide
+/// insurance against the next token shifting which experts hit on
+/// K2.6's sigmoid-router distribution.
+pub fn shell_forward_decode_int4_predict_n(
+    shell: &Int4Shell,
+    x_f32: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
+    past_seq_len: usize,
+    capacity: usize,
+    predict_top_n: usize,
+) -> ShellOutputs {
+    shell_forward_decode_int4_inner(
+        shell,
+        x_f32,
+        past_k,
+        past_v,
+        past_seq_len,
+        capacity,
+        predict_top_n,
+    )
+}
+
 /// Variant of [`shell_forward_decode_int4`] that accepts a KV cache
 /// sized to a larger `capacity` per head (`stride = capacity * HEAD_DIM`),
 /// of which only the first `past_seq_len` slots are populated. Lets
@@ -257,9 +291,34 @@ pub fn shell_forward_decode_int4_with_capacity(
     past_seq_len: usize,
     capacity: usize,
 ) -> ShellOutputs {
+    // Back-compat: predict_top_n == TOPK yields exactly the same routing
+    // ids the K2.6 dispatch path consumes, and `predicted_top_n_ids` is
+    // just a copy of the chosen routing ids (callers that don't use it
+    // pay only the ~32-byte clone).
+    shell_forward_decode_int4_inner(shell, x_f32, past_k, past_v, past_seq_len, capacity, TOPK)
+}
+
+/// Shared implementation. `predict_top_n` controls how many top-by-score
+/// expert ids are returned for next-token prefetch prediction. Must be
+/// >= TOPK and <= N_ROUTED_EXPERTS. The first TOPK entries are exactly
+/// the routing ids the K2.6 dispatch path uses; the rest are insurance
+/// for the C1 prefetcher (iter 047 better predictor).
+fn shell_forward_decode_int4_inner(
+    shell: &Int4Shell,
+    x_f32: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
+    past_seq_len: usize,
+    capacity: usize,
+    predict_top_n: usize,
+) -> ShellOutputs {
     // Reuse the shell.rs forward but swap bf16_gemv_auto -> dequant_gemv_int4_auto.
     // Easiest: copy the body and adapt. (Generic functions over a trait would
     // be cleaner but pure functions are fine here.)
+    assert!(
+        predict_top_n >= TOPK && predict_top_n <= N_ROUTED_EXPERTS,
+        "predict_top_n ({predict_top_n}) must be in [TOPK={TOPK}, N_ROUTED_EXPERTS={N_ROUTED_EXPERTS}]"
+    );
     assert_eq!(x_f32.len(), HIDDEN);
     assert!(
         capacity >= past_seq_len,
@@ -453,18 +512,24 @@ pub fn shell_forward_decode_int4_with_capacity(
     for i in 0..N_ROUTED_EXPERTS {
         scores_for_choice[i] = scores_raw[i] + bias[i];
     }
-    let mut idx_score: Vec<(usize, f32)> = scores_for_choice.iter().copied().enumerate().collect();
-    idx_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // autolab iter 047 (C1 better predictor): partial-sort the top
+    // `predict_top_n` of 384 expert scores. K2.6's routing only needs
+    // the first TOPK; we want the next `predict_top_n - TOPK` for the
+    // C1 prefetcher's next-token expert prediction. See
+    // `select_top_n_by_score` for the sort strategy.
+    let top_n_indices = select_top_n_by_score(&scores_for_choice, predict_top_n);
     let mut topk_ids = vec![0i64; TOPK];
     let mut topk_w = vec![0.0f32; TOPK];
     for k in 0..TOPK {
-        topk_ids[k] = idx_score[k].0 as i64;
-        topk_w[k] = scores_raw[idx_score[k].0];
+        topk_ids[k] = top_n_indices[k] as i64;
+        topk_w[k] = scores_raw[top_n_indices[k]];
     }
     let s: f32 = topk_w.iter().sum::<f32>() + 1.0e-20;
     for w in topk_w.iter_mut() {
         *w = *w / s * ROUTED_SCALING_FACTOR;
     }
+    // Top-N prediction list — first TOPK match routing_ids exactly.
+    let predicted_top_n_ids: Vec<i64> = top_n_indices.iter().map(|&idx| idx as i64).collect();
 
     // Shared expert (int4 ×3)
     let mut shared_gate_out = vec![0.0f32; INTERMEDIATE_SHARED];
@@ -505,10 +570,126 @@ pub fn shell_forward_decode_int4_with_capacity(
         routing_weights: topk_w,
         present_k: new_k,
         present_v: new_v,
+        predicted_top_n_ids,
     }
 }
 
 /// Re-export the bf16-weight RMSNorm (shell.rs's rmsnorm_apply) for use here.
 fn rmsnorm_apply(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
     shell::rmsnorm_apply_pub(x, weight_bf16, dim)
+}
+
+/// autolab iter 047 (C1 better predictor): return the indices of the
+/// top `n` scores in descending order. When `n < scores.len()` we use
+/// `select_nth_unstable_by` for partial sorting (O(n) average vs
+/// O(n log n) for the full sort), then sort just the resulting
+/// `n`-prefix so the highest score comes first. This shape matters
+/// for the K2.6 dispatch path: `routing_ids = top_n_indices[..TOPK]`
+/// expects the highest-scoring expert at index 0.
+///
+/// Stability is not guaranteed across ties (we use *_unstable_by).
+/// In practice the router scores are dense floats so ties are
+/// vanishingly rare; even when they happen the choice between two
+/// equal-score experts has no effect on quality (the dispatch
+/// already weights by score and renormalizes).
+pub(crate) fn select_top_n_by_score(scores: &[f32], n: usize) -> Vec<usize> {
+    assert!(n <= scores.len(), "n ({n}) > scores.len ({})", scores.len());
+    let mut idx_score: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+    if n >= scores.len() {
+        // Degenerate: full sort, no partial-sort benefit when n == len.
+        idx_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    } else if n > 0 {
+        // Place the top-n into [..n] (unordered within), then sort
+        // just that prefix so the caller can read [..TOPK] in
+        // canonical descending-score order.
+        idx_score.select_nth_unstable_by(n, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx_score[..n].sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    idx_score.into_iter().take(n).map(|(i, _)| i).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract that matters most for the C1 predictor: every
+    /// expert in `select_top_n_by_score(scores, K)` must also appear
+    /// in `select_top_n_by_score(scores, N)` for any N >= K. Tested
+    /// across random score distributions to catch any sort/partial-sort
+    /// drift.
+    #[test]
+    fn top_n_is_superset_of_top_k() {
+        // Build pseudo-router scores. Sigmoid-router outputs land in
+        // (0, 1) with most of the density in the middle; mimic with a
+        // simple xorshift-driven scan so we cover lots of orderings.
+        let mut state: u32 = 0xCAFEBABE;
+        let mut xorshift = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32) / (u32::MAX as f32)
+        };
+        for trial in 0..16 {
+            let n_experts = N_ROUTED_EXPERTS; // 384
+            let scores: Vec<f32> = (0..n_experts).map(|_| xorshift()).collect();
+            let top_k = select_top_n_by_score(&scores, TOPK);
+            // Every legal N >= K must include all of top_k.
+            for &n in &[TOPK, TOPK + 4, TOPK + 8, TOPK + 16, 32, 64, 384] {
+                let top_n = select_top_n_by_score(&scores, n);
+                assert_eq!(top_n.len(), n, "trial {trial} N={n}: wrong length");
+                for &k in &top_k {
+                    assert!(
+                        top_n.contains(&k),
+                        "trial {trial} N={n}: top_n missing top_k entry {k}"
+                    );
+                }
+                // The first TOPK of top_n must be ordered by descending
+                // score (the dispatch path consumes them in order).
+                for win in top_n[..TOPK].windows(2) {
+                    assert!(
+                        scores[win[0]] >= scores[win[1]],
+                        "trial {trial} N={n}: prefix not descending at {win:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Trivial sanity: top-N on a fully-sorted score vector picks the
+    /// first N indices in order.
+    #[test]
+    fn top_n_descending_input() {
+        let scores: Vec<f32> = (0..384).rev().map(|i| i as f32).collect();
+        let got = select_top_n_by_score(&scores, 12);
+        let want: Vec<usize> = (0..12).collect();
+        assert_eq!(got, want);
+    }
+
+    /// And on a fully-reversed (ascending) input.
+    #[test]
+    fn top_n_ascending_input() {
+        let scores: Vec<f32> = (0..384).map(|i| i as f32).collect();
+        let got = select_top_n_by_score(&scores, 8);
+        // Top-8 ascending => last 8 indices in descending order.
+        let want: Vec<usize> = (376..384).rev().collect();
+        assert_eq!(got, want);
+    }
+
+    /// Edge: N == 0 should return an empty vec (the dispatch path
+    /// never calls with 0 but the helper is a free function).
+    #[test]
+    fn top_n_zero() {
+        let scores = vec![1.0f32, 2.0, 3.0];
+        assert!(select_top_n_by_score(&scores, 0).is_empty());
+    }
+
+    /// Edge: N == len returns a fully-sorted index vector.
+    #[test]
+    fn top_n_equals_len() {
+        let scores = vec![0.3f32, 0.9, 0.1, 0.7, 0.5];
+        let got = select_top_n_by_score(&scores, 5);
+        assert_eq!(got, vec![1, 3, 4, 0, 2]);
+    }
 }

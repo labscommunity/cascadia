@@ -256,6 +256,9 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
         routing_weights,
         present_k,
         present_v,
+        // C ABI doesn't expose top-N prediction. Internal Rust callers
+        // use `shell_forward_decode_int4_predict_n` instead.
+        predicted_top_n_ids: _,
     } = crate::shell_int4::shell_forward_decode_int4(s, x, &pk_bf, &pv_bf, past_seq_len);
     std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)
         .copy_from_slice(&attn_out_post_norm);
@@ -300,6 +303,8 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward(
         routing_weights,
         present_k,
         present_v,
+        // bf16 reference path always leaves this empty.
+        predicted_top_n_ids: _,
     } = shell_forward_decode(s, x, pk, pv, past_seq_len);
 
     std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)

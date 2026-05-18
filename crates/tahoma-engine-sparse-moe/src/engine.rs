@@ -49,6 +49,13 @@ pub struct SparseMoEBuilderConfig {
     /// Skip experts whose router weight falls below this threshold (A2).
     /// 0.0 / None = disabled. Applied AFTER top_k_override.
     pub routing_threshold: Option<f32>,
+    /// autolab iter 047 (C1 better predictor): number of top-by-router-
+    /// score expert IDs to record per layer per token for next-token
+    /// prefetch prediction. Silently clamped to `[TOPK, 384]`. `None`
+    /// keeps the default (TOPK == 8, same-as-last-token = iter 033
+    /// behavior). N > TOPK pre-pages additional experts the next
+    /// token is likely to fire on K2.6's sigmoid-router distribution.
+    pub prefetch_n: Option<u32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -62,6 +69,7 @@ impl SparseMoEBuilderConfig {
             total: 1,
             top_k_override: None,
             routing_threshold: None,
+            prefetch_n: None,
         }
     }
 
@@ -243,6 +251,10 @@ impl Builder for SparseMoEBuilder {
         // autolab campaign 007 (A2): plumb the routing-weight threshold so
         // forward_shells skips experts below the threshold per token.
         runner.set_routing_threshold(self.config.routing_threshold);
+        // autolab iter 047 (C1 better predictor): plumb the prefetch
+        // width so the C1 prefetcher gets the top-N expert ids per
+        // layer per token instead of just the actually-fired TOPK.
+        runner.set_prefetch_n(self.config.prefetch_n);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

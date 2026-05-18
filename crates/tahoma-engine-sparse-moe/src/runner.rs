@@ -21,8 +21,8 @@ use tahoma_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
-use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
+use tahoma_int4_gemm::shell::{NUM_HEADS, N_ROUTED_EXPERTS, QK_HEAD_DIM, TOPK, V_HEAD_DIM};
+use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_predict_n, Int4Shell};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -218,10 +218,14 @@ struct Prefetcher {
 
 impl Prefetcher {
     fn spawn(source: Arc<SafetensorsExpertSource>) -> Self {
-        // 4096 slots = ~22 tokens of 6 experts × 30 layers at K=6.
-        // Plenty of headroom; if we overrun this we're either way ahead
-        // of the consumer or producing more prefetches than we should.
-        let (tx, rx) = mpsc::sync_channel::<PrefetchReq>(4096);
+        // 16K slots = ~11 tokens of N=24 × 60 layers (iter 047 worst
+        // case) or ~50 tokens at the iter 033 K=8 baseline. Generous
+        // headroom: madvise is sub-µs per call so even when the
+        // prefetcher is the slow side, the queue drains fast. Overrun
+        // just drops the prefetch (fall-back to cache miss = the
+        // no-prefetch baseline), so this only caps how far ahead we
+        // can race the OS readahead.
+        let (tx, rx) = mpsc::sync_channel::<PrefetchReq>(16 * 1024);
         let drops = Arc::new(AtomicU64::new(0));
         let submits = Arc::new(AtomicU64::new(0));
         let processed = Arc::new(AtomicU64::new(0));
@@ -339,19 +343,45 @@ pub struct Runner {
     /// Per-token effective K varies; safer than fixed K if router
     /// confidence is uneven.
     routing_threshold: Option<f32>,
-    /// autolab iter 029 (C1): cache of the *previous* token's routed
-    /// expert IDs per layer (indexed by position in `self.layers`, not
-    /// by `lid`). Empty `Vec<u32>` means "no history yet" (just after
-    /// `reset_kv` or first prefill token). Used as a simple
-    /// same-as-last-token predictor: at the start of each
-    /// `forward_shells` we push these IDs to the prefetcher so the OS
-    /// can start pulling pages while this token's earlier layers run.
+    /// autolab iter 029 (C1): cache of the *previous* token's predicted
+    /// next-token expert IDs per layer (indexed by position in
+    /// `self.layers`, not by `lid`). Empty `Vec<u32>` means "no history
+    /// yet" (just after `reset_kv` or first prefill token). At the
+    /// start of each `forward_shells` we push these IDs to the
+    /// prefetcher so the OS can start pulling pages while this token's
+    /// earlier layers run.
+    ///
+    /// **autolab iter 047:** what we store here depends on
+    /// `prefetch_n`. With `prefetch_n == TOPK` (default, == iter 033
+    /// behavior) these are just the previous token's actually-fired
+    /// IDs. With `prefetch_n > TOPK` these are the top-N by router
+    /// score from the previous token's router — a wider net intended
+    /// to land more of the next token's actually-fired experts in
+    /// pre-paged memory. Tracked length per layer: `prefetch_n`.
     last_routing_ids: Vec<Vec<u32>>,
     /// autolab iter 029 (C1): background prefetcher fed by
     /// `last_routing_ids` at the start of each `forward_shells`. `None`
     /// when prefetching is disabled (env var `TAHOMA_EXPERT_PREFETCH=0`
     /// or experts_format != safetensors_bin).
     prefetcher: Option<Prefetcher>,
+    /// autolab iter 047 (C1 better predictor): how many top-by-router-
+    /// score experts to record per layer per token for next-token
+    /// prefetch prediction. Must be in `[TOPK, N_ROUTED_EXPERTS]`.
+    /// Default == [`TOPK`] (back-compat with iter 033 — same-as-last-
+    /// token predictor). N > TOPK adds insurance: the `N - TOPK` extras
+    /// cover the next token's likely-different expert selection at the
+    /// cost of more `madvise(WILLNEED)` calls + more page-cache churn.
+    prefetch_n: u32,
+    /// autolab iter 047 (C1 better predictor): per-token hit-rate
+    /// instrumentation. Counter pairs (correct_predictions, total) sum
+    /// over the entire generation; deltas at decode-time tell us how
+    /// well `last_routing_ids[i]` covered the experts the next token
+    /// actually fired. "Correct" = an expert that fired in this token
+    /// appeared in this token's `last_routing_ids[i]` (i.e. was
+    /// pre-paged or at least prefetch-requested). Read by the
+    /// instrumentation log and tests.
+    prefetch_hits: u64,
+    prefetch_chances: u64,
 }
 
 impl Runner {
@@ -552,6 +582,17 @@ impl Runner {
             routing_threshold: None,
             last_routing_ids,
             prefetcher,
+            // Default: N == TOPK → same-as-last-token predictor. With
+            // no A2 threshold and no A3 K-override, this is
+            // behaviorally identical to iter 033 (the prefetched IDs
+            // are the same TOPK that fired). With A2 or A3 active,
+            // we prefetch the full TOPK by router score rather than
+            // only the dispatched k' — strictly more prefetch (~480
+            // madvise/tok vs 360 at K=6) but the same predictive
+            // accuracy, because madvise is non-blocking sub-µs.
+            prefetch_n: TOPK as u32,
+            prefetch_hits: 0,
+            prefetch_chances: 0,
         })
     }
 
@@ -573,6 +614,36 @@ impl Runner {
     pub fn set_routing_threshold(&mut self, v: Option<f32>) {
         self.routing_threshold = v.filter(|t| *t > 0.0);
         info!(routing_threshold = ?self.routing_threshold, "set_routing_threshold");
+    }
+
+    /// autolab iter 047 (C1 better predictor): set how many top-by-
+    /// router-score expert IDs to record per layer per token for
+    /// next-token prefetch prediction. Silently clamped to
+    /// `[TOPK, N_ROUTED_EXPERTS]`. `None` keeps the default (`TOPK`,
+    /// same-as-last-token = iter 033 behavior).
+    pub fn set_prefetch_n(&mut self, v: Option<u32>) {
+        let clamped = v
+            .map(|n| n.max(TOPK as u32).min(N_ROUTED_EXPERTS as u32))
+            .unwrap_or(TOPK as u32);
+        self.prefetch_n = clamped;
+        info!(
+            prefetch_n = clamped,
+            topk = TOPK,
+            n_routed = N_ROUTED_EXPERTS,
+            "set_prefetch_n"
+        );
+    }
+
+    /// autolab iter 047 (C1): cumulative prefetch hit-rate counters
+    /// since Runner load (or since the last `reset_prefetch_stats()`
+    /// call). Returns `(hits, chances)` where `chances` counts the
+    /// total number of actually-fired experts (across all layers, all
+    /// tokens) that had a chance to be in the predictor (i.e. tokens
+    /// after the very first per-prompt token where the predictor was
+    /// still empty). `hits` counts how many of those were actually in
+    /// the previous token's predicted top-N. Hit-rate = hits / chances.
+    pub fn prefetch_stats(&self) -> (u64, u64) {
+        (self.prefetch_hits, self.prefetch_chances)
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -665,6 +736,11 @@ impl Runner {
         for hist in self.last_routing_ids.iter_mut() {
             hist.clear();
         }
+        // iter 047: hit-rate counters are cumulative across this
+        // generation only — reset alongside the predictor so per-prompt
+        // stats aren't confused with the previous prompt's tail.
+        self.prefetch_hits = 0;
+        self.prefetch_chances = 0;
     }
 
     /// Run one forward pass:
@@ -843,17 +919,21 @@ impl Runner {
 
             // Run Rust shell forward — same int4 kernel rainier's eval
             // used via the cdylib, just called directly since we're in
-            // the same Cargo workspace. The `_with_capacity` variant
-            // lets us pass a pre-allocated [H, capacity, D] buffer
-            // with only the first `past_seq_len` slots populated.
+            // the same Cargo workspace. The `_predict_n` variant lets
+            // us pass a pre-allocated [H, capacity, D] buffer with
+            // only the first `past_seq_len` slots populated, AND emits
+            // the top-N expert ids by router score for next-token
+            // prefetch prediction (autolab iter 047 C1 better
+            // predictor; N == TOPK is back-compat with iter 033).
             let shell_t0 = Instant::now();
-            let outs = shell_forward_decode_int4_with_capacity(
+            let outs = shell_forward_decode_int4_predict_n(
                 &self.layers[i].int4_shell,
                 &h_f32,
                 &self.layers[i].past_k,
                 &self.layers[i].past_v,
                 past_seq_len,
                 capacity,
+                self.prefetch_n as usize,
             );
             shell_attn_total_us += shell_t0.elapsed().as_micros() as u64;
 
@@ -893,27 +973,45 @@ impl Runner {
             // We still iterate over `effective_top_k` to honor the A3 cap,
             // but skip experts below the threshold within that range.
             let threshold = self.routing_threshold.unwrap_or(0.0);
-            // autolab iter 029 (C1): collect this layer's actually-fired
-            // expert IDs so the next forward_shells call can use them as
-            // its prefetch predictor. Same-as-last-token heuristic.
-            let mut this_token_ids: Vec<u32> = Vec::with_capacity(effective_top_k);
+            // autolab iter 047 (C1 hit-rate): each actually-fired expert
+            // is a "chance" — was it in the previous token's prediction?
+            // Skip the very first per-prompt token (predictor is empty,
+            // counting those would dilute the rate spuriously).
+            let predictor_was_warm = !self.last_routing_ids[i].is_empty();
             for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
                 if w < threshold {
                     continue;
                 }
                 let eid = outs.routing_ids[k] as u32;
-                this_token_ids.push(eid);
+                if predictor_was_warm {
+                    self.prefetch_chances += 1;
+                    if self.last_routing_ids[i].contains(&eid) {
+                        self.prefetch_hits += 1;
+                    }
+                }
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
                 }
             }
-            // Stash the IDs for the next token's prefetch. We do this
-            // regardless of whether prefetching is currently enabled;
-            // tracking it costs ~k*u32 per layer per token (negligible)
-            // and makes it cheaper to toggle the prefetcher mid-run.
-            self.last_routing_ids[i] = this_token_ids;
+            // autolab iter 047: stash the top-N expert IDs for the next
+            // token's prefetch. With prefetch_n == TOPK (default) this
+            // is byte-identical to iter 033's behavior: the same TOPK
+            // actually-fired IDs go in. With prefetch_n > TOPK we get
+            // the top-N by router score — the actually-fired TOPK are
+            // guaranteed in there plus `prefetch_n - TOPK` insurance
+            // experts. The dispatch path above doesn't see these
+            // (still only iterates `effective_top_k` of routing_ids).
+            //
+            // Tracking it costs ~N*u32 per layer per token (negligible
+            // vs the expert GEMM bandwidth) and makes it cheaper to
+            // toggle the prefetcher mid-run.
+            self.last_routing_ids[i] = outs
+                .predicted_top_n_ids
+                .iter()
+                .map(|&id| id as u32)
+                .collect();
             experts_total_us += experts_t0.elapsed().as_micros() as u64;
 
             // Combine: h_next = residual + shared + moe (single token).
@@ -929,6 +1027,9 @@ impl Runner {
         // submit/drop ratio evolves across a generation. Counters are
         // cumulative-since-Runner-load, so the deltas across consecutive
         // tokens tell us submits-per-token and drops-per-token.
+        // iter 047 (better predictor): log hit-rate (predict-only-correct
+        // = good prefetch; predict-mostly-wrong = wasted bandwidth) and
+        // the active prefetch_n so A/B campaigns can correlate.
         let (pf_submits, pf_drops, pf_processed) = self
             .prefetcher
             .as_ref()
@@ -939,6 +1040,7 @@ impl Runner {
             n_layers,
             top_k,
             effective_top_k,
+            prefetch_n = self.prefetch_n,
             shell_attn_us = shell_attn_total_us,
             experts_us = experts_total_us,
             combine_us = combine_total_us,
@@ -946,6 +1048,8 @@ impl Runner {
             prefetch_total_submits = pf_submits,
             prefetch_total_drops = pf_drops,
             prefetch_total_processed = pf_processed,
+            prefetch_hits = self.prefetch_hits,
+            prefetch_chances = self.prefetch_chances,
             total_us = _t0.elapsed().as_micros() as u64,
             "stage_timing"
         );
