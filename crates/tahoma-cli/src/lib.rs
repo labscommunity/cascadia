@@ -131,6 +131,22 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Sparse-MoE engine: prefill chunk size. `0` (default) = single
+    /// outer pass over the whole prompt — historical behavior. `N > 0`
+    /// splits the prompt into ⌈P/N⌉ chunks and emits a
+    /// `prefill chunk done` log line at every boundary, giving callers
+    /// steady prefill progress signal on long prompts.
+    ///
+    /// **No numerical effect.** The int4 shell + layer-0 kernels are
+    /// seq=1 only — chunking wraps the same token-by-token inner loop
+    /// without changing kernel call order or KV-write pattern. See
+    /// `tahoma_engine_sparse_moe::runner::Runner::prefill_chunk_size`
+    /// for the structural reason this is bit-identical to chunk=0.
+    /// The flag is the engine-layer seam a future multi-token kernel
+    /// (or continuous-batching decode overlap) can hook into.
+    #[arg(long, default_value_t = 0)]
+    pub prefill_chunk_size: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +333,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_prefill_chunk_size(args.prefill_chunk_size);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }

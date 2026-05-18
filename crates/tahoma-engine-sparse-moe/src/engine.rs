@@ -30,7 +30,7 @@ use crate::dist::{
     recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
     StageTransport,
 };
-use crate::runner::{LayerRange, Runner, RunnerError};
+use crate::runner::{prefill_chunks, LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
@@ -42,6 +42,16 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Engine-layer prefill chunk size. `0` = disabled (one outer pass
+    /// over the whole prompt; historical behavior). `N > 0` splits the
+    /// prompt into ⌈P/N⌉ chunks and logs a `prefill chunk done` line at
+    /// every boundary. See [`crate::runner::Runner::prefill_chunk_size`]
+    /// for the no-numerical-effect rationale: the int4 shell + layer-0
+    /// kernels are seq=1 only, so the per-chunk inner loop is still
+    /// token-by-token. The flag is the engine-layer seam a future
+    /// multi-token kernel (or continuous-batching decode interleave)
+    /// can hook into without re-plumbing the CLI / builder.
+    pub prefill_chunk_size: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +63,22 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            prefill_chunk_size: 0,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    /// Set the engine-layer prefill chunk size. `0` disables chunking
+    /// (one outer pass; historical behavior); any `N > 0` enables
+    /// chunked progress logging. See the field doc for why this has no
+    /// numerical effect today.
+    pub fn with_prefill_chunk_size(mut self, v: u32) -> Self {
+        self.prefill_chunk_size = v;
         self
     }
 }
@@ -219,7 +239,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +248,7 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        runner.set_prefill_chunk_size(self.config.prefill_chunk_size);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
@@ -605,25 +626,53 @@ impl SparseMoEEngine {
 
         // Prefill: feed each prompt token; the very last response from
         // last-rank becomes the first generated token.
+        //
+        // Chunking: when the runner's `prefill_chunk_size` is non-zero,
+        // we wrap the inner per-token loop with an outer chunk loop that
+        // emits a `prefill chunk done` log line at every boundary.
+        // Bit-identical to the un-chunked path (the per-chunk inner
+        // loop calls `forward_one_token_first` in the same order with
+        // the same KV growth pattern), since both the int4 shell and
+        // layer-0 kernels are seq=1 only. See
+        // `crate::runner::Runner::prefill_chunk_size` for the rationale.
+        //
+        // The chunk boundaries come from the same `prefill_chunks` helper
+        // the single-stage path uses, so the two paths can't drift.
+        let chunks = prefill_chunks(prompt_ids.len(), self.runner.prefill_chunk_size());
         info!(
             prompt_len = prompt_ids.len(),
-            "prefill (token-by-token, distributed)"
+            chunk_size = self.runner.prefill_chunk_size(),
+            n_chunks = chunks.len(),
+            "prefill (token-by-token, distributed, chunked)"
         );
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            history.push(t);
-            let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
-                .map_err(|e| format!("prefill step {i}: {e}"))?;
-            if i + 1 == prompt_ids.len() {
-                // Last prefill step: this is the first generated token.
-                if eos.contains(&token_back) {
-                    return Ok(generated);
+        let t_pre_dist = std::time::Instant::now();
+        for (chunk_idx_dist, (chunk_start, chunk_end)) in chunks.iter().copied().enumerate() {
+            let t_chunk = std::time::Instant::now();
+            for i in chunk_start..chunk_end {
+                history.push(prompt_ids[i]);
+                let token_back = self
+                    .forward_one_token_first(&history, cfg, downstream)
+                    .map_err(|e| format!("prefill step {i}: {e}"))?;
+                if i + 1 == prompt_ids.len() {
+                    // Last prefill step: this is the first generated token.
+                    if eos.contains(&token_back) {
+                        return Ok(generated);
+                    }
+                    generated.push(token_back);
+                    history.push(token_back);
                 }
-                generated.push(token_back);
-                history.push(token_back);
+                // Otherwise discard (intermediate prefill samples are stale).
+                let _ = token_back;
             }
-            // Otherwise discard (intermediate prefill samples are stale).
-            let _ = token_back;
+            info!(
+                chunk = chunk_idx_dist,
+                tokens_in_chunk = chunk_end - chunk_start,
+                chunk_start,
+                chunk_end,
+                chunk_ms = (t_chunk.elapsed().as_secs_f64() * 1000.0) as u64,
+                cumulative_s = t_pre_dist.elapsed().as_secs_f64(),
+                "prefill chunk done"
+            );
         }
 
         // Decode loop.

@@ -217,6 +217,21 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// Engine-layer prefill chunk size. `0` (the default) preserves the
+    /// historical behavior: one outer pass over the whole prompt. Any
+    /// `N > 0` splits the prompt into ⌈P/N⌉ chunks and emits a log line
+    /// at every chunk boundary, giving callers steady prefill progress
+    /// signal on long prompts.
+    ///
+    /// **No numerical effect.** The inner per-chunk loop still drives
+    /// `step()` token-by-token, because both the int4 shell and the int4
+    /// layer-0 kernels are seq=1 only. KV state advances identically
+    /// whether chunks are size 1, 64, or the full prompt length — the
+    /// kernel-call order and KV-write pattern are unchanged. The flag
+    /// is the engine-layer seam that a future multi-token prefill
+    /// kernel (or continuous-batching decode overlap) can hook into
+    /// without re-plumbing the CLI / builder.
+    prefill_chunk_size: u32,
 }
 
 impl Runner {
@@ -392,7 +407,28 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            prefill_chunk_size: 0,
         })
+    }
+
+    /// Set the engine-layer prefill chunk size. `0` disables chunking
+    /// (one outer pass over the whole prompt — the historical behavior).
+    /// Any `N > 0` splits the prompt into ⌈P/N⌉ chunks, emitting a log
+    /// line after each chunk's inner token-by-token loop completes.
+    ///
+    /// See the field doc on `prefill_chunk_size` for the no-numerical-
+    /// effect rationale (the int4 kernels are seq=1 only — chunking is
+    /// observability + a future-kernel seam).
+    pub fn set_prefill_chunk_size(&mut self, v: u32) {
+        self.prefill_chunk_size = v;
+        info!(prefill_chunk_size = v, "set_prefill_chunk_size");
+    }
+
+    /// Read back the current engine-layer prefill chunk size. Public for
+    /// tests / debug-page rendering; the inference path consults the
+    /// field directly.
+    pub fn prefill_chunk_size(&self) -> u32 {
+        self.prefill_chunk_size
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -738,28 +774,53 @@ impl Runner {
 
         // Prefill token-by-token to keep shell input shapes uniform (avoids
         // the OV 2026.1.0 CPU snippets shape-specialization bug we hit on
-        // shape changes).
-        info!(prompt_len = prompt_ids.len(), "prefill (token-by-token)");
+        // shape changes — and the int4 kernels are seq=1 only anyway).
+        //
+        // The outer chunked loop (`prefill_chunk_size > 0`) wraps the inner
+        // per-token loop without changing the call order or KV-write
+        // pattern; the bit-level output is identical to chunk_size=0. See
+        // the `Runner::prefill_chunk_size` field doc for why this is
+        // structurally true with the current kernels.
+        let chunks = prefill_chunks(prompt_ids.len(), self.prefill_chunk_size);
+        info!(
+            prompt_len = prompt_ids.len(),
+            chunk_size = self.prefill_chunk_size,
+            n_chunks = chunks.len(),
+            "prefill (token-by-token, chunked)"
+        );
         let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_tokens);
         let mut last_logits: Option<Vec<f32>> = None;
         let t_pre = Instant::now();
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            history.push(t);
-            let logits = self.step(&history, 1)?;
-            last_logits = Some(logits);
-            if (i + 1) % 8 == 0 || i + 1 == prompt_ids.len() {
-                info!(
-                    "prefill {}/{} elapsed={:.1}s",
-                    i + 1,
-                    prompt_ids.len(),
-                    t_pre.elapsed().as_secs_f64()
-                );
+        for (chunk_idx, (chunk_start, chunk_end)) in chunks.iter().copied().enumerate() {
+            let t_chunk = Instant::now();
+            for i in chunk_start..chunk_end {
+                history.push(prompt_ids[i]);
+                let logits = self.step(&history, 1)?;
+                last_logits = Some(logits);
+                if (i + 1) % 8 == 0 || i + 1 == prompt_ids.len() {
+                    debug!(
+                        "prefill {}/{} elapsed={:.1}s",
+                        i + 1,
+                        prompt_ids.len(),
+                        t_pre.elapsed().as_secs_f64()
+                    );
+                }
             }
+            info!(
+                chunk = chunk_idx,
+                tokens_in_chunk = chunk_end - chunk_start,
+                chunk_start,
+                chunk_end,
+                chunk_ms = (t_chunk.elapsed().as_secs_f64() * 1000.0) as u64,
+                cumulative_s = t_pre.elapsed().as_secs_f64(),
+                "prefill chunk done"
+            );
         }
         let prefill_secs = t_pre.elapsed().as_secs_f64();
         info!(
             secs = prefill_secs,
             tok_per_s = prompt_ids.len() as f64 / prefill_secs,
+            n_chunks = chunks.len(),
             "prefill done"
         );
 
@@ -927,6 +988,35 @@ fn write_present_kv(
     }
 }
 
+/// Compute the half-open chunk boundaries `(chunk_start, chunk_end)` for
+/// an outer chunked-prefill loop over `prompt_len` tokens with
+/// `prefill_chunk_size`. `0` means "no chunking" (one outer chunk
+/// covering the whole prompt). Returns an empty vec on empty input.
+///
+/// Pure helper — unit-tested without touching the inference path.
+/// Used by both `Runner::generate` (single-stage) and the rank-0
+/// `drive_generation_first` driver (multi-stage) so the two paths
+/// agree on boundary placement.
+pub fn prefill_chunks(prompt_len: usize, prefill_chunk_size: u32) -> Vec<(usize, usize)> {
+    if prompt_len == 0 {
+        return Vec::new();
+    }
+    let chunk_size = if prefill_chunk_size == 0 {
+        prompt_len
+    } else {
+        (prefill_chunk_size as usize).max(1)
+    };
+    let n_chunks = prompt_len.div_ceil(chunk_size);
+    let mut out = Vec::with_capacity(n_chunks);
+    let mut start = 0usize;
+    while start < prompt_len {
+        let end = (start + chunk_size).min(prompt_len);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,5 +1086,119 @@ mod tests {
         let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         assert!(dst.iter().all(|&x| x == 0.0));
+    }
+
+    // ── prefill_chunks (engine-layer prefill chunking math) ────────────
+    //
+    // These exhaustively cover the boundary cases for the outer chunked-
+    // prefill loop. The bit-identical-to-single-shot correctness claim
+    // depends on (a) the inner per-token loop being unchanged and (b)
+    // the union of chunk ranges exactly covering [0, prompt_len) in
+    // order — which is what these tests verify.
+
+    #[test]
+    fn prefill_chunks_disabled_returns_one_chunk_covering_all() {
+        // chunk_size=0 = disabled = one outer chunk covering [0, P).
+        // This preserves the historical behavior bit-for-bit.
+        let chunks = prefill_chunks(10, 0);
+        assert_eq!(chunks, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn prefill_chunks_empty_prompt_returns_empty() {
+        let chunks = prefill_chunks(0, 0);
+        assert!(chunks.is_empty());
+        let chunks = prefill_chunks(0, 64);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn prefill_chunks_exact_multiple() {
+        // 256 tokens at chunk=64 → 4 chunks, each 64 tokens.
+        let chunks = prefill_chunks(256, 64);
+        assert_eq!(chunks, vec![(0, 64), (64, 128), (128, 192), (192, 256)]);
+    }
+
+    #[test]
+    fn prefill_chunks_with_remainder() {
+        // 200 tokens at chunk=64 → 3 full + 1 short (8 tokens).
+        let chunks = prefill_chunks(200, 64);
+        assert_eq!(chunks, vec![(0, 64), (64, 128), (128, 192), (192, 200)]);
+    }
+
+    #[test]
+    fn prefill_chunks_chunk_larger_than_prompt() {
+        // chunk=64 but prompt=10 → one chunk [0, 10). No over-read.
+        let chunks = prefill_chunks(10, 64);
+        assert_eq!(chunks, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn prefill_chunks_chunk_size_1_is_per_token() {
+        // chunk=1 means one outer chunk per token — fully fine-grained
+        // progress logging at maximal overhead. Matches the most
+        // granular setting the seq=1 kernel can support today.
+        let chunks = prefill_chunks(5, 1);
+        assert_eq!(chunks, vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn prefill_chunks_covers_prompt_contiguously() {
+        // Critical invariant: the union of chunk ranges must exactly
+        // tile [0, prompt_len) with no gaps and no overlaps. This is
+        // the structural property that guarantees chunked prefill
+        // produces the same KV state as un-chunked prefill (since the
+        // inner loop is unchanged, the only thing that could go wrong
+        // is a miscounted boundary).
+        for prompt_len in [1, 7, 63, 64, 65, 127, 128, 129, 256, 1000].iter().copied() {
+            for chunk_size in [0u32, 1, 8, 64, 128, 256, 1024].iter().copied() {
+                let chunks = prefill_chunks(prompt_len, chunk_size);
+                if prompt_len == 0 {
+                    assert!(chunks.is_empty());
+                    continue;
+                }
+                assert!(!chunks.is_empty(), "non-empty prompt should yield ≥1 chunk");
+                assert_eq!(
+                    chunks.first().map(|p| p.0),
+                    Some(0),
+                    "first chunk starts at 0 (P={prompt_len}, CS={chunk_size})"
+                );
+                assert_eq!(
+                    chunks.last().map(|p| p.1),
+                    Some(prompt_len),
+                    "last chunk ends at prompt_len (P={prompt_len}, CS={chunk_size})"
+                );
+                for w in chunks.windows(2) {
+                    assert_eq!(
+                        w[0].1, w[1].0,
+                        "chunk boundary mismatch (P={prompt_len}, CS={chunk_size})"
+                    );
+                    assert!(
+                        w[0].1 > w[0].0,
+                        "empty chunk (P={prompt_len}, CS={chunk_size})"
+                    );
+                }
+                let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+                assert_eq!(
+                    total, prompt_len,
+                    "chunks cover {total} of {prompt_len} (CS={chunk_size})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_chunks_disabled_matches_single_chunk_size_eq_prompt() {
+        // chunk_size=0 (disabled) and chunk_size=prompt_len should
+        // produce the same single-chunk result. This is what makes
+        // `--prefill-chunk-size 0` a true no-op for callers using
+        // the new flag.
+        for p in [1usize, 7, 64, 200].iter().copied() {
+            assert_eq!(
+                prefill_chunks(p, 0),
+                prefill_chunks(p, p as u32),
+                "disabled vs CS=P (P={p})"
+            );
+        }
     }
 }
