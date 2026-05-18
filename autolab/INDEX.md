@@ -30,6 +30,7 @@ narrative.
 | 023 | 2026-05-18 | K=6 on code prompts | quality on programming questions | 4/5 (matches K=4; same format failure on x=5+3) | 0.1197 | 4/5 |
 | 024 | 2026-05-18 | K=6 mt=128 sustained | very-long context | 3/3, 0.1713 tok/s (sustained K=6 production number) | **0.1713** | 3/3 |
 | 025 | 2026-05-18 | K=4 mt=128 sustained | throughput-max long-context | 3/3 narrow, 0.3209 tok/s (+87% vs K=6 mt=128) | **0.3209** | 3/3 |
+| 026 | 2026-05-18 | system prompt | "Answer concisely" on code prompts | neutral: shifts which prompt fails, same 4/5 rate | 0.1624 | 4/5 |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

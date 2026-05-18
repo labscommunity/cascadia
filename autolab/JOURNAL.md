@@ -2,6 +2,31 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 026 — System prompt test — NEUTRAL (shifts which prompt fails) (2026-05-18 ~08:55 PT)
+
+K=4 on 5 code prompts with system prompt "Answer directly and concisely
+in one sentence":
+
+| Prompt | No sys | + sys prompt |
+|--------|------:|------:|
+| reverse-string | ✓ "def" | ✗ (sys made model omit code template) |
+| x=5+3 print(x) | ✗ "trace through" | ✓ "8" (FIXED by sys) |
+| typeof | ✓ | ✓ |
+| factorial 5 | ✓ | ✓ |
+| SQL count | ✓ | ✓ |
+| **total** | **4/5** | **4/5** |
+
+System prompt SHIFTED which prompt fails but didn't change the pass
+rate. Sys-prompt is a wash on this prompt set.
+
+**Practical takeaway:** prompt engineering can re-route failures
+across prompt types. Production deployments should tune system prompts
+to match their workload's mix.
+
+Bench: `experiments/026_sys_prompt/bench_k4_sys.jsonl`
+
+---
+
 ## 025 — K=4 mt=128 sustained = 0.3209 tok/s, 3/3 (+87% vs K=6 mt=128) (2026-05-18 ~08:15 PT)
 
 K=4 at mt=128: 0.3209 tok/s, 3/3 narrow quality. Sustained throughput
