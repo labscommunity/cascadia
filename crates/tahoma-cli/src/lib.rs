@@ -498,6 +498,43 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
     runner.start_with_listen(peers, shard, listen).await?;
 
+    // Probe listener: bind a TCP socket on listen_port so the
+    // coordinator's latency probe loop has something to handshake
+    // against. Real engines bind this port themselves (for activation
+    // relay) via Engine::configure_listen, but the mock engine's impl
+    // is a no-op — without this, latency probes against mock-engine
+    // workers find a closed port and the matrix stays empty in the
+    // dashboard demo. If the engine already bound the port, `bind`
+    // fails with AddrInUse and we silently step aside (the engine's
+    // listener handles probes identically at the TCP layer).
+    let probe_addr = format!("0.0.0.0:{listen_port}");
+    match tokio::net::TcpListener::bind(&probe_addr).await {
+        Ok(listener) => {
+            info!(addr = %probe_addr, "probe listener bound");
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok(_) => {
+                            // Drop the connection immediately — the
+                            // probe only needs the connect handshake.
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "probe accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                addr = %probe_addr,
+                "probe listener could not bind; engine likely owns the port"
+            );
+        }
+    }
+
     // Every worker advertises itself via mDNS — not just rank 0 — so the
     // coordinator's dashboard /api/topology can render the full cluster
     // and not just self. Best-effort: a host without a working multicast
