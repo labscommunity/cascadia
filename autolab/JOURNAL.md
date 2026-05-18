@@ -2,6 +2,81 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 041 — Multi-token int4 shell kernel (in flight) (2026-05-18 ~15:00 PT)
+
+Keystone moonshot — extending the seq=1 int4 kernel to seq>1 (multi-
+token forward). This unlocks REAL wins from spec-decode (iter 036),
+chunked prefill (iter 040), and continuous batching. All prior agents
+identified this as the bottleneck.
+
+Agent running in background; deliverable scoped (A) working kernel,
+(B) skeleton + bit-identity tests, or (C) plan + scaffolding — honest
+about which.
+
+---
+
+## 039 — ForwardBatch(K) wire frame for spec-decode — WIRE BATCHING DONE + bug discovered (2026-05-18 ~14:55 PT)
+
+Real architectural deliverable + bonus bug discovery. Branch
+`perf/forward-batch-spec-decode-039` @ `a4245db` (based on iter 036
+spec-decode skeleton `acd21bd`).
+
+**What shipped:**
+- `FrameKind::ForwardBatch` (0x534D4503) — K hiddens +
+  past_seq_len_start + SamplingConfig in one wire frame
+- `FrameKind::TokenBatch` (0x534D4521) — K token IDs back in one frame
+- `send_forward_batch` / `recv_forward_batch_body_server` /
+  `send_token_batch_upstream` / `recv_token_batch_body_client`
+- `MAX_BATCH_COUNT = 256` cap; defensive K=0 / shape-mismatch
+  rejection
+- Existing Forward/Reset/Token codes UNCHANGED — pre-iter-039 workers
+  stay wire-compatible for the per-token path
+- `handle_forward_batch_frame`: K sequential `forward_shells`
+  internally, last rank does K head+sample, mid ranks relay K hiddens
+  downstream + forward TokenBatch upstream
+- `maybe_rewind_to`: worker self-rewinds KV (+ `last_rank_history`)
+  on every Forward / ForwardBatch — no dedicated RewindBatch frame
+  needed
+- `spec_decode_k` now honored on **both** single-stage AND pipeline-
+  parallel (was single-stage-only)
+
+**Tests:** 58 sparse-moe tests pass (was 50; +8 new). Critical:
+- `forward_batch_frame_round_trips_k4` — K=4 ser/deser
+- `token_batch_frame_round_trips_k4` + extreme-ids
+- `forward_batch_then_token_batch_pair` — full request/response cycle
+- 3 defensive-rejection tests (K=0, K>MAX, shape mismatch)
+- `frame_kind_codes_remain_stable` — pins all 5 codes
+- Existing `simulated_session_matches_sequential_greedy` still passes
+  unchanged (single-stage path unmodified)
+- `cargo fmt` clean, `cargo clippy --no-deps` clean, workspace builds
+
+**🐛 BUG DISCOVERED (off-by-one in iter 036's spec_decode helper):**
+> The existing `spec_decode::reconcile_after_round` is off-by-one for
+> the runner's convention (history pre-pushes `first_gen` + appends
+> bonus after the K-loop, so trail-by-1 is invariant). The helper's
+> tests use a no-first-gen convention which doesn't expose the bug;
+> `debug_assert` in `Runner::generate_speculative` would likely fire
+> on the second round. My pipeline-parallel driver computes the
+> correct rewind locally (K-A-1 for partial accept, 0 for all-
+> accepted) and documents why in comments. The single-stage runner's
+> spec-decode is left unfixed — out of scope.
+
+**Follow-up needed:** fix the off-by-one in
+`spec_decode::reconcile_after_round` so single-stage `generate_
+speculative` actually works past round 1 in debug builds. Small fix
+but easy to miss without this finding.
+
+**What's left:**
+- No 2-box bench (matias workers stale; gated on iter 038 source-sync
+  or on revival via tunnel chain again)
+- Per-token shell still seq=1 (unchanged) — wire-batching not kernel-
+  batching. The ~9s/token K2.6 dispatch cost is untouched. Win is on
+  cross-rank wire latency: ~110ms saved per spec round at cascadia
+  22ms RT, K=8, 70% accept rate. ForwardBatch + multi-token kernel
+  (iter 041 in flight) would compound to a real K2.6 spec-decode win.
+
+---
+
 ## 040 — Chunked prefill — SEAM SHIPPED, no perf win today (honest) (2026-05-18 ~14:55 PT)
 
 Branch `perf/chunked-prefill-040` @ `2a004cc`. Agent's honest framing:
