@@ -2,6 +2,56 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 049 — f16/bf16 inter-layer hidden states — NEGATIVE RESULT (verified by microbench) (2026-05-18 ~16:50 PT)
+
+Honest negative result via path (C) investigation-first. Branch
+`perf/f16-hidden-states-049` @ `4b0c4a8`. Agent decided NOT to ship
+the change after microbenching.
+
+**Why bf16 inter-layer is net-negative (verbatim agent finding):**
+- bf16 hidden states: **3.4× SLOWER** per token (105.5 µs vs 31.4 µs
+  across 60 layers). `bf16::from_f32` round-to-nearest-even is ~3×
+  more expensive than a plain f32 store.
+- Even at the THEORETICAL BEST CASE (free bf16), the saving would be
+  31 µs out of a **~41-second-per-token attention budget** (iter
+  032's KV bf16 baseline). That's **0.00007%** — invisible.
+- Distributed (pipeline-parallel): hidden-state wire is 22.4 ms RTT
+  vs 0.23 ms raw byte-transmit. **Wire is 100× latency-bound, not
+  bandwidth-bound** — halving payload doesn't move RTT.
+
+**Why iter 032 KV bf16 IS a win but this isn't:**
+> The KV cache lives in attention SDPA's hot loop (60 layers × 64
+> heads × past_seq_len × QK dot products) — that IS bandwidth-bound
+> at long context. The inter-layer hidden state is one 28 KB buffer
+> that fits in L1 and gets touched once per layer — not
+> bandwidth-bound at all.
+
+**What was shipped (path B defensive infra):**
+- New microbench `bin/bench_hidden_state_transition.rs` (+239 LOC)
+  comparing the actual inter-layer loop vs hypothetical bf16 path
+- `trace!` instrumentation in `runner.rs::forward_shells` summing
+  per-layer inter-layer transition cost — gated `LevelFilter=trace`,
+  zero cost in default builds
+- 2 new unit tests in runner.rs:
+  `bf16_hidden_state_roundtrip_error_envelope` (pins rounding bounds)
+  `bf16_u16_conversion_matches_half_crate` (cross-checks iter 032's
+  bit-shortcut)
+- 36 tests pass; fmt + clippy clean
+- 16 → 18 sparse-moe tests
+
+**Why this is a successful iteration despite "negative":** the
+investigation saved future effort (no one will re-attempt this
+without re-reading the analysis). The microbench is reusable —
+future quantization questions about inter-layer buffers can use the
+same harness. The envelope tests document the bound if a future iter
+DOES want to ship bf16 for a different reason (e.g., memory savings
+on long-context).
+
+**No bench conflict:** the microbench is host-laptop pure-Rust, not
+a miner run. Did not collide with iter 044 / iter 048.
+
+---
+
 ## 046 — Row-blocked AVX-512 for oproj — VERIFIED WIN: +40% over iter 042 (2026-05-18 ~16:30 PT)
 
 **FOURTH VERIFIED ARCHITECTURAL MOONSHOT.** AND a critical
