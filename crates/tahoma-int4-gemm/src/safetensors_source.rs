@@ -30,7 +30,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::Advice;
 use parking_lot::RwLock;
 
 use crate::format::GemmError;
@@ -124,14 +126,24 @@ impl Shard {
     /// and the worst case is the read happens on demand later (which is
     /// exactly the no-prefetch baseline).
     fn advise_willneed(&self, tensor_name: &str) {
-        let Some(&(off, len)) = self.tensors.get(tensor_name) else {
+        let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
             return;
         };
-        let start = self.data_start + off;
         // memmap2's `advise_range` takes a (offset, len) within the mmap.
         // The kernel rounds the start down and the length up to the next
         // page boundary, so we don't need to align here.
-        let _ = self.mmap.advise_range(Advice::WillNeed, start, len);
+        //
+        // Unix only: `madvise(MADV_WILLNEED)` is the underlying syscall.
+        // Windows has `PrefetchVirtualMemory` (Win8+) with similar
+        // semantics; not wired up yet — the prefetcher path is a no-op
+        // there. This still compiles cleanly so the rest of C1 (the
+        // background thread + queue + telemetry) ships unchanged. The
+        // performance impact is the same as `TAHOMA_EXPERT_PREFETCH=0`.
+        #[cfg(unix)]
+        {
+            let start = self.data_start + _off;
+            let _ = self.mmap.advise_range(Advice::WillNeed, start, _len);
+        }
     }
 }
 
