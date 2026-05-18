@@ -29,6 +29,7 @@ narrative.
 | 022 | 2026-05-18 | K=6+thr=0.1 compose | composed flag at K=6 | 10/10 quality, slight tps edge | 0.1482 | 10/10 |
 | 023 | 2026-05-18 | K=6 on code prompts | quality on programming questions | 4/5 (matches K=4; same format failure on x=5+3) | 0.1197 | 4/5 |
 | 024 | 2026-05-18 | K=6 mt=128 sustained | very-long context | 3/3, 0.1713 tok/s (sustained K=6 production number) | **0.1713** | 3/3 |
+| 025 | 2026-05-18 | K=4 mt=128 sustained | throughput-max long-context | 3/3 narrow, 0.3209 tok/s (+87% vs K=6 mt=128) | **0.3209** | 3/3 |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

@@ -2,6 +2,31 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 025 — K=4 mt=128 sustained = 0.3209 tok/s, 3/3 (+87% vs K=6 mt=128) (2026-05-18 ~08:15 PT)
+
+K=4 at mt=128: 0.3209 tok/s, 3/3 narrow quality. Sustained throughput
+plateau for the throughput-max tier.
+
+Long-context K head-to-head:
+| K | mt=64 | mt=128 |
+|--:|------:|-------:|
+| 4 | 0.3253 | **0.3209** | (3/3 narrow; 9/10 broad at mt=64) |
+| 6 | 0.1587 | 0.1713 | (10/10 broad; 3/3 narrow at mt=128) |
+
+K=4 stable at ~0.32 tok/s at long context — +87% vs K=6 (0.17). The
+trade is K=4's 9/10 broad quality vs K=6's 10/10 broad quality.
+
+Productionization tiering (final):
+- K=4: throughput-max, low-temp, 9/10 broad quality, **0.32 tok/s** sustained
+- K=6: universal best, any temp, 10/10 broad quality, **0.17 tok/s** sustained
+- K=8: ref, 8/10 broad quality, 0.10 tok/s sustained
+
+Bench: `experiments/025_k4_mt128/bench_k4_mt128.jsonl`
+
+K-tuning Pareto is now FULLY characterized. Next iter: genuinely new bucket (A8 KV bf16, or another non-K direction).
+
+---
+
 ## 024 — K=6 mt=128 sustained = 0.1713 tok/s, 3/3 quality (2026-05-18 ~07:31 PT)
 
 K=6 at very-long context (128 tokens): 0.1713 tok/s, perfect quality
