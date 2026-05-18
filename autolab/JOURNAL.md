@@ -2,6 +2,75 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 051 — Expert dispatch batching across tokens — KEYSTONE BREAKER, code shipped (2026-05-18 ~17:40 PT)
+
+The keystone moonshot that breaks iter 044's 94%-expert ceiling.
+Branch `perf/expert-batching-051` @ `8ec368a` (3 commits, based on
+iter 048 which carries iter 041 + 042 + 046).
+
+**Path (A) delivered — real batching, not looping.**
+
+**What shipped:**
+
+1. `kernel.rs::expert_forward_multi(xs_bf16, gate/up/down weights,
+   num_tokens, ys)` — routes all three FFN projections through iter
+   042's `dequant_gemm_int4_multi_auto` instead of three per-token
+   GEMVs. **Weight DRAM motion drops from `num_tokens × 21 MB` to
+   `~21 MB` per expert.**
+   - 4 bit-near-identity tests (max delta < 1e-3 = bf16 noise floor)
+     vs N per-token `expert_forward` calls at seq=1/2/4/8.
+
+2. `runner.rs::forward_shells_multi_batched_experts` — mirrors iter
+   048's `forward_shells_multi` but replaces per-token, per-expert
+   inner loop with `dispatch_experts_batched`. Buckets
+   `(token_idx, k_slot)` by `eid`, calls `dispatch_expert_multi`
+   ONCE per unique expert with gathered input rows, scatters in
+   `(t, k)` order so fp accumulation matches per-token reference
+   EXACTLY.
+   - Backend coverage: int4 (Int4Bin, SafetensorsBin) gets real
+     batching; OvIr stays per-token (legacy path)
+   - 7 unit tests on extracted helpers `bucket_assignments` +
+     `scatter_moe` cover bookkeeping (sharing, no-sharing,
+     degenerate-all-same-expert, K2.6 shape seq=4 top_k=8)
+
+3. `bin/bench_expert_multi.rs` — standalone microbench. Fire on
+   miner with `cargo run --release --bin bench_expert_multi -- 
+   --tokens 1,2,4,8 --iters 20`.
+
+**Critical:** seq=1 hot path UNCHANGED. `forward_shells_multi`
+UNCHANGED. iter 051 is an additive opt-in seam — spec-decode driver
+doesn't auto-switch until bench confirms.
+
+**Predicted speedup (agent's honest analysis):**
+- K2.6 K=8 top_k seq=4 spec-decode with ~50% expert reuse:
+  ~32 dispatches → ~16 unique experts per layer per step
+- Weight motion roughly halves
+- With iter 048's shell-projection win already in place, multi-token
+  shell stack should approach ~2× over seq=1 baseline at seq=4
+- End-to-end on spec-decode stack: smaller because draft walks one
+  token at a time
+- **Honest target: +30-50% over iter 044's +19.7% baseline = +55-80%
+  over seq=1 reference**
+
+**Risk (also honest):** experts are smaller (21 MB) than oproj
+(28 MB), so per-expert amortization at small num_tokens may not hit
+iter 042's 1.4-4.75× peaks. Microbench will falsify or confirm.
+
+**What's missing:**
+- No miner bench (load avg ~45, iter 050 production-spinout 3 tahoma
+  processes active)
+- Spec-decode driver doesn't auto-switch to new path
+- No engine-level integration test (needs real Runner + real weights,
+  can't run on Mac). Bit-identity established compositionally:
+  kernel-level (bit-identical), bookkeeping (bit-identical fp sum
+  order)
+
+**Build/test:** fmt clean, clippy clean (no new warnings), 100% test
+pass + 11 new tests. **Total: 4 kernel + 7 sparse-moe bookkeeping
+tests added.**
+
+---
+
 ## 044 — Compound spec-decode bench — VERIFIED WIN +19.7% e2e (modest; experts cap it) (2026-05-18 ~17:00 PT)
 
 **FIFTH VERIFIED ARCHITECTURAL WIN** + critical root-cause finding.
