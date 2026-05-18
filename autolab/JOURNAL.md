@@ -2,6 +2,20 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 020 — K=5 at temp=0.7 borderline (6/10) — confirms K=6 is temp threshold (2026-05-18 ~03:36 PT)
+
+K × temp=0.7:
+- K=4: 5/10 fragile
+- K=5: 6/10 borderline
+- K=6: 8/10 robust ← threshold
+- K=8: 8/10 ref
+
+K=5 too close to K=4 cliff. **K=6 is the safe high-temp default.**
+
+Bench: `experiments/020_k5_temp07/bench_k5_temp07.jsonl`
+
+---
+
 ## 019 — K=6 at temp=0.7 = TEMP-ROBUST WIN (8/10 matches K=8, +75% tps) (2026-05-18 ~02:57 PT)
 
 K-tiering productionization recommendation:
