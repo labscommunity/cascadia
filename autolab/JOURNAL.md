@@ -2,6 +2,49 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 034 — A8+C1 combined bench — MERGE LANDED + Windows C1 gap discovered (bench incomplete) (2026-05-18 ~14:30 PT)
+
+Mixed result: the merge succeeded, but the agent died mid-bench
+(incomplete final message). **Key discovery: C1 prefetch only works
+on Unix.**
+
+Branch `perf/a8-c1-combined-bench-034` (pushed):
+- `181e2de` Merge perf/c1-expert-prefetch-029 → branch
+- `8713929` fix(c1-prefetch): cfg(unix) gate madvise so Windows builds
+- (no bench commit — agent ran out of context)
+
+**Windows C1 gap (agent's commit body, verbatim):**
+> memmap2's Advice and advise_range are #[cfg(unix)] only — Windows
+> has PrefetchVirtualMemory with similar semantics but it's not wired
+> up yet. The C1 prefetcher thread, queue, and telemetry still ship
+> unchanged; on Windows each advise_willneed call is a no-op (same
+> effect as TAHOMA_EXPERT_PREFETCH=0 at the source level).
+>
+> Implication for the matias bench: C1 contributes zero on Windows,
+> so the 'combined' run effectively measures A8 alone there. Adding
+> the Win32 path is a separate change (windows-sys dep +
+> cfg(windows) arm).
+
+**Pre-death observation:** "3600 prefetches in 15 calls. Total ~3.7s
+per token now." If real, that's ~0.27 tok/s vs baseline 0.111
+(2-box) — but C1 was a no-op on Windows, so any speedup would be
+from A8 alone or measurement noise. Unverified; the agent's death
+prevented a clean A/B.
+
+**Two follow-ups identified:**
+1. **Port C1 to Windows** using `PrefetchVirtualMemory` (windows-sys
+   crate). New moonshot — C1 currently only earns its +27% on Linux
+   (miner). The headline 2-box demo runs on Windows.
+2. **Re-run combined bench on miner** where C1 actually works. The
+   merge is clean; just needs a clean Linux substrate. Defer until
+   F5 bench (iter 037) finishes — they'd contend.
+
+**State:** branch is mergeable as-is for Linux deployments. Don't
+ship to matias 2-box until C1 Windows port lands or document the
+no-op behavior clearly.
+
+---
+
 ## 036 — Speculative decode foundation (n-gram draft + simulation-verified) (2026-05-18 ~14:15 PT)
 
 Real foundation, no throughput win yet. Branch
