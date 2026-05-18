@@ -42,6 +42,36 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Head tensor parallelism. When `true` and `total > 1`, the
+    /// lm_head matrix is split across all ranks along the vocab dim
+    /// using [`tahoma_int4_gemm::head::even_vocab_split`]. Each rank
+    /// loads its slice from safetensors at startup; the non-sampling
+    /// ranks emit `HeadPartial` frames upstream for the sampling rank
+    /// to concatenate before sampling.
+    ///
+    /// Default `false` keeps the legacy single-rank head behavior on
+    /// the existing 2-box matias pipeline, where the wire RTT for the
+    /// extra HeadPartial frame may exceed the head-compute savings on
+    /// the relayed Tailscale-over-Mac topology. Enable explicitly when
+    /// running on a LAN fleet with sub-10ms cross-host RTT, or for
+    /// single-stage benches to isolate head-only timing.
+    pub enable_head_tp: bool,
+    /// Force the Rust head (RMSNorm + lm_head via
+    /// [`tahoma_int4_gemm::HeadSlice`]) instead of the OV head IR,
+    /// even in single-stage mode. This is the substrate used for
+    /// **measuring head-only timing in isolation** — a clean A/B
+    /// against the existing OV head — without needing the multi-stage
+    /// driver back-channel that head TP requires.
+    ///
+    /// Default `false` preserves the existing OV head path.
+    ///
+    /// In multi-stage mode this is implied by `enable_head_tp` (each
+    /// rank loads its slice; the sampling rank sources its own slice's
+    /// gemv from `HeadSlice`). In single-stage mode, setting this
+    /// allocates the FULL vocab slice on the rank (memory cost ≈ 2.3
+    /// GB bf16 for K2.6), and the engine routes head forward through
+    /// `Runner::forward_head_last_rust`.
+    pub force_rust_head: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +83,31 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            enable_head_tp: false,
+            force_rust_head: false,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    /// Opt-in to head tensor parallelism. Off by default. See
+    /// [`SparseMoEBuilderConfig::enable_head_tp`] for the wire / RTT
+    /// trade-off.
+    pub fn with_head_tp(mut self, enabled: bool) -> Self {
+        self.enable_head_tp = enabled;
+        self
+    }
+
+    /// Force the Rust head (RMSNorm + lm_head via `HeadSlice`) instead
+    /// of the OV head IR. Off by default. Useful in single-stage benches
+    /// to measure head-only timing without the OV per-call overhead. See
+    /// [`SparseMoEBuilderConfig::force_rust_head`] for details.
+    pub fn with_force_rust_head(mut self, enabled: bool) -> Self {
+        self.force_rust_head = enabled;
         self
     }
 }
@@ -197,11 +246,48 @@ impl Builder for SparseMoEBuilder {
             layer_start = 0;
             layer_end = u32::MAX;
         }
+        // Head tensor parallelism: when enabled and multi-stage,
+        // partition the vocab dim across all ranks. Single-stage
+        // (total == 1) holds the full head regardless — there's nothing
+        // to parallelize against. `force_rust_head` is the
+        // single-stage-friendly knob that allocates the FULL vocab slice
+        // on this rank for an A/B against the OV head.
+        let head_vocab_range = if self.config.enable_head_tp && total > 1 {
+            let manifest = crate::manifest::Manifest::load(&self.config.model_dir)
+                .map_err(|e| EngineError::Backend(format!("read manifest for head TP: {e}")))?;
+            let (vs, ve) =
+                tahoma_int4_gemm::head::even_vocab_split(manifest.vocab_size as usize, rank, total);
+            info!(
+                rank,
+                total,
+                vocab_start = vs,
+                vocab_end = ve,
+                slice_rows = ve - vs,
+                "head TP enabled: computed vocab split"
+            );
+            Some((vs as u32, ve as u32))
+        } else if self.config.force_rust_head {
+            let manifest =
+                crate::manifest::Manifest::load(&self.config.model_dir).map_err(|e| {
+                    EngineError::Backend(format!("read manifest for force_rust_head: {e}"))
+                })?;
+            info!(
+                vocab_size = manifest.vocab_size,
+                "force_rust_head: loading FULL vocab slice (Rust head replaces OV head)"
+            );
+            Some((0u32, manifest.vocab_size))
+        } else {
+            if self.config.enable_head_tp && total == 1 {
+                warn!("enable_head_tp=true ignored for single-stage (total=1) — set force_rust_head=true instead, or run multi-stage");
+            }
+            None
+        };
         let range = LayerRange {
             layer_start,
             layer_end,
             is_first,
             is_last,
+            head_vocab_range,
         };
 
         let cfg = self.config.clone();
@@ -644,6 +730,48 @@ impl SparseMoEEngine {
     /// Run one (prefill or decode) step on rank 0: embed via layer 0,
     /// run my shells, send hidden state downstream, receive the
     /// sampled token back along the same socket.
+    ///
+    /// **Head TP integration design (deferred; this branch ships the
+    /// wire frame + per-rank head_slice loading; runtime wiring needs a
+    /// back-channel from rank-1 to rank-0 that the current 2-box
+    /// matias topology cannot serve cheaply):**
+    ///
+    /// When `enable_head_tp` is on, this method also needs to dispatch
+    /// rank-0's HeadSlice GEMV on the *post-final-RMSNorm* hidden state
+    /// produced by rank-1. The constraint is that the hidden state
+    /// rank-0's slice operates on is the FULL post-shells hidden after
+    /// rank-1's last layer (each rank only owns half the layers), so
+    /// rank-0 has to wait for rank-1's shells to finish.
+    ///
+    /// Concrete protocol extension:
+    ///   1. rank-0 sends Forward(hidden_after_my_shells) to rank-1.
+    ///   2. rank-1 runs its shells. **NEW:** rank-1 sends back a
+    ///      NormedHidden frame (~28 KB f32 or 14 KB bf16 over the wire)
+    ///      containing `final_norm(h_after_rank1_shells)`.
+    ///   3. rank-0 runs its HeadSlice GEMV against the normed hidden.
+    ///      In parallel, rank-1 runs ITS HeadSlice GEMV against the
+    ///      same normed hidden.
+    ///   4. rank-0 sends HeadPartial(vocab[0..mid], logits_lower) to
+    ///      rank-1.
+    ///   5. rank-1 receives HeadPartial, concats with its own
+    ///      vocab[mid..end] partial, samples, sends Token.
+    ///
+    /// Why we defer the runtime wiring on this branch:
+    ///   - The 2-box matias topology runs over an SSH-tunnel chain
+    ///     with ~117 ms RTT (iter 029-infra). One extra round-trip
+    ///     (NormedHidden + HeadPartial) costs >200 ms vs the ~70 ms
+    ///     theoretical savings on the 139 ms head compute. Net negative
+    ///     on the only currently-revived 2-box pipeline.
+    ///   - The LAN fleet (beta/charlie/alpha) doesn't have the K2.6
+    ///     model checked out — transfer is ~14 hr/box.
+    ///   - Multi-agent miner contention means we cannot reliably bench
+    ///     even the in-process variant right now.
+    ///
+    /// The plumbing this commit ships (`enable_head_tp` config +
+    /// `head_vocab_range` + `HeadSlice` construction + wire frame) is
+    /// the prerequisite layer. The runtime trigger is intentionally a
+    /// no-op below; a follow-up commit on a LAN-deployed branch can
+    /// activate the back-channel without changing the wire format.
     fn forward_one_token_first(
         &mut self,
         history: &[i64],

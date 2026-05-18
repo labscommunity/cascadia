@@ -93,6 +93,9 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::Token => {
                 println!("[server] unexpected TOKEN from upstream — ignoring");
             }
+            FrameKind::HeadPartial => {
+                println!("[server] unexpected HEAD_PARTIAL from upstream — ignoring (head TP not exercised by this example)");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");

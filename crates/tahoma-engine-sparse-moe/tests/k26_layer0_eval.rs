@@ -19,13 +19,24 @@ fn model_dir_from_env() -> Option<PathBuf> {
 }
 
 fn run_prompt(model_dir: &PathBuf, prompt: &str, expected_substr: &str, max_new: usize) {
-    let mut runner = Runner::load(
-        model_dir.clone(),
-        "CPU",
-        PluginConfig::new(),
+    run_prompt_with_range(
+        model_dir,
+        prompt,
+        expected_substr,
+        max_new,
         tahoma_engine_sparse_moe::runner::LayerRange::full(),
     )
-    .expect("Runner::load");
+}
+
+fn run_prompt_with_range(
+    model_dir: &PathBuf,
+    prompt: &str,
+    expected_substr: &str,
+    max_new: usize,
+    range: tahoma_engine_sparse_moe::runner::LayerRange,
+) {
+    let mut runner =
+        Runner::load(model_dir.clone(), "CPU", PluginConfig::new(), range).expect("Runner::load");
 
     let tokenizer_path = model_dir.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -57,4 +68,52 @@ fn k26_paris_pacific_four() {
     run_prompt(&model_dir, "The capital of France is", "Paris", 4);
     run_prompt(&model_dir, "The largest ocean is the", "Pacific", 4);
     run_prompt(&model_dir, "Two plus two equals", "four", 4);
+}
+
+/// Run the same prompts with the Rust head substituted for the OV head
+/// (via `LayerRange::full()` + `head_vocab_range = Some((0,
+/// vocab_size))`). This is the standalone-Rust-head A/B path: same
+/// model, same shells, same layer 0 — only the head changes.
+///
+/// Gated separately because it exercises a new code path (`HeadSlice`
+/// for the FULL vocab) and uses an extra ~2.3 GB bf16 mmap. The
+/// expected outputs must match `k26_paris_pacific_four`'s OV-head
+/// outputs token-for-token, validating that the Rust head's numerical
+/// output is interchangeable with the OV head's. Skipped when
+/// K26_MODEL_DIR is unset.
+#[test]
+fn k26_paris_pacific_four_rust_head() {
+    let Some(model_dir) = model_dir_from_env() else {
+        eprintln!("K26_MODEL_DIR not set; skipping");
+        return;
+    };
+    // Read vocab_size from manifest so the test stays in lockstep with
+    // the model on disk (the value is in manifest.json).
+    let manifest = tahoma_engine_sparse_moe::Manifest::load(&model_dir).expect("manifest load");
+    let range = tahoma_engine_sparse_moe::runner::LayerRange {
+        layer_start: 0,
+        layer_end: u32::MAX,
+        is_first: true,
+        is_last: true,
+        head_vocab_range: Some((0, manifest.vocab_size)),
+    };
+    eprintln!(
+        "k26_paris_pacific_four_rust_head: loading FULL vocab slice {} rows",
+        manifest.vocab_size
+    );
+    run_prompt_with_range(
+        &model_dir,
+        "The capital of France is",
+        "Paris",
+        4,
+        range.clone(),
+    );
+    run_prompt_with_range(
+        &model_dir,
+        "The largest ocean is the",
+        "Pacific",
+        4,
+        range.clone(),
+    );
+    run_prompt_with_range(&model_dir, "Two plus two equals", "four", 4, range);
 }

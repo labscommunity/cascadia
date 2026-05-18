@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use half::bf16;
+use tahoma_int4_gemm::head::HeadSlice;
 use tahoma_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
 };
@@ -181,12 +182,26 @@ impl Int4BinExpertCache {
 /// (1-based, matching the manifest convention) this Runner is
 /// responsible for. The dense layer 0 is implicit and tracked
 /// separately via `is_first` (only rank 0 needs it).
+///
+/// `head_vocab_range` controls **head tensor parallelism**: when
+/// `Some((start, end))`, this rank loads the `lm_head` row slice
+/// `[start..end]` from safetensors and constructs a `HeadSlice` next to
+/// (or instead of) the OV head IR. The non-sampling rank uses its slice
+/// purely as a partial-logits computer (sends a `HeadPartial` upstream);
+/// the sampling rank concatenates its peers' partials with its own
+/// slice's output before sampling. `None` means this rank does NOT
+/// participate in head TP — the legacy behavior where the sampling rank
+/// runs the full head IR alone.
 #[derive(Clone, Debug)]
 pub struct LayerRange {
     pub layer_start: u32,
     pub layer_end: u32,
     pub is_first: bool,
     pub is_last: bool,
+    /// Optional `(vocab_start, vocab_end)` — when set, this rank loads
+    /// the corresponding slice of `lm_head.weight` and constructs a
+    /// `HeadSlice`. Default `None` preserves the single-rank head path.
+    pub head_vocab_range: Option<(u32, u32)>,
 }
 
 impl LayerRange {
@@ -197,8 +212,21 @@ impl LayerRange {
             layer_end: u32::MAX,
             is_first: true,
             is_last: true,
+            head_vocab_range: None,
         }
     }
+}
+
+/// Per-rank head state: pinned safetensors slices + the HeadSlice the
+/// kernel runs against. Pins keep the mmaps alive as long as the slice
+/// references in HeadSlice are in use.
+struct HeadSliceState {
+    /// `[hidden]` bf16 final-norm weight mmap pin.
+    _norm_pin: Arc<Shard>,
+    /// `[(vocab_end - vocab_start), hidden]` bf16 lm_head row-slice
+    /// mmap pin.
+    _weights_pin: Arc<Shard>,
+    slice: HeadSlice,
 }
 
 /// Main inference runner.
@@ -210,6 +238,17 @@ pub struct Runner {
     pub range: LayerRange,
     layer0: Option<Layer0State>,
     head: Option<Runtime>,
+    /// Optional Rust head slice. When set, this rank participates in
+    /// head tensor parallelism — either as the sampling rank (which
+    /// also still has `head` for legacy/full-vocab paths in this
+    /// transitional design) or as a non-sampling slice owner.
+    ///
+    /// Mutually-exclusive with `head` is NOT enforced here: the
+    /// transitional v1 keeps both so the engine can fall back to the
+    /// OV head on errors. A future iteration can remove `head` entirely
+    /// from the sampling rank once the Rust head matches OV head output
+    /// numerically on a long bench.
+    head_slice: Option<HeadSliceState>,
     layers: Vec<LayerState>,
     experts: ExpertCache,
     /// Shared safetensors handle used to construct each Int4Shell at
@@ -268,6 +307,8 @@ impl Runner {
             info!("skipping head (not last stage)");
             None
         };
+        // head_slice construction is deferred until after the
+        // safetensors source is open, below.
 
         // Shells always come from safetensors now (the OV shell IRs are
         // numerically broken for K2.6 — see k26_output_divergence). The
@@ -283,6 +324,44 @@ impl Runner {
             SafetensorsExpertSource::open(st_dir)
                 .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
         );
+
+        // Construct the Rust HeadSlice (if requested by
+        // range.head_vocab_range). This is the substrate for head
+        // tensor parallelism — each rank loads only its vocab slice of
+        // lm_head, runs RMSNorm + GEMV on its slice, and the sampling
+        // rank concatenates partials before sampling. See
+        // crates/tahoma-int4-gemm/src/head.rs for the math contract +
+        // numerical guarantees.
+        let head_slice = if let Some((vs, ve)) = range.head_vocab_range {
+            let vs = vs as usize;
+            let ve = ve as usize;
+            let hidden = manifest.hidden_size as usize;
+            let vocab = manifest.vocab_size as usize;
+            if ve <= vs || ve > vocab {
+                return Err(RunnerError::Internal(format!(
+                    "head_vocab_range {vs}..{ve} out of range for vocab_size {vocab}"
+                )));
+            }
+            let (norm_pin, norm_bytes) = safetensors_source
+                .final_norm()
+                .map_err(|e| RunnerError::Internal(format!("safetensors norm: {e}")))?;
+            let (weights_pin, weights_bytes) = safetensors_source
+                .lm_head_slice(vs, ve, hidden)
+                .map_err(|e| RunnerError::Internal(format!("safetensors lm_head_slice: {e}")))?;
+            let slice = HeadSlice::new(vs, ve, hidden, norm_bytes, weights_bytes);
+            info!(
+                "constructed Rust head slice vocab[{vs}..{ve}] = {} rows ({:.1} MiB bf16)",
+                ve - vs,
+                ((ve - vs) * hidden * 2) as f64 / (1024.0 * 1024.0)
+            );
+            Some(HeadSliceState {
+                _norm_pin: norm_pin,
+                _weights_pin: weights_pin,
+                slice,
+            })
+        } else {
+            None
+        };
 
         if range.is_first {
             // Construct dense layer 0 from safetensors. The old OV IR
@@ -389,6 +468,7 @@ impl Runner {
             range,
             layer0: layer0_holder,
             head,
+            head_slice,
             layers,
             experts,
             _safetensors_source: safetensors_source,
@@ -514,8 +594,26 @@ impl Runner {
         // 2) Run all my shells.
         let h_f32 = self.forward_shells(&h_f32, &h_shape, past_seq_len)?;
 
-        // 3) Head on the LAST token.
-        self.forward_head_last(&h_f32, tail_len)
+        // 3) Head on the LAST token. When a HeadSlice covers the FULL
+        // vocab (set via `force_rust_head` or single-stage head TP),
+        // we route through the Rust head — the OV head IR is bypassed
+        // entirely. Otherwise (the legacy default), we use the OV head.
+        if self.head_slice_covers_full_vocab() {
+            self.forward_head_last_rust(&h_f32, tail_len)
+        } else {
+            self.forward_head_last(&h_f32, tail_len)
+        }
+    }
+
+    /// True when this rank holds a HeadSlice that covers the entire
+    /// vocab — i.e. it can produce final logits on its own without
+    /// gathering partials. Used by `step` to pick between the OV head
+    /// and the Rust head.
+    fn head_slice_covers_full_vocab(&self) -> bool {
+        match self.head_slice.as_ref() {
+            Some(hs) => hs.slice.slice_len() == self.manifest.vocab_size as usize,
+            None => false,
+        }
     }
 
     /// Run one stateful step of layer 0 for a single token, updating
@@ -672,6 +770,79 @@ impl Runner {
         }
 
         Ok(h_f32)
+    }
+
+    /// Returns this rank's head vocab slice, or `None` when head TP is
+    /// not enabled for this rank. Used by the engine to decide whether
+    /// to dispatch a `forward_head_partial` and emit a `HeadPartial`
+    /// frame upstream alongside the existing `Forward` round-trip.
+    pub fn head_vocab_range(&self) -> Option<(u32, u32)> {
+        self.head_slice
+            .as_ref()
+            .map(|s| (s.slice.vocab_start as u32, s.slice.vocab_end as u32))
+    }
+
+    /// Single-rank Rust head forward — `forward_head_last` equivalent
+    /// using the safetensors-backed `HeadSlice` instead of the OV head
+    /// IR. Used in single-stage mode when the caller has set up
+    /// `head_vocab_range = Some((0, vocab_size))` to run the entire head
+    /// through the Rust path. Returns the full `[vocab_size]` logits.
+    ///
+    /// Errors if `head_slice` is not set or if the slice doesn't cover
+    /// the full vocab (a partial slice is by definition incomplete and
+    /// only useful as a `HeadPartial` body).
+    pub fn forward_head_last_rust(
+        &self,
+        h_f32: &[f32],
+        tail_len: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hs = self.head_slice.as_ref().ok_or_else(|| {
+            RunnerError::Internal("forward_head_last_rust: head_slice not constructed".into())
+        })?;
+        let hidden = self.manifest.hidden_size as usize;
+        let vocab = self.manifest.vocab_size as usize;
+        if hs.slice.slice_len() != vocab {
+            return Err(RunnerError::Internal(format!(
+                "forward_head_last_rust requires a full-vocab head_slice; got slice [{}..{}] = {} rows, vocab_size = {}",
+                hs.slice.vocab_start,
+                hs.slice.vocab_end,
+                hs.slice.slice_len(),
+                vocab
+            )));
+        }
+        if tail_len == 0 || h_f32.len() < tail_len * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_head_last_rust: tail_len={tail_len} h.len={} hidden={hidden}",
+                h_f32.len(),
+            )));
+        }
+        let last_off = (tail_len - 1) * hidden;
+        let last_h = &h_f32[last_off..last_off + hidden];
+        Ok(hs.slice.forward_partial(last_h))
+    }
+
+    /// Compute this rank's *partial* logits over its vocab slice,
+    /// starting from a `[hidden]` input vector that is the post-shells
+    /// hidden state for the last position. Skips the OV head IR
+    /// entirely.
+    ///
+    /// Used by the non-sampling rank in head TP — it computes its
+    /// slice's contribution and sends it upstream via `HeadPartial`.
+    ///
+    /// `h_f32` must be `[hidden]` exactly. Errors if head TP is not
+    /// enabled on this rank.
+    pub fn forward_head_partial(&self, h_f32: &[f32]) -> Result<Vec<f32>, RunnerError> {
+        let hs = self.head_slice.as_ref().ok_or_else(|| {
+            RunnerError::Internal("forward_head_partial: head TP not enabled on this rank".into())
+        })?;
+        let hidden = self.manifest.hidden_size as usize;
+        if h_f32.len() != hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_head_partial: h.len {} != hidden {hidden}",
+                h_f32.len()
+            )));
+        }
+        Ok(hs.slice.forward_partial(h_f32))
     }
 
     /// Take the last position of `h_f32` (shape `[1, tail_len, hidden]`,
