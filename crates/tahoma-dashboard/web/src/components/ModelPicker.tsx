@@ -45,21 +45,18 @@ export function ModelPicker({ value, onChange }: Props) {
   if (models.length === 0) {
     return <span className="label-mono">no models loaded</span>;
   }
-  if (models.length === 1) {
-    return (
-      <div className="flex items-center gap-2">
-        <span className="label-mono">Model</span>
-        <span className="font-mono text-[13px] text-ink">{models[0].id}</span>
-      </div>
-    );
-  }
+  // Always render the <select> — even with a single model. The dropdown
+  // affordance signals "this is a control you can interact with" and
+  // future-proofs against multi-model coordinators without a code path
+  // change. With one entry the user just sees the model name plus a
+  // disabled-looking chevron, which is fine.
   return (
     <label className="flex items-center gap-2">
       <span className="label-mono">Model</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="font-mono text-[13px] text-ink bg-transparent border border-rule rounded-sm px-2 py-0.5 focus:outline-none focus:border-persian"
+        className="font-mono text-[13px] text-ink bg-paper border border-rule rounded-sm px-2 py-1 focus:outline-none focus:border-persian hover:border-pine transition-colors"
       >
         {models.map((m) => (
           <option key={m.id} value={m.id}>
