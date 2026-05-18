@@ -1117,10 +1117,21 @@ impl Runner {
             // `history` + KV represent the accepted prefix (NOT
             // including the bonus — we append it explicitly below
             // so the EOS check can roll it back cleanly).
+            //
+            // `pending_token_in_history=true`: this driver pre-pushes
+            // `first_gen` to history before round 1 and appends each
+            // round's `bonus` to history at end-of-round — both ride
+            // ahead of KV by 1 slot. The K-loop's first verify forward
+            // catches up the pending token's KV slot as a side effect,
+            // so the helper must rewind one LESS than the clean
+            // convention. See `spec_decode::reconcile_after_round` for
+            // the convention contract and the pending-token regression
+            // tests added in fix/spec-decode-reconcile-off-by-one-043.
             let r = crate::spec_decode::reconcile_after_round(
                 drafts.len(),
                 accepted,
                 bonus_forward_ran,
+                true,
             );
             if r.history_pop > 0 {
                 history.truncate(history.len() - r.history_pop);
@@ -1136,6 +1147,7 @@ impl Runner {
             // first forward writes its slot — so no KV undo needed for
             // the bonus itself).
             let mut hit_eos = false;
+            let mut bonus_pushed_to_history = false;
             for &t in drafts.iter().take(accepted) {
                 if eos.contains(&t) {
                     hit_eos = true;
@@ -1154,13 +1166,26 @@ impl Runner {
                     history.push(bonus);
                     draft.append(bonus);
                     generated.push(bonus);
+                    bonus_pushed_to_history = true;
                 }
             }
 
-            // Debug invariant: every layer's past_seq_len should match
-            // history.len() if we got the rewind math right. Strip
-            // from prod paths.
-            debug_assert!(self.kv_invariant_holds(&history), "KV invariant broken");
+            // Debug invariant: every layer's past_seq_len should trail
+            // history.len() by exactly 1 when the bonus rode through
+            // (the next round's first verify forward will fill its
+            // slot), and by 0 when we cut the round short (EOS hit, or
+            // max_tokens saturated before the bonus push). Strip from
+            // prod paths.
+            //
+            // Convention contract: this matches the
+            // `pending_token_in_history=true` convention
+            // `reconcile_after_round` uses; see its docs for the full
+            // mathematical statement.
+            let expected_drift = if bonus_pushed_to_history { 1 } else { 0 };
+            debug_assert!(
+                self.kv_invariant_holds(&history, expected_drift),
+                "KV invariant broken (expected drift {expected_drift})"
+            );
 
             if hit_eos {
                 break;
@@ -1184,10 +1209,21 @@ impl Runner {
 
     /// Debug helper used by `generate_speculative` to assert all layers
     /// agree on past_seq_len, and that it matches the public history
-    /// length. Returns true on agreement, false otherwise. Public so the
-    /// unit tests in `crate::spec_decode` can call it.
-    pub fn kv_invariant_holds(&self, history: &[i64]) -> bool {
-        let target = history.len();
+    /// length minus `pending_drift`. Returns true on agreement, false
+    /// otherwise. Public so the unit tests in `crate::spec_decode` can
+    /// call it.
+    ///
+    /// `pending_drift = 0` is the "clean" invariant (KV == history.len)
+    /// used by `generate`. `pending_drift = 1` is the spec-decode
+    /// runner / pipeline-parallel convention where history pre-pushes
+    /// `first_gen` (and each round's `bonus`) ahead of KV by one slot;
+    /// the next forward will catch the slot up. See
+    /// [`crate::spec_decode::reconcile_after_round`] for the contract.
+    pub fn kv_invariant_holds(&self, history: &[i64], pending_drift: usize) -> bool {
+        if history.len() < pending_drift {
+            return false;
+        }
+        let target = history.len() - pending_drift;
         if let Some(l0) = self.layer0.as_ref() {
             if l0.past_seq_len != target {
                 return false;

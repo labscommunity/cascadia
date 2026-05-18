@@ -962,42 +962,28 @@ impl SparseMoEEngine {
             // rewind KV so the next round's past_seq_len_start matches
             // the rank-0 KV state.
             //
-            // We compute the rewind directly instead of using
-            // `spec_decode::reconcile_after_round`, which (in its
-            // current form) is off-by-one for the convention used here:
-            // history pre-pushes `first_gen` before the K-loop and we
-            // append `bonus` AFTER the K-loop, so the post-round trail
-            // between history.len() and KV must be 1 (the bonus's
-            // pending slot, which the next round's first forward will
-            // fill). The helper assumes history holds no trailing
-            // unforwarded token. See [`spec_decode::reconcile_after_round`]
-            // tests, which use a no-first-gen convention.
-            //
-            // Partial accept (A < K, no bonus forward):
-            //   pre-round: history.len() = N, KV = N-1 (first_gen pending).
-            //   after K verifies: history.len() = N+K, KV = N+K-1.
-            //   want: history.len() = N+A+1 (drop K-A drafts + push bonus),
-            //         KV = N+A (the bonus's slot is pending).
-            //   pop = K-A, rewind = (N+K-1) - (N+A) = K-A-1.
-            //
-            // All accepted (A == K, bonus forward ran):
-            //   pre-round: history.len() = N, KV = N-1.
-            //   after K verifies: history.len() = N+K, KV = N+K-1.
-            //   after bonus forward: KV = N+K.
-            //   want: history.len() = N+K+1 (push bonus, no drops),
-            //         KV = N+K (the bonus's slot is pending).
-            //   pop = 0, rewind = 0.
-            let pop = drafts.len() - accepted;
-            let rewind = if bonus_forward_ran {
-                0
-            } else {
-                drafts.len() - accepted - 1
-            };
-            if pop > 0 {
-                history.truncate(history.len() - pop);
+            // We defer to `spec_decode::reconcile_after_round` with
+            // `pending_token_in_history=true`, the runner / pipeline-
+            // parallel convention: history pre-pushes `first_gen`
+            // before the K-loop and we append `bonus` AFTER the K-loop,
+            // so the post-round trail between history.len() and KV
+            // must be 1 (the bonus's pending slot, which the next
+            // round's first forward will fill). The helper's contract
+            // documents the same K-A-1 (partial) / 0 (all-accepted)
+            // arithmetic this driver historically computed inline; see
+            // fix/spec-decode-reconcile-off-by-one-043 for the
+            // regression tests covering this path.
+            let r = crate::spec_decode::reconcile_after_round(
+                drafts.len(),
+                accepted,
+                bonus_forward_ran,
+                true,
+            );
+            if r.history_pop > 0 {
+                history.truncate(history.len() - r.history_pop);
             }
-            if rewind > 0 {
-                self.runner.rewind_kv(rewind);
+            if r.kv_rewind > 0 {
+                self.runner.rewind_kv(r.kv_rewind);
             }
 
             let mut hit_eos = false;
