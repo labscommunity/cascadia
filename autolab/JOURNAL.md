@@ -2,6 +2,54 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 040 — Chunked prefill — SEAM SHIPPED, no perf win today (honest) (2026-05-18 ~14:55 PT)
+
+Branch `perf/chunked-prefill-040` @ `2a004cc`. Agent's honest framing:
+this is a foundation, not a measurable win — and the commit body says
+so explicitly.
+
+**What shipped:**
+- `--prefill-chunk-size N` CLI flag (default 0 = current behavior)
+- `SparseMoEBuilderConfig::prefill_chunk_size` + builder method
+- `Runner::prefill_chunk_size` accessors
+- `prefill_chunks(prompt_len, chunk_size) -> Vec<(start, end)>` pure
+  helper, shared between single-stage `Runner::generate` and
+  multi-stage rank-0 `drive_generation_first` (paths can't drift)
+- Outer chunk loop in both prefill drivers + per-chunk timing log
+- 8 unit tests on chunk-boundary arithmetic (incl. fuzz-style
+  partition check)
+
+**Honest caveat (verbatim from agent):**
+> Chunked prefill has no numerical effect today and no perf effect
+> today. The int4 shell kernel (shell_int4.rs:213) and int4 layer-0
+> kernel (layer0_int4.rs:163) in tahoma are seq=1 only — they don't
+> accept multi-token inputs. The outer chunk loop wraps the
+> unchanged token-by-token inner loop; same kernel call order, same
+> KV-write pattern, identical KV state at every position. Chunking
+> is purely observability + an engine-layer seam for a future
+> multi-token kernel or continuous-batching decode interleave to
+> hook into without re-plumbing the CLI / builder.
+
+**Rainier findings (load-bearing):**
+- `scripts/k26_sparse_moe_runner.py:638-654` — K2.6 reference loops
+  one token at a time because OV 2026.1.0 CPU snippets pass shape-
+  specializes on first call and mis-routes on subsequent shape
+  changes (this is why we don't have a multi-token kernel — it's an
+  OV runtime bug, not just laziness)
+- `scripts/cascadia_distributed_node.py:664-668` — Llama-8B
+  tile-fusing prefill experiment was a net loss at per-op overhead;
+  reverted to single-pass (precedent: multi-token kernels need
+  careful per-op amortization)
+
+**Workspace:** builds clean, fmt clean, clippy no new warnings,
+24-test sparse-moe suite passes, CLI smoke test passes.
+
+**What's left for a real win:** seq>N int4 shell kernel + layer-0
+kernel. Wire-in is trivial once kernels exist (swap inner
+`step(&history, 1)` for `step(&history, chunk_end - chunk_start)`).
+
+---
+
 ## 038 — C1 Windows port (PrefetchVirtualMemory) — CODE READY, bench gated on source-sync (2026-05-18 ~14:40 PT)
 
 Closes the iter 034 Windows gap. Branch `perf/c1-windows-port-038`

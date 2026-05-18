@@ -41,6 +41,7 @@ narrative.
 | 034 | 2026-05-18 | A8+C1 combined bench | merge + bench on live 2-box matias | **MERGE LANDED** (perf/a8-c1-combined-bench-034 @ 8713929), Windows C1 gap discovered (memmap2 Unix-only), bench incomplete (agent died); needs Windows port OR Linux re-bench | (incomplete) | (incomplete) |
 | 037 | 2026-05-18 | F5 bench retry | long-context windowed-attention bench (miner) | (in flight) | (pending) | (pending) |
 | 038 | 2026-05-18 | C1 Windows port | PrefetchVirtualMemory via windows-sys | **CODE READY** (perf/c1-windows-port-038 @ 77650ea): Mac + Windows MSVC + Windows GNU all build clean, 7/7 unit tests pass; bench gated on matias source-sync (~300 MB scp + rebuild) | (no bench) | (no bench) |
+| 040 | 2026-05-18 | chunked prefill | --prefill-chunk-size N CLI seam | **SEAM SHIPPED, NO PERF WIN** (perf/chunked-prefill-040 @ 2a004cc): int4 kernel still seq=1 so outer chunk loop wraps unchanged inner loop; foundation for future multi-token kernel. Agent honest in commit body. | (no perf change by design) | 24/24 tests pass |
 | 035 | 2026-05-18 | F5 bench | long-context windowed-attention bench | **FAILED** (API Error: Overloaded, 450 tokens before crash); will retry | — | — |
 | 036 | 2026-05-18 | spec-decode skeleton | n-gram Prompt-Lookup draft + accept/rewind in sparse-moe | **FOUNDATION** (perf/spec-decode-skeleton-034 @ acd21bd): 38 unit tests pass, simulation = bit-identical to sequential greedy; throughput win waits for ForwardBatch(K) wire frame | (no bench) | bit-identical to greedy (proven by sim test) |
 
