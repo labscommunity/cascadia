@@ -45,8 +45,11 @@ const GROUP_SIZE: usize = 32;
 /// `blocked_matches_iter042_multi_seq_8` test in
 /// `kernel_avx512_multi_blocked`), so the dispatch decision is purely
 /// performance — correctness is invariant.
+///
+/// Exposed at `pub(crate)` so `layer0_int4` can use the same dispatch
+/// table — keeps the shape-→-kernel mapping a single source of truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProjShape {
+pub(crate) enum ProjShape {
     /// Largest shape: N=7168, K=8192. Iter 046 wins +41% at seq>=4.
     Oproj,
     /// Second-largest where iter 046 also wins (N=7168, K=2048).
@@ -65,7 +68,7 @@ enum ProjShape {
 /// (its dispatcher will fall back to iter 042 at seq=2-3 internally).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn dispatch_int4_multi(
+pub(crate) fn dispatch_int4_multi(
     shape: ProjShape,
     packed: &[u8],
     scale_bits: &[u8],

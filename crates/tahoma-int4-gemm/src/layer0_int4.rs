@@ -18,7 +18,7 @@ use crate::shell::{
     INTERMEDIATE_DENSE, KV_LORA_RANK, NUM_HEADS, QK_HEAD_DIM, QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM,
     Q_LORA_RANK, V_HEAD_DIM,
 };
-use crate::shell_int4::quantize_int4_group;
+use crate::shell_int4::{dispatch_int4_multi, quantize_int4_group, ProjShape};
 
 /// All layer-0 weights in int4 + bf16 scales, layer-norms kept as bf16.
 pub struct Int4Layer0 {
@@ -380,9 +380,23 @@ pub struct MultiLayer0Outputs {
 /// Multi-token layer-0 forward — the seq>=1 entry point. The seq=1
 /// path ([`layer0_forward_decode_int4_with_capacity`]) is unchanged.
 ///
-/// Like [`crate::shell_int4::shell_forward_decode_int4_multi_with_capacity`],
-/// this is currently an internal scalar loop over `seq` sequential
-/// seq=1 calls — the API seam that future tiled-GEMM work plugs into.
+/// **Semantics.** Observationally identical to `seq` sequential calls
+/// of [`layer0_forward_decode_int4_with_capacity`] — same int4 GEMV
+/// math runs per token, in token order, with the KV cache updated
+/// after each step so the next token's attention sees it. The
+/// behavioral change is purely the API: outputs are concatenated
+/// across tokens, and `past_k` / `past_v` are written in place rather
+/// than returned.
+///
+/// **Bit-identity.** At seq=1 this delegates straight to the seq=1
+/// scalar reference path. At seq>=2 the per-projection GEMVs are
+/// batched into iter 042 / iter 046 SIMD multi-token tiles via
+/// [`crate::shell_int4::dispatch_int4_multi`]. Those tiles are
+/// bit-identical per cell to the scalar kernel — same FMA accumulation
+/// order, same dequant grouping — so the seq>=2 path produces
+/// byte-identical KV state and per-token hidden outputs as the scalar
+/// reference (proved by the `multi_layer0_seq_4_matches_*_iter048_dispatch`
+/// tests below).
 ///
 /// **Inputs.**
 /// - `xs_f32`: `[seq, HIDDEN]` flat, the per-token layer inputs
@@ -421,6 +435,45 @@ pub fn layer0_forward_decode_int4_multi_with_capacity(
     assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
     assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
 
+    // seq=1 hot path: delegate to the per-token kernel exactly once.
+    // Matches the shell wrapper's seq=1 shortcut — the multi-token tile
+    // pays a per-row scatter cost that doesn't amortize across a single
+    // token, and seq=1 is the dominant K2.6 decode path.
+    if seq == 1 {
+        return layer0_forward_decode_int4_multi_scalar(
+            layer,
+            xs_f32,
+            past_k,
+            past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+    }
+    layer0_forward_decode_int4_multi_batched(
+        layer,
+        xs_f32,
+        past_k,
+        past_v,
+        past_seq_len,
+        capacity,
+        seq,
+    )
+}
+
+/// Reference per-token scalar loop. Kept as the seq=1 fast path of
+/// [`layer0_forward_decode_int4_multi_with_capacity`] AND as the
+/// reference implementation for the bit-identity tests against
+/// [`layer0_forward_decode_int4_multi_batched`].
+pub fn layer0_forward_decode_int4_multi_scalar(
+    layer: &Int4Layer0,
+    xs_f32: &[f32],
+    past_k: &mut [f32],
+    past_v: &mut [f32],
+    past_seq_len: usize,
+    capacity: usize,
+    seq: usize,
+) -> MultiLayer0Outputs {
     let mut hidden_out = vec![0.0f32; seq * HIDDEN];
 
     for t in 0..seq {
@@ -433,6 +486,338 @@ pub fn layer0_forward_decode_int4_multi_with_capacity(
         write_present_kv_inplace(past_k, &outs.present_k, cur_past, capacity, QK_HEAD_DIM);
         write_present_kv_inplace(past_v, &outs.present_v, cur_past, capacity, V_HEAD_DIM);
         hidden_out[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&outs.hidden_out);
+    }
+
+    MultiLayer0Outputs { hidden_out }
+}
+
+/// Batched seq>=2 layer-0 forward. Structures the per-token work as
+/// three phases so the big dense projections can amortize their weight
+/// load across `seq` tokens via [`crate::shell_int4::dispatch_int4_multi`]:
+///
+/// **Phase A (batched projections, no KV).** Per-token `h_norm` →
+/// batched `q_a`, `kv_a` → per-token rmsnorm on the LoRA outputs →
+/// batched `q_b`, `kv_b`.
+///
+/// **Phase B (per-token, KV-dependent).** Per-token RoPE on q + k_rope,
+/// assemble `q_full` / `new_k` / `new_v`, SDPA against the running KV
+/// cache, append the new K/V into the cache so the next token sees them.
+///
+/// **Phase C (batched projections, no KV).** Batched `o_proj` on the
+/// stack of per-token `attn_outs` → per-token residual + post-norm →
+/// batched `gate_proj`, `up_proj` → per-token SwiGLU → batched
+/// `down_proj` → per-token residual.
+///
+/// **Why batching helps.** Every batched projection is a
+/// `[seq, K] x [K, N]` int4 GEMM that loads each packed weight byte
+/// once and FMAs it against `seq` token rows. At seq=4-16 the iter 042
+/// tile gives 1.4-4.75x per-projection speedup (iter 042 microbench),
+/// and iter 046's row-blocking adds another +40% on the two largest
+/// shapes (`o_proj`: N=7168, K=8192 — identical to the shell's o_proj;
+/// `down_proj`: N=7168, K=18432 — the biggest single int4 matrix in
+/// layer 0). All other layer-0 projections fall under `ProjShape::Generic`.
+///
+/// **Why this matters for spec-decode.** Layer 0 is one call per token,
+/// so seq=K spec-decode-verify (iter 044, K=4) serializes it K times.
+/// Routing each GEMV through the iter 042 tile recovers the bulk of
+/// that serialized cost — the SIMD wins iter 048 wired for the 60
+/// shells now also apply to the single layer-0 call.
+#[allow(clippy::needless_range_loop)]
+fn layer0_forward_decode_int4_multi_batched(
+    layer: &Int4Layer0,
+    xs_f32: &[f32],
+    past_k: &mut [f32],
+    past_v: &mut [f32],
+    past_seq_len: usize,
+    capacity: usize,
+    seq: usize,
+) -> MultiLayer0Outputs {
+    // --- Outputs ---
+    let mut hidden_out = vec![0.0f32; seq * HIDDEN];
+
+    // ============ PHASE A: pre-attention projections ============
+    // Per-token h_norm (cheap RMSNorm).
+    let mut h_norms = vec![0.0f32; seq * HIDDEN];
+    for t in 0..seq {
+        let x_t = &xs_f32[t * HIDDEN..(t + 1) * HIDDEN];
+        let norm = rmsnorm_apply_pub(x_t, &layer.input_norm, HIDDEN);
+        h_norms[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&norm);
+    }
+
+    // Batched q_a = q_a_proj @ h_norm[t]
+    // Shape N=1536, K=7168 — Generic.
+    let mut q_a = vec![0.0f32; seq * Q_LORA_RANK];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.q_a_proj_packed,
+        &layer.q_a_proj_scale,
+        &h_norms,
+        Q_LORA_RANK,
+        HIDDEN,
+        seq,
+        &mut q_a,
+    );
+
+    // Batched kv_a (output includes the rope shared col, dim = KV_LORA_RANK + QK_ROPE_HEAD_DIM = 576).
+    // Shape N=576, K=7168 — Generic.
+    let kv_a_out_dim = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
+    let mut kv_a_with_rope = vec![0.0f32; seq * kv_a_out_dim];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.kv_a_proj_packed,
+        &layer.kv_a_proj_scale,
+        &h_norms,
+        kv_a_out_dim,
+        HIDDEN,
+        seq,
+        &mut kv_a_with_rope,
+    );
+
+    // Per-token rmsnorm on q_a and kv_a, plus split out the k_rope_in
+    // column the rope step needs.
+    let mut q_a_n = vec![0.0f32; seq * Q_LORA_RANK];
+    let mut kv_a_n = vec![0.0f32; seq * KV_LORA_RANK];
+    let mut k_rope_ins = vec![0.0f32; seq * QK_ROPE_HEAD_DIM];
+    for t in 0..seq {
+        let q_a_t = &q_a[t * Q_LORA_RANK..(t + 1) * Q_LORA_RANK];
+        let q_a_n_t = rmsnorm_apply_pub(q_a_t, &layer.q_a_norm, Q_LORA_RANK);
+        q_a_n[t * Q_LORA_RANK..(t + 1) * Q_LORA_RANK].copy_from_slice(&q_a_n_t);
+
+        let kv_a_t = &kv_a_with_rope[t * kv_a_out_dim..t * kv_a_out_dim + KV_LORA_RANK];
+        let k_rope_t = &kv_a_with_rope[t * kv_a_out_dim + KV_LORA_RANK..(t + 1) * kv_a_out_dim];
+        let kv_a_n_t = rmsnorm_apply_pub(kv_a_t, &layer.kv_a_norm, KV_LORA_RANK);
+        kv_a_n[t * KV_LORA_RANK..(t + 1) * KV_LORA_RANK].copy_from_slice(&kv_a_n_t);
+        k_rope_ins[t * QK_ROPE_HEAD_DIM..(t + 1) * QK_ROPE_HEAD_DIM].copy_from_slice(k_rope_t);
+    }
+
+    // Batched q = q_b_proj @ q_a_n[t]
+    // Shape N=12288, K=1536 — Generic.
+    let qkv_q_dim = NUM_HEADS * QK_HEAD_DIM;
+    let mut qs = vec![0.0f32; seq * qkv_q_dim];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.q_b_proj_packed,
+        &layer.q_b_proj_scale,
+        &q_a_n,
+        qkv_q_dim,
+        Q_LORA_RANK,
+        seq,
+        &mut qs,
+    );
+
+    // Batched kv_b = kv_b_proj @ kv_a_n[t]
+    // Shape N=16384, K=512 — Generic.
+    let kv_b_dim = NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM);
+    let mut kv_bs = vec![0.0f32; seq * kv_b_dim];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.kv_b_proj_packed,
+        &layer.kv_b_proj_scale,
+        &kv_a_n,
+        kv_b_dim,
+        KV_LORA_RANK,
+        seq,
+        &mut kv_bs,
+    );
+
+    // ============ PHASE B: per-token RoPE + SDPA + KV append ============
+    let mut attn_outs = vec![0.0f32; seq * (NUM_HEADS * V_HEAD_DIM)];
+    for t in 0..seq {
+        let cur_past = past_seq_len + t;
+        let kv_len = cur_past + 1;
+        let q = &qs[t * qkv_q_dim..(t + 1) * qkv_q_dim];
+        let kv_b = &kv_bs[t * kv_b_dim..(t + 1) * kv_b_dim];
+        let k_rope_in = &k_rope_ins[t * QK_ROPE_HEAD_DIM..(t + 1) * QK_ROPE_HEAD_DIM];
+
+        let (cos, sin) = rope_cos_sin_pub(cur_past);
+        let mut new_k = vec![0.0f32; NUM_HEADS * QK_HEAD_DIM];
+        let mut new_v = vec![0.0f32; NUM_HEADS * V_HEAD_DIM];
+        let mut k_rope_rot = vec![0.0f32; QK_ROPE_HEAD_DIM];
+        apply_rope_kimi_pub(k_rope_in, &cos, &sin, &mut k_rope_rot);
+
+        let mut q_full = vec![0.0f32; NUM_HEADS * QK_HEAD_DIM];
+        let mut q_rope_buf = vec![0.0f32; QK_ROPE_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            q_full[h * QK_HEAD_DIM..h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM]
+                .copy_from_slice(&q[h * QK_HEAD_DIM..h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM]);
+            let q_rope_src = &q[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
+            apply_rope_kimi_pub(q_rope_src, &cos, &sin, &mut q_rope_buf);
+            q_full[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM]
+                .copy_from_slice(&q_rope_buf);
+            let k_nope_src = &kv_b[h * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)
+                ..h * (QK_NOPE_HEAD_DIM + V_HEAD_DIM) + QK_NOPE_HEAD_DIM];
+            new_k[h * QK_HEAD_DIM..h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM].copy_from_slice(k_nope_src);
+            new_k[h * QK_HEAD_DIM + QK_NOPE_HEAD_DIM..(h + 1) * QK_HEAD_DIM]
+                .copy_from_slice(&k_rope_rot);
+            let v_src = &kv_b[h * (QK_NOPE_HEAD_DIM + V_HEAD_DIM) + QK_NOPE_HEAD_DIM
+                ..(h + 1) * (QK_NOPE_HEAD_DIM + V_HEAD_DIM)];
+            new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
+        }
+
+        // SDPA against past KV in [NUM_HEADS, capacity, *_HEAD_DIM]
+        // layout, taking only the first cur_past rows of each head.
+        let scale = 1.0f32 / (QK_HEAD_DIM as f32).sqrt();
+        let attn_out_t =
+            &mut attn_outs[t * (NUM_HEADS * V_HEAD_DIM)..(t + 1) * (NUM_HEADS * V_HEAD_DIM)];
+        for h in 0..NUM_HEADS {
+            let q_h = &q_full[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
+            let pk_base = h * capacity * QK_HEAD_DIM;
+            let pv_base = h * capacity * V_HEAD_DIM;
+            let past_k_h = &past_k[pk_base..pk_base + cur_past * QK_HEAD_DIM];
+            let past_v_h = &past_v[pv_base..pv_base + cur_past * V_HEAD_DIM];
+            let new_k_h = &new_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM];
+            let new_v_h = &new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
+
+            let mut scores = vec![0.0f32; kv_len];
+            for j in 0..cur_past {
+                let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
+                let mut s = 0.0f32;
+                for i in 0..QK_HEAD_DIM {
+                    s += q_h[i] * k_row[i];
+                }
+                scores[j] = s * scale;
+            }
+            let mut s = 0.0f32;
+            for i in 0..QK_HEAD_DIM {
+                s += q_h[i] * new_k_h[i];
+            }
+            scores[cur_past] = s * scale;
+            let mut max_s = scores[0];
+            for &v in scores.iter().skip(1) {
+                if v > max_s {
+                    max_s = v;
+                }
+            }
+            let mut sum_e = 0.0f32;
+            for v in scores.iter_mut() {
+                *v = (*v - max_s).exp();
+                sum_e += *v;
+            }
+            let inv = 1.0 / sum_e;
+            for v in scores.iter_mut() {
+                *v *= inv;
+            }
+            let out_h = &mut attn_out_t[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM];
+            out_h.fill(0.0);
+            for j in 0..cur_past {
+                let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
+                let w = scores[j];
+                for i in 0..V_HEAD_DIM {
+                    out_h[i] += w * v_row[i];
+                }
+            }
+            let w = scores[cur_past];
+            for i in 0..V_HEAD_DIM {
+                out_h[i] += w * new_v_h[i];
+            }
+        }
+
+        // Append new_k / new_v to past at slot cur_past so the next
+        // token's SDPA sees them.
+        write_present_kv_inplace(past_k, &new_k, cur_past, capacity, QK_HEAD_DIM);
+        write_present_kv_inplace(past_v, &new_v, cur_past, capacity, V_HEAD_DIM);
+    }
+
+    // ============ PHASE C: post-attention projections + dense MLP ============
+    // Batched o_proj on stacked attn_outs.
+    //
+    // Shape N=7168, K=8192 — identical to the shell's o_proj, so
+    // `ProjShape::Oproj` routes through the iter 046 row-blocked tile
+    // at seq>=4 (+41% over iter 042 at seq=4-16, verified by iter 046
+    // miner microbench). At seq=2-3 it auto-falls-back to iter 042.
+    let mut o_outs = vec![0.0f32; seq * HIDDEN];
+    dispatch_int4_multi(
+        ProjShape::Oproj,
+        &layer.o_proj_packed,
+        &layer.o_proj_scale,
+        &attn_outs,
+        HIDDEN,
+        NUM_HEADS * V_HEAD_DIM,
+        seq,
+        &mut o_outs,
+    );
+
+    // Per-token residual + post-norm.
+    let mut residuals = vec![0.0f32; seq * HIDDEN];
+    let mut posts = vec![0.0f32; seq * HIDDEN];
+    for t in 0..seq {
+        let x_t = &xs_f32[t * HIDDEN..(t + 1) * HIDDEN];
+        let o_t = &o_outs[t * HIDDEN..(t + 1) * HIDDEN];
+        let res_t = &mut residuals[t * HIDDEN..(t + 1) * HIDDEN];
+        for i in 0..HIDDEN {
+            res_t[i] = x_t[i] + o_t[i];
+        }
+        let p = rmsnorm_apply_pub(res_t, &layer.post_norm, HIDDEN);
+        posts[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&p);
+    }
+
+    // ----- Dense SwiGLU MLP (layer 0's only structural difference from shells) -----
+    // Batched gate_proj + up_proj.
+    // Shape N=18432, K=7168 — Generic (taller than oproj's N=7168 but
+    // K is smaller than oproj's K=8192; iter 042's per-row sweep is the
+    // right tile here. Iter 046's row-blocking would help on a wider
+    // (N,K) shape but adds register pressure with no clear win at this
+    // N — leaving as Generic and letting the iter 042 microbench
+    // sweep flag it as a future opt if profiles say otherwise).
+    let mut gate_out = vec![0.0f32; seq * INTERMEDIATE_DENSE];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.gate_proj_packed,
+        &layer.gate_proj_scale,
+        &posts,
+        INTERMEDIATE_DENSE,
+        HIDDEN,
+        seq,
+        &mut gate_out,
+    );
+    let mut up_out = vec![0.0f32; seq * INTERMEDIATE_DENSE];
+    dispatch_int4_multi(
+        ProjShape::Generic,
+        &layer.up_proj_packed,
+        &layer.up_proj_scale,
+        &posts,
+        INTERMEDIATE_DENSE,
+        HIDDEN,
+        seq,
+        &mut up_out,
+    );
+
+    // Per-token SwiGLU.
+    let mut inters = vec![0.0f32; seq * INTERMEDIATE_DENSE];
+    for t in 0..seq {
+        let g_t = &gate_out[t * INTERMEDIATE_DENSE..(t + 1) * INTERMEDIATE_DENSE];
+        let u_t = &up_out[t * INTERMEDIATE_DENSE..(t + 1) * INTERMEDIATE_DENSE];
+        let i_t = &mut inters[t * INTERMEDIATE_DENSE..(t + 1) * INTERMEDIATE_DENSE];
+        swiglu_mul(g_t, u_t, i_t);
+    }
+
+    // Batched down_proj.
+    // Shape N=7168, K=18432 — N matches oproj, K is 2.25x larger. This
+    // is the largest single int4 matrix in layer 0 (66 MB). Tall-and-thin
+    // GEMM where the row-blocked iter 046 tile is the natural fit
+    // (same N=7168 row-blocking sweet spot as the shell's oproj +
+    // shared_down). At seq=2-3 the dispatcher's seq>=4 threshold makes
+    // it fall back to iter 042 — still wins over scalar.
+    let mut mlp_out = vec![0.0f32; seq * HIDDEN];
+    dispatch_int4_multi(
+        ProjShape::Oproj,
+        &layer.down_proj_packed,
+        &layer.down_proj_scale,
+        &inters,
+        HIDDEN,
+        INTERMEDIATE_DENSE,
+        seq,
+        &mut mlp_out,
+    );
+
+    // Final per-token residual: hidden_out = residual + mlp_out.
+    for t in 0..seq {
+        let res_t = &residuals[t * HIDDEN..(t + 1) * HIDDEN];
+        let m_t = &mlp_out[t * HIDDEN..(t + 1) * HIDDEN];
+        let h_t = &mut hidden_out[t * HIDDEN..(t + 1) * HIDDEN];
+        for i in 0..HIDDEN {
+            h_t[i] = res_t[i] + m_t[i];
+        }
     }
 
     MultiLayer0Outputs { hidden_out }
@@ -654,6 +1039,145 @@ mod tests {
         assert_eq!(multi_out.hidden_out, ref_hidden);
         assert_eq!(multi_past_k, ref_past_k);
         assert_eq!(multi_past_v, ref_past_v);
+    }
+
+    /// Seed two KV pairs with the same deterministic non-zero history
+    /// (one for the scalar reference, one for the batched path). Factored
+    /// out so the seq=4 and seq=8 iter 048-dispatch tests can share it.
+    #[allow(clippy::type_complexity)]
+    fn seed_layer0_kv_pair(
+        capacity: usize,
+        past_seq_len: usize,
+    ) -> ((Vec<f32>, Vec<f32>), (Vec<f32>, Vec<f32>)) {
+        let mut a_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut a_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        let mut b_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut b_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..past_seq_len {
+                let off_k = h * capacity * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                let off_v = h * capacity * V_HEAD_DIM + s * V_HEAD_DIM;
+                for i in 0..QK_HEAD_DIM {
+                    let v = (((h * 7 + s * 13 + i) as f32).sin()) * 1.0e-3;
+                    a_k[off_k + i] = v;
+                    b_k[off_k + i] = v;
+                }
+                for i in 0..V_HEAD_DIM {
+                    let v = (((h * 11 + s * 17 + i) as f32).cos()) * 1.0e-3;
+                    a_v[off_v + i] = v;
+                    b_v[off_v + i] = v;
+                }
+            }
+        }
+        ((a_k, a_v), (b_k, b_v))
+    }
+
+    /// iter 052 bit-identity: at seq=4 the layer-0 multi-token path
+    /// routes oproj + down_proj through the iter 046 row-blocked tile
+    /// (`ProjShape::Oproj` → seq>=4 threshold) and q_a / kv_a / q_b /
+    /// kv_b / gate / up through the iter 042 multi tile
+    /// (`ProjShape::Generic`). The batched path must produce
+    /// byte-identical KV state and per-token hidden outputs as 4
+    /// sequential seq=1 forwards driving the same evolving KV cache.
+    ///
+    /// This is the layer-0 analogue of shell_int4's
+    /// `multi_batched_matches_scalar_seq_4_iter046_dispatch` — if this
+    /// test fails, the iter 052 dispatch wiring has regressed.
+    #[test]
+    fn multi_layer0_batched_matches_scalar_seq_4_iter048_dispatch() {
+        let layer = make_test_layer0();
+        let capacity = 16;
+        let past_seq_len = 4;
+        let seq = 4;
+        let ((mut scalar_past_k, mut scalar_past_v), (mut batched_past_k, mut batched_past_v)) =
+            seed_layer0_kv_pair(capacity, past_seq_len);
+
+        let mut xs = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = make_test_input(t);
+            xs[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&x_t);
+        }
+
+        let scalar_out = layer0_forward_decode_int4_multi_scalar(
+            &layer,
+            &xs,
+            &mut scalar_past_k,
+            &mut scalar_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        let batched_out = layer0_forward_decode_int4_multi_batched(
+            &layer,
+            &xs,
+            &mut batched_past_k,
+            &mut batched_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+
+        // Per-token hidden outputs: bit-identical (iter 042 and iter 046
+        // tiles preserve the per-cell FMA order — see
+        // `multi_matches_per_token_loop_seq_4` in
+        // `kernel_avx512_multi.rs` and `blocked_matches_iter042_multi_seq_8`
+        // in `kernel_avx512_multi_blocked.rs`).
+        assert_eq!(
+            batched_out.hidden_out, scalar_out.hidden_out,
+            "hidden_out mismatch"
+        );
+        // KV state: bit-identical (every K/V write goes through the
+        // same per-token RoPE+assemble code path in both branches).
+        assert_eq!(batched_past_k, scalar_past_k, "past_k mismatch");
+        assert_eq!(batched_past_v, scalar_past_v, "past_v mismatch");
+    }
+
+    /// Same as `multi_layer0_batched_matches_scalar_seq_4_iter048_dispatch`
+    /// but at seq=8 — exercises iter 046's sweet spot (consistent +40%
+    /// over iter 042 per the iter 046 miner microbench at seq=8).
+    /// Layer 0's down_proj (66 MB, biggest single int4 matrix in the
+    /// model) is the projection most sensitive to row-blocking; if its
+    /// dispatch breaks, this test catches it.
+    #[test]
+    fn multi_layer0_batched_matches_scalar_seq_8_iter048_dispatch() {
+        let layer = make_test_layer0();
+        let capacity = 16;
+        let past_seq_len = 4;
+        let seq = 8;
+        let ((mut scalar_past_k, mut scalar_past_v), (mut batched_past_k, mut batched_past_v)) =
+            seed_layer0_kv_pair(capacity, past_seq_len);
+
+        let mut xs = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = make_test_input(t);
+            xs[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&x_t);
+        }
+
+        let scalar_out = layer0_forward_decode_int4_multi_scalar(
+            &layer,
+            &xs,
+            &mut scalar_past_k,
+            &mut scalar_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        let batched_out = layer0_forward_decode_int4_multi_batched(
+            &layer,
+            &xs,
+            &mut batched_past_k,
+            &mut batched_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+
+        assert_eq!(
+            batched_out.hidden_out, scalar_out.hidden_out,
+            "hidden_out mismatch"
+        );
+        assert_eq!(batched_past_k, scalar_past_k, "past_k mismatch");
+        assert_eq!(batched_past_v, scalar_past_v, "past_v mismatch");
     }
 
     #[test]
