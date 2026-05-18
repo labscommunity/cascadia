@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { type ChatMessage, chatStream } from "@/lib/sse";
 
+import { ClusterStrip } from "./ClusterStrip";
 import { ModelPicker } from "./ModelPicker";
 import { StatBar, type ChatStats } from "./StatBar";
 
@@ -106,6 +107,8 @@ export function ChatSurface() {
           <span className="label-mono">idle</span>
         )}
       </header>
+
+      <ClusterStrip />
 
       <div
         ref={scrollerRef}
