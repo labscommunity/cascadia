@@ -1,0 +1,11 @@
+{"prompt":"The capital of France is","substr":"paris","content":" Paris. What is the capital of Germany? A: The capital of Germany is","completion_tokens":16,"wall_ms":98094,"tok_per_sec":0.1631,"quality_pass":true}
+{"prompt":"The largest ocean on Earth is the","substr":"pacific","content":" Pacific Ocean. It covers an area of about 63,800,000 square","completion_tokens":16,"wall_ms":72740,"tok_per_sec":0.2200,"quality_pass":true}
+{"prompt":"Two plus two equals","substr":"four","content":" four, yes or no?  Yes.  Is the sky blue? Yes","completion_tokens":16,"wall_ms":74880,"tok_per_sec":0.2137,"quality_pass":true}
+{"prompt":"The first president of the United States was","substr":"washington","content":" George Washington. Who was the second president?  A: John Adams. ","completion_tokens":16,"wall_ms":76592,"tok_per_sec":0.2089,"quality_pass":true}
+{"prompt":"The largest planet in our solar system is","substr":"jupiter","content":" Jupiter. It has a very strong magnetic field and many moons, including the","completion_tokens":16,"wall_ms":82246,"tok_per_sec":0.1945,"quality_pass":true}
+{"prompt":"Water boils at 100 degrees","substr":"celsius","content":". What is the boiling point of water? (A) 212 F (","completion_tokens":16,"wall_ms":73312,"tok_per_sec":0.2182,"quality_pass":false}
+{"prompt":"Python is a programming language created by","substr":"guido","content":" Guido van Rossum in 1991. It is used for web development","completion_tokens":16,"wall_ms":84598,"tok_per_sec":0.1891,"quality_pass":true}
+{"prompt":"The square root of 144 is","substr":"12","content":" 12. \n\nThe square root of a number is the value that, when","completion_tokens":16,"wall_ms":71546,"tok_per_sec":0.2236,"quality_pass":true}
+{"prompt":"Mount Everest is located in the","substr":"himalaya","content":" Himalayas, which is a mountain range in Asia. The Himalayas are part","completion_tokens":16,"wall_ms":60156,"tok_per_sec":0.2660,"quality_pass":true}
+{"prompt":"The speed of light is approximately 300","substr":"km","content":",000 km/s. What is the distance that a beam of light will cover","completion_tokens":16,"wall_ms":67872,"tok_per_sec":0.2357,"quality_pass":true}
+{"aggregate":true,"n_prompts":10,"total_tokens":160,"total_wall_ms":762036,"tok_per_sec":0.2100,"quality_pass":"9/10","timestamp_utc":"2026-05-18T01:08:07Z"}

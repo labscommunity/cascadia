@@ -18,6 +18,44 @@ Entry template:
 
 ---
 
+## 009 — A3 10-prompt robustness — K=4 is the real leader (2026-05-17 ~20:08 PT)
+
+**Hypothesis:** K=3 (iter 008 leader on 3-prompt eval) holds at 9-10/10 on a broader 10-prompt set.
+
+**Result: HYPOTHESIS REFUTED. K=3 only passes 6/10. K=4 = 9/10 (matches K=8 baseline).**
+
+| K | tok/s | Quality | Failed |
+|--:|------:|:-------:|--------|
+| 8 | 0.0853 | 9/10 | "km" (sampling artifact) |
+| **4** | **0.2100** | **9/10** | "celsius" (single sampling artifact) |
+| 3 | 0.3050 | 6/10 | jupiter, celsius, guido, "12" — substantive failures |
+
+**Revised production recommendation: K=4, not K=3.** K=3 was misled
+by the narrow 3-prompt eval. On a 10-prompt set K=4 matches K=8
+quality (within sampling noise) while K=3 has substantive degradation
+(multi-choice format, vague answers, factual errors).
+
+Bench: `experiments/009_a3_robustness_10prompt/{bench_k8_10p,bench_k4_10p,bench_k3_10p}.jsonl`
+Notes: `experiments/009_a3_robustness_10prompt/result.md`
+
+**Important reflection:** narrow evals can be very misleading for MoE
+expert-reduction sweeps. The 3-prompt set (Paris/Pacific/four) only
+tested factual lookups that K=3 could still answer; broader prompts
+reveal the cliff is between K=4 and K=3, not K=3 and K=2 as iter 008
+suggested.
+
+**LEADERBOARD updated** to show K=4 as production-ready leader. K=3
+demoted but kept as "narrow-eval fastest." Iteration 009 itself is
+classified as a robustness validation that REVISED an earlier win,
+not a new win or negative — call it `revision` outcome class.
+
+**Next (iteration 010):** Spinout-PR-prep for K=4 finding. Open a
+small focused PR off main with just `--top-k-override` flag + docs.
+Plus start iteration 011 on a different moonshot (F4 or A8) to
+diversify beyond A3.
+
+---
+
 ## 008 — A3 K-sweep full Pareto — K=3 NEW LEADER +208% (2026-05-17 ~19:07 PT)
 
 **Hypothesis:** Bench K=3 + K=5 to complete the Pareto curve.
