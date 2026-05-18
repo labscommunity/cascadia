@@ -18,6 +18,40 @@ Entry template:
 
 ---
 
+## 012 — A3 K=4 code-prompt robustness — 4/5 pass (2026-05-17 ~21:30 PT)
+
+**Hypothesis:** K=4 quality (so far validated on factual prompts) holds on
+code/programming prompts.
+
+**Result: 4/5 pass at K=4 on 5 code prompts.** Same direction as the
+factual-prompt eval (4/5 = 80% vs the factual 9/10 = 90%). Consistent
+~80-90% pass rate across prompt classes.
+
+| Prompt | substr | content (first 80 chars) | pass |
+|--------|--------|--------------------------|------|
+| reverse-string | def | "Hello, World!" Assistant: `def reverse_string(s): return s[::-1]` | ✓ |
+| x=5+3; print(x) | 8 | "?\n\nThe user is asking..." → broke down rather than answered | ✗ |
+| JS typeof | string | "string indicating the type..." `typeof "foo"` returns "string" | ✓ |
+| factorial of 5 | 120 | "120. But that doesn't seem right. Let me check..." (self-corrects to right answer) | ✓ |
+| SQL count | count | repeated "In SQL... count rows..." (degenerate pattern but substr present) | ✓ |
+
+aggregate 0.2298 tok/s, max_tokens=32. Throughput in the expected K=4 range.
+
+**Failure mode pattern across iters 009/011/012:** K=4 occasionally
+"breaks down" the question into reasoning steps rather than answering
+directly within max_tokens budget. The model knows the answer (when
+output is longer, it eventually says "120" for factorial, "8" for the
+math). With max_tokens=32 cap, the direct-answer-first prompts pass,
+the let-me-think prompts fail the substring check.
+
+Bench: `experiments/012_a3_k4_code_prompts/bench_k4_code.jsonl`
+
+**Next (iteration 013):** Either A8 KV bf16 (real code change, attacks
+attention BW bucket) or multi-turn dialog robustness. Leaning toward
+A8 to diversify beyond A3-related work.
+
+---
+
 ## 011 — A3 K=4 long-context (max_tokens=64) — CONFIRMS, throughput doubles (2026-05-17 ~21:06 PT)
 
 **Hypothesis:** K=4 quality holds at longer generation; throughput
