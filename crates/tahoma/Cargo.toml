@@ -9,6 +9,7 @@ description = "tahoma binary — distributed LLM inference for Intel hardware (R
 [features]
 default = []
 openvino = ["tahoma-cli/openvino"]
+dashboard-embed = ["tahoma-cli/dashboard-embed"]
 
 [[bin]]
 name = "tahoma"

@@ -12,6 +12,11 @@ openvino = [
     "tahoma-engine-openvino/openvino",
     "tahoma-engine-sparse-moe/openvino",
 ]
+# Embed the built SPA (crates/tahoma-dashboard/web/dist) into the binary.
+# Off by default so a fresh `cargo build` doesn't require `npm run build`
+# to have been run first. With this on, `tahoma worker --api` serves the
+# UI at `/`.
+dashboard-embed = ["tahoma-dashboard/embed-spa"]
 
 [dependencies]
 tahoma-types = { workspace = true }
@@ -21,6 +26,9 @@ tahoma-engine-openvino = { workspace = true }
 tahoma-engine-sparse-moe = { workspace = true }
 tahoma-runner = { workspace = true }
 tahoma-api = { workspace = true }
+tahoma-dashboard = { workspace = true }
+tahoma-topology = { workspace = true }
+tahoma-discovery = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }

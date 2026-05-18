@@ -18,8 +18,34 @@ use tahoma_engine_openvino::{
 use tahoma_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use tahoma_runner::Runner;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// String form of an engine kind, used in NodeInfo.engines for discovery
+/// and in the dashboard's "Engines" pill list. Stable wire format —
+/// matches the strings `tahoma engines` already prints.
+fn engine_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Mock => "mock",
+        EngineKind::OvGenai => "ov-genai",
+        EngineKind::OvRuntime => "ov-runtime",
+        EngineKind::OvDistSpec => "ov-dist-spec",
+        EngineKind::SparseMoe => "sparse-moe",
+    }
+}
+
+/// Best-effort hostname for the local node. Used as the human-readable
+/// prefix of `node_id`. Falls back to "node" if the `hostname` command is
+/// unavailable or returns something empty.
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".to_owned())
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -475,11 +501,51 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 "no chat_template found; /v1/chat/completions will use legacy formatting"
             );
         }
-        let mut cfg = tahoma_api::Config::default();
-        cfg.chat_template = chat_template;
-        let app = tahoma_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
+        let cfg = tahoma_api::Config {
+            chat_template,
+            ..Default::default()
+        };
+        let max_concurrent = cfg.max_concurrent_requests as u64;
+        let api_router =
+            tahoma_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
+
+        // Stand up a Topology + mDNS discovery so the dashboard has
+        // peers to render. The discovery service is best-effort: a host
+        // without a working multicast path (CI sandbox, restricted LAN)
+        // still serves the API and dashboard, just with `self` as the
+        // only node. We keep `_discovery` bound for the lifetime of
+        // serve_with_nodelay so its Drop unregisters cleanly on shutdown.
+        let topology = tahoma_topology::Topology::new();
+        let self_node = tahoma_topology::NodeInfo {
+            node_id: format!("{}-r{}", hostname(), args.rank),
+            host: tahoma_discovery::local_ip().to_string(),
+            port: listen_port,
+            namespace: "default".to_owned(),
+            device: args.device.clone(),
+            memory_mb: 0,
+            engines: vec![engine_name(args.engine).to_owned()],
+            last_seen: 0.0,
+        };
+        topology.add_node(self_node.clone());
+        let mut discovery = tahoma_discovery::DiscoveryService::new(topology.clone(), "default");
+        if let Err(e) = discovery.start(self_node) {
+            warn!(error = %e, "mDNS discovery failed to start; dashboard will show only self");
+        }
+        let _discovery = discovery;
+
+        let dash_state = tahoma_dashboard::DashboardState {
+            topology,
+            stats: tahoma_dashboard::DashboardStats::new(max_concurrent),
+        };
+        // Compose: OpenAI-compat routes (/v1/*, /health) stay at root for
+        // backward compatibility with existing clients; dashboard-internal
+        // routes live at /api/* plus the SPA (when the `dashboard-embed`
+        // feature is on) at /. The dashboard router carries the SPA
+        // fallback, so it must be merged second.
+        let app = api_router.merge(tahoma_dashboard::make_router(dash_state));
+
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
-        info!(host = %api_host, port = api_port, "API serving");
+        info!(host = %api_host, port = api_port, "API + dashboard serving");
         // NODELAY-on-accept wrapper. tokio's TcpStream defaults to
         // NODELAY=false (Nagle on); for SSE streaming small per-token
         // chunks, Nagle aggregates them into ~3500 B bursts every
