@@ -2,6 +2,69 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 036 — Speculative decode foundation (n-gram draft + simulation-verified) (2026-05-18 ~14:15 PT)
+
+Real foundation, no throughput win yet. Branch
+`perf/spec-decode-skeleton-034` @ `acd21bd`. **38 unit tests** pass
+(up from 17).
+
+**What shipped:**
+
+| File | LOC | What |
+|------|----:|------|
+| `ngram_draft.rs` | 270 (new) | Zero-compute Prompt-Lookup draft: hash table of (k-gram → next-token), longest-match-wins propose, rewind-safe |
+| `spec_decode.rs` | 380 (new) | Pure helpers: `count_accepted()` + `reconcile_after_round()` + 10 unit tests including mock-target end-to-end |
+| `runner.rs` | +357 | `rewind_kv(n)`, `kv_past_seq_lens()`, `kv_invariant_holds()`, `generate_speculative()`, `argmax_i64()` |
+| `engine.rs` | +74 | `spec_decode_k` config, wired into `step_single_stage` |
+| `cli.rs` | +15 | `--prompt-lookup N --spec-k K` enables n-gram spec on single-stage |
+
+**Key test:** `simulated_session_matches_sequential_greedy` — full
+multi-round spec-decode session against a deterministic mock target,
+asserts output is bit-identical to plain sequential greedy. Validates
+accept/rewind/emit pipeline end-to-end **without needing model
+weights**.
+
+**Honest caveat:** NOT yet "K candidate tokens verified in one OV
+inference". The int4 shell forward only accepts seq=1, so verify
+runs K sequential single-token forwards. The accept+rewind logic IS
+correct (simulation proves it), so the speedup unlocks when paired
+with EITHER:
+- A multi-token shell kernel (significant int4-gemm work, not in
+  scope)
+- Pipeline-parallel `FrameKind::ForwardBatch(K)` extension to
+  `dist.rs` so rank-0 verifies K tokens per wire round (where the
+  real win is — cascadia 22ms × 5.6 saved hops = ~123ms/round)
+
+**Existing tahoma infrastructure surveyed:**
+- `ov-dist-spec` engine (2364 lines) — complete spec-decode but for
+  v5 cascaded shards using OV stateful inference. Pattern maps; wire
+  format + KV handling differ enough that port = rewrite. Used as
+  reference, not lift.
+- rainier `k26_spec_decode.py` — K2.6-specific reference (uses
+  Moonlight 16B-A3B as draft). Our impl is its accept/rewind logic
+  ported to Rust with n-gram draft instead of Moonlight (avoids
+  "should we package a separate 16B draft?" question).
+
+**Greedy only.** `generate_speculative` falls back to plain
+`generate()` for temp>0; agent opted for honest "greedy-only spec
+decode" over shipping incorrect acceptance test. Leviathan-style
+rejection sampling is the obvious follow-up.
+
+**No bench** — task said bench optional; bench hosts contended (A8+C1
+combined and F5 both running). Simulation test validates correctness
+more robustly than any single-prompt bench could.
+
+---
+
+## 035 — F5 sparse-attn bench — FAILED (API overloaded) (2026-05-18 ~14:00 PT)
+
+F5 long-context bench agent crashed early with "API Error: Overloaded"
+(450 tokens, 48 tool uses, 8.5 min). No deliverable. Will retry on a
+fresh agent. F5 impl from iter 029 is unchanged on
+`perf/f5-sparse-attention-029` — still needs bench validation.
+
+---
+
 ## 033 — C1 expert prefetch — VERIFIED WIN: +26.8% tok/s A/B under contention (2026-05-18 ~13:35 PT)
 
 **SECOND VERIFIED ARCHITECTURAL MOONSHOT** of the parallel batch.
