@@ -19,7 +19,10 @@ use tahoma_int4_gemm::layer0_int4::{
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
-use tahoma_int4_gemm::shell_int4::{shell_forward_decode_int4_with_capacity, Int4Shell};
+use tahoma_int4_gemm::shell_int4::{
+    shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity,
+    Int4Shell,
+};
 use tahoma_int4_gemm::{
     expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
@@ -668,6 +671,156 @@ impl Runner {
             // Combine: h_next = residual + shared + moe (single token).
             for j in 0..hidden {
                 h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
+            }
+        }
+
+        Ok(h_f32)
+    }
+
+    /// Multi-token shell forward: same semantics as a `seq`-iteration
+    /// loop over [`Self::forward_shells`], but routes the int4 GEMM
+    /// projections through the iter 041/042/046 multi-token kernels
+    /// (`shell_forward_decode_int4_multi_with_capacity`). At seq=1 this
+    /// is a no-op wrapper over the existing seq=1 path; at seq>=2 the
+    /// projections amortize the weight load across tokens (1.4-4.75x
+    /// per projection per iter 042 microbench; +40% on oproj/shared_down
+    /// at seq>=4 per iter 046).
+    ///
+    /// **Caller contract.**
+    /// - `h_in` is `[1, seq, hidden]` flat, row-major: token `t`'s row
+    ///   lives at `h_in[t * hidden .. (t + 1) * hidden]`.
+    /// - `past_seq_len` is the populated KV length on entry. After this
+    ///   call returns, each shell's `past_seq_len` advances by `seq`.
+    /// - Returns `[1, seq, hidden]` flat — the post-MoE hidden state for
+    ///   each input token. Callers that only need the last token's
+    ///   logits slice `out[(seq-1)*hidden .. seq*hidden]`.
+    ///
+    /// **Why a separate API.** The seq=1 hot path
+    /// ([`Self::forward_shells`]) is unchanged — every K2.6 inference
+    /// today runs through it. This is the seam that the
+    /// chunked-prefill (iter 040) and spec-decode verify (iter 036/039)
+    /// driver loops plug into to batch multiple tokens per shell call,
+    /// turning N sequential seq=1 GEMVs into one seq=N GEMM and
+    /// recovering the iter 042/046 SIMD wins at the engine level.
+    ///
+    /// **Bit-identity.** The underlying multi-token kernels are
+    /// bit-identical per-cell to the scalar seq=1 path (proved by the
+    /// `multi_batched_matches_scalar*` tests in
+    /// `tahoma-int4-gemm/src/shell_int4.rs`). Combined with the
+    /// per-token expert dispatch — which is identical between this
+    /// function and `forward_shells` since both apply the same
+    /// `routing_ids` × `routing_weights` to the same per-token attn_out
+    /// — the engine-level path produces byte-identical outputs to N
+    /// sequential `forward_shells` calls.
+    pub fn forward_shells_multi(
+        &mut self,
+        h_in: &[f32],
+        h_shape: &[usize],
+        past_seq_len: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>, RunnerError> {
+        let hidden = self.manifest.hidden_size as usize;
+        let top_k = self.manifest.top_k as usize;
+        if seq == 0 {
+            return Err(RunnerError::Internal(
+                "forward_shells_multi: seq must be >= 1".into(),
+            ));
+        }
+        if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != seq || h_shape[2] != hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells_multi: int4 shells require shape [1, {seq}, {hidden}], got {h_shape:?}"
+            )));
+        }
+        if h_in.len() != seq * hidden {
+            return Err(RunnerError::Internal(format!(
+                "forward_shells_multi: h_in.len={} != seq*hidden={}*{}={}",
+                h_in.len(),
+                seq,
+                hidden,
+                seq * hidden
+            )));
+        }
+        // Fast-path seq=1 by delegating to the existing seq=1 forward.
+        // This keeps the seq=1 hot path bit-identical and avoids paying
+        // the scalar-loop dispatch overhead inside
+        // `_multi_with_capacity` for a single token.
+        if seq == 1 {
+            return self.forward_shells(h_in, &[1, 1, hidden], past_seq_len);
+        }
+
+        let mut h_f32 = h_in.to_vec();
+        let n_layers = self.layers.len();
+        for i in 0..n_layers {
+            let lid = self.layers[i].lid;
+            if self.layers[i].past_seq_len != past_seq_len {
+                return Err(RunnerError::Internal(format!(
+                    "L{lid}: past_seq_len mismatch (caller {past_seq_len} vs layer {})",
+                    self.layers[i].past_seq_len
+                )));
+            }
+            // Grow KV until it fits past_seq_len + seq. Geometric grow
+            // (doubling) preserves O(N) cumulative alloc traffic; a
+            // single seq=8 step from kv_capacity=32 needs at most two
+            // doublings.
+            while past_seq_len + seq > self.layers[i].kv_capacity {
+                grow_kv_capacity(&mut self.layers[i])?;
+            }
+            let capacity = self.layers[i].kv_capacity;
+
+            // shell_forward_decode_int4_multi_with_capacity writes
+            // present_k / present_v in place into slots
+            // [past_seq_len, past_seq_len + seq) of each head — no
+            // separate write_present_kv calls needed at the engine
+            // boundary.
+            //
+            // Destructure the layer into disjoint &mut borrows so the
+            // shell (immut), past_k (mut), past_v (mut) all coexist —
+            // otherwise indexing `self.layers[i]` three times trips
+            // the borrow checker (E0502).
+            let outs = {
+                let layer = &mut self.layers[i];
+                shell_forward_decode_int4_multi_with_capacity(
+                    &layer.int4_shell,
+                    &h_f32,
+                    &mut layer.past_k,
+                    &mut layer.past_v,
+                    past_seq_len,
+                    capacity,
+                    seq,
+                )
+            };
+            self.layers[i].past_seq_len = past_seq_len + seq;
+
+            // Per-token expert dispatch + residual combine. Same logic
+            // as forward_shells, just looped over seq tokens. The shell
+            // chose the routing_ids/weights per token in the batched
+            // forward; we just apply them.
+            if outs.routing_ids.len() != seq * top_k || outs.routing_weights.len() != seq * top_k {
+                return Err(RunnerError::Internal(format!(
+                    "L{lid} multi-token routing shape unexpected: ids={} weights={} (expected seq*top_k = {}*{})",
+                    outs.routing_ids.len(),
+                    outs.routing_weights.len(),
+                    seq,
+                    top_k
+                )));
+            }
+            for t in 0..seq {
+                let attn_post_t = &outs.attn_out_post_norm[t * hidden..(t + 1) * hidden];
+                let mut moe = vec![0.0f32; hidden];
+                for k in 0..top_k {
+                    let eid = outs.routing_ids[t * top_k + k] as u32;
+                    let w = outs.routing_weights[t * top_k + k];
+                    let y_f32 = self.dispatch_expert(lid, eid, attn_post_t)?;
+                    for j in 0..hidden {
+                        moe[j] += w * y_f32[j];
+                    }
+                }
+                let attn_res_t = &outs.attn_residual[t * hidden..(t + 1) * hidden];
+                let shared_t = &outs.shared_expert_out[t * hidden..(t + 1) * hidden];
+                let h_next_t = &mut h_f32[t * hidden..(t + 1) * hidden];
+                for j in 0..hidden {
+                    h_next_t[j] = attn_res_t[j] + shared_t[j] + moe[j];
+                }
             }
         }
 

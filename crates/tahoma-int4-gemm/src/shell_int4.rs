@@ -11,6 +11,7 @@
 
 use crate::kernel_avx512::dequant_gemv_int4_auto;
 use crate::kernel_avx512_multi::dequant_gemm_int4_multi_auto;
+use crate::kernel_avx512_multi_blocked::dequant_gemm_int4_multi_blocked_auto;
 use crate::kernel_bf16::bf16_gemv_auto;
 use crate::safetensors_source::SafetensorsShell;
 use crate::shell::{
@@ -20,6 +21,73 @@ use crate::shell::{
 };
 
 const GROUP_SIZE: usize = 32;
+
+/// Per-shape SIMD dispatch for the batched int4 GEMM kernels.
+///
+/// **Why a per-shape table.** Iter 042's tile (`kernel_avx512_multi`)
+/// wins over scalar on every K2.6 projection at seq>=2 (1.4-4.75x in
+/// iter 042 microbench). Iter 046's row-blocked tile
+/// (`kernel_avx512_multi_blocked`) wins +40% *over iter 042* but only
+/// on the largest shapes — oproj (N=7168, K=8192, 28 MB) and
+/// shared_down (N=7168, K=2048, 7 MB). For the smaller shapes (qproj
+/// 5 MB, kvproj 2 MB, router 1.4 MB) the iter 046 commit message
+/// flagged "more variable seq=4 behavior" — the RB=2 register
+/// pressure costs more than it gains on shapes where xs already fits
+/// in L1.
+///
+/// **Dispatch rules** (matches task spec for iter 048):
+/// - `Oproj` (N=7168, K=8192): iter 046 at seq>=4, iter 042 otherwise
+/// - `SharedDown` (N=7168, K=2048): iter 046 at seq>=4, iter 042 otherwise
+/// - `Generic` (all other shapes): iter 042 (auto-falls-through to
+///   scalar at seq=1)
+///
+/// All three kernels are bit-identical per-cell (proved by the
+/// `blocked_matches_iter042_multi_seq_8` test in
+/// `kernel_avx512_multi_blocked`), so the dispatch decision is purely
+/// performance — correctness is invariant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjShape {
+    /// Largest shape: N=7168, K=8192. Iter 046 wins +41% at seq>=4.
+    Oproj,
+    /// Second-largest where iter 046 also wins (N=7168, K=2048).
+    SharedDown,
+    /// All other projections — iter 042 is consistently best or tied.
+    Generic,
+}
+
+/// Single entry point all batched-projection callers go through.
+///
+/// At seq=1 the iter 042 wrapper itself routes to the single-token
+/// kernel (preserving the seq=1 hot path that every K2.6 inference uses
+/// today). At seq>=2 the wrapper picks AVX-512 multi tile when the host
+/// supports it; for `Oproj` / `SharedDown` at seq>=4 we upgrade to the
+/// row-blocked iter 046 tile via `dequant_gemm_int4_multi_blocked_auto`
+/// (its dispatcher will fall back to iter 042 at seq=2-3 internally).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_int4_multi(
+    shape: ProjShape,
+    packed: &[u8],
+    scale_bits: &[u8],
+    xs: &[f32],
+    n_rows: usize,
+    k_cols: usize,
+    seq: usize,
+    ys: &mut [f32],
+) {
+    match shape {
+        ProjShape::Oproj | ProjShape::SharedDown => {
+            // iter 046 dispatcher: routes to blocked variant at seq>=4,
+            // iter 042 at seq=2-3, scalar at seq=1.
+            dequant_gemm_int4_multi_blocked_auto(packed, scale_bits, xs, n_rows, k_cols, seq, ys);
+        }
+        ProjShape::Generic => {
+            // iter 042 dispatcher: routes to multi tile at seq>=2,
+            // single-token kernel at seq=1.
+            dequant_gemm_int4_multi_auto(packed, scale_bits, xs, n_rows, k_cols, seq, ys);
+        }
+    }
+}
 
 /// Quantize a bf16 weight matrix [n_rows, k_cols] (raw bytes, little-endian
 /// bf16 = u16) into int4 packed nibbles + per-group bf16 scales.
@@ -695,7 +763,8 @@ fn shell_forward_decode_int4_multi_batched(
 
     // Batched q_a = q_a_proj @ h_norm[t]
     let mut q_a = vec![0.0f32; seq * Q_LORA_RANK];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.q_a_proj_packed,
         &shell.q_a_proj_scale,
         &h_norms,
@@ -708,7 +777,8 @@ fn shell_forward_decode_int4_multi_batched(
     // Batched kv_a (kv_a_proj output includes the rope shared col).
     let kv_a_out_dim = KV_LORA_RANK + QK_ROPE_HEAD_DIM;
     let mut kv_a_with_rope = vec![0.0f32; seq * kv_a_out_dim];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.kv_a_proj_packed,
         &shell.kv_a_proj_scale,
         &h_norms,
@@ -737,7 +807,8 @@ fn shell_forward_decode_int4_multi_batched(
     // Batched q = q_b_proj @ q_a_n[t]
     let qkv_q_dim = NUM_HEADS * QK_HEAD_DIM;
     let mut qs = vec![0.0f32; seq * qkv_q_dim];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.q_b_proj_packed,
         &shell.q_b_proj_scale,
         &q_a_n,
@@ -750,7 +821,8 @@ fn shell_forward_decode_int4_multi_batched(
     // Batched kv_b = kv_b_proj @ kv_a_n[t]
     let kv_b_dim = NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM);
     let mut kv_bs = vec![0.0f32; seq * kv_b_dim];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.kv_b_proj_packed,
         &shell.kv_b_proj_scale,
         &kv_a_n,
@@ -860,8 +932,16 @@ fn shell_forward_decode_int4_multi_batched(
 
     // ============ PHASE C: post-attention projections ============
     // Batched o_proj on stacked attn_outs.
+    //
+    // **iter 048 dispatch.** o_proj is the largest single int4 weight in
+    // the shell (28 MB) — its inner loop pays the most for the redundant
+    // xs reads that iter 042 had. The row-blocked iter 046 tile halves
+    // xs L1 traffic and wins +41% at seq>=4 (verified miner microbench,
+    // 100 iters, seq={4,8,16}). `ProjShape::Oproj` routes through the
+    // blocked dispatcher; at seq<4 it falls back to iter 042 internally.
     let mut o_outs = vec![0.0f32; seq * HIDDEN];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Oproj,
         &shell.o_proj_packed,
         &shell.o_proj_scale,
         &attn_outs,
@@ -887,7 +967,8 @@ fn shell_forward_decode_int4_multi_batched(
 
     // Batched router.
     let mut router_logits = vec![0.0f32; seq * N_ROUTED_EXPERTS];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.router_packed,
         &shell.router_scale,
         &posts,
@@ -929,7 +1010,8 @@ fn shell_forward_decode_int4_multi_batched(
     // Batched shared_gate + shared_up.
     let mut shared_gate_out = vec![0.0f32; seq * INTERMEDIATE_SHARED];
     let mut shared_up_out = vec![0.0f32; seq * INTERMEDIATE_SHARED];
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.shared_gate_packed,
         &shell.shared_gate_scale,
         &posts,
@@ -938,7 +1020,8 @@ fn shell_forward_decode_int4_multi_batched(
         seq,
         &mut shared_gate_out,
     );
-    dequant_gemm_int4_multi_auto(
+    dispatch_int4_multi(
+        ProjShape::Generic,
         &shell.shared_up_packed,
         &shell.shared_up_scale,
         &posts,
@@ -958,7 +1041,14 @@ fn shell_forward_decode_int4_multi_batched(
     }
 
     // Batched shared_down.
-    dequant_gemm_int4_multi_auto(
+    //
+    // **iter 048 dispatch.** Shared_down's N=HIDDEN=7168 rows match
+    // o_proj's row count, with K=2048 instead of 8192. The same RB=2
+    // row-blocking that wins on oproj wins on shared_down (+33% over
+    // iter 042 at seq=16 per iter 046 microbench). `ProjShape::SharedDown`
+    // routes through the iter 046 blocked dispatcher.
+    dispatch_int4_multi(
+        ProjShape::SharedDown,
         &shell.shared_down_packed,
         &shell.shared_down_scale,
         &shared_inters,
@@ -1405,5 +1495,243 @@ mod tests {
         );
         assert_eq!(batched_past_k, scalar_past_k, "past_k");
         assert_eq!(batched_past_v, scalar_past_v, "past_v");
+    }
+
+    /// Build a freshly-seeded KV cache with `past_seq_len` rows of
+    /// deterministic non-zero data per head. The pattern matches what
+    /// `multi_batched_matches_scalar` uses, factored out so the seq=4
+    /// and seq=8 iter 046 dispatch tests can reuse it without copy-paste.
+    #[allow(clippy::type_complexity)]
+    fn seed_kv_pair(
+        capacity: usize,
+        past_seq_len: usize,
+    ) -> ((Vec<f32>, Vec<f32>), (Vec<f32>, Vec<f32>)) {
+        let mut a_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut a_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        let mut b_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut b_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..past_seq_len {
+                let off_k = h * capacity * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                let off_v = h * capacity * V_HEAD_DIM + s * V_HEAD_DIM;
+                for i in 0..QK_HEAD_DIM {
+                    let v = (((h * 7 + s * 13 + i) as f32).sin()) * 1.0e-3;
+                    a_k[off_k + i] = v;
+                    b_k[off_k + i] = v;
+                }
+                for i in 0..V_HEAD_DIM {
+                    let v = (((h * 11 + s * 17 + i) as f32).cos()) * 1.0e-3;
+                    a_v[off_v + i] = v;
+                    b_v[off_v + i] = v;
+                }
+            }
+        }
+        ((a_k, a_v), (b_k, b_v))
+    }
+
+    /// iter 048 bit-identity: at seq=4 the iter 046 row-blocked tile
+    /// kicks in for oproj + shared_down (per
+    /// `dispatch_int4_multi`). The blocked tile is bit-identical to
+    /// iter 042 per-cell, and iter 042 is bit-identical to scalar per
+    /// the existing `multi_matches_per_token_loop_*` tests in
+    /// `kernel_avx512_multi.rs`. So the engine-level shell forward
+    /// must produce byte-identical KV state + per-token outputs as the
+    /// scalar reference loop. This test asserts that property — if it
+    /// fails, the iter 046 dispatch wiring has regressed.
+    #[test]
+    fn multi_batched_matches_scalar_seq_4_iter046_dispatch() {
+        let shell = make_test_shell();
+        let capacity = 16;
+        let past_seq_len = 4;
+        let seq = 4;
+        let ((mut scalar_past_k, mut scalar_past_v), (mut batched_past_k, mut batched_past_v)) =
+            seed_kv_pair(capacity, past_seq_len);
+
+        let mut xs = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = make_test_input(t);
+            xs[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&x_t);
+        }
+
+        let scalar_out = shell_forward_decode_int4_multi_scalar(
+            &shell,
+            &xs,
+            &mut scalar_past_k,
+            &mut scalar_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        let batched_out = shell_forward_decode_int4_multi_batched(
+            &shell,
+            &xs,
+            &mut batched_past_k,
+            &mut batched_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+
+        assert_outputs_match(
+            &batched_out.attn_out_post_norm,
+            &scalar_out.attn_out_post_norm,
+            "attn_out_post_norm",
+        );
+        assert_outputs_match(
+            &batched_out.attn_residual,
+            &scalar_out.attn_residual,
+            "attn_residual",
+        );
+        assert_outputs_match(
+            &batched_out.shared_expert_out,
+            &scalar_out.shared_expert_out,
+            "shared_expert_out",
+        );
+        assert_eq!(batched_out.routing_ids, scalar_out.routing_ids);
+        assert_outputs_match(
+            &batched_out.routing_weights,
+            &scalar_out.routing_weights,
+            "routing_weights",
+        );
+        // KV state: bit-identical (FMA order within each output cell is
+        // preserved across all three kernels).
+        assert_eq!(batched_past_k, scalar_past_k, "past_k");
+        assert_eq!(batched_past_v, scalar_past_v, "past_v");
+    }
+
+    /// Same as `multi_batched_matches_scalar_seq_4_iter046_dispatch`
+    /// but at seq=8 — the iter 046 blocked tile's sweet spot
+    /// (microbench: +40% over iter 042 at seq=8). Also exercises the
+    /// iter 042 path for the Generic projections at seq=8.
+    #[test]
+    fn multi_batched_matches_scalar_seq_8_iter046_dispatch() {
+        let shell = make_test_shell();
+        let capacity = 16;
+        let past_seq_len = 4;
+        let seq = 8;
+        let ((mut scalar_past_k, mut scalar_past_v), (mut batched_past_k, mut batched_past_v)) =
+            seed_kv_pair(capacity, past_seq_len);
+
+        let mut xs = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = make_test_input(t);
+            xs[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&x_t);
+        }
+
+        let scalar_out = shell_forward_decode_int4_multi_scalar(
+            &shell,
+            &xs,
+            &mut scalar_past_k,
+            &mut scalar_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        let batched_out = shell_forward_decode_int4_multi_batched(
+            &shell,
+            &xs,
+            &mut batched_past_k,
+            &mut batched_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+
+        assert_outputs_match(
+            &batched_out.attn_out_post_norm,
+            &scalar_out.attn_out_post_norm,
+            "attn_out_post_norm",
+        );
+        assert_outputs_match(
+            &batched_out.attn_residual,
+            &scalar_out.attn_residual,
+            "attn_residual",
+        );
+        assert_outputs_match(
+            &batched_out.shared_expert_out,
+            &scalar_out.shared_expert_out,
+            "shared_expert_out",
+        );
+        assert_eq!(batched_out.routing_ids, scalar_out.routing_ids);
+        assert_outputs_match(
+            &batched_out.routing_weights,
+            &scalar_out.routing_weights,
+            "routing_weights",
+        );
+        assert_eq!(batched_past_k, scalar_past_k, "past_k");
+        assert_eq!(batched_past_v, scalar_past_v, "past_v");
+    }
+
+    /// Smoke test for the per-shape dispatcher itself: at seq=1, all
+    /// shapes must route to the single-token kernel (the seq=1 hot
+    /// path the entire K2.6 engine runs on today). Verify that
+    /// `dispatch_int4_multi` produces bit-identical output to
+    /// `dequant_gemv_int4_auto` for every shape variant.
+    ///
+    /// This is the most important regression test for iter 048: every
+    /// existing seq=1 inference call routes through the dispatcher
+    /// (when the engine eventually wires the multi seam end-to-end),
+    /// and any drift here would silently corrupt every token.
+    #[test]
+    fn dispatch_int4_multi_seq_1_matches_single_token_kernel() {
+        use crate::kernel_avx512::dequant_gemv_int4_auto;
+        // Use shapes representative of K2.6 projections but small enough
+        // for fast test execution.
+        let n_rows = 64;
+        let k_cols = 128;
+        let seq = 1;
+
+        // Deterministic packed bytes + bf16 scales + f32 inputs; same
+        // pattern as `kernel_avx512_multi::tests::make_test_data` but
+        // duplicated here so we don't have to export the helper.
+        let mut packed = vec![0u8; n_rows * k_cols / 2];
+        for r in 0..n_rows {
+            for c in 0..(k_cols / 2) {
+                packed[r * (k_cols / 2) + c] = ((r.wrapping_mul(31).wrapping_add(c)) & 0xFF) as u8;
+            }
+        }
+        let n_groups = k_cols / GROUP_SIZE;
+        let mut scales = vec![0u8; n_rows * n_groups * 2];
+        for r in 0..n_rows {
+            for g in 0..n_groups {
+                let s = 0.5f32 + (((r * 7 + g * 3) % 11) as f32) * 0.1;
+                let bits = bf16_round(s);
+                let off = (r * n_groups + g) * 2;
+                scales[off] = (bits & 0xFF) as u8;
+                scales[off + 1] = (bits >> 8) as u8;
+            }
+        }
+        let mut xs = vec![0.0f32; seq * k_cols];
+        for t in 0..seq {
+            for c in 0..k_cols {
+                xs[t * k_cols + c] = ((t * 17 + c * 5) as f32).sin() * 0.5;
+            }
+        }
+
+        let mut y_single = vec![0.0f32; n_rows];
+        dequant_gemv_int4_auto(&packed, &scales, &xs, n_rows, k_cols, &mut y_single);
+
+        for shape in [ProjShape::Generic, ProjShape::Oproj, ProjShape::SharedDown] {
+            let mut y_disp = vec![0.0f32; n_rows];
+            dispatch_int4_multi(
+                shape,
+                &packed,
+                &scales,
+                &xs,
+                n_rows,
+                k_cols,
+                seq,
+                &mut y_disp,
+            );
+            for i in 0..n_rows {
+                assert_eq!(
+                    y_single[i].to_bits(),
+                    y_disp[i].to_bits(),
+                    "shape={shape:?}: mismatch at i={i}: single={}, dispatch={}",
+                    y_single[i],
+                    y_disp[i]
+                );
+            }
+        }
     }
 }
