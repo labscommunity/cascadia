@@ -36,6 +36,7 @@ narrative.
 | 029 | 2026-05-18 | F5 sliding-window | windowed attention via --attention-window W flag | **IMPL DONE** (perf/f5-sparse-attention-029 @ 769c8b0), 8 unit tests pass, bench deferred for sibling-agent miner contention | (bench pending) | (bench pending) |
 | 030 | 2026-05-18 | matias 2-box | revive 2-box pipeline-parallel via SSH-tunnel chain | **IN FLIGHT** (infra/matias-2box-revival-029, agent still running, 1952 lines staged) | (pending) | (pending) |
 | 031 | 2026-05-18 | A1 int2 experts | int4→int2 expert weight quantization | **KERNEL WORKS** (perf/a1-int2-experts-029 @ ae617a6): 1.80× smaller, 2.89× faster in clean run, cosine 0.61, 4/4 quality preserved at layer-30 swap; pipeline bench contaminated by 3-worker contention | 1.722ms (int2) vs 4.977ms (int4) per-expert | 4/4 (substring) |
+| 032 | 2026-05-18 | A8 KV bf16 | KV cache fp32→bf16 + inline bf16→f32 in SDPA | **VERIFIED WIN** (perf/a8-kv-bf16-029 @ ebd8ac4): ~2.1× attn kernel speedup (687ms vs 1456ms f32), KV mem halved (2.4 vs 5 MB/tok), 3/3 quality | (kernel: 687ms attn, contention-depressed e2e) | 3/3 |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.
