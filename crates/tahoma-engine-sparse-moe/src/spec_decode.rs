@@ -62,24 +62,74 @@ pub struct RoundReconcile {
 
 /// Compute reconcile actions given accept count + draft count.
 ///
-/// Pre-conditions (caller invariants):
-/// - `drafts.len() == k_drafts` forwards have been run, each
-///   advancing the KV cache by 1 slot and pushing one drafted token
-///   into `history`.
+/// # The two history conventions
+///
+/// Two call sites carry slightly different history/KV invariants
+/// going INTO each spec-decode round; pass `pending_token_in_history`
+/// to select between them.
+///
+/// ## `pending_token_in_history = false` (clean convention)
+///
+/// At round entry, `history.len() == KV.past_seq_len` — every token
+/// in history has a matching KV slot. The bonus token from the
+/// previous round was either consumed by an explicit "warmup" forward
+/// before re-entry, or it's round 1 and there's no previous bonus.
+/// This is the convention exercised by the existing helper tests
+/// (e.g. `simulated_session_matches_sequential_greedy`).
+///
+/// ## `pending_token_in_history = true` (runner / pipeline-parallel convention)
+///
+/// At round entry, `history.len() == KV.past_seq_len + 1` — there's
+/// one trailing token in history whose KV slot is NOT yet written.
+/// It's the previous round's bonus (or, for round 1, the `first_gen`
+/// token sampled from the last prefill step). The next round's first
+/// verify forward will fill that slot as a side effect.
+///
+/// This is the convention used by:
+/// - [`crate::runner::Runner::generate_speculative`] (single-stage),
+///   which pre-pushes `first_gen` to history before the first round
+///   and appends the round's `bonus` to history at end-of-round.
+/// - The pipeline-parallel driver `drive_generation_first_spec` in
+///   [`crate::engine`], which inherited the same convention from the
+///   single-stage path.
+///
+/// In this convention, the K verify forwards collectively write K KV
+/// slots starting from `past_seq_len = history.len() - 1` — i.e. the
+/// first verify is the one that "catches up" the pending token, and
+/// each subsequent verify writes one draft's slot. So total KV writes
+/// during the K-loop is still K, but the post-loop KV ends at
+/// `history.len() - 1` (NOT `history.len()`). The bonus the caller
+/// appends at end-of-round is itself unforwarded — it becomes the
+/// next round's pending token. Net effect: `kv_rewind` is one less
+/// than the clean-convention formula returns.
+///
+/// # Pre-conditions (caller invariants)
+///
+/// - `k_drafts` forwards have been run during the round's K-loop,
+///   each advancing the KV cache by 1 slot and pushing one drafted
+///   token into `history`.
 /// - If `accepted == k_drafts` AND the caller chose to run a bonus
 ///   forward (typically `true` so the next round has its
 ///   `prev_correction`), the bonus forward has also advanced KV by 1
 ///   and produced one target sample. Pass `bonus_forward_ran=true` in
-///   that case.
+///   that case. In the runner convention, this extra forward writes
+///   the K-th draft's slot (the K-loop only wrote K-1 draft slots
+///   itself; its first verify filled the pending token's slot).
 ///
-/// Post-conditions:
+/// # Post-conditions
+///
 /// - After `history.truncate(history.len() - history_pop)` and
 ///   `runner.rewind_kv(kv_rewind)`, the engine state holds exactly
-///   the accepted prefix.
+///   the accepted prefix. In the clean convention,
+///   `KV == history.len() == prev_kv + accepted`. In the runner
+///   convention, `KV + 1 == history.len() == prev_history + accepted`
+///   (i.e. the +1 drift is preserved for the next round's pending
+///   bonus, which the caller appends to history immediately after).
 pub fn reconcile_after_round(
     k_drafts: usize,
     accepted: usize,
     bonus_forward_ran: bool,
+    pending_token_in_history: bool,
 ) -> RoundReconcile {
     debug_assert!(accepted <= k_drafts);
     let rejected = k_drafts.saturating_sub(accepted);
@@ -91,8 +141,30 @@ pub fn reconcile_after_round(
     // We want KV to end at `accepted` (matching the accepted-drafts
     // suffix in history). Then the caller pushes bonus; the next
     // round's first forward will fill its KV slot.
+    //
+    // In the runner / pipeline-parallel convention, the K-loop "absorbed"
+    // the previous round's pending token (filling its KV slot as a
+    // side effect of the first verify forward). So the bonus we
+    // re-attach as the next round's pending token rides on the same
+    // 1-slot drift — `kv_rewind` is one less than the clean-convention
+    // value. This is mathematically equivalent to the inline
+    // `K - A - 1` (partial) / `0` (all-accepted) formulas documented
+    // in `engine::drive_generation_first_spec`.
     let kv_writes = k_drafts + if bonus_forward_ran { 1 } else { 0 };
-    let kv_rewind = kv_writes - accepted;
+    let mut kv_rewind = kv_writes - accepted;
+    if pending_token_in_history {
+        // The pending-token convention preserves one KV slot of drift
+        // (history is always +1 ahead of KV). `kv_rewind` should never
+        // go negative — for partial accept, K > A so K-A-1 >= 0; for
+        // all-accepted with bonus_forward_ran=true, kv_writes-A = 1
+        // and rewind becomes 0 cleanly.
+        debug_assert!(
+            kv_rewind >= 1,
+            "pending-token convention requires kv_writes - accepted >= 1 \
+             (k_drafts={k_drafts}, accepted={accepted}, bonus_forward_ran={bonus_forward_ran})"
+        );
+        kv_rewind -= 1;
+    }
     // New tokens emitted = accepted drafts + 1 bonus (always — bonus
     // is the target's sample at the rejection boundary, or the
     // dedicated extra forward's sample when all-accepted).
@@ -143,7 +215,7 @@ mod tests {
     fn reconcile_partial_accept() {
         // 4 drafts, 2 accepted, no bonus forward (the bonus comes from
         // the rejection-position forward).
-        let r = reconcile_after_round(4, 2, false);
+        let r = reconcile_after_round(4, 2, false, false);
         assert_eq!(
             r,
             RoundReconcile {
@@ -159,7 +231,7 @@ mod tests {
     fn reconcile_all_accepted_with_bonus_forward() {
         // 4 drafts, all 4 accepted, an extra bonus forward ran to get
         // the prev_correction for next round.
-        let r = reconcile_after_round(4, 4, true);
+        let r = reconcile_after_round(4, 4, true, false);
         assert_eq!(
             r,
             RoundReconcile {
@@ -175,7 +247,7 @@ mod tests {
     fn reconcile_zero_accepted() {
         // All drafts rejected; bonus comes from the first-position
         // forward.
-        let r = reconcile_after_round(8, 0, false);
+        let r = reconcile_after_round(8, 0, false, false);
         assert_eq!(
             r,
             RoundReconcile {
@@ -189,7 +261,7 @@ mod tests {
 
     #[test]
     fn reconcile_single_draft_accepted() {
-        let r = reconcile_after_round(1, 1, true);
+        let r = reconcile_after_round(1, 1, true, false);
         // K=1: if the one draft accepted, bonus_forward_ran=true
         // means we ran 1 + 1 = 2 forwards; accepted 1; rewind 2-1=1.
         assert_eq!(
@@ -199,6 +271,71 @@ mod tests {
                 kv_rewind: 1,
                 new_tokens_emitted: 2,
                 all_accepted_bonus: true,
+            }
+        );
+    }
+
+    /// Regression test for the runner-convention off-by-one fixed in
+    /// `fix/spec-decode-reconcile-off-by-one-043`.
+    ///
+    /// In the pending-token convention (used by
+    /// `Runner::generate_speculative` and the pipeline-parallel
+    /// `drive_generation_first_spec` driver), the K verify forwards
+    /// absorb the previous round's pending token into KV as a side
+    /// effect. So `kv_rewind` must be one LESS than the clean-convention
+    /// value — otherwise the helper rewinds one too many KV slots,
+    /// causing the next round's verify forward to mis-align with the
+    /// stale KV state. The single-stage runner's `kv_invariant_holds`
+    /// debug_assert fires on round 2 when this drift is wrong.
+    ///
+    /// Matches the inline formula documented in
+    /// `engine::drive_generation_first_spec`:
+    ///   partial accept (A < K, no bonus forward): rewind = K - A - 1
+    ///   all accepted (A == K, bonus forward ran):  rewind = 0
+    #[test]
+    fn reconcile_pending_token_partial_accept() {
+        // 4 drafts, 2 accepted, runner convention (pending token present).
+        let r = reconcile_after_round(4, 2, false, true);
+        assert_eq!(
+            r,
+            RoundReconcile {
+                history_pop: 2,        // pop the 2 rejected drafts
+                kv_rewind: 1,          // 4 KV writes - 2 accepted - 1 (pending drift) = 1
+                new_tokens_emitted: 3, // 2 accepted + 1 bonus
+                all_accepted_bonus: false,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_pending_token_all_accepted() {
+        // 4 drafts, all 4 accepted, bonus forward ran, runner convention.
+        let r = reconcile_after_round(4, 4, true, true);
+        assert_eq!(
+            r,
+            RoundReconcile {
+                history_pop: 0,
+                kv_rewind: 0, // 5 KV writes - 4 accepted - 1 (pending drift) = 0
+                new_tokens_emitted: 5, // 4 accepted + 1 bonus
+                all_accepted_bonus: true,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_pending_token_zero_accepted() {
+        // 8 drafts, all rejected, runner convention. The K-loop wrote
+        // 8 KV slots (first one absorbed the pending token); we want
+        // to end at KV = pre_kv = pre_history - 1, which means
+        // rewind = 8 - 0 - 1 = 7.
+        let r = reconcile_after_round(8, 0, false, true);
+        assert_eq!(
+            r,
+            RoundReconcile {
+                history_pop: 8,
+                kv_rewind: 7,
+                new_tokens_emitted: 1,
+                all_accepted_bonus: false,
             }
         );
     }
@@ -217,22 +354,31 @@ mod tests {
         // alongside the bonus).
         //
         // Walk every combination of (k_drafts, accepted, bonus_ran)
-        // and check the arithmetic balances.
-        for k in 1..=8 {
-            for a in 0..=k {
-                let bonus_ran = a == k;
-                let r = reconcile_after_round(k, a, bonus_ran);
-                // Total KV writes during the round = k + (bonus_ran ? 1 : 0).
-                let total_writes = k + if bonus_ran { 1 } else { 0 };
-                // After rewind, kv = total_writes - r.kv_rewind.
-                let kv_after = total_writes - r.kv_rewind;
-                // We want kv_after == accepted (the next round's
-                // first forward will push the bonus to KV).
-                assert_eq!(kv_after, a, "k={k} a={a} bonus_ran={bonus_ran}");
-                // new_tokens_emitted = accepted + 1 (the +1 is the bonus).
-                assert_eq!(r.new_tokens_emitted, a + 1, "k={k} a={a}");
-                // history_pop = k - a (rejected drafts).
-                assert_eq!(r.history_pop, k - a, "k={k} a={a}");
+        // and check the arithmetic balances. Tests both conventions.
+        for &pending in &[false, true] {
+            for k in 1..=8 {
+                for a in 0..=k {
+                    let bonus_ran = a == k;
+                    let r = reconcile_after_round(k, a, bonus_ran, pending);
+                    // Total KV writes during the round = k + (bonus_ran ? 1 : 0).
+                    let total_writes = k + if bonus_ran { 1 } else { 0 };
+                    // After rewind, kv = total_writes - r.kv_rewind.
+                    let kv_after = total_writes - r.kv_rewind;
+                    // Clean convention: we want kv_after == accepted (the next round's
+                    // first forward will push the bonus to KV).
+                    // Pending convention: we want kv_after == accepted + 1 (the bonus
+                    // becomes the next round's pending token; KV was already at +1
+                    // drift relative to history pre-round, and that drift is preserved).
+                    let expected_kv = if pending { a + 1 } else { a };
+                    assert_eq!(
+                        kv_after, expected_kv,
+                        "k={k} a={a} bonus_ran={bonus_ran} pending={pending}"
+                    );
+                    // new_tokens_emitted = accepted + 1 (the +1 is the bonus).
+                    assert_eq!(r.new_tokens_emitted, a + 1, "k={k} a={a} pending={pending}");
+                    // history_pop = k - a (rejected drafts).
+                    assert_eq!(r.history_pop, k - a, "k={k} a={a} pending={pending}");
+                }
             }
         }
     }
@@ -326,7 +472,7 @@ mod tests {
                 kv_len += 1; // extra bonus forward
                 b
             };
-            let r = reconcile_after_round(drafts.len(), accepted, bonus_forward_ran);
+            let r = reconcile_after_round(drafts.len(), accepted, bonus_forward_ran, false);
             // Apply rewinds (mock).
             history.truncate(history.len() - r.history_pop);
             kv_len -= r.kv_rewind;
@@ -365,6 +511,188 @@ mod tests {
         assert_eq!(
             generated, expected_new,
             "spec-decoded output should match sequential greedy"
+        );
+    }
+
+    /// Regression test for the runner-convention off-by-one fixed in
+    /// `fix/spec-decode-reconcile-off-by-one-043`.
+    ///
+    /// Simulates the EXACT call pattern used by
+    /// [`crate::runner::Runner::generate_speculative`] (and the
+    /// pipeline-parallel `drive_generation_first_spec` driver):
+    ///
+    /// 1. Pre-push `first_gen` to history right after prefill; KV
+    ///    stays at prompt.len(). History trails ahead by +1.
+    /// 2. K-loop: for each draft, `step(history, 1)` (which writes 1
+    ///    KV slot at past_seq_len = history.len()-1), THEN
+    ///    `history.push(draft_tok)`. After K iterations:
+    ///    history.len() = N+K, kv = N+K-1, where N is the pre-round
+    ///    history length.
+    /// 3. Compute accepted; if accepted == K, run a bonus forward
+    ///    (writes 1 more KV slot, no history push).
+    /// 4. Apply `reconcile_after_round(..., pending=true)`.
+    /// 5. Append bonus to history (no KV write). History trails by +1
+    ///    again, ready for the next round.
+    ///
+    /// The post-round invariant the runner asserts (via
+    /// `kv_invariant_holds`) is:
+    ///   `KV == history.len()` after appending bonus AND the NEXT
+    ///   round's first verify forward (which writes the bonus's KV
+    ///   slot).
+    ///
+    /// At the boundary between rounds (between bonus.push and the
+    /// next K-loop's first forward), the invariant is:
+    ///   `KV + 1 == history.len()`.
+    ///
+    /// Before the fix, the helper rewound K-A KV slots (clean
+    /// convention) instead of K-A-1 (runner convention) — so KV ended
+    /// up at history.len() - 2, and the runner's `kv_invariant_holds`
+    /// would fail on round 2 (and `debug_assert!` would fire in debug
+    /// builds).
+    #[test]
+    fn simulated_runner_pending_session_matches_sequential_greedy() {
+        // Same mock target as the clean-convention test, so we can
+        // compare against the same sequential reference.
+        let mock_target = |history: &[i64]| -> i64 {
+            if history.len() >= 2 {
+                let a = history[history.len() - 1];
+                let b = history[history.len() - 2];
+                ((a + b) % 100).max(0)
+            } else if !history.is_empty() {
+                (history[history.len() - 1] + 1) % 100
+            } else {
+                7
+            }
+        };
+
+        let prompt: Vec<i64> = vec![1, 2, 3];
+        let max_new: usize = 16;
+
+        // Sequential reference.
+        let mut sequential = prompt.clone();
+        for _ in 0..max_new {
+            sequential.push(mock_target(&sequential));
+        }
+        let expected_new: Vec<i64> = sequential[prompt.len()..].to_vec();
+
+        // Same draft pattern.
+        let mock_draft = |history: &[i64]| -> Vec<i64> {
+            let mut out = Vec::with_capacity(4);
+            let mut working = history.to_vec();
+            for k in 0..4 {
+                let proposal = if k == 0 {
+                    mock_target(&working)
+                } else {
+                    (mock_target(&working) + 3) % 100
+                };
+                working.push(proposal);
+                out.push(proposal);
+            }
+            out
+        };
+
+        // ---- Prefill: runner convention ----
+        let mut history = prompt.clone();
+        let mut generated: Vec<i64> = Vec::new();
+        // After prefill, KV == history.len() (every prompt token had a
+        // forward call write its slot).
+        let mut kv_len = prompt.len();
+
+        // First generated token from last prefill step's logits.
+        // Runner pre-pushes this to history; KV stays put.
+        let first = mock_target(&history);
+        history.push(first);
+        generated.push(first);
+        // Invariant at this point: kv_len + 1 == history.len() (pending).
+        assert_eq!(
+            kv_len + 1,
+            history.len(),
+            "round-0 setup: pending-token invariant",
+        );
+
+        // ---- Spec-decode rounds, runner convention ----
+        while generated.len() < max_new {
+            let drafts = mock_draft(&history);
+
+            // K-loop: each verify does `step` then `history.push(draft)`.
+            // step writes KV at past_seq_len = history.len()-1, then KV
+            // advances by 1. So per-iter: kv_len += 1 BEFORE the push,
+            // then history.push() pushes history ahead. Net per-iter:
+            // kv_len += 1, history.len() += 1.
+            let mut target_samples = Vec::with_capacity(drafts.len() + 1);
+            for &draft_tok in &drafts {
+                target_samples.push(mock_target(&history));
+                kv_len += 1; // the step's KV write
+                history.push(draft_tok);
+            }
+            // After K-loop: history.len() = N+K, kv_len = N+K-1
+            // (where N was the pre-round history length).
+
+            let accepted = count_accepted(&drafts, &target_samples);
+            let bonus_forward_ran = accepted == drafts.len();
+            let bonus: i64 = if !bonus_forward_ran {
+                target_samples[accepted]
+            } else {
+                // All-accepted bonus forward: writes one more KV slot,
+                // no history push.
+                let b = mock_target(&history);
+                kv_len += 1;
+                b
+            };
+
+            let r = reconcile_after_round(drafts.len(), accepted, bonus_forward_ran, true);
+            history.truncate(history.len() - r.history_pop);
+            kv_len -= r.kv_rewind;
+
+            // Emit accepted drafts (into `generated` only — they're
+            // already in history from the K-loop and survived the pop).
+            let mut hit_max = false;
+            for &t in drafts.iter().take(accepted) {
+                generated.push(t);
+                if generated.len() >= max_new {
+                    hit_max = true;
+                    break;
+                }
+            }
+
+            // Append bonus to history (no KV write) — pending-token
+            // convention preserves the +1 drift for the next round.
+            // We only push if we have room AND haven't hit_max; this
+            // mirrors the runner's behavior.
+            let bonus_pushed = !hit_max && generated.len() < max_new;
+            if bonus_pushed {
+                history.push(bonus);
+                generated.push(bonus);
+            }
+
+            // Post-round invariant: with the bonus pushed, history
+            // trails KV by +1 (the bonus's pending slot — the next
+            // round's first verify forward will fill it). Without the
+            // bonus pushed (max_new saturated mid-round), no drift.
+            //
+            // Before the fix, the helper rewound K-A slots instead of
+            // K-A-1, leaving kv_len at history.len() - 2 (drift = -2)
+            // after the bonus push — which would trip the runner's
+            // `kv_invariant_holds` debug_assert on round 2.
+            let expected_drift = if bonus_pushed { 1 } else { 0 };
+            assert_eq!(
+                kv_len + expected_drift,
+                history.len(),
+                "pending-token round invariant broken: \
+                 drafts={drafts:?} accepted={accepted} bonus_forward_ran={bonus_forward_ran} \
+                 bonus_pushed={bonus_pushed} kv_len={kv_len} history.len()={}",
+                history.len()
+            );
+
+            if hit_max {
+                break;
+            }
+        }
+
+        generated.truncate(max_new);
+        assert_eq!(
+            generated, expected_new,
+            "spec-decoded output (runner convention) should match sequential greedy"
         );
     }
 }
