@@ -18,6 +18,36 @@ Entry template:
 
 ---
 
+## 015 — A3 K=4 + A2 threshold=0.3 composed — NEUTRAL (+33% but -1 quality) (2026-05-17 ~23:30 PT)
+
+**Hypothesis:** Adaptive per-token K via routing threshold composed
+with the K=4 cap further reduces expert dispatches.
+
+**Result: Pareto-incomparable.** +33% throughput but -1 quality vs K=4
+alone.
+
+| Config | tok/s | quality | Δ vs K=4 alone |
+|--------|------:|---------|---------------:|
+| K=4 alone (iter 009) | 0.2100 | 9/10 | (ref) |
+| K=4 + threshold=0.3 | 0.2792 | 8/10 | +33%, -1 prompt |
+
+Failures: celsius (already failed at K=4); Python "Guido" prompt
+(NEW failure — K=4 alone got "Guido van Rossum", thr=0.3 said "the Dutch").
+The threshold=0.3 prunes the "Guido" expert because its routing weight
+is below 0.3 for the Python prompt.
+
+**Lesson:** Threshold pruning has a quality cost beyond what K=4 alone
+incurs. 0.3 is too aggressive. Could try 0.1 / 0.2 if returning to
+this — but the marginal gain probably doesn't justify the eval cost.
+
+Bench: `experiments/015_a3_a2_compose/bench_k4_thr3.jsonl`
+
+**Next (iteration 016):** Pivot to a non-A3 moonshot. Top picks:
+A8 KV bf16 (real code change, attacks attention BW bucket), or
+max_tokens sweep on K=4 (cheap, more production evidence).
+
+---
+
 ## 014 — Spinout PR #29 opened (A3 productionization on main) (2026-05-17 ~22:35 PT)
 
 **Hypothesis:** Crystallize the validated K=4 win into a small focused

@@ -19,6 +19,7 @@ narrative.
 | 012 | 2026-05-17 | A3 K=4 code prompts | 5 code/programming prompts at K=4 | 4/5 (consistent ~80-90% across prompt classes) | 0.2298 | 4/5 |
 | 013 | 2026-05-17 | K=4 vs K=8 apples-to-apples mt=64 | Direct head-to-head at long context | **K=4 +210% AND higher quality (9 vs 8/10)** | 0.3253 (K=4) | 9/10 (K=4) vs 8/10 (K=8) |
 | 014 | 2026-05-17 | spinout PR #29 | productionize K=4 win on main | **SHIPPED** as PR #29 (perf/a3-topk-override) | — | — |
+| 015 | 2026-05-17 | A3+A2 compose | K=4 + threshold=0.3 (adaptive per-token K) | Pareto-incomparable: +33% tok/s but -1 quality (Guido) | 0.2792 | 8/10 |
 
 Format note: `result` is one of `win` / `neutral` / `negative` / `running`.
 `tok/s` is steady-state on the 2-box matias pipeline unless noted.

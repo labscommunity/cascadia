@@ -1,0 +1,11 @@
+{"prompt":"The capital of France is","substr":"paris","content":" Paris. The capital of Germany is Berlin. The capital of the United States is","completion_tokens":16,"wall_ms":68163,"tok_per_sec":0.2347,"quality_pass":true}
+{"prompt":"The largest ocean on Earth is the","substr":"pacific","content":" Pacific Ocean. It covers about 30% of the Earth's surface and is the","completion_tokens":16,"wall_ms":59859,"tok_per_sec":0.2673,"quality_pass":true}
+{"prompt":"Two plus two equals","substr":"four","content":" four, yes or no?  Yes.  Two plus two is four,","completion_tokens":16,"wall_ms":45842,"tok_per_sec":0.3490,"quality_pass":true}
+{"prompt":"The first president of the United States was","substr":"washington","content":" George Washington. He was born in 1732 and died in 1799","completion_tokens":16,"wall_ms":52200,"tok_per_sec":0.3065,"quality_pass":true}
+{"prompt":"The largest planet in our solar system is","substr":"jupiter","content":" Jupiter, which has a mass of 1.898 × 10^27","completion_tokens":16,"wall_ms":59356,"tok_per_sec":0.2696,"quality_pass":true}
+{"prompt":"Water boils at 100 degrees","substr":"celsius","content":". Who is the author of the book \"The Cat in the Hat\"? The","completion_tokens":16,"wall_ms":60006,"tok_per_sec":0.2666,"quality_pass":false}
+{"prompt":"Python is a programming language created by","substr":"guido","content":" the Dutch. It was released in 1991, and it has been used","completion_tokens":16,"wall_ms":65026,"tok_per_sec":0.2461,"quality_pass":false}
+{"prompt":"The square root of 144 is","substr":"12","content":" 12. Is this correct? Yes, the square root of 144 is","completion_tokens":16,"wall_ms":52525,"tok_per_sec":0.3046,"quality_pass":true}
+{"prompt":"Mount Everest is located in the","substr":"himalaya","content":" Himalayas, which is a mountain range in Asia. The Himalayas are part","completion_tokens":16,"wall_ms":54456,"tok_per_sec":0.2938,"quality_pass":true}
+{"prompt":"The speed of light is approximately 300","substr":"km","content":",000 km/s. What is the speed of light in km/h? (","completion_tokens":16,"wall_ms":55601,"tok_per_sec":0.2878,"quality_pass":true}
+{"aggregate":true,"n_prompts":10,"total_tokens":160,"total_wall_ms":573034,"tok_per_sec":0.2792,"quality_pass":"8/10","timestamp_utc":"2026-05-18T04:29:41Z"}
