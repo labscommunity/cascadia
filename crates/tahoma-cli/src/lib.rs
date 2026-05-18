@@ -470,6 +470,31 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
     runner.start_with_listen(peers, shard, listen).await?;
 
+    // Every worker advertises itself via mDNS — not just rank 0 — so the
+    // coordinator's dashboard /api/topology can render the full cluster
+    // and not just self. Best-effort: a host without a working multicast
+    // path (CI sandbox, restricted LAN) still serves; the dashboard just
+    // shows fewer nodes. We bind `_discovery` for the rest of this
+    // function so its Drop unregisters the mDNS record cleanly on
+    // shutdown (relay loop or `serve_with_nodelay`).
+    let topology = tahoma_topology::Topology::new();
+    let self_node = tahoma_topology::NodeInfo {
+        node_id: format!("{}-r{}", hostname(), args.rank),
+        host: tahoma_discovery::local_ip().to_string(),
+        port: listen_port,
+        namespace: "default".to_owned(),
+        device: args.device.clone(),
+        memory_mb: 0,
+        engines: vec![engine_name(args.engine).to_owned()],
+        last_seen: 0.0,
+    };
+    topology.add_node(self_node.clone());
+    let mut discovery = tahoma_discovery::DiscoveryService::new(topology.clone(), "default");
+    if let Err(e) = discovery.start(self_node) {
+        warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
+    }
+    let _discovery = discovery;
+
     if !is_first {
         info!("entering relay loop");
         let r = runner.clone();
@@ -509,30 +534,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let api_router =
             tahoma_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
 
-        // Stand up a Topology + mDNS discovery so the dashboard has
-        // peers to render. The discovery service is best-effort: a host
-        // without a working multicast path (CI sandbox, restricted LAN)
-        // still serves the API and dashboard, just with `self` as the
-        // only node. We keep `_discovery` bound for the lifetime of
-        // serve_with_nodelay so its Drop unregisters cleanly on shutdown.
-        let topology = tahoma_topology::Topology::new();
-        let self_node = tahoma_topology::NodeInfo {
-            node_id: format!("{}-r{}", hostname(), args.rank),
-            host: tahoma_discovery::local_ip().to_string(),
-            port: listen_port,
-            namespace: "default".to_owned(),
-            device: args.device.clone(),
-            memory_mb: 0,
-            engines: vec![engine_name(args.engine).to_owned()],
-            last_seen: 0.0,
-        };
-        topology.add_node(self_node.clone());
-        let mut discovery = tahoma_discovery::DiscoveryService::new(topology.clone(), "default");
-        if let Err(e) = discovery.start(self_node) {
-            warn!(error = %e, "mDNS discovery failed to start; dashboard will show only self");
-        }
-        let _discovery = discovery;
-
+        // `topology` was populated above (every worker advertises +
+        // browses) so by the time the dashboard binds, mDNS may already
+        // have discovered other ranks on the LAN.
         let dash_state = tahoma_dashboard::DashboardState {
             topology,
             stats: tahoma_dashboard::DashboardStats::new(max_concurrent),
