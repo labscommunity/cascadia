@@ -70,13 +70,21 @@ output distribution on harder prompts.
 
 ## Caveats
 
+- **Temperature sensitivity (important):** K=4 quality is validated at
+  temperature=0 (greedy). At temperature=0.7, K=4 quality COLLAPSES
+  to 5/10 on the same 10-prompt eval while K=8 holds 8/10. The smaller
+  expert budget can't recover from sampling variance — outputs go
+  incoherent ("Pyth" "Pyth" for the Python prompt, "delighted" for
+  Washington). For high-temperature chat workloads (temp ≥ 0.5),
+  recommend K=6 or K=8. The +146% throughput win only applies in the
+  low-temperature regime. Source: `autolab/k26-perf` iter 018.
 - Measured on miner single-stage (disk-bound regime — K2.6 = 553 GB,
   RAM = 133 GB). The 2-box matias setup (compute-bound) may show a
   smaller relative win but the quality picture should hold.
 - 10-prompt substring eval is narrow. A proper MMLU/LongBench eval
   would tighten the quality claim. The 1-prompt quality difference
-  between K=4 and K=8 may be sampling-format dependent rather than a
-  true capability gap.
+  between K=4 and K=8 at temp=0 may be sampling-format dependent
+  rather than a true capability gap.
 - Output text diverges from K=8 at K=4 (different routing → different
   hidden states → different sampled tokens). Substring pass doesn't
   imply semantic equivalence.
