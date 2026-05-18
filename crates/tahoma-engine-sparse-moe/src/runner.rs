@@ -664,6 +664,52 @@ impl Runner {
         }
     }
 
+    /// Truncate the per-layer KV caches by `n` slots. Used by speculative
+    /// decoding to discard rejected-draft positions without paying the cost
+    /// of resetting + replaying the kept prefix.
+    ///
+    /// **Equivalence to mask-based rewind.** rainier's `MaskedReq.rewind(k)`
+    /// (see `docs/SPEC_DECODE_SUMMARY.md`) leaves K/V values physically in
+    /// the OV stateful cache and flips an `attention_mask[j] = 0` flag so
+    /// future queries skip those positions. We don't have an OV-stateful
+    /// cache here — the int4 shell's K/V is a raw f32 buffer that we
+    /// already address via `past_seq_len`. So we can do the simpler
+    /// in-place truncation: shrink `past_seq_len` by `n`. The next
+    /// `forward_shells` call writes its new slot at the now-vacant
+    /// position; the rejected K/V values become dead memory until
+    /// overwritten or the cache is reset.
+    ///
+    /// This is symmetric across layer 0 and every shell layer this rank
+    /// owns. Saturating on `n > past_seq_len` clamps to 0 (equivalent
+    /// to `reset_kv` for that layer).
+    pub fn rewind_kv(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        for l in &mut self.layers {
+            l.past_seq_len = l.past_seq_len.saturating_sub(n);
+        }
+        if let Some(l0) = self.layer0.as_mut() {
+            l0.past_seq_len = l0.past_seq_len.saturating_sub(n);
+        }
+    }
+
+    /// Snapshot of the current KV-cache lengths across the rank's
+    /// layers (layer 0 + every MoE layer this rank owns). All values
+    /// should be equal during normal operation; if they diverge that
+    /// indicates a bug in the spec-decode rewind path. Public for tests
+    /// and for the spec-decode loop's debug assertions.
+    pub fn kv_past_seq_lens(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.layers.len() + 1);
+        if let Some(l0) = self.layer0.as_ref() {
+            out.push(l0.past_seq_len);
+        }
+        for l in &self.layers {
+            out.push(l.past_seq_len);
+        }
+        out
+    }
+
     /// Run one forward pass:
     /// - `full_ids` is the FULL prefix-so-far (1D i64), used by stateless
     ///   layer 0.
@@ -1226,6 +1272,278 @@ impl Runner {
             &crate::sampling::SamplingConfig::default(),
         )
     }
+
+    /// Speculative-decode wrapper around [`Self::generate`]. Uses the
+    /// caller-provided [`crate::ngram_draft::Draft`] as a zero-compute
+    /// draft model and verifies each round of `K` drafts through the
+    /// full target forward path (token-by-token shell calls — there is
+    /// **no multi-token shell forward kernel yet**, so each verify pass
+    /// pays K full target forwards). The win is therefore concentrated
+    /// in the wire/orchestration overhead the engine pays per token, not
+    /// in the per-token compute. On the single-stage Rust engine that
+    /// overhead is just one round-trip through `step()` + sampler per
+    /// token — small relative to K2.6's ~9 s/token, so single-stage
+    /// speedup is bounded by *whatever fraction of per-token cost is
+    /// NOT in `forward_shells`* (today: layer 0 + head + sampler, ~50ms
+    /// of a ~9 s budget, i.e. negligible).
+    ///
+    /// The real payoff is in pipeline-parallel mode: every accepted
+    /// draft saves one full wire round-trip through the pipeline. At
+    /// the 22 ms cross-host RT measured on the cascadia fleet, K=8 with
+    /// 70% acceptance saves `5.6 × 22 ms = 123 ms` per round — roughly
+    /// the same proportional cost as rainier reported on llama 3.1 8B.
+    ///
+    /// **Distributed support is currently OUT OF SCOPE**. The
+    /// pipeline-parallel `step_first` / `step_worker` paths in
+    /// [`crate::engine::SparseMoEEngine`] do not yet know about
+    /// multi-token verify frames — adding that requires extending
+    /// [`crate::dist::FrameKind`] with a `ForwardBatch(K)` variant.
+    /// This function is single-stage only for now; callers in multi-stage
+    /// configs should fall back to [`Self::generate`].
+    ///
+    /// Implementation notes:
+    /// - Greedy acceptance: we accept consecutive matches between
+    ///   draft and target greedy argmax, stopping at the first
+    ///   mismatch. The "bonus" target token at the first mismatch is
+    ///   itself a valid sample we keep (matches rainier's
+    ///   `k26_spec_decode.py` line 282).
+    /// - KV rewind: after each round, `rewind_kv(rejected)` truncates
+    ///   the K/V buffers back to the accepted prefix. The draft's
+    ///   history is mirrored via [`crate::ngram_draft::Draft::rewind`].
+    /// - **Temperature handling**: we currently only support greedy
+    ///   spec-decode (temperature ≤ 0). At non-zero temperature, the
+    ///   classical Leviathan et al. "rejection sampling" acceptance
+    ///   rule applies; we punt to plain [`Self::generate`] in that
+    ///   case rather than ship an incorrect acceptance test. This
+    ///   matches rainier's `MaskedReq.feed` path which is also
+    ///   greedy-only.
+    ///
+    /// Returns the generated tokens (excluding the prompt; excluding
+    /// any trailing EOS).
+    pub fn generate_speculative(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        draft: &mut crate::ngram_draft::Draft,
+    ) -> Result<Vec<i64>, RunnerError> {
+        // Non-greedy sampling falls through to the standard path —
+        // greedy-acceptance spec decode would change the output
+        // distribution under temperature > 0.
+        if cfg.temperature > 0.0 {
+            return self.generate(prompt_ids, max_tokens, cfg);
+        }
+
+        self.reset_kv();
+        draft.reset();
+        let eos: Vec<i64> = self
+            .manifest
+            .eos_token_ids
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let mut generated: Vec<i64> = Vec::with_capacity(max_tokens);
+        let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_tokens);
+
+        // Prefill — same shape as `generate`. We load the prompt into
+        // the draft alongside the target's KV cache so the draft has
+        // its prompt-suffix k-grams indexed.
+        info!(
+            prompt_len = prompt_ids.len(),
+            "spec: prefill (token-by-token)"
+        );
+        let mut last_logits: Option<Vec<f32>> = None;
+        let t_pre = Instant::now();
+        for &t in prompt_ids.iter() {
+            history.push(t);
+            let logits = self.step(&history, 1)?;
+            last_logits = Some(logits);
+        }
+        draft.warm_with_prompt(prompt_ids);
+        info!(secs = t_pre.elapsed().as_secs_f64(), "spec: prefill done");
+
+        // First generated token from the last prefill step's logits.
+        let first = match last_logits {
+            Some(l) => argmax_i64(&l),
+            None => return Ok(generated),
+        };
+        if eos.contains(&first) {
+            return Ok(generated);
+        }
+        history.push(first);
+        generated.push(first);
+        draft.append(first);
+
+        // Spec-decode rounds.
+        let mut n_rounds: u32 = 0;
+        let mut n_drafts_total: u32 = 0;
+        let mut n_accepted_total: u32 = 0;
+        while generated.len() < max_tokens {
+            n_rounds += 1;
+            let budget = max_tokens - generated.len();
+            // 1. Propose draft tokens via n-gram lookup.
+            let mut drafts = draft.propose();
+            // Trim the proposal to the remaining budget — if budget is
+            // smaller than the proposal length, cap so we don't have
+            // to throw away forwards we'd never emit.
+            if drafts.len() > budget {
+                drafts.truncate(budget);
+            }
+
+            // Path 1: empty proposal → fall back to one standard
+            // forward step. Same cost as plain `generate`, plus a
+            // hash-table miss. No spec round counted.
+            if drafts.is_empty() {
+                let logits = self.step(&history, 1)?;
+                let next = argmax_i64(&logits);
+                if eos.contains(&next) {
+                    break;
+                }
+                history.push(next);
+                generated.push(next);
+                draft.append(next);
+                continue;
+            }
+
+            // 2. Verify drafts one-by-one through the target forward.
+            // The int4 shell only supports seq=1, so this runs K
+            // sequential single-token forwards — NOT a batched K-pass.
+            // (Adding a multi-token shell forward is the next perf
+            // unlock; see [`crate::spec_decode`] module docs.) Each
+            // forward conditions on the previous drafted token in
+            // history and produces the target's prediction for the
+            // next position. We compare predictions vs drafts below.
+            n_drafts_total += drafts.len() as u32;
+            let mut target_samples: Vec<i64> = Vec::with_capacity(drafts.len() + 1);
+            for &draft_tok in drafts.iter() {
+                let logits = self.step(&history, 1)?;
+                target_samples.push(argmax_i64(&logits));
+                // Push the drafted token into history regardless of
+                // whether it will eventually be accepted — the next
+                // forward needs it to condition correctly. We trim
+                // back any rejected suffix below.
+                history.push(draft_tok);
+            }
+
+            // 3. Acceptance: longest matching prefix between drafts
+            // and target_samples. See [`crate::spec_decode::count_accepted`].
+            let accepted = crate::spec_decode::count_accepted(&drafts, &target_samples);
+            n_accepted_total += accepted as u32;
+
+            // 4. Bonus token: target's prediction at the first
+            // rejection boundary (in the partial-accept case), OR the
+            // result of one extra forward when all K drafts accepted
+            // (so the next round has a fresh `prev_correction`).
+            let bonus_forward_ran = accepted == drafts.len();
+            let bonus: i64 = if !bonus_forward_ran {
+                target_samples[accepted]
+            } else {
+                let logits = self.step(&history, 1)?;
+                argmax_i64(&logits)
+            };
+
+            // 5. Reconcile state via the pure helper. After this,
+            // `history` + KV represent the accepted prefix (NOT
+            // including the bonus — we append it explicitly below
+            // so the EOS check can roll it back cleanly).
+            let r = crate::spec_decode::reconcile_after_round(
+                drafts.len(),
+                accepted,
+                bonus_forward_ran,
+            );
+            if r.history_pop > 0 {
+                history.truncate(history.len() - r.history_pop);
+            }
+            if r.kv_rewind > 0 {
+                self.rewind_kv(r.kv_rewind);
+            }
+
+            // 6. Emit accepted drafts + bonus into the public output.
+            // Stop on EOS or max_tokens, undoing the bonus from KV
+            // when EOS is reached BEFORE the bonus would be emitted
+            // (the bonus is NOT in KV at this point — the next round's
+            // first forward writes its slot — so no KV undo needed for
+            // the bonus itself).
+            let mut hit_eos = false;
+            for &t in drafts.iter().take(accepted) {
+                if eos.contains(&t) {
+                    hit_eos = true;
+                    break;
+                }
+                generated.push(t);
+                draft.append(t);
+                if generated.len() >= max_tokens {
+                    break;
+                }
+            }
+            if !hit_eos && generated.len() < max_tokens {
+                if eos.contains(&bonus) {
+                    hit_eos = true;
+                } else {
+                    history.push(bonus);
+                    draft.append(bonus);
+                    generated.push(bonus);
+                }
+            }
+
+            // Debug invariant: every layer's past_seq_len should match
+            // history.len() if we got the rewind math right. Strip
+            // from prod paths.
+            debug_assert!(self.kv_invariant_holds(&history), "KV invariant broken");
+
+            if hit_eos {
+                break;
+            }
+        }
+
+        info!(
+            tokens = generated.len(),
+            n_rounds,
+            total_drafts = n_drafts_total,
+            total_accepted = n_accepted_total,
+            accept_rate = if n_drafts_total > 0 {
+                n_accepted_total as f32 / n_drafts_total as f32
+            } else {
+                0.0
+            },
+            "spec_decode done"
+        );
+        Ok(generated)
+    }
+
+    /// Debug helper used by `generate_speculative` to assert all layers
+    /// agree on past_seq_len, and that it matches the public history
+    /// length. Returns true on agreement, false otherwise. Public so the
+    /// unit tests in `crate::spec_decode` can call it.
+    pub fn kv_invariant_holds(&self, history: &[i64]) -> bool {
+        let target = history.len();
+        if let Some(l0) = self.layer0.as_ref() {
+            if l0.past_seq_len != target {
+                return false;
+            }
+        }
+        for l in &self.layers {
+            if l.past_seq_len != target {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Greedy argmax over a logits row. Mirrors the inline impl in
+/// `dist_spec.rs::argmax` — kept private to the sparse-moe crate to
+/// avoid a cross-engine dep.
+fn argmax_i64(xs: &[f32]) -> i64 {
+    let mut best = 0i64;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in xs.iter().enumerate() {
+        if v.is_finite() && v > best_v {
+            best_v = v;
+            best = i as i64;
+        }
+    }
+    best
 }
 
 fn read_f32(bytes: &[u8]) -> Vec<f32> {
@@ -1470,5 +1788,30 @@ mod tests {
         let nan_ours = super::f32_to_bf16_bits(f32::NAN);
         let nan_back = f32::from_bits((nan_ours as u32) << 16);
         assert!(nan_back.is_nan(), "ours: 0x{nan_ours:04x} not NaN");
+    }
+
+    #[test]
+    fn argmax_i64_finds_max_index() {
+        let xs = vec![0.1, 0.9, 0.3, 0.8];
+        assert_eq!(argmax_i64(&xs), 1);
+    }
+
+    #[test]
+    fn argmax_i64_skips_non_finite() {
+        // NaN and Inf are skipped; the largest finite wins. This
+        // matches the dist_spec.rs argmax behavior — without the
+        // is_finite() guard, a NaN early in the logits row would
+        // silently make argmax return 0.
+        let xs = vec![f32::NAN, -10.0, 0.5, f32::NEG_INFINITY, 0.3];
+        assert_eq!(argmax_i64(&xs), 2);
+    }
+
+    #[test]
+    fn argmax_i64_all_non_finite_returns_zero() {
+        let xs = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        // All non-finite (INFINITY is technically finite()=false in Rust).
+        // Wait — INFINITY.is_finite() is false. So all should skip and
+        // best stays 0.
+        assert_eq!(argmax_i64(&xs), 0);
     }
 }

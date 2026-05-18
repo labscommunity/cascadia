@@ -48,6 +48,17 @@ pub struct SparseMoEBuilderConfig {
     /// Skip experts whose router weight falls below this threshold.
     /// 0.0 / None = disabled. Applied AFTER `top_k_override`.
     pub routing_threshold: Option<f32>,
+    /// If `Some(k > 0)`, the **single-stage** engine runs
+    /// [`crate::runner::Runner::generate_speculative`] instead of the
+    /// plain greedy generate path. Uses n-gram lookup decoding (Yang et
+    /// al. 2025) as a zero-compute draft model. K is the per-round
+    /// draft proposal length; see [`crate::ngram_draft::DEFAULT_DRAFT_K`]
+    /// (currently 8) for the recommended default.
+    ///
+    /// **Pipeline-parallel mode is NOT yet supported by spec_decode** —
+    /// extending it requires a new `ForwardBatch(K)` variant on
+    /// [`crate::dist::FrameKind`]. With `total > 1`, this flag is a no-op.
+    pub spec_decode_k: Option<u32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -61,12 +72,20 @@ impl SparseMoEBuilderConfig {
             total: 1,
             top_k_override: None,
             routing_threshold: None,
+            spec_decode_k: None,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    /// Enable speculative decoding with the given draft K. Single-stage
+    /// only; ignored on multi-stage configs.
+    pub fn with_spec_decode_k(mut self, k: u32) -> Self {
+        self.spec_decode_k = if k == 0 { None } else { Some(k) };
         self
     }
 }
@@ -270,6 +289,18 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 && self.tokenizer.is_none() {
             return Err(EngineError::Backend("tokenizer.json missing".into()));
         }
+        // Spec-decode is single-stage only — warn if the caller set
+        // both spec_decode_k and total>1.
+        let spec_decode_k = if total > 1 {
+            if self.config.spec_decode_k.is_some() {
+                warn!(
+                    "spec_decode_k set but total={total} > 1; spec-decode is single-stage only, ignoring"
+                );
+            }
+            None
+        } else {
+            self.config.spec_decode_k
+        };
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -282,6 +313,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            spec_decode_k,
         }))
     }
 }
@@ -370,6 +402,10 @@ pub struct SparseMoEEngine {
     /// `Reset` so deterministic-seed mode reproduces across runs.
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// If `Some(k > 0)`, single-stage path runs n-gram speculative
+    /// decode with draft K. Only honored when `total == 1` — checked at
+    /// engine construction. None = plain greedy / sampled generate.
+    spec_decode_k: Option<u32>,
 }
 
 impl SparseMoEEngine {
@@ -486,12 +522,38 @@ impl SparseMoEEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(task = %task.task_id, "runner failed: {e}");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                return vec![(task.task_id, final_chunk)];
+        // Choose generate path: spec-decode if configured (and the
+        // sampling config is greedy — the spec-decode helper falls
+        // back to plain generate on temp>0 anyway, but this keeps the
+        // log message accurate).
+        let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
+        let generated = if use_spec {
+            let k = self.spec_decode_k.unwrap();
+            let mut draft = crate::ngram_draft::Draft::new().with_draft_k(k as usize);
+            info!(
+                task = %task.task_id,
+                draft_k = k,
+                "using n-gram speculative decode"
+            );
+            match self
+                .runner
+                .generate_speculative(&prompt_ids, max_new, &sampling_cfg, &mut draft)
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(task = %task.task_id, "runner spec-decode failed: {e}");
+                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    return vec![(task.task_id, final_chunk)];
+                }
+            }
+        } else {
+            match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(task = %task.task_id, "runner failed: {e}");
+                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    return vec![(task.task_id, final_chunk)];
+                }
             }
         };
         let n_tokens = generated.len() as u32;
