@@ -2,6 +2,38 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 029 — COURSE CORRECTION — 4 real moonshots in parallel (2026-05-18 ~12:00 PT)
+
+**User pushback** (verbatim): "is it true that the k variable will need
+to be tuned individually for each user? if so tuning k is a complete
+waste of time here and these are not moonshots." And: "all of them.
+stop being scared. this is your job. the entire reason you exist is to
+run moonshots that are not easy. that is the entire point."
+
+The K-tuning streak (iters 005-028) was **optimization, not
+moonshots**. PR #29 productionizes those wins. The loop is now
+pivoting to real architectural swings.
+
+**Parallel kickoff — 4 background agents in worktrees:**
+
+| Track | Branch | Scope |
+|-------|--------|-------|
+| C1 expert prefetch | perf/c1-expert-prefetch-029 | Async-load next-token experts during current attention; targets 82%-of-decode expert dispatch cost |
+| A1 int2 experts | perf/a1-int2-experts-029 | Re-quantize experts int4→int2; ~2x storage; targets bandwidth-bound paths |
+| A8 KV bf16 | perf/a8-kv-bf16-029 | KV cache fp32→bf16; halves long-context memory; unlocks mt>=128 |
+| 2-box revival | infra/matias-2box-revival-029 | Fix matias Tailscale (or pivot to LAN fleet) + measure 2-box pipeline-parallel vs 0.0553 tok/s baseline |
+
+Each agent: implement → bench on miner / 2-box → push branch with
+measured numbers + commit summary. Honest partial reporting if
+blocked. Single iter 029 in INDEX (collapsed to one row) once results
+return. Real moonshots take 1-3 days each; results will arrive
+asynchronously.
+
+Memory updated: `autolab_moonshot_definition.md` now codifies the
+moonshot bar so future loop iterations don't drift back to K-sweeps.
+
+---
+
 ## 028 — K=6 temperature ladder — robust through temp=0.5 (gentle degradation) (2026-05-18 ~11:45 PT)
 
 10-prompt eval at K=6 across temperature ladder, comparing degradation
