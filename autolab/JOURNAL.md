@@ -2,6 +2,26 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 024 — K=6 mt=128 sustained = 0.1713 tok/s, 3/3 quality (2026-05-18 ~07:31 PT)
+
+K=6 at very-long context (128 tokens): 0.1713 tok/s, perfect quality
+on 3 prompts. Higher than mt=64 (0.1587) — prefill amortization
+continues to pay off as output grows.
+
+K=6 sustained-throughput summary:
+- mt=16:  ~0.13 tok/s (extrapolated)
+- mt=32:  0.1489
+- mt=64:  0.1587 (10/10)
+- mt=128: 0.1713 (3/3 narrow)
+
+K=6 plateaus around 0.17-0.19 tok/s for production-realistic
+generation lengths. With +51% over K=8 mt=64 baseline (~0.10), this
+is the right number to quote for chat-style workloads.
+
+Bench: `experiments/024_k6_mt128/bench_k6_mt128.jsonl`
+
+---
+
 ## 023 — K=6 on code prompts = 4/5 (same as K=4 — single format failure) (2026-05-18 ~06:23 PT)
 
 K=6 on 5 code prompts: 4/5 quality. Same single failure as K=4 (iter 012)
