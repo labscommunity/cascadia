@@ -39,7 +39,7 @@ pub mod shell;
 pub mod shell_int4;
 
 pub use format::{ExpertWeights, GemmError};
-pub use kernel::{dequant_gemv_int4, expert_forward};
+pub use kernel::{dequant_gemv_int4, expert_forward, expert_forward_multi};
 pub use kernel_avx512::dequant_gemv_int4_auto;
 pub use kernel_avx512_multi::dequant_gemm_int4_multi_auto;
 pub use kernel_avx512_multi_blocked::dequant_gemm_int4_multi_blocked_auto;
