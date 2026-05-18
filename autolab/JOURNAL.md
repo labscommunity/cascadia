@@ -2,6 +2,61 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 045 — Head tensor-parallelism — PLUMBING + Rust head kernel done, runtime gated on back-channel + low-RTT (2026-05-18 ~15:55 PT)
+
+Substantial architectural work + honest "not net-positive on current
+infra" finding. Branch `perf/head-tp-045` (3 commits).
+
+**(B+) delivered:**
+- `head.rs`: `HeadSlice` kernel — RMSNorm + bf16 GEMV against a vocab
+  row-slice. `concat_partials` (gap/overlap-rejecting),
+  `even_vocab_split` (matches existing even_moe_split style).
+- `safetensors_source.rs`: `lm_head_slice(vs, ve, hidden)` exploits
+  that `lm_head [vocab, hidden]` rows are byte-contiguous; plus
+  `final_norm()` for pre-head norm weight.
+- `dist.rs`: `FrameKind::HeadPartial = 0x534D4530`, body =
+  `vocab_start u32 BE + vocab_end u32 BE + F32 tensor`. Send/recv
+  both sides.
+- `runner.rs`: `LayerRange.head_vocab_range` per-rank loading;
+  `Runner::forward_head_partial` and `forward_head_last_rust`;
+  `step()` auto-routes to Rust head when slice covers full vocab.
+- `engine.rs`: `enable_head_tp` + `force_rust_head` config flags;
+  builder partitions vocab via `even_vocab_split`.
+- **26 tests pass** (9 new head + 4 new wire-frame + 13 existing).
+  Includes byte-identical full-vs-split-then-concat round-trip.
+- Gated integration test `k26_paris_pacific_four_rust_head` runs the
+  real Paris/Pacific/four prompts via Rust head when
+  `K26_MODEL_DIR` is set.
+
+**NOT delivered + WHY (honest architectural finding):**
+> Runtime activation of the multi-stage head-TP path in the engine
+> driver. The crux: for rank-0 to run its head slice, it needs the
+> post-shells hidden state from rank-1 (since rank-1 owns the second
+> half of layers). That requires a NEW back-channel frame
+> (post-norm hidden, ~14 KB bf16 or 28 KB f32) plus the HeadPartial
+> round-trip. On the current 2-box matias topology (117ms RTT via
+> SSH-tunnel-Mac chain per iter 030) the extra wire RTT (~234ms)
+> exceeds the head-compute savings (~70ms on 139ms baseline). Net
+> negative on the only currently-revived 2-box pipeline.
+
+**Critical architectural insight:** head TP needs **sub-10ms RTT** to
+be net-positive. The 117ms SSH-tunnel-chain is far too slow. Useful
+substrates would be:
+- LAN fleet (beta/charlie/alpha) at ~1-5ms RTT — but K2.6 isn't
+  loaded there (~14hr/box transfer)
+- Shared-memory ranks on one box — different deployment model
+- Future direct Tailscale recovery (~22ms baseline) — borderline
+
+**Standalone opportunity identified:** `force_rust_head=true` is an
+A/B benchable on single-stage even WITHOUT head TP. Could replace the
+OV head with native Rust on miner — pure correctness + perf swap.
+Worth iter 046 once miner frees from iter 044.
+
+**Free wire-frame slot:** `0x534D454x` range is free for the future
+`NormedHidden` back-channel frame.
+
+---
+
 ## 037 — F5 bench retry — REAL +80% TPS at W=32 BUT quality cliff (substring eval too weak) (2026-05-18 ~15:35 PT)
 
 Mixed result + methodology discovery. Branch `perf/f5-bench-results-
