@@ -834,6 +834,19 @@ impl SparseMoEEngine {
                 "rank {} received unexpected TOKEN from upstream",
                 self.rank
             )),
+            // HeadPartial flows upstream (earlier rank → sampling rank)
+            // so receiving one here on a worker's upstream socket is a
+            // wire-protocol error from the wrong direction. The
+            // sampling rank reads HeadPartial inline from its own
+            // upstream as part of the head-TP path — that's handled in
+            // the head-TP branch of FrameKind::Forward above. When head
+            // TP is OFF (the v1 default), no rank should ever send a
+            // HeadPartial, so this is also a config drift between
+            // peers.
+            FrameKind::HeadPartial => Err(format!(
+                "rank {} received unexpected HEAD_PARTIAL frame on upstream — head TP not enabled, or peer config drift",
+                self.rank
+            )),
         }
     }
 }

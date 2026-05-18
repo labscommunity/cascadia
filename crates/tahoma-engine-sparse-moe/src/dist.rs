@@ -29,6 +29,20 @@
 //! `Token` returns one sampled token i64 to upstream after the last
 //! rank runs head + sample. Body:
 //!   - 8 B big-endian i64 token_id
+//!
+//! `HeadPartial` carries one rank's contribution to a tensor-parallel
+//! head: a contiguous slice of the vocab dim of the logits. Flowing
+//! direction is **upstream** (any earlier rank that holds a head slice
+//! → the sampling rank), but the wire body is symmetric so a future
+//! ring-style partition could re-use it. Body:
+//!   - 4 B big-endian u32 vocab_start
+//!   - 4 B big-endian u32 vocab_end  (exclusive)
+//!   - F32 partial logits tensor [1, 1, vocab_end - vocab_start]
+//!
+//! Head TP is OFF by default. When enabled (engine config
+//! `enable_head_tp`), rank-0 holds the lower vocab slice + computes its
+//! partial in parallel with the sampling rank's slice. See
+//! `crates/tahoma-int4-gemm/src/head.rs` for the math contract.
 
 use std::sync::Arc;
 
@@ -52,12 +66,16 @@ use crate::sampling::SamplingConfig;
 /// History:
 /// - 0x01 — past_seq_len + hidden tensor only (pre-PR #10)
 /// - 0x02 — adds 28-byte SamplingConfig between past_seq_len and tensor (PR #10)
+/// - HeadPartial introduced for head TP (PR #11+, default-off; existing
+///   peers reject it as unknown if they don't recognize the code, which
+///   is the desired failure mode)
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    Forward = 0x53_4D_45_02, // "SME\x02"
-    Reset = 0x53_4D_45_10,   // "SME\x10"
-    Token = 0x53_4D_45_20,   // "SME\x20"
+    Forward = 0x53_4D_45_02,     // "SME\x02"
+    Reset = 0x53_4D_45_10,       // "SME\x10"
+    Token = 0x53_4D_45_20,       // "SME\x20"
+    HeadPartial = 0x53_4D_45_30, // "SME\x30" — per-rank partial logits for head TP
 }
 
 impl FrameKind {
@@ -66,6 +84,7 @@ impl FrameKind {
             x if x == FrameKind::Forward as u32 => Some(FrameKind::Forward),
             x if x == FrameKind::Reset as u32 => Some(FrameKind::Reset),
             x if x == FrameKind::Token as u32 => Some(FrameKind::Token),
+            x if x == FrameKind::HeadPartial as u32 => Some(FrameKind::HeadPartial),
             _ => None,
         }
     }
@@ -280,6 +299,102 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// caller and the kind is already consumed before this point.
 pub async fn forward_reset(downstream: &Mutex<ActivationClient>) -> TransportResult<()> {
     send_reset(downstream).await
+}
+
+/// Send a HeadPartial frame upstream (rank holding a vocab slice →
+/// sampling rank). Body:
+/// - kind (4 B BE u32)
+/// - vocab_start (4 B BE u32)
+/// - vocab_end (4 B BE u32, exclusive)
+/// - F32 logits tensor [1, 1, vocab_end - vocab_start]
+///
+/// The shape is `[1, 1, slice_len]` to match the other tensor frames'
+/// `[batch, seq, dim]` convention and let the existing tahoma-transport
+/// `Tensor` carry it without a new wire shape variant.
+pub async fn send_head_partial(
+    srv: &Mutex<ActivationServer>,
+    vocab_start: u32,
+    vocab_end: u32,
+    partial_f32: &[f32],
+) -> TransportResult<()> {
+    if (vocab_end - vocab_start) as usize != partial_f32.len() {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "send_head_partial: vocab range {}..{} = {} != partial len {}",
+            vocab_start,
+            vocab_end,
+            vocab_end - vocab_start,
+            partial_f32.len()
+        ))));
+    }
+    let mut header = [0u8; 12];
+    header[0..4].copy_from_slice(&(FrameKind::HeadPartial as u32).to_be_bytes());
+    header[4..8].copy_from_slice(&vocab_start.to_be_bytes());
+    header[8..12].copy_from_slice(&vocab_end.to_be_bytes());
+    let tensor = hidden_to_tensor(partial_f32, [1, 1, (vocab_end - vocab_start)]);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&header).await?;
+    guard.send(&tensor).await?;
+    Ok(())
+}
+
+/// Receive a HeadPartial frame's body on the client side (sampling rank
+/// reads from the rank that owns a vocab slice upstream of it on the
+/// pipeline). Returns `(vocab_start, vocab_end, partial_logits)`.
+///
+/// The kind code has already been consumed by `recv_kind_*`.
+pub async fn recv_head_partial_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(u32, u32, Vec<f32>)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let vocab_start = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let vocab_end = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    let (logits, shape) = tensor_to_hidden(&tensor)?;
+    let expected = (vocab_end - vocab_start) as usize;
+    if logits.len() != expected {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_head_partial: shape {:?} (len {}) != expected slice {}",
+            shape,
+            logits.len(),
+            expected
+        ))));
+    }
+    Ok((vocab_start, vocab_end, logits))
+}
+
+/// Server-side variant of `recv_head_partial_body_client` — used when
+/// the rank receiving a HeadPartial accepted the upstream connection
+/// (rather than dialing it). For the v1 wiring rank-0 dials the
+/// downstream rank-1, so the sampling rank (rank-1) reads via its
+/// server socket from rank-0. Symmetric with the client variant.
+pub async fn recv_head_partial_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u32, u32, Vec<f32>)> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    let vocab_start = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let vocab_end = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let (tensor, _) = guard.recv().await?;
+    drop(guard);
+    let (logits, shape) = tensor_to_hidden(&tensor)?;
+    let expected = (vocab_end - vocab_start) as usize;
+    if logits.len() != expected {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "recv_head_partial: shape {:?} (len {}) != expected slice {}",
+            shape,
+            logits.len(),
+            expected
+        ))));
+    }
+    Ok((vocab_start, vocab_end, logits))
 }
 
 /// Bundle of the per-rank transport state. The Builder constructs this
