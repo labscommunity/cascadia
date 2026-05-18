@@ -363,9 +363,298 @@ pub fn layer0_forward_decode_int4_with_capacity(
     }
 }
 
+/// Per-token outputs of a multi-token layer-0 forward (`seq >= 1`).
+///
+/// Layout: `hidden_out` is flat `[seq, HIDDEN]` in token order.
+/// `present_k` / `present_v` are NOT in this struct — the multi-token
+/// kernel writes them in place into the caller's pre-allocated KV
+/// cache buffer (slots `[past_seq_len, past_seq_len + seq)` of each
+/// head).
+pub struct MultiLayer0Outputs {
+    /// Per-token hidden-state output (after attention + MLP + residual).
+    /// Shape `[seq, HIDDEN]` flat — caller slices
+    /// `[t * HIDDEN .. (t + 1) * HIDDEN]` for token `t`.
+    pub hidden_out: Vec<f32>,
+}
+
+/// Multi-token layer-0 forward — the seq>=1 entry point. The seq=1
+/// path ([`layer0_forward_decode_int4_with_capacity`]) is unchanged.
+///
+/// Like [`crate::shell_int4::shell_forward_decode_int4_multi_with_capacity`],
+/// this is currently an internal scalar loop over `seq` sequential
+/// seq=1 calls — the API seam that future tiled-GEMM work plugs into.
+///
+/// **Inputs.**
+/// - `xs_f32`: `[seq, HIDDEN]` flat, the per-token layer inputs
+///   (typically `embed_token_bf16` of each new token id, concatenated).
+/// - `past_k` / `past_v`: pre-allocated KV cache,
+///   `[NUM_HEADS, capacity, *_HEAD_DIM]`. Only the first
+///   `past_seq_len` slots are populated on entry; the kernel writes
+///   slots `[past_seq_len, past_seq_len + seq)` on exit.
+/// - `past_seq_len`: populated KV length on entry.
+/// - `capacity`: total per-head KV slot capacity. Must be
+///   `>= past_seq_len + seq`.
+/// - `seq`: number of tokens. Must be `>= 1`.
+pub fn layer0_forward_decode_int4_multi_with_capacity(
+    layer: &Int4Layer0,
+    xs_f32: &[f32],
+    past_k: &mut [f32],
+    past_v: &mut [f32],
+    past_seq_len: usize,
+    capacity: usize,
+    seq: usize,
+) -> MultiLayer0Outputs {
+    assert!(seq >= 1, "seq must be >= 1, got {seq}");
+    assert_eq!(
+        xs_f32.len(),
+        seq * HIDDEN,
+        "xs_f32.len() = {} != seq * HIDDEN = {} * {} = {}",
+        xs_f32.len(),
+        seq,
+        HIDDEN,
+        seq * HIDDEN
+    );
+    assert!(
+        capacity >= past_seq_len + seq,
+        "capacity ({capacity}) must be >= past_seq_len ({past_seq_len}) + seq ({seq})",
+    );
+    assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
+    assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
+
+    let mut hidden_out = vec![0.0f32; seq * HIDDEN];
+
+    for t in 0..seq {
+        let x_t = &xs_f32[t * HIDDEN..(t + 1) * HIDDEN];
+        let cur_past = past_seq_len + t;
+        let outs = layer0_forward_decode_int4_with_capacity(
+            layer, x_t, past_k, past_v, cur_past, capacity,
+        );
+        // Write present_k / present_v into slot `cur_past` for each head.
+        write_present_kv_inplace(past_k, &outs.present_k, cur_past, capacity, QK_HEAD_DIM);
+        write_present_kv_inplace(past_v, &outs.present_v, cur_past, capacity, V_HEAD_DIM);
+        hidden_out[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&outs.hidden_out);
+    }
+
+    MultiLayer0Outputs { hidden_out }
+}
+
+/// Same in-place KV write as `shell_int4`'s helper. Lives here to keep
+/// `layer0_int4` self-contained for unit testing.
+fn write_present_kv_inplace(
+    buf: &mut [f32],
+    present: &[f32],
+    slot: usize,
+    capacity: usize,
+    head_dim: usize,
+) {
+    debug_assert!(slot < capacity);
+    debug_assert_eq!(buf.len(), NUM_HEADS * capacity * head_dim);
+    debug_assert_eq!(present.len(), NUM_HEADS * head_dim);
+    for h in 0..NUM_HEADS {
+        let dst_off = h * capacity * head_dim + slot * head_dim;
+        buf[dst_off..dst_off + head_dim]
+            .copy_from_slice(&present[h * head_dim..(h + 1) * head_dim]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GROUP_SIZE;
+
+    /// Build a deterministic Int4Layer0 with non-trivial weights — same
+    /// fake-shell pattern as `shell_int4::tests::make_test_shell`.
+    fn make_test_layer0() -> Int4Layer0 {
+        let norm_w = [0x00u8, 0x3F]; // 0.5 in bf16
+        let make_norm = |dim: usize| -> Vec<u8> {
+            let mut v = vec![0u8; dim * 2];
+            for i in 0..dim {
+                v[i * 2] = norm_w[0];
+                v[i * 2 + 1] = norm_w[1];
+            }
+            v
+        };
+        let make_packed =
+            |n_rows: usize, k_cols: usize| -> Vec<u8> { vec![0x11u8; n_rows * k_cols / 2] };
+        let make_scale = |n_rows: usize, k_cols: usize| -> Vec<u8> {
+            let n_groups = k_cols / GROUP_SIZE;
+            let mut v = vec![0u8; n_rows * n_groups * 2];
+            for i in 0..n_rows * n_groups {
+                v[i * 2] = 0x80;
+                v[i * 2 + 1] = 0x3F;
+            }
+            v
+        };
+        Int4Layer0 {
+            input_norm: make_norm(HIDDEN),
+            q_a_proj_packed: make_packed(Q_LORA_RANK, HIDDEN),
+            q_a_proj_scale: make_scale(Q_LORA_RANK, HIDDEN),
+            q_a_norm: make_norm(Q_LORA_RANK),
+            q_b_proj_packed: make_packed(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK),
+            q_b_proj_scale: make_scale(NUM_HEADS * QK_HEAD_DIM, Q_LORA_RANK),
+            kv_a_proj_packed: make_packed(KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN),
+            kv_a_proj_scale: make_scale(KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN),
+            kv_a_norm: make_norm(KV_LORA_RANK),
+            kv_b_proj_packed: make_packed(
+                NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM),
+                KV_LORA_RANK,
+            ),
+            kv_b_proj_scale: make_scale(NUM_HEADS * (QK_NOPE_HEAD_DIM + V_HEAD_DIM), KV_LORA_RANK),
+            o_proj_packed: make_packed(HIDDEN, NUM_HEADS * V_HEAD_DIM),
+            o_proj_scale: make_scale(HIDDEN, NUM_HEADS * V_HEAD_DIM),
+            post_norm: make_norm(HIDDEN),
+            gate_proj_packed: make_packed(INTERMEDIATE_DENSE, HIDDEN),
+            gate_proj_scale: make_scale(INTERMEDIATE_DENSE, HIDDEN),
+            up_proj_packed: make_packed(INTERMEDIATE_DENSE, HIDDEN),
+            up_proj_scale: make_scale(INTERMEDIATE_DENSE, HIDDEN),
+            down_proj_packed: make_packed(HIDDEN, INTERMEDIATE_DENSE),
+            down_proj_scale: make_scale(HIDDEN, INTERMEDIATE_DENSE),
+        }
+    }
+
+    fn make_test_input(seed: usize) -> Vec<f32> {
+        let mut x = vec![0.0f32; HIDDEN];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = ((seed.wrapping_mul(31).wrapping_add(i)) as f32).sin() * 1.0e-3;
+        }
+        x
+    }
+
+    /// Bit-identity test: seq=1 multi-call produces identical KV +
+    /// hidden_out as a single seq=1 forward.
+    #[test]
+    fn multi_layer0_seq_1_matches_seq_1_reference() {
+        let layer = make_test_layer0();
+        let capacity = 4;
+        let past_seq_len = 0;
+        let seq = 1;
+        let x = make_test_input(0);
+
+        let ref_past_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let ref_past_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        let ref_out = layer0_forward_decode_int4_with_capacity(
+            &layer,
+            &x,
+            &ref_past_k,
+            &ref_past_v,
+            past_seq_len,
+            capacity,
+        );
+
+        let mut multi_past_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut multi_past_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        let multi_out = layer0_forward_decode_int4_multi_with_capacity(
+            &layer,
+            &x,
+            &mut multi_past_k,
+            &mut multi_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+        assert_eq!(multi_out.hidden_out, ref_out.hidden_out);
+
+        // KV state: ref is unchanged (seq=1 API returns present_k/v),
+        // so we manually splat present_k/v at slot 0.
+        let mut expected_past_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut expected_past_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            let pk_dst = h * capacity * QK_HEAD_DIM;
+            let pv_dst = h * capacity * V_HEAD_DIM;
+            expected_past_k[pk_dst..pk_dst + QK_HEAD_DIM]
+                .copy_from_slice(&ref_out.present_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM]);
+            expected_past_v[pv_dst..pv_dst + V_HEAD_DIM]
+                .copy_from_slice(&ref_out.present_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM]);
+        }
+        assert_eq!(multi_past_k, expected_past_k);
+        assert_eq!(multi_past_v, expected_past_v);
+    }
+
+    /// Bit-identity test: seq=3 multi-call matches 3 sequential seq=1
+    /// calls feeding through the same evolving KV cache (starting at
+    /// past_seq_len=2 with pre-seeded history).
+    #[test]
+    fn multi_layer0_seq_3_matches_sequential_seq_1_calls() {
+        let layer = make_test_layer0();
+        let capacity = 8;
+        let past_seq_len = 2;
+        let seq = 3;
+
+        // Pre-seed cache with deterministic non-zero history.
+        let mut ref_past_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut ref_past_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..past_seq_len {
+                let off_k = h * capacity * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                let off_v = h * capacity * V_HEAD_DIM + s * V_HEAD_DIM;
+                for i in 0..QK_HEAD_DIM {
+                    ref_past_k[off_k + i] = (((h * 7 + s * 13 + i) as f32).sin()) * 1.0e-3;
+                }
+                for i in 0..V_HEAD_DIM {
+                    ref_past_v[off_v + i] = (((h * 11 + s * 17 + i) as f32).cos()) * 1.0e-3;
+                }
+            }
+        }
+
+        let mut xs = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = make_test_input(t);
+            xs[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&x_t);
+        }
+
+        // Reference: 3 sequential seq=1 forwards, KV updated between.
+        let mut ref_hidden = vec![0.0f32; seq * HIDDEN];
+        for t in 0..seq {
+            let x_t = &xs[t * HIDDEN..(t + 1) * HIDDEN];
+            let cur_past = past_seq_len + t;
+            let outs = layer0_forward_decode_int4_with_capacity(
+                &layer,
+                x_t,
+                &ref_past_k,
+                &ref_past_v,
+                cur_past,
+                capacity,
+            );
+            for h in 0..NUM_HEADS {
+                let dst_k = h * capacity * QK_HEAD_DIM + cur_past * QK_HEAD_DIM;
+                let dst_v = h * capacity * V_HEAD_DIM + cur_past * V_HEAD_DIM;
+                ref_past_k[dst_k..dst_k + QK_HEAD_DIM]
+                    .copy_from_slice(&outs.present_k[h * QK_HEAD_DIM..(h + 1) * QK_HEAD_DIM]);
+                ref_past_v[dst_v..dst_v + V_HEAD_DIM]
+                    .copy_from_slice(&outs.present_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM]);
+            }
+            ref_hidden[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&outs.hidden_out);
+        }
+
+        // Test: same seed cache, single multi-call.
+        let mut multi_past_k = vec![0.0f32; NUM_HEADS * capacity * QK_HEAD_DIM];
+        let mut multi_past_v = vec![0.0f32; NUM_HEADS * capacity * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..past_seq_len {
+                let off_k = h * capacity * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                let off_v = h * capacity * V_HEAD_DIM + s * V_HEAD_DIM;
+                for i in 0..QK_HEAD_DIM {
+                    multi_past_k[off_k + i] = (((h * 7 + s * 13 + i) as f32).sin()) * 1.0e-3;
+                }
+                for i in 0..V_HEAD_DIM {
+                    multi_past_v[off_v + i] = (((h * 11 + s * 17 + i) as f32).cos()) * 1.0e-3;
+                }
+            }
+        }
+        let multi_out = layer0_forward_decode_int4_multi_with_capacity(
+            &layer,
+            &xs,
+            &mut multi_past_k,
+            &mut multi_past_v,
+            past_seq_len,
+            capacity,
+            seq,
+        );
+
+        assert_eq!(multi_out.hidden_out, ref_hidden);
+        assert_eq!(multi_past_k, ref_past_k);
+        assert_eq!(multi_past_v, ref_past_v);
+    }
 
     #[test]
     fn embed_token_bf16_decodes_one_row() {
