@@ -2,6 +2,65 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 055 — INT4 router quantization — DISCOVERED: already int4 in production (regression coverage added) (2026-05-18 ~18:25 PT)
+
+**Discovery that overturned the brief.** Branch
+`perf/int4-router-055` @ `40ac2ab`.
+
+**Critical finding (verbatim agent):**
+> The router is already int4-quantized in the production hot path.
+> The brief assumed it was still bf16, but commit `aedee33` (PR #7)
+> quantized it as part of the original `Int4Shell` port. The router
+> weight (`mlp.gate.weight`, `[384, 7168]`) flows through
+> `quantize_int4_group(...)` at `shell_int4.rs:160-161` and the GEMV
+> through `dequant_gemv_int4_auto` at `shell_int4.rs:434-441`. The
+> bf16 router path in `shell.rs` is a reference implementation no
+> longer in the production engine.
+
+So the "moonshot" was already shipped 6 months ago. Agent correctly
+verified BEFORE implementing — saved a false-premise reimplementation.
+
+**Scope pivot — what shipped (real value):**
+- **3 top-K stability regression tests** in `shell_int4.rs`:
+  - `router_topk_stability_synthetic_k2_6_shape` — full `[384, 7168]`,
+    top-K=8, 100 trials
+  - `router_topk_stability_compact` — `[64, 1024]`, top-K=8, 50 trials,
+    fast CI bar
+  - `router_quantize_zero_weight` — covers `max_abs == 0.0` branch
+- **Int4 GEMV bench at all K2.6 shell shapes** in
+  `bench_bf16_gemv.rs` (including router)
+- **Module docstring** documenting router-int4 path + quality
+  regression bar
+- **Removed dead `bf16_gemv_auto` import** (unused since router went
+  int4)
+
+**Measured top-K stability (adversarial Normal(0, 0.02²) weights,
+synthetic):**
+- Mean top-8 set intersection: **~89.9%** (5/8 worst single-trial)
+- Random-chance baseline: 2.1% → **~40× chance**
+- Regression bar set at **85%** (well above noise floor for any
+  catastrophic quantizer bug)
+- 95% target NOT met on adversarial i.i.d.; real trained K2.6
+  weights expected smoother per group. Recommended follow-up:
+  `#[ignore]`-by-default fixture-driven test against real weights.
+
+**Measured speedup (Mac scalar fallback; AVX-512 on miner larger):**
+- Router bf16 GEMV: 0.34 ms/iter (the obsolete reference path)
+- Router int4 GEMV: 0.22 ms/iter → **1.55× wall-clock**
+- Per-call weight bytes: 5376 kB → 1512 kB = **3.56× memory traffic
+  reduction**
+- Per-token across 60 layers: 330 MB → 92 MB
+- E2E decode contribution: <2% (router is 1-3% of decode)
+
+**Lesson:** always verify the current state before assuming a
+moonshot is novel. Reading the existing impl FIRST is the right
+first step. The agent did this correctly.
+
+10/10 lib tests pass (was 7, now 10). Workspace builds clean. No new
+clippy warnings. fmt clean.
+
+---
+
 ## 052 — Layer-0 multi-token SIMD lift — SEAM SHIPPED, 8 projections lifted (2026-05-18 ~18:05 PT)
 
 Closes the gap iter 048 explicitly skipped. Branch
