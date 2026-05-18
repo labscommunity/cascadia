@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -42,6 +42,13 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
+    /// token are dispatched per shell layer. Plumbed into Runner; effective
+    /// at every `forward_shells` call. Used by autolab campaign 004 (A3).
+    pub top_k_override: Option<u32>,
+    /// Skip experts whose router weight falls below this threshold (A2).
+    /// 0.0 / None = disabled. Applied AFTER top_k_override.
+    pub routing_threshold: Option<f32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,6 +60,8 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            top_k_override: None,
+            routing_threshold: None,
         }
     }
 
@@ -219,7 +228,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +237,12 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        // autolab campaign 004 (A3): plumb the top-K override into the runner
+        // so per-token forward_shells dispatches only k' experts.
+        runner.set_top_k_override(self.config.top_k_override);
+        // autolab campaign 007 (A2): plumb the routing-weight threshold so
+        // forward_shells skips experts below the threshold per token.
+        runner.set_routing_threshold(self.config.routing_threshold);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
@@ -673,7 +688,9 @@ impl SparseMoEEngine {
             .map_err(|e| format!("forward_shells: {e}"))?;
 
         // Send hidden downstream and wait for token to come back.
-        self.block_on(async {
+        // autolab/k26-perf q1 instrumentation: split timing of send vs round-trip.
+        let wire_t0 = Instant::now();
+        let result = self.block_on(async {
             send_forward(
                 downstream,
                 past_seq_len,
@@ -683,18 +700,33 @@ impl SparseMoEEngine {
             )
             .await
             .map_err(|e| format!("send_forward: {e}"))?;
+            let send_done_us = wire_t0.elapsed().as_micros() as u64;
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => {
                     let token = recv_token_body_client(downstream)
                         .await
                         .map_err(|e| format!("recv_token: {e}"))?;
-                    Ok(token)
+                    Ok((token, send_done_us))
                 }
                 Ok(Some(other)) => Err(format!("unexpected frame after forward: {other:?}")),
                 Ok(None) => Err("downstream closed during recv_kind".into()),
                 Err(e) => Err(format!("recv_kind: {e}")),
             }
-        })
+        });
+        match result {
+            Ok((token, send_done_us)) => {
+                let total_wire_us = wire_t0.elapsed().as_micros() as u64;
+                info!(
+                    stage = "rank0_wire",
+                    send_done_us,
+                    total_wire_us,
+                    downstream_compute_us = total_wire_us.saturating_sub(send_done_us),
+                    "stage_timing"
+                );
+                Ok(token)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Worker step: process exactly one frame from upstream and emit

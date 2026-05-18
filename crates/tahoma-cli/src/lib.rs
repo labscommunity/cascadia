@@ -131,6 +131,24 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Override the MoE top-K dispatch (sparse-moe engine only).
+    /// If set and < manifest top_k, dispatch only the first K' experts
+    /// per token. Lower K' = fewer expert FFN calls = faster decode
+    /// at some quality cost. K2.6 manifest default is 8. Sigmoid
+    /// routers (K2.6 / DeepSeek-V3) tolerate K' down to 4-6 with
+    /// minimal quality loss; see autolab campaign 004.
+    #[arg(long)]
+    pub top_k_override: Option<u32>,
+
+    /// Skip experts whose router weight falls below this threshold
+    /// (sparse-moe engine only). 0.0 = disabled. Applied after
+    /// top_k_override, so the effective set is the routed top-K whose
+    /// routing weight >= threshold. Variant of A3, lit-supported as
+    /// outperforming fixed-K reduction for sigmoid routers. See
+    /// autolab campaign 007.
+    #[arg(long)]
+    pub routing_threshold: Option<f32>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -321,6 +339,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
+            cfg.top_k_override = args.top_k_override;
+            cfg.routing_threshold = args.routing_threshold;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

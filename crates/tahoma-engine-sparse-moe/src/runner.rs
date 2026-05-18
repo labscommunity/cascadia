@@ -10,7 +10,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use half::bf16;
@@ -55,15 +58,20 @@ const INITIAL_KV_CAPACITY: usize = 32;
 /// which expects flat KV caches in `[NUM_HEADS, capacity, D]` row-major layout where only the
 /// first `past_seq_len` slots per head are populated. We track `kv_capacity` separately
 /// from `past_seq_len` so a steady-state generation never triggers a realloc.
+///
+/// **autolab campaign 029 (A8): KV is stored as bf16-as-u16.** Halves
+/// the per-layer footprint and the per-token bandwidth touched at
+/// attention time (the dominant cost per q1 once expert dispatch is
+/// thinned by A3 K-override). The SDPA kernel upconverts to f32 inline.
 struct LayerState {
     lid: u32,
     int4_shell: Int4Shell,
-    /// Layout: `[NUM_HEADS, kv_capacity, QK_HEAD_DIM]` row-major.
+    /// Layout: `[NUM_HEADS, kv_capacity, QK_HEAD_DIM]` row-major, bf16-as-u16.
     /// Slots `past_seq_len..kv_capacity` per head are reserved but
     /// unpopulated (their contents don't matter).
-    past_k: Vec<f32>,
-    /// Layout: `[NUM_HEADS, kv_capacity, V_HEAD_DIM]` row-major.
-    past_v: Vec<f32>,
+    past_k: Vec<u16>,
+    /// Layout: `[NUM_HEADS, kv_capacity, V_HEAD_DIM]` row-major, bf16-as-u16.
+    past_v: Vec<u16>,
     past_seq_len: usize,
     /// Slots allocated per head. Doubles on overflow. Survives across
     /// generations via `reset_kv` (resetting clears past_seq_len but
@@ -85,8 +93,9 @@ struct Layer0State {
     _embed_pin: Arc<Shard>,
     /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
     embed_tokens_bf16: &'static [u8],
-    past_k: Vec<f32>,
-    past_v: Vec<f32>,
+    /// bf16-as-u16 KV (autolab 029 / A8).
+    past_k: Vec<u16>,
+    past_v: Vec<u16>,
     past_seq_len: usize,
     kv_capacity: usize,
 }
@@ -97,8 +106,8 @@ impl LayerState {
         Self {
             lid,
             int4_shell,
-            past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
-            past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
+            past_k: vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM],
+            past_v: vec![0u16; NUM_HEADS * cap * V_HEAD_DIM],
             past_seq_len: 0,
             kv_capacity: cap,
         }
@@ -175,6 +184,108 @@ impl Int4BinExpertCache {
     }
 }
 
+/// autolab iter 029 (C1): one prefetch request — kindly hint the kernel
+/// to start reading the weights for expert `eid` on layer `lid`. The
+/// prefetcher thread translates this into `madvise(MADV_WILLNEED)` calls
+/// on the six safetensors slices that make up the expert. Sent on a
+/// bounded `sync_channel`; if the prefetcher falls behind we drop the
+/// request (the read happens on demand later, which is the no-prefetch
+/// baseline).
+#[derive(Copy, Clone, Debug)]
+struct PrefetchReq {
+    lid: u32,
+    eid: u32,
+}
+
+/// Background thread that consumes [`PrefetchReq`] from a channel and
+/// issues `madvise(MADV_WILLNEED)` on each expert's six tensor byte
+/// ranges. Owned by [`Runner`]; the channel sender is dropped on
+/// `Runner` drop, terminating the consumer.
+///
+/// One thread is plenty — madvise is cheap (~µs per call) and the goal
+/// is just to kick off async page-in. The bottleneck is the OS's
+/// readahead queue, not our scheduler.
+struct Prefetcher {
+    /// SyncSender so we have bounded backpressure; if we overrun the
+    /// queue we silently drop (the request just becomes a cache miss).
+    tx: Option<SyncSender<PrefetchReq>>,
+    join: Option<JoinHandle<()>>,
+    /// Diagnostic counters (per-Runner lifetime).
+    drops: Arc<AtomicU64>,
+    submits: Arc<AtomicU64>,
+    processed: Arc<AtomicU64>,
+}
+
+impl Prefetcher {
+    fn spawn(source: Arc<SafetensorsExpertSource>) -> Self {
+        // 4096 slots = ~22 tokens of 6 experts × 30 layers at K=6.
+        // Plenty of headroom; if we overrun this we're either way ahead
+        // of the consumer or producing more prefetches than we should.
+        let (tx, rx) = mpsc::sync_channel::<PrefetchReq>(4096);
+        let drops = Arc::new(AtomicU64::new(0));
+        let submits = Arc::new(AtomicU64::new(0));
+        let processed = Arc::new(AtomicU64::new(0));
+        let source_for_thread = source.clone();
+        let processed_thread = processed.clone();
+        let join = thread::Builder::new()
+            .name("expert-prefetch".into())
+            .spawn(move || {
+                // Plain blocking recv loop. Terminates when the sender
+                // side is dropped (i.e. when the Runner is being torn
+                // down).
+                while let Ok(req) = rx.recv() {
+                    let _hits = source_for_thread.prefetch_expert(req.lid, req.eid);
+                    processed_thread.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            })
+            .expect("spawn expert-prefetch thread");
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+            drops,
+            submits,
+            processed,
+        }
+    }
+
+    /// Non-blocking enqueue. Drops the request on overflow rather than
+    /// stalling the inference path. Bumps the `submits` counter on
+    /// success and `drops` on overflow/disconnect.
+    fn try_submit(&self, lid: u32, eid: u32) {
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(PrefetchReq { lid, eid }) {
+            Ok(()) => {
+                self.submits.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.drops.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// Snapshot the (submits, drops, processed) counters. Used by the
+    /// instrumentation log emitted every few tokens.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.submits.load(AtomicOrdering::Relaxed),
+            self.drops.load(AtomicOrdering::Relaxed),
+            self.processed.load(AtomicOrdering::Relaxed),
+        )
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        // Close the sender so the thread's recv loop terminates.
+        drop(self.tx.take());
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
 /// Per-rank slice of the model the Runner should hold.
 ///
 /// `layer_start..layer_end` is the half-open range of *MoE layer ids*
@@ -217,6 +328,30 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// autolab campaign 004 (A3): if Some(k') with k' < manifest.top_k,
+    /// forward_shells dispatches only the first k' of the routed top-K
+    /// experts per token. The shell's router still computes full top-K;
+    /// we just skip the dispatch of the tail. Sigmoid-router models
+    /// (K2.6 / DeepSeek-V3) tolerate this with minimal quality loss.
+    top_k_override: Option<u32>,
+    /// autolab campaign 007 (A2): if Some(t) with t > 0, skip experts
+    /// whose routing weight falls below t. Applied AFTER top_k_override.
+    /// Per-token effective K varies; safer than fixed K if router
+    /// confidence is uneven.
+    routing_threshold: Option<f32>,
+    /// autolab iter 029 (C1): cache of the *previous* token's routed
+    /// expert IDs per layer (indexed by position in `self.layers`, not
+    /// by `lid`). Empty `Vec<u32>` means "no history yet" (just after
+    /// `reset_kv` or first prefill token). Used as a simple
+    /// same-as-last-token predictor: at the start of each
+    /// `forward_shells` we push these IDs to the prefetcher so the OS
+    /// can start pulling pages while this token's earlier layers run.
+    last_routing_ids: Vec<Vec<u32>>,
+    /// autolab iter 029 (C1): background prefetcher fed by
+    /// `last_routing_ids` at the start of each `forward_shells`. `None`
+    /// when prefetching is disabled (env var `TAHOMA_EXPERT_PREFETCH=0`
+    /// or experts_format != safetensors_bin).
+    prefetcher: Option<Prefetcher>,
 }
 
 impl Runner {
@@ -301,8 +436,8 @@ impl Runner {
                 int4_layer0,
                 _embed_pin: embed_pin,
                 embed_tokens_bf16: embed_bytes,
-                past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
-                past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
+                past_k: vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM],
+                past_v: vec![0u16; NUM_HEADS * cap * V_HEAD_DIM],
                 past_seq_len: 0,
                 kv_capacity: cap,
             });
@@ -381,6 +516,27 @@ impl Runner {
             }
         };
 
+        // autolab iter 029 (C1): spin up the prefetcher thread when we're
+        // serving experts directly from safetensors mmaps. Disabled when
+        // TAHOMA_EXPERT_PREFETCH=0 so it's easy to A/B at runtime. Other
+        // expert backends (ov_ir, int4_bin) don't benefit from madvise
+        // because their weights aren't served from the safetensors mmaps,
+        // so the prefetcher would do nothing useful there.
+        let prefetcher = match (&experts, std::env::var("TAHOMA_EXPERT_PREFETCH").as_deref()) {
+            (ExpertCache::SafetensorsBin(_), Ok("0")) => {
+                info!("expert prefetch: disabled via TAHOMA_EXPERT_PREFETCH=0");
+                None
+            }
+            (ExpertCache::SafetensorsBin(_), _) => {
+                info!(
+                    "expert prefetch: enabled (madvise(WILLNEED) on predicted next-token experts)"
+                );
+                Some(Prefetcher::spawn(safetensors_source.clone()))
+            }
+            _ => None,
+        };
+        let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -392,7 +548,31 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            top_k_override: None,
+            routing_threshold: None,
+            last_routing_ids,
+            prefetcher,
         })
+    }
+
+    /// Set the per-token top-K dispatch override. None = use manifest's top_k.
+    /// Values > manifest.top_k are silently clamped down (no point dispatching
+    /// experts the router didn't route to).
+    pub fn set_top_k_override(&mut self, v: Option<u32>) {
+        self.top_k_override = v;
+        info!(
+            top_k_override = ?v,
+            manifest_top_k = self.manifest.top_k,
+            "set_top_k_override"
+        );
+    }
+
+    /// Set the per-token routing-weight threshold (A2). None / 0.0 = disabled.
+    /// Experts whose routing weight is < threshold are skipped during
+    /// forward_shells dispatch.
+    pub fn set_routing_threshold(&mut self, v: Option<f32>) {
+        self.routing_threshold = v.filter(|t| *t > 0.0);
+        info!(routing_threshold = ?self.routing_threshold, "set_routing_threshold");
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -478,6 +658,13 @@ impl Runner {
         if let Some(l0) = self.layer0.as_mut() {
             l0.past_seq_len = 0;
         }
+        // autolab iter 029 (C1): a fresh prompt has zero correlation
+        // with the previous prompt's expert routing — wipe the
+        // same-as-last-token predictor so we don't waste prefetch
+        // bandwidth on irrelevant experts.
+        for hist in self.last_routing_ids.iter_mut() {
+            hist.clear();
+        }
     }
 
     /// Run one forward pass:
@@ -525,6 +712,7 @@ impl Runner {
     /// The shape contract matches `forward_shells`: returns `[HIDDEN]`,
     /// already passed through attention + dense MLP + residual.
     pub fn forward_layer0_step(&mut self, token_id: i64) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
         let l0 = self.layer0.as_mut().ok_or_else(|| {
             RunnerError::Internal("forward_layer0_step on non-first stage".into())
         })?;
@@ -564,6 +752,13 @@ impl Runner {
         );
         l0.past_seq_len = past_seq_len + 1;
 
+        // autolab/k26-perf q1 instrumentation: per-token layer-0 timing.
+        info!(
+            stage = "layer0",
+            duration_us = _t0.elapsed().as_micros() as u64,
+            past_seq_len,
+            "stage_timing"
+        );
         Ok(outs.hidden_out)
     }
 
@@ -583,8 +778,20 @@ impl Runner {
         h_shape: &[usize],
         past_seq_len: usize,
     ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
+        let mut shell_attn_total_us: u64 = 0;
+        let mut experts_total_us: u64 = 0;
+        let mut combine_total_us: u64 = 0;
         let hidden = self.manifest.hidden_size as usize;
-        let top_k = self.manifest.top_k as usize;
+        let manifest_top_k = self.manifest.top_k as usize;
+        // autolab campaign 004 (A3): if an override is set, only dispatch
+        // the first k' of the routed top-K experts per token. The shell's
+        // router still returns the full manifest top_k.
+        let effective_top_k = self
+            .top_k_override
+            .map(|v| (v as usize).min(manifest_top_k))
+            .unwrap_or(manifest_top_k);
+        let top_k = manifest_top_k; // alias for the router contract check below
         if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != 1 || h_shape[2] != hidden {
             return Err(RunnerError::Internal(format!(
                 "forward_shells: int4 shells require shape [1, 1, {hidden}], got {h_shape:?}"
@@ -593,6 +800,29 @@ impl Runner {
         let mut h_f32 = h_in.to_vec();
 
         let n_layers = self.layers.len();
+
+        // autolab iter 029 (C1): kick off madvise(WILLNEED) for every
+        // predicted next-token expert before we run any layer's attn.
+        // Predictor is "same as last token" — i.e. the IDs we stored in
+        // `last_routing_ids[i]` after the previous call. This races the
+        // OS readahead against this token's compute, so by the time we
+        // hit each layer's dispatch_expert the pages are (hopefully)
+        // already warm. Skipped for the very first token after
+        // `reset_kv` when last_routing_ids[i] is still empty.
+        let mut prefetch_submitted: u64 = 0;
+        if let Some(pf) = self.prefetcher.as_ref() {
+            for (i, hist) in self.last_routing_ids.iter().enumerate() {
+                if hist.is_empty() {
+                    continue;
+                }
+                let lid = self.layers[i].lid;
+                for &eid in hist.iter() {
+                    pf.try_submit(lid, eid);
+                    prefetch_submitted += 1;
+                }
+            }
+        }
+
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
             if self.layers[i].past_seq_len != past_seq_len {
@@ -616,6 +846,7 @@ impl Runner {
             // the same Cargo workspace. The `_with_capacity` variant
             // lets us pass a pre-allocated [H, capacity, D] buffer
             // with only the first `past_seq_len` slots populated.
+            let shell_t0 = Instant::now();
             let outs = shell_forward_decode_int4_with_capacity(
                 &self.layers[i].int4_shell,
                 &h_f32,
@@ -624,6 +855,7 @@ impl Runner {
                 past_seq_len,
                 capacity,
             );
+            shell_attn_total_us += shell_t0.elapsed().as_micros() as u64;
 
             // Write present_k / present_v into the existing capacity
             // buffer at slot `past_seq_len` for each head. No alloc.
@@ -655,22 +887,68 @@ impl Runner {
                     top_k
                 )));
             }
+            let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
-            for k in 0..top_k {
-                let eid = outs.routing_ids[k] as u32;
+            // autolab campaign 007 (A2): apply routing-weight threshold.
+            // We still iterate over `effective_top_k` to honor the A3 cap,
+            // but skip experts below the threshold within that range.
+            let threshold = self.routing_threshold.unwrap_or(0.0);
+            // autolab iter 029 (C1): collect this layer's actually-fired
+            // expert IDs so the next forward_shells call can use them as
+            // its prefetch predictor. Same-as-last-token heuristic.
+            let mut this_token_ids: Vec<u32> = Vec::with_capacity(effective_top_k);
+            for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
+                if w < threshold {
+                    continue;
+                }
+                let eid = outs.routing_ids[k] as u32;
+                this_token_ids.push(eid);
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
                 }
             }
+            // Stash the IDs for the next token's prefetch. We do this
+            // regardless of whether prefetching is currently enabled;
+            // tracking it costs ~k*u32 per layer per token (negligible)
+            // and makes it cheaper to toggle the prefetcher mid-run.
+            self.last_routing_ids[i] = this_token_ids;
+            experts_total_us += experts_t0.elapsed().as_micros() as u64;
 
             // Combine: h_next = residual + shared + moe (single token).
+            let combine_t0 = Instant::now();
             for j in 0..hidden {
                 h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
             }
+            combine_total_us += combine_t0.elapsed().as_micros() as u64;
         }
 
+        // autolab/k26-perf q1 instrumentation: per-token shells breakdown.
+        // iter 029 (C1): also log prefetch counters so we can see how the
+        // submit/drop ratio evolves across a generation. Counters are
+        // cumulative-since-Runner-load, so the deltas across consecutive
+        // tokens tell us submits-per-token and drops-per-token.
+        let (pf_submits, pf_drops, pf_processed) = self
+            .prefetcher
+            .as_ref()
+            .map(|p| p.snapshot())
+            .unwrap_or((0, 0, 0));
+        info!(
+            stage = "shells",
+            n_layers,
+            top_k,
+            effective_top_k,
+            shell_attn_us = shell_attn_total_us,
+            experts_us = experts_total_us,
+            combine_us = combine_total_us,
+            prefetch_submitted_this_call = prefetch_submitted,
+            prefetch_total_submits = pf_submits,
+            prefetch_total_drops = pf_drops,
+            prefetch_total_processed = pf_processed,
+            total_us = _t0.elapsed().as_micros() as u64,
+            "stage_timing"
+        );
         Ok(h_f32)
     }
 
@@ -682,6 +960,7 @@ impl Runner {
         h_f32: &[f32],
         tail_len: usize,
     ) -> Result<Vec<f32>, RunnerError> {
+        let _t0 = Instant::now();
         let hidden = self.manifest.hidden_size as usize;
         if tail_len == 0 || h_f32.len() < tail_len * hidden {
             return Err(RunnerError::Internal(format!(
@@ -713,6 +992,13 @@ impl Runner {
             DType::Bf16 => bf16_bytes_to_f32(&head_bytes),
             _ => return Err(RunnerError::Internal(format!("head dtype {:?}", head_dt))),
         };
+        // autolab/k26-perf q1 instrumentation: per-token head timing.
+        info!(
+            stage = "head",
+            duration_us = _t0.elapsed().as_micros() as u64,
+            tail_len,
+            "stage_timing"
+        );
         Ok(logits)
     }
 
@@ -868,32 +1154,32 @@ fn grow_layer0_kv_capacity(l0: &mut Layer0State) -> Result<(), RunnerError> {
 }
 
 /// Inner helper: allocate a fresh `[NUM_HEADS, new_cap, head_dim]`
-/// buffer, copy the populated `past_seq` prefix per head from a
-/// `[NUM_HEADS, old_cap, head_dim]` source. The rest is zero. Pure
-/// over buffers — no Int4Shell required, which keeps it unit-testable.
+/// buffer of bf16-as-u16, copy the populated `past_seq` prefix per head
+/// from a `[NUM_HEADS, old_cap, head_dim]` source. The rest is zero.
+/// Pure over buffers — no Int4Shell required, which keeps it unit-testable.
 ///
 /// Uses `try_reserve_exact` + `resize` so OOM at long context bubbles
 /// up as a recoverable `Err` instead of an abort from the global
-/// allocator.
+/// allocator. autolab 029 (A8): elements are 2 bytes, not 4.
 fn grow_kv_buffer(
-    src: &[f32],
+    src: &[u16],
     past_seq: usize,
     old_cap: usize,
     new_cap: usize,
     head_dim: usize,
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<u16>, String> {
     debug_assert!(new_cap >= old_cap);
     debug_assert!(past_seq <= old_cap);
     debug_assert_eq!(src.len(), NUM_HEADS * old_cap * head_dim);
     let total = NUM_HEADS * new_cap * head_dim;
-    let mut dst: Vec<f32> = Vec::new();
+    let mut dst: Vec<u16> = Vec::new();
     dst.try_reserve_exact(total).map_err(|e| {
         format!(
-            "alloc {total} f32 ({:.1} MB) failed: {e}",
-            (total * 4) as f64 / 1e6
+            "alloc {total} u16/bf16 ({:.1} MB) failed: {e}",
+            (total * 2) as f64 / 1e6
         )
     })?;
-    dst.resize(total, 0.0f32);
+    dst.resize(total, 0u16);
     if past_seq == 0 {
         return Ok(dst);
     }
@@ -905,12 +1191,28 @@ fn grow_kv_buffer(
     Ok(dst)
 }
 
+/// Convert one f32 to bf16 bits via round-to-nearest-even. Matches the
+/// rounding `half::bf16::from_f32` would do; inlined here so the hot
+/// per-token write loop doesn't depend on the `half` crate at this site.
+#[inline]
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        // NaN — keep mantissa nonzero so the round-trip stays a NaN
+        // rather than collapsing to ±inf when we shift back.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
 /// Write the new step's per-head K (or V) row at slot `past_seq`
-/// inside a `[NUM_HEADS, capacity, HEAD_DIM]` buffer. No allocation,
+/// inside a `[NUM_HEADS, capacity, HEAD_DIM]` bf16-as-u16 buffer.
+/// `present` is still f32 (we are the conversion site). No allocation,
 /// no shift — the slot exists because the caller pre-allocated /
 /// grew `capacity` to be `> past_seq`.
 fn write_present_kv(
-    buf: &mut [f32],
+    buf: &mut [u16],
     present: &[f32],
     past_seq: usize,
     capacity: usize,
@@ -922,8 +1224,12 @@ fn write_present_kv(
     debug_assert_eq!(present.len(), num_heads * head_dim);
     for h in 0..num_heads {
         let dst_off = h * capacity * head_dim + past_seq * head_dim;
-        buf[dst_off..dst_off + head_dim]
-            .copy_from_slice(&present[h * head_dim..(h + 1) * head_dim]);
+        let src_off = h * head_dim;
+        let dst = &mut buf[dst_off..dst_off + head_dim];
+        let src = &present[src_off..src_off + head_dim];
+        for i in 0..head_dim {
+            dst[i] = f32_to_bf16_bits(src[i]);
+        }
     }
 }
 
@@ -931,59 +1237,74 @@ fn write_present_kv(
 mod tests {
     use super::*;
 
+    /// Upconvert one bf16 bit-pattern to f32 the same way the SDPA
+    /// kernels do (used in test assertions below).
+    fn bf16_bits_to_f32(b: u16) -> f32 {
+        f32::from_bits((b as u32) << 16)
+    }
+
     #[test]
     fn write_present_kv_into_empty_slot() {
         // 2 heads, capacity=3, head_dim=2, past_seq=0.
         // Buffer starts zero; expect present rows at slot 0 of each head.
-        let mut buf = vec![0.0f32; 2 * 3 * 2];
-        let present = vec![1.0, 2.0, 3.0, 4.0]; // h0=[1,2], h1=[3,4]
+        // (autolab 029 / A8: buf is now bf16-as-u16; we feed f32 in.)
+        let mut buf = vec![0u16; 2 * 3 * 2];
+        let present = vec![1.0_f32, 2.0, 3.0, 4.0]; // h0=[1,2], h1=[3,4]
         write_present_kv(&mut buf, &present, 0, 3, 2, 2);
         // head 0 base = 0,        slot 0 = [1, 2]
         // head 1 base = capacity*head_dim = 6, slot 0 = [3, 4]
-        assert_eq!(buf[0..2], [1.0, 2.0]);
-        assert_eq!(buf[6..8], [3.0, 4.0]);
+        // Small integers round-trip exactly through bf16.
+        assert_eq!(bf16_bits_to_f32(buf[0]), 1.0);
+        assert_eq!(bf16_bits_to_f32(buf[1]), 2.0);
+        assert_eq!(bf16_bits_to_f32(buf[6]), 3.0);
+        assert_eq!(bf16_bits_to_f32(buf[7]), 4.0);
         // Unfilled slots untouched.
-        assert_eq!(buf[2..6], [0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(buf[8..12], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(&buf[2..6], &[0u16; 4]);
+        assert_eq!(&buf[8..12], &[0u16; 4]);
     }
 
     #[test]
     fn write_present_kv_into_middle_slot() {
         // 2 heads, capacity=4, head_dim=2, past_seq=2.
-        // Pre-populate slots 0..2 of each head, then write slot 2.
-        let mut buf = vec![0.0f32; 2 * 4 * 2];
+        // Pre-populate slots 0..2 of each head with bf16 values, then write slot 2.
+        let mut buf = vec![0u16; 2 * 4 * 2];
         // head 0 base=0
-        buf[0..2].copy_from_slice(&[10.0, 11.0]); // slot 0
-        buf[2..4].copy_from_slice(&[12.0, 13.0]); // slot 1
-                                                  // head 1 base = capacity*head_dim = 8
-        buf[8..10].copy_from_slice(&[20.0, 21.0]); // slot 0
-        buf[10..12].copy_from_slice(&[22.0, 23.0]); // slot 1
-        let present = vec![14.0, 15.0, 24.0, 25.0]; // h0=[14,15], h1=[24,25]
+        buf[0..2].copy_from_slice(&[super::f32_to_bf16_bits(10.0), super::f32_to_bf16_bits(11.0)]);
+        buf[2..4].copy_from_slice(&[super::f32_to_bf16_bits(12.0), super::f32_to_bf16_bits(13.0)]);
+        // head 1 base = capacity*head_dim = 8
+        buf[8..10].copy_from_slice(&[super::f32_to_bf16_bits(20.0), super::f32_to_bf16_bits(21.0)]);
+        buf[10..12]
+            .copy_from_slice(&[super::f32_to_bf16_bits(22.0), super::f32_to_bf16_bits(23.0)]);
+        let present = vec![14.0_f32, 15.0, 24.0, 25.0]; // h0=[14,15], h1=[24,25]
         write_present_kv(&mut buf, &present, 2, 4, 2, 2);
         // head 0 slot 2
-        assert_eq!(buf[4..6], [14.0, 15.0]);
+        assert_eq!(bf16_bits_to_f32(buf[4]), 14.0);
+        assert_eq!(bf16_bits_to_f32(buf[5]), 15.0);
         // head 1 slot 2
-        assert_eq!(buf[12..14], [24.0, 25.0]);
+        assert_eq!(bf16_bits_to_f32(buf[12]), 24.0);
+        assert_eq!(bf16_bits_to_f32(buf[13]), 25.0);
         // Existing slots untouched
-        assert_eq!(buf[0..2], [10.0, 11.0]);
-        assert_eq!(buf[8..10], [20.0, 21.0]);
+        assert_eq!(bf16_bits_to_f32(buf[0]), 10.0);
+        assert_eq!(bf16_bits_to_f32(buf[8]), 20.0);
     }
 
     #[test]
     fn grow_kv_buffer_doubles_and_preserves_data() {
         // Stamp a unique value at head h, slot 0, dim 0 of a
-        // [NUM_HEADS, 2, QK_HEAD_DIM] buffer, then double to cap=4.
+        // [NUM_HEADS, 2, QK_HEAD_DIM] u16 buffer, then double to cap=4.
         // Each head's base offset shifts from h*2*D to h*4*D — the
         // stamp should still be at the new base offset.
-        let mut src = vec![0.0f32; NUM_HEADS * 2 * QK_HEAD_DIM];
+        let mut src = vec![0u16; NUM_HEADS * 2 * QK_HEAD_DIM];
         for h in 0..NUM_HEADS {
-            src[h * 2 * QK_HEAD_DIM] = (h + 1) as f32;
+            // store small ints as bf16 bits — h+1
+            let v = (h + 1) as f32;
+            src[h * 2 * QK_HEAD_DIM] = super::f32_to_bf16_bits(v);
         }
         let dst = grow_kv_buffer(&src, 1, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         for h in 0..NUM_HEADS {
             assert_eq!(
-                dst[h * 4 * QK_HEAD_DIM],
+                bf16_bits_to_f32(dst[h * 4 * QK_HEAD_DIM]),
                 (h + 1) as f32,
                 "head {h} stamp lost"
             );
@@ -992,9 +1313,33 @@ mod tests {
 
     #[test]
     fn grow_kv_buffer_from_empty_is_zero_filled() {
-        let src = vec![0.0f32; NUM_HEADS * 2 * QK_HEAD_DIM];
+        let src = vec![0u16; NUM_HEADS * 2 * QK_HEAD_DIM];
         let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
-        assert!(dst.iter().all(|&x| x == 0.0));
+        assert!(dst.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn f32_to_bf16_bits_matches_half_crate() {
+        // Cross-check our hand-rolled rounding against `half::bf16::from_f32`
+        // for a handful of values: zero, ±1, ±0.5, small powers of 2,
+        // a denormal-ish value, and a few transcendentals.
+        use half::bf16;
+        let cases: &[f32] = &[
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, 0.125, 1.0e-30, 3.14159265, -42.5,
+        ];
+        for &x in cases {
+            let ours = super::f32_to_bf16_bits(x);
+            let theirs = bf16::from_f32(x).to_bits();
+            assert_eq!(
+                ours, theirs,
+                "mismatch for f32={x:?}: ours=0x{ours:04x} theirs=0x{theirs:04x}"
+            );
+        }
+        // NaN: any pattern with exp=0xFF and nonzero mantissa is valid.
+        // Bit-equality not required for NaN.
+        let nan_ours = super::f32_to_bf16_bits(f32::NAN);
+        let nan_back = f32::from_bits((nan_ours as u32) << 16);
+        assert!(nan_back.is_nan(), "ours: 0x{nan_ours:04x} not NaN");
     }
 }
