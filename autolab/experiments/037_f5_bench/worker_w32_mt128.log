@@ -1,0 +1,29 @@
+[2m2026-05-18T20:00:46.997317Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m tahoma worker starting [3mengine[0m[2m=[0mSparseMoe [3mrank[0m[2m=[0m0 [3mtotal[0m[2m=[0m1 [3mdevice[0m[2m=[0mCPU [3mmodel[0m[2m=[0m/tmp/k26-model-miner
+[2m2026-05-18T20:00:46.997488Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner connect [3mupstream[0m[2m=[0mNone [3mdownstream[0m[2m=[0mNone
+[2m2026-05-18T20:00:46.997502Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner load
+[2m2026-05-18T20:00:46.998915Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loading sparse-MoE model [3march[0m[2m=[0mkimi_k2.6 [3mnum_layers[0m[2m=[0m61 [3mnum_experts[0m[2m=[0m384 [3mtop_k[0m[2m=[0m8 [3mlayer_start[0m[2m=[0m0 [3mlayer_end[0m[2m=[0m4294967295 [3mis_first[0m[2m=[0mtrue [3mis_last[0m[2m=[0mtrue
+[2m2026-05-18T20:00:48.661781Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m compiled head (RMSNorm + lm_head)
+[2m2026-05-18T20:00:53.568610Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m constructed Rust int4 layer 0 + embed_tokens mmap
+[2m2026-05-18T20:00:53.568665Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m this rank holds 60 MoE layers (of 60 total)
+[2m2026-05-18T20:01:07.035862Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 10/60 (13.5s elapsed)
+[2m2026-05-18T20:01:19.715698Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 20/60 (26.1s elapsed)
+[2m2026-05-18T20:01:32.371998Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 30/60 (38.8s elapsed)
+[2m2026-05-18T20:01:45.002512Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 40/60 (51.4s elapsed)
+[2m2026-05-18T20:01:57.976059Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 50/60 (64.4s elapsed)
+[2m2026-05-18T20:02:11.020767Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m loaded int4 shells 60/60 (77.5s elapsed)
+[2m2026-05-18T20:02:11.020814Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m expert backend: safetensors_bin (shared with shell source)
+[2m2026-05-18T20:02:11.022898Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m set_attention_window [3mattention_window[0m[2m=[0mSome(32)
+[2m2026-05-18T20:02:11.676213Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m load progress loading sparse-MoE model
+[2m2026-05-18T20:02:11.676258Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner build engine
+[2m2026-05-18T20:02:11.676268Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner warmup
+[2m2026-05-18T20:02:11.676273Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::engine[0m[2m:[0m warmup: generating 1 token to warm caches
+[2m2026-05-18T20:02:11.676954Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill (token-by-token) [3mprompt_len[0m[2m=[0m1
+[2m2026-05-18T20:02:32.971441Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill 1/1 elapsed=21.3s
+[2m2026-05-18T20:02:32.971501Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill done [3msecs[0m[2m=[0m21.294527143 [3mtok_per_s[0m[2m=[0m0.046960422895735585
+[2m2026-05-18T20:02:32.971982Z[0m [32m INFO[0m [2mtahoma_runner[0m[2m:[0m runner ready
+[2m2026-05-18T20:02:32.972066Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m no chat_template found; /v1/chat/completions will use legacy formatting [3mmodel[0m[2m=[0m/tmp/k26-model-miner
+[2m2026-05-18T20:02:32.973947Z[0m [32m INFO[0m [2mtahoma_cli[0m[2m:[0m API serving [3mhost[0m[2m=[0m0.0.0.0 [3mport[0m[2m=[0m8000
+[2m2026-05-18T20:03:01.071321Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill (token-by-token) [3mprompt_len[0m[2m=[0m7
+[2m2026-05-18T20:04:16.893206Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill 7/7 elapsed=75.8s
+[2m2026-05-18T20:04:16.894867Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::runner[0m[2m:[0m prefill done [3msecs[0m[2m=[0m75.823516858 [3mtok_per_s[0m[2m=[0m0.09231964290326165
+[2m2026-05-18T20:12:56.250912Z[0m [32m INFO[0m [2mtahoma_engine_sparse_moe::engine[0m[2m:[0m task done (single-stage) [3mtask[0m[2m=[0mchatcmpl-624ffb6a2a7e495b9973ffcda5eb390d [3mtokens[0m[2m=[0m128 [3melapsed_s[0m[2m=[0m595.179163702 [3mtok_s[0m[2m=[0m0.21506129213906464
