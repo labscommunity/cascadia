@@ -2,6 +2,65 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 047 — Better C1 predictor (top-N pre-softmax) — CODE + INSTRUMENTATION shipped, bench deferred (2026-05-18 ~16:25 PT)
+
+Code + measurement instrumentation done. Branch
+`perf/c1-better-predictor-047` @ `4753fa2` (based on iter 038
+Windows-port branch, +361 / -32 across 6 files).
+
+**What shipped:**
+- `shell_int4::shell_forward_decode_int4_predict_n(..., predict_top_n)`
+  new entry point
+- Pure helper `select_top_n_by_score(scores, n)` —
+  `select_nth_unstable_by` partial sort then small-prefix sort, so
+  first TOPK come out in canonical descending order (dispatch path's
+  invariant)
+- Existing `shell_forward_decode_int4_with_capacity` delegates with
+  `predict_top_n=TOPK` for back-compat
+- `ShellOutputs.predicted_top_n_ids: Vec<i64>` (first TOPK exactly
+  match `routing_ids`)
+- `Runner.prefetch_n: u32` + `set_prefetch_n(Option<u32>)` setter
+  (clamped to `[TOPK, N_ROUTED_EXPERTS]`)
+- `last_routing_ids[i]` now stores top-N predicted IDs (when
+  N=TOPK and no A2/A3, behaviorally identical to iter 033)
+- **Hit-rate counters** (`prefetch_hits`, `prefetch_chances`) via
+  `prefetch_stats()` + logged in per-token `stage_timing` line —
+  makes future bench cheap
+- Prefetcher channel cap 4K → 16K (absorbs N=24 × 60 layers worst
+  case)
+- `--prefetch-n N` CLI flag
+- C ABI destructuring-only update (no byte-compat change for rainier
+  cdylib consumers)
+
+**Tests (5 new, all pass):**
+- `top_n_is_superset_of_top_k` — 16 trials of 384-expert score
+  vectors, validates top-K ⊆ top-N for N ∈ {8, 12, 16, 24, 32, 64,
+  384} AND first-TOPK prefix is sorted descending
+- 4 edge-case (ascending, descending, N=0, N=len)
+- All 12 int4-gemm + 17 sparse-moe lib pass; fmt + clippy clean
+
+**Hit-rate analysis (theoretical, bench deferred due to miner
+contention from iter 044):**
+
+| N  | Predicted hit-rate | Hinted/tok | Notes |
+|----|-------------------:|----------:|-------|
+| 8  | ~0.70 (baseline)   | 11.5 GB   | iter 033 |
+| 12 | ~0.78              | 17.3 GB   | comfortable in 133 GB cache |
+| **16** | **~0.85**      | **23 GB** | **sweet-spot candidate** |
+| 24 | ~0.95              | 34.5 GB   | risk of evicting earlier hints |
+
+Per-expert: ~24 MB (553 GB / 60 layers / 384 experts). N=24 may
+regress due to page-cache eviction; the shipped counters will
+empirically falsify/confirm.
+
+**Why it might compound nicely with iter 033 C1:** iter 033 measured
++27% with same-as-last (~0.70 hit-rate). Each +10 percentage points
+of hit-rate translates to ~3-5% additional throughput (avoided disk
+faults). N=16 → +5-7% on top of iter 033 = ~33-35% combined vs
+no-prefetch baseline.
+
+---
+
 ## 045 — Head tensor-parallelism — PLUMBING + Rust head kernel done, runtime gated on back-channel + low-RTT (2026-05-18 ~15:55 PT)
 
 Substantial architectural work + honest "not net-positive on current
