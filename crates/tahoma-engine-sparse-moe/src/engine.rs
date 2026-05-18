@@ -26,8 +26,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::dist::{
-    forward_reset, recv_forward_body_server, recv_kind_client, recv_kind_server,
-    recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
+    forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
+    recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
+    send_forward_batch, send_reset, send_token_batch_upstream, send_token_upstream, FrameKind,
     StageTransport,
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
@@ -48,16 +49,20 @@ pub struct SparseMoEBuilderConfig {
     /// Skip experts whose router weight falls below this threshold.
     /// 0.0 / None = disabled. Applied AFTER `top_k_override`.
     pub routing_threshold: Option<f32>,
-    /// If `Some(k > 0)`, the **single-stage** engine runs
-    /// [`crate::runner::Runner::generate_speculative`] instead of the
-    /// plain greedy generate path. Uses n-gram lookup decoding (Yang et
-    /// al. 2025) as a zero-compute draft model. K is the per-round
-    /// draft proposal length; see [`crate::ngram_draft::DEFAULT_DRAFT_K`]
-    /// (currently 8) for the recommended default.
+    /// If `Some(k > 0)`, the engine runs n-gram (Prompt-Lookup,
+    /// Yang et al. 2025) speculative decode instead of the plain greedy
+    /// generate path. K is the per-round draft proposal length;
+    /// see [`crate::ngram_draft::DEFAULT_DRAFT_K`] (currently 8) for the
+    /// recommended default.
     ///
-    /// **Pipeline-parallel mode is NOT yet supported by spec_decode** —
-    /// extending it requires a new `ForwardBatch(K)` variant on
-    /// [`crate::dist::FrameKind`]. With `total > 1`, this flag is a no-op.
+    /// - **Single-stage** (`total == 1`): uses
+    ///   [`crate::runner::Runner::generate_speculative`] directly.
+    /// - **Pipeline-parallel** (`total > 1`): rank 0 batches the K draft
+    ///   verifies into one [`crate::dist::FrameKind::ForwardBatch`]
+    ///   frame per round (one wire round-trip per round vs K round-trips
+    ///   the per-token Forward path would pay). Worker ranks
+    ///   transparently service ForwardBatch alongside the per-token
+    ///   path — no per-rank flag needed.
     pub spec_decode_k: Option<u32>,
 }
 
@@ -289,18 +294,15 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 && self.tokenizer.is_none() {
             return Err(EngineError::Backend("tokenizer.json missing".into()));
         }
-        // Spec-decode is single-stage only — warn if the caller set
-        // both spec_decode_k and total>1.
-        let spec_decode_k = if total > 1 {
-            if self.config.spec_decode_k.is_some() {
-                warn!(
-                    "spec_decode_k set but total={total} > 1; spec-decode is single-stage only, ignoring"
-                );
-            }
-            None
-        } else {
-            self.config.spec_decode_k
-        };
+        // Spec-decode is honored on both single-stage and pipeline-
+        // parallel paths now that FrameKind::ForwardBatch lets rank 0
+        // verify K positions per wire round-trip. The single-stage path
+        // uses `Runner::generate_speculative` directly; the
+        // pipeline-parallel path uses `drive_generation_first_spec`
+        // (added in PR #11), which batches the verify forwards over
+        // ForwardBatch frames. Worker ranks transparently service either
+        // path — they handle ForwardBatch frames as they arrive.
+        let spec_decode_k = self.config.spec_decode_k;
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -421,6 +423,35 @@ impl SparseMoEEngine {
 
     fn is_last(&self) -> bool {
         self.transport.is_last()
+    }
+
+    /// Worker-side helper: if the runner's KV is AHEAD of the driver's
+    /// requested `past_seq_len`, shrink it back. Used to absorb
+    /// spec-decode rejections without a dedicated wire frame — the
+    /// driver is the source of truth for the accepted prefix length and
+    /// the worker trusts the past_seq_len carried on every Forward /
+    /// ForwardBatch frame. No-op when the worker is already at or
+    /// behind the target (the non-spec path).
+    ///
+    /// Also handles the last-rank sampling-history book-keeping: we
+    /// strip the most-recently-pushed tokens off `last_rank_history`
+    /// so the repetition-penalty window doesn't double-count rejected
+    /// drafts. Mid-ranks have no sampling state, so this is a layers-
+    /// only rewind there.
+    fn maybe_rewind_to(&mut self, target_past_seq_len: usize) {
+        let lens = self.runner.kv_past_seq_lens();
+        let Some(&current) = lens.iter().max() else {
+            return;
+        };
+        if target_past_seq_len < current {
+            let n = current - target_past_seq_len;
+            self.runner.rewind_kv(n);
+            if self.is_last() {
+                let pop = n.min(self.last_rank_history.len());
+                let new_len = self.last_rank_history.len() - pop;
+                self.last_rank_history.truncate(new_len);
+            }
+        }
     }
 }
 
@@ -618,14 +649,40 @@ impl SparseMoEEngine {
 
         // Drive the full generation. result_tokens collects new tokens
         // generated AFTER the prompt (we discard the prefill responses).
-        let result_tokens =
+        // If spec-decode is enabled AND we're greedy (temp==0), use the
+        // batched ForwardBatch path; otherwise fall back to the
+        // per-token Forward driver.
+        let use_spec =
+            self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
+        let result_tokens = if use_spec {
+            let k = self.spec_decode_k.unwrap();
+            info!(
+                task = %task.task_id,
+                draft_k = k,
+                "using n-gram speculative decode (pipeline-parallel)"
+            );
+            match self.drive_generation_first_spec(
+                &prompt_ids,
+                max_new,
+                k as usize,
+                &sampling_cfg,
+                &downstream,
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(task = %task.task_id, "rank-0 spec-decode driver failed: {e}");
+                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                }
+            }
+        } else {
             match self.drive_generation_first(&prompt_ids, max_new, &sampling_cfg, &downstream) {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 driver failed: {e}");
                     return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
                 }
-            };
+            }
+        };
 
         let n_tokens = result_tokens.len() as u32;
         let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
@@ -787,6 +844,304 @@ impl SparseMoEEngine {
         }
     }
 
+    /// Pipeline-parallel speculative-decode driver on rank 0. Mirrors
+    /// [`crate::runner::Runner::generate_speculative`] but issues
+    /// `FrameKind::ForwardBatch` for each verify round so K positions
+    /// fit in one wire round-trip instead of K round-trips.
+    ///
+    /// Greedy-only by construction — temperature > 0 would change the
+    /// distribution under greedy acceptance; callers must dispatch the
+    /// non-greedy path to `drive_generation_first` instead.
+    fn drive_generation_first_spec(
+        &mut self,
+        prompt_ids: &[i64],
+        max_new: usize,
+        draft_k: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<Vec<i64>, String> {
+        let mut draft = crate::ngram_draft::Draft::new().with_draft_k(draft_k);
+        // Reset state on both ends. Rank-0's runner.reset_kv was
+        // already called by the caller (step_first sends Reset
+        // downstream and clears its own KV); we just need draft reset.
+        draft.reset();
+
+        let eos: Vec<i64> = self
+            .runner
+            .manifest
+            .eos_token_ids
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+        let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_new);
+        let mut generated: Vec<i64> = Vec::with_capacity(max_new);
+
+        // Prefill: same shape as the non-spec driver — one Forward per
+        // prompt token. Keeps the wire payload narrow during prefill
+        // (no draft model is consulted until decode begins).
+        info!(
+            prompt_len = prompt_ids.len(),
+            "spec: prefill (token-by-token, distributed)"
+        );
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            history.push(t);
+            let token_back = self
+                .forward_one_token_first(&history, cfg, downstream)
+                .map_err(|e| format!("spec prefill step {i}: {e}"))?;
+            if i + 1 == prompt_ids.len() {
+                if eos.contains(&token_back) {
+                    return Ok(generated);
+                }
+                generated.push(token_back);
+                history.push(token_back);
+                draft.warm_with_prompt(prompt_ids);
+                draft.append(token_back);
+            }
+            let _ = token_back;
+        }
+
+        let mut n_rounds: u32 = 0;
+        let mut n_drafts_total: u32 = 0;
+        let mut n_accepted_total: u32 = 0;
+
+        while generated.len() < max_new {
+            let budget = max_new - generated.len();
+            let mut drafts = draft.propose();
+            if drafts.len() > budget {
+                drafts.truncate(budget);
+            }
+
+            // No proposal → fall back to one standard forward step.
+            if drafts.is_empty() {
+                let token_back = self
+                    .forward_one_token_first(&history, cfg, downstream)
+                    .map_err(|e| format!("spec fallback step: {e}"))?;
+                if eos.contains(&token_back) {
+                    break;
+                }
+                history.push(token_back);
+                generated.push(token_back);
+                draft.append(token_back);
+                continue;
+            }
+
+            n_rounds += 1;
+            n_drafts_total += drafts.len() as u32;
+
+            // Run K verify forwards as ONE wire round-trip.
+            // Each forward conditions on history+drafts[0..i] and
+            // produces the target's prediction for position i.
+            // past_seq_len_start = history.len() - 1 BEFORE appending
+            // any draft (matches the single-token path's convention:
+            // forward_one_token_first uses past_seq_len = history.len()-1
+            // because it embeds the LAST history token).
+            let target_samples = self
+                .forward_batch_first(&drafts, &mut history, cfg, downstream)
+                .map_err(|e| format!("spec batch verify (round {n_rounds}): {e}"))?;
+            // Acceptance: longest matching prefix.
+            let accepted = crate::spec_decode::count_accepted(&drafts, &target_samples);
+            n_accepted_total += accepted as u32;
+
+            let bonus_forward_ran = accepted == drafts.len();
+            let bonus: i64 = if !bonus_forward_ran {
+                target_samples[accepted]
+            } else {
+                // All accepted: run one extra forward (the bonus) to
+                // get the next round's prev_correction. Same as the
+                // single-stage path; kept as a single-token Forward so
+                // we don't introduce a 1-token ForwardBatch frame.
+                self.forward_one_token_first(&history, cfg, downstream)
+                    .map_err(|e| format!("spec bonus forward (round {n_rounds}): {e}"))?
+            };
+
+            // Reconciliation: pop rejected drafts from history, then
+            // rewind KV so the next round's past_seq_len_start matches
+            // the rank-0 KV state.
+            //
+            // We compute the rewind directly instead of using
+            // `spec_decode::reconcile_after_round`, which (in its
+            // current form) is off-by-one for the convention used here:
+            // history pre-pushes `first_gen` before the K-loop and we
+            // append `bonus` AFTER the K-loop, so the post-round trail
+            // between history.len() and KV must be 1 (the bonus's
+            // pending slot, which the next round's first forward will
+            // fill). The helper assumes history holds no trailing
+            // unforwarded token. See [`spec_decode::reconcile_after_round`]
+            // tests, which use a no-first-gen convention.
+            //
+            // Partial accept (A < K, no bonus forward):
+            //   pre-round: history.len() = N, KV = N-1 (first_gen pending).
+            //   after K verifies: history.len() = N+K, KV = N+K-1.
+            //   want: history.len() = N+A+1 (drop K-A drafts + push bonus),
+            //         KV = N+A (the bonus's slot is pending).
+            //   pop = K-A, rewind = (N+K-1) - (N+A) = K-A-1.
+            //
+            // All accepted (A == K, bonus forward ran):
+            //   pre-round: history.len() = N, KV = N-1.
+            //   after K verifies: history.len() = N+K, KV = N+K-1.
+            //   after bonus forward: KV = N+K.
+            //   want: history.len() = N+K+1 (push bonus, no drops),
+            //         KV = N+K (the bonus's slot is pending).
+            //   pop = 0, rewind = 0.
+            let pop = drafts.len() - accepted;
+            let rewind = if bonus_forward_ran {
+                0
+            } else {
+                drafts.len() - accepted - 1
+            };
+            if pop > 0 {
+                history.truncate(history.len() - pop);
+            }
+            if rewind > 0 {
+                self.runner.rewind_kv(rewind);
+            }
+
+            let mut hit_eos = false;
+            for &t in drafts.iter().take(accepted) {
+                if eos.contains(&t) {
+                    hit_eos = true;
+                    break;
+                }
+                generated.push(t);
+                draft.append(t);
+                if generated.len() >= max_new {
+                    break;
+                }
+            }
+            if !hit_eos && generated.len() < max_new {
+                if eos.contains(&bonus) {
+                    hit_eos = true;
+                } else {
+                    history.push(bonus);
+                    draft.append(bonus);
+                    generated.push(bonus);
+                }
+            }
+
+            if hit_eos {
+                break;
+            }
+        }
+
+        info!(
+            tokens = generated.len(),
+            n_rounds,
+            total_drafts = n_drafts_total,
+            total_accepted = n_accepted_total,
+            accept_rate = if n_drafts_total > 0 {
+                n_accepted_total as f32 / n_drafts_total as f32
+            } else {
+                0.0
+            },
+            "spec_decode_pipeline done"
+        );
+        Ok(generated)
+    }
+
+    /// Run K verify forwards through the pipeline in one batched wire
+    /// round-trip. Pushes the K drafted tokens into `history` as it
+    /// runs each layer-0 + shell pass (so the next forward conditions
+    /// on the drafted prefix). Returns the K target-sampled tokens (one
+    /// per draft position) so the caller can run `count_accepted`.
+    ///
+    /// Note on KV: this method ADVANCES rank-0's KV by exactly K slots
+    /// (one per layer-0 + shell step). The caller is responsible for
+    /// `rewind_kv(rejected_count)` after running `count_accepted`.
+    fn forward_batch_first(
+        &mut self,
+        drafts: &[i64],
+        history: &mut Vec<i64>,
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<Vec<i64>, String> {
+        let hidden = self.runner.manifest.hidden_size as usize;
+        let k = drafts.len();
+        if k == 0 {
+            return Err("forward_batch_first called with empty drafts".into());
+        }
+        let past_seq_len_start = history
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "forward_batch_first: empty history".to_string())?
+            as u32;
+
+        // Run K rank-0 (layer 0 + shells) forwards locally, gathering K
+        // hidden rows. After this loop:
+        // - history grew by K (drafted tokens pushed in order)
+        // - runner's KV grew by K slots (layer 0 + every shell)
+        let mut h_batch: Vec<f32> = Vec::with_capacity(k * hidden);
+        for (i, &draft_tok) in drafts.iter().enumerate() {
+            // last token currently in history is what layer 0 should
+            // embed for THIS step. For step 0 it's the prior bonus /
+            // first generated token; for step i>0 it's drafts[i-1]
+            // because we pushed it on the previous iteration.
+            let last_id = *history
+                .last()
+                .ok_or_else(|| "forward_batch_first: empty history mid-step".to_string())?;
+            let past_seq_len = past_seq_len_start as usize + i;
+            let h_tail = self
+                .runner
+                .forward_layer0_step(last_id)
+                .map_err(|e| format!("layer0_step (batch {i}): {e}"))?;
+            let h_after = self
+                .runner
+                .forward_shells(&h_tail, &[1, 1, hidden], past_seq_len)
+                .map_err(|e| format!("forward_shells (batch {i}): {e}"))?;
+            h_batch.extend_from_slice(&h_after);
+            // Push the drafted token AFTER computing this step's
+            // hidden (which conditions on the prior history). The next
+            // iteration's layer 0 will embed `draft_tok`.
+            history.push(draft_tok);
+        }
+
+        let wire_t0 = Instant::now();
+        let result = self.block_on(async {
+            send_forward_batch(
+                downstream,
+                past_seq_len_start,
+                k as u32,
+                cfg,
+                &h_batch,
+                [1, k as u32, hidden as u32],
+            )
+            .await
+            .map_err(|e| format!("send_forward_batch: {e}"))?;
+            let send_done_us = wire_t0.elapsed().as_micros() as u64;
+            match recv_kind_client(downstream).await {
+                Ok(Some(FrameKind::TokenBatch)) => {
+                    let tokens = recv_token_batch_body_client(downstream)
+                        .await
+                        .map_err(|e| format!("recv_token_batch: {e}"))?;
+                    Ok((tokens, send_done_us))
+                }
+                Ok(Some(other)) => Err(format!("unexpected frame after forward_batch: {other:?}")),
+                Ok(None) => Err("downstream closed during recv_kind (batch)".into()),
+                Err(e) => Err(format!("recv_kind (batch): {e}")),
+            }
+        });
+        match result {
+            Ok((tokens, send_done_us)) => {
+                let total_wire_us = wire_t0.elapsed().as_micros() as u64;
+                info!(
+                    stage = "rank0_wire_batch",
+                    k,
+                    send_done_us,
+                    total_wire_us,
+                    downstream_compute_us = total_wire_us.saturating_sub(send_done_us),
+                    "stage_timing"
+                );
+                if tokens.len() != k {
+                    return Err(format!(
+                        "forward_batch_first: expected {k} tokens back, got {}",
+                        tokens.len()
+                    ));
+                }
+                Ok(tokens)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Worker step: process exactly one frame from upstream and emit
     /// its response (either FORWARD downstream + TOKEN back upstream
     /// for middle ranks, or TOKEN back upstream for the last rank).
@@ -862,6 +1217,14 @@ impl SparseMoEEngine {
                         in_shape, hidden
                     ));
                 }
+                // Self-rewind if the driver's past_seq_len is behind our
+                // local KV (spec-decode rejection in the prior round —
+                // see drive_generation_first_spec). The driver is the
+                // source of truth for the accepted prefix length; the
+                // worker trusts it and shrinks its KV before this
+                // forward writes its slot. No-op when past_seq_len is
+                // current (the normal non-spec path).
+                self.maybe_rewind_to(past_seq_len as usize);
                 let h_after = self
                     .runner
                     .forward_shells(&hidden_f32, &[1, 1, hidden], past_seq_len as usize)
@@ -920,10 +1283,134 @@ impl SparseMoEEngine {
                     Ok(())
                 }
             }
+            FrameKind::ForwardBatch => self.handle_forward_batch_frame(upstream, downstream),
             FrameKind::Token => Err(format!(
                 "rank {} received unexpected TOKEN from upstream",
                 self.rank
             )),
+            FrameKind::TokenBatch => Err(format!(
+                "rank {} received unexpected TOKEN_BATCH from upstream",
+                self.rank
+            )),
+        }
+    }
+
+    /// Worker-side ForwardBatch handler. Drives K sequential shell
+    /// forwards over the K hidden rows received in one frame, then
+    /// either runs head+sample × K on the last rank (TokenBatch back
+    /// upstream) or relays the K hiddens downstream and waits for a
+    /// TokenBatch to forward upstream on a mid rank.
+    ///
+    /// The wire savings vs K separate Forward frames is one round-trip
+    /// of latency per K verifies. At cascadia's 22 ms cross-host RT,
+    /// K=8 saves ~7 round-trips per spec-decode round (~154 ms). The
+    /// per-token shell compute is unchanged — `shell_forward_decode_int4`
+    /// still only accepts seq=1, so this is a wire-batching unlock, not
+    /// a kernel-batching one.
+    fn handle_forward_batch_frame(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (past_seq_len_start, batch_count, sampling_cfg, hidden_f32, in_shape) = self
+            .block_on(recv_forward_batch_body_server(upstream))
+            .map_err(|e| format!("recv_forward_batch: {e}"))?;
+        let hidden = self.runner.manifest.hidden_size as usize;
+        if in_shape[0] != 1 || in_shape[1] != batch_count || in_shape[2] as usize != hidden {
+            return Err(format!(
+                "forward_batch shape unexpected {:?} (expected [1, {batch_count}, {hidden}])",
+                in_shape
+            ));
+        }
+        let k = batch_count as usize;
+
+        // Self-rewind if the driver's past_seq_len_start is behind our
+        // local KV (spec-decode rejection in the prior round). Trusting
+        // the driver here lets us skip a dedicated RewindBatch frame.
+        self.maybe_rewind_to(past_seq_len_start as usize);
+
+        // Run K sequential shell forwards. Each forward consumes one
+        // hidden row and advances the per-layer KV cache by 1 slot.
+        // We accumulate the per-position post-shell hidden states so
+        // mid-ranks can relay them downstream as a single ForwardBatch.
+        let mut h_post_batch: Vec<f32> = if !self.is_last() {
+            Vec::with_capacity(k * hidden)
+        } else {
+            Vec::new()
+        };
+        let mut tokens_out: Vec<i64> = Vec::with_capacity(k);
+
+        // Last-rank-only: lazily seed RNG from the FIRST forward batch's
+        // sampling config.
+        if self.is_last() && !self.last_rank_rng_seeded {
+            self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+            self.last_rank_rng_seeded = true;
+        }
+
+        for i in 0..k {
+            let h_row = &hidden_f32[i * hidden..(i + 1) * hidden];
+            let past_seq_len = past_seq_len_start as usize + i;
+            let h_after = self
+                .runner
+                .forward_shells(h_row, &[1, 1, hidden], past_seq_len)
+                .map_err(|e| format!("forward_shells (batch step {i}): {e}"))?;
+            if self.is_last() {
+                let logits = self
+                    .runner
+                    .forward_head_last(&h_after, 1)
+                    .map_err(|e| format!("forward_head (batch step {i}): {e}"))?;
+                let token = crate::sampling::sample(
+                    &logits,
+                    &self.last_rank_history,
+                    &sampling_cfg,
+                    &mut self.last_rank_rng,
+                );
+                // Mirror the existing per-token Forward path: push into
+                // last_rank_history so the rep-penalty window includes
+                // this token in subsequent forwards. The caller is
+                // responsible for any rewind on rejection — the worker
+                // does not know which drafts were accepted.
+                self.last_rank_history.push(token);
+                tokens_out.push(token);
+            } else {
+                h_post_batch.extend_from_slice(&h_after);
+            }
+        }
+
+        if self.is_last() {
+            self.block_on(send_token_batch_upstream(upstream, &tokens_out))
+                .map_err(|e| format!("send_token_batch: {e}"))?;
+            Ok(())
+        } else {
+            let down = downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
+            self.block_on(async {
+                send_forward_batch(
+                    &down,
+                    past_seq_len_start,
+                    batch_count,
+                    &sampling_cfg,
+                    &h_post_batch,
+                    [1, batch_count, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch: {e}"))?;
+                let tokens = match recv_kind_client(&down).await {
+                    Ok(Some(FrameKind::TokenBatch)) => recv_token_batch_body_client(&down)
+                        .await
+                        .map_err(|e| format!("recv_token_batch: {e}"))?,
+                    Ok(Some(other)) => {
+                        return Err(format!(
+                            "unexpected mid-rank frame after ForwardBatch: {other:?}"
+                        ));
+                    }
+                    Ok(None) => return Err("downstream closed mid-batch".into()),
+                    Err(e) => return Err(format!("recv_kind (batch): {e}")),
+                };
+                send_token_batch_upstream(upstream, &tokens)
+                    .await
+                    .map_err(|e| format!("send_token_batch (relay): {e}"))
+            })?;
+            Ok(())
         }
     }
 }
