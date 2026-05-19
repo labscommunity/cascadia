@@ -73,6 +73,61 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 077 — Adaptive max_tokens early-stop — Track A working impl (2026-05-19 ~00:25 PT)
+
+Branch `perf/adaptive-stop-077` (3 commits). Full plumbing through
+types → sparse-moe → API → CLI.
+
+**What shipped:**
+1. **Types** (`tahoma-types/task.rs`): `stop: Option<Vec<String>>` +
+   `stop_on_repetition: bool` on `GenerationTask`, builder methods.
+   Backwards-compatible at serde layer (default values for missing
+   fields).
+2. **Sparse-MoE sampling** (`sampling.rs`): `StopConditions`,
+   `StopReason`, `text_ends_with_any`, `is_repetition_loop` (n=4
+   gram, threshold=3, window=20)
+3. **Sparse-MoE runner** (`runner.rs`): `generate_with_stop` new
+   core entry; `generate` is back-compat wrapper. **EOS check stays
+   primary; stop sequences require a `decode_tail` closure so
+   detokenization cost is paid only when needed.**
+4. **Sparse-MoE engine** (`engine.rs`): both `step_single_stage` and
+   rank-0 distributed driver (`drive_generation_first`) honor
+   conditions. Stop-sequence text trimmed from visible completion
+   (OpenAI convention). Distributed uses separate helper.
+5. **API** (`tahoma-api/lib.rs`): `ChatCompletionRequest` accepts
+   OpenAI-spec `stop` (string OR array via `StopField` untagged enum)
+   and custom `stop_on_repetition` bool. Empty filtered.
+6. **CLI** (`tahoma-cli/lib.rs`): new flags on `WorkerArgs`:
+   `--enable-adaptive-stop` (default true), `--stop-on-repetition`
+   (default false), `--stop` (repeatable)
+
+**Tests (17 new, all pass):**
+- types (3): builder, serde_roundtrip, serde_old_payload_without_new_fields
+- sparse-moe lib (10): `stop_conditions_any_reflects_state`,
+  `text_ends_with_any_matches_simple_sequence`, ignores_empty,
+  repetition detects/quiet-below-floor/ignores-unique/no-false-positive
+  variants, plus engine `stop_conditions_from_task_propagates_fields`,
+  `check_adaptive_stop_dist_no_tokenizer_skips_stop_seq_but_keeps_repetition`
+- tahoma-api (4): `stop_field_accepts_single_string` + `_accepts_array`
+  + `_absent_is_none` + `stop_on_repetition_parses`
+
+`cargo test --workspace` all pass; fmt + clippy clean.
+
+**Honest blockers:**
+- No real K2.6 verification of the 50%+ savings claim — only trigger
+  logic is unit-tested
+- Mock engine doesn't honor stop conditions; API tests verify wire
+  parsing only
+- `--enable-adaptive-stop=true` default is effectively no-op since
+  `--stop` and `--stop-on-repetition` default off; flag matters when
+  user overrides API-supplied stop list
+- Distributed: only rank 0 evaluates (only rank with tokenizer); no
+  wire format change
+- Stop-seq decode cap: trailing 64 tokens (`DECODE_TAIL_BUDGET`);
+  unusual long stop strings could miss
+
+---
+
 ## 078 — Continuous batching engine wiring — Blocker 3 done (per-request sampling state) (2026-05-19 ~00:15 PT)
 
 Extends iter 059 ContinuousBatcher skeleton. Branch
