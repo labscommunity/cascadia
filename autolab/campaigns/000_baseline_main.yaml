@@ -1,0 +1,53 @@
+version: 1
+name: 000_baseline_main
+hypothesis: |
+  Establish 2-box matias K2.6 pipeline baseline tok/s on main @ 208104e
+  to anchor every downstream moonshot. Expected from memory: ~0.05 tok/s
+  end-to-end, 3/3 quality on Paris/Pacific/four (130-160 s/prompt at
+  max_tokens=8).
+question: q1
+moonshot_id: null
+moonshot: false
+prior_art_note: |
+  Baseline reading; no lit needed. Reference: PR #9 ("K2.6 2-box
+  pipeline-parallel quality eval - 3/3 PASS (2026-05-17)") in
+  [[k26-state]] memory. Re-measuring on fresh worker restart in case
+  yesterday's numbers were warm-cache.
+
+runner:
+  backend: ssh
+  rank0_host: cascadia-matias-02
+  rank1_host: cascadia-matias-03
+  command: "powershell -NoProfile -File k26_3prompt_eval.ps1"
+  setup:
+    - autolab/bench/kill_workers.sh
+    - autolab/bench/start_workers.sh
+  timeout_seconds: 5400
+
+defaults:
+  max_tokens: 8
+  temperature: 0
+  prompts: ["The capital of France is", "The largest ocean on Earth is the", "Two plus two equals"]
+  expected_substrs: ["paris", "pacific", "four"]
+
+grid: {}
+
+metrics:
+  primary: tok_per_sec
+  direction: maximize
+  collect:
+    - name: tok_per_sec
+      source: stdout
+      pattern: '"tok_per_sec":([\d.]+)'
+      type: float
+    - name: quality_pass_count
+      source: stdout
+      pattern: '"quality_pass":"(\d+)/3"'
+      type: int
+
+repeats: 1                  # cold start only; sets the baseline number for the leaderboard
+acceptance:
+  min_quality_pass: 3
+  significance: "single run; subsequent campaigns provide variance"
+
+stopping: { max_failures: 1 }

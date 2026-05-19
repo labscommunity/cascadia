@@ -1,0 +1,91 @@
+version: 1
+
+directive: |
+  Maximize end-to-end tok/s on the K2.6 sparse-MoE pipeline-parallel
+  inference path in tahoma. Headline metric: tok/s measured at the
+  rank-0 OpenAI-compatible API, 2-box matias-02 ↔ matias-03 over
+  Tailscale DERP, with the 3-prompt Paris/Pacific/four quality eval
+  passing (substring + coherent). No fixed bar — document the
+  ceiling we hit. Optimize for moonshots over incremental tuning.
+
+baseline:
+  hardware: matias-02 + matias-03 (Lunar Lake 258V, 32 GB, Tailscale DERP)
+  model: K2.6 (553 GB orig, ~290 GB/box int4 experts)
+  config: total=2, rank=0+1, max_tokens=8, temp=0
+  measured: ~0.05 tok/s (17-20 s/tok), 3/3 quality pass (PR #9 + #10 evals)
+
+questions:
+  q1:
+    title: Where does the per-token time actually go on the 2-box pipeline?
+    status: active
+    bucket: instrumentation
+    rationale: |
+      Memory says expert page-in dominates, but the breakdown has never
+      been measured precisely on the 2-box matias setup. Every
+      subsequent moonshot needs this baseline.
+    success: per-stage time table with ±5% confidence across 3 runs.
+
+  q2:
+    title: Can we reduce active expert weight bandwidth without quality loss?
+    status: active
+    bucket: A (quant)
+    rationale: |
+      The largest rock per [[PRIOR_ART]]. Top-K reduction, int2 experts,
+      and per-token pruning all attack this. Lit search needed on AWQ /
+      SmoothQuant / MoE pruning for K2.6-class models.
+    candidates: [A1, A2, A3, A4, A5, A7, A10]
+
+  q3:
+    title: Can we hide expert page-in behind attention?
+    status: active
+    bucket: C (dispatch)
+    rationale: |
+      Attention runs on warm cache; expert dispatch hits cold pages.
+      Prefetching next layer's experts during this layer's attention
+      should overlap I/O with compute.
+    candidates: [C1, C2, C7, C8, F3]
+
+  q4:
+    title: Can KV cache be compressed enough to lift the BW ceiling?
+    status: active
+    bucket: A+B
+    rationale: |
+      KV cache f32 doubles BW relative to bf16. With 60 layers × 64 heads
+      × (192 + 128) dims, even short-context KV traffic is significant.
+    candidates: [A8, A9, B3, B5, B7]
+
+  q5:
+    title: Does the wire format choice meaningfully affect inter-rank latency?
+    status: active
+    bucket: D (wire)
+    rationale: |
+      28 KB / token at 22 ms DERP RTT is ~5% of per-token budget. Compressing,
+      overlapping, or batching the wire could either claw that back or enable
+      finer-grained pipeline schedules.
+    candidates: [D1, D3, D4, D5, D7, D8]
+
+  q6:
+    title: Does 3+ box topology beat 2-box for K2.6?
+    status: active
+    bucket: E (topo)
+    rationale: |
+      Cuts per-box weight footprint further (target: out of swap pressure),
+      at the cost of one more network hop per token. PR #4 d5 showed split
+      direction matters — need to retest the assumption on K2.6.
+    candidates: [E1, E2, E9]
+
+  q7:
+    title: Is speculative decoding viable for K2.6?
+    status: parked
+    bucket: G (algo)
+    rationale: |
+      Needs a K2.6 draft model. No public 1B-class K2.6 draft exists.
+      Cost: training a draft. Defer until other moonshots saturate.
+    candidates: [G1, G2, E8]
+
+stopping:
+  total_moonshots: 100
+  consecutive_no_improvement_escape: 3
+  moonshot_ratio_target: 0.7    # 70%+ should be M+ magnitude class
+
+state_file: .autolab/state.json

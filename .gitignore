@@ -7,6 +7,9 @@ target/
 # Tahoma scratch dirs (bench logs, ad-hoc experiments)
 tmp/
 experiments/
+# Exception: autolab/ is a tracked research archive; its experiments/ subdir is data we keep.
+!autolab/experiments/
+!autolab/experiments/**
 
 # Editors
 .idea/

@@ -50,7 +50,9 @@ pub const YARN_ORIGINAL_MAX_POSITION: f64 = 4096.0;
 pub const YARN_MSCALE: f64 = 1.0;
 pub const YARN_MSCALE_ALL_DIM: f64 = 1.0;
 
-/// Output struct: exactly the seven tensors the engine consumes.
+/// Output struct: exactly the seven tensors the engine consumes,
+/// plus the optional top-N expert prediction list used by C1 prefetch
+/// (iter 047 — better predictor).
 pub struct ShellOutputs {
     /// post_attention_layernorm output — fed to experts + shared.
     pub attn_out_post_norm: Vec<f32>,
@@ -68,6 +70,14 @@ pub struct ShellOutputs {
     pub present_k: Vec<f32>,
     /// NEW V values for this step only — shape [NUM_HEADS, seq, V_HEAD_DIM].
     pub present_v: Vec<f32>,
+    /// autolab iter 047 (C1 better predictor): top-N expert ids by
+    /// router score (pre-truncation to TOPK). The first TOPK entries
+    /// are exactly `routing_ids` (in the same order). The remaining
+    /// `N - TOPK` entries are the next-best experts — used by the
+    /// engine as a same-as-last-token + insurance predictor for the
+    /// next token's C1 prefetch. Empty when the shell forward was
+    /// called with `predict_top_n == TOPK` (back-compat path).
+    pub predicted_top_n_ids: Vec<i64>,
 }
 
 /// Run one shell forward for a single token (seq=1).
@@ -337,6 +347,9 @@ pub fn shell_forward_decode(
         routing_weights: topk_w,
         present_k: new_k,
         present_v: new_v,
+        // bf16 reference path is not on the prefetch critical path
+        // (only int4 shell runs in steady-state inference). Empty.
+        predicted_top_n_ids: Vec::new(),
     }
 }
 

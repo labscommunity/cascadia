@@ -1,0 +1,90 @@
+version: 1
+name: 001_instrumentation_breakdown
+hypothesis: |
+  Per-stage time breakdown on the 2-box K2.6 pipeline will show expert
+  dispatch dominates >60% of per-token wall time, with shell attention
+  ~20%, cross-rank wire ~5%, and the remainder split between layer 0 +
+  head + sampling. Disk-page-in latency on cold expert pages is the
+  long-tail variance source.
+question: q1
+moonshot_id: null
+moonshot: false      # instrumentation work, not a moonshot
+prior_art_note: |
+  No external lit needed — straightforward tokio-tracing instrumentation
+  around critical functions. The tracing crate is already a workspace
+  dep (see engine.rs / runner.rs imports). What's novel here is the
+  measurement, not the technique.
+
+runner:
+  backend: ssh
+  rank0_host: cascadia-matias-02
+  rank1_host: cascadia-matias-03
+  command: "powershell -NoProfile -File k26_3prompt_eval.ps1 -OutFile C:\\Users\\devcloud\\k26-bench-001.jsonl"
+  setup:
+    - autolab/bench/kill_workers.sh
+    - cargo build --release -p tahoma --features openvino  # build instrumented binary
+    - scp target/release/tahoma.exe cascadia-matias-02:tahoma/target/release/tahoma.exe
+    - scp target/release/tahoma.exe cascadia-matias-03:tahoma/target/release/tahoma.exe
+    - autolab/bench/start_workers.sh
+  timeout_seconds: 5400
+
+defaults:
+  max_tokens: 8
+  temperature: 0
+  prompts: ["The capital of France is", "The largest ocean on Earth is the", "Two plus two equals"]
+  expected_substrs: ["paris", "pacific", "four"]
+  rust_log: "info,tahoma_engine_sparse_moe=debug,tahoma_int4_gemm=debug"
+
+grid: {}
+
+metrics:
+  primary: tok_per_sec
+  direction: maximize
+  collect:
+    - name: tok_per_sec
+      source: stdout
+      pattern: '"tok_per_sec":([\d.]+)'
+      type: float
+    - name: quality_pass_count
+      source: stdout
+      pattern: '"quality_pass":"(\d+)/3"'
+      type: int
+    # Per-stage timing (parsed from the tracing spans):
+    - name: layer0_us_per_token
+      source: rank0_tahoma_log
+      pattern: 'layer0_forward.*duration_us=([\d.]+)'
+      type: float
+    - name: shell_us_per_token
+      source: rank0_tahoma_log
+      pattern: 'shell_forward_total.*duration_us=([\d.]+)'
+      type: float
+    - name: experts_us_per_token
+      source: rank0_tahoma_log
+      pattern: 'experts_total.*duration_us=([\d.]+)'
+      type: float
+    - name: wire_send_us
+      source: rank0_tahoma_log
+      pattern: 'wire_send.*duration_us=([\d.]+)'
+      type: float
+    - name: wire_recv_us
+      source: rank0_tahoma_log
+      pattern: 'wire_recv.*duration_us=([\d.]+)'
+      type: float
+    - name: head_us_per_token
+      source: rank1_tahoma_log
+      pattern: 'head_forward.*duration_us=([\d.]+)'
+      type: float
+
+repeats: 3
+acceptance:
+  min_quality_pass: 3
+  significance: "median across 3 runs; per-stage breakdown sums to ≥90% of measured tok-time (rest = overhead)"
+  instrumentation_overhead_budget_pct: 5    # if instrumented tok/s drops >5% vs baseline, instrumentation is too heavy
+
+stopping: { max_failures: 2 }
+
+links:
+  spawned_from: research_plan.yaml#q1
+  feeds:
+    - "Per-stage table → PRIOR_ART.md 'Where the time goes' (replace estimates with measurements)"
+    - "Ranking input for MOONSHOTS.md order (sort by stage * candidate's expected impact)"

@@ -159,13 +159,14 @@ pub fn embed_token_bf16(embed_table_bf16: &[u8], token_id: i64) -> Vec<f32> {
 /// of the new token id).
 ///
 /// `past_k` shape `[NUM_HEADS, capacity, QK_HEAD_DIM]`, `past_v`
-/// shape `[NUM_HEADS, capacity, V_HEAD_DIM]`; only the first
-/// `past_seq_len` slots per head are populated.
+/// shape `[NUM_HEADS, capacity, V_HEAD_DIM]`, **bf16-as-u16** storage
+/// (autolab campaign 029 / A8). Only the first `past_seq_len` slots
+/// per head are populated.
 pub fn layer0_forward_decode_int4_with_capacity(
     layer: &Int4Layer0,
     x_f32: &[f32],
-    past_k: &[f32],
-    past_v: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
     past_seq_len: usize,
     capacity: usize,
 ) -> Layer0Outputs {
@@ -248,6 +249,10 @@ pub fn layer0_forward_decode_int4_with_capacity(
         new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
     }
 
+    // SDPA — autolab campaign 029 (A8): past_k/past_v are bf16-as-u16,
+    // upconverted to f32 inline at each dot-product element. The new
+    // (this-step) k/v stay f32 — the caller writes them into the bf16
+    // cache after we return.
     let scale = 1.0f32 / (QK_HEAD_DIM as f32).sqrt();
     let mut attn_out = vec![0.0f32; NUM_HEADS * V_HEAD_DIM];
     let kv_len = past_seq_len + 1;
@@ -265,7 +270,8 @@ pub fn layer0_forward_decode_int4_with_capacity(
             let k_row = &past_k_h[j * QK_HEAD_DIM..(j + 1) * QK_HEAD_DIM];
             let mut s = 0.0f32;
             for i in 0..QK_HEAD_DIM {
-                s += q_h[i] * k_row[i];
+                let kf = f32::from_bits((k_row[i] as u32) << 16);
+                s += q_h[i] * kf;
             }
             scores[j] = s * scale;
         }
@@ -295,7 +301,8 @@ pub fn layer0_forward_decode_int4_with_capacity(
             let v_row = &past_v_h[j * V_HEAD_DIM..(j + 1) * V_HEAD_DIM];
             let w = scores[j];
             for i in 0..V_HEAD_DIM {
-                out_h[i] += w * v_row[i];
+                let vf = f32::from_bits((v_row[i] as u32) << 16);
+                out_h[i] += w * vf;
             }
         }
         let w = scores[past_seq_len];

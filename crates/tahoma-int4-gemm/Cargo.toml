@@ -14,7 +14,27 @@ rayon = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+# autolab iter 038 (C1 Windows port): PrefetchVirtualMemory + friends
+# for the Windows arm of advise_willneed. Bundled in `windows-sys` so
+# we only pull the Win32 import lib, no proc-macros or extra crates.
+# iter 054 (expert pinning) reuses the same `Win32_System_Memory`
+# feature for `VirtualLock` / `VirtualUnlock` — no new feature bit
+# required.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+# autolab iter 054 (expert pinning): `libc::mlock` / `libc::munlock` and
+# `libc::getrlimit(RLIMIT_MEMLOCK)`. Linux-only on the hot path
+# (Windows uses `VirtualLock`); macOS / BSD also have mlock so the
+# unix-cfg gate is correct.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+tempfile = "3"
 # (canonical reference decompression for cross-validation lives in
 # rainier/scripts/k26_export_per_expert_v2.py — we cross-validate the
 # Rust kernel against bytes-on-disk only).

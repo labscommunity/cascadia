@@ -28,10 +28,19 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::Mmap;
 use parking_lot::RwLock;
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{
+    PrefetchVirtualMemory, VirtualLock, VirtualUnlock, WIN32_MEMORY_RANGE_ENTRY,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::format::GemmError;
 
@@ -117,6 +126,207 @@ impl Shard {
             &self.mmap[start..start + len]
         })
     }
+
+    /// Hint the OS that we'll need a tensor's byte range soon. On Unix
+    /// this wraps `madvise(MADV_WILLNEED)`; on Windows it wraps
+    /// `PrefetchVirtualMemory` (kernel32, Win8+). Best-effort: errors
+    /// swallowed because both APIs are advisory and the worst case is
+    /// the read happens on demand later (which is exactly the
+    /// no-prefetch baseline).
+    fn advise_willneed(&self, tensor_name: &str) {
+        let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
+            return;
+        };
+        // memmap2's `advise_range` (Unix) and `PrefetchVirtualMemory`
+        // (Windows) both round the start down and the length up to the
+        // next page boundary internally, so we don't align here.
+        #[cfg(unix)]
+        {
+            let start = self.data_start + _off;
+            let _ = self.mmap.advise_range(Advice::WillNeed, start, _len);
+        }
+        #[cfg(windows)]
+        {
+            self.win_prefetch_range(_off, _len);
+        }
+    }
+
+    /// autolab iter 054 (expert pinning): lock one tensor's byte range
+    /// into RAM so it can never be paged out. On Unix wraps
+    /// `mlock(addr, len)`; on Windows wraps `VirtualLock(addr, len)`.
+    /// Returns the number of bytes actually attempted to pin (= the
+    /// tensor's on-disk length, *not* page-rounded — the OS rounds
+    /// internally and that doesn't change accounting at the granularity
+    /// we care about). Returns 0 on failure so the caller can decide
+    /// whether to bail (e.g. RLIMIT_MEMLOCK exhausted) without us
+    /// holding any partial state.
+    ///
+    /// **Critical contract:** the returned byte count is what we'd need
+    /// to `munlock` later. Callers track the total via the
+    /// `SafetensorsExpertSource::pinned_bytes` counter for diagnostics
+    /// and budget enforcement.
+    fn pin_range(&self, tensor_name: &str) -> usize {
+        let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
+            return 0;
+        };
+        if _len == 0 {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            let start = self.data_start + _off;
+            // SAFETY: `start..start+len` is inside the live mmap (validated
+            // at Shard::open via the data_offsets check) and we never deref
+            // the pointer — only hand it to the kernel. `mlock` does not
+            // require alignment; the kernel page-rounds internally.
+            let addr = unsafe { self.mmap.as_ptr().add(start) } as *const libc::c_void;
+            let rc = unsafe { libc::mlock(addr, _len) };
+            if rc == 0 {
+                _len
+            } else {
+                0
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.win_lock_range(_off, _len)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            // No-op fallback: pinning isn't available. Returning 0 makes
+            // the caller treat the expert as unpinned, which degrades
+            // gracefully to the C1-prefetch-only baseline.
+            let _ = _off;
+            0
+        }
+    }
+
+    /// Inverse of `pin_range`. Best-effort: errors swallowed so a
+    /// double-unpin (or unpin after a Shard recreation that lost the
+    /// pin) doesn't poison the source. Returns the byte count the
+    /// caller should subtract from `pinned_bytes` if non-zero.
+    fn unpin_range(&self, tensor_name: &str) -> usize {
+        let Some(&(_off, _len)) = self.tensors.get(tensor_name) else {
+            return 0;
+        };
+        if _len == 0 {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            let start = self.data_start + _off;
+            // SAFETY: same as pin_range. munlock is idempotent on Linux
+            // (returns 0 even if the range wasn't locked); other Unixen
+            // may return EINVAL — we ignore either way.
+            let addr = unsafe { self.mmap.as_ptr().add(start) } as *const libc::c_void;
+            let rc = unsafe { libc::munlock(addr, _len) };
+            if rc == 0 {
+                _len
+            } else {
+                0
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.win_unlock_range(_off, _len)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = _off;
+            0
+        }
+    }
+
+    /// Windows arm of `pin_range`. `VirtualLock` requires SE_LOCK_MEMORY
+    /// privilege OR a working-set big enough to hold the locked region
+    /// (auto-grown when locking under `SetProcessWorkingSetSizeEx` is
+    /// configured). Returns 0 on failure — caller falls back to
+    /// C1-prefetch-only.
+    #[cfg(windows)]
+    fn win_lock_range(&self, off: usize, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let start = self.data_start + off;
+        let base = self.mmap.as_ptr();
+        // SAFETY: pointer is inside the live mmap; only handed to kernel.
+        let addr = unsafe { base.add(start) } as *const core::ffi::c_void;
+        // SAFETY: VirtualLock signature accepts a const pointer; non-zero
+        // return is success. Failure is non-fatal (caller treats as unpinned).
+        let ok = unsafe { VirtualLock(addr, len) };
+        if ok != 0 {
+            len
+        } else {
+            0
+        }
+    }
+
+    /// Windows arm of `unpin_range`. `VirtualUnlock` is best-effort:
+    /// returns failure if the range was already unlocked, which we
+    /// ignore (idempotent semantics).
+    #[cfg(windows)]
+    fn win_unlock_range(&self, off: usize, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let start = self.data_start + off;
+        let base = self.mmap.as_ptr();
+        // SAFETY: see win_lock_range.
+        let addr = unsafe { base.add(start) } as *const core::ffi::c_void;
+        unsafe {
+            let _ = VirtualUnlock(addr, len);
+        }
+        len
+    }
+
+    /// Windows arm of `advise_willneed`. Resolves a single tensor's
+    /// (offset, length) inside this mmap to a virtual-address range and
+    /// hands it to `PrefetchVirtualMemory` for async page-in.
+    ///
+    /// Semantics MS documents for `PrefetchVirtualMemory`:
+    ///   * "purely a performance optimization … treated as a strong
+    ///     hint by the system and is subject to usual physical memory
+    ///     constraints where it can completely or partially fail under
+    ///     low-memory conditions."
+    ///   * Returns nonzero on success, zero on failure (we ignore both —
+    ///     the read will just happen synchronously on first access).
+    ///   * Available on Windows 8 / Server 2012 and up.
+    ///
+    /// We call it once per tensor (one entry in the
+    /// `WIN32_MEMORY_RANGE_ENTRY` array). The expert-prefetch caller
+    /// invokes us six times per expert (gate/up/down × packed/scale)
+    /// which is consistent with how the Unix path iterates.
+    /// Calling with batches of one keeps the code simple and avoids
+    /// holding a `Vec` of entries that would have to outlive the
+    /// `unsafe` call; the per-call cost is just one cross-DLL hop
+    /// (~µs), same order of magnitude as `madvise` on Linux.
+    #[cfg(windows)]
+    fn win_prefetch_range(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // Tensor offset is within the mmap's data section; compute the
+        // raw virtual address by adding it to the mmap's base ptr.
+        // `Mmap::as_ptr()` returns a `*const u8` aimed at byte 0 of the
+        // mapped view. Adding `data_start + off` lands us at the first
+        // tensor byte. SAFETY: the resulting pointer is inside the live
+        // mmap; we never deref it, only hand it to the kernel.
+        let start = self.data_start + off;
+        let base = self.mmap.as_ptr();
+        let addr = unsafe { base.add(start) } as *mut core::ffi::c_void;
+
+        let entry = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: addr,
+            NumberOfBytes: len,
+        };
+        // SAFETY: hProcess from GetCurrentProcess is a pseudo-handle (no
+        // close required), the entry array lives on the stack for the
+        // duration of the call, and Flags must be 0 per MSDN. Return
+        // value is intentionally ignored (advisory API).
+        unsafe {
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+        }
+    }
 }
 
 /// Source of safetensors-backed expert weights. Caches mmaps lazily.
@@ -131,6 +341,18 @@ pub struct SafetensorsExpertSource {
     weight_map: Arc<HashMap<String, String>>,
     /// Lazy mmap cache: shard filename → Shard.
     shards: Arc<RwLock<HashMap<String, Arc<Shard>>>>,
+    /// autolab iter 054 (expert pinning): cumulative bytes successfully
+    /// `mlock`/`VirtualLock`'d via `pin_expert` minus the bytes returned
+    /// to the OS via `unpin_expert`. Used by the runner for budget
+    /// enforcement and diagnostics. Sum of *attempted* sizes (not page-
+    /// rounded) — close enough for the warn-threshold check.
+    pinned_bytes: Arc<AtomicU64>,
+    /// autolab iter 054 (expert pinning): set of (layer, expert) pairs
+    /// currently pinned. Used to (a) make pin_expert idempotent (skip
+    /// double-pin which would double-count bytes) and (b) drive unpin
+    /// of the full set when the runner is being torn down or a new
+    /// pin set is being installed.
+    pinned_experts: Arc<RwLock<HashMap<(u32, u32), usize>>>,
 }
 
 impl SafetensorsExpertSource {
@@ -164,6 +386,8 @@ impl SafetensorsExpertSource {
             model_dir,
             weight_map: Arc::new(map),
             shards: Arc::new(RwLock::new(HashMap::new())),
+            pinned_bytes: Arc::new(AtomicU64::new(0)),
+            pinned_experts: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -198,6 +422,208 @@ impl SafetensorsExpertSource {
         // so caller pins it.
         let static_bytes: &'static [u8] = unsafe { std::mem::transmute(bytes) };
         Ok((s, static_bytes))
+    }
+
+    /// Names of the six tensors that compose one expert. Same enumeration
+    /// `expert()` uses; pulled out so prefetch can iterate them without
+    /// materializing the full `SafetensorsExpert`.
+    fn expert_tensor_names(layer: u32, expert: u32) -> [String; 6] {
+        let base = format!(
+            "language_model.model.layers.{}.mlp.experts.{}",
+            layer, expert
+        );
+        [
+            format!("{}.gate_proj.weight_packed", base),
+            format!("{}.gate_proj.weight_scale", base),
+            format!("{}.up_proj.weight_packed", base),
+            format!("{}.up_proj.weight_scale", base),
+            format!("{}.down_proj.weight_packed", base),
+            format!("{}.down_proj.weight_scale", base),
+        ]
+    }
+
+    /// autolab iter 029 (C1): issue `madvise(MADV_WILLNEED)` on every
+    /// byte slice for one expert. Non-blocking — the kernel queues
+    /// async readahead. Returns the number of slices for which madvise
+    /// succeeded (caller can ignore; useful for instrumentation).
+    ///
+    /// Designed to be called from a dedicated prefetch thread that's
+    /// fed by the inference path. Holds no locks across madvise calls
+    /// (the shard lookup briefly takes the inner RwLock).
+    pub fn prefetch_expert(&self, layer: u32, expert: u32) -> usize {
+        let mut hits = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            // Resolve the shard. If the tensor isn't in the weight map
+            // we silently skip — prefetch is best-effort.
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            // Open-or-clone the shard. We tolerate the open cost because
+            // (a) prefetch runs off the hot path and (b) once cached
+            // every subsequent prefetch on that shard is one HashMap
+            // hit + one madvise syscall.
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            shard.advise_willneed(name);
+            hits += 1;
+        }
+        hits
+    }
+
+    /// autolab iter 054 (expert pinning): `mlock` (Linux/macOS/BSD) or
+    /// `VirtualLock` (Windows) every byte slice that makes up one
+    /// expert (six tensors: gate / up / down × packed / scale). Returns
+    /// the number of bytes successfully pinned for this call — `0` on
+    /// any failure path (tensor missing, shard open failure, syscall
+    /// error). Idempotent: pinning an already-pinned expert is a no-op
+    /// and returns `0` (does not double-count toward `pinned_bytes`).
+    ///
+    /// Strategy: composes with C1 prefetch — pinning short-circuits the
+    /// expert's pages from ever being evicted under memory pressure,
+    /// while C1 prefetch hides the page-in latency for the unpinned
+    /// tail. On K2.6 with a heavy-tailed expert hit distribution, pinning
+    /// the top ~10% per layer (38 of 384) covers ~80% of dispatches at
+    /// ~47 GB total cost — easily fits on a 133 GB miner with the page
+    /// cache for the unpinned 90% behind it.
+    ///
+    /// Critical: callers MUST verify `rlimit_memlock_soft()` is large
+    /// enough to hold the target set before kicking off bulk pin calls;
+    /// once `mlock` starts returning ENOMEM, partial pins remain and
+    /// the page cache will start thrashing as the OS tries to free
+    /// pages that are locked.
+    pub fn pin_expert(&self, layer: u32, expert: u32) -> usize {
+        // Idempotency check — already pinned ⇒ no-op. Drop the read
+        // lock before doing the syscall work to keep contention low
+        // when many layers fire pin_expert in parallel during the
+        // warmup-completion handoff.
+        if self.pinned_experts.read().contains_key(&(layer, expert)) {
+            return 0;
+        }
+        let mut total = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            total += shard.pin_range(name);
+        }
+        if total > 0 {
+            // Record after successful pin so partial failures don't
+            // leave us with a counter mismatch on unpin. A `(layer,
+            // expert)` row may exist with `0` bytes (full failure) —
+            // store it only if any pages took.
+            self.pinned_experts.write().insert((layer, expert), total);
+            self.pinned_bytes
+                .fetch_add(total as u64, AtomicOrdering::Relaxed);
+        }
+        total
+    }
+
+    /// Inverse of `pin_expert`. Returns the byte count actually released
+    /// (0 if the expert wasn't pinned). Safe to call from any thread.
+    pub fn unpin_expert(&self, layer: u32, expert: u32) -> usize {
+        let prev_bytes = match self.pinned_experts.write().remove(&(layer, expert)) {
+            Some(b) => b,
+            None => return 0,
+        };
+        let mut released = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            released += shard.unpin_range(name);
+        }
+        // Subtract the *recorded* pin size, not the freshly-returned
+        // count — the two should match in steady state, but if mmap
+        // hot-reload ever changed offsets between pin and unpin we'd
+        // want the accounting to follow what we promised on the way in.
+        self.pinned_bytes
+            .fetch_sub(prev_bytes as u64, AtomicOrdering::Relaxed);
+        released
+    }
+
+    /// autolab iter 054: unpin every expert this source has pinned.
+    /// Useful at runner teardown or before installing a new pin set.
+    /// Returns `(experts_unpinned, bytes_released_recorded)`.
+    pub fn unpin_all_experts(&self) -> (usize, u64) {
+        let to_unpin: Vec<(u32, u32)> = self.pinned_experts.read().keys().copied().collect();
+        let n = to_unpin.len();
+        let mut released = 0u64;
+        for (layer, expert) in to_unpin {
+            let bytes = self.unpin_expert(layer, expert);
+            released += bytes as u64;
+        }
+        (n, released)
+    }
+
+    /// Snapshot the cumulative pinned-bytes counter (sum of
+    /// pin_expert returns minus unpin_expert returns).
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Snapshot the count of (layer, expert) pairs currently pinned.
+    pub fn pinned_expert_count(&self) -> usize {
+        self.pinned_experts.read().len()
+    }
+
+    /// autolab iter 054: read the process's soft RLIMIT_MEMLOCK on Unix.
+    /// Returns `Some(soft_bytes)` or `None` if the syscall fails or
+    /// the limit is `RLIM_INFINITY` (which we report as `u64::MAX` so
+    /// callers can compare directly). On non-Unix returns `None` —
+    /// Windows has no equivalent rlimit (instead the working-set size
+    /// caps `VirtualLock`, which auto-grows).
+    pub fn rlimit_memlock_soft() -> Option<u64> {
+        #[cfg(unix)]
+        {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: RLIMIT_MEMLOCK is a valid resource id and rlim is
+            // owned + initialized to zero.
+            let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) };
+            if rc != 0 {
+                return None;
+            }
+            // RLIM_INFINITY is the sentinel — report as MAX so callers
+            // can do a single `>= required` check without special-casing.
+            if rlim.rlim_cur == libc::RLIM_INFINITY {
+                Some(u64::MAX)
+            } else {
+                Some(rlim.rlim_cur as u64)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Helper: bytes required to pin the named expert (sum of the six
+    /// tensor slice lengths). Returns `0` if the expert isn't in the
+    /// weight map — useful as a probe before deciding to pin.
+    pub fn expert_size_bytes(&self, layer: u32, expert: u32) -> u64 {
+        let mut total = 0u64;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            if let Some(&(_off, len)) = shard.tensors.get(name) {
+                total += len as u64;
+            }
+        }
+        total
     }
 
     /// Fetch one expert's six tensor slices (gate/up/down × packed/scale).
@@ -438,5 +864,223 @@ impl SafetensorsExpertSource {
     /// pinned shard reference plus a slice into the mmap.
     pub fn embed_tokens(&self) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
         self.slice("language_model.model.embed_tokens.weight")
+    }
+}
+
+/// autolab iter 054 (expert pinning): tests cover the on-disk pinning
+/// pipeline end-to-end against a hand-rolled synthetic safetensors
+/// shard. We can't easily run against real K2.6 weights from a unit
+/// test (the model is ~480 GB on disk, hundreds of shards), so we
+/// build the smallest legal shard that has the six per-expert tensors
+/// for one (layer, expert) pair and verify pin/unpin accounting +
+/// idempotency + size probe.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build a tiny safetensors shard at `path` containing exactly the
+    /// six per-expert tensors for `(layer, expert)`. Each tensor is
+    /// filled with `byte_size` random-looking bytes — the actual
+    /// content doesn't matter, only the offsets and lengths. Returns
+    /// the per-tensor byte size so tests can compute expected totals.
+    fn write_test_shard(
+        path: &std::path::Path,
+        layer: u32,
+        expert: u32,
+        byte_size: usize,
+    ) -> usize {
+        let names = SafetensorsExpertSource::expert_tensor_names(layer, expert);
+        // Build a JSON header with `data_offsets` for each tensor.
+        let mut tensors_json = serde_json::Map::new();
+        for (i, name) in names.iter().enumerate() {
+            let start = i * byte_size;
+            let end = start + byte_size;
+            tensors_json.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": "U8",
+                    "shape": [byte_size],
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header = serde_json::Value::Object(tensors_json);
+        let header_bytes = serde_json::to_vec(&header).expect("json serialize");
+        let header_len = header_bytes.len() as u64;
+        let mut f = std::fs::File::create(path).expect("create test shard");
+        f.write_all(&header_len.to_le_bytes()).expect("write len");
+        f.write_all(&header_bytes).expect("write header");
+        // Now write `byte_size * 6` bytes of data.
+        let data = vec![0xABu8; byte_size * 6];
+        f.write_all(&data).expect("write data");
+        f.sync_all().expect("fsync");
+        byte_size
+    }
+
+    /// Build a minimal `model.safetensors.index.json` pointing every
+    /// per-expert tensor for (layer, expert) at the named shard.
+    fn write_test_index(dir: &std::path::Path, layer: u32, expert: u32, shard_name: &str) {
+        let names = SafetensorsExpertSource::expert_tensor_names(layer, expert);
+        let mut weight_map = serde_json::Map::new();
+        for name in names.iter() {
+            weight_map.insert(name.clone(), serde_json::Value::String(shard_name.into()));
+        }
+        let idx = serde_json::json!({
+            "metadata": {"total_size": 0},
+            "weight_map": serde_json::Value::Object(weight_map),
+        });
+        let p = dir.join("model.safetensors.index.json");
+        std::fs::write(&p, serde_json::to_vec_pretty(&idx).unwrap()).expect("write index");
+    }
+
+    #[test]
+    fn expert_tensor_names_six_entries_with_correct_template() {
+        let names = SafetensorsExpertSource::expert_tensor_names(7, 42);
+        assert_eq!(names.len(), 6);
+        // Verify the template (layer, expert) substitution matches the
+        // `expert()` path's enumeration.
+        assert_eq!(
+            names[0],
+            "language_model.model.layers.7.mlp.experts.42.gate_proj.weight_packed"
+        );
+        assert_eq!(
+            names[5],
+            "language_model.model.layers.7.mlp.experts.42.down_proj.weight_scale"
+        );
+    }
+
+    #[test]
+    fn expert_size_bytes_sums_six_tensor_lengths() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let shard_name = "model-00001-of-00001.safetensors";
+        let shard_path = tmp.path().join(shard_name);
+        let per_tensor_bytes = 256usize;
+        write_test_shard(&shard_path, 0, 0, per_tensor_bytes);
+        write_test_index(tmp.path(), 0, 0, shard_name);
+        let src = SafetensorsExpertSource::open(tmp.path()).expect("open source");
+        // 6 tensors × 256 B each = 1536 B.
+        assert_eq!(
+            src.expert_size_bytes(0, 0),
+            (per_tensor_bytes * 6) as u64,
+            "expert_size_bytes should sum the six tensor slice lengths"
+        );
+        // Missing expert → 0 (probe is safe to call on unknown ids).
+        assert_eq!(src.expert_size_bytes(0, 999), 0);
+    }
+
+    #[test]
+    fn pin_expert_then_unpin_round_trips_counters() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let shard_name = "model-00001-of-00001.safetensors";
+        let shard_path = tmp.path().join(shard_name);
+        // 4 KB per tensor — one page on most arches. Total per expert
+        // is 24 KB, well below any reasonable RLIMIT_MEMLOCK so the
+        // test is robust to environments where the limit isn't bumped.
+        let per_tensor_bytes = 4096usize;
+        write_test_shard(&shard_path, 1, 2, per_tensor_bytes);
+        write_test_index(tmp.path(), 1, 2, shard_name);
+        let src = SafetensorsExpertSource::open(tmp.path()).expect("open source");
+        assert_eq!(src.pinned_bytes(), 0);
+        assert_eq!(src.pinned_expert_count(), 0);
+
+        let bytes_pinned = src.pin_expert(1, 2);
+        // On environments where mlock is denied (low RLIMIT_MEMLOCK,
+        // restricted CI, etc.) the syscall may fail and we record 0.
+        // The test still asserts the accounting is consistent.
+        if bytes_pinned == 0 {
+            assert_eq!(src.pinned_bytes(), 0);
+            assert_eq!(src.pinned_expert_count(), 0);
+            return; // Can't test the success path here.
+        }
+        assert_eq!(
+            bytes_pinned,
+            per_tensor_bytes * 6,
+            "expected to pin all six tensors"
+        );
+        assert_eq!(src.pinned_bytes(), bytes_pinned as u64);
+        assert_eq!(src.pinned_expert_count(), 1);
+
+        // Idempotent: pinning the same expert again is a no-op and
+        // doesn't double-count.
+        let bytes_pinned_again = src.pin_expert(1, 2);
+        assert_eq!(bytes_pinned_again, 0);
+        assert_eq!(src.pinned_bytes(), bytes_pinned as u64);
+        assert_eq!(src.pinned_expert_count(), 1);
+
+        // Unpin: clears the counters back to zero.
+        let released = src.unpin_expert(1, 2);
+        assert!(released > 0, "unpin should return non-zero on success");
+        assert_eq!(src.pinned_bytes(), 0);
+        assert_eq!(src.pinned_expert_count(), 0);
+
+        // Unpinning an unpinned expert is a no-op.
+        let released_again = src.unpin_expert(1, 2);
+        assert_eq!(released_again, 0);
+        assert_eq!(src.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn unpin_all_releases_every_pinned_expert() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let shard_name = "model-00001-of-00001.safetensors";
+        let shard_path = tmp.path().join(shard_name);
+        let per_tensor_bytes = 4096usize;
+        // Three experts in the same layer; the index uses the same
+        // shard file but the test_shard writer covers only one expert
+        // — for unpin_all coverage we re-use the same tensor names by
+        // pinning different (layer, expert) pairs and tolerate that
+        // only one pair actually has weights. unpin_all should still
+        // be a no-op for the absent ones (skip), and clear the present one.
+        write_test_shard(&shard_path, 3, 5, per_tensor_bytes);
+        write_test_index(tmp.path(), 3, 5, shard_name);
+        let src = SafetensorsExpertSource::open(tmp.path()).expect("open source");
+        let pinned = src.pin_expert(3, 5);
+        if pinned == 0 {
+            // mlock denied in this env; can't exercise unpin_all here.
+            return;
+        }
+        // Try to pin a phantom expert — should be a no-op (no tensors
+        // in weight_map) and add nothing to the counter.
+        let phantom = src.pin_expert(3, 99);
+        assert_eq!(phantom, 0);
+        assert_eq!(src.pinned_expert_count(), 1);
+        let (n, released) = src.unpin_all_experts();
+        assert_eq!(n, 1);
+        assert_eq!(released, pinned as u64);
+        assert_eq!(src.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn pin_expert_with_unknown_id_returns_zero() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let shard_name = "model-00001-of-00001.safetensors";
+        let shard_path = tmp.path().join(shard_name);
+        write_test_shard(&shard_path, 0, 0, 64);
+        write_test_index(tmp.path(), 0, 0, shard_name);
+        let src = SafetensorsExpertSource::open(tmp.path()).expect("open source");
+        // Layer / expert pair that isn't in the index → all six lookups
+        // miss the weight_map and pin_expert reports zero without
+        // updating the counter.
+        let bytes = src.pin_expert(99, 99);
+        assert_eq!(bytes, 0);
+        assert_eq!(src.pinned_bytes(), 0);
+        assert_eq!(src.pinned_expert_count(), 0);
+    }
+
+    #[test]
+    fn rlimit_memlock_soft_returns_a_value_on_unix() {
+        #[cfg(unix)]
+        {
+            let lim = SafetensorsExpertSource::rlimit_memlock_soft();
+            assert!(lim.is_some(), "getrlimit(RLIMIT_MEMLOCK) should succeed");
+            // We don't assert a specific minimum — CI may run with the
+            // 64 KiB default on Linux; this just ensures the syscall
+            // wiring works.
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(SafetensorsExpertSource::rlimit_memlock_soft().is_none());
+        }
     }
 }

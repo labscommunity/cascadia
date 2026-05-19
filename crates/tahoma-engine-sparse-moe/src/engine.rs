@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream;
@@ -42,12 +42,74 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
-    /// Hot-expert buffer size (top-N hot experts packed contiguously
-    /// per layer). `0` disables the feature. See
-    /// `tahoma_engine_sparse_moe::hot_buffer` for the memory trade-off.
+    /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
+    /// token are dispatched per shell layer. Plumbed into Runner; effective
+    /// at every `forward_shells` call. Used by autolab campaign 004 (A3).
+    pub top_k_override: Option<u32>,
+    /// Skip experts whose router weight falls below this threshold (A2).
+    /// 0.0 / None = disabled. Applied AFTER top_k_override.
+    pub routing_threshold: Option<f32>,
+    /// autolab iter 047 (C1 better predictor): number of top-by-router-
+    /// score expert IDs to record per layer per token for next-token
+    /// prefetch prediction. Silently clamped to `[TOPK, 384]`. `None`
+    /// keeps the default (TOPK == 8, same-as-last-token = iter 033
+    /// behavior). N > TOPK pre-pages additional experts the next
+    /// token is likely to fire on K2.6's sigmoid-router distribution.
+    pub prefetch_n: Option<u32>,
+    /// autolab iter 054 (expert pinning): if `Some(n)`, after the
+    /// warmup window (default 16 decoded tokens) `mlock` the top-`n`
+    /// experts *per layer* by observed hit count so they never page
+    /// out. Composes with C1 prefetch — the prefetcher handles the
+    /// long-tail unpinned experts. Estimated cost ≈ n × num_layers ×
+    /// 21 MB; requires `RLIMIT_MEMLOCK` >= that on Unix (or root /
+    /// `prlimit --memlock=unlimited`). `None` = pinning off.
+    pub pin_top_n: Option<u32>,
+    /// autolab iter 054: override the warmup window before the first
+    /// pin pass fires. Default 16 decoded tokens (one sentence worth
+    /// of router decisions). 0 = pin on the first forward_shells call.
+    pub pin_after_tokens: Option<u32>,
+    /// autolab iter 056 (cache-aware dispatch): when `true`, reorder
+    /// the per-layer top-K dispatch loop in `forward_shells` by
+    /// descending `expert_hits[i]` (the same fire-count map iter 054
+    /// uses for pinning) so the hottest experts run first and stay
+    /// L3-resident across layers. Output is bit-identical to the
+    /// router-score order. Default `false` for back-compat.
+    pub cache_aware_dispatch: bool,
+    /// autolab iter 057 (async kernel scheduling — speculative
+    /// prefetch): if `Some(n)`, before each layer `i`'s expert
+    /// dispatch the runner submits `madvise(WILLNEED)` for the
+    /// top-`n` hit-frequent experts of layer `i + 1` (looked up via
+    /// `expert_hits[i + 1]`). The OS pages those experts in while
+    /// layer `i`'s ~150 ms expert dispatch is on the critical path,
+    /// so layer `i + 1`'s router fires with the page-cache miss bill
+    /// already paid. Composes with iter 047 (the iter 047 predictor
+    /// races a fresh-token-wide prefetch against layer 0's router,
+    /// ~5 ms; iter 057 races a per-layer prefetch against the much
+    /// longer expert FFN window, ~150 ms). Output is bit-identical;
+    /// only readahead-bandwidth is spent. Default `None` (off).
+    pub speculative_prefetch_n: Option<u32>,
+    /// autolab iter 065 (prefill-hint static schedule): merge weight
+    /// for folding the per-prompt prefill expert-firing distribution
+    /// into `expert_hits` at the end of prefill. `None` / `Some(0.0)`
+    /// (default) disables the hint — prefill bumps `expert_hits`
+    /// directly (iter 054 behavior). `Some(w)` with `w > 0.0` records
+    /// prefill firings into a separate map and merges them with
+    /// `round(w * obs_count)` at end-of-prefill, seeding iter 054
+    /// pin-top-N, iter 056 cache-aware dispatch, and iter 057
+    /// speculative next-layer prefetch from the very first decode
+    /// token. Reasonable starting point: `0.5` — half-weights the
+    /// prompt prior so decode-time firings still dominate over a
+    /// short window. Output is unaffected; only the schedule changes.
+    /// See autolab campaign 065.
+    pub prefill_hint_weight: Option<f32>,
+    /// autolab iter 069 (hot-expert buffer): hot-expert buffer size
+    /// (top-N hot experts packed contiguously per layer). `0` disables
+    /// the feature. See `tahoma_engine_sparse_moe::hot_buffer` for the
+    /// memory trade-off.
     pub hot_expert_buffer_n: u32,
-    /// Number of dispatches to record before building the hot buffer.
-    /// Defaults to 1500 (about 3 tokens at top_k=8, 60 layers).
+    /// autolab iter 069: number of dispatches to record before building
+    /// the hot buffer. Defaults to 1500 (about 3 tokens at top_k=8,
+    /// 60 layers).
     pub hot_expert_warmup_dispatches: u64,
 }
 
@@ -60,6 +122,14 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            top_k_override: None,
+            routing_threshold: None,
+            prefetch_n: None,
+            pin_top_n: None,
+            pin_after_tokens: None,
+            cache_aware_dispatch: false,
+            speculative_prefetch_n: None,
+            prefill_hint_weight: None,
             hot_expert_buffer_n: 0,
             hot_expert_warmup_dispatches: 1500,
         }
@@ -240,7 +310,7 @@ impl Builder for SparseMoEBuilder {
             Ok(r)
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -249,6 +319,47 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        // autolab campaign 004 (A3): plumb the top-K override into the runner
+        // so per-token forward_shells dispatches only k' experts.
+        runner.set_top_k_override(self.config.top_k_override);
+        // autolab campaign 007 (A2): plumb the routing-weight threshold so
+        // forward_shells skips experts below the threshold per token.
+        runner.set_routing_threshold(self.config.routing_threshold);
+        // autolab iter 047 (C1 better predictor): plumb the prefetch
+        // width so the C1 prefetcher gets the top-N expert ids per
+        // layer per token instead of just the actually-fired TOPK.
+        runner.set_prefetch_n(self.config.prefetch_n);
+        // autolab iter 054 (expert pinning): plumb the pin-top-N and
+        // optional warmup-window override. set_pin_top_n only stores
+        // the target N + emits the RLIMIT_MEMLOCK pre-flight; the
+        // actual pin pass fires from inside forward_shells after the
+        // warmup window has accumulated hit data.
+        if let Some(n) = self.config.pin_after_tokens {
+            runner.set_pin_after_tokens(n);
+        }
+        runner.set_pin_top_n(self.config.pin_top_n);
+        // autolab iter 056 (cache-aware dispatch): toggle the per-layer
+        // dispatch reorder. Off by default for back-compat with iter
+        // 047/054 baselines; on with `--cache-aware-dispatch`.
+        runner.set_cache_aware_dispatch(self.config.cache_aware_dispatch);
+        // autolab iter 057 (async kernel scheduling — speculative
+        // prefetch): wire the per-layer top-N hit-frequent expert
+        // prefetch into the runner. `None` keeps iter 056 behavior;
+        // `Some(n)` arms the scheduler to fire from inside the layer
+        // loop. The scheduler is a no-op until `expert_hits[i+1]`
+        // accumulates data — so by construction bit-identical to iter
+        // 056 on the very first per-prompt token.
+        runner.set_speculative_prefetch_n(self.config.speculative_prefetch_n);
+        // autolab iter 065 (prefill-hint static schedule): plumb the
+        // merge weight. `None` / `Some(0.0)` keeps iter 057 behavior
+        // (prefill bumps `expert_hits` directly). `Some(w > 0.0)`
+        // diverts prefill firings into a per-prompt observation map
+        // and folds them into `expert_hits` with weight `w` at the
+        // end of prefill, so decode iter #1 sees iter 054 / 056 / 057
+        // already shaped by the prompt's actual routing.
+        if let Some(w) = self.config.prefill_hint_weight {
+            runner.set_prefill_hint_weight(w);
+        }
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
@@ -626,17 +737,43 @@ impl SparseMoEEngine {
 
         // Prefill: feed each prompt token; the very last response from
         // last-rank becomes the first generated token.
+        //
+        // iter 065 (prefill-hint static schedule): bracket the prefill
+        // loop on this (rank-0) runner so its slice's per-prompt prefill
+        // firings get diverted to `prefill_expert_observations` and
+        // merged into `expert_hits` at end-of-prefill. **The downstream
+        // workers do NOT see this bracket today** — the wire protocol
+        // currently has no Prefill/Decode tag, so their forward_shells
+        // bumps `expert_hits` directly (iter 054 behavior) on prefill
+        // as well as decode. Threading a Prefill/Decode frame through
+        // `tahoma-transport` is a follow-up; the rank-0 wiring is
+        // enough to validate the hint plumbing end-to-end in
+        // single-stage mode, which is the killer-demo target. No-op
+        // when the hint is disabled.
         info!(
             prompt_len = prompt_ids.len(),
             "prefill (token-by-token, distributed)"
         );
+        self.runner.enter_prefill();
+        let mut prefill_exit_fired = false;
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
-            let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
-                .map_err(|e| format!("prefill step {i}: {e}"))?;
+            let token_back = match self.forward_one_token_first(&history, cfg, downstream) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Make sure the in-prefill gate clears on error so
+                    // the next prompt isn't accidentally still in
+                    // prefill mode.
+                    if !prefill_exit_fired {
+                        self.runner.exit_prefill_and_merge_hints();
+                    }
+                    return Err(format!("prefill step {i}: {e}"));
+                }
+            };
             if i + 1 == prompt_ids.len() {
                 // Last prefill step: this is the first generated token.
+                self.runner.exit_prefill_and_merge_hints();
+                prefill_exit_fired = true;
                 if eos.contains(&token_back) {
                     return Ok(generated);
                 }
@@ -645,6 +782,11 @@ impl SparseMoEEngine {
             }
             // Otherwise discard (intermediate prefill samples are stale).
             let _ = token_back;
+        }
+        if !prefill_exit_fired {
+            // Empty prompt: nothing was forwarded, but we still want
+            // the in-prefill gate cleared.
+            self.runner.exit_prefill_and_merge_hints();
         }
 
         // Decode loop.
@@ -694,7 +836,9 @@ impl SparseMoEEngine {
             .map_err(|e| format!("forward_shells: {e}"))?;
 
         // Send hidden downstream and wait for token to come back.
-        self.block_on(async {
+        // autolab/k26-perf q1 instrumentation: split timing of send vs round-trip.
+        let wire_t0 = Instant::now();
+        let result = self.block_on(async {
             send_forward(
                 downstream,
                 past_seq_len,
@@ -704,18 +848,33 @@ impl SparseMoEEngine {
             )
             .await
             .map_err(|e| format!("send_forward: {e}"))?;
+            let send_done_us = wire_t0.elapsed().as_micros() as u64;
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => {
                     let token = recv_token_body_client(downstream)
                         .await
                         .map_err(|e| format!("recv_token: {e}"))?;
-                    Ok(token)
+                    Ok((token, send_done_us))
                 }
                 Ok(Some(other)) => Err(format!("unexpected frame after forward: {other:?}")),
                 Ok(None) => Err("downstream closed during recv_kind".into()),
                 Err(e) => Err(format!("recv_kind: {e}")),
             }
-        })
+        });
+        match result {
+            Ok((token, send_done_us)) => {
+                let total_wire_us = wire_t0.elapsed().as_micros() as u64;
+                info!(
+                    stage = "rank0_wire",
+                    send_done_us,
+                    total_wire_us,
+                    downstream_compute_us = total_wire_us.saturating_sub(send_done_us),
+                    "stage_timing"
+                );
+                Ok(token)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Worker step: process exactly one frame from upstream and emit

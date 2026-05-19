@@ -2358,11 +2358,14 @@ name = "tahoma-int4-gemm"
 version = "0.1.0"
 dependencies = [
  "half",
+ "libc",
  "memmap2",
  "parking_lot",
  "rayon",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

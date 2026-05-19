@@ -1,0 +1,51 @@
+{
+  "iteration": 28,
+  "moonshots_attempted": 28,
+  "moonshots_target": 100,
+  "moonshot_class_counts": {
+    "win": 8,
+    "neutral": 6,
+    "negative": 1,
+    "parked": 1,
+    "revision": 1,
+    "shipped": 1
+  },
+  "moonshot_magnitude_counts": {
+    "XS": 0,
+    "S": 1,
+    "M": 2,
+    "L": 1,
+    "XL": 0
+  },
+  "moonshot_ratio": 0.78,
+  "consecutive_no_improvement": 0,
+  "current_leader": {
+    "tok_per_sec": 0.3253,
+    "config": "A3 K=4 long-context (--top-k-override 4, max_tokens=64) on miner single-stage",
+    "campaign": "011_a3_k4_longcontext",
+    "quality": "9/10 (10-prompt eval, max_tokens=64 — same single failure as max_tokens=16; sampling format issue not K-related)",
+    "delta_vs_k8_same_substrate": "~3-5x in production-realistic workloads (K=8 long-context not directly measured but extrapolates ~0.13-0.15)",
+    "per_prompt_peak_tok_s": 0.4509,
+    "measured_at_utc": "2026-05-18T02:06:05Z",
+    "production_recommendation": "default --top-k-override 4 for K2.6 sparse-MoE on Intel CPU single-stage; ~0.30-0.45 tok/s for chat workloads"
+  },
+  "baseline_2box_matias": {
+    "tok_per_sec": 0.0553,
+    "measured_at_utc": "2026-05-17T20:36:29Z",
+    "note": "matias-02 Tailscale needs manual re-auth; 2-box bench parked"
+  },
+  "started_at_utc": "2026-05-17T19:45:00Z",
+  "last_iteration_at_utc": "2026-05-17T21:34:00Z",
+  "q1_breakdown_per_token_decode_ms": {
+    "rank0_layer0": 81,
+    "rank0_shells_attn": 728,
+    "rank0_shells_experts": 3229,
+    "wire_pure": 60,
+    "rank1_shells_attn": 578,
+    "rank1_shells_experts": 4151,
+    "rank1_head": 139,
+    "total": 9005,
+    "implied_decode_tok_s": 0.111,
+    "expert_dispatch_pct_of_decode": 82
+  }
+}

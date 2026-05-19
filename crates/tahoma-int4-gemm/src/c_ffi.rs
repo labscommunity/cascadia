@@ -204,7 +204,26 @@ pub unsafe extern "C" fn tahoma_int4_destroy_shell_int4(h: *mut TahomaShellInt4)
     drop(Box::from_raw(h));
 }
 
+/// Convert one f32 to bf16 bits, round-to-nearest-even. Used to bridge
+/// the C-FFI's legacy f32 KV inputs into the inner Rust kernel's
+/// bf16-as-u16 layout (autolab campaign 029 / A8).
+#[inline]
+fn f32_to_bf16_bits_ffi(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
 /// Run int4 shell forward.
+///
+/// **autolab campaign 029 (A8):** The inner Rust kernel now uses
+/// bf16-as-u16 for past_k/past_v. To preserve this C-FFI's ABI
+/// (Python harness passes f32 KV), we convert the f32 inputs into a
+/// transient bf16 staging buffer before the call. Net effect for FFI
+/// callers: no source change required, slightly more work per call.
 #[no_mangle]
 pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
     shell: *mut TahomaShellInt4,
@@ -225,8 +244,10 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
     }
     let s = &(*shell).inner;
     let x = std::slice::from_raw_parts(x_f32, SHELL_HIDDEN);
-    let pk = std::slice::from_raw_parts(past_k, NUM_HEADS * past_seq_len * QK_HEAD_DIM);
-    let pv = std::slice::from_raw_parts(past_v, NUM_HEADS * past_seq_len * V_HEAD_DIM);
+    let pk_f = std::slice::from_raw_parts(past_k, NUM_HEADS * past_seq_len * QK_HEAD_DIM);
+    let pv_f = std::slice::from_raw_parts(past_v, NUM_HEADS * past_seq_len * V_HEAD_DIM);
+    let pk_bf: Vec<u16> = pk_f.iter().map(|&v| f32_to_bf16_bits_ffi(v)).collect();
+    let pv_bf: Vec<u16> = pv_f.iter().map(|&v| f32_to_bf16_bits_ffi(v)).collect();
     let ShellOutputs {
         attn_out_post_norm,
         attn_residual,
@@ -235,7 +256,10 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
         routing_weights,
         present_k,
         present_v,
-    } = crate::shell_int4::shell_forward_decode_int4(s, x, pk, pv, past_seq_len);
+        // C ABI doesn't expose top-N prediction. Internal Rust callers
+        // use `shell_forward_decode_int4_predict_n` instead.
+        predicted_top_n_ids: _,
+    } = crate::shell_int4::shell_forward_decode_int4(s, x, &pk_bf, &pv_bf, past_seq_len);
     std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)
         .copy_from_slice(&attn_out_post_norm);
     std::slice::from_raw_parts_mut(out_residual, SHELL_HIDDEN).copy_from_slice(&attn_residual);
@@ -279,6 +303,8 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward(
         routing_weights,
         present_k,
         present_v,
+        // bf16 reference path always leaves this empty.
+        predicted_top_n_ids: _,
     } = shell_forward_decode(s, x, pk, pv, past_seq_len);
 
     std::slice::from_raw_parts_mut(out_post_norm, SHELL_HIDDEN)

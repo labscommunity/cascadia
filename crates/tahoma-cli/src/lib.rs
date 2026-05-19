@@ -132,6 +132,130 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
 
+    /// Override the MoE top-K dispatch (sparse-moe engine only).
+    /// If set and < manifest top_k, dispatch only the first K' experts
+    /// per token. Lower K' = fewer expert FFN calls = faster decode
+    /// at some quality cost. K2.6 manifest default is 8. Sigmoid
+    /// routers (K2.6 / DeepSeek-V3) tolerate K' down to 4-6 with
+    /// minimal quality loss; see autolab campaign 004.
+    #[arg(long)]
+    pub top_k_override: Option<u32>,
+
+    /// Skip experts whose router weight falls below this threshold
+    /// (sparse-moe engine only). 0.0 = disabled. Applied after
+    /// top_k_override, so the effective set is the routed top-K whose
+    /// routing weight >= threshold. Variant of A3, lit-supported as
+    /// outperforming fixed-K reduction for sigmoid routers. See
+    /// autolab campaign 007.
+    #[arg(long)]
+    pub routing_threshold: Option<f32>,
+
+    /// C1 expert prefetch width: number of top-by-router-score experts
+    /// to record per layer per token for the next-token prefetcher
+    /// (sparse-moe engine only). Default = manifest top_k (= 8 on
+    /// K2.6), which is the iter 033 same-as-last-token predictor.
+    /// Values > 8 widen the prediction net: the actually-fired top-8
+    /// stay in (no quality change), the extra N - 8 are insurance
+    /// experts pre-paged in case the next token's routing shifts.
+    /// Clamped to `[manifest.top_k, 384]`. Wider N = more
+    /// `madvise(WILLNEED)` calls + more page-cache churn but higher
+    /// hit-rate. See autolab campaign 047.
+    #[arg(long)]
+    pub prefetch_n: Option<u32>,
+
+    /// Expert pinning top-N per layer (sparse-moe engine only): after
+    /// a brief warmup window the runner identifies the top-N most-
+    /// frequently-fired experts per layer (by hit count) and pins them
+    /// via `mlock` (Unix) / `VirtualLock` (Windows) so they can never
+    /// page out under memory pressure. Composes with `--prefetch-n` —
+    /// pinning protects the hot-set, prefetch hides page-in latency for
+    /// the cold tail. K2.6 expert distribution is heavy-tailed: pinning
+    /// the top 10% (N = 38 of 384) per layer covers ~80% of dispatches
+    /// at ~47 GB total (well within miner's 133 GB). Default = pinning
+    /// off. **Requires `ulimit -l unlimited` on Linux** (default 64
+    /// KiB ⇒ all pins fail silently; runner logs a warn at startup).
+    /// See autolab campaign 054.
+    #[arg(long)]
+    pub pin_top_n: Option<u32>,
+
+    /// Override the pin-warmup window (sparse-moe engine only): number
+    /// of decoded tokens to accumulate hit data before the first pin
+    /// pass fires. Default 16 ≈ one sentence of router decisions.
+    /// 0 = pin on the very first forward_shells call. Higher = more
+    /// accurate top-N selection at the cost of N more disk-bound
+    /// tokens. Only meaningful with `--pin-top-n`.
+    #[arg(long)]
+    pub pin_after_tokens: Option<u32>,
+
+    /// Cache-aware dispatch order (sparse-moe engine only): reorder
+    /// the per-layer top-K dispatch loop in `forward_shells` by
+    /// descending observed `expert_hits` count so the hottest experts
+    /// run first and stay L3-resident across the next layer's
+    /// dispatch. The OUTPUT is bit-identical to the default router-
+    /// score order — only the `dispatch_expert` *call order* changes
+    /// (router weights are still summed in the original index order).
+    /// Composes with iter 047 (better predictor warms RAM) and iter
+    /// 054 (pinning protects the hot-set); iter 056 warms L3 inside
+    /// each layer's dispatch. Default off — turn on with
+    /// `--cache-aware-dispatch`. See autolab campaign 056.
+    #[arg(long, default_value_t = false)]
+    pub cache_aware_dispatch: bool,
+
+    /// Async kernel scheduling: speculative prefetch of layer N+1's
+    /// top-N hit-frequent experts (sparse-moe engine only). Before
+    /// each layer i's ~150 ms expert dispatch begins, the runner
+    /// submits `madvise(WILLNEED)` for the top-N most-frequently-
+    /// fired experts on layer i+1 (looked up via the iter 054
+    /// `expert_hits` histogram). The OS readahead races the next
+    /// layer's expert weights into the page cache during the long
+    /// expert-FFN window, so by the time layer i+1's router fires
+    /// the page-miss bill is already paid.
+    ///
+    /// Composes with `--prefetch-n` (iter 047 whole-token predictor
+    /// fires once per token against the ~5 ms layer-0 router; iter
+    /// 057 fires per-layer against the ~150 ms expert-FFN window).
+    /// Composes with `--pin-top-n` (pinned hot-set is immune to
+    /// eviction, so the speculative prefetch's hot-set requests are
+    /// trivial no-ops on already-paged-in pages and the bandwidth is
+    /// spent on the cold tail). Composes with `--cache-aware-dispatch`
+    /// (the iter 056 reorder runs experts hot-first within a layer;
+    /// iter 057 cross-layer prefetch maximises the chance the next
+    /// layer's hot prefix is L3-warm as well as RAM-resident).
+    ///
+    /// Default off; `--speculative-prefetch 16` is a reasonable
+    /// starting point for A/B against the iter 056 baseline. Output
+    /// is bit-identical — wrong guesses waste OS readahead bandwidth
+    /// but cannot affect tokens. See autolab campaign 057.
+    #[arg(long)]
+    pub speculative_prefetch: Option<u32>,
+
+    /// Prefill-hint static schedule (sparse-moe engine only): observe
+    /// which experts fire per layer during prefill, then fold that
+    /// observation into the `expert_hits` map used by iter 054
+    /// (pin-top-N), iter 056 (cache-aware dispatch), and iter 057
+    /// (speculative next-layer prefetch). With a non-zero weight,
+    /// decode iteration #1 sees an `expert_hits` map already shaped
+    /// by the prompt's actually-fired routing distribution — a
+    /// stronger prior than the empty / cold map decode #1 sees today.
+    ///
+    /// Mechanics: during prefill the per-expert hit bumps are diverted
+    /// from `expert_hits` into a per-prompt observation buffer. At the
+    /// end of prefill the observations are merged into `expert_hits`
+    /// as `expert_hits[i][eid] += round(W * obs_count)`. Setting
+    /// `W = 0.0` (default) **disables the hint path entirely** —
+    /// prefill bumps `expert_hits` directly (iter 054 behavior). The
+    /// observation buffer is cleared on every prompt reset so each
+    /// prompt's prior is independent.
+    ///
+    /// Reasonable starting points: `0.5` (half-weight the prompt
+    /// prior; decode firings will still dominate within ~16 decode
+    /// tokens), `1.0` (match today's iter 054 prefill weighting but
+    /// expose it as a knob for A/B), `2.0` (over-weight the prior
+    /// for continuation-heavy tasks where prompt and decode share
+    /// vocabulary). Default 0.0 (off). See autolab campaign 065.
+    #[arg(long, default_value_t = 0.0)]
+    pub prefill_hint_weight: f32,
+
     /// Hot-expert buffer size (sparse-moe only): pack the top-N
     /// most-frequently-fired experts per layer into a contiguous
     /// owned buffer for L3-friendly dispatch. `0` (default) disables.
@@ -333,6 +457,23 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
+            cfg.top_k_override = args.top_k_override;
+            cfg.routing_threshold = args.routing_threshold;
+            cfg.prefetch_n = args.prefetch_n;
+            cfg.pin_top_n = args.pin_top_n;
+            cfg.pin_after_tokens = args.pin_after_tokens;
+            cfg.cache_aware_dispatch = args.cache_aware_dispatch;
+            cfg.speculative_prefetch_n = args.speculative_prefetch;
+            // iter 065 (prefill-hint static schedule): plumb the merge
+            // weight. CLI default 0.0 disables the hint (back-compat
+            // with iter 057). Map 0.0 to `None` so the engine config
+            // matches the "no override" semantics it already uses for
+            // pin / prefetch params.
+            cfg.prefill_hint_weight = if args.prefill_hint_weight > 0.0 {
+                Some(args.prefill_hint_weight)
+            } else {
+                None
+            };
             if args.hot_expert_buffer_n > 0 {
                 cfg = cfg.with_hot_expert_buffer(
                     args.hot_expert_buffer_n,
