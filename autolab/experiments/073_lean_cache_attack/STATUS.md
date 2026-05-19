@@ -58,7 +58,7 @@ after an 8-token warmup window.
 | 073-A pin only                                    | 0.1492 | 10/10 | -6.0%  | hit-rate 43.5%, pinned 22.7 GB |
 | 073-B pin + cache-aware dispatch                  | 0.1477 | 10/10 | -6.9%  | reorder neutral, same hit-rate 43.5% as A |
 | 073-C pin + dispatch + hot-buffer                 | 0.1386 | 10/10 | -12.7% | hot-buffer 11.3 GB + pin 22.7 GB = 34 GB held; cold-tail page-cache budget shrinks |
-| 073-D pin + dispatch + hot-buffer + light prefetch | TBD    | TBD   | TBD    | |
+| 073-D pin + dispatch + hot-buffer + light prefetch | 0.1368 | 10/10 | -13.8% | --prefetch-n 8 == default (TOPK), so effectively same as C; -1.3% noise |
 | 073-E pin + dispatch + hot-buffer + prefill-hint  | TBD    | TBD   | TBD    | |
 
 ## Conclusion
