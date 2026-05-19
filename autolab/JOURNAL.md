@@ -73,6 +73,67 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 059 — Continuous batching skeleton — Option (A) shipped + 4 blockers documented (2026-05-18 ~20:25 PT)
+
+Foundation for multi-request serving. Branch
+`perf/continuous-batching-059` @ `681df02`. New module
+`batcher.rs` (661 LOC incl tests + docs). Single-file additive
+change — `Engine::step` not touched, single-request + pipeline-
+parallel paths untouched, 28 existing sparse-MoE tests still pass.
+
+**Public API:**
+- `ContinuousBatcher { max_slots, slots, pending, prefill_chunk }`
+- `RequestSlot { task_id, prompt_ids, generated, past_seq_len,
+  max_new, sampling, phase }`
+- `SlotPhase = Prefill | Decode | Done { eos }`
+- `BatchPlan { slots: Vec<PlannedSlot> }`
+- `PlannedSlot { slot_idx, input_ids, past_seq_len, sampling,
+  sample_this_step }`
+- `StepOutcome { sampled: Option<i64> }`
+- Methods: `new`, `submit`, `plan_step`, `commit_step`, `gc`,
+  `active_count`, `pending_count`, `slot`
+
+**Lifecycle contract:** caller's engine would call `plan_step()` →
+run batched forward over `plan.slots` → call `commit_step()` with
+sampled tokens → call `gc()` to free Done slots → repeat.
+
+**Tests (7 new, all pass):** N=2 batch-assembly with different
+prompt lengths proving independent past_seq_len advance; EOS-frees-
+slot-and-promotes-pending; max_new termination; duplicate-submit
+rejection; idle empty plan; hard-cap enforcement.
+
+**4 blockers documented in module doc (the keystone follow-ups):**
+1. **KV-cache layout** — `LayerState` today owns one shared
+   `[NUM_HEADS, capacity, HEAD_DIM]` buffer + one `past_seq_len`.
+   Batching N requests needs either padded slab (simpler, wastes
+   memory) or vLLM-style paged-attention with block table
+   (efficient, big refactor). Deserves its own PR.
+2. **Shell forward signature** — `shell_forward_decode_int4_with_
+   capacity` is hard-coded `seq=1`. iter 048's
+   `forward_shells_multi` and iter 051's
+   `forward_shells_multi_batched_experts` are on `autolab/k26-perf`
+   but NOT merged to main yet. Skeleton is designed so batched-
+   shells primitive can land separately.
+3. **Per-request sampling state** — last rank holds one
+   `last_rank_history` + one `last_rank_rng`. Needs N of each,
+   keyed by slot id. Embarrassingly parallel.
+4. **API/runner admission control** — `tahoma-api` serializes
+   behind `Semaphore`, runner grabs engine mutex per `step()`.
+   Continuous batching contract requires API → batcher direct +
+   batcher demuxes SSE chunks. Touches `tahoma-api/src/lib.rs`,
+   `tahoma-runner/src/lib.rs`, `Engine` trait.
+
+**Honest (A) scope (labeled in module docstring, commit body, here):**
+`ContinuousBatcher::plan_step()` returns valid `BatchPlan`s for
+state-machine purposes but nothing in engine consumes them yet. The
+keystone follow-up PR would land
+`Runner::step_batch(plan: &BatchPlan) -> Vec<StepOutcome>` that
+uses (or introduces) a multi-request shell forward.
+
+**Workspace:** fmt clean, no new clippy warnings.
+
+---
+
 ## 058 — Int4 embedding quantization — IMPL SHIPPED, real-model quality eval pending (2026-05-18 ~20:10 PT)
 
 Branch `perf/int4-embedding-058` @ `d23d7c5`. Path (B) — working
