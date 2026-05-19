@@ -42,8 +42,10 @@ pub mod manifest;
 pub mod runner;
 pub mod sampling;
 pub mod tensors;
+pub mod tokenizer_cache;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use manifest::Manifest;
 pub use runner::{Runner, RunnerError};
 pub use sampling::SamplingConfig;
+pub use tokenizer_cache::{fingerprint_bytes, TokenizerCache, TokenizerFingerprint};

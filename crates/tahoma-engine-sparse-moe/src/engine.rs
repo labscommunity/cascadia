@@ -31,6 +31,7 @@ use crate::dist::{
     StageTransport,
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
+use crate::tokenizer_cache::{fingerprint_bytes, TokenizerCache, TokenizerFingerprint};
 
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
@@ -42,6 +43,13 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Capacity of the prompt → token-ids cache. `0` disables the
+    /// cache (default; pre-iter-086 behavior). Realistic settings are
+    /// 8..128 — at ~5..20 ms saved per repeated prompt and ~1 KiB of
+    /// key storage per entry, this is one of the cheaper wins in
+    /// the chat-completion path. See [`crate::tokenizer_cache`] for
+    /// the full design.
+    pub tokenizer_cache_size: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,6 +61,7 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            tokenizer_cache_size: 0,
         }
     }
 
@@ -61,12 +70,23 @@ impl SparseMoEBuilderConfig {
         self.total = total;
         self
     }
+
+    /// Set the tokenizer-cache size. `0` (default) disables the cache.
+    pub fn with_tokenizer_cache_size(mut self, n: u32) -> Self {
+        self.tokenizer_cache_size = n;
+        self
+    }
 }
 
 pub struct SparseMoEBuilder {
     pub config: SparseMoEBuilderConfig,
     runner: Option<Runner>,
     tokenizer: Option<Tokenizer>,
+    /// 64-bit digest of the loaded `tokenizer.json` bytes. `None`
+    /// when the tokenizer is absent (worker ranks, or models without
+    /// a tokenizer.json). Stamped into every [`TokenizerCache`] key so
+    /// stale entries can't survive a model swap.
+    tokenizer_fingerprint: Option<TokenizerFingerprint>,
     listen_host: String,
     listen_port: Option<u16>,
     transport: StageTransport,
@@ -78,6 +98,7 @@ impl SparseMoEBuilder {
             config,
             runner: None,
             tokenizer: None,
+            tokenizer_fingerprint: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
             transport: StageTransport::default(),
@@ -233,8 +254,24 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 {
             let tok_path = self.config.model_dir.join("tokenizer.json");
             if tok_path.exists() {
-                let t = Tokenizer::from_file(&tok_path)
-                    .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?;
+                // Read raw bytes first so we can fingerprint them
+                // before handing the file to the tokenizer constructor.
+                // The fingerprint is stamped into every TokenizerCache
+                // key so cached entries are silently invalidated when
+                // the model is reloaded against a different
+                // tokenizer.json. We fingerprint the raw bytes (not the
+                // parsed `Tokenizer` struct) so config-only diffs that
+                // change tokenization (added merges, altered
+                // pre-tokenizer regex, etc.) are caught.
+                let tok_bytes = std::fs::read(&tok_path).map_err(|e| {
+                    EngineError::Backend(format!(
+                        "read tokenizer.json at {}: {e}",
+                        tok_path.display()
+                    ))
+                })?;
+                self.tokenizer_fingerprint = Some(fingerprint_bytes(&tok_bytes));
+                let t = Tokenizer::from_bytes(&tok_bytes)
+                    .map_err(|e| EngineError::Backend(format!("parse tokenizer.json: {e}")))?;
                 self.tokenizer = Some(t);
             } else {
                 warn!(
@@ -259,9 +296,27 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 && self.tokenizer.is_none() {
             return Err(EngineError::Backend("tokenizer.json missing".into()));
         }
+        // Tokenizer cache is rank-0-only (only rank 0 ever runs encode).
+        // Worker ranks construct it with capacity=0 so the field is
+        // always present but inert — keeps the struct layout uniform.
+        let tokenizer_cache_size = if rank == 0 {
+            self.config.tokenizer_cache_size as usize
+        } else {
+            0
+        };
+        let tokenizer_cache = TokenizerCache::new(tokenizer_cache_size);
+        if tokenizer_cache.enabled() {
+            info!(
+                capacity = tokenizer_cache.capacity(),
+                fingerprint = ?self.tokenizer_fingerprint,
+                "tokenizer cache enabled"
+            );
+        }
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
+            tokenizer_fingerprint: self.tokenizer_fingerprint,
+            tokenizer_cache,
             pending: VecDeque::new(),
             peer_disconnected: false,
             transport: self.transport,
@@ -337,6 +392,18 @@ const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 pub struct SparseMoEEngine {
     runner: Runner,
     tokenizer: Option<Tokenizer>,
+    /// 64-bit digest of the loaded tokenizer.json bytes; `None` if no
+    /// tokenizer was loaded (worker ranks, or models without a
+    /// tokenizer.json). Used as part of every cache key so reloading
+    /// the engine against a different model invalidates the cache
+    /// without an explicit clear.
+    tokenizer_fingerprint: Option<TokenizerFingerprint>,
+    /// LRU `(prompt, add_special_tokens, fingerprint) → token_ids`
+    /// cache. Disabled (capacity = 0) when
+    /// `SparseMoEBuilderConfig::tokenizer_cache_size` is 0 — the
+    /// default. Workers always have an inert (capacity-0) cache so the
+    /// field is always present but does nothing.
+    tokenizer_cache: TokenizerCache,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
     runtime_handle: tokio::runtime::Handle,
@@ -374,6 +441,57 @@ impl SparseMoEEngine {
 
     fn is_last(&self) -> bool {
         self.transport.is_last()
+    }
+
+    /// Encode `prompt` with `tokenizer.encode(prompt, add_special_tokens)`,
+    /// going through the [`TokenizerCache`] when one is enabled.
+    ///
+    /// Returns the token IDs as `Vec<i64>` so callers can pass them
+    /// straight into the runner without a second conversion. On cache
+    /// hit we just clone the cached `Vec<u32>` and widen; on miss we
+    /// encode, insert into the cache (under the engine's tokenizer
+    /// fingerprint), and return the result.
+    ///
+    /// Returns `Err` if no tokenizer is loaded or the encode fails —
+    /// the cache itself can never fail.
+    fn encode_cached(
+        &mut self,
+        prompt: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<i64>, String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "no tokenizer loaded".to_string())?;
+        // Cache hits require a fingerprint to be in scope. Worker ranks
+        // never reach this code path (only rank 0 calls encode), and
+        // rank 0 always has a fingerprint by the time `build()` finishes
+        // (or `build()` would have errored on missing tokenizer.json).
+        // If `tokenizer_fingerprint` is somehow None we just skip the
+        // cache — a missed optimization is much better than corrupting
+        // requests.
+        if let Some(fp) = self.tokenizer_fingerprint {
+            if let Some(ids_u32) = self.tokenizer_cache.get(prompt, add_special_tokens, fp) {
+                return Ok(ids_u32.into_iter().map(|u| u as i64).collect());
+            }
+            let enc = tokenizer
+                .encode(prompt, add_special_tokens)
+                .map_err(|e| e.to_string())?;
+            let ids_u32: Vec<u32> = enc.get_ids().to_vec();
+            self.tokenizer_cache.insert(
+                prompt.to_string(),
+                add_special_tokens,
+                fp,
+                ids_u32.clone(),
+            );
+            Ok(ids_u32.into_iter().map(|u| u as i64).collect())
+        } else {
+            // No fingerprint -> straight encode, no caching.
+            let enc = tokenizer
+                .encode(prompt, add_special_tokens)
+                .map_err(|e| e.to_string())?;
+            Ok(enc.get_ids().iter().map(|&u| u as i64).collect())
+        }
     }
 }
 
@@ -456,17 +574,14 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t,
-            None => {
-                warn!(task = %task.task_id, "single-stage engine has no tokenizer");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                return vec![(task.task_id, final_chunk)];
-            }
-        };
+        if self.tokenizer.is_none() {
+            warn!(task = %task.task_id, "single-stage engine has no tokenizer");
+            let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+            return vec![(task.task_id, final_chunk)];
+        }
         let started = std::time::Instant::now();
-        let prompt_ids: Vec<i64> = match tokenizer.encode(task.prompt.as_str(), true) {
-            Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
+        let prompt_ids: Vec<i64> = match self.encode_cached(task.prompt.as_str(), true) {
+            Ok(ids) => ids,
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
                 let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
@@ -485,6 +600,10 @@ impl SparseMoEEngine {
         };
         let n_tokens = generated.len() as u32;
         let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            warn!("tokenizer disappeared mid-task");
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        };
         let mut text = tokenizer
             .decode(&ids_u32, true)
             .unwrap_or_else(|_| String::new());
@@ -497,6 +616,8 @@ impl SparseMoEEngine {
             tokens = n_tokens,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            cache_hits = self.tokenizer_cache.hits(),
+            cache_misses = self.tokenizer_cache.misses(),
             "task done (single-stage)"
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
@@ -512,17 +633,15 @@ impl SparseMoEEngine {
             None => return Vec::new(),
         };
         let started = std::time::Instant::now();
-        let prompt_ids: Vec<i64> = {
-            let Some(tok) = self.tokenizer.as_ref() else {
-                warn!(task = %task.task_id, "rank-0 engine has no tokenizer");
+        if self.tokenizer.is_none() {
+            warn!(task = %task.task_id, "rank-0 engine has no tokenizer");
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        }
+        let prompt_ids: Vec<i64> = match self.encode_cached(task.prompt.as_str(), true) {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(task = %task.task_id, "tokenizer encode failed: {e}");
                 return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
-            };
-            match tok.encode(task.prompt.as_str(), true) {
-                Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
-                Err(e) => {
-                    warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
-                }
             }
         };
 

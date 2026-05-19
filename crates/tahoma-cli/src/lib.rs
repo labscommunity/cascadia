@@ -131,6 +131,14 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Sparse-MoE engine only: capacity of the prompt → token-ids
+    /// cache. `0` (default) disables the cache. Common-prompt
+    /// workloads (chat completions with shared system prompts) get a
+    /// ~5..20 ms saving per cached prompt at the cost of ~1 KiB of
+    /// key storage per entry. Realistic settings: 8..128.
+    #[arg(long, default_value_t = 0)]
+    pub tokenizer_cache_size: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +325,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_tokenizer_cache_size(args.tokenizer_cache_size);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
