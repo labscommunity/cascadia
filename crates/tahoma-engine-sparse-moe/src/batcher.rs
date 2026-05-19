@@ -1,20 +1,24 @@
 //! Continuous-batching skeleton for the sparse-MoE engine.
 //!
-//! **Status: (A) SKELETON ONLY — not wired into `Engine::step`.**
+//! **Status:** iter 059 shipped the skeleton (slots + `plan_step`);
+//! iter 078 (this iter) wires per-request sampling state (blocker 3).
+//! The remaining blockers (1: per-request KV slabs; 2: shell forward
+//! `[N,1,H]` signature; 4: API admission rewrite) are still out of
+//! scope — they each need their own design review + bench.
 //!
 //! This module defines the request-queue + batch-assembly + per-request
 //! KV-slot accounting that a real continuous batcher needs, with a
 //! `BatchPlan` data structure produced per decode step and a
-//! `ContinuousBatcher` that owns the active slots. **No tensor work
-//! happens here.** The runner-level `step_batch` (which would actually
-//! call `forward_layer0_step` / `forward_shells` / `forward_head_last`
-//! over N requests in lock-step) is intentionally not implemented —
-//! that depends on the batched-shells primitives (iter 048 +
-//! `forward_shells_multi`; iter 051 +
+//! `ContinuousBatcher` that owns the active slots. **No batched tensor
+//! work happens here.** The runner-level batched forward (which would
+//! actually call `forward_layer0_step` / `forward_shells` /
+//! `forward_head_last` over N requests in lock-step) is intentionally
+//! not implemented — that depends on the batched-shells primitives
+//! (iter 048 + `forward_shells_multi`; iter 051 +
 //! `forward_shells_multi_batched_experts`) which are still on the
 //! `autolab/k26-perf` research branch.
 //!
-//! ## Why a skeleton, not the wiring
+//! ## Why most of this is still a skeleton
 //!
 //! Implementing the full thing requires four parallel changes that each
 //! need their own design review + benchmark:
@@ -37,12 +41,19 @@
 //!    request (spec-decode), not N. We need a real multi-request
 //!    variant.
 //!
-//! 3. **Per-request sampling state.** Today the last rank holds one
-//!    `last_rank_history`, one `last_rank_rng`. Batching needs `N` of
-//!    each, keyed by slot id, plus a sampler that vectorizes the
-//!    repetition-penalty / softmax / categorical pick across N logit
-//!    rows. Sampling is cheap compared to the shell pass so this is
-//!    embarrassingly parallel.
+//! 3. **Per-request sampling state.** [DONE — iter 078.] The batcher
+//!    now owns a parallel `samplers: Vec<Option<SamplerState>>` keyed
+//!    by `slot_idx`, and `sample_for_plan(planned, logits_per_slot)`
+//!    runs `sampling::sample` once per planned slot with that slot's
+//!    `(rng, history=slot.generated)` state. The rep-penalty history
+//!    is read directly from `RequestSlot.generated` (already
+//!    maintained by `commit_step`); the RNG is lazy-seeded from
+//!    `sampling.seed` on first sample to match the single-request
+//!    engine path's bit-for-bit determinism. Vectorizing the
+//!    rep-penalty / softmax / categorical-pick across N rows is still
+//!    a TODO — `sample_for_plan` calls the scalar sampler N times.
+//!    That's fine for now: sampling is ~µs vs ~ms shells, so the loop
+//!    is not on the critical path.
 //!
 //! 4. **API server admission control.** `tahoma-api` today serializes
 //!    requests behind a `Semaphore(MAX_CONCURRENT)` and the runner
@@ -65,12 +76,16 @@
 //!   shape, just `tokens_this_step > 1` for slots in prefill.
 //! - A unit-tested `plan_step` that proves the assembly logic at N=2
 //!   without any tensor backend at all.
+//! - A `sample_for_plan` that runs the per-slot sampler with
+//!   independent RNG + history state, so two concurrent slots produce
+//!   two independent token streams from identical logits — even with
+//!   different seeds, temperatures, or rep-penalty histories.
 
 use std::collections::HashMap;
 
 use tahoma_types::{GenerationTask, TaskId};
 
-use crate::sampling::SamplingConfig;
+use crate::sampling::{self, SamplingConfig};
 
 /// Hard cap on concurrent slots. Picked at construction time so the
 /// per-slot KV slab footprint is bounded.
@@ -197,6 +212,35 @@ impl BatchPlan {
     }
 }
 
+/// Per-slot sampler state. One of these per active `RequestSlot`.
+///
+/// **What this owns** (iter 078, blocker 3):
+///
+/// - `rng`: the xorshift64* state used by `sampling::sample` for the
+///   categorical pick. Seeded lazily on first sample so deterministic
+///   `seed=Some(_)` reproduces across runs. Zero is treated as
+///   "unseeded" — `sampling::init_rng` will replace it on first use.
+/// - `rng_seeded`: tracks whether the lazy init has happened.
+///
+/// **What it does NOT own** — by design:
+///
+/// - The repetition-penalty history. That lives on `RequestSlot.generated`
+///   and is read directly by `sample_for_plan`. Two reasons: (a) it's
+///   already populated by `commit_step`, no need to duplicate; (b) the
+///   token-stream is the source of truth for what "this slot has emitted".
+/// - The sampling config. That's snapshotted on the slot at admission
+///   (`RequestSlot.sampling`) and copied into each `PlannedSlot` so the
+///   sampler can read it without borrowing back into the batcher.
+///
+/// Lifecycle: created (via `Default`) when `submit()` (or
+/// `fill_from_pending`) places a task into a free slot; dropped (its
+/// index set to `None`) when `gc()` frees the slot.
+#[derive(Clone, Debug, Default)]
+struct SamplerState {
+    rng: u64,
+    rng_seeded: bool,
+}
+
 /// Continuous batcher. Owns the active slot pool + pending queue.
 ///
 /// **Not** the engine itself — the engine would hold this and call
@@ -213,6 +257,12 @@ pub struct ContinuousBatcher {
     /// (slots are freed in place by `gc()` but the vec is not
     /// compacted within a step so `slot_idx`s stay stable).
     slots: Vec<Option<RequestSlot>>,
+    /// Per-slot sampler state, index-parallel with `slots`. `samplers[i]`
+    /// is `Some` exactly when `slots[i]` is `Some`. Owned by the batcher
+    /// (not the slot) so the sampler can be reset independently — e.g. a
+    /// future iter that supports prompt-cache-reuse across slots would
+    /// keep the slot but wipe the sampler.
+    samplers: Vec<Option<SamplerState>>,
     /// Reverse lookup so `submit()` can no-op on duplicate `task_id`.
     by_task: HashMap<TaskId, usize>,
     /// Pending slot-less tasks. Drained into `slots` at `plan_step`
@@ -233,6 +283,7 @@ impl ContinuousBatcher {
         Self {
             max_slots,
             slots: (0..max_slots).map(|_| None).collect(),
+            samplers: (0..max_slots).map(|_| None).collect(),
             by_task: HashMap::new(),
             pending: Vec::new(),
             prefill_chunk: 1,
@@ -257,6 +308,10 @@ impl ContinuousBatcher {
             let slot = RequestSlot::new(&task, prompt_ids, sampling);
             self.by_task.insert(slot.task_id.clone(), free);
             self.slots[free] = Some(slot);
+            // Parallel sampler-state init. `rng` stays 0 until the first
+            // `sample_for_plan` call seeds it from `sampling.seed` — see
+            // `SamplerState` rationale for the lazy seeding contract.
+            self.samplers[free] = Some(SamplerState::default());
         } else {
             self.pending.push((task, prompt_ids, sampling));
         }
@@ -377,14 +432,105 @@ impl ContinuousBatcher {
         newly_done
     }
 
+    /// Sample one token per planned slot, applying per-slot sampler
+    /// state (RNG + rep-penalty history) independently. This is the
+    /// blocker-3 wiring from `perf/continuous-batching-059`'s docstring:
+    /// the existing single-rank sampler in `SparseMoEEngine` holds one
+    /// `(history, rng)` shared across every request; this routes it
+    /// per-slot so two concurrent requests with different seeds /
+    /// histories / temperatures produce two independent token streams.
+    ///
+    /// Contract:
+    ///
+    /// - `planned.len() == logits_per_slot.len()`. Caller must pass one
+    ///   logits vector per planned slot, in the same order.
+    /// - For each planned slot:
+    ///   - If `sample_this_step == false`: returns
+    ///     `StepOutcome::none()`. The slot's sampler is NOT touched so
+    ///     intermediate prefill steps don't advance the RNG (matters for
+    ///     deterministic-seed reproducibility — the rainier reference
+    ///     only invokes RNG on the steps that actually sample).
+    ///   - If `sample_this_step == true`: looks up the slot's
+    ///     `SamplerState`, lazy-seeds the RNG from `planned.sampling.seed`
+    ///     on first use, then calls `sampling::sample(logits,
+    ///     &slot.generated, &planned.sampling, &mut sampler.rng)` and
+    ///     returns the result wrapped in `StepOutcome::token`.
+    /// - The rep-penalty history is `slot.generated` (already maintained
+    ///   by `commit_step`), so callers should run this BEFORE
+    ///   `commit_step` for the same plan — otherwise the just-emitted
+    ///   token would be in the rep-penalty window for itself, which is a
+    ///   one-token off-by-one vs the existing single-request path.
+    ///
+    /// Panics if a planned slot's `slot_idx` points to a freed slot
+    /// (`samplers[i] == None`); the batcher's invariants make this
+    /// impossible if you pass back the plan from `plan_step` without
+    /// intervening `gc()` calls.
+    pub fn sample_for_plan(
+        &mut self,
+        planned: &[PlannedSlot],
+        logits_per_slot: &[Vec<f32>],
+    ) -> Vec<StepOutcome> {
+        assert_eq!(
+            planned.len(),
+            logits_per_slot.len(),
+            "sample_for_plan: one logits row per planned slot"
+        );
+        let mut out = Vec::with_capacity(planned.len());
+        for (p, logits) in planned.iter().zip(logits_per_slot.iter()) {
+            if !p.sample_this_step {
+                out.push(StepOutcome::none());
+                continue;
+            }
+            // Pull history out of the slot first (immutable borrow), then
+            // mutate the sampler — separate fields so this is safe.
+            let history: Vec<i64> = match self.slots.get(p.slot_idx).and_then(|s| s.as_ref()) {
+                Some(slot) => slot.generated.clone(),
+                None => {
+                    // Slot got GC'd between plan and sample. Treat as
+                    // "nothing to sample" rather than panicking — caller
+                    // can choose to skip the chunk.
+                    out.push(StepOutcome::none());
+                    continue;
+                }
+            };
+            let sampler = self
+                .samplers
+                .get_mut(p.slot_idx)
+                .and_then(|s| s.as_mut())
+                .expect("sample_for_plan: sampler missing for active slot");
+            if !sampler.rng_seeded {
+                sampler.rng = sampling::init_rng(p.sampling.seed);
+                sampler.rng_seeded = true;
+            }
+            let token = sampling::sample(logits, &history, &p.sampling, &mut sampler.rng);
+            out.push(StepOutcome::token(token));
+        }
+        out
+    }
+
+    /// Convenience: borrow a slot's sampler RNG state. Test-only hook
+    /// so unit tests can verify independent advancement without
+    /// reaching into the batcher's private fields.
+    #[cfg(test)]
+    fn sampler_rng(&self, idx: usize) -> Option<u64> {
+        self.samplers
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.rng)
+    }
+
     /// Free slots in `Done` phase, freeing their KV slabs for new
     /// admissions. Returns the freed `task_id`s in undefined order.
     pub fn gc(&mut self) -> Vec<TaskId> {
         let mut freed = Vec::new();
-        for slot in self.slots.iter_mut() {
-            let take = matches!(slot, Some(s) if matches!(s.phase, SlotPhase::Done { .. }));
+        for i in 0..self.slots.len() {
+            let take =
+                matches!(&self.slots[i], Some(s) if matches!(s.phase, SlotPhase::Done { .. }));
             if take {
-                let s = slot.take().unwrap();
+                let s = self.slots[i].take().unwrap();
+                // Drop the matching sampler state. Parallel-index
+                // invariant: samplers[i].is_some() iff slots[i].is_some().
+                self.samplers[i] = None;
                 self.by_task.remove(&s.task_id);
                 freed.push(s.task_id);
             }
@@ -421,6 +567,9 @@ impl ContinuousBatcher {
             let slot = RequestSlot::new(&task, prompt_ids, sampling);
             self.by_task.insert(slot.task_id.clone(), free);
             self.slots[free] = Some(slot);
+            // Same init as `submit`'s direct-fill path. See
+            // `SamplerState::default` for why rng=0 is OK pre-seed.
+            self.samplers[free] = Some(SamplerState::default());
         }
     }
 }
@@ -653,5 +802,251 @@ mod tests {
         }
         assert_eq!(b.active_count(), MAX_BATCH_SLOTS_DEFAULT);
         assert_eq!(b.pending_count(), 2);
+    }
+
+    // ============================================================
+    // Per-request sampling state tests (iter 078, blocker 3).
+    //
+    // These tests prove the "blocker 3" wiring from iter 059:
+    // ContinuousBatcher now owns N independent (rng, rng_seeded)
+    // pairs keyed by slot_idx, so two concurrent slots produce two
+    // independent token streams from the same logits.
+    // ============================================================
+
+    /// Build a flat-ish logits vector with a mild peak at one index, so
+    /// temperature + RNG meaningfully decide the outcome (vs argmax
+    /// dominating). Vocab=32 keeps test output small but still gives
+    /// the sampler enough surface area to diverge.
+    fn flatish_logits(peak_idx: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 32];
+        // Peak is only +1.5; with temperature=1.0 this leaves ~25% prob
+        // on the peak and ~3% on each tail token, so different RNG
+        // states will pick different tokens. Argmax would always be
+        // `peak_idx`.
+        v[peak_idx] = 1.5;
+        v
+    }
+
+    fn temp_cfg(seed: u64) -> SamplingConfig {
+        SamplingConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        }
+    }
+
+    /// The headline test: two slots, same prompt, same logits, but
+    /// DIFFERENT seeds. With temperature>0, sample_for_plan must
+    /// produce different tokens for the two slots — proving the per-slot
+    /// RNG state is actually independent.
+    #[test]
+    fn two_slots_different_seeds_independent_streams() {
+        let mut b = ContinuousBatcher::new(2);
+        b.submit(task("a", "p", 8), vec![10], temp_cfg(1)).unwrap();
+        b.submit(task("b", "p", 8), vec![10], temp_cfg(999_999))
+            .unwrap();
+
+        let plan = b.plan_step();
+        assert_eq!(plan.slots.len(), 2);
+        // Both slots get the EXACT same logits, so any divergence in the
+        // sampled tokens has to come from the per-slot RNG.
+        let logits = vec![flatish_logits(7), flatish_logits(7)];
+        let outcomes = b.sample_for_plan(&plan.slots, &logits);
+        assert_eq!(outcomes.len(), 2);
+        let t0 = outcomes[0].sampled.expect("slot 0 should sample");
+        let t1 = outcomes[1].sampled.expect("slot 1 should sample");
+        assert_ne!(
+            t0, t1,
+            "different seeds should yield different tokens (got {t0} == {t1})"
+        );
+
+        // And the RNG state for each slot should have advanced
+        // independently — neither slot was touched by the other's
+        // sampling call.
+        let rng0 = b.sampler_rng(0).unwrap();
+        let rng1 = b.sampler_rng(1).unwrap();
+        assert_ne!(rng0, rng1, "per-slot RNGs should diverge after sample");
+        assert_ne!(rng0, 0, "slot 0 RNG should be seeded");
+        assert_ne!(rng1, 0, "slot 1 RNG should be seeded");
+    }
+
+    /// Sampling-state independence is also about history (rep-penalty
+    /// window). Two slots with the same seed and same logits but
+    /// different `generated` histories should diverge as soon as the
+    /// rep-penalty kicks in on one but not the other.
+    #[test]
+    fn two_slots_different_history_independent_streams() {
+        // Greedy + strong repetition penalty so the test is
+        // deterministic. The rep-penalty divides any token in history
+        // by alpha (when its logit is positive), so we need a second
+        // candidate close to the peak to win after the peak gets
+        // penalized. Logit layout: peak at 5 (value 2.0), runner-up at
+        // 8 (value 1.0). With alpha=10, after penalizing token 5 its
+        // logit drops to 0.2, so 8 (1.0) wins.
+        let c = SamplingConfig {
+            temperature: 0.0,
+            repetition_penalty: 10.0,
+            repetition_window: 0,
+            seed: Some(7),
+            ..SamplingConfig::default()
+        };
+
+        let mut b = ContinuousBatcher::new(2);
+        b.submit(task("a", "p", 8), vec![10], c.clone()).unwrap();
+        b.submit(task("b", "p", 8), vec![10], c.clone()).unwrap();
+
+        let two_peak_logits = || {
+            let mut v = vec![0.0_f32; 32];
+            v[5] = 2.0; // primary peak
+            v[8] = 1.0; // runner-up — wins when 5 is penalized
+            v
+        };
+
+        // Step 1: prefill+sample on the one-token prompt. Both slots
+        // empty-history → argmax = 5 (the primary peak).
+        let plan1 = b.plan_step();
+        let logits1 = vec![two_peak_logits(), two_peak_logits()];
+        let out1 = b.sample_for_plan(&plan1.slots, &logits1);
+        assert_eq!(out1[0].sampled, Some(5));
+        assert_eq!(out1[1].sampled, Some(5));
+        // Force-divergence: commit DIFFERENT tokens. Slot 0 gets the
+        // real argmax (5); slot 1 gets a synthetic alternative (8).
+        // This sets up histories that point at DIFFERENT indices, so
+        // the rep penalty will hit different positions next step.
+        b.commit_step(
+            &plan1.slots,
+            &[StepOutcome::token(5), StepOutcome::token(8)],
+            &[],
+        );
+        assert_eq!(b.slot(0).unwrap().generated, vec![5]);
+        assert_eq!(b.slot(1).unwrap().generated, vec![8]);
+
+        // Step 2: both decode. Same logits AGAIN — but slot 0's
+        // rep-penalty knocks index 5 down (logit 2.0 → 0.2) so the
+        // runner-up at 8 (logit 1.0) wins. Slot 1's history has 8
+        // instead, so 8 → 0.1 and 5 (unpenalized 2.0) wins. The two
+        // slots SWAP their preferred token.
+        let plan2 = b.plan_step();
+        let logits2 = vec![two_peak_logits(), two_peak_logits()];
+        let out2 = b.sample_for_plan(&plan2.slots, &logits2);
+        let t0 = out2[0].sampled.expect("slot 0 sampled");
+        let t1 = out2[1].sampled.expect("slot 1 sampled");
+        assert_eq!(t0, 8, "slot 0 penalized 5 → runner-up 8 wins");
+        assert_eq!(t1, 5, "slot 1 penalized 8 → primary peak 5 wins");
+        assert_ne!(t0, t1, "per-slot histories must diverge token streams");
+    }
+
+    /// `sample_this_step == false` (intermediate prefill steps) must NOT
+    /// advance the slot's RNG. This matches the existing single-request
+    /// engine path which only calls the sampler on the last prefill
+    /// step + decode — deterministic seeds reproduce bit-for-bit only
+    /// if the batched path obeys the same invariant.
+    #[test]
+    fn unsampled_step_does_not_advance_rng() {
+        let mut b = ContinuousBatcher::new(1);
+        // 3-token prompt → 2 unsampled prefill steps then 1 sampled.
+        b.submit(task("a", "abc", 4), vec![10, 11, 12], temp_cfg(1))
+            .unwrap();
+
+        // Step 1: prefill token 10. sample_this_step=false.
+        let plan = b.plan_step();
+        assert!(!plan.slots[0].sample_this_step);
+        let out = b.sample_for_plan(&plan.slots, &[flatish_logits(7)]);
+        assert!(out[0].sampled.is_none(), "intermediate prefill yields none");
+        // RNG should NOT be seeded yet — no sample happened.
+        assert_eq!(b.sampler_rng(0), Some(0), "rng untouched on unsampled step");
+        // Commit to advance phase.
+        b.commit_step(&plan.slots, &out, &[]);
+
+        // Step 2: prefill token 11. Still sample_this_step=false.
+        let plan = b.plan_step();
+        assert!(!plan.slots[0].sample_this_step);
+        b.sample_for_plan(&plan.slots, &[flatish_logits(7)]);
+        assert_eq!(b.sampler_rng(0), Some(0), "rng still untouched");
+        b.commit_step(&plan.slots, &[StepOutcome::none()], &[]);
+
+        // Step 3: prefill token 12, LAST prompt token → sample_this_step=true.
+        let plan = b.plan_step();
+        assert!(plan.slots[0].sample_this_step);
+        let _ = b.sample_for_plan(&plan.slots, &[flatish_logits(7)]);
+        let rng_now = b.sampler_rng(0).unwrap();
+        assert_ne!(rng_now, 0, "rng must be seeded + advanced after a sample");
+    }
+
+    /// GC frees the sampler in lockstep with the slot. Re-admitting a
+    /// task into the same slot index gets a FRESH sampler (not the
+    /// stale one from the previous occupant). The parallel-index
+    /// invariant (samplers[i].is_some() iff slots[i].is_some()) is the
+    /// load-bearing thing here.
+    #[test]
+    fn gc_clears_sampler_state() {
+        let mut b = ContinuousBatcher::new(1);
+        b.submit(task("a", "p", 1), vec![10], temp_cfg(42)).unwrap();
+        let plan = b.plan_step();
+        b.sample_for_plan(&plan.slots, &[flatish_logits(3)]);
+        let stale_rng = b.sampler_rng(0).unwrap();
+        assert_ne!(stale_rng, 0);
+
+        // Terminate slot 0 by max_new=1 → Done(eos: false) → gc.
+        b.commit_step(&plan.slots, &[StepOutcome::token(99)], &[]);
+        assert!(matches!(
+            b.slot(0).unwrap().phase,
+            SlotPhase::Done { eos: false }
+        ));
+        b.gc();
+        assert!(b.slot(0).is_none(), "slot 0 freed");
+        assert!(b.sampler_rng(0).is_none(), "sampler 0 freed in lockstep");
+
+        // Re-admit. Slot 0 is reused; the sampler must NOT carry over
+        // the previous occupant's RNG state.
+        b.submit(task("b", "p", 1), vec![20], temp_cfg(42)).unwrap();
+        assert_eq!(
+            b.sampler_rng(0),
+            Some(0),
+            "fresh slot gets fresh (unseeded) sampler, not stale RNG state"
+        );
+    }
+
+    /// End-to-end round trip on N=2: plan → sample (per-slot RNGs
+    /// independent) → commit → plan again → sample again, verifying
+    /// per-slot state survives across steps. This is the "2 slots
+    /// produce 2 independent token streams" test the task asks for, in
+    /// integration form rather than the unit-level seed-divergence test.
+    #[test]
+    fn n2_round_trip_independent_token_streams() {
+        let mut b = ContinuousBatcher::new(2);
+        b.submit(task("a", "p", 4), vec![10], temp_cfg(1)).unwrap();
+        b.submit(task("b", "p", 4), vec![20], temp_cfg(2)).unwrap();
+
+        let mut stream_a: Vec<i64> = Vec::new();
+        let mut stream_b: Vec<i64> = Vec::new();
+
+        for _ in 0..3 {
+            let plan = b.plan_step();
+            assert_eq!(plan.slots.len(), 2);
+            // Same logits to both — the only source of divergence is
+            // the per-slot sampler state.
+            let logits: Vec<Vec<f32>> = plan.slots.iter().map(|_| flatish_logits(13)).collect();
+            let outcomes = b.sample_for_plan(&plan.slots, &logits);
+            // Push the sampled token into whichever stream it belongs to.
+            for (p, o) in plan.slots.iter().zip(outcomes.iter()) {
+                if let Some(t) = o.sampled {
+                    if p.slot_idx == 0 {
+                        stream_a.push(t);
+                    } else {
+                        stream_b.push(t);
+                    }
+                }
+            }
+            b.commit_step(&plan.slots, &outcomes, &[]);
+        }
+
+        assert!(!stream_a.is_empty());
+        assert!(!stream_b.is_empty());
+        assert_ne!(
+            stream_a, stream_b,
+            "independent per-slot samplers must produce different streams"
+        );
     }
 }
