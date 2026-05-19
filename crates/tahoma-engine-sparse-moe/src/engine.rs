@@ -75,6 +75,19 @@ pub struct SparseMoEBuilderConfig {
     /// L3-resident across layers. Output is bit-identical to the
     /// router-score order. Default `false` for back-compat.
     pub cache_aware_dispatch: bool,
+    /// autolab iter 057 (async kernel scheduling — speculative
+    /// prefetch): if `Some(n)`, before each layer `i`'s expert
+    /// dispatch the runner submits `madvise(WILLNEED)` for the
+    /// top-`n` hit-frequent experts of layer `i + 1` (looked up via
+    /// `expert_hits[i + 1]`). The OS pages those experts in while
+    /// layer `i`'s ~150 ms expert dispatch is on the critical path,
+    /// so layer `i + 1`'s router fires with the page-cache miss bill
+    /// already paid. Composes with iter 047 (the iter 047 predictor
+    /// races a fresh-token-wide prefetch against layer 0's router,
+    /// ~5 ms; iter 057 races a per-layer prefetch against the much
+    /// longer expert FFN window, ~150 ms). Output is bit-identical;
+    /// only readahead-bandwidth is spent. Default `None` (off).
+    pub speculative_prefetch_n: Option<u32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -92,6 +105,7 @@ impl SparseMoEBuilderConfig {
             pin_top_n: None,
             pin_after_tokens: None,
             cache_aware_dispatch: false,
+            speculative_prefetch_n: None,
         }
     }
 
@@ -290,6 +304,14 @@ impl Builder for SparseMoEBuilder {
         // dispatch reorder. Off by default for back-compat with iter
         // 047/054 baselines; on with `--cache-aware-dispatch`.
         runner.set_cache_aware_dispatch(self.config.cache_aware_dispatch);
+        // autolab iter 057 (async kernel scheduling — speculative
+        // prefetch): wire the per-layer top-N hit-frequent expert
+        // prefetch into the runner. `None` keeps iter 056 behavior;
+        // `Some(n)` arms the scheduler to fire from inside the layer
+        // loop. The scheduler is a no-op until `expert_hits[i+1]`
+        // accumulates data — so by construction bit-identical to iter
+        // 056 on the very first per-prompt token.
+        runner.set_speculative_prefetch_n(self.config.speculative_prefetch_n);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

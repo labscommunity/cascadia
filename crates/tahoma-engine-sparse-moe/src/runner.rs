@@ -420,6 +420,46 @@ pub struct Runner {
     /// summed in the original index order — only the `dispatch_expert`
     /// calls are reordered. Default `false` for back-compat.
     cache_aware_dispatch: bool,
+    /// autolab iter 057 (async kernel scheduling — speculative prefetch):
+    /// if `Some(n)` with `n > 0`, before each layer `i`'s expert dispatch
+    /// begins, submit `madvise(WILLNEED)` for the top-`n` hit-frequent
+    /// experts of layer `i + 1` (looked up via `expert_hits[i + 1]` and
+    /// `select_top_n_by_hits`). The OS pages those experts in while
+    /// layer `i`'s ~150 ms expert dispatch is the only thing on the
+    /// critical path, so by the time layer `i + 1`'s router fires the
+    /// page-cache miss bill is already paid.
+    ///
+    /// **Composes with iter 047 (whole-token predictor).** The iter 047
+    /// predictor fires *once per token* before any layer runs, working
+    /// from the previous token's routing decision. iter 057 fires *N - 1
+    /// times per token* inside the layer loop, working from the current
+    /// generation's accumulated `expert_hits`. The two predictors
+    /// overlap (both madvise the same expert set when iter 057's
+    /// top-n is also in iter 047's last_routing_ids) — duplicates are
+    /// cheap (madvise on already-paged-in ranges is sub-µs) and the
+    /// overlap shrinks as iter 047's prefetch_n widens. The point of
+    /// iter 057 is that it kicks off prefetch *during* expert compute,
+    /// not before it: the iter 047 prefetch races against layer 0's
+    /// router (~5 ms), iter 057 races against layer i's expert dispatch
+    /// (~150 ms). Disk-bound prefetches that need > 5 ms but < 150 ms
+    /// are pure latency win for iter 057.
+    ///
+    /// **Correctness:** the prefetcher's `try_submit` is a non-blocking
+    /// kernel hint. Wrong guesses waste OS readahead bandwidth (cache
+    /// miss = the no-prefetch baseline) but cannot affect model output.
+    /// The dispatch path still pulls weights from `dispatch_expert` and
+    /// the actual routing decision is made fresh on real hidden states.
+    ///
+    /// Default `None` (off) for back-compat with iter 056 baseline. Set
+    /// via `set_speculative_prefetch_n`.
+    speculative_prefetch_n: Option<u32>,
+    /// autolab iter 057: cumulative count of speculative prefetch
+    /// submissions across the runner's lifetime. Bumped once per
+    /// `(layer_i, expert)` pair that we tried to `try_submit` for the
+    /// next-layer hot-set. Logged alongside the per-token iter 029 /
+    /// 047 prefetch counters so A/B campaigns can attribute readahead
+    /// bandwidth between the two predictors.
+    speculative_prefetch_submitted: u64,
 }
 
 impl Runner {
@@ -646,6 +686,12 @@ impl Runner {
             // for back-compat with iter 047 / 054 — A/B campaigns will
             // toggle this once the branch lands.
             cache_aware_dispatch: false,
+            // iter 057: opt-in speculative next-layer prefetch. Default
+            // off for back-compat with iter 056 baseline. A/B campaigns
+            // toggle this with `--speculative-prefetch <N>` once the
+            // branch lands.
+            speculative_prefetch_n: None,
+            speculative_prefetch_submitted: 0,
         })
     }
 
@@ -859,6 +905,50 @@ impl Runner {
     /// autolab iter 056: read-only accessor for tests + benches.
     pub fn cache_aware_dispatch_enabled(&self) -> bool {
         self.cache_aware_dispatch
+    }
+
+    /// autolab iter 057 (async kernel scheduling — speculative prefetch):
+    /// set the per-layer top-N hit-frequent experts to speculatively
+    /// `madvise(WILLNEED)` for layer `i + 1` immediately before layer
+    /// `i`'s expert dispatch begins. `None` (default) = off; `Some(n)`
+    /// with `n > 0` enables the scheduler. Silently clamped to
+    /// `[1, N_ROUTED_EXPERTS]` to bound runaway prefetch storms.
+    ///
+    /// Behaviorally a no-op until `expert_hits[i + 1]` has data — i.e.
+    /// the first prefill token across the whole layer stack is a
+    /// pure no-op (every layer's hit map is empty), so by construction
+    /// iter 057 is byte-identical to iter 056 on the very first
+    /// per-prompt forward_shells call. Steady-state (after the iter
+    /// 054 warmup window worth of tokens) the prefetcher submits up
+    /// to `n × (n_layers - 1)` madvise requests per token in addition
+    /// to the iter 047 `prefetch_n × n_layers` submitted at the top
+    /// of `forward_shells`. Together they pre-page both this token's
+    /// next layer (iter 057, tight overlap) and the next token's
+    /// entire layer stack (iter 047, loose overlap).
+    ///
+    /// The prefetcher is a non-blocking kernel hint; misses are wasted
+    /// bandwidth but never affect output. Pass `None` to disable.
+    pub fn set_speculative_prefetch_n(&mut self, v: Option<u32>) {
+        let clamped = v.map(|n| n.min(N_ROUTED_EXPERTS as u32).max(1));
+        self.speculative_prefetch_n = clamped;
+        info!(
+            speculative_prefetch_n = ?clamped,
+            n_routed = N_ROUTED_EXPERTS,
+            "set_speculative_prefetch_n"
+        );
+    }
+
+    /// autolab iter 057: read-only accessor for tests + benches.
+    pub fn speculative_prefetch_n(&self) -> Option<u32> {
+        self.speculative_prefetch_n
+    }
+
+    /// autolab iter 057: cumulative count of speculative prefetch
+    /// submissions since `Runner::load`. Used by the instrumentation
+    /// log emitted from `forward_shells` and by unit tests that drive
+    /// the scheduling logic synthetically.
+    pub fn speculative_prefetch_submitted(&self) -> u64 {
+        self.speculative_prefetch_submitted
     }
 
     /// autolab iter 054: snapshot of (pinned_experts_count, pinned_bytes).
@@ -1209,6 +1299,34 @@ impl Runner {
                     top_k
                 )));
             }
+
+            // autolab iter 057 (async kernel scheduling — speculative
+            // prefetch of layer i+1's hit-frequent experts). We're about
+            // to spend ~150 ms inside the expert dispatch below; that
+            // window is wasted on the prefetcher side if we don't
+            // schedule the *next* layer's likely-fired weights now.
+            // Delegates the selection to `speculative_prefetch_targets`
+            // so the per-call logic is exercised by the runner tests
+            // without needing a loaded K2.6 model.
+            //
+            // Wrong guesses cost OS readahead bandwidth but cannot
+            // affect model output — the dispatch path below still pulls
+            // weights via `dispatch_expert` from real routing decisions.
+            if let (Some(n_spec), Some(pf)) =
+                (self.speculative_prefetch_n, self.prefetcher.as_ref())
+            {
+                let next_i = i + 1;
+                if next_i < n_layers {
+                    let next_lid = self.layers[next_i].lid;
+                    let eids = speculative_prefetch_expert_ids(&self.expert_hits[next_i], n_spec);
+                    for eid in eids {
+                        pf.try_submit(next_lid, eid);
+                        self.speculative_prefetch_submitted =
+                            self.speculative_prefetch_submitted.saturating_add(1);
+                    }
+                }
+            }
+
             let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
             // autolab campaign 007 (A2): apply routing-weight threshold.
@@ -1401,6 +1519,14 @@ impl Runner {
             prefetch_chances = self.prefetch_chances,
             pinned_experts = pinned_count,
             pinned_bytes_mb = pinned_bytes / (1024 * 1024),
+            // iter 057 (speculative prefetch): cumulative count of
+            // madvise requests submitted from inside the layer loop
+            // for layer i+1's hit-frequent experts. Per-token delta
+            // ≈ speculative_prefetch_n × (n_layers - 1) when enabled
+            // and expert_hits has warmed up; 0 when disabled or on
+            // the very first per-prompt token before any dispatch.
+            speculative_prefetch_n = ?self.speculative_prefetch_n,
+            speculative_prefetch_submitted = self.speculative_prefetch_submitted,
             total_us = _t0.elapsed().as_micros() as u64,
             "stage_timing"
         );
@@ -1618,6 +1744,35 @@ fn select_top_n_by_hits(hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
 /// tie-broken on ascending k), which matches the current router-score
 /// dispatch order exactly.
 ///
+/// autolab iter 057 (async kernel scheduling — speculative prefetch):
+/// pure helper — pick the top-`n` hit-frequent expert IDs from layer
+/// `i + 1`'s histogram so the runner can `try_submit` them to the C1
+/// prefetcher right before layer `i`'s ~150 ms expert dispatch begins.
+/// This is a thin wrapper around `select_top_n_by_hits` so the runner
+/// site (which has to deal with the prefetcher option, the lid
+/// lookup, and the cumulative submitted counter) stays free of
+/// selection logic and the same heavy-tail tie-breaking rules apply
+/// (descending count, ascending expert id).
+///
+/// Returns an empty vec when:
+///   - `n == 0` (caller disabled speculative prefetch),
+///   - `next_layer_hits` is empty (the very first prefill token before
+///     any dispatch data has accumulated for that layer — degenerate
+///     no-op, ensuring iter 057 is byte-identical to iter 056 on the
+///     first per-prompt forward_shells call).
+///
+/// Stable across runs (HashMap iteration order is sorted away by the
+/// inner `select_top_n_by_hits`) so A/B campaigns reproduce identical
+/// prefetch streams when fed identical hit histograms — critical for
+/// attributing tok/s deltas to the scheduling change rather than
+/// noise in the prefetcher's submission pattern.
+///
+/// Separated from `Runner::forward_shells` so unit tests can drive
+/// the scheduling logic without a loaded Runner.
+fn speculative_prefetch_expert_ids(next_layer_hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
+    select_top_n_by_hits(next_layer_hits, n)
+}
+
 /// Separated from `Runner::forward_shells` so unit tests can verify
 /// the permutation logic without a loaded model.
 fn cache_aware_dispatch_order(routing_ids: &[i64], hits: &HashMap<u32, u64>) -> Vec<usize> {
@@ -2297,5 +2452,206 @@ mod tests {
                 "j={j}: threshold-skipped dispatch must be bit-identical across orderings"
             );
         }
+    }
+
+    // ====================================================================
+    // autolab iter 057 (async kernel scheduling — speculative prefetch) tests
+    // ====================================================================
+    //
+    // The runner-side scheduling lives inside `forward_shells`, which
+    // needs a loaded K2.6 model end-to-end. The unit tests below cover
+    // the pure-helper layer:
+    //
+    //  (1) `speculative_prefetch_expert_ids` — picks the right top-N
+    //      from a layer's hit histogram, degenerates to empty for the
+    //      first-prefill (no data) case, and is deterministic under
+    //      ties (so A/B prefetch streams are reproducible).
+    //
+    //  (2) Boundary semantics — the last-layer-in-this-rank case is
+    //      handled at the call site (`next_i < n_layers`), not in the
+    //      helper, so we verify the runner-loop behavior by simulating
+    //      the same loop predicate the call site uses.
+    //
+    //  (3) Composition with iter 054 — the same `expert_hits` histogram
+    //      feeds both pin-top-N and iter 057 prefetch. Verify that for
+    //      an identical histogram the two helpers produce the same
+    //      first-N expert id sequence (i.e. iter 057 prefetch is a
+    //      no-op when the iter 054 pinned set is a superset of the
+    //      iter 057 target N).
+
+    /// Simple top-N case: clearly hot experts should come out in
+    /// descending count order. Tests the basic flow the runner uses.
+    #[test]
+    fn speculative_prefetch_expert_ids_picks_top_n_hot_experts() {
+        let mut next_layer_hits = HashMap::new();
+        next_layer_hits.insert(101u32, 500u64);
+        next_layer_hits.insert(202, 1000);
+        next_layer_hits.insert(303, 750);
+        next_layer_hits.insert(404, 250);
+        next_layer_hits.insert(505, 100);
+        let ids = super::speculative_prefetch_expert_ids(&next_layer_hits, 3);
+        // Descending by count: 202 (1000), 303 (750), 101 (500).
+        assert_eq!(ids, vec![202, 303, 101]);
+    }
+
+    /// First-prefill-token case: layer hit map is empty (no dispatches
+    /// have happened yet for that layer), so the speculative scheduler
+    /// must return an empty target set. This is the load-bearing
+    /// no-op-on-first-token invariant — without it iter 057 would
+    /// submit phantom prefetches for expert id 0 on every layer at the
+    /// very start of every prompt.
+    #[test]
+    fn speculative_prefetch_expert_ids_empty_hits_returns_empty() {
+        let empty: HashMap<u32, u64> = HashMap::new();
+        assert!(super::speculative_prefetch_expert_ids(&empty, 16).is_empty());
+        assert!(super::speculative_prefetch_expert_ids(&empty, 1).is_empty());
+        assert!(super::speculative_prefetch_expert_ids(&empty, 384).is_empty());
+    }
+
+    /// N=0 is the "off" case at the helper level. The runner site also
+    /// gates on `self.speculative_prefetch_n.is_some()`, but a caller
+    /// that passes Some(0) (e.g. a test) should still get an empty set
+    /// rather than every expert.
+    #[test]
+    fn speculative_prefetch_expert_ids_n_zero_returns_empty() {
+        let mut hits = HashMap::new();
+        hits.insert(1u32, 100u64);
+        hits.insert(2, 200);
+        assert!(super::speculative_prefetch_expert_ids(&hits, 0).is_empty());
+    }
+
+    /// Asking for more experts than the hit map has should return
+    /// every distinct expert (not panic, not duplicate). On a real
+    /// run the hit map will eventually contain all 384 experts; this
+    /// covers the early-warm case where only ~20 have fired.
+    #[test]
+    fn speculative_prefetch_expert_ids_n_exceeds_distinct_returns_all() {
+        let mut hits = HashMap::new();
+        hits.insert(5u32, 10u64);
+        hits.insert(15, 20);
+        hits.insert(25, 30);
+        let ids = super::speculative_prefetch_expert_ids(&hits, 100);
+        // Three distinct experts, descending count: 25, 15, 5.
+        assert_eq!(ids, vec![25, 15, 5]);
+    }
+
+    /// A/B reproducibility: for the same logical histogram inserted in
+    /// different orders, the prefetch stream must be identical so the
+    /// autolab campaign sees per-token deltas attributable to the
+    /// scheduling change, not HashMap iteration order.
+    #[test]
+    fn speculative_prefetch_expert_ids_deterministic_across_insertion_order() {
+        let mut a = HashMap::new();
+        a.insert(3u32, 50u64);
+        a.insert(1, 50);
+        a.insert(9, 50);
+        a.insert(7, 100);
+        let mut b = HashMap::new();
+        b.insert(7u32, 100u64);
+        b.insert(9, 50);
+        b.insert(3, 50);
+        b.insert(1, 50);
+        assert_eq!(
+            super::speculative_prefetch_expert_ids(&a, 4),
+            super::speculative_prefetch_expert_ids(&b, 4),
+            "iter 057 prefetch stream must be insertion-order-independent"
+        );
+    }
+
+    /// The K2.6 heavy-tail shape (10% of experts cover ~80% of fires)
+    /// is the realistic distribution iter 057 targets. Verify the
+    /// top-N helper picks exactly the hot-set head and pads with the
+    /// cold tail when N > hot-set-size.
+    #[test]
+    fn speculative_prefetch_expert_ids_heavy_tail_picks_hot_head_then_cold_tail() {
+        let mut hits = HashMap::new();
+        // 38 hot experts at 100 fires each.
+        for eid in 0..38u32 {
+            hits.insert(eid, 100);
+        }
+        // 346 cold experts at 3 fires each.
+        for eid in 38..384u32 {
+            hits.insert(eid, 3);
+        }
+        // N = 16 — well inside the hot-set. Should return the first
+        // 16 hot IDs (tied at 100 fires, ascending id).
+        let n16 = super::speculative_prefetch_expert_ids(&hits, 16);
+        assert_eq!(n16, (0..16).collect::<Vec<u32>>());
+        // N = 50 — overshoots the hot-set by 12. First 38 hot IDs in
+        // ascending order, then 12 cold tail IDs (also tied, ascending).
+        let n50 = super::speculative_prefetch_expert_ids(&hits, 50);
+        assert_eq!(n50.len(), 50);
+        assert_eq!(&n50[..38], &(0..38).collect::<Vec<u32>>()[..]);
+        assert_eq!(&n50[38..], &(38..50).collect::<Vec<u32>>()[..]);
+    }
+
+    /// Composition test: the iter 054 `select_top_n_by_hits` (used by
+    /// `pin_top_n_per_layer`) and the iter 057 `speculative_prefetch_
+    /// expert_ids` are supposed to share the same selection semantics,
+    /// so that prefetching the iter 057 hot-set is a no-op when the
+    /// iter 054 pinned set is a superset. Verify they produce the
+    /// same expert id sequence on the same histogram for N matching.
+    #[test]
+    fn speculative_prefetch_matches_iter_054_pin_selection() {
+        let mut hits = HashMap::new();
+        // Mixed-magnitude histogram to exercise tie-break + ordering.
+        for (eid, count) in [
+            (10u32, 50u64),
+            (20, 100),
+            (30, 30),
+            (40, 100),
+            (50, 75),
+            (60, 5),
+            (70, 75),
+            (80, 1),
+        ] {
+            hits.insert(eid, count);
+        }
+        for n in [1u32, 2, 4, 8, 16] {
+            let pin = super::select_top_n_by_hits(&hits, n);
+            let spec = super::speculative_prefetch_expert_ids(&hits, n);
+            assert_eq!(
+                pin, spec,
+                "iter 054 pin and iter 057 prefetch must select the same top-{n} expert IDs"
+            );
+        }
+    }
+
+    /// Runner-loop boundary: the iter 057 call site only fires when
+    /// `next_i < n_layers` so the last layer in this rank's slice
+    /// has no i+1 to prefetch. Simulate that gate here so the
+    /// invariant is regression-covered without needing a loaded
+    /// Runner. (Cross-token coverage for the last-layer boundary is
+    /// the responsibility of iter 047's `last_routing_ids` predictor,
+    /// which fires at the top of the next `forward_shells` call.)
+    #[test]
+    fn speculative_prefetch_skips_last_layer_in_rank_slice() {
+        // 4-layer rank slice. Layers 0/1/2 each prefetch the next
+        // layer's hot-set; layer 3 (last) skips. Each layer's hit map
+        // has its own canary expert id so we can verify which layer's
+        // map was consulted.
+        let mut expert_hits: Vec<HashMap<u32, u64>> = vec![HashMap::new(); 4];
+        for (layer_i, &canary_eid) in [42u32, 99, 7, 200].iter().enumerate() {
+            // Each layer's "hot expert" has a high count.
+            expert_hits[layer_i].insert(canary_eid, 1000);
+        }
+        let n_layers = expert_hits.len();
+        let mut submitted: Vec<(usize, Vec<u32>)> = Vec::new();
+        for i in 0..n_layers {
+            let next_i = i + 1;
+            if next_i < n_layers {
+                let eids = super::speculative_prefetch_expert_ids(&expert_hits[next_i], 1);
+                submitted.push((i, eids));
+            }
+        }
+        // Layer 0 prefetches layer 1's canary (99).
+        // Layer 1 prefetches layer 2's canary (7).
+        // Layer 2 prefetches layer 3's canary (200).
+        // Layer 3 (last) skips.
+        assert_eq!(
+            submitted,
+            vec![(0, vec![99]), (1, vec![7]), (2, vec![200])],
+            "iter 057 must consult layer i+1's hit map, and must skip the last layer"
+        );
     }
 }

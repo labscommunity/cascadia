@@ -200,6 +200,34 @@ pub struct WorkerArgs {
     /// `--cache-aware-dispatch`. See autolab campaign 056.
     #[arg(long, default_value_t = false)]
     pub cache_aware_dispatch: bool,
+
+    /// Async kernel scheduling: speculative prefetch of layer N+1's
+    /// top-N hit-frequent experts (sparse-moe engine only). Before
+    /// each layer i's ~150 ms expert dispatch begins, the runner
+    /// submits `madvise(WILLNEED)` for the top-N most-frequently-
+    /// fired experts on layer i+1 (looked up via the iter 054
+    /// `expert_hits` histogram). The OS readahead races the next
+    /// layer's expert weights into the page cache during the long
+    /// expert-FFN window, so by the time layer i+1's router fires
+    /// the page-miss bill is already paid.
+    ///
+    /// Composes with `--prefetch-n` (iter 047 whole-token predictor
+    /// fires once per token against the ~5 ms layer-0 router; iter
+    /// 057 fires per-layer against the ~150 ms expert-FFN window).
+    /// Composes with `--pin-top-n` (pinned hot-set is immune to
+    /// eviction, so the speculative prefetch's hot-set requests are
+    /// trivial no-ops on already-paged-in pages and the bandwidth is
+    /// spent on the cold tail). Composes with `--cache-aware-dispatch`
+    /// (the iter 056 reorder runs experts hot-first within a layer;
+    /// iter 057 cross-layer prefetch maximises the chance the next
+    /// layer's hot prefix is L3-warm as well as RAM-resident).
+    ///
+    /// Default off; `--speculative-prefetch 16` is a reasonable
+    /// starting point for A/B against the iter 056 baseline. Output
+    /// is bit-identical — wrong guesses waste OS readahead bandwidth
+    /// but cannot affect tokens. See autolab campaign 057.
+    #[arg(long)]
+    pub speculative_prefetch: Option<u32>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -396,6 +424,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.pin_top_n = args.pin_top_n;
             cfg.pin_after_tokens = args.pin_after_tokens;
             cfg.cache_aware_dispatch = args.cache_aware_dispatch;
+            cfg.speculative_prefetch_n = args.speculative_prefetch;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }
