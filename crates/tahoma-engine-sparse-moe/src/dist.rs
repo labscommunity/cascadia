@@ -31,11 +31,13 @@
 //!   - 8 B big-endian i64 token_id
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tahoma_transport::{
     ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
 };
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::sampling::SamplingConfig;
 
@@ -462,6 +464,205 @@ impl Default for HeartbeatWatchdog {
         // (strict GT). So max_misses=1 trips on the SECOND consecutive
         // miss, exactly matching the spec.
         Self::new(1)
+    }
+}
+
+/// Outcome of one heartbeat round. `Alive` and `Missed` keep the loop
+/// running; `Dead` ends it (the watchdog crossed its threshold) and
+/// `WireBroken` ends it (socket-level failure — separate signal so the
+/// orchestrator can distinguish "worker hung" from "TCP died").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatOutcome {
+    /// Pong with matching nonce arrived inside the timeout.
+    Alive,
+    /// Timeout fired or an unexpected frame arrived; watchdog has
+    /// recorded the miss but has not yet crossed `max_misses`.
+    Missed,
+    /// Watchdog crossed its `max_misses` threshold on this round's miss.
+    /// Caller should stop pinging and escalate to the orchestrator.
+    Dead,
+    /// Transport-level failure (socket closed, IO error). Distinct from
+    /// `Dead` because the worker may still be alive — the link is what
+    /// broke. Caller should also stop and escalate.
+    WireBroken,
+}
+
+/// Run one heartbeat round against `downstream`: send Ping with `nonce`,
+/// wait up to `timeout` for the matching Pong. The mutex is held for the
+/// entire round so the wire stays in sync — see "Mutex serialization" in
+/// `docs/architecture/heartbeat-recovery.md`.
+///
+/// Returns the new outcome AFTER updating the watchdog: `Alive` on
+/// success, `Missed` on timeout if still under threshold, `Dead` on
+/// timeout if the watchdog just crossed threshold, `WireBroken` on a
+/// socket-level error.
+///
+/// Stale pongs (Pong frames whose nonce doesn't match this round's
+/// nonce) are drained silently and the loop continues waiting for the
+/// matching pong until the deadline. This handles the recovery path
+/// where a previous round timed out, released the lock, and the worker
+/// later sent the late pong that's now sitting in the receive buffer.
+pub async fn ping_one_round(
+    downstream: &Mutex<ActivationClient>,
+    nonce: u64,
+    timeout: Duration,
+    watchdog: &Mutex<HeartbeatWatchdog>,
+) -> HeartbeatOutcome {
+    let mut guard = downstream.lock().await;
+
+    // Send the ping. A send-side failure means the link is broken;
+    // count it as a miss too so the watchdog escalates if it persists.
+    let mut ping = [0u8; 4 + HEARTBEAT_BODY_BYTES];
+    ping[0..4].copy_from_slice(&(FrameKind::HeartbeatPing as u32).to_be_bytes());
+    ping[4..12].copy_from_slice(&nonce.to_be_bytes());
+    if guard.send_raw(&ping).await.is_err() {
+        drop(guard);
+        let mut wg = watchdog.lock().await;
+        let dead = wg.record_miss();
+        return if dead {
+            HeartbeatOutcome::Dead
+        } else {
+            HeartbeatOutcome::WireBroken
+        };
+    }
+
+    let deadline = Instant::now() + timeout;
+    // Loop until: matched pong (Alive), deadline elapsed (Missed/Dead),
+    // unexpected frame / socket error (WireBroken).
+    let outcome = loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break MissOutcome::Timeout;
+        }
+        let remaining = deadline - now;
+        let kind_recv = tokio::time::timeout(remaining, guard.recv_raw(4)).await;
+        let kind_bytes = match kind_recv {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => break MissOutcome::WireError,
+            Err(_) => break MissOutcome::Timeout,
+        };
+        if kind_bytes.len() != 4 {
+            break MissOutcome::WireError;
+        }
+        let code = u32::from_be_bytes([kind_bytes[0], kind_bytes[1], kind_bytes[2], kind_bytes[3]]);
+        match FrameKind::from_code(code) {
+            Some(FrameKind::HeartbeatPong) => {
+                // Body comes next — read it under the same guard.
+                let body_recv = tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    guard.recv_raw(HEARTBEAT_BODY_BYTES),
+                )
+                .await;
+                let body = match body_recv {
+                    Ok(Ok(b)) if b.len() == HEARTBEAT_BODY_BYTES => b,
+                    _ => break MissOutcome::WireError,
+                };
+                let got_nonce = u64::from_be_bytes([
+                    body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+                ]);
+                if got_nonce == nonce {
+                    break MissOutcome::Matched;
+                }
+                // Stale pong from an earlier round — drain it and keep
+                // waiting for the current round's matching pong.
+                continue;
+            }
+            Some(_) | None => {
+                // An unexpected frame on a channel reserved (in this
+                // call) for heartbeat traffic indicates the wire is
+                // desynced. Surface as WireBroken so the orchestrator
+                // can tear down the link rather than spin reading
+                // garbage. Note: `ping_one_round` assumes the caller
+                // serializes against the Forward path — if a Forward
+                // response (Token) arrives mid-heartbeat that's the
+                // caller's bug, not the worker's.
+                break MissOutcome::WireError;
+            }
+        }
+    };
+    drop(guard);
+
+    let mut wg = watchdog.lock().await;
+    match outcome {
+        MissOutcome::Matched => {
+            wg.record_success();
+            HeartbeatOutcome::Alive
+        }
+        MissOutcome::Timeout => {
+            let dead = wg.record_miss();
+            if dead {
+                HeartbeatOutcome::Dead
+            } else {
+                HeartbeatOutcome::Missed
+            }
+        }
+        MissOutcome::WireError => {
+            let dead = wg.record_miss();
+            if dead {
+                HeartbeatOutcome::Dead
+            } else {
+                HeartbeatOutcome::WireBroken
+            }
+        }
+    }
+}
+
+/// Internal helper enum kept private so the public `HeartbeatOutcome`
+/// API stays minimal (callers care about Alive/Missed/Dead/WireBroken;
+/// "was it a timeout or a wire error?" is an implementation detail of
+/// the bookkeeping path).
+enum MissOutcome {
+    Matched,
+    Timeout,
+    WireError,
+}
+
+/// Driver-side cadence loop. Sends a ping every `interval`, waits up to
+/// `timeout` for the matching pong, updates the watchdog, and returns
+/// when the watchdog declares the worker dead OR the cancel flag flips
+/// to `true` OR the transport breaks.
+///
+/// Designed to be `tokio::spawn`'d from rank-0 setup. Cancellation: flip
+/// `cancel` to `true` — the loop will exit at its next sleep boundary
+/// (≤ `interval` later). Calling `JoinHandle::abort` also works but
+/// leaves the watchdog in whatever state the last round landed in.
+///
+/// **Concurrency contract:** the caller must guarantee no other task
+/// reads from or writes to `downstream` while this loop is running OR
+/// must serialize against the heartbeat via the same socket mutex (the
+/// Forward path does the latter by taking `downstream.lock()` in
+/// `forward_one_token_first`). Violating this races for frame ordering
+/// — see the "Mutex serialization" section of the design doc.
+///
+/// Returns the final outcome that ended the loop (`Dead`, `WireBroken`,
+/// or, if cancelled cleanly, the most recent round's outcome).
+pub async fn run_heartbeat_loop(
+    downstream: Arc<Mutex<ActivationClient>>,
+    watchdog: Arc<Mutex<HeartbeatWatchdog>>,
+    interval: Duration,
+    timeout: Duration,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) -> HeartbeatOutcome {
+    use std::sync::atomic::Ordering;
+    // Monotonic nonce — never reused within the life of this loop so a
+    // stale pong from a previous round can be detected (and dropped).
+    let mut nonce: u64 = 0;
+    let mut last_outcome = HeartbeatOutcome::Alive;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return last_outcome;
+        }
+        tokio::time::sleep(interval).await;
+        if cancel.load(Ordering::Acquire) {
+            return last_outcome;
+        }
+        nonce = nonce.wrapping_add(1);
+        let outcome = ping_one_round(&downstream, nonce, timeout, &watchdog).await;
+        last_outcome = outcome;
+        match outcome {
+            HeartbeatOutcome::Alive | HeartbeatOutcome::Missed => continue,
+            HeartbeatOutcome::Dead | HeartbeatOutcome::WireBroken => return outcome,
+        }
     }
 }
 

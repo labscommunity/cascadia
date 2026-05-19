@@ -6,13 +6,15 @@
 //! no model artifacts, no engine instance — pure socket plumbing +
 //! watchdog state machine.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tahoma_engine_sparse_moe::dist::{
-    recv_heartbeat_body_client, recv_heartbeat_body_server, recv_kind_client, recv_kind_server,
-    send_heartbeat_ping, send_heartbeat_ping_upstream, send_heartbeat_pong_downstream,
-    send_heartbeat_pong_upstream, FrameKind, HeartbeatWatchdog, HEARTBEAT_BODY_BYTES,
+    ping_one_round, recv_heartbeat_body_client, recv_heartbeat_body_server, recv_kind_client,
+    recv_kind_server, run_heartbeat_loop, send_heartbeat_ping, send_heartbeat_ping_upstream,
+    send_heartbeat_pong_downstream, send_heartbeat_pong_upstream, FrameKind, HeartbeatOutcome,
+    HeartbeatWatchdog, HEARTBEAT_BODY_BYTES,
 };
 use tahoma_transport::{ActivationClient, ActivationServer};
 use tokio::sync::Mutex;
@@ -252,4 +254,353 @@ async fn watchdog_recovers_on_first_pong() {
     assert!(recv.is_err());
     assert!(!watchdog.record_miss());
     assert!(!watchdog.is_dead());
+}
+
+// ────────────────────────────────────────────────────────────────────
+// iter 094 — driver-side cadence loop
+// ────────────────────────────────────────────────────────────────────
+//
+// These tests cover `run_heartbeat_loop` + `ping_one_round`. They run
+// against a deterministic in-process fake worker that selectively
+// drops pings according to a passed-in predicate. The fake worker
+// runs in a separate task on the same tokio runtime.
+
+/// Spawn a fake worker that pulls (kind, nonce) frames off `server`
+/// and replies with a Pong on rounds where `reply_on(round)` returns
+/// true (round is 1-indexed). Drops the ping silently otherwise.
+/// Stops when the socket closes or the cancel flag flips.
+async fn spawn_selective_worker(
+    server: Arc<Mutex<ActivationServer>>,
+    cancel: Arc<AtomicBool>,
+    reply_on: impl Fn(u32) -> bool + Send + 'static,
+) -> tokio::task::JoinHandle<u32> {
+    tokio::spawn(async move {
+        let mut round: u32 = 0;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                break round;
+            }
+            // Use recv_kind_server, which returns Ok(None) on a clean
+            // close so we can shut down without scaring the assertions.
+            let kind = match recv_kind_server(&server).await {
+                Ok(Some(k)) => k,
+                Ok(None) => break round,
+                Err(_) => break round,
+            };
+            assert_eq!(
+                kind,
+                FrameKind::HeartbeatPing,
+                "fake worker only handles Ping; got {kind:?}"
+            );
+            let nonce = match recv_heartbeat_body_server(&server).await {
+                Ok(n) => n,
+                Err(_) => break round,
+            };
+            round += 1;
+            if reply_on(round) && send_heartbeat_pong_upstream(&server, nonce).await.is_err() {
+                break round;
+            }
+            // else: drop on the floor — the driver's ping_one_round
+            // will time out.
+        }
+    })
+}
+
+#[tokio::test]
+async fn ping_one_round_alive_when_worker_replies() {
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = spawn_selective_worker(server.clone(), cancel.clone(), |_| true).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default()));
+    let outcome = ping_one_round(&client, 42, Duration::from_millis(500), &watchdog).await;
+    assert_eq!(outcome, HeartbeatOutcome::Alive);
+    let wg = watchdog.lock().await;
+    assert_eq!(wg.consecutive_misses(), 0);
+    assert_eq!(wg.successes(), 1);
+    drop(wg);
+
+    cancel.store(true, Ordering::Release);
+    // Close the client to unblock the worker's recv_kind_server.
+    client.lock().await.close().await;
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn ping_one_round_missed_when_worker_silent() {
+    let (server, client) = make_pair().await;
+    let _server_guard = server; // Hold the socket open; never reply.
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default()));
+    let outcome = ping_one_round(&client, 1, Duration::from_millis(50), &watchdog).await;
+    assert_eq!(outcome, HeartbeatOutcome::Missed);
+    let wg = watchdog.lock().await;
+    assert_eq!(wg.consecutive_misses(), 1);
+    assert_eq!(wg.successes(), 0);
+    assert!(!wg.is_dead());
+}
+
+#[tokio::test]
+async fn ping_one_round_dead_on_threshold_crossing() {
+    let (server, client) = make_pair().await;
+    let _server_guard = server;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default())); // max_misses=1
+                                                                       // 1st miss: not dead yet
+    let outcome = ping_one_round(&client, 1, Duration::from_millis(40), &watchdog).await;
+    assert_eq!(outcome, HeartbeatOutcome::Missed);
+    // 2nd miss: crosses the default threshold (max_misses=1 → dead
+    // when consecutive > 1).
+    let outcome = ping_one_round(&client, 2, Duration::from_millis(40), &watchdog).await;
+    assert_eq!(outcome, HeartbeatOutcome::Dead);
+    let wg = watchdog.lock().await;
+    assert_eq!(wg.consecutive_misses(), 2);
+    assert!(wg.is_dead());
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_stays_alive_against_healthy_worker() {
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let worker = spawn_selective_worker(server.clone(), worker_cancel, |_| true).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default()));
+    let watchdog_for_check = watchdog.clone();
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(25),
+        Duration::from_millis(200),
+        cancel_for_loop,
+    ));
+
+    // Let several rounds elapse — at 25 ms cadence, ~6 rounds in 150 ms.
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    {
+        let wg = watchdog_for_check.lock().await;
+        assert!(!wg.is_dead(), "healthy worker should never trip watchdog");
+        assert!(
+            wg.successes() >= 3,
+            "expected ≥3 successes, got {}",
+            wg.successes()
+        );
+        assert_eq!(wg.consecutive_misses(), 0);
+    }
+    cancel.store(true, Ordering::Release);
+    client.lock().await.close().await;
+    let outcome = loop_task.await.expect("loop task panicked");
+    assert!(
+        matches!(outcome, HeartbeatOutcome::Alive | HeartbeatOutcome::Missed),
+        "expected clean exit, got {outcome:?}"
+    );
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_fires_when_worker_silent_forever() {
+    // Task-spec test: simulate a worker that drops every ping → watchdog
+    // fires after the default 2 consecutive misses.
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = spawn_selective_worker(server.clone(), cancel.clone(), |_| false).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default())); // max_misses=1
+    let watchdog_for_check = watchdog.clone();
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(20),
+        Duration::from_millis(60),
+        cancel_for_loop,
+    ));
+
+    // Loop will: sleep 20 ms → ping 1 → timeout 60 ms → miss 1 → sleep 20 ms
+    //           → ping 2 → timeout 60 ms → miss 2 → DEAD → return.
+    // Total ≈ 160 ms; allow generous margin.
+    let outcome = tokio::time::timeout(Duration::from_millis(1500), loop_task)
+        .await
+        .expect("loop did not exit within 1.5 s")
+        .expect("loop task panicked");
+    assert_eq!(outcome, HeartbeatOutcome::Dead);
+    let wg = watchdog_for_check.lock().await;
+    assert!(wg.is_dead());
+    assert_eq!(wg.consecutive_misses(), 2);
+    assert_eq!(wg.successes(), 0);
+    drop(wg);
+
+    cancel.store(true, Ordering::Release);
+    client.lock().await.close().await;
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_fires_when_worker_drops_every_nth_ping() {
+    // Tighter task-spec test: worker drops every Nth ping. With N=2,
+    // the worker pattern is reply, drop, reply, drop, ... — i.e. the
+    // streak never reaches 2 misses in a row, so the watchdog stays
+    // alive. With N=1 (drop EVERY ping) it dies fast — covered by the
+    // sibling test above. The meaningful new case is "intermittent
+    // worker → watchdog stays alive": prove the recovery path actually
+    // resets the streak.
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    // reply on odd rounds, drop on even — alternating reply/drop.
+    let worker =
+        spawn_selective_worker(server.clone(), cancel.clone(), |round| round % 2 == 1).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default())); // max_misses=1
+    let watchdog_for_check = watchdog.clone();
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(20),
+        Duration::from_millis(50),
+        cancel_for_loop,
+    ));
+
+    // Let ≥ 8 rounds elapse.
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    {
+        let wg = watchdog_for_check.lock().await;
+        assert!(
+            !wg.is_dead(),
+            "alternating reply/drop should NOT trip watchdog (consecutive misses caps at 1)"
+        );
+        assert!(
+            wg.successes() >= 2,
+            "expected ≥2 successes from odd rounds, got {}",
+            wg.successes()
+        );
+        assert!(
+            wg.consecutive_misses() <= 1,
+            "consecutive misses should stay ≤ 1"
+        );
+    }
+    cancel.store(true, Ordering::Release);
+    client.lock().await.close().await;
+    let _ = loop_task.await;
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_fires_after_exactly_n_drops_with_higher_tolerance() {
+    // Strict task-spec test: with max_misses=3, the worker must miss
+    // 4 consecutive pings to flip dead. Worker drops the first 4 then
+    // would reply; the loop should fire on the 4th miss, BEFORE the
+    // 5th ping is sent.
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    // First 4 rounds drop; rounds 5+ reply (we don't expect to reach them).
+    let worker = spawn_selective_worker(server.clone(), cancel.clone(), |round| round > 4).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::new(3))); // dead on 4th consecutive miss
+    let watchdog_for_check = watchdog.clone();
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(15),
+        Duration::from_millis(50),
+        cancel_for_loop,
+    ));
+
+    let outcome = tokio::time::timeout(Duration::from_millis(2000), loop_task)
+        .await
+        .expect("loop did not exit within 2 s")
+        .expect("loop task panicked");
+    assert_eq!(outcome, HeartbeatOutcome::Dead);
+    let wg = watchdog_for_check.lock().await;
+    assert_eq!(
+        wg.consecutive_misses(),
+        4,
+        "should fire on the 4th miss (not earlier, not later)"
+    );
+    assert_eq!(wg.successes(), 0);
+    drop(wg);
+
+    cancel.store(true, Ordering::Release);
+    client.lock().await.close().await;
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_recovers_from_intermittent_misses() {
+    // Sequence: miss, miss-of-one-tolerance-not-yet-dead, reply (resets
+    // streak), miss → not dead because streak was reset.
+    //
+    // With max_misses=1 (default): worker drops round 1, then replies
+    // forever. After round 1 we have miss=1. Round 2 replies, miss
+    // resets to 0. Loop continues healthy. Validates that
+    // `record_success` inside the cadence loop actually wipes the streak.
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = spawn_selective_worker(server.clone(), cancel.clone(), |round| round != 1).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default()));
+    let watchdog_for_check = watchdog.clone();
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(20),
+        Duration::from_millis(60),
+        cancel_for_loop,
+    ));
+
+    // After ~5 rounds, the watchdog should be alive with at least
+    // 3 successes and 0 current misses.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    {
+        let wg = watchdog_for_check.lock().await;
+        assert!(!wg.is_dead());
+        assert_eq!(
+            wg.consecutive_misses(),
+            0,
+            "streak should be reset by replies"
+        );
+        assert!(wg.successes() >= 3);
+    }
+    cancel.store(true, Ordering::Release);
+    client.lock().await.close().await;
+    let _ = loop_task.await;
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn run_heartbeat_loop_exits_promptly_on_cancel() {
+    // Verify the cancel flag is actually observed — flipping it should
+    // stop the loop within ~1 interval, not block forever.
+    let (server, client) = make_pair().await;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = spawn_selective_worker(server.clone(), cancel.clone(), |_| true).await;
+
+    let watchdog = Arc::new(Mutex::new(HeartbeatWatchdog::default()));
+    let cancel_for_loop = cancel.clone();
+    let loop_task = tokio::spawn(run_heartbeat_loop(
+        client.clone(),
+        watchdog,
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+        cancel_for_loop,
+    ));
+    // Let it complete at least one healthy round.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    cancel.store(true, Ordering::Release);
+    // Loop should observe the flag at its next sleep boundary
+    // (≤ 50 ms) and exit. Generous 1 s budget for CI scheduler jitter.
+    let outcome = tokio::time::timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("loop did not exit within 1 s of cancel")
+        .expect("loop task panicked");
+    assert!(
+        matches!(outcome, HeartbeatOutcome::Alive | HeartbeatOutcome::Missed),
+        "expected clean Alive/Missed on cancel, got {outcome:?}"
+    );
+
+    client.lock().await.close().await;
+    let _ = worker.await;
 }

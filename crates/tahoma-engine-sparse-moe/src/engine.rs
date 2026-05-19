@@ -27,8 +27,9 @@ use tracing::{info, warn};
 
 use crate::dist::{
     forward_reset, recv_forward_body_server, recv_heartbeat_body_server, recv_kind_client,
-    recv_kind_server, recv_token_body_client, send_forward, send_heartbeat_pong_upstream,
-    send_reset, send_token_upstream, FrameKind, StageTransport,
+    recv_kind_server, recv_token_body_client, run_heartbeat_loop, send_forward,
+    send_heartbeat_pong_upstream, send_reset, send_token_upstream, FrameKind, HeartbeatOutcome,
+    HeartbeatWatchdog, StageTransport,
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
 
@@ -42,6 +43,12 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Heartbeat ping cadence in milliseconds. 0 disables heartbeats
+    /// (legacy behavior). Honored only by rank 0 in multi-stage mode
+    /// (the driver spawns the cadence loop; worker ranks just answer
+    /// pings via `handle_one_frame`). See
+    /// `docs/architecture/heartbeat-recovery.md`.
+    pub heartbeat_interval_ms: u64,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +60,18 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            heartbeat_interval_ms: 0,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    pub fn with_heartbeat_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.heartbeat_interval_ms = interval_ms;
         self
     }
 }
@@ -259,6 +272,70 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 && self.tokenizer.is_none() {
             return Err(EngineError::Backend("tokenizer.json missing".into()));
         }
+
+        // Driver-side heartbeat cadence loop. Only spawned on rank 0 in
+        // multi-stage mode when the user opted in via
+        // --heartbeat-interval-ms > 0. Worker ranks just answer pings
+        // via handle_one_frame; no separate task needed there.
+        let watchdog = Arc::new(TokioMutex::new(HeartbeatWatchdog::default()));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat_task = if rank == 0
+            && total > 1
+            && self.config.heartbeat_interval_ms > 0
+            && self.transport.downstream.is_some()
+        {
+            let downstream = self.transport.downstream.clone().unwrap();
+            let watchdog_for_task = watchdog.clone();
+            let cancel_for_task = cancel.clone();
+            let interval = Duration::from_millis(self.config.heartbeat_interval_ms);
+            // Default timeout = 2 × interval, matching the watchdog
+            // default of "2 misses → dead": at 1 s cadence with 2 s
+            // timeout, detection completes in ≤ 4 s in the worst case
+            // (1 ping that gets a late pong is treated as a miss).
+            let timeout = interval.saturating_mul(2);
+            info!(
+                interval_ms = self.config.heartbeat_interval_ms,
+                timeout_ms = timeout.as_millis() as u64,
+                "spawning driver-side heartbeat cadence loop"
+            );
+            Some(runtime_handle.spawn(async move {
+                let final_outcome = run_heartbeat_loop(
+                    downstream,
+                    watchdog_for_task,
+                    interval,
+                    timeout,
+                    cancel_for_task,
+                )
+                .await;
+                match final_outcome {
+                    HeartbeatOutcome::Dead => {
+                        // FOLLOW-UP-orchestrator: signal the upper layer
+                        // (engine teardown, fleet rebalance) here. iter
+                        // 092 only logs the death; iter 094 only adds
+                        // the cadence loop. The actual restart path is
+                        // documented in heartbeat-recovery.md, blocker 2.
+                        tracing::error!(
+                            "heartbeat: pipeline worker declared DEAD by watchdog \
+                             (consecutive misses crossed threshold); \
+                             upper-layer recovery is not yet wired (FOLLOW-UP-orchestrator)"
+                        );
+                    }
+                    HeartbeatOutcome::WireBroken => {
+                        tracing::error!(
+                            "heartbeat: downstream wire broken \
+                             (transport-level failure on ping/pong); \
+                             upper-layer recovery is not yet wired (FOLLOW-UP-orchestrator)"
+                        );
+                    }
+                    HeartbeatOutcome::Alive | HeartbeatOutcome::Missed => {
+                        info!("heartbeat: cadence loop exited cleanly via cancel flag");
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -271,6 +348,9 @@ impl Builder for SparseMoEBuilder {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            heartbeat_task,
+            heartbeat_cancel: cancel,
+            heartbeat_watchdog: watchdog,
         }))
     }
 }
@@ -359,6 +439,22 @@ pub struct SparseMoEEngine {
     /// `Reset` so deterministic-seed mode reproduces across runs.
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// `JoinHandle` for the rank-0 heartbeat cadence task spawned in
+    /// `Builder::build`. `None` on worker ranks, on single-stage, or
+    /// when `heartbeat_interval_ms == 0`. Aborted in `close()`.
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    /// Soft-cancel flag for the cadence loop. `close()` flips this to
+    /// true so the loop exits at its next sleep boundary; the
+    /// `JoinHandle::abort()` in `close()` is a backstop if the loop is
+    /// blocked inside `recv_raw`.
+    heartbeat_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Watchdog state shared with the cadence loop. Held by the engine
+    /// so a future orchestrator wiring can inspect successes /
+    /// consecutive misses for restart-policy decisions (iter 092
+    /// blocker 2). Unused inside this iter — kept so iter 095's
+    /// orchestrator callback can read it without re-plumbing.
+    #[allow(dead_code)]
+    heartbeat_watchdog: Arc<TokioMutex<HeartbeatWatchdog>>,
 }
 
 impl SparseMoEEngine {
@@ -432,6 +528,14 @@ impl Engine for SparseMoEEngine {
     }
 
     fn close(&mut self) {
+        // Signal the heartbeat task to exit at its next sleep boundary,
+        // then abort as a backstop in case it's currently blocked
+        // inside `recv_raw` waiting for a pong. Abort must come AFTER
+        // the socket close below, because aborting while the loop owns
+        // the socket mutex would just leak the guard — and the socket
+        // close needs the mutex.
+        self.heartbeat_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
         // Best-effort transport teardown. We block_on each socket's close()
         // sequentially because the engine is being torn down; lock
         // contention isn't a worry. Errors are logged but swallowed —
@@ -447,6 +551,14 @@ impl Engine for SparseMoEEngine {
             });
         }
         self.peer_disconnected = true;
+        // Now the socket is closed: any in-flight recv inside the
+        // heartbeat loop will fail-fast, the loop will see the cancel
+        // flag at its next iteration and exit. Abort is the backstop
+        // for "loop is sleeping" — JoinHandle::abort cancels at the
+        // next await point including sleep.
+        if let Some(handle) = self.heartbeat_task.take() {
+            handle.abort();
+        }
     }
 }
 

@@ -1,10 +1,11 @@
 # Worker heartbeat + auto-recovery
 
-**Status:** skeleton (wire frame + watchdog + CLI flag only). Auto-restart
-is FOLLOW-UP-orchestrator and not in this PR.
+**Status:** wire frame + watchdog + CLI flag (iter 092) + driver-side
+cadence loop (iter 094). Auto-restart is still FOLLOW-UP-orchestrator
+and not in either PR.
 
-**Track:** sparse-MoE pipeline-parallel (iter 092, follow-up to iter
-030's Matias 2-box revival).
+**Track:** sparse-MoE pipeline-parallel (iter 092 → iter 094, follow-
+up to iter 030's Matias 2-box revival).
 
 ## Goal
 
@@ -55,6 +56,57 @@ The two scenarios this exists to fix:
   `tests/heartbeat_wire.rs`): wire round-trip in both directions,
   nonce-mismatch ordering, watchdog default tolerance, success-resets-
   streak, higher tolerance, recovery after first pong.
+
+## What iter 094 ships (driver-side cadence loop)
+
+Closes blocker 1 of iter 092. Specifically:
+
+- `dist::HeartbeatOutcome` enum: `Alive` | `Missed` | `Dead` |
+  `WireBroken` — the per-round result reported back to the cadence
+  loop (and ultimately to the orchestrator hook).
+- `dist::ping_one_round(downstream, nonce, timeout, &watchdog)` — one
+  ping → pong exchange, atomic under the downstream socket mutex.
+  Stale pongs (mismatched nonce) are drained silently; the loop
+  continues waiting for the matching pong until the deadline.
+- `dist::run_heartbeat_loop(downstream, watchdog, interval, timeout,
+  cancel)` — the spawn-once driver. Monotonic nonce per round; default
+  `timeout = 2 × interval` to match the watchdog's "2 misses → dead"
+  default. Soft-cancel via `Arc<AtomicBool>` (engine `close()` flips
+  it); `JoinHandle::abort()` as a backstop when the loop is sleeping.
+- `SparseMoEBuilderConfig::with_heartbeat_interval_ms(ms)` — plumbed
+  through `tahoma-cli`'s existing `--heartbeat-interval-ms` flag.
+- `SparseMoEEngine` carries `heartbeat_task: Option<JoinHandle<()>>`
+  + cancel flag + shared watchdog handle. `Builder::build` spawns the
+  loop on rank 0 in multi-stage mode when interval > 0.
+- 9 new integration tests in `tests/heartbeat_wire.rs` covering the
+  per-round helper (3) and the full cadence loop (6), including the
+  task-spec "worker drops every Nth ping → watchdog fires" pattern at
+  N=1 (silent worker) and N=2 (alternating reply/drop stays alive).
+- Updates to `docs/architecture/heartbeat-recovery.md` and the design
+  doc's blocker / next-step list.
+
+Detection upper bound at default settings: with `--heartbeat-interval-ms
+1000` and `max_misses=1`, a stuck worker is declared dead within ≤ 4 s
+(2 s for the first ping's timeout to elapse, 1 s sleep, then up to 1 s
+of the second ping's timeout before crossing the threshold). Real-
+world median is closer to 3 s because the ping-after-cancel sleep
+runs to completion before the second probe.
+
+What iter 094 still does NOT ship — these remain `FOLLOW-UP-orchestrator`:
+
+- Upper-layer signaling when `HeartbeatOutcome::Dead` fires. The loop
+  logs `tracing::error!` and exits; nothing tears down the engine,
+  cancels in-flight tasks, or kicks the orchestrator. The shared
+  `heartbeat_watchdog` field is the seam where iter 095 hangs a
+  callback.
+- Worker auto-restart. Same as iter 092 — still
+  `FOLLOW-UP-orchestrator`.
+- KV migration to the replacement worker (still `iter 091` skeleton).
+- Driver-side failover (re-pointing downstream socket).
+- Side-channel heartbeat socket (option (c) in blocker 1 above). The
+  current design serializes heartbeats against Forward via the
+  downstream socket mutex; mid-Forward false misses are documented in
+  blocker 1 as the known limitation.
 
 What this PR explicitly does NOT ship — see "Blockers / open questions"
 below:
@@ -161,25 +213,40 @@ listener per worker — punted, see Blocker #5).
 
 ## Blockers / open questions
 
-### 1. No driver-side heartbeat loop
+### 1. ~~No driver-side heartbeat loop~~ — shipped in iter 094
 
-The wire helpers + watchdog exist; the rank-0 loop that calls them on
-a cadence and turns the boolean `is_dead()` into "stop the engine,
-notify the orchestrator" does not. Wiring this requires picking where
-the heartbeat task sits relative to `step_first`:
+iter 094 (`perf/heartbeat-driver-094`) wires the rank-0 cadence loop:
+`dist::run_heartbeat_loop` is `tokio::spawn`'d in `Builder::build`
+when `--heartbeat-interval-ms > 0` on rank 0 of a multi-stage engine.
+The loop calls `dist::ping_one_round` every `interval` ms with a
+monotonic nonce, default timeout = `2 × interval`, and updates the
+shared `HeartbeatWatchdog`. On `watchdog.is_dead()` or
+`HeartbeatOutcome::WireBroken` the loop exits and the engine logs
+`heartbeat: pipeline worker declared DEAD by watchdog`.
 
-- (a) Inside `step_first`, between tasks. Cheapest, but no liveness
-  signal mid-task — a worker that dies on token 7 of a 200-token
-  generation isn't detected until the 60 s `recv_kind_client` timeout
-  on token 8.
-- (b) A separate `tokio::spawn`'d task. Strongest liveness coverage,
-  but contends for the downstream mutex (see "Mutex serialization"
-  above). Punted; the cleanest version is (c).
-- (c) Out-of-band heartbeat on a separate TCP channel per worker.
-  Requires a second listener port and `--heartbeat-port` flag.
+Approach taken: option (b) — a separate `tokio::spawn` task — but with
+the mutex-coupling caveat below addressed by holding the downstream
+socket guard for the entire ping+pong round (`ping_one_round` acquires
+`downstream.lock()` once across `send_raw(Ping)` and the deadline-
+bounded `recv_raw(Pong)` so the heartbeat exchange is atomic on the
+wire). The existing Forward path is unchanged: it acquires + releases
+the same mutex per `send_raw` / `recv_raw` call. The two paths
+serialize on the mutex, never interleave bytes mid-frame.
 
-Recommended ordering: ship (a) first as a follow-up (small, low risk),
-then (c) once the orchestrator restart path lands.
+Limitation accepted: if the heartbeat task acquires the mutex between
+Forward's `send` and Forward's `recv`, the next bytes off the wire are
+the Forward's Token response, not a Pong. `ping_one_round` treats this
+as `WireBroken` (an unexpected frame on the heartbeat channel). On a
+healthy pipeline this is rare — Forward send → worker process →
+Forward response RTT is sub-millisecond on LAN, much less than the
+heartbeat interval — but it WILL trip a false miss occasionally.
+Detecting and tolerating this is option (c) (side-channel socket) and
+remains an open follow-up.
+
+Tests covering the cadence loop end-to-end live in
+`tests/heartbeat_wire.rs` (9 new tests: alive/missed/dead per round,
+silent worker → dead, intermittent worker → alive, drop-every-Nth
+patterns, higher tolerance, intermittent recovery, prompt cancel).
 
 ### 2. No orchestrator restart path
 
@@ -238,45 +305,65 @@ sub-table once we have a config-file path.
 
 ## Testing matrix
 
-In this PR (12 tests across `dist.rs::tests` and
-`tests/heartbeat_wire.rs`):
+iter 092 + iter 094: 21 tests across `dist.rs::tests` and
+`tests/heartbeat_wire.rs`.
 
-| Concern                              | Coverage                                        |
-| ------------------------------------ | ----------------------------------------------- |
-| FrameKind codes disjoint             | `heartbeat_codes_disjoint_from_other_frames`    |
-| FrameKind round-trip                 | `frame_kind_round_trip_includes_heartbeat`     |
-| Watchdog spec ("2 misses → dead")    | `watchdog_default_is_two_misses`               |
-| Watchdog success resets streak       | `watchdog_success_resets_miss_counter`         |
-| Higher tolerance                     | `watchdog_with_higher_tolerance`                |
-| Body bytes constant pinned to 8      | `heartbeat_body_bytes_is_eight`                |
-| Ping → Pong round-trip downstream    | `heartbeat_ping_pong_round_trip_downstream`     |
-| Multiple pings stay in nonce order   | `heartbeat_nonce_mismatch_round_trip_*`         |
-| Worker→driver direction (symmetric)  | `heartbeat_ping_upstream_is_symmetric`          |
-| Two simulated misses → dead          | `watchdog_declares_dead_after_two_simulated...` |
-| Streak recovers after first pong     | `watchdog_recovers_on_first_pong`              |
-| Worker handler echoes Pong           | covered by `dist_wire.rs` chain + engine compile |
+| Concern                                       | Coverage                                              | Iter |
+| --------------------------------------------- | ----------------------------------------------------- | ---- |
+| FrameKind codes disjoint                      | `heartbeat_codes_disjoint_from_other_frames`          | 092 |
+| FrameKind round-trip                          | `frame_kind_round_trip_includes_heartbeat`            | 092 |
+| Watchdog spec ("2 misses → dead")             | `watchdog_default_is_two_misses`                      | 092 |
+| Watchdog success resets streak                | `watchdog_success_resets_miss_counter`                | 092 |
+| Higher tolerance                              | `watchdog_with_higher_tolerance`                      | 092 |
+| Body bytes constant pinned to 8               | `heartbeat_body_bytes_is_eight`                       | 092 |
+| Ping → Pong round-trip downstream             | `heartbeat_ping_pong_round_trip_downstream`           | 092 |
+| Multiple pings stay in nonce order            | `heartbeat_nonce_mismatch_round_trip_*`               | 092 |
+| Worker→driver direction (symmetric)           | `heartbeat_ping_upstream_is_symmetric`                | 092 |
+| Two simulated misses → dead                   | `watchdog_declares_dead_after_two_simulated...`       | 092 |
+| Streak recovers after first pong              | `watchdog_recovers_on_first_pong`                     | 092 |
+| Worker handler echoes Pong                    | covered by `dist_wire.rs` chain + engine compile      | 092 |
+| `ping_one_round` alive when worker replies    | `ping_one_round_alive_when_worker_replies`            | 094 |
+| `ping_one_round` missed when silent           | `ping_one_round_missed_when_worker_silent`            | 094 |
+| `ping_one_round` dead on threshold crossing   | `ping_one_round_dead_on_threshold_crossing`           | 094 |
+| Cadence loop healthy worker → never dead      | `run_heartbeat_loop_stays_alive_against_healthy_worker` | 094 |
+| Silent worker → cadence loop fires Dead       | `run_heartbeat_loop_fires_when_worker_silent_forever` | 094 |
+| Intermittent worker → loop stays Alive        | `run_heartbeat_loop_fires_when_worker_drops_every_nth_ping` | 094 |
+| Higher tolerance crosses at exactly Nth miss  | `run_heartbeat_loop_fires_after_exactly_n_drops_with_higher_tolerance` | 094 |
+| record_success inside loop resets streak      | `run_heartbeat_loop_recovers_from_intermittent_misses` | 094 |
+| Cancel flag stops loop within one interval    | `run_heartbeat_loop_exits_promptly_on_cancel`         | 094 |
 
-Out of scope until the driver loop ships:
+Out of scope:
 
 - Latency-bounded delivery (P50 / P99 of ping-to-pong on a Matias 2-box
-  link).
-- Behavior under genuine process death (`kill -SEGV`, OOM).
-- Watchdog interaction with the engine teardown path (does `close()`
-  trip the watchdog falsely? — engine `close()` is invoked
-  intentionally, so no).
+  link). Wants a real 2-box bench rather than the loopback in
+  `heartbeat_wire.rs`.
+- Behavior under genuine process death (`kill -SEGV`, OOM). The
+  current cadence test uses a silent socket as the proxy; matching the
+  real-world `recv_raw` error semantics needs an actual subprocess
+  spawn.
+- Engine-level teardown: does `SparseMoEEngine::close()` cleanly stop
+  the spawned task without orphaning a tokio worker? Manual smoke
+  test only; not in CI.
 
 ## Next-step ordering
 
-1. Wire a between-task heartbeat in `SparseMoEEngine::step_first` (~50
-   LOC). Validates the watchdog end-to-end on the 2-box pipeline.
+1. ~~Wire a between-task heartbeat in `SparseMoEEngine::step_first`~~
+   — shipped in iter 094 as a separate `tokio::spawn`'d cadence loop
+   (`run_heartbeat_loop`). Updated approach + tradeoffs in blocker 1
+   above. The "between-task only" alternative is filed as a follow-up
+   if the false-miss rate under the current design proves problematic.
 2. Add a side-channel heartbeat socket + `--heartbeat-port` flag
    (~150 LOC + 1 new listener per worker). Lifts the mutex coupling.
 3. Wire the orchestrator restart callback. Estimated 300–500 LOC; needs
    process-spawn + reconnect helpers in `tahoma-runner` + KV restore
-   composition with iter 091's migration skeleton.
+   composition with iter 091's migration skeleton. The cadence loop
+   in iter 094 already exposes the `HeartbeatWatchdog` through
+   `SparseMoEEngine::heartbeat_watchdog`; the orchestrator can read
+   `successes()` / `consecutive_misses()` without re-plumbing.
 4. Multi-hop ping for full-chain detection. Estimated +100 LOC.
 5. End-to-end CI test under `tests-e2e/` that kills a worker and asserts
    the orchestrator recovers within 5 s without losing the request.
 
 Refs: PR #10 (pipeline-parallel inference + Rust shells), iter 030
-(Matias 2-box revival), iter 091 (KV migration skeleton).
+(Matias 2-box revival), iter 091 (KV migration skeleton), iter 094
+(`perf/heartbeat-driver-094` — driver-side cadence loop).

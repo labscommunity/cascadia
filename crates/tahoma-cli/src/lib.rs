@@ -337,7 +337,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_heartbeat_interval_ms(args.heartbeat_interval_ms);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
