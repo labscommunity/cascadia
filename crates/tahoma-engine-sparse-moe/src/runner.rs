@@ -811,6 +811,283 @@ impl Runner {
             &crate::sampling::SamplingConfig::default(),
         )
     }
+
+    // ------------------------------------------------------------------
+    // KV migration (skeleton — see docs/architecture/kv-migration.md)
+    //
+    // These two methods are the runner-side API for moving a slab of KV
+    // state from one rank to another mid-decode. They are intentionally
+    // narrow: pure get-this-buffer / install-this-buffer semantics, no
+    // transport, no atomic-swap orchestration, no in-flight-request
+    // handling. The caller (engine layer) is responsible for quiescing
+    // the runner before extract and after install.
+    //
+    // WIRE LAYOUT (must match `dist::KvSlabHeader`):
+    //
+    //   For each layer in `layer_range` (in ascending lid order):
+    //     [4B BE u32 lid]
+    //     [4B BE u32 past_seq_len]
+    //     [4B BE u32 num_heads]
+    //     [4B BE u32 qk_head_dim]
+    //     [4B BE u32 v_head_dim]
+    //     [past_k bytes: NUM_HEADS * past_seq_len * QK_HEAD_DIM * 4 (f32 LE)]
+    //     [past_v bytes: NUM_HEADS * past_seq_len * V_HEAD_DIM  * 4 (f32 LE)]
+    //
+    // Layer-0 is currently NOT migrate-able through this API — it's
+    // only ever held by rank 0 in the current pipeline-parallel layout
+    // (`is_first` is set on rank 0). If rank-0 migration ever lands we
+    // add a `layer == 0` sentinel variant; for now `extract_kv_slab`
+    // rejects ranges that overlap layer 0.
+    // ------------------------------------------------------------------
+
+    /// Number of populated KV slots (the per-decode `past_seq_len`)
+    /// for layer `lid` on this runner, if it owns that layer.
+    /// Used by the engine layer to validate consistency before installing
+    /// a slab from a different rank.
+    pub fn past_seq_len_for(&self, lid: u32) -> Option<usize> {
+        self.layers
+            .iter()
+            .find(|l| l.lid == lid)
+            .map(|l| l.past_seq_len)
+    }
+
+    /// Serialize the KV state for layers `[layer_start, layer_end)`.
+    ///
+    /// Skeleton — see docs/architecture/kv-migration.md for the full
+    /// protocol (consistency, atomic swap, in-flight requests). This
+    /// method is a read-only snapshot: it does not mutate runner state
+    /// and does not block decode. The caller must serialize against the
+    /// runner externally (engine layer) to avoid a torn read mid-step.
+    ///
+    /// Returns `RunnerError::Internal` if the range overlaps layer 0
+    /// (not supported, see above) or no layer in the range is held by
+    /// this runner.
+    pub fn extract_kv_slab(
+        &self,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> Result<Vec<u8>, RunnerError> {
+        if layer_start == 0 {
+            return Err(RunnerError::Internal(
+                "extract_kv_slab: layer 0 migration not supported in v1".into(),
+            ));
+        }
+        let mut layers: Vec<&LayerState> = self
+            .layers
+            .iter()
+            .filter(|l| l.lid >= layer_start && l.lid < layer_end)
+            .collect();
+        if layers.is_empty() {
+            return Err(RunnerError::Internal(format!(
+                "extract_kv_slab: this rank holds no layers in [{layer_start}, {layer_end})"
+            )));
+        }
+        layers.sort_by_key(|l| l.lid);
+
+        // Pre-compute size to allocate once.
+        let mut total = 0usize;
+        for l in &layers {
+            let ps = l.past_seq_len;
+            total += 5 * 4; // per-layer header
+            total += NUM_HEADS * ps * QK_HEAD_DIM * 4;
+            total += NUM_HEADS * ps * V_HEAD_DIM * 4;
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(total);
+        for l in &layers {
+            let ps = l.past_seq_len;
+            let cap = l.kv_capacity;
+            out.extend_from_slice(&l.lid.to_be_bytes());
+            out.extend_from_slice(&(ps as u32).to_be_bytes());
+            out.extend_from_slice(&(NUM_HEADS as u32).to_be_bytes());
+            out.extend_from_slice(&(QK_HEAD_DIM as u32).to_be_bytes());
+            out.extend_from_slice(&(V_HEAD_DIM as u32).to_be_bytes());
+            // past_k: copy the populated `0..ps` prefix per head from
+            // the `[NUM_HEADS, cap, QK_HEAD_DIM]` buffer.
+            for h in 0..NUM_HEADS {
+                let base = h * cap * QK_HEAD_DIM;
+                let slice = &l.past_k[base..base + ps * QK_HEAD_DIM];
+                for &v in slice {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            // past_v: same shape but V_HEAD_DIM.
+            for h in 0..NUM_HEADS {
+                let base = h * cap * V_HEAD_DIM;
+                let slice = &l.past_v[base..base + ps * V_HEAD_DIM];
+                for &v in slice {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Inverse of `extract_kv_slab`. Overwrites the per-layer KV state
+    /// for every layer found in `kv_bytes` that this runner owns AND
+    /// that falls within `[layer_start, layer_end)`. Layers in the slab
+    /// that this runner does not own are silently skipped — useful for
+    /// the case where a sender ships a wider range than any single
+    /// receiver actually holds.
+    ///
+    /// On success returns the number of layers installed.
+    ///
+    /// **Pre-condition (caller-enforced):** the runner is quiesced — no
+    /// `forward_shells` / `step` / `generate` is running. Installing
+    /// during a step would corrupt mid-flight KV reads. The engine
+    /// layer is responsible for this; the Runner itself has no
+    /// concurrency primitives.
+    pub fn install_kv_slab(
+        &mut self,
+        layer_start: u32,
+        layer_end: u32,
+        kv_bytes: &[u8],
+    ) -> Result<usize, RunnerError> {
+        if layer_start == 0 {
+            return Err(RunnerError::Internal(
+                "install_kv_slab: layer 0 migration not supported in v1".into(),
+            ));
+        }
+        let mut cursor = 0usize;
+        let mut installed = 0usize;
+        while cursor < kv_bytes.len() {
+            if cursor + 5 * 4 > kv_bytes.len() {
+                return Err(RunnerError::Internal(format!(
+                    "install_kv_slab: truncated header at offset {cursor}"
+                )));
+            }
+            let lid = u32_be(&kv_bytes[cursor..cursor + 4]);
+            let past_seq_len = u32_be(&kv_bytes[cursor + 4..cursor + 8]) as usize;
+            let n_heads = u32_be(&kv_bytes[cursor + 8..cursor + 12]) as usize;
+            let qk_d = u32_be(&kv_bytes[cursor + 12..cursor + 16]) as usize;
+            let v_d = u32_be(&kv_bytes[cursor + 16..cursor + 20]) as usize;
+            cursor += 5 * 4;
+
+            // Sanity-check the shape matches this build's compile-time
+            // constants. A peer with a different model would still
+            // parse the header but trip here before we install
+            // mismatched data.
+            if n_heads != NUM_HEADS || qk_d != QK_HEAD_DIM || v_d != V_HEAD_DIM {
+                return Err(RunnerError::Internal(format!(
+                    "install_kv_slab L{lid}: shape mismatch (got n_heads={n_heads}, qk_d={qk_d}, v_d={v_d}; \
+                     expected {NUM_HEADS}, {QK_HEAD_DIM}, {V_HEAD_DIM})"
+                )));
+            }
+
+            let k_bytes = n_heads * past_seq_len * qk_d * 4;
+            let v_bytes_len = n_heads * past_seq_len * v_d * 4;
+            if cursor + k_bytes + v_bytes_len > kv_bytes.len() {
+                return Err(RunnerError::Internal(format!(
+                    "install_kv_slab L{lid}: truncated body (need {} bytes, have {})",
+                    k_bytes + v_bytes_len,
+                    kv_bytes.len() - cursor
+                )));
+            }
+
+            let in_range = lid >= layer_start && lid < layer_end;
+            let owned = self.layers.iter().any(|l| l.lid == lid);
+            if !in_range || !owned {
+                // Skip body without parsing.
+                cursor += k_bytes + v_bytes_len;
+                continue;
+            }
+
+            // Decode K then V into a single contiguous f32 buffer per
+            // layer, then grow capacity if needed and copy into place.
+            let mut k_f32 = Vec::with_capacity(n_heads * past_seq_len * qk_d);
+            for c in kv_bytes[cursor..cursor + k_bytes].chunks_exact(4) {
+                k_f32.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            cursor += k_bytes;
+            let mut v_f32 = Vec::with_capacity(n_heads * past_seq_len * v_d);
+            for c in kv_bytes[cursor..cursor + v_bytes_len].chunks_exact(4) {
+                v_f32.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            cursor += v_bytes_len;
+
+            install_layer_kv(&mut self.layers, lid, past_seq_len, &k_f32, &v_f32)?;
+            installed += 1;
+        }
+        if installed == 0 {
+            return Err(RunnerError::Internal(format!(
+                "install_kv_slab: parsed {cursor} bytes but installed zero layers (range [{layer_start}, {layer_end}) didn't intersect any owned layer)"
+            )));
+        }
+        Ok(installed)
+    }
+}
+
+fn u32_be(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Install a per-layer KV slab into the runner. Grows the layer's
+/// capacity if `past_seq_len` exceeds it (the sender may have a longer
+/// context than the receiver has decoded so far). Pure on `layers`; no
+/// transport, no locking.
+fn install_layer_kv(
+    layers: &mut [LayerState],
+    lid: u32,
+    past_seq_len: usize,
+    k_packed: &[f32],
+    v_packed: &[f32],
+) -> Result<(), RunnerError> {
+    let layer = layers
+        .iter_mut()
+        .find(|l| l.lid == lid)
+        .ok_or_else(|| RunnerError::Internal(format!("install_layer_kv: L{lid} not owned")))?;
+    if k_packed.len() != NUM_HEADS * past_seq_len * QK_HEAD_DIM {
+        return Err(RunnerError::Internal(format!(
+            "install_layer_kv L{lid}: k length {} != expected {}",
+            k_packed.len(),
+            NUM_HEADS * past_seq_len * QK_HEAD_DIM
+        )));
+    }
+    if v_packed.len() != NUM_HEADS * past_seq_len * V_HEAD_DIM {
+        return Err(RunnerError::Internal(format!(
+            "install_layer_kv L{lid}: v length {} != expected {}",
+            v_packed.len(),
+            NUM_HEADS * past_seq_len * V_HEAD_DIM
+        )));
+    }
+    // Grow to at least `past_seq_len` (double until we fit; matches the
+    // grow_kv_capacity path's geometric strategy).
+    while past_seq_len > layer.kv_capacity {
+        grow_kv_capacity(layer)?;
+    }
+    let cap = layer.kv_capacity;
+    // Copy K and V into the per-head slots.
+    for h in 0..NUM_HEADS {
+        let src_off = h * past_seq_len * QK_HEAD_DIM;
+        let dst_off = h * cap * QK_HEAD_DIM;
+        layer.past_k[dst_off..dst_off + past_seq_len * QK_HEAD_DIM]
+            .copy_from_slice(&k_packed[src_off..src_off + past_seq_len * QK_HEAD_DIM]);
+        // Zero the stale tail past `past_seq_len` so a subsequent decode
+        // can't read uninitialized junk from an older session that left
+        // the buffer at a higher seq_len. The forward kernel only reads
+        // `0..past_seq_len`, so this is belt-and-suspenders, but cheap.
+        let tail_start = dst_off + past_seq_len * QK_HEAD_DIM;
+        let tail_end = dst_off + cap * QK_HEAD_DIM;
+        if tail_start < tail_end {
+            for v in &mut layer.past_k[tail_start..tail_end] {
+                *v = 0.0;
+            }
+        }
+    }
+    for h in 0..NUM_HEADS {
+        let src_off = h * past_seq_len * V_HEAD_DIM;
+        let dst_off = h * cap * V_HEAD_DIM;
+        layer.past_v[dst_off..dst_off + past_seq_len * V_HEAD_DIM]
+            .copy_from_slice(&v_packed[src_off..src_off + past_seq_len * V_HEAD_DIM]);
+        let tail_start = dst_off + past_seq_len * V_HEAD_DIM;
+        let tail_end = dst_off + cap * V_HEAD_DIM;
+        if tail_start < tail_end {
+            for v in &mut layer.past_v[tail_start..tail_end] {
+                *v = 0.0;
+            }
+        }
+    }
+    layer.past_seq_len = past_seq_len;
+    Ok(())
 }
 
 fn read_f32(bytes: &[u8]) -> Vec<f32> {
@@ -996,5 +1273,121 @@ mod tests {
         let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         assert!(dst.iter().all(|&x| x == 0.0));
+    }
+
+    // ---- KV migration unit tests (pure, no model artifacts) ----
+    //
+    // These exercise the `install_layer_kv` helper directly. The
+    // public `extract_kv_slab` + `install_kv_slab` round-trip is
+    // covered by an integration test in tests/kv_migration_wire.rs
+    // (which builds a Runner-free harness so it can run in CI without
+    // the K2.6 model artifacts).
+
+    /// Build an `Int4Shell` with every weight field empty. Safe to
+    /// drop, safe to leave un-called — the KV-migration tests only
+    /// touch the KV cache fields of the surrounding `LayerState`. We
+    /// never call any int4 forward on this shell, so the absence of
+    /// weights does not matter.
+    fn empty_int4_shell(lid: u32) -> Int4Shell {
+        Int4Shell {
+            layer: lid,
+            input_norm: Vec::new(),
+            q_a_proj_packed: Vec::new(),
+            q_a_proj_scale: Vec::new(),
+            q_a_norm: Vec::new(),
+            q_b_proj_packed: Vec::new(),
+            q_b_proj_scale: Vec::new(),
+            kv_a_proj_packed: Vec::new(),
+            kv_a_proj_scale: Vec::new(),
+            kv_a_norm: Vec::new(),
+            kv_b_proj_packed: Vec::new(),
+            kv_b_proj_scale: Vec::new(),
+            o_proj_packed: Vec::new(),
+            o_proj_scale: Vec::new(),
+            post_norm: Vec::new(),
+            router_packed: Vec::new(),
+            router_scale: Vec::new(),
+            router_bias: Vec::new(),
+            shared_gate_packed: Vec::new(),
+            shared_gate_scale: Vec::new(),
+            shared_up_packed: Vec::new(),
+            shared_up_scale: Vec::new(),
+            shared_down_packed: Vec::new(),
+            shared_down_scale: Vec::new(),
+        }
+    }
+
+    fn make_layer(lid: u32, past_seq_len: usize) -> LayerState {
+        // Allocate a layer with capacity >= past_seq_len so installs
+        // smaller than the initial cap don't have to grow.
+        let cap = past_seq_len.max(INITIAL_KV_CAPACITY);
+        LayerState {
+            lid,
+            int4_shell: empty_int4_shell(lid),
+            past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
+            past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
+            past_seq_len: 0,
+            kv_capacity: cap,
+        }
+    }
+
+    #[test]
+    fn install_layer_kv_basic_round_trip() {
+        // Build a single-layer test rig, install a deterministic
+        // K/V pattern, then verify it's at the right offsets per head.
+        let past = 3;
+        let mut layers = vec![make_layer(5, past)];
+        let mut k_packed = vec![0.0f32; NUM_HEADS * past * QK_HEAD_DIM];
+        let mut v_packed = vec![0.0f32; NUM_HEADS * past * V_HEAD_DIM];
+        // Unique stamp per (head, slot, dim).
+        for h in 0..NUM_HEADS {
+            for s in 0..past {
+                let val = (h * 1000 + s) as f32;
+                k_packed[h * past * QK_HEAD_DIM + s * QK_HEAD_DIM] = val;
+                v_packed[h * past * V_HEAD_DIM + s * V_HEAD_DIM] = -val;
+            }
+        }
+        install_layer_kv(&mut layers, 5, past, &k_packed, &v_packed).expect("install");
+        assert_eq!(layers[0].past_seq_len, past);
+        let cap = layers[0].kv_capacity;
+        // Spot-check head 0 slot 0, head 17 slot 2.
+        assert_eq!(layers[0].past_k[0], 0.0);
+        let expected_17_2 = (17usize * 1000 + 2) as f32;
+        assert_eq!(
+            layers[0].past_k[17 * cap * QK_HEAD_DIM + 2 * QK_HEAD_DIM],
+            expected_17_2
+        );
+        assert_eq!(
+            layers[0].past_v[17 * cap * V_HEAD_DIM + 2 * V_HEAD_DIM],
+            -expected_17_2
+        );
+        // Mem-after-prefix is zeroed.
+        let last_dim_idx = cap * QK_HEAD_DIM - 1;
+        assert_eq!(layers[0].past_k[last_dim_idx], 0.0);
+    }
+
+    #[test]
+    fn install_layer_kv_rejects_wrong_size() {
+        let mut layers = vec![make_layer(2, 4)];
+        let wrong_k = vec![0.0f32; 7]; // not NUM_HEADS * 4 * QK_HEAD_DIM
+        let v = vec![0.0f32; NUM_HEADS * 4 * V_HEAD_DIM];
+        let err = install_layer_kv(&mut layers, 2, 4, &wrong_k, &v).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("k length"), "got: {msg}");
+    }
+
+    #[test]
+    fn install_layer_kv_grows_capacity_when_needed() {
+        // Start with capacity = INITIAL_KV_CAPACITY (32). Install a
+        // slab with past_seq_len = 100 — should double up to >= 100.
+        let mut layers = vec![make_layer(7, 0)];
+        let cap0 = layers[0].kv_capacity;
+        assert_eq!(cap0, INITIAL_KV_CAPACITY);
+        let past = 100;
+        let k = vec![1.0f32; NUM_HEADS * past * QK_HEAD_DIM];
+        let v = vec![2.0f32; NUM_HEADS * past * V_HEAD_DIM];
+        install_layer_kv(&mut layers, 7, past, &k, &v).expect("install");
+        assert!(layers[0].kv_capacity >= past);
+        assert_eq!(layers[0].past_seq_len, past);
     }
 }

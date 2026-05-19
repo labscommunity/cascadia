@@ -93,6 +93,14 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::Token => {
                 println!("[server] unexpected TOKEN from upstream — ignoring");
             }
+            FrameKind::KvMigration => {
+                // The wire-check example does not run a real engine, so
+                // accepting a migration frame would have nowhere to
+                // install the slab. Log and ignore — the wire-protocol
+                // test for this frame lives in
+                // `tests/kv_migration_wire.rs`.
+                println!("[server] unexpected KvMigration from upstream — ignoring");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");

@@ -834,6 +834,40 @@ impl SparseMoEEngine {
                 "rank {} received unexpected TOKEN from upstream",
                 self.rank
             )),
+            FrameKind::KvMigration => {
+                // Skeleton handler — see docs/architecture/kv-migration.md.
+                // The engine layer does not yet drive migration end-to-end:
+                // there is no atomic-swap orchestrator, no pause-token
+                // negotiation, and no fail-back on partial install. For now
+                // we accept the frame, run the (already-quiesced) install
+                // on the runner, and log. A future PR will wire this into a
+                // full handler that:
+                //   1. quiesces the worker (latch a `paused` flag in
+                //      step_worker so the next Forward errors cleanly)
+                //   2. installs the slab
+                //   3. ACKs upstream so the driver can resume
+                //   4. on receiver-side failure: NAK + the sender's old
+                //      copy is still authoritative until the swap commits
+                let layer = self
+                    .block_on(crate::dist::recv_kv_migration_body_server(upstream))
+                    .map_err(|e| format!("recv_kv_migration: {e}"))?;
+                let slab = layer.clone().into_install_slab();
+                let lid_only_lo = layer.lid;
+                let lid_only_hi = layer.lid + 1;
+                match self.runner.install_kv_slab(lid_only_lo, lid_only_hi, &slab) {
+                    Ok(n) => {
+                        info!(
+                            rank = self.rank,
+                            lid = layer.lid,
+                            past_seq_len = layer.past_seq_len,
+                            installed = n,
+                            "kv migration installed (skeleton handler — no ACK yet)"
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("install_kv_slab L{}: {e}", layer.lid)),
+                }
+            }
         }
     }
 }
