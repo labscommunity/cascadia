@@ -73,6 +73,76 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 071 — Intel iGPU OneAPI scoping — SCOPING + skeleton crate shipped (2026-05-18 ~23:05 PT)
+
+Track B+C delivered. Branch `perf/igpu-oneapi-scoping-071` @ `3f8127b`.
+
+New workspace crate `tahoma-engine-igpu` with stub Rust API, planned
+C ABI, and 340-line `IGPU_PLAN.md`. Everything builds, 3 stub tests
+pass.
+
+**Files added:**
+- `crates/tahoma-engine-igpu/Cargo.toml` — reserved features
+  (oneapi-sycl, opencl-fallback)
+- `crates/tahoma-engine-igpu/build.rs` — panics if real feature
+  enabled (clear pointer to plan)
+- `crates/tahoma-engine-igpu/src/lib.rs` — `IGpuContext`, `Int4Gemv`,
+  `Backend` enum, `select_backend()`; entry points return
+  `Error::Stub`
+- `crates/tahoma-engine-igpu/cpp/shim.h` — planned C ABI (mirrors
+  `tahoma-ov-genai-shim`)
+- `crates/tahoma-engine-igpu/cpp/README.md` — points at the plan
+- **`crates/tahoma-engine-igpu/docs/IGPU_PLAN.md`** — the scoping
+  doc (~340 lines)
+- workspace `Cargo.toml` — added member + deps
+
+**Recommended path: OneAPI / SYCL via `icpx -fsycl` + Level Zero
+loader.**
+- First-party Intel toolchain; same OneAPI tree OpenVINO's GPU
+  plugin already uses
+- AOT compile to SPIR-V/device ISA — no per-launch JIT tax
+- DPC++ runs Linux + Windows from one C++ source — matches matias
+  Lunar Lake target
+- OpenCL kept as `--features opencl-fallback` for "no OneAPI"
+  deployments
+- `wgpu`/Vulkan compute deferred (loses XMX/DPAS intrinsics)
+
+**Hot-path inventory (the load-bearing finding):**
+- **~1900 int4 GEMV calls per decode step** at K2.6 dims
+- **76% are routed expert FFN calls** (8 experts × 3 linears × 60
+  layers = 1440)
+- **9% are shared expert** (180 calls)
+- Even partial iGPU offload of just the expert path moves the
+  needle
+
+**6 blockers identified:**
+1. Intel Graphics Driver 32.0.x+ on Windows for Level Zero 1.6
+2. i915 firmware on Linux Lunar Lake (≥ 20241210, kernel ≥ 6.6)
+3. OneAPI 2025.0 needs Compute Runtime ≥ 24.50.x (Ubuntu LTS ships
+   older)
+4. WSL2 iGPU passthrough requires Windows 11 25H2 + driver
+   32.0.101.6299+
+5. Kernel-launch overhead 50-80 µs on Lunar Lake — ops < 1ms CPU
+   compute aren't worth offloading without batching
+6. K2.6 expert mmap can't be host-pinned without breaking mmap
+   semantics; first impl needs ~30 µs staging-buffer copy per launch
+
+**Composition story:** Backend enum dispatcher inside sparse-MoE
+engine. CPU AVX-512 stays canonical; iGPU returns Result, engine
+silently falls back on Err. **Real win is async overlap** (PR #5
+dist_spec pattern): submit GEMV to iGPU, run next CPU op in parallel,
+await at consumer.
+
+**Effort estimate (honest):** 6-10 weeks for first working kernel +
+end-to-end matias-02 validation. 10-week milestone breakdown in plan:
+context → kernel → bench → engine wiring → async overlap → 2-box
+validation. **iter 071 is week 0** (scoping).
+
+**Verification:** workspace builds clean, 3/3 stub tests pass, fmt +
+doc clean, single-author conventional commit.
+
+---
+
 ## 070 — Full 7-feature cache-attack stack bench — MAJOR NEGATIVE FINDING -32% (2026-05-18 ~22:55 PT)
 
 **ARCHITECTURAL LESSON ON COMPOSITION.** All 7 features fired
