@@ -204,8 +204,15 @@ impl AsyncPrefetcher {
 | 5 | Instrumentation + counters (sqe_submitted, cqe_seen, queue_depth, blocked_on_inflight) | both    |
 | 6 | Bench harness + measured speedup vs iter 033         | autolab `074_iouring_bench/`                    |
 
-This PR (#74) ships milestones 1 + 2 + the API skeleton for 3. The
-remaining four are tracked as the autolab campaign follow-ups.
+PR #74 shipped the **skeleton** for milestones 1+2+3 (everything
+constructs cleanly but the Linux path returns `NotImplemented` / the
+backend always picks `Fallback`). **Iter 097 (`perf/io-uring-milestone1-097`)
+flips milestone 1 from skeleton to real:** `AsyncPrefetchBackend::with_depth`
+now constructs `io_uring::IoUring`, probes it with a NOP SQE/CQE
+round-trip, spawns a reaper thread, and serves `queue_read` via
+`IORING_OP_READ`. Milestones 2–6 still need wiring (the demand-path
+overlap pattern, the dispatcher hook, instrumentation, and the bench
+harness).
 
 ## Blockers / portability notes
 

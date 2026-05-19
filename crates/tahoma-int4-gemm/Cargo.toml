@@ -13,30 +13,38 @@ parking_lot = { workspace = true }
 rayon = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
-# autolab iter 074 (async expert prefetch): Linux-only io_uring dep.
+# autolab iter 074/097 (async expert prefetch): Linux-only io_uring dep.
 # Gated to cfg(target_os = "linux") because the upstream crate only
 # compiles there. On every other platform the `async_prefetch` module
 # falls back to the existing madvise / PrefetchVirtualMemory path
-# (see crates/tahoma-int4-gemm/src/async_prefetch.rs). The dep is not
-# yet wired into the skeleton — milestone 1 in
-# docs/perf/io_uring_prefetch.md will flip it on by replacing the
-# `BackendKind::Fallback` constructor with the io_uring init path.
+# (see crates/tahoma-int4-gemm/src/async_prefetch.rs).
+#
+# Milestone 1 (iter 097) wires the real backend: AsyncPrefetchBackend
+# probes io_uring at init time via a NOP SQE + CQE round-trip and
+# falls back gracefully on any failure (kernel <5.1, WSL2,
+# seccomp-blocked container). The dep is no longer behind a feature
+# flag — it's always pulled on Linux (it's a few KB of FFI bindings),
+# and the runtime probe decides whether to use it.
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.6", optional = true }
+io-uring = "0.6"
 
 [features]
-# Build with the real io_uring backend (Linux only — silently does
-# nothing on other platforms). Off by default until milestone 1 of the
-# implementation plan lands; flipping it on today just pulls the dep
-# without firing any of its code, since the skeleton still constructs
-# `BackendKind::Fallback`.
-io-uring = ["dep:io-uring"]
+# Force the io_uring backend even if the runtime probe says it's
+# unavailable. Useful only for diagnostics — production should let
+# the probe decide. No-op on non-Linux.
+io-uring-force = []
 
 [dev-dependencies]
 # (canonical reference decompression for cross-validation lives in
 # rainier/scripts/k26_export_per_expert_v2.py — we cross-validate the
 # Rust kernel against bytes-on-disk only).
+
+# Milestone-1 io_uring E2E test (Linux only — but tempfile is
+# cross-platform, so dropping it in unconditionally is fine and avoids
+# a target-gated dev-dependency block).
+tempfile = { workspace = true }
 
 [[bench]]
 name = "expert_gemm"
