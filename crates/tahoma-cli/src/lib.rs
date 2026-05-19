@@ -17,6 +17,7 @@ use tahoma_engine_openvino::{
 };
 use tahoma_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use tahoma_runner::Runner;
+use tahoma_transport::Compression;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -131,6 +132,33 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Wire compression for pipeline-parallel hidden states.
+    /// Defaults to `none` for byte-identical back-compat with the
+    /// pre-068 wire format. Must match on every rank in the
+    /// pipeline — there is no protocol-level negotiation. Currently
+    /// only the sparse-moe engine consumes this flag.
+    #[arg(long, value_enum, default_value_t = WireCompression::None)]
+    pub wire_compression: WireCompression,
+}
+
+/// CLI mirror of [`tahoma_transport::Compression`]. Kept separate so
+/// `clap::ValueEnum` and `Compression`'s `#[repr(u8)]` don't tangle.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireCompression {
+    None,
+    Zstd,
+    Lz4,
+}
+
+impl WireCompression {
+    pub fn to_transport(self) -> Compression {
+        match self {
+            Self::None => Compression::None,
+            Self::Zstd => Compression::Zstd,
+            Self::Lz4 => Compression::Lz4,
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +345,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_wire_compression(args.wire_compression.to_transport());
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }

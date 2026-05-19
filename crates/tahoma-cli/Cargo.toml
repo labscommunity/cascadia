@@ -21,6 +21,7 @@ tahoma-engine-openvino = { workspace = true }
 tahoma-engine-sparse-moe = { workspace = true }
 tahoma-runner = { workspace = true }
 tahoma-api = { workspace = true }
+tahoma-transport = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }

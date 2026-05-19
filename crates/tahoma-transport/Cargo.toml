@@ -11,3 +11,11 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# Wire compression — both default-on (`std` features only, no system deps).
+# `zstd` gives ~50-70% on numeric f32 hidden states; `lz4_flex` is ~3x
+# faster than zstd at level 3 but typically compresses 5-10% worse.
+zstd = { version = "0.13", default-features = false }
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

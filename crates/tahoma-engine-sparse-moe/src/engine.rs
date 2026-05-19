@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tahoma_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use tahoma_ov_genai_shim::PluginConfig;
-use tahoma_transport::{ActivationClient, ActivationServer};
+use tahoma_transport::{ActivationClient, ActivationServer, Compression};
 use tahoma_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
@@ -42,6 +42,12 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Hidden-state wire compression. Both ranks of the pipeline must
+    /// be started with the same value — see PR #068 for the tradeoff
+    /// analysis (helps high-RTT links like the matias SSH tunnel,
+    /// roughly neutral on a LAN). Defaults to `None` for byte-identical
+    /// back-compat with the pre-068 wire.
+    pub wire_compression: Compression,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +59,18 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            wire_compression: Compression::None,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    pub fn with_wire_compression(mut self, compression: Compression) -> Self {
+        self.wire_compression = compression;
         self
     }
 }
@@ -110,13 +122,15 @@ impl Builder for SparseMoEBuilder {
         // then accept the upstream connection. This matches the order
         // ov-runtime / ov-dist-spec use to avoid the bind-vs-connect
         // race at startup.
+        let compression = self.config.wire_compression;
         if has_upstream {
             let port = self.listen_port.ok_or_else(|| {
                 EngineError::InvalidConfig(
                     "non-first rank requires configure_listen() before connect()".into(),
                 )
             })?;
-            let mut server = ActivationServer::new(self.listen_host.clone(), port);
+            let mut server =
+                ActivationServer::new(self.listen_host.clone(), port).with_compression(compression);
             server.start().await.map_err(|e| {
                 EngineError::Backend(format!("listen {}:{}: {}", self.listen_host, port, e))
             })?;
@@ -124,12 +138,14 @@ impl Builder for SparseMoEBuilder {
             info!(
                 host = %self.listen_host,
                 port,
+                compression = compression.as_str(),
                 "sparse-moe upstream bound"
             );
         }
 
         if let Some(down) = peers.downstream.as_ref() {
-            let mut client = ActivationClient::new(down.host.clone(), down.port);
+            let mut client =
+                ActivationClient::new(down.host.clone(), down.port).with_compression(compression);
             client
                 .connect_with_timeout(std::time::Duration::from_secs(60))
                 .await
@@ -137,7 +153,12 @@ impl Builder for SparseMoEBuilder {
                     EngineError::Backend(format!("connect to {}:{}: {}", down.host, down.port, e))
                 })?;
             self.transport.downstream = Some(Arc::new(TokioMutex::new(client)));
-            info!(host = %down.host, port = down.port, "sparse-moe downstream connected");
+            info!(
+                host = %down.host,
+                port = down.port,
+                compression = compression.as_str(),
+                "sparse-moe downstream connected"
+            );
         }
 
         if let Some(srv) = self.transport.upstream.as_ref() {
