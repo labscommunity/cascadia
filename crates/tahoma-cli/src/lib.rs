@@ -15,7 +15,7 @@ use tahoma_engine_mock::MockBuilder;
 use tahoma_engine_openvino::{
     OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
 };
-use tahoma_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
+use tahoma_engine_sparse_moe::{LayerRangeStrategy, SparseMoEBuilder, SparseMoEBuilderConfig};
 use tahoma_runner::Runner;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use tracing::info;
@@ -131,6 +131,31 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Explicit MoE-layer slice for this rank, in `start..end` form
+    /// (half-open, 1-based — dense layer 0 is implicit). Overrides the
+    /// default even split. K2.6 has 60 MoE layers; e.g. on a 2-box
+    /// pipeline rank 0 might pass `--layer-range 1..29` and rank 1
+    /// `--layer-range 29..61` for a 28/32 split (moves 2 shells off
+    /// the bottleneck rank — see iter-003 / iter-081 instrumentation).
+    /// Currently only the `sparse-moe` engine honors this flag.
+    #[arg(long)]
+    pub layer_range: Option<String>,
+
+    /// Auto-rebalance strategy. `auto` reads per-stage timing
+    /// instrumentation and computes a balanced split; today it falls
+    /// back to the even split with a warning (iter-082 wires the
+    /// timing-driven logic). Mutually exclusive with `--layer-range`.
+    #[arg(long, value_enum)]
+    pub rank_balance: Option<RankBalance>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RankBalance {
+    /// Read instrumentation, rebalance automatically. **Skeleton only**
+    /// — falls back to even split with a warning until iter-082 wires
+    /// the timing-driven logic.
+    Auto,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -233,6 +258,36 @@ fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
     Ok((h.to_string(), p.parse().context("port")?))
 }
 
+/// Parse the `--layer-range` argument's `start..end` literal into a
+/// half-open pair. Rejects swapped / missing components early so the
+/// caller gets a clean clap-style error, not an `EngineError` 30
+/// seconds into model load. Range semantics (`start < end`, `start >=
+/// 1`, etc.) are validated by the engine against the actual manifest
+/// — we just need to get two parseable integers out of the literal
+/// here.
+fn parse_layer_range(s: &str) -> Result<(u32, u32)> {
+    let (start_s, end_s) = s.split_once("..").ok_or_else(|| {
+        anyhow!(
+            "--layer-range must be in `start..end` form (got {s:?}); \
+             e.g. `--layer-range 1..29` for the first 28 MoE layers"
+        )
+    })?;
+    let start: u32 = start_s
+        .trim()
+        .parse()
+        .with_context(|| format!("--layer-range start `{start_s}`"))?;
+    let end: u32 = end_s
+        .trim()
+        .parse()
+        .with_context(|| format!("--layer-range end `{end_s}`"))?;
+    if start >= end {
+        return Err(anyhow!(
+            "--layer-range start ({start}) must be < end ({end})"
+        ));
+    }
+    Ok((start, end))
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -316,10 +371,22 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
         }
         EngineKind::SparseMoe => {
+            if args.layer_range.is_some() && args.rank_balance.is_some() {
+                return Err(anyhow!(
+                    "--layer-range and --rank-balance are mutually exclusive; \
+                     pass one or the other"
+                ));
+            }
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
                 .with_rank(args.rank, args.total);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
+            }
+            if let Some(lr) = args.layer_range.as_deref() {
+                let (start, end) = parse_layer_range(lr)?;
+                cfg = cfg.with_layer_range_strategy(LayerRangeStrategy::Explicit { start, end });
+            } else if matches!(args.rank_balance, Some(RankBalance::Auto)) {
+                cfg = cfg.with_layer_range_strategy(LayerRangeStrategy::Auto);
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
@@ -662,4 +729,130 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         args.output_dir, args.num_stages, args.output_dir
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_layer_range_accepts_28_32_split_for_k26() {
+        // The headline iter-081 case: K2.6's 60 MoE layers split 28/32
+        // (rank 0 holds shells 1..29 = 28 layers, rank 1 holds 29..61
+        // = 32 layers + the head).
+        assert_eq!(parse_layer_range("1..29").unwrap(), (1, 29));
+        assert_eq!(parse_layer_range("29..61").unwrap(), (29, 61));
+    }
+
+    #[test]
+    fn parse_layer_range_tolerates_whitespace() {
+        // clap strips outer whitespace, but a defensive trim around
+        // the `..` lets `--layer-range "1 .. 29"` work too.
+        assert_eq!(parse_layer_range("1 .. 29").unwrap(), (1, 29));
+    }
+
+    #[test]
+    fn parse_layer_range_rejects_missing_separator() {
+        let err = parse_layer_range("1-29").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("start..end"), "got {msg}");
+    }
+
+    #[test]
+    fn parse_layer_range_rejects_non_numeric() {
+        assert!(parse_layer_range("foo..29").is_err());
+        assert!(parse_layer_range("1..bar").is_err());
+    }
+
+    #[test]
+    fn parse_layer_range_rejects_inverted_or_empty() {
+        // start >= end is a config error caught at the CLI boundary
+        // — engine-side validation catches it again as defense in
+        // depth, but the user-facing message is friendlier here.
+        assert!(parse_layer_range("29..1").is_err());
+        assert!(parse_layer_range("5..5").is_err());
+    }
+
+    #[test]
+    fn worker_args_parses_layer_range_flag() {
+        // Smoke-test the clap derive: --layer-range should be
+        // optional, and when passed it should round-trip through to
+        // WorkerArgs.layer_range as Some(string).
+        let cli = Cli::try_parse_from([
+            "tahoma",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "2",
+            "--model",
+            "/tmp/k26",
+            "--engine",
+            "sparse-moe",
+            "--layer-range",
+            "1..29",
+        ])
+        .expect("clap parse");
+        match cli.cmd {
+            Command::Worker(args) => {
+                assert_eq!(args.layer_range.as_deref(), Some("1..29"));
+                assert_eq!(args.rank_balance, None);
+            }
+            _ => panic!("expected Worker subcommand"),
+        }
+    }
+
+    #[test]
+    fn worker_args_parses_rank_balance_auto_flag() {
+        let cli = Cli::try_parse_from([
+            "tahoma",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "2",
+            "--model",
+            "/tmp/k26",
+            "--engine",
+            "sparse-moe",
+            "--rank-balance",
+            "auto",
+        ])
+        .expect("clap parse");
+        match cli.cmd {
+            Command::Worker(args) => {
+                assert_eq!(args.rank_balance, Some(RankBalance::Auto));
+                assert_eq!(args.layer_range, None);
+            }
+            _ => panic!("expected Worker subcommand"),
+        }
+    }
+
+    #[test]
+    fn worker_args_default_omits_balance_flags() {
+        // Critical: existing CLI invocations without the new flags
+        // must still parse, with both options coming out as None so
+        // the engine takes the historical even-split path.
+        let cli = Cli::try_parse_from([
+            "tahoma",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "2",
+            "--model",
+            "/tmp/k26",
+            "--engine",
+            "sparse-moe",
+        ])
+        .expect("clap parse");
+        match cli.cmd {
+            Command::Worker(args) => {
+                assert!(args.layer_range.is_none(), "default must be None");
+                assert!(args.rank_balance.is_none(), "default must be None");
+            }
+            _ => panic!("expected Worker subcommand"),
+        }
+    }
 }
