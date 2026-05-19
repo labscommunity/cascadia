@@ -73,6 +73,67 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 084 — Persistent prompt cache (disk persistence) — full (A) impl (2026-05-19 ~02:00 PT)
+
+Extends iter 060's in-memory KvPrefixCache to disk. Branch
+`perf/persistent-kv-cache-084` @ `1271dc2` (based on iter 060).
+
+**What shipped (+764 / -4):**
+- `kv_prefix_cache.rs`: `save_to_disk` / `load_from_disk` +
+  `LoadOutcome` / `PersistError` enums + 10 new tests
+- `engine.rs`: `kv_prefix_cache_path: Option<PathBuf>` on
+  `SparseMoEBuilderConfig`; load on `Builder::build`, save on
+  `Engine::close`
+- `lib.rs`: re-export `LoadOutcome` + `PersistError`
+- `Cargo.toml`: `bincode = workspace`
+- `tahoma-cli/lib.rs`: `--kv-prefix-cache-path <PATH>` flag
+
+**File format (little-endian, packed):**
+```
+MAGIC (8 bytes = b"TAHKVPC\0") + FORMAT_VERSION (u32=0)
++ fingerprint_len (u32) + bincode(ModelFingerprint)
++ entry_count (u32)
++ for each entry: entry_len (u32) + bincode((Vec<i64>, KvSnapshot))
+```
+Length-prefixing per entry → **torn tail-write loses only the
+truncated entry**, not the whole file.
+
+**Atomic write:** sibling tempfile + `fs::rename`.
+
+**Fingerprint check:** reused iter 060's `ModelFingerprint`.
+Mismatch → `LoadOutcome::FingerprintMismatch`, cache untouched, warn
+logged, no panic.
+
+**Default off:** `kv_prefix_cache_path = None` keeps iter 060
+behavior byte-identical.
+
+**Tests (10 new, 23 module, 42 crate total):**
+- `save_load_round_trip_is_byte_identical` (load-bearing)
+- `load_rejects_fingerprint_mismatch` — fp_a saved, fp_b loaded →
+  empty
+- `load_rejects_bad_magic_without_crashing` — garbage → Corrupted
+- `load_unsupported_version_is_corrupted` — wrong version
+- `load_truncated_entry_keeps_earlier_entries` — chop tail, no panic
+- `save_disabled_cache_is_noop`, `save_empty_cache_is_noop` — no
+  0-byte stubs
+- `load_preserves_mru_order` — MRU on disk stays MRU after reload
+- `save_to_existing_dir_writes_default_filename` — dir →
+  `rank_00.bin`
+- `load_missing_file_is_not_found` — cold-start path
+
+**Workspace:** `cargo build` + 42 unit + 12 integration tests pass.
+fmt + clippy clean.
+
+**Multi-stage:** inherited iter 060 limitation (single-stage only).
+`DEFAULT_FILENAME = rank_00.bin` is forward-compatible with future
+per-rank sharding without CLI change.
+
+**Composes for chat:** iter 060 in-memory saves prefill on cache
+hit within one process; iter 084 extends that win across process
+restarts. Cold start = warm start when persistence path is set.
+
+---
+
 ## 085 — Sparse softmax router — NEGATIVE: premise wrong (router is sigmoid, sigmoid is 0.0002%) (2026-05-19 ~01:55 PT)
 
 Path C investigation; decisive skip. Branch `perf/sparse-softmax-085`
