@@ -73,6 +73,58 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 088 — Cross-layer expert sharing detection — Track C+B (2026-05-19 ~02:55 PT)
+
+Branch `perf/cross-layer-expert-share-088` @ `f15b0f3`. Tracks when
+SAME expert ID fires in consecutive layers; reorders dispatch to
+keep weights L3-warm across layer boundary.
+
+**(C) Investigation infrastructure:**
+- `Runner::expert_hits` per-(layer-pos, expert) count
+- `Runner::last_layer_routing_ids: HashSet<u32>` — IDs from previous
+  layer, cleared at each forward_shells call
+- `cross_layer_total` / `cross_layer_overlap` counters →
+  share-fraction metric `overlap / total` via
+  `cross_layer_share_snapshot()`
+- Optional per-(prev-pos, this-pos, eid) co-occurrence map gated by
+  `--cross-layer-pair-tracking` (off by default — keeps work
+  proportional to top-K)
+- One debug! log per token emitting running share fraction
+
+**(B) Skeleton — opt-in cross-layer-aware dispatch reorder:**
+- `--cross-layer-dispatch` CLI flag → `Runner::set_cross_layer_
+  dispatch(true)`
+- `forward_shells` restructured into Phase 1 / 2 / 3 pattern (same
+  as iter 056). **Phase 3 walks ascending `k = 0..top_k` for weighted
+  sum so output is bit-identical regardless of Phase 2 dispatch
+  order** (load-bearing FP-rounding invariant)
+- Pure helper `cross_layer_dispatch_order(routing_ids,
+  prev_layer_ids)` returns permutation putting shared experts first,
+  in router-score order among themselves
+
+**Tests:** 7 new unit tests on helper. 23/23 sparse-moe lib + 5/5
+engine_smoke + 1/1 K2.6 layer-0 eval pass. K2.6 integration test
+implicitly validates 3-phase loop with default-off flags.
+
+**Design decision:** iter 054 expert_hits + iter 056
+cache_aware_dispatch_order live on unmerged research branches.
+Built standalone with same shape for trivial future dedupe.
+
+**Honest blockers:**
+- No measured share rate (framework only). Numbers require
+  `--cross-layer-pair-tracking` on miner with representative
+  prompts, then snapshot
+- No e2e tok/s claim. Reorder is bit-identical; L3 hit-rate change
+  depends on (a) actual share rate the C investigation reveals,
+  (b) AVX-512 GEMM's own prefetch behavior
+- **Pipeline-parallel cap:** `last_layer_routing_ids` is per-Runner,
+  so rank boundary breaks share signal (1st layer of rank R+1 sees
+  `{}`). Caps reorder benefit by 1/N for N-stage pipelines.
+
+`cargo fmt --check` + clippy clean.
+
+---
+
 ## 089 — SSE streaming aggregator — NEGATIVE (overhead is invisible) (2026-05-19 ~02:45 PT)
 
 Path C investigation; decisive skip. Branch `perf/sse-aggregator-089`
