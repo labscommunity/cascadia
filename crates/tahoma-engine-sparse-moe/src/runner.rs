@@ -991,12 +991,46 @@ impl Runner {
     ///
     /// Returns the generated tokens (excluding the prompt; excluding
     /// any trailing EOS).
+    ///
+    /// # Adaptive K
+    ///
+    /// Pass `adaptive_k_cfg = Some(cfg)` to opt into dynamic draft
+    /// length: each round's K is capped at
+    /// [`crate::spec_decode::AdaptiveK::current_k`], and the
+    /// controller observes the round's `(accepted, drafts_proposed)`
+    /// counts before the next round. With `None` (default), the
+    /// `draft`'s own `draft_k` is the round budget — i.e. static-K
+    /// behavior, byte-identical to pre-iter-083.
+    ///
+    /// The controller's initial K should match the draft's `draft_k`
+    /// so the first round's behavior is identical with or without
+    /// adaptive mode (only adjustment fires from round
+    /// `cfg.window + 1` onward). Caller responsibility to keep these
+    /// in sync — the runner does not enforce a coupling because the
+    /// draft's K is a hard ceiling (n-gram lookup truncates at that
+    /// length) while AdaptiveK's K is the per-round target. Setting
+    /// `draft.with_draft_k(cfg.k_max)` is the recommended pattern.
     pub fn generate_speculative(
         &mut self,
         prompt_ids: &[i64],
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
         draft: &mut crate::ngram_draft::Draft,
+    ) -> Result<Vec<i64>, RunnerError> {
+        self.generate_speculative_with_adaptive(prompt_ids, max_tokens, cfg, draft, None)
+    }
+
+    /// Underlying impl of [`Self::generate_speculative`] that takes an
+    /// optional [`crate::spec_decode::AdaptiveKConfig`]. Public so the
+    /// engine wrapper can call it directly without re-routing through
+    /// `Option::None` when the operator wants dynamic K.
+    pub fn generate_speculative_with_adaptive(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        draft: &mut crate::ngram_draft::Draft,
+        adaptive_k_cfg: Option<crate::spec_decode::AdaptiveKConfig>,
     ) -> Result<Vec<i64>, RunnerError> {
         // Non-greedy sampling falls through to the standard path —
         // greedy-acceptance spec decode would change the output
@@ -1007,6 +1041,11 @@ impl Runner {
 
         self.reset_kv();
         draft.reset();
+        // Construct the dynamic-K controller (if requested). Its
+        // `current_k()` becomes a per-round cap on `drafts.truncate(...)`
+        // below. Static-K behavior (`adaptive_k_cfg = None`) just lets
+        // the draft propose up to its own `draft_k`.
+        let mut adaptive_k = adaptive_k_cfg.map(crate::spec_decode::AdaptiveK::new);
         let eos: Vec<i64> = self
             .manifest
             .eos_token_ids
@@ -1060,6 +1099,18 @@ impl Runner {
             if drafts.len() > budget {
                 drafts.truncate(budget);
             }
+            // Adaptive-K cap: if dynamic-K is enabled, the controller's
+            // current_k() is the round's max draft count. The draft
+            // itself may propose more (up to its own draft_k); we cap
+            // before running verify forwards so we never pay for
+            // forwards we'd discard. Static-K mode (controller=None)
+            // skips this cap and lets the draft's own limit apply.
+            if let Some(ak) = adaptive_k.as_ref() {
+                let cap = ak.current_k();
+                if drafts.len() > cap {
+                    drafts.truncate(cap);
+                }
+            }
 
             // Path 1: empty proposal → fall back to one standard
             // forward step. Same cost as plain `generate`, plus a
@@ -1100,6 +1151,20 @@ impl Runner {
             // and target_samples. See [`crate::spec_decode::count_accepted`].
             let accepted = crate::spec_decode::count_accepted(&drafts, &target_samples);
             n_accepted_total += accepted as u32;
+            // Feed the dynamic-K controller (no-op in static-K mode).
+            // Observed BEFORE the bonus forward / reconcile so the next
+            // round's K is set before drafts.propose() runs next iter.
+            if let Some(ak) = adaptive_k.as_mut() {
+                let new_k = ak.observe_round(accepted, drafts.len());
+                debug!(
+                    round = n_rounds,
+                    accepted,
+                    proposed = drafts.len(),
+                    next_k = new_k,
+                    window_fill = ak.window_len(),
+                    "adaptive_k observe"
+                );
+            }
 
             // 4. Bonus token: target's prediction at the first
             // rejection boundary (in the partial-accept case), OR the

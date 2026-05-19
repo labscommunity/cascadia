@@ -123,6 +123,16 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 5)]
     pub spec_k: u32,
 
+    /// Enable per-request dynamic spec-decode draft length (iter 083).
+    /// Sparse-MoE engine only. The `--spec-k` value is the starting K;
+    /// the runner observes the accept rate over a sliding window of 8
+    /// rounds and adjusts K up (when accept rate > 0.7, K += 2, capped
+    /// at 16) or down (when accept rate < 0.3, K -= 1, floored at 2).
+    /// Default off — explicit `--spec-k` keeps the static-K behavior.
+    /// Ignored when spec decode is not enabled (no `--prompt-lookup`).
+    #[arg(long, default_value_t = false)]
+    pub spec_k_adaptive: bool,
+
     /// Enable Prompt Lookup decoding with n-gram size N. Mutually
     /// exclusive with --draft-model.
     #[arg(long, default_value_t = 0)]
@@ -355,6 +365,23 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             };
             if let Some(k) = spec_k {
                 cfg = cfg.with_spec_decode_k(k);
+                // Honor --spec-k-adaptive only when spec decode is on.
+                // Defensive: passing the flag without --prompt-lookup
+                // is a misconfiguration we silently drop (no spec
+                // round = no controller observations = no adjustment
+                // would fire anyway).
+                if args.spec_k_adaptive {
+                    cfg = cfg.with_spec_decode_k_adaptive(true);
+                }
+            } else if args.spec_k_adaptive {
+                // Loud-warn: operator passed --spec-k-adaptive without
+                // --prompt-lookup, which means no spec decode = no
+                // controller. Easy mistake to make; flag it so they
+                // notice before queuing a long bench.
+                tracing::warn!(
+                    "--spec-k-adaptive has no effect without --prompt-lookup > 0 \
+                     (spec decode is disabled — the controller would never run)"
+                );
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }

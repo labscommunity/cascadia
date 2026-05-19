@@ -65,6 +65,24 @@ pub struct SparseMoEBuilderConfig {
     ///   transparently service ForwardBatch alongside the per-token
     ///   path — no per-rank flag needed.
     pub spec_decode_k: Option<u32>,
+    /// Opt-in to per-request dynamic draft length (iter 083).
+    ///
+    /// When `true`, the engine constructs a
+    /// [`crate::spec_decode::AdaptiveK`] controller per request,
+    /// seeded with `spec_decode_k` as the starting K. Each round's
+    /// observed accept rate (sliding window of
+    /// [`crate::spec_decode::AdaptiveKConfig::window`] rounds, default
+    /// 8) feeds back into the controller; K rises by `up_step` when
+    /// the windowed accept rate exceeds `up_threshold`, and falls by
+    /// `down_step` when it falls below `down_threshold`. Clamped to
+    /// `[k_min, k_max]`.
+    ///
+    /// Default `false` (static K, byte-identical to pre-iter-083).
+    /// Honored on both single-stage and pipeline-parallel paths.
+    /// Ignored when `spec_decode_k` is `None` (no spec decode in the
+    /// first place) or when sampling temperature > 0 (the spec-decode
+    /// path falls through to plain `generate` in that case).
+    pub spec_decode_k_adaptive: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -79,6 +97,7 @@ impl SparseMoEBuilderConfig {
             top_k_override: None,
             routing_threshold: None,
             spec_decode_k: None,
+            spec_decode_k_adaptive: false,
         }
     }
 
@@ -88,10 +107,18 @@ impl SparseMoEBuilderConfig {
         self
     }
 
-    /// Enable speculative decoding with the given draft K. Single-stage
-    /// only; ignored on multi-stage configs.
+    /// Enable speculative decoding with the given draft K.
     pub fn with_spec_decode_k(mut self, k: u32) -> Self {
         self.spec_decode_k = if k == 0 { None } else { Some(k) };
+        self
+    }
+
+    /// Enable dynamic-K adaptation (iter 083). The K from
+    /// [`Self::with_spec_decode_k`] becomes the initial K; the
+    /// controller adjusts it per round based on the observed accept
+    /// rate. No-op when spec decode is not enabled in the first place.
+    pub fn with_spec_decode_k_adaptive(mut self, adaptive: bool) -> Self {
+        self.spec_decode_k_adaptive = adaptive;
         self
     }
 }
@@ -307,6 +334,7 @@ impl Builder for SparseMoEBuilder {
         // ForwardBatch frames. Worker ranks transparently service either
         // path — they handle ForwardBatch frames as they arrive.
         let spec_decode_k = self.config.spec_decode_k;
+        let spec_decode_k_adaptive = self.config.spec_decode_k_adaptive;
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -320,6 +348,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
             spec_decode_k,
+            spec_decode_k_adaptive,
         }))
     }
 }
@@ -412,6 +441,13 @@ pub struct SparseMoEEngine {
     /// decode with draft K. Only honored when `total == 1` — checked at
     /// engine construction. None = plain greedy / sampled generate.
     spec_decode_k: Option<u32>,
+    /// Mirror of [`SparseMoEBuilderConfig::spec_decode_k_adaptive`].
+    /// When true and `spec_decode_k` is `Some`, every spec-decode
+    /// generation constructs a fresh
+    /// [`crate::spec_decode::AdaptiveK`] controller seeded with
+    /// `spec_decode_k` as `k_start`. Per-request, so different prompts
+    /// can land at different K's without cross-talk.
+    spec_decode_k_adaptive: bool,
 }
 
 impl SparseMoEEngine {
@@ -564,16 +600,37 @@ impl SparseMoEEngine {
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
         let generated = if use_spec {
             let k = self.spec_decode_k.unwrap();
-            let mut draft = crate::ngram_draft::Draft::new().with_draft_k(k as usize);
+            // Adaptive-K mode (iter 083): seed the controller with K as
+            // k_start. Set the draft's per-round ceiling to k_max so it
+            // can propose up to the controller's growth cap; otherwise
+            // the draft would silently truncate at the static K. In
+            // static mode we keep the historical behavior (draft K == K).
+            let adaptive_k_cfg = if self.spec_decode_k_adaptive {
+                Some(crate::spec_decode::AdaptiveKConfig::new_with_start(
+                    k as usize,
+                ))
+            } else {
+                None
+            };
+            let draft_ceiling = adaptive_k_cfg
+                .as_ref()
+                .map(|c| c.k_max)
+                .unwrap_or(k as usize);
+            let mut draft = crate::ngram_draft::Draft::new().with_draft_k(draft_ceiling);
             info!(
                 task = %task.task_id,
                 draft_k = k,
+                adaptive = self.spec_decode_k_adaptive,
+                draft_ceiling,
                 "using n-gram speculative decode"
             );
-            match self
-                .runner
-                .generate_speculative(&prompt_ids, max_new, &sampling_cfg, &mut draft)
-            {
+            match self.runner.generate_speculative_with_adaptive(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                &mut draft,
+                adaptive_k_cfg,
+            ) {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "runner spec-decode failed: {e}");
@@ -660,17 +717,34 @@ impl SparseMoEEngine {
             self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
         let result_tokens = if use_spec {
             let k = self.spec_decode_k.unwrap();
+            // Adaptive-K (iter 083) — same pattern as the single-stage
+            // path. The draft's per-round ceiling is k_max so the
+            // controller can grow K past the initial value.
+            let adaptive_k_cfg = if self.spec_decode_k_adaptive {
+                Some(crate::spec_decode::AdaptiveKConfig::new_with_start(
+                    k as usize,
+                ))
+            } else {
+                None
+            };
+            let draft_ceiling = adaptive_k_cfg
+                .as_ref()
+                .map(|c| c.k_max)
+                .unwrap_or(k as usize);
             info!(
                 task = %task.task_id,
                 draft_k = k,
+                adaptive = self.spec_decode_k_adaptive,
+                draft_ceiling,
                 "using n-gram speculative decode (pipeline-parallel)"
             );
-            match self.drive_generation_first_spec(
+            match self.drive_generation_first_spec_with_adaptive(
                 &prompt_ids,
                 max_new,
-                k as usize,
+                draft_ceiling,
                 &sampling_cfg,
                 &downstream,
+                adaptive_k_cfg,
             ) {
                 Ok(g) => g,
                 Err(e) => {
@@ -856,19 +930,26 @@ impl SparseMoEEngine {
     /// Greedy-only by construction — temperature > 0 would change the
     /// distribution under greedy acceptance; callers must dispatch the
     /// non-greedy path to `drive_generation_first` instead.
-    fn drive_generation_first_spec(
+    ///
+    /// When `adaptive_k_cfg` is `Some(_)`, the driver caps each round's
+    /// draft proposal at [`crate::spec_decode::AdaptiveK::current_k`]
+    /// and feeds round outcomes back into the controller (iter 083).
+    /// `None` keeps static-K behavior, byte-identical to pre-iter-083.
+    fn drive_generation_first_spec_with_adaptive(
         &mut self,
         prompt_ids: &[i64],
         max_new: usize,
         draft_k: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        adaptive_k_cfg: Option<crate::spec_decode::AdaptiveKConfig>,
     ) -> Result<Vec<i64>, String> {
         let mut draft = crate::ngram_draft::Draft::new().with_draft_k(draft_k);
         // Reset state on both ends. Rank-0's runner.reset_kv was
         // already called by the caller (step_first sends Reset
         // downstream and clears its own KV); we just need draft reset.
         draft.reset();
+        let mut adaptive_k = adaptive_k_cfg.map(crate::spec_decode::AdaptiveK::new);
 
         let eos: Vec<i64> = self
             .runner
@@ -914,6 +995,14 @@ impl SparseMoEEngine {
             if drafts.len() > budget {
                 drafts.truncate(budget);
             }
+            // Adaptive-K cap (mirrors the single-stage runner path).
+            // No-op in static-K mode (controller = None).
+            if let Some(ak) = adaptive_k.as_ref() {
+                let cap = ak.current_k();
+                if drafts.len() > cap {
+                    drafts.truncate(cap);
+                }
+            }
 
             // No proposal → fall back to one standard forward step.
             if drafts.is_empty() {
@@ -945,6 +1034,18 @@ impl SparseMoEEngine {
             // Acceptance: longest matching prefix.
             let accepted = crate::spec_decode::count_accepted(&drafts, &target_samples);
             n_accepted_total += accepted as u32;
+            // Feed the dynamic-K controller (no-op in static-K mode).
+            if let Some(ak) = adaptive_k.as_mut() {
+                let new_k = ak.observe_round(accepted, drafts.len());
+                tracing::debug!(
+                    round = n_rounds,
+                    accepted,
+                    proposed = drafts.len(),
+                    next_k = new_k,
+                    window_fill = ak.window_len(),
+                    "adaptive_k observe (pipeline-parallel)"
+                );
+            }
 
             let bonus_forward_ran = accepted == drafts.len();
             let bonus: i64 = if !bonus_forward_ran {
