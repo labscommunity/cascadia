@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use half::bf16;
 use tahoma_int4_gemm::layer0_int4::{
-    embed_token_bf16, layer0_forward_decode_int4_with_capacity, Int4Layer0,
+    embed_token_bf16, embed_token_int4, layer0_forward_decode_int4_with_capacity, Int4Embedding,
+    Int4Layer0,
 };
 use tahoma_int4_gemm::safetensors_source::Shard;
 use tahoma_int4_gemm::shell::{NUM_HEADS, QK_HEAD_DIM, V_HEAD_DIM};
@@ -71,20 +72,60 @@ struct LayerState {
     kv_capacity: usize,
 }
 
-/// First-stage layer-0 state: Rust int4 forward + KV cache + a
-/// pinned mmap of the bf16 embed_tokens table.
+/// Source of the embed_tokens table for the one-row-per-token
+/// lookup. The choice is fixed at Runner load time:
+/// - `Bf16Mmap`: zero-copy mmap of `embed_tokens.weight` from the
+///   safetensors shard (~2.34 GB resident at steady state — only the
+///   touched rows are paged in, but in practice almost every row gets
+///   touched at warmup). The shard Arc is held to keep the mmap
+///   valid for the slice's lifetime.
+/// - `Int4Owned`: int4 + bf16-scales table built once at load (~660 MB
+///   resident, heap-owned so never page-evicted). Quantization is
+///   one-shot, ~30 s on the miner Xeon for the full K2.6 vocab. The
+///   per-token lookup dequantizes one row in scalar code; this is
+///   negligible vs the per-layer GEMV cost.
+enum EmbeddingTable {
+    Bf16Mmap {
+        /// Keeps the embed_tokens mmap alive as long as we hold the slice.
+        _pin: Arc<Shard>,
+        /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
+        bytes: &'static [u8],
+    },
+    Int4Owned(Int4Embedding),
+}
+
+impl EmbeddingTable {
+    /// Resident bytes attributable to this embedding table on the heap
+    /// / in the mmap'd region. For the bf16 mmap this is the file
+    /// size (the OS may not have paged it all in, but RSS-vs-VSZ is
+    /// the operator's concern).
+    fn footprint_bytes(&self) -> usize {
+        match self {
+            EmbeddingTable::Bf16Mmap { bytes, .. } => bytes.len(),
+            EmbeddingTable::Int4Owned(e) => e.footprint_bytes(),
+        }
+    }
+
+    /// One-token embedding lookup, returns f32 [HIDDEN]. Same contract
+    /// regardless of the underlying storage mode.
+    fn embed(&self, token_id: i64) -> Vec<f32> {
+        match self {
+            EmbeddingTable::Bf16Mmap { bytes, .. } => embed_token_bf16(bytes, token_id),
+            EmbeddingTable::Int4Owned(e) => embed_token_int4(e, token_id),
+        }
+    }
+}
+
+/// First-stage layer-0 state: Rust int4 forward + KV cache + the
+/// embed_tokens table (bf16 mmap or int4 owned, picked at load time).
 ///
 /// The original code ran the layer-0 OV IR stateless on the full
 /// prefix for every decode step (O(N²) attention across a generation).
 /// This struct gives layer 0 its own pre-allocated KV cache so it
-/// joins the shells on the O(N) per-token path. The embed_tokens
-/// lookup is done in Rust against a mmap'd safetensors shard.
+/// joins the shells on the O(N) per-token path.
 struct Layer0State {
     int4_layer0: Int4Layer0,
-    /// Keeps the embed_tokens mmap alive as long as we hold the slice.
-    _embed_pin: Arc<Shard>,
-    /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
-    embed_tokens_bf16: &'static [u8],
+    embed: EmbeddingTable,
     past_k: Vec<f32>,
     past_v: Vec<f32>,
     past_seq_len: usize,
@@ -232,6 +273,7 @@ impl Runner {
         device: &str,
         plugin: PluginConfig,
         range: LayerRange,
+        int4_embedding: bool,
     ) -> Result<Self, RunnerError> {
         let manifest = Manifest::load(&model_dir)?;
         info!(
@@ -296,17 +338,62 @@ impl Runner {
             let (embed_pin, embed_bytes) = safetensors_source
                 .embed_tokens()
                 .map_err(|e| RunnerError::Internal(format!("safetensors embed_tokens: {e}")))?;
+            let embed = if int4_embedding {
+                // One-shot quantize the entire vocab. Streams row-by-row
+                // so we never hold the full f32 expansion; peak transient
+                // beyond the int4 output is a single row's f32 buffer
+                // inside the bf16 → int4 helper.
+                let vocab = manifest.vocab_size as usize;
+                let q_t0 = Instant::now();
+                let quantized = Int4Embedding::from_bf16_table(embed_bytes, vocab);
+                info!(
+                    bf16_bytes = embed_bytes.len(),
+                    int4_bytes = quantized.footprint_bytes(),
+                    quantize_secs = q_t0.elapsed().as_secs_f64(),
+                    "quantized embed_tokens to int4 (group=32 sym)"
+                );
+                // Drop the local mmap pin. NB: the
+                // `SafetensorsExpertSource` shard cache (line
+                // ~177-186) still holds an Arc on this shard for any
+                // other tensor the engine needs from the same file;
+                // until the Source is dropped the mmap region itself
+                // stays live. The OS page cache, however, is free to
+                // evict the untouched bf16 embed_tokens pages once
+                // nothing in the per-token decode path reads them —
+                // which is the actual RSS win on Linux (the kernel
+                // page-reclaims cold mmap pages under memory pressure
+                // even with the VMA still mapped). On Windows the
+                // page-evict heuristics are weaker; expect a smaller
+                // RSS delta there until the Source itself is dropped
+                // at process exit. The int4 packed buffer (~660 MB,
+                // heap-owned, never evicted) is the meaningful
+                // long-term resident memory for embedding lookups.
+                drop(embed_pin);
+                EmbeddingTable::Int4Owned(quantized)
+            } else {
+                info!(
+                    bf16_bytes = embed_bytes.len(),
+                    "using bf16 mmap'd embed_tokens (set int4_embedding=true to quantize)"
+                );
+                EmbeddingTable::Bf16Mmap {
+                    _pin: embed_pin,
+                    bytes: embed_bytes,
+                }
+            };
+            let embed_footprint_mb = embed.footprint_bytes() as f64 / (1024.0 * 1024.0);
             let cap = INITIAL_KV_CAPACITY;
             layer0_holder = Some(Layer0State {
                 int4_layer0,
-                _embed_pin: embed_pin,
-                embed_tokens_bf16: embed_bytes,
+                embed,
                 past_k: vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM],
                 past_v: vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM],
                 past_seq_len: 0,
                 kv_capacity: cap,
             });
-            info!("constructed Rust int4 layer 0 + embed_tokens mmap");
+            info!(
+                embed_mode = if int4_embedding { "int4" } else { "bf16-mmap" },
+                embed_footprint_mb, "constructed Rust int4 layer 0"
+            );
         } else {
             info!("skipping layer 0 (not first stage)");
         }
@@ -529,7 +616,7 @@ impl Runner {
             RunnerError::Internal("forward_layer0_step on non-first stage".into())
         })?;
 
-        let x_f32 = embed_token_bf16(l0.embed_tokens_bf16, token_id);
+        let x_f32 = l0.embed.embed(token_id);
 
         if l0.past_seq_len + 1 > l0.kv_capacity {
             grow_layer0_kv_capacity(l0)?;

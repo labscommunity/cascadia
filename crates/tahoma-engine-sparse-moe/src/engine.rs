@@ -42,6 +42,13 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// If true, quantize the embed_tokens table to int4 (group=32 sym
+    /// with bf16 scales) at load time. Frees ~1.7 GB of resident RAM
+    /// on K2.6 (2.34 GB bf16 → ~660 MB int4) at the cost of a one-shot
+    /// quantize at startup. Off by default to preserve byte-for-byte
+    /// compatibility with the bf16 mmap baseline; opt in via
+    /// `--int4-embedding` on the worker CLI.
+    pub int4_embedding: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +60,18 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            int4_embedding: false,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    pub fn with_int4_embedding(mut self, on: bool) -> Self {
+        self.int4_embedding = on;
         self
     }
 }
@@ -207,6 +220,7 @@ impl Builder for SparseMoEBuilder {
         let cfg = self.config.clone();
         let plugin_for_worker = plugin.clone();
         let range_for_worker = range.clone();
+        let int4_embedding = cfg.int4_embedding;
         let (tx, rx) = std::sync::mpsc::channel();
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
             tx.send(LoadProgress::message("loading sparse-MoE model"))
@@ -216,6 +230,7 @@ impl Builder for SparseMoEBuilder {
                 &cfg.device,
                 plugin_for_worker,
                 range_for_worker,
+                int4_embedding,
             )
         });
 

@@ -24,6 +24,7 @@ fn run_prompt(model_dir: &PathBuf, prompt: &str, expected_substr: &str, max_new:
         "CPU",
         PluginConfig::new(),
         tahoma_engine_sparse_moe::runner::LayerRange::full(),
+        false, // int4_embedding: keep bf16 path as the eval baseline
     )
     .expect("Runner::load");
 

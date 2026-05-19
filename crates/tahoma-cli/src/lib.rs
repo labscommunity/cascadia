@@ -131,6 +131,14 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// (sparse-moe only) Quantize the embed_tokens table to int4
+    /// (group=32 sym, bf16 scales) at load time. Frees ~1.7 GB of
+    /// resident RAM on K2.6 (2.34 GB bf16 → ~660 MB int4) so the OS
+    /// can keep more pinned experts / page cache hot. Off by default
+    /// to preserve byte-for-byte parity with the bf16 baseline.
+    #[arg(long, default_value_t = false)]
+    pub int4_embedding: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +325,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_int4_embedding(args.int4_embedding);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
