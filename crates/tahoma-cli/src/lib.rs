@@ -149,6 +149,28 @@ pub struct WorkerArgs {
     /// autolab campaign 007.
     #[arg(long)]
     pub routing_threshold: Option<f32>,
+
+    /// Use lookahead-decoding (Fu et al. 2023) semantics for the
+    /// n-gram draft (sparse-moe engine only). Default off; iter 036
+    /// prompt-lookup behavior — a single unified table where
+    /// generated tokens can overwrite prompt-derived entries —
+    /// remains the default.
+    ///
+    /// When set, the prompt's k-gram → next-token table is
+    /// snapshotted at warm time and preserved across generation;
+    /// lookup queries both tables and prefers (a) the longest
+    /// matching k-gram and (b) the prompt's continuation on
+    /// equal-length ties (so the model echoing a prompt phrase
+    /// recovers the document's continuation even if generation
+    /// transiently overwrote the same k-gram with a different
+    /// successor). Empirically improves accept rate on
+    /// documents-with-repeated-phrases workloads (summarization,
+    /// refactor, QA over a doc).
+    ///
+    /// No effect without `--prompt-lookup` (which is what enables
+    /// the n-gram spec-decode path on sparse-moe).
+    #[arg(long, default_value_t = false)]
+    pub lookahead_decoding: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -356,6 +378,13 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(k) = spec_k {
                 cfg = cfg.with_spec_decode_k(k);
             }
+            // Lookahead-decoding (iter 061) is an opt-in semantic
+            // tweak to the n-gram draft. It has no effect unless
+            // spec_decode_k is also set; we still propagate the flag
+            // unconditionally so the engine logs the chosen mode
+            // (`lookahead=true/false`) regardless of whether spec is
+            // active.
+            cfg = cfg.with_spec_decode_lookahead(args.lookahead_decoding);
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

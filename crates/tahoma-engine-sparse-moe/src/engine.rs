@@ -65,6 +65,18 @@ pub struct SparseMoEBuilderConfig {
     ///   transparently service ForwardBatch alongside the per-token
     ///   path — no per-rank flag needed.
     pub spec_decode_k: Option<u32>,
+    /// If true, the n-gram draft uses **lookahead-decoding**
+    /// (Fu et al. 2023) semantics: the prompt's k-gram → next-token
+    /// map is snapshotted at warm time and never overwritten by
+    /// generation. Default `false` — iter 036 prompt-lookup
+    /// behavior, which uses a single unified table.
+    ///
+    /// Only meaningful when `spec_decode_k.is_some()`; ignored
+    /// otherwise. See [`crate::ngram_draft::Draft::with_lookahead`]
+    /// for the algorithm and the documents-with-repeated-phrases
+    /// motivation. Plumbed through to both the single-stage and
+    /// pipeline-parallel spec-decode driver paths in this engine.
+    pub spec_decode_lookahead: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -79,6 +91,7 @@ impl SparseMoEBuilderConfig {
             top_k_override: None,
             routing_threshold: None,
             spec_decode_k: None,
+            spec_decode_lookahead: false,
         }
     }
 
@@ -92,6 +105,14 @@ impl SparseMoEBuilderConfig {
     /// only; ignored on multi-stage configs.
     pub fn with_spec_decode_k(mut self, k: u32) -> Self {
         self.spec_decode_k = if k == 0 { None } else { Some(k) };
+        self
+    }
+
+    /// Enable lookahead-decoding semantics for the n-gram draft. No
+    /// effect unless `spec_decode_k` is also set. Default off — iter
+    /// 036 prompt-lookup behavior is preserved when this is false.
+    pub fn with_spec_decode_lookahead(mut self, on: bool) -> Self {
+        self.spec_decode_lookahead = on;
         self
     }
 }
@@ -307,6 +328,7 @@ impl Builder for SparseMoEBuilder {
         // ForwardBatch frames. Worker ranks transparently service either
         // path — they handle ForwardBatch frames as they arrive.
         let spec_decode_k = self.config.spec_decode_k;
+        let spec_decode_lookahead = self.config.spec_decode_lookahead;
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -320,6 +342,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
             spec_decode_k,
+            spec_decode_lookahead,
         }))
     }
 }
@@ -412,6 +435,12 @@ pub struct SparseMoEEngine {
     /// decode with draft K. Only honored when `total == 1` — checked at
     /// engine construction. None = plain greedy / sampled generate.
     spec_decode_k: Option<u32>,
+    /// If true, the n-gram draft used by spec-decode runs in
+    /// lookahead-decoding mode (Fu et al. 2023): the prompt's k-gram
+    /// table survives generated-token appends. Honored on both
+    /// single-stage and pipeline-parallel spec paths. Ignored when
+    /// `spec_decode_k.is_none()`.
+    spec_decode_lookahead: bool,
 }
 
 impl SparseMoEEngine {
@@ -564,10 +593,14 @@ impl SparseMoEEngine {
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
         let generated = if use_spec {
             let k = self.spec_decode_k.unwrap();
-            let mut draft = crate::ngram_draft::Draft::new().with_draft_k(k as usize);
+            let lookahead = self.spec_decode_lookahead;
+            let mut draft = crate::ngram_draft::Draft::new()
+                .with_draft_k(k as usize)
+                .with_lookahead(lookahead);
             info!(
                 task = %task.task_id,
                 draft_k = k,
+                lookahead,
                 "using n-gram speculative decode"
             );
             match self
@@ -660,15 +693,18 @@ impl SparseMoEEngine {
             self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
         let result_tokens = if use_spec {
             let k = self.spec_decode_k.unwrap();
+            let lookahead = self.spec_decode_lookahead;
             info!(
                 task = %task.task_id,
                 draft_k = k,
+                lookahead,
                 "using n-gram speculative decode (pipeline-parallel)"
             );
             match self.drive_generation_first_spec(
                 &prompt_ids,
                 max_new,
                 k as usize,
+                lookahead,
                 &sampling_cfg,
                 &downstream,
             ) {
@@ -861,10 +897,13 @@ impl SparseMoEEngine {
         prompt_ids: &[i64],
         max_new: usize,
         draft_k: usize,
+        lookahead: bool,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<Vec<i64>, String> {
-        let mut draft = crate::ngram_draft::Draft::new().with_draft_k(draft_k);
+        let mut draft = crate::ngram_draft::Draft::new()
+            .with_draft_k(draft_k)
+            .with_lookahead(lookahead);
         // Reset state on both ends. Rank-0's runner.reset_kv was
         // already called by the caller (step_first sends Reset
         // downstream and clears its own KV); we just need draft reset.
