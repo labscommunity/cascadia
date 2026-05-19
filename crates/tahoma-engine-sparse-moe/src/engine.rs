@@ -68,6 +68,13 @@ pub struct SparseMoEBuilderConfig {
     /// pin pass fires. Default 16 decoded tokens (one sentence worth
     /// of router decisions). 0 = pin on the first forward_shells call.
     pub pin_after_tokens: Option<u32>,
+    /// autolab iter 056 (cache-aware dispatch): when `true`, reorder
+    /// the per-layer top-K dispatch loop in `forward_shells` by
+    /// descending `expert_hits[i]` (the same fire-count map iter 054
+    /// uses for pinning) so the hottest experts run first and stay
+    /// L3-resident across layers. Output is bit-identical to the
+    /// router-score order. Default `false` for back-compat.
+    pub cache_aware_dispatch: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -84,6 +91,7 @@ impl SparseMoEBuilderConfig {
             prefetch_n: None,
             pin_top_n: None,
             pin_after_tokens: None,
+            cache_aware_dispatch: false,
         }
     }
 
@@ -278,6 +286,10 @@ impl Builder for SparseMoEBuilder {
             runner.set_pin_after_tokens(n);
         }
         runner.set_pin_top_n(self.config.pin_top_n);
+        // autolab iter 056 (cache-aware dispatch): toggle the per-layer
+        // dispatch reorder. Off by default for back-compat with iter
+        // 047/054 baselines; on with `--cache-aware-dispatch`.
+        runner.set_cache_aware_dispatch(self.config.cache_aware_dispatch);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

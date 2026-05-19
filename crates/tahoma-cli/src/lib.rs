@@ -186,6 +186,20 @@ pub struct WorkerArgs {
     /// tokens. Only meaningful with `--pin-top-n`.
     #[arg(long)]
     pub pin_after_tokens: Option<u32>,
+
+    /// Cache-aware dispatch order (sparse-moe engine only): reorder
+    /// the per-layer top-K dispatch loop in `forward_shells` by
+    /// descending observed `expert_hits` count so the hottest experts
+    /// run first and stay L3-resident across the next layer's
+    /// dispatch. The OUTPUT is bit-identical to the default router-
+    /// score order — only the `dispatch_expert` *call order* changes
+    /// (router weights are still summed in the original index order).
+    /// Composes with iter 047 (better predictor warms RAM) and iter
+    /// 054 (pinning protects the hot-set); iter 056 warms L3 inside
+    /// each layer's dispatch. Default off — turn on with
+    /// `--cache-aware-dispatch`. See autolab campaign 056.
+    #[arg(long, default_value_t = false)]
+    pub cache_aware_dispatch: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -381,6 +395,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.prefetch_n = args.prefetch_n;
             cfg.pin_top_n = args.pin_top_n;
             cfg.pin_after_tokens = args.pin_after_tokens;
+            cfg.cache_aware_dispatch = args.cache_aware_dispatch;
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

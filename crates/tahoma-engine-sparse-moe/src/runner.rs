@@ -412,6 +412,14 @@ pub struct Runner {
     /// autolab iter 054: count of forward_shells calls since the most
     /// recent `reset_kv`. Drives `pin_after_tokens` gating.
     decoded_tokens_since_reset: u32,
+    /// autolab iter 056 (cache-aware dispatch): if `true`, reorder the
+    /// per-layer top-K dispatch loop by descending hit count using
+    /// `expert_hits[i]` so the hottest experts run first and stay
+    /// L3-resident across layers. The output is bit-identical to the
+    /// default router-score order because router weights are still
+    /// summed in the original index order — only the `dispatch_expert`
+    /// calls are reordered. Default `false` for back-compat.
+    cache_aware_dispatch: bool,
 }
 
 impl Runner {
@@ -634,6 +642,10 @@ impl Runner {
             // top-N stable. Configurable via `set_pin_after_tokens`.
             pin_after_tokens: 16,
             decoded_tokens_since_reset: 0,
+            // iter 056: opt-in cache-aware dispatch order. Default off
+            // for back-compat with iter 047 / 054 — A/B campaigns will
+            // toggle this once the branch lands.
+            cache_aware_dispatch: false,
         })
     }
 
@@ -824,6 +836,29 @@ impl Runner {
             "unpin_all_experts"
         );
         (n, released)
+    }
+
+    /// autolab iter 056 (cache-aware dispatch): enable / disable the
+    /// hit-frequency dispatch reorder inside `forward_shells`. When
+    /// `true`, per-layer top-K experts are dispatched in descending
+    /// `expert_hits[i]` order so the hottest experts run first and
+    /// stay L3-resident across the next layer's dispatch. Default
+    /// `false` keeps the iter 047 router-score order.
+    ///
+    /// Bit-identical to router-score order on the output side: router
+    /// weights are still summed in the original index order. Only the
+    /// `dispatch_expert` *call order* changes — every other side effect
+    /// (`prefetch_hits` counters, `expert_hits` bumps, weighted-sum
+    /// accumulation order) is byte-identical to the default. Verified
+    /// by `cache_aware_dispatch_bit_identical_to_router_score_order`.
+    pub fn set_cache_aware_dispatch(&mut self, v: bool) {
+        self.cache_aware_dispatch = v;
+        info!(cache_aware_dispatch = v, "set_cache_aware_dispatch");
+    }
+
+    /// autolab iter 056: read-only accessor for tests + benches.
+    pub fn cache_aware_dispatch_enabled(&self) -> bool {
+        self.cache_aware_dispatch
     }
 
     /// autolab iter 054: snapshot of (pinned_experts_count, pinned_bytes).
@@ -1185,6 +1220,20 @@ impl Runner {
             // Skip the very first per-prompt token (predictor is empty,
             // counting those would dilute the rate spuriously).
             let predictor_was_warm = !self.last_routing_ids[i].is_empty();
+
+            // autolab iter 056 (cache-aware dispatch): three-phase
+            // restructure that gates the optional dispatch reorder
+            // while preserving byte-identical output and all observable
+            // side effects.
+            //
+            // Phase 1 (original-order bookkeeping): walk
+            // `k = 0..effective_top_k` in router-score order to
+            // (a) skip threshold misses, (b) count prefetch hits/chances,
+            // (c) bump expert_hits. This is byte-identical to the
+            // pre-056 loop's side-effect ordering — important because
+            // autolab campaigns A/B these counters across iterations.
+            // Mark "active" indices for the dispatch pass.
+            let mut active_ks: Vec<usize> = Vec::with_capacity(effective_top_k);
             for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
                 if w < threshold {
@@ -1209,9 +1258,60 @@ impl Runner {
                     .expect("layer-indexed hit map")
                     .entry(eid)
                     .or_insert(0) += 1;
+                active_ks.push(k);
+            }
+
+            // Phase 2 (dispatch in cache-aware or router-score order):
+            // compute each active expert and stash its output indexed
+            // by the original `k`. With `cache_aware_dispatch == false`
+            // this is byte-identical to the pre-056 path: the iteration
+            // happens in router-score order and the stash is trivial.
+            // With it enabled the iteration happens in descending
+            // `expert_hits[i]` order (broken on the original k) so the
+            // hottest experts run first and stay L3-warm across the
+            // next layer's hot prefix.
+            //
+            // NOTE: `expert_hits` was just updated in Phase 1 for this
+            // token. That means a freshly-fired expert sees its own
+            // bump reflected in the reorder — desired, because a
+            // single L3-warm expert that just fired is the cheapest
+            // to call back-to-back from the next layer's dispatch.
+            let dispatch_seq: Vec<usize> = if self.cache_aware_dispatch {
+                // Build a slice of just the active k's so the helper
+                // sees the same `routing_ids` view the dispatch path
+                // sees. We pass the original `routing_ids` slice but
+                // restrict the returned permutation to entries that
+                // are in `active_ks` (set difference is rare — most
+                // tokens hit threshold for every k). Two-pass:
+                // permutation over the full top-K, then filter.
+                let full = cache_aware_dispatch_order(&outs.routing_ids, &self.expert_hits[i]);
+                let active_set: std::collections::HashSet<usize> =
+                    active_ks.iter().copied().collect();
+                full.into_iter()
+                    .filter(|k| active_set.contains(k))
+                    .collect()
+            } else {
+                active_ks.clone()
+            };
+            let mut expert_outs: Vec<Option<Vec<f32>>> =
+                (0..effective_top_k).map(|_| None).collect();
+            for &k in dispatch_seq.iter() {
+                let eid = outs.routing_ids[k] as u32;
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
-                for j in 0..hidden {
-                    moe[j] += w * y_f32[j];
+                expert_outs[k] = Some(y_f32);
+            }
+
+            // Phase 3 (original-order weighted sum): accumulate into
+            // `moe` in ascending `k` so the floating-point rounding
+            // chain is identical regardless of `cache_aware_dispatch`.
+            // Skipped slots (threshold misses) stay `None` and are
+            // ignored, byte-identical to the pre-056 `continue` path.
+            for (k, slot) in expert_outs.iter().enumerate() {
+                if let Some(y_f32) = slot {
+                    let w = outs.routing_weights[k];
+                    for j in 0..hidden {
+                        moe[j] += w * y_f32[j];
+                    }
                 }
             }
             // autolab iter 047: stash the top-N expert IDs for the next
@@ -1487,6 +1587,59 @@ fn select_top_n_by_hits(hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
         .take(take)
         .map(|(eid, _)| eid)
         .collect()
+}
+
+/// autolab iter 056 (cache-aware dispatch): produce a permutation of
+/// `0..routing_ids.len()` ordered by descending hit count in `hits`,
+/// breaking ties by ascending original index (which is router-score
+/// order — TOPK[0] is the highest-scored expert). Returns indices into
+/// `routing_ids`, NOT expert IDs — the dispatch loop uses these to
+/// look up `routing_ids[k]` and `routing_weights[k]` from the shell
+/// output without losing the original alignment.
+///
+/// Example: `routing_ids = [42, 99, 7, 200, 50, 1, 88, 12]` (router
+/// top-8 by score), `hits = {42: 10, 99: 0, 7: 50, 200: 5, 50: 100, 1:
+/// 0, 88: 50, 12: 0}` ⇒ returned permutation `[4, 2, 6, 0, 3, 1, 5,
+/// 7]` (50 first at 100 hits, then 7 and 88 tied at 50 in router-
+/// score order, then 42 at 10, then 200 at 5, then 99/1/12 tied at 0
+/// in router-score order).
+///
+/// **Pure function — no side effects.** The runner's dispatch loop
+/// preserves byte-identical output by:
+/// (a) doing hit-rate / `expert_hits` bookkeeping in the original
+///     `k = 0..effective_top_k` order,
+/// (b) calling `dispatch_expert` in the cache-aware order (this loop),
+/// (c) summing the weighted expert outputs into `moe` in original
+///     order so the float-addition rounding chain is unchanged.
+///
+/// `hits` missing an expert ID counts as zero hits — typical on the
+/// very first prefill token before any hit data has accumulated. In
+/// that case the permutation degenerates to the identity (all zeros,
+/// tie-broken on ascending k), which matches the current router-score
+/// dispatch order exactly.
+///
+/// Separated from `Runner::forward_shells` so unit tests can verify
+/// the permutation logic without a loaded model.
+fn cache_aware_dispatch_order(routing_ids: &[i64], hits: &HashMap<u32, u64>) -> Vec<usize> {
+    let mut order: Vec<(usize, u64)> = routing_ids
+        .iter()
+        .enumerate()
+        .map(|(k, &id)| {
+            // Guard cast: router IDs are nonneg expert ids in [0, 384).
+            // A pathological negative id would just look up as zero hits.
+            let count = if id >= 0 {
+                *hits.get(&(id as u32)).unwrap_or(&0)
+            } else {
+                0
+            };
+            (k, count)
+        })
+        .collect();
+    // Sort descending by count, ascending by original index (= router
+    // score order) on ties. This guarantees that when `hits` is empty
+    // (e.g. very first prefill token) the permutation is the identity.
+    order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    order.into_iter().map(|(k, _)| k).collect()
 }
 
 /// Double the per-head slot capacity of one layer's KV buffers,
@@ -1818,5 +1971,331 @@ mod tests {
         // the result is exactly 0..38 in order.
         let expected: Vec<u32> = (0..38).collect();
         assert_eq!(top, expected);
+    }
+
+    // ====================================================================
+    // autolab iter 056 (cache-aware dispatch) tests
+    // ====================================================================
+    //
+    // The dispatch reorder lives inside `Runner::forward_shells`, which
+    // requires a loaded K2.6 model to drive end-to-end. The unit tests
+    // below cover:
+    //
+    //  (1) the pure permutation helper `cache_aware_dispatch_order` —
+    //      correctness across the cases the dispatch loop will see
+    //      (heavy-tail, all-zero hits, ties, etc.);
+    //  (2) the load-bearing bit-identity property — Phase 2 + Phase 3 of
+    //      the dispatch loop reproduced as a pure simulator so we can
+    //      assert that for ANY permutation, the accumulated `moe[]`
+    //      vector is byte-identical to the router-score-order baseline.
+    //      This is the property the task says must hold.
+
+    #[test]
+    fn cache_aware_dispatch_order_with_empty_hits_is_identity() {
+        // First prefill token: expert_hits is empty for this layer.
+        // The permutation must degenerate to the identity so behavior
+        // is byte-identical to router-score order until hit data warms.
+        let routing_ids: Vec<i64> = vec![42, 99, 7, 200, 50, 1, 88, 12];
+        let hits: HashMap<u32, u64> = HashMap::new();
+        let order = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        assert_eq!(order, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn cache_aware_dispatch_order_sorts_by_descending_hits() {
+        // Routing-score order: 42 (top), 99, 7, 200, 50, 1, 88, 12.
+        // Hit counts: 50 hottest at 100, then 7 and 88 tied at 50, then
+        // 42 at 10, then 200 at 5, then 99/1/12 at 0. Expected permutation:
+        // [4 (50), 2 (7, tied), 6 (88, tied), 0 (42), 3 (200), 1 (99, tied),
+        //  5 (1, tied), 7 (12, tied)].
+        let routing_ids: Vec<i64> = vec![42, 99, 7, 200, 50, 1, 88, 12];
+        let mut hits = HashMap::new();
+        hits.insert(42u32, 10u64);
+        hits.insert(99, 0);
+        hits.insert(7, 50);
+        hits.insert(200, 5);
+        hits.insert(50, 100);
+        hits.insert(1, 0);
+        hits.insert(88, 50);
+        hits.insert(12, 0);
+        let order = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        assert_eq!(order, vec![4, 2, 6, 0, 3, 1, 5, 7]);
+    }
+
+    #[test]
+    fn cache_aware_dispatch_order_missing_ids_treated_as_zero() {
+        // Hits map only covers two of the five experts; the other three
+        // count as zero hits and tie-break by original index.
+        let routing_ids: Vec<i64> = vec![10, 20, 30, 40, 50];
+        let mut hits = HashMap::new();
+        hits.insert(30u32, 100u64);
+        hits.insert(50, 50);
+        let order = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        // 30 first (100), then 50 (50), then 10/20/40 tied at 0 in
+        // original index order.
+        assert_eq!(order, vec![2, 4, 0, 1, 3]);
+    }
+
+    #[test]
+    fn cache_aware_dispatch_order_heavy_tail_puts_hot_first() {
+        // Simulate the K2.6 heavy-tail: of the 8 routed experts, 2 are
+        // hot (in the warm-set), 6 are cold. Permutation must put the
+        // 2 hot ones first regardless of their router-score positions.
+        let routing_ids: Vec<i64> = vec![5, 1, 9, 3, 7, 2, 8, 4];
+        let mut hits = HashMap::new();
+        // Hot set: experts 3 and 8 — at indices 3 and 6 in routing_ids.
+        hits.insert(3u32, 10_000);
+        hits.insert(8, 10_000);
+        // Cold set: everyone else at uniformly low count.
+        for &id in &[5u32, 1, 9, 7, 2, 4] {
+            hits.insert(id, 1);
+        }
+        let order = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        // First two slots must be the hot indices in router-score-tied
+        // ascending order: 3 (idx 3), then 8 (idx 6). The rest are at
+        // count 1, tie-broken by ascending original index.
+        assert_eq!(&order[..2], &[3, 6]);
+        // The cold tail is a permutation of the remaining six indices,
+        // ordered by ascending original index (all tied at count 1).
+        assert_eq!(&order[2..], &[0, 1, 2, 4, 5, 7]);
+    }
+
+    #[test]
+    fn cache_aware_dispatch_order_is_a_permutation() {
+        // For any input the returned vec must be a valid permutation of
+        // 0..len — same length, no duplicates, every index present.
+        let routing_ids: Vec<i64> = vec![100, 200, 300, 400, 500, 600, 700, 800];
+        let mut hits = HashMap::new();
+        for (i, &id) in routing_ids.iter().enumerate() {
+            // Spread counts so every order pair is exercised.
+            hits.insert(id as u32, (i * 17 + 3) as u64);
+        }
+        let order = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        assert_eq!(order.len(), routing_ids.len());
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        let expected: Vec<usize> = (0..routing_ids.len()).collect();
+        assert_eq!(sorted, expected, "must be a permutation of 0..K");
+    }
+
+    /// Reproduce Phases 2 + 3 of the `forward_shells` dispatch loop as
+    /// a pure simulator. `dispatch_seq` is the order in which we call
+    /// the (mocked) expert; the per-expert outputs are looked up by
+    /// original index from `expert_outs_by_k`. Phase 3 sums in
+    /// ascending original-index order regardless of dispatch order.
+    fn simulate_phase23(
+        routing_weights: &[f32],
+        expert_outs_by_k: &[Vec<f32>],
+        dispatch_seq: &[usize],
+        hidden: usize,
+    ) -> Vec<f32> {
+        let effective_top_k = routing_weights.len();
+        let mut stash: Vec<Option<Vec<f32>>> = (0..effective_top_k).map(|_| None).collect();
+        // Phase 2: dispatch in the given order, stash outputs by k.
+        for &k in dispatch_seq {
+            stash[k] = Some(expert_outs_by_k[k].clone());
+        }
+        // Phase 3: accumulate weighted sum in original k order.
+        let mut moe = vec![0.0f32; hidden];
+        for k in 0..effective_top_k {
+            if let Some(y) = &stash[k] {
+                let w = routing_weights[k];
+                for j in 0..hidden {
+                    moe[j] += w * y[j];
+                }
+            }
+        }
+        moe
+    }
+
+    /// **The load-bearing test for iter 056.** For K=8 on a hidden=128
+    /// vector with synthetic-but-non-trivial weights + expert outputs,
+    /// the simulated dispatch in router-score order must produce
+    /// byte-identical `moe[]` to the simulated dispatch in cache-aware
+    /// (and reverse, and shuffled) order. This is the property that
+    /// makes cache-aware dispatch safe to enable: it cannot change
+    /// model output.
+    #[test]
+    fn cache_aware_dispatch_bit_identical_to_router_score_order() {
+        const K: usize = 8;
+        const HIDDEN: usize = 128;
+
+        // Pseudo-random but deterministic weights and outputs so the
+        // test reproduces across runs. Mixed-sign, mixed-magnitude
+        // values to make floating-point reordering actually matter
+        // (catches a regression where Phase 3 also reordered).
+        let routing_weights: Vec<f32> = (0..K)
+            .map(|k| {
+                // K2.6-shaped weights: heavy on the first few, decaying.
+                let raw = 1.0 / (k as f32 + 1.0);
+                let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+                raw * sign * 0.7
+            })
+            .collect();
+        let expert_outs_by_k: Vec<Vec<f32>> = (0..K)
+            .map(|k| {
+                (0..HIDDEN)
+                    .map(|j| {
+                        // Non-trivial values per (k, j): mix of trig +
+                        // polynomial so different orderings of the
+                        // weighted sum produce different float results
+                        // unless Phase 3 actually fixes the order.
+                        let kx = k as f32;
+                        let jx = j as f32;
+                        (kx * 0.31 + jx * 0.017).sin() * 1.7 + (jx * 0.005).cos() - kx * 0.013
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Baseline: router-score order = identity permutation.
+        let router_score_order: Vec<usize> = (0..K).collect();
+        let baseline = simulate_phase23(
+            &routing_weights,
+            &expert_outs_by_k,
+            &router_score_order,
+            HIDDEN,
+        );
+
+        // Cache-aware order driven by a synthetic heavy-tail hit map.
+        // We don't need real expert IDs for the simulator — the order
+        // helper operates on indices, so we wire routing_ids = [10..18)
+        // and put descending hits on every other expert.
+        let routing_ids: Vec<i64> = (10..(10 + K as i64)).collect();
+        let mut hits: HashMap<u32, u64> = HashMap::new();
+        hits.insert(10u32, 50); // k=0
+        hits.insert(11, 0); // k=1
+        hits.insert(12, 100); // k=2 (hottest)
+        hits.insert(13, 0); // k=3
+        hits.insert(14, 25); // k=4
+        hits.insert(15, 75); // k=5
+        hits.insert(16, 0); // k=6
+        hits.insert(17, 10); // k=7
+        let cache_aware = super::cache_aware_dispatch_order(&routing_ids, &hits);
+        // Expected: 2 (100), 5 (75), 0 (50), 4 (25), 7 (10), then 1/3/6
+        // tied at 0 in ascending original index order.
+        assert_eq!(cache_aware, vec![2, 5, 0, 4, 7, 1, 3, 6]);
+
+        let cache_aware_out =
+            simulate_phase23(&routing_weights, &expert_outs_by_k, &cache_aware, HIDDEN);
+        // Byte-identical: every f32 in the output vector matches by bit.
+        for j in 0..HIDDEN {
+            assert_eq!(
+                baseline[j].to_bits(),
+                cache_aware_out[j].to_bits(),
+                "j={j} baseline={} cache_aware={} (bit-identity required)",
+                baseline[j],
+                cache_aware_out[j]
+            );
+        }
+
+        // Even-more-permuted dispatch orders must also match. Try a
+        // reverse + a couple of hand-crafted shuffles to make sure
+        // Phase 3 truly fixes the accumulation order independent of
+        // Phase 2's dispatch order.
+        let mut reversed = router_score_order.clone();
+        reversed.reverse();
+        let reversed_out = simulate_phase23(&routing_weights, &expert_outs_by_k, &reversed, HIDDEN);
+        for j in 0..HIDDEN {
+            assert_eq!(
+                baseline[j].to_bits(),
+                reversed_out[j].to_bits(),
+                "j={j} reversed dispatch order broke bit-identity"
+            );
+        }
+
+        let weird: Vec<usize> = vec![3, 7, 1, 0, 6, 2, 5, 4];
+        let weird_out = simulate_phase23(&routing_weights, &expert_outs_by_k, &weird, HIDDEN);
+        for j in 0..HIDDEN {
+            assert_eq!(
+                baseline[j].to_bits(),
+                weird_out[j].to_bits(),
+                "j={j} hand-shuffled dispatch order broke bit-identity"
+            );
+        }
+    }
+
+    /// Same property but at the "real" K=8 with hidden=7168 (K2.6's
+    /// hidden_size). This guards against any HIDDEN-dependent
+    /// regression — e.g. an optimization that splits the Phase 3 sum
+    /// into tiles and accidentally folds reordering into the tile
+    /// boundary.
+    #[test]
+    fn cache_aware_dispatch_bit_identity_at_k26_hidden() {
+        const K: usize = 8;
+        const HIDDEN: usize = 7168;
+        let routing_weights: Vec<f32> = (0..K).map(|k| 1.0 / ((k as f32 + 1.0).powi(2))).collect();
+        let expert_outs_by_k: Vec<Vec<f32>> = (0..K)
+            .map(|k| {
+                (0..HIDDEN)
+                    .map(|j| {
+                        let kx = k as f32;
+                        let jx = j as f32;
+                        ((kx * 7.0 + jx) * 0.0011).sin() - 0.3 * (jx * 0.0007).cos()
+                    })
+                    .collect()
+            })
+            .collect();
+        let identity: Vec<usize> = (0..K).collect();
+        let baseline = simulate_phase23(&routing_weights, &expert_outs_by_k, &identity, HIDDEN);
+        // 5! permutations is too many; sample a handful with broad
+        // coverage (reverse, even-odd interleave, "hot in the middle").
+        let permutations: [Vec<usize>; 4] = [
+            vec![7, 6, 5, 4, 3, 2, 1, 0],
+            vec![0, 2, 4, 6, 1, 3, 5, 7],
+            vec![4, 3, 5, 2, 6, 1, 7, 0],
+            vec![5, 0, 7, 1, 6, 3, 4, 2],
+        ];
+        for perm in permutations.iter() {
+            let out = simulate_phase23(&routing_weights, &expert_outs_by_k, perm, HIDDEN);
+            for j in 0..HIDDEN {
+                assert_eq!(
+                    baseline[j].to_bits(),
+                    out[j].to_bits(),
+                    "j={j}, perm={perm:?}: bit-identity broken"
+                );
+            }
+        }
+    }
+
+    /// Threshold-skip (iter 007 A2) carves out specific `k` slots from
+    /// dispatch. Those slots must stay zero in the `moe` accumulator
+    /// regardless of dispatch order — i.e. dropping an entry from the
+    /// stash is byte-equivalent to a `continue` in the pre-056 loop.
+    #[test]
+    fn cache_aware_dispatch_threshold_skip_byte_identical() {
+        const K: usize = 8;
+        const HIDDEN: usize = 64;
+        let routing_weights: Vec<f32> = vec![0.5, 0.05, 0.3, 0.02, 0.4, 0.1, 0.08, 0.2];
+        let expert_outs_by_k: Vec<Vec<f32>> = (0..K)
+            .map(|k| {
+                (0..HIDDEN)
+                    .map(|j| (k as f32) * 0.1 + (j as f32) * 0.001)
+                    .collect()
+            })
+            .collect();
+        // Threshold 0.1 skips k=1 (0.05), k=3 (0.02), k=6 (0.08).
+        // Active: 0, 2, 4, 5, 7.
+        let active: Vec<usize> = vec![0, 2, 4, 5, 7];
+
+        // Baseline (router-score order over active).
+        let baseline = simulate_phase23(&routing_weights, &expert_outs_by_k, &active, HIDDEN);
+
+        // Cache-aware: shuffle the active set. Phase 3 still skips
+        // inactive slots, so output stays byte-identical.
+        let shuffled_active: Vec<usize> = vec![5, 0, 7, 2, 4];
+        let shuffled = simulate_phase23(
+            &routing_weights,
+            &expert_outs_by_k,
+            &shuffled_active,
+            HIDDEN,
+        );
+        for j in 0..HIDDEN {
+            assert_eq!(
+                baseline[j].to_bits(),
+                shuffled[j].to_bits(),
+                "j={j}: threshold-skipped dispatch must be bit-identical across orderings"
+            );
+        }
     }
 }
