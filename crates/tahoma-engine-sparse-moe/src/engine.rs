@@ -88,6 +88,20 @@ pub struct SparseMoEBuilderConfig {
     /// longer expert FFN window, ~150 ms). Output is bit-identical;
     /// only readahead-bandwidth is spent. Default `None` (off).
     pub speculative_prefetch_n: Option<u32>,
+    /// autolab iter 065 (prefill-hint static schedule): merge weight
+    /// for folding the per-prompt prefill expert-firing distribution
+    /// into `expert_hits` at the end of prefill. `None` / `Some(0.0)`
+    /// (default) disables the hint — prefill bumps `expert_hits`
+    /// directly (iter 054 behavior). `Some(w)` with `w > 0.0` records
+    /// prefill firings into a separate map and merges them with
+    /// `round(w * obs_count)` at end-of-prefill, seeding iter 054
+    /// pin-top-N, iter 056 cache-aware dispatch, and iter 057
+    /// speculative next-layer prefetch from the very first decode
+    /// token. Reasonable starting point: `0.5` — half-weights the
+    /// prompt prior so decode-time firings still dominate over a
+    /// short window. Output is unaffected; only the schedule changes.
+    /// See autolab campaign 065.
+    pub prefill_hint_weight: Option<f32>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -106,6 +120,7 @@ impl SparseMoEBuilderConfig {
             pin_after_tokens: None,
             cache_aware_dispatch: false,
             speculative_prefetch_n: None,
+            prefill_hint_weight: None,
         }
     }
 
@@ -312,6 +327,16 @@ impl Builder for SparseMoEBuilder {
         // accumulates data — so by construction bit-identical to iter
         // 056 on the very first per-prompt token.
         runner.set_speculative_prefetch_n(self.config.speculative_prefetch_n);
+        // autolab iter 065 (prefill-hint static schedule): plumb the
+        // merge weight. `None` / `Some(0.0)` keeps iter 057 behavior
+        // (prefill bumps `expert_hits` directly). `Some(w > 0.0)`
+        // diverts prefill firings into a per-prompt observation map
+        // and folds them into `expert_hits` with weight `w` at the
+        // end of prefill, so decode iter #1 sees iter 054 / 056 / 057
+        // already shaped by the prompt's actual routing.
+        if let Some(w) = self.config.prefill_hint_weight {
+            runner.set_prefill_hint_weight(w);
+        }
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
@@ -689,17 +714,43 @@ impl SparseMoEEngine {
 
         // Prefill: feed each prompt token; the very last response from
         // last-rank becomes the first generated token.
+        //
+        // iter 065 (prefill-hint static schedule): bracket the prefill
+        // loop on this (rank-0) runner so its slice's per-prompt prefill
+        // firings get diverted to `prefill_expert_observations` and
+        // merged into `expert_hits` at end-of-prefill. **The downstream
+        // workers do NOT see this bracket today** — the wire protocol
+        // currently has no Prefill/Decode tag, so their forward_shells
+        // bumps `expert_hits` directly (iter 054 behavior) on prefill
+        // as well as decode. Threading a Prefill/Decode frame through
+        // `tahoma-transport` is a follow-up; the rank-0 wiring is
+        // enough to validate the hint plumbing end-to-end in
+        // single-stage mode, which is the killer-demo target. No-op
+        // when the hint is disabled.
         info!(
             prompt_len = prompt_ids.len(),
             "prefill (token-by-token, distributed)"
         );
+        self.runner.enter_prefill();
+        let mut prefill_exit_fired = false;
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
-            let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
-                .map_err(|e| format!("prefill step {i}: {e}"))?;
+            let token_back = match self.forward_one_token_first(&history, cfg, downstream) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Make sure the in-prefill gate clears on error so
+                    // the next prompt isn't accidentally still in
+                    // prefill mode.
+                    if !prefill_exit_fired {
+                        self.runner.exit_prefill_and_merge_hints();
+                    }
+                    return Err(format!("prefill step {i}: {e}"));
+                }
+            };
             if i + 1 == prompt_ids.len() {
                 // Last prefill step: this is the first generated token.
+                self.runner.exit_prefill_and_merge_hints();
+                prefill_exit_fired = true;
                 if eos.contains(&token_back) {
                     return Ok(generated);
                 }
@@ -708,6 +759,11 @@ impl SparseMoEEngine {
             }
             // Otherwise discard (intermediate prefill samples are stale).
             let _ = token_back;
+        }
+        if !prefill_exit_fired {
+            // Empty prompt: nothing was forwarded, but we still want
+            // the in-prefill gate cleared.
+            self.runner.exit_prefill_and_merge_hints();
         }
 
         // Decode loop.

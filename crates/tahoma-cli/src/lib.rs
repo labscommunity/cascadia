@@ -228,6 +228,33 @@ pub struct WorkerArgs {
     /// but cannot affect tokens. See autolab campaign 057.
     #[arg(long)]
     pub speculative_prefetch: Option<u32>,
+
+    /// Prefill-hint static schedule (sparse-moe engine only): observe
+    /// which experts fire per layer during prefill, then fold that
+    /// observation into the `expert_hits` map used by iter 054
+    /// (pin-top-N), iter 056 (cache-aware dispatch), and iter 057
+    /// (speculative next-layer prefetch). With a non-zero weight,
+    /// decode iteration #1 sees an `expert_hits` map already shaped
+    /// by the prompt's actually-fired routing distribution — a
+    /// stronger prior than the empty / cold map decode #1 sees today.
+    ///
+    /// Mechanics: during prefill the per-expert hit bumps are diverted
+    /// from `expert_hits` into a per-prompt observation buffer. At the
+    /// end of prefill the observations are merged into `expert_hits`
+    /// as `expert_hits[i][eid] += round(W * obs_count)`. Setting
+    /// `W = 0.0` (default) **disables the hint path entirely** —
+    /// prefill bumps `expert_hits` directly (iter 054 behavior). The
+    /// observation buffer is cleared on every prompt reset so each
+    /// prompt's prior is independent.
+    ///
+    /// Reasonable starting points: `0.5` (half-weight the prompt
+    /// prior; decode firings will still dominate within ~16 decode
+    /// tokens), `1.0` (match today's iter 054 prefill weighting but
+    /// expose it as a knob for A/B), `2.0` (over-weight the prior
+    /// for continuation-heavy tasks where prompt and decode share
+    /// vocabulary). Default 0.0 (off). See autolab campaign 065.
+    #[arg(long, default_value_t = 0.0)]
+    pub prefill_hint_weight: f32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -425,6 +452,16 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.pin_after_tokens = args.pin_after_tokens;
             cfg.cache_aware_dispatch = args.cache_aware_dispatch;
             cfg.speculative_prefetch_n = args.speculative_prefetch;
+            // iter 065 (prefill-hint static schedule): plumb the merge
+            // weight. CLI default 0.0 disables the hint (back-compat
+            // with iter 057). Map 0.0 to `None` so the engine config
+            // matches the "no override" semantics it already uses for
+            // pin / prefetch params.
+            cfg.prefill_hint_weight = if args.prefill_hint_weight > 0.0 {
+                Some(args.prefill_hint_weight)
+            } else {
+                None
+            };
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
     }

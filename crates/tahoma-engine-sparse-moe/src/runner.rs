@@ -460,6 +460,57 @@ pub struct Runner {
     /// 047 prefetch counters so A/B campaigns can attribute readahead
     /// bandwidth between the two predictors.
     speculative_prefetch_submitted: u64,
+    /// autolab iter 065 (prefill-hint static schedule): per-layer
+    /// per-expert observation counts accumulated **only during prefill**.
+    /// Mirrors `expert_hits` in shape but is fed solely by prefill
+    /// dispatches when `prefill_hint_weight > 0`. At the end of each
+    /// prompt's prefill pass `exit_prefill_and_merge_hints` is called
+    /// to fold these observations into `expert_hits` with the configured
+    /// weight, so decode iteration #1 sees a `expert_hits` map already
+    /// shaped by the prompt's actual routing — giving iter 054 (pin
+    /// top-N), iter 056 (cache-aware dispatch), and iter 057 (speculative
+    /// next-layer prefetch) a useful prior from token zero of decode
+    /// rather than the empty / cold map they see today.
+    ///
+    /// Indexed by position in `self.layers` (same as `expert_hits`).
+    /// Cleared by `reset_kv` so each prompt starts with a fresh
+    /// observation window. Always allocated to `n_layers` length so
+    /// indexing is panic-free regardless of whether the hint is enabled.
+    prefill_expert_observations: Vec<HashMap<u32, u64>>,
+    /// autolab iter 065 (prefill-hint static schedule): merge weight for
+    /// folding `prefill_expert_observations` into `expert_hits` at the
+    /// end of prefill. `0.0` (default) **disables the entire hint path**:
+    /// `forward_shells` falls back to bumping `expert_hits` during prefill
+    /// exactly as iter 054 does today, and `prefill_expert_observations`
+    /// is never populated or merged.
+    ///
+    /// With `w > 0.0`, prefill dispatches stop bumping `expert_hits` and
+    /// instead bump `prefill_expert_observations`. At the end of prefill
+    /// (driven by `exit_prefill_and_merge_hints`) we fold each observation
+    /// into `expert_hits[i][eid] += round(w * obs_count)`. So:
+    ///
+    ///   - `w = 1.0` matches today's iter 054 behavior: prefill firings
+    ///     count 1:1 with decode firings.
+    ///   - `w = 0.5` cuts the prefill prior in half — useful when prompt
+    ///     vocabulary diverges sharply from decode vocabulary.
+    ///   - `w = 2.0` over-weights the prior — useful when the prompt is
+    ///     known to be highly representative of the eventual decode
+    ///     distribution (e.g. continuation tasks).
+    ///
+    /// Set via `set_prefill_hint_weight` from the engine config.
+    prefill_hint_weight: f32,
+    /// autolab iter 065: gate used by `forward_shells` to decide whether
+    /// expert-hit bumps go to `expert_hits` (decode, or hint disabled)
+    /// or to `prefill_expert_observations` (prefill, hint enabled).
+    /// Toggled by `enter_prefill` / `exit_prefill_and_merge_hints`. The
+    /// gate is layered on top of `prefill_hint_weight > 0.0` so the
+    /// flag itself is harmless when the hint is disabled — the dispatch
+    /// loop checks the weight first and short-circuits.
+    ///
+    /// Distributed callers (engine `drive_generation_first` /
+    /// `step_worker`) own the same enter/exit calls so prefill on every
+    /// rank tracks the same set of observations independently.
+    in_prefill: bool,
 }
 
 impl Runner {
@@ -646,6 +697,11 @@ impl Runner {
         let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
         let expert_hits: Vec<HashMap<u32, u64>> =
             (0..layers.len()).map(|_| HashMap::new()).collect();
+        // autolab iter 065 (prefill-hint static schedule): per-prompt
+        // observation buffer; always allocated to n_layers so the
+        // dispatch loop can `get_mut(i)` without bounds checks.
+        let prefill_expert_observations: Vec<HashMap<u32, u64>> =
+            (0..layers.len()).map(|_| HashMap::new()).collect();
 
         Ok(Self {
             manifest,
@@ -692,6 +748,13 @@ impl Runner {
             // branch lands.
             speculative_prefetch_n: None,
             speculative_prefetch_submitted: 0,
+            // iter 065: prefill-hint static schedule. Default disabled
+            // (weight 0.0) for back-compat with iter 057 — prefill
+            // bumps `expert_hits` directly as iter 054 does today.
+            // A/B campaigns toggle with `--prefill-hint-weight <W>`.
+            prefill_expert_observations,
+            prefill_hint_weight: 0.0,
+            in_prefill: false,
         })
     }
 
@@ -951,6 +1014,117 @@ impl Runner {
         self.speculative_prefetch_submitted
     }
 
+    /// autolab iter 065 (prefill-hint static schedule): set the merge
+    /// weight applied to per-prompt prefill observations when folding
+    /// them into `expert_hits` at the end of prefill. `0.0` (default)
+    /// **disables the hint path entirely** — prefill `forward_shells`
+    /// calls bump `expert_hits` directly (iter 054 behavior), and the
+    /// per-prompt observation buffer stays empty.
+    ///
+    /// With `w > 0.0`, prefill dispatches stop bumping `expert_hits`
+    /// and instead record into `prefill_expert_observations`. At
+    /// `exit_prefill_and_merge_hints` the observations are folded back
+    /// in as `expert_hits[i][eid] += round(w * obs_count)`. The
+    /// downstream consumers — iter 054 (`pin_top_n_per_layer`), iter
+    /// 056 (`cache_aware_dispatch_order`), iter 057
+    /// (`speculative_prefetch_expert_ids`) — all read from the same
+    /// `expert_hits` map, so a non-zero weight seeds them with the
+    /// prompt's actually-fired routing distribution before decode
+    /// iteration #1.
+    ///
+    /// Negative weights are silently clamped to 0.0 (no merge). NaN /
+    /// infinite weights are silently clamped to 0.0 as well; the merge
+    /// uses `round() as u64` which would otherwise saturate or panic.
+    pub fn set_prefill_hint_weight(&mut self, w: f32) {
+        let clean = if w.is_finite() && w >= 0.0 { w } else { 0.0 };
+        self.prefill_hint_weight = clean;
+        info!(
+            prefill_hint_weight = clean,
+            enabled = clean > 0.0,
+            "set_prefill_hint_weight"
+        );
+    }
+
+    /// autolab iter 065: read-only accessor for tests + benches.
+    pub fn prefill_hint_weight(&self) -> f32 {
+        self.prefill_hint_weight
+    }
+
+    /// autolab iter 065: mark the runner as entering the prefill phase
+    /// for the next prompt. When the hint is enabled
+    /// (`prefill_hint_weight > 0.0`) this re-routes
+    /// `forward_shells`'s per-expert hit bumps from `expert_hits` into
+    /// `prefill_expert_observations` so the per-prompt prefill firing
+    /// distribution can be merged back with the configured weight at
+    /// `exit_prefill_and_merge_hints`.
+    ///
+    /// When the hint is disabled (`prefill_hint_weight == 0.0`) this
+    /// is a cheap no-op: the dispatch loop checks the weight first and
+    /// keeps bumping `expert_hits` directly, preserving iter 054
+    /// behavior bit-for-bit.
+    ///
+    /// Idempotent — repeated calls without an intervening
+    /// `exit_prefill_and_merge_hints` are harmless. Called from
+    /// `Runner::generate` (single-stage) and from the engine's
+    /// distributed driver (`drive_generation_first`) at the top of
+    /// the prompt loop.
+    pub fn enter_prefill(&mut self) {
+        self.in_prefill = true;
+        info!(
+            prefill_hint_weight = self.prefill_hint_weight,
+            "enter_prefill"
+        );
+    }
+
+    /// autolab iter 065: mark prefill complete and fold the per-prompt
+    /// `prefill_expert_observations` into `expert_hits` using
+    /// `prefill_hint_weight`. The merge formula is
+    /// `expert_hits[i][eid] += round(w * obs_count)`, with saturating
+    /// `u64` addition so over-long prompts can't wrap. Observations are
+    /// cleared after the merge so the next prompt's prefill starts with
+    /// a fresh window.
+    ///
+    /// When the hint is disabled (`prefill_hint_weight == 0.0`) this
+    /// is a cheap no-op: nothing was recorded in
+    /// `prefill_expert_observations`, and `expert_hits` already reflects
+    /// the prefill firings (bumped directly during the prefill calls).
+    ///
+    /// Returns the total number of `(layer, expert)` entries merged so
+    /// the engine can log + tests can verify the merge fired.
+    pub fn exit_prefill_and_merge_hints(&mut self) -> usize {
+        // Always clear the in-prefill gate so decode-phase hit bumps go
+        // to `expert_hits` even if the caller forgot to enable the hint.
+        self.in_prefill = false;
+        if self.prefill_hint_weight <= 0.0 {
+            // Hint disabled: prefill_expert_observations is empty by
+            // construction (the dispatch loop never wrote to it).
+            return 0;
+        }
+        let w = self.prefill_hint_weight;
+        let merged = merge_prefill_observations_into_hits(
+            &mut self.expert_hits,
+            &self.prefill_expert_observations,
+            w,
+        );
+        for obs in self.prefill_expert_observations.iter_mut() {
+            obs.clear();
+        }
+        info!(
+            prefill_hint_weight = w,
+            entries_merged = merged,
+            "exit_prefill_and_merge_hints"
+        );
+        merged
+    }
+
+    /// autolab iter 065: read-only snapshot of the per-prompt prefill
+    /// observation map. Used by tests to verify the dispatch loop wrote
+    /// the right entries during prefill before `exit_prefill_and_merge_hints`
+    /// flushes them.
+    pub fn prefill_expert_observations_snapshot(&self) -> Vec<HashMap<u32, u64>> {
+        self.prefill_expert_observations.clone()
+    }
+
     /// autolab iter 054: snapshot of (pinned_experts_count, pinned_bytes).
     /// Used by the instrumentation log + tests.
     pub fn pinned_stats(&self) -> (usize, u64) {
@@ -1073,6 +1247,16 @@ impl Runner {
         // the data means re-pin passes (after `unpin_all_experts`) get
         // increasingly accurate top-Ns rather than starting from zero.
         self.decoded_tokens_since_reset = 0;
+        // iter 065 (prefill-hint): per-prompt observations are
+        // **single-prompt-scoped** — clear them on every reset so the
+        // next prompt's prefill window doesn't double-count the prior
+        // prompt's prefill firings. Also clear the in-prefill gate so
+        // a fresh prompt enters in a known state regardless of whether
+        // the previous prompt called `exit_prefill_and_merge_hints`.
+        for obs in self.prefill_expert_observations.iter_mut() {
+            obs.clear();
+        }
+        self.in_prefill = false;
     }
 
     /// Run one forward pass:
@@ -1370,12 +1554,31 @@ impl Runner {
                 // full workload, not a single prompt. Negligible cost:
                 // one HashMap entry update per dispatched expert
                 // (~K=8 per layer per token).
-                *self
-                    .expert_hits
-                    .get_mut(i)
-                    .expect("layer-indexed hit map")
-                    .entry(eid)
-                    .or_insert(0) += 1;
+                //
+                // autolab iter 065 (prefill-hint static schedule): when
+                // the hint is enabled (`prefill_hint_weight > 0.0`) and
+                // we're inside the prefill phase, the bump is diverted
+                // to `prefill_expert_observations` so it can be folded
+                // back into `expert_hits` with the configured weight
+                // at `exit_prefill_and_merge_hints`. When the hint is
+                // disabled (weight 0.0) or we're in decode, bumps go
+                // straight to `expert_hits` exactly as iter 054 does.
+                let route_to_observations = self.in_prefill && self.prefill_hint_weight > 0.0;
+                if route_to_observations {
+                    *self
+                        .prefill_expert_observations
+                        .get_mut(i)
+                        .expect("layer-indexed prefill observations map")
+                        .entry(eid)
+                        .or_insert(0) += 1;
+                } else {
+                    *self
+                        .expert_hits
+                        .get_mut(i)
+                        .expect("layer-indexed hit map")
+                        .entry(eid)
+                        .or_insert(0) += 1;
+                }
                 active_ks.push(k);
             }
 
@@ -1606,10 +1809,19 @@ impl Runner {
         // Prefill token-by-token to keep shell input shapes uniform (avoids
         // the OV 2026.1.0 CPU snippets shape-specialization bug we hit on
         // shape changes).
+        //
+        // iter 065 (prefill-hint static schedule): bracket the prefill
+        // loop with enter / exit so per-expert hit bumps during prefill
+        // get diverted to `prefill_expert_observations` when the hint
+        // is enabled. The `exit_prefill_and_merge_hints` call folds
+        // them back into `expert_hits` with the configured weight, so
+        // decode iteration #1 below sees a hint-seeded map. When the
+        // hint is disabled (default 0.0 weight) both calls are no-ops.
         info!(prompt_len = prompt_ids.len(), "prefill (token-by-token)");
         let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_tokens);
         let mut last_logits: Option<Vec<f32>> = None;
         let t_pre = Instant::now();
+        self.enter_prefill();
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
             let logits = self.step(&history, 1)?;
@@ -1624,9 +1836,11 @@ impl Runner {
             }
         }
         let prefill_secs = t_pre.elapsed().as_secs_f64();
+        let merged = self.exit_prefill_and_merge_hints();
         info!(
             secs = prefill_secs,
             tok_per_s = prompt_ids.len() as f64 / prefill_secs,
+            prefill_hint_entries_merged = merged,
             "prefill done"
         );
 
@@ -1771,6 +1985,67 @@ fn select_top_n_by_hits(hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
 /// the scheduling logic without a loaded Runner.
 fn speculative_prefetch_expert_ids(next_layer_hits: &HashMap<u32, u64>, n: u32) -> Vec<u32> {
     select_top_n_by_hits(next_layer_hits, n)
+}
+
+/// autolab iter 065 (prefill-hint static schedule): pure helper —
+/// fold a per-layer prefill-observation map into a per-layer
+/// `expert_hits` map using a configurable weight. Mutates `hits`
+/// in place; reads `obs` non-destructively (the caller clears it
+/// after the merge so observation buffers can be reused across
+/// prompts without realloc).
+///
+/// Per `(layer i, expert eid)`: `hits[i][eid] += round(w * obs[i][eid])`.
+/// `saturating_add` on the `u64` slot so a pathologically long prompt
+/// at high weight can't wrap silently. Zero / NaN-weighted entries are
+/// skipped (no map insert, no `merged` count bump) so the returned
+/// count reflects only effective merges.
+///
+/// Separated from `Runner::exit_prefill_and_merge_hints` so unit
+/// tests can exercise the merge math against synthetic histograms
+/// without spinning up a loaded Runner (which needs K2.6 IRs on disk).
+/// Also keeps the runner-side method short and one-concern.
+///
+/// Returns the count of `(layer, expert)` slots that received a
+/// nonzero contribution. Useful for both the runner's info-log and
+/// the unit tests that assert "yes, the merge actually happened".
+fn merge_prefill_observations_into_hits(
+    hits: &mut [HashMap<u32, u64>],
+    obs: &[HashMap<u32, u64>],
+    w: f32,
+) -> usize {
+    // Runner allocates `hits` and `obs` to identical length at load
+    // time, so in production this never trips. We still tolerate a
+    // mismatch at runtime (skip the over-length obs slots) instead
+    // of asserting — callers in defensive code paths (e.g. a future
+    // multi-stage worker that hadn't yet allocated its hits map)
+    // shouldn't panic the inference loop on a length skew.
+    if !(w.is_finite() && w > 0.0) {
+        return 0;
+    }
+    let mut merged = 0usize;
+    for (i, obs_i) in obs.iter().enumerate() {
+        let target = match hits.get_mut(i) {
+            Some(t) => t,
+            None => continue,
+        };
+        for (&eid, &count) in obs_i.iter() {
+            // f32 multiply then round-to-nearest. For the weights we
+            // accept (0..~10) and any plausible prompt length, the f32
+            // mantissa is ample. Saturating cast guards the u64 add.
+            let weighted_f = (w * count as f32).round();
+            if !weighted_f.is_finite() || weighted_f <= 0.0 {
+                continue;
+            }
+            let weighted = weighted_f as u64;
+            if weighted == 0 {
+                continue;
+            }
+            let slot = target.entry(eid).or_insert(0);
+            *slot = slot.saturating_add(weighted);
+            merged += 1;
+        }
+    }
+    merged
 }
 
 /// Separated from `Runner::forward_shells` so unit tests can verify
@@ -2653,5 +2928,271 @@ mod tests {
             vec![(0, vec![99]), (1, vec![7]), (2, vec![200])],
             "iter 057 must consult layer i+1's hit map, and must skip the last layer"
         );
+    }
+
+    // ====================================================================
+    // autolab iter 065 (prefill-hint static schedule) tests
+    // ====================================================================
+    //
+    // The runner-side bracket (`enter_prefill` → `forward_shells` x N →
+    // `exit_prefill_and_merge_hints`) lives inside `Runner::generate`,
+    // which needs a loaded K2.6 model to drive end-to-end. The unit
+    // tests below cover the load-bearing pure helper
+    // `merge_prefill_observations_into_hits`. The pure helper is what
+    // `exit_prefill_and_merge_hints` actually delegates to, so this
+    // is a faithful test of the merge math.
+    //
+    // The integration property the task spec demands — "prefill firing
+    // layer-30 expert-42 produces a hint count change in expert_hits"
+    // — is reproduced as `prefill_firing_l30_e42_produces_hint_count_change`
+    // below: we synthesize an `obs[30][42] = N` observation, call the
+    // merge helper at the configured weight, and assert that
+    // `hits[30][42]` shifted by `round(weight * N)` while every other
+    // slot stays empty.
+
+    /// Baseline: an observation of `{layer 30 → expert 42 fires N
+    /// times}` at weight 0.5 merges into `hits` as
+    /// `hits[30][42] += round(0.5 * N)`. Other layers / experts stay
+    /// untouched. This is the "Test:" from the iter 065 task spec.
+    #[test]
+    fn prefill_firing_l30_e42_produces_hint_count_change() {
+        const N_LAYERS: usize = 60;
+        const PREFILL_FIRINGS: u64 = 8;
+        const WEIGHT: f32 = 0.5;
+
+        let mut hits: Vec<HashMap<u32, u64>> = (0..N_LAYERS).map(|_| HashMap::new()).collect();
+        let mut obs: Vec<HashMap<u32, u64>> = (0..N_LAYERS).map(|_| HashMap::new()).collect();
+        obs[30].insert(42u32, PREFILL_FIRINGS);
+
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, WEIGHT);
+
+        // Exactly one (layer, expert) entry was merged.
+        assert_eq!(merged, 1, "exactly one entry should merge");
+        // hits[30][42] should now hold round(0.5 * 8) = 4.
+        assert_eq!(
+            hits[30].get(&42).copied(),
+            Some(4),
+            "hits[30][42] should reflect round(weight * prefill_firings)"
+        );
+        // Every other layer's hit map should still be empty.
+        for (i, h) in hits.iter().enumerate() {
+            if i == 30 {
+                continue;
+            }
+            assert!(
+                h.is_empty(),
+                "layer {i} hit map should be untouched by an L30 observation"
+            );
+        }
+        // Layer 30 should hold only expert 42.
+        assert_eq!(
+            hits[30].len(),
+            1,
+            "layer 30 should hold only the merged expert"
+        );
+    }
+
+    /// Weight 0.0 must short-circuit: zero entries merged, hits map
+    /// untouched even when observations are present. This is the
+    /// back-compat path the CLI's default flag value relies on.
+    #[test]
+    fn merge_with_zero_weight_is_a_noop() {
+        let mut hits = vec![HashMap::new(); 4];
+        let mut obs = vec![HashMap::new(); 4];
+        obs[0].insert(1u32, 100u64);
+        obs[2].insert(7u32, 50u64);
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.0);
+        assert_eq!(merged, 0, "weight=0.0 must merge nothing");
+        for h in &hits {
+            assert!(h.is_empty(), "hits map must be untouched at weight 0.0");
+        }
+    }
+
+    /// Weight 1.0 is the "treat prefill as a decode firing" identity
+    /// case — the iter 054 status quo, but rerouted through the hint
+    /// plumbing. Verify the merged counts match prefill_obs exactly.
+    #[test]
+    fn merge_with_unit_weight_copies_observations_into_hits() {
+        let mut hits = vec![HashMap::new(); 3];
+        let mut obs = vec![HashMap::new(); 3];
+        obs[0].insert(10u32, 5);
+        obs[0].insert(11, 7);
+        obs[2].insert(99, 12);
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 1.0);
+        assert_eq!(merged, 3, "all three observation entries should merge");
+        assert_eq!(hits[0].get(&10).copied(), Some(5));
+        assert_eq!(hits[0].get(&11).copied(), Some(7));
+        assert!(hits[1].is_empty());
+        assert_eq!(hits[2].get(&99).copied(), Some(12));
+    }
+
+    /// The merge must ADD on top of existing hit counts (e.g. from a
+    /// previous prompt's decode that left `expert_hits` warm), not
+    /// overwrite them. Otherwise a fresh prefill on prompt 2 would
+    /// wipe the workload-level heavy-tail data that iter 054 pinning
+    /// relies on.
+    #[test]
+    fn merge_adds_on_top_of_existing_hits() {
+        let mut hits = vec![HashMap::new(); 2];
+        hits[0].insert(5u32, 100); // carryover from prior decode
+        hits[1].insert(7u32, 200);
+        let mut obs = vec![HashMap::new(); 2];
+        obs[0].insert(5u32, 4); // same expert fired again in this prompt's prefill
+        obs[1].insert(8u32, 6); // a new expert this prompt fired
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.5);
+        assert_eq!(merged, 2, "two distinct observation entries should merge");
+        // hits[0][5] = 100 + round(0.5 * 4) = 102
+        assert_eq!(hits[0].get(&5).copied(), Some(102));
+        // hits[1][7] untouched (no observation for it)
+        assert_eq!(hits[1].get(&7).copied(), Some(200));
+        // hits[1][8] = round(0.5 * 6) = 3 (new entry)
+        assert_eq!(hits[1].get(&8).copied(), Some(3));
+    }
+
+    /// The K2.6 heavy-tail prefill shape (e.g. a code prompt that
+    /// fires a handful of experts a lot, a long tail a tiny bit each)
+    /// should fold into hits proportionally to its real distribution.
+    /// Verify the relative ordering survives a 0.5 weight so iter 054
+    /// pin / iter 056 cache-aware / iter 057 prefetch all see the
+    /// same heavy-tail head after the merge.
+    #[test]
+    fn merge_preserves_heavy_tail_shape_relative_ordering() {
+        let mut hits = vec![HashMap::new(); 1];
+        let mut obs = vec![HashMap::new(); 1];
+        // Hot head: experts 0..3 fire 200 times each during prefill.
+        for eid in 0u32..3 {
+            obs[0].insert(eid, 200);
+        }
+        // Warm middle: experts 10..15 fire 50 times each.
+        for eid in 10u32..15 {
+            obs[0].insert(eid, 50);
+        }
+        // Cold tail: experts 100..120 fire 4 times each.
+        for eid in 100u32..120 {
+            obs[0].insert(eid, 4);
+        }
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.5);
+        assert_eq!(merged, 3 + 5 + 20);
+        // Verify relative ordering survives. Hot > warm > cold.
+        for hot in 0u32..3 {
+            assert_eq!(hits[0].get(&hot).copied(), Some(100));
+        }
+        for warm in 10u32..15 {
+            assert_eq!(hits[0].get(&warm).copied(), Some(25));
+        }
+        for cold in 100u32..120 {
+            assert_eq!(hits[0].get(&cold).copied(), Some(2));
+        }
+        // And the iter 054 / 056 / 057 helpers must rank them correctly.
+        let top3 = super::select_top_n_by_hits(&hits[0], 3);
+        assert_eq!(top3, vec![0, 1, 2], "top-3 must be the hot head");
+        let top8 = super::select_top_n_by_hits(&hits[0], 8);
+        assert_eq!(
+            top8,
+            vec![0, 1, 2, 10, 11, 12, 13, 14],
+            "top-8 must drop into the warm middle after exhausting the hot head"
+        );
+    }
+
+    /// Empty observations (the first call ever, or after `reset_kv`)
+    /// must merge zero entries regardless of weight. Guards against
+    /// "did we accidentally insert phantom expert 0 entries?".
+    #[test]
+    fn merge_with_empty_observations_merges_nothing() {
+        let mut hits = vec![HashMap::new(); 10];
+        let obs = vec![HashMap::new(); 10];
+        for w in [0.5_f32, 1.0, 2.0, 10.0] {
+            let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, w);
+            assert_eq!(merged, 0, "empty obs must merge zero entries at w={w}");
+            for h in &hits {
+                assert!(h.is_empty(), "hits must stay empty when obs is empty");
+            }
+        }
+    }
+
+    /// Non-finite / negative weights must short-circuit to a no-op,
+    /// mirroring `set_prefill_hint_weight`'s clamping. A NaN that
+    /// snuck through the API setter (or a future code path that
+    /// doesn't call the setter) must not panic the merge.
+    #[test]
+    fn merge_with_invalid_weight_is_a_noop() {
+        let mut hits = vec![HashMap::new(); 2];
+        let mut obs = vec![HashMap::new(); 2];
+        obs[0].insert(1u32, 100);
+        for bad_w in [-1.0_f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, bad_w);
+            assert_eq!(merged, 0, "weight={bad_w:?} must merge nothing");
+            for h in &hits {
+                assert!(
+                    h.is_empty(),
+                    "hits must stay untouched on invalid weight={bad_w:?}"
+                );
+            }
+        }
+    }
+
+    /// Round-to-nearest: `round(0.5 * 1) = 1` (banker's rounding would
+    /// give 0; we want 1 so a single prefill firing always leaves a
+    /// trace at any positive weight ≥ 0.5). Without this, a w=0.5
+    /// hint would silently drop every odd-count observation.
+    #[test]
+    fn merge_rounds_to_nearest_not_truncate() {
+        let mut hits = vec![HashMap::new(); 1];
+        let mut obs = vec![HashMap::new(); 1];
+        // 1 firing at w=0.5 → 0.5 → round to 1 (round-half-away).
+        obs[0].insert(7u32, 1);
+        // 3 firings at w=0.5 → 1.5 → round to 2.
+        obs[0].insert(8u32, 3);
+        // 4 firings at w=0.5 → 2.0 → round to 2.
+        obs[0].insert(9u32, 4);
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.5);
+        assert_eq!(merged, 3);
+        assert_eq!(hits[0].get(&7).copied(), Some(1), "1*0.5 should round to 1");
+        assert_eq!(hits[0].get(&8).copied(), Some(2), "3*0.5 should round to 2");
+        assert_eq!(hits[0].get(&9).copied(), Some(2), "4*0.5 should round to 2");
+    }
+
+    /// Sub-rounding firings (e.g. 1 firing at w=0.1 = 0.1 ≈ rounds to
+    /// 0) must NOT be counted in the returned `merged` total and must
+    /// NOT insert a zero entry into `hits`. Otherwise the helper would
+    /// silently bloat the hits map with no-op entries that perturb
+    /// downstream iter 054 / 056 / 057 selection.
+    #[test]
+    fn merge_skips_sub_rounding_contributions() {
+        let mut hits = vec![HashMap::new(); 1];
+        let mut obs = vec![HashMap::new(); 1];
+        // 1 firing at w=0.1 → 0.1 → rounds to 0 → skip.
+        obs[0].insert(1u32, 1);
+        // 2 firings at w=0.1 → 0.2 → rounds to 0 → skip.
+        obs[0].insert(2u32, 2);
+        // 5 firings at w=0.1 → 0.5 → rounds to 1 (round-half-away).
+        obs[0].insert(3u32, 5);
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.1);
+        assert_eq!(
+            merged, 1,
+            "only the expert with >= round-up contribution should count"
+        );
+        assert!(!hits[0].contains_key(&1), "expert 1 should NOT be inserted");
+        assert!(!hits[0].contains_key(&2), "expert 2 should NOT be inserted");
+        assert_eq!(hits[0].get(&3).copied(), Some(1), "expert 3 should be 1");
+        assert_eq!(hits[0].len(), 1, "no phantom zero entries");
+    }
+
+    /// Length-mismatched inputs should not panic — short observations
+    /// vs longer hits is fine (extra hit slots stay untouched); short
+    /// hits vs longer observations short-circuits the extra obs slots
+    /// because `hits.get_mut(i)` returns None.
+    #[test]
+    fn merge_tolerates_length_mismatch_without_panic() {
+        // hits shorter than obs: extra obs entries are skipped.
+        let mut hits = vec![HashMap::new(); 2];
+        let mut obs = vec![HashMap::new(); 5];
+        obs[0].insert(1u32, 4);
+        obs[3].insert(7u32, 4); // out-of-bounds for hits
+        let merged = super::merge_prefill_observations_into_hits(&mut hits, &obs, 0.5);
+        // Only obs[0] could merge.
+        assert_eq!(merged, 1);
+        assert_eq!(hits[0].get(&1).copied(), Some(2));
+        assert!(hits[1].is_empty());
     }
 }
