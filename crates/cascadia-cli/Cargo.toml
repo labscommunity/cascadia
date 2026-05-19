@@ -1,0 +1,36 @@
+[package]
+name = "cascadia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cascadia CLI — clap-based, mirrors the Python `python -m cascadia worker` flag set."
+
+[features]
+default = []
+openvino = [
+    "cascadia-engine-openvino/openvino",
+    "cascadia-engine-sparse-moe/openvino",
+]
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-engine = { workspace = true }
+cascadia-engine-mock = { workspace = true }
+cascadia-engine-openvino = { workspace = true }
+cascadia-engine-sparse-moe = { workspace = true }
+cascadia-runner = { workspace = true }
+cascadia-api = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tower = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }

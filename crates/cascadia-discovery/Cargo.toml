@@ -1,0 +1,18 @@
+[package]
+name = "cascadia-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-config mDNS peer discovery for cascadia; populates a cascadia_topology::Topology."
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-topology = { workspace = true }
+mdns-sd = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -43,11 +43,11 @@ jobs:
         # are tagged with `#[allow(dead_code)]` or actually used.
         run: cargo clippy --workspace --all-targets
 
-      - name: Build tahoma binary (needed by e2e tests)
-        # tests-e2e exec the tahoma binary directly; without this they
-        # panic with "tahoma binary not built". Stub mode is fine —
+      - name: Build cascadia binary (needed by e2e tests)
+        # tests-e2e exec the cascadia binary directly; without this they
+        # panic with "cascadia binary not built". Stub mode is fine —
         # the e2e tests use the mock engine.
-        run: cargo build -p tahoma
+        run: cargo build -p cascadia
 
       - name: Test (workspace)
         # Stub-mode build — engines that need OpenVINO link return a

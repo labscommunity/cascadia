@@ -1,6 +1,6 @@
-# Sharding models for tahoma
+# Sharding models for cascadia
 
-`tahoma shard` slices a HuggingFace causal-LM into per-stage OpenVINO IRs
+`cascadia shard` slices a HuggingFace causal-LM into per-stage OpenVINO IRs
 that the worker engines (`ov-runtime`, `ov-dist-spec`) can load. Each
 stage holds a contiguous slab of decoder layers + (on the first stage)
 the embedding + (on the last stage) the final norm + lm_head.
@@ -12,8 +12,8 @@ the embedding + (on the last stage) the final norm + lm_head.
 pip install torch transformers openvino safetensors huggingface_hub nncf
 
 # Two-stage shard from HF:
-tahoma shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
-             --output-dir ~/tahoma/llama-8b-2stage \
+cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
+             --output-dir ~/cascadia/llama-8b-2stage \
              --num-stages 2 \
              --quantization int4
 ```
@@ -21,7 +21,7 @@ tahoma shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
 Output:
 
 ```
-~/tahoma/llama-8b-2stage/
+~/cascadia/llama-8b-2stage/
   pipeline_config.json    # global metadata: model_id, layer count, vocab, etc.
   tokenizer/              # tokenizer.json + config.json + special tokens
   stage_0/
@@ -35,14 +35,14 @@ Output:
 ```
 
 This directory is portable. Copy it to every worker node (or re-run
-`tahoma shard` separately on each, depending on which is faster on your
+`cascadia shard` separately on each, depending on which is faster on your
 network).
 
 ## Flags
 
 | Flag | Meaning |
 |------|---------|
-| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`) OR local path to a directory with `config.json` + `*.safetensors`. HF repos auto-download into `~/.cache/tahoma/models/`. |
+| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`) OR local path to a directory with `config.json` + `*.safetensors`. HF repos auto-download into `~/.cache/cascadia/models/`. |
 | `-o`, `--output-dir` | Where to write the shard tree. |
 | `--num-stages N` | Pipeline stages to split into. 2 is the common case for 2-machine setups; use 3+ for larger clusters. |
 | `--quantization` | `int4` (default — typical), `int4_asym`, `int8`, or `fp16`. INT4 needs nncf installed. |
@@ -53,7 +53,7 @@ network).
 
 ## Supported architectures
 
-Tahoma's exporter uses HuggingFace's standard decoder-layer classes,
+Cascadia's exporter uses HuggingFace's standard decoder-layer classes,
 so anything whose layer exposes the conventional names
 (`self_attn.{q_proj,k_proj,v_proj,o_proj}`, `mlp`, `input_layernorm`,
 `post_attention_layernorm`) and uses RoPE rotary embeddings works:
@@ -70,7 +70,7 @@ so anything whose layer exposes the conventional names
 
 For unknown architectures the script falls back to `LlamaDecoderLayer`
 and warns on stderr. If the resulting shard's outputs match the HF
-reference (you can spot-check with `tahoma worker --engine ov-genai`
+reference (you can spot-check with `cascadia worker --engine ov-genai`
 single-stage on the same model), it's good. If they diverge, file an
 issue with the model's `model_type` and `architectures` from `config.json`.
 
@@ -117,7 +117,7 @@ If you change a config knob (rope_theta, quantization mode) and want to
 avoid the full multi-minute re-export:
 
 ```bash
-tahoma shard --model <same args> --stage 1
+cascadia shard --model <same args> --stage 1
 ```
 
 This re-runs only stage 1 against the same source weights. The
@@ -142,7 +142,7 @@ int8` which doesn't hit the same path.
 **"unknown model_type, falling back to Llama" warning**: the model
 isn't in the explicit support list. The export will produce a working
 IR for any model whose layer interface matches Llama's, but you should
-verify the outputs (run `tahoma worker --engine ov-genai` against the
+verify the outputs (run `cascadia worker --engine ov-genai` against the
 same source model and compare the first 10 generated tokens).
 
 **OOM during INT4 quantization**: NNCF holds the full FP16 model in

@@ -4,7 +4,7 @@ target/
 *.pdb
 # Cargo.lock IS tracked (binary project — pinned for reproducibility)
 
-# Tahoma scratch dirs (bench logs, ad-hoc experiments)
+# Cascadia scratch dirs (bench logs, ad-hoc experiments)
 tmp/
 experiments/
 

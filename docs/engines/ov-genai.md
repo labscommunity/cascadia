@@ -27,30 +27,30 @@ optimum-cli export openvino \
 ### Plain LLMPipeline
 
 ```bash
-tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --model /models/llama-3.1-8b-int4-ov \
-              --ov-cache-dir ~/.cache/tahoma/ov_kernel_cache \
+              --ov-cache-dir ~/.cache/cascadia/ov_kernel_cache \
               --api :8000
 ```
 
 ### FastDraft speculative decode (short-input chat)
 
 ```bash
-tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --model /models/llama-3.1-8b-int4-ov \
               --draft-model /models/llama-3.1-fastdraft-150m-int8-ov \
               --spec-k 5 \
-              --ov-cache-dir ~/.cache/tahoma/ov_kernel_cache \
+              --ov-cache-dir ~/.cache/cascadia/ov_kernel_cache \
               --api :8000
 ```
 
 ### Prompt Lookup decoding (extractive workloads)
 
 ```bash
-tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --model /models/llama-3.1-8b-int4-ov \
               --prompt-lookup 3 \
-              --ov-cache-dir ~/.cache/tahoma/ov_kernel_cache \
+              --ov-cache-dir ~/.cache/cascadia/ov_kernel_cache \
               --api :8000
 ```
 

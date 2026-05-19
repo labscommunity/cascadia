@@ -1,4 +1,4 @@
-# Tahoma
+# Cascadia
 
 Distributed LLM inference for Intel hardware. Think exo (github.com/exo-explore/exo), but Intel-native.
 
@@ -16,30 +16,30 @@ Run any model on Intel hardware. Shard models across Intel AI PCs using pipeline
 
 ## Architecture
 
-Tahoma is a Cargo workspace at the repo root. The Python source tree
+Cascadia is a Cargo workspace at the repo root. The Python source tree
 was removed at the end of Phase 12 (2026-05-02); the `rust/`
 subdirectory was hoisted to the root in Phase 12.1. Module seams
 (one concern per crate):
 
-- `crates/tahoma-api/` — OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`)
-- `crates/tahoma-runner/` — Per-stage Runner: connects transports, drives the engine, streams chunks
-- `crates/tahoma-engine/` — `Engine` + `Builder` traits (the plugin seam)
-- `crates/tahoma-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
-- `crates/tahoma-engine-mock/` — Deterministic test engine
-- `crates/tahoma-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
-- `crates/tahoma-transport/` — TCP activation relay (length-prefixed tensor wire format)
-- `crates/tahoma-topology/` — Topology graph with per-link latency + bandwidth
-- `crates/tahoma-types/` — Zero-dep wire/value types
-- `crates/tahoma-discovery/` — mDNS peer discovery (`_tahoma._tcp.local.`)
-- `crates/tahoma-download/` — Model registry, HuggingFace pull
-- `crates/tahoma-cli/` — `tahoma worker`, `tahoma engines`
-- `crates/tahoma/` — `tahoma` binary entry point
+- `crates/cascadia-api/` — OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`, `/health`)
+- `crates/cascadia-runner/` — Per-stage Runner: connects transports, drives the engine, streams chunks
+- `crates/cascadia-engine/` — `Engine` + `Builder` traits (the plugin seam)
+- `crates/cascadia-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
+- `crates/cascadia-engine-mock/` — Deterministic test engine
+- `crates/cascadia-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
+- `crates/cascadia-transport/` — TCP activation relay (length-prefixed tensor wire format)
+- `crates/cascadia-topology/` — Topology graph with per-link latency + bandwidth
+- `crates/cascadia-types/` — Zero-dep wire/value types
+- `crates/cascadia-discovery/` — mDNS peer discovery (`_cascadia._tcp.local.`)
+- `crates/cascadia-download/` — Model registry, HuggingFace pull
+- `crates/cascadia-cli/` — `cascadia worker`, `cascadia engines`
+- `crates/cascadia/` — `cascadia` binary entry point
 
 ## Design decisions (locked 2026-05-01)
 
-- **Engine plurality: OpenVINO-first, pluggable.** `Engine` + `Builder` traits live in `tahoma-engine`; ship `mock`, `ov-genai`, `ov-runtime`, and `ov-dist-spec` from day one. Future engines (IPEX, OneAPI direct) plug behind the same trait.
-- **Discovery: libp2p-style, zero-config peer-to-peer.** No central control plane in OSS — that's the productization angle (handled in the cascadia-fleet track, not here).
-- **Topology stores measured latency + bandwidth.** Exo's topology graph tracks edges as `SocketConnection` / `RDMAConnection` but does not store latency or bandwidth. Empirically (1,200+ rainier experiments), latency drives placement on Intel fleets — a 50 ms WAN hop drops throughput 65%. Tahoma's topology stores per-link measurements.
+- **Engine plurality: OpenVINO-first, pluggable.** `Engine` + `Builder` traits live in `cascadia-engine`; ship `mock`, `ov-genai`, `ov-runtime`, and `ov-dist-spec` from day one. Future engines (IPEX, OneAPI direct) plug behind the same trait.
+- **Discovery: libp2p-style, zero-config peer-to-peer.** No central control plane in OSS — that's the productization angle (handled in the cascadia-enterprise track, not here).
+- **Topology stores measured latency + bandwidth.** Exo's topology graph tracks edges as `SocketConnection` / `RDMAConnection` but does not store latency or bandwidth. Empirically (1,200+ rainier experiments), latency drives placement on Intel fleets — a 50 ms WAN hop drops throughput 65%. Cascadia's topology stores per-link measurements.
 - **Rust-only.** Compiles to a single static binary per node; no runtime Python dep, no pip install on workers.
 - **License:** Apache-2.0 target; repo is private during incubation.
 - **No co-authors on commits.** See "Commit conventions" below — this is non-negotiable for this project.
@@ -47,7 +47,7 @@ subdirectory was hoisted to the root in Phase 12.1. Module seams
 ## Source of truth for inference internals
 
 The OpenVINO export + pipeline-parallel patterns originated in rainier
-(`/Users/tatef/Workspaces/rainier`). Tahoma re-implements them in
+(`/Users/tatef/Workspaces/rainier`). Cascadia re-implements them in
 Rust; rainier's Python is the reference for shape semantics and
 attention-mask conventions:
 
@@ -69,6 +69,6 @@ Documented in rainier's `DISCOVERIES.md` and `docs/PRODUCTION_LEARNINGS.md`.
 
 - Rust 1.75+ (workspace edition 2021).
 - `cargo fmt` + `cargo clippy --workspace` clean before commit.
-- One concern per crate; `Engine` and `Builder` traits in `tahoma-engine` are the plugin seam — engines should not depend on each other.
-- C++ in `tahoma-ov-genai-shim/cpp/` is `extern "C"` only (no exceptions across the boundary, every entry point catches `...`).
-- No runtime cascadia / rainier imports. Reference their algorithms; copy structure where useful; do not link.
+- One concern per crate; `Engine` and `Builder` traits in `cascadia-engine` are the plugin seam — engines should not depend on each other.
+- C++ in `cascadia-ov-genai-shim/cpp/` is `extern "C"` only (no exceptions across the boundary, every entry point catches `...`).
+- No runtime cascadia-enterprise / rainier imports. Reference their algorithms; copy structure where useful; do not link.

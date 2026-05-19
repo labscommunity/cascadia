@@ -211,6 +211,232 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cascadia"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cascadia-cli",
+ "clap",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-runner",
+ "cascadia-types",
+ "chrono",
+ "futures",
+ "minijinja",
+ "minijinja-contrib",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cascadia-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cascadia-api",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-engine-openvino",
+ "cascadia-engine-sparse-moe",
+ "cascadia-runner",
+ "cascadia-types",
+ "clap",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cascadia-discovery"
+version = "0.1.0"
+dependencies = [
+ "cascadia-topology",
+ "cascadia-types",
+ "mdns-sd",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-download"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hf-hub",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-types",
+ "futures",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cascadia-engine-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-types",
+ "futures",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-engine-openvino"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-ov-genai-shim",
+ "cascadia-runner",
+ "cascadia-transport",
+ "cascadia-types",
+ "futures",
+ "half",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-engine-sparse-moe"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-int4-gemm",
+ "cascadia-ov-genai-shim",
+ "cascadia-runner",
+ "cascadia-transport",
+ "cascadia-types",
+ "futures",
+ "half",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-int4-gemm"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "memmap2",
+ "parking_lot",
+ "rayon",
+ "serde_json",
+ "thiserror 1.0.69",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cascadia-ov-genai-shim"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cascadia-runner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-types",
+ "futures",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-tests-e2e"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-topology"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "serde",
+]
+
+[[package]]
+name = "cascadia-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2199,232 +2425,6 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "tahoma"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "tahoma-cli",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "chrono",
- "futures",
- "minijinja",
- "minijinja-contrib",
- "parking_lot",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-runner",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tahoma-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "tahoma-api",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-engine-openvino",
- "tahoma-engine-sparse-moe",
- "tahoma-runner",
- "tahoma-types",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tahoma-discovery"
-version = "0.1.0"
-dependencies = [
- "mdns-sd",
- "parking_lot",
- "tahoma-topology",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-download"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hf-hub",
- "parking_lot",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-engine"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "tahoma-types",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tahoma-engine-mock"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "tahoma-engine",
- "tahoma-types",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-engine-openvino"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "half",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-ov-genai-shim",
- "tahoma-runner",
- "tahoma-transport",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokenizers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-engine-sparse-moe"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "half",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-int4-gemm",
- "tahoma-ov-genai-shim",
- "tahoma-runner",
- "tahoma-transport",
- "tahoma-types",
- "tempfile",
- "thiserror 1.0.69",
- "tokenizers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-int4-gemm"
-version = "0.1.0"
-dependencies = [
- "half",
- "memmap2",
- "parking_lot",
- "rayon",
- "serde_json",
- "thiserror 1.0.69",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "tahoma-ov-genai-shim"
-version = "0.1.0"
-dependencies = [
- "cc",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tahoma-runner"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "parking_lot",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-tests-e2e"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-topology"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "parking_lot",
- "serde",
-]
-
-[[package]]
-name = "tahoma-transport"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-# tahoma — current status
+# cascadia — current status
 
 Snapshot of what works today. Updated whenever something material
 ships on `main`.
@@ -8,8 +8,8 @@ ships on `main`.
 Distributed LLM inference for Intel hardware. Single Rust binary per
 node. Sharding + serving + tokenizer + HTTP API are all in the same
 ~7 MB executable. Pipeline parallelism over TCP between nodes. The
-OSS / hobbyist counterpart to cascadia (the enterprise track —
-multi-tenant, auth, fault tolerance, separate repo).
+OSS / hobbyist counterpart to cascadia-enterprise (the enterprise
+track — multi-tenant, auth, fault tolerance, separate repo).
 
 Closest comparable in the ecosystem: [exo](https://github.com/exo-explore/exo),
 but for Intel devices (Lunar Lake / Arrow Lake / Panther Lake / Battlemage
@@ -24,9 +24,9 @@ end-to-end in CI plus on-hardware benches.
 | Engine | Stages | Spec decode | Shards required | Status |
 |--------|-------:|-------------|-----------------|--------|
 | `mock` | 1 | – | none | reference / test fixture |
-| `ov-genai` | 1 only | optional (FastDraft / Prompt Lookup) | off-the-shelf HF or `tahoma shard` | production-ready |
-| `ov-runtime` | N | – | v3 OR v5 (`tahoma shard` produces v5) | production-ready |
-| `ov-dist-spec` | N | required (chain spec) | v5 (`tahoma shard`) | production-ready |
+| `ov-genai` | 1 only | optional (FastDraft / Prompt Lookup) | off-the-shelf HF or `cascadia shard` | production-ready |
+| `ov-runtime` | N | – | v3 OR v5 (`cascadia shard` produces v5) | production-ready |
+| `ov-dist-spec` | N | required (chain spec) | v5 (`cascadia shard`) | production-ready |
 
 `ov-runtime` auto-detects v3 vs v5 IR layouts and dispatches to the
 right input-binding path (added in PR #6 so user-sharded models work
@@ -38,13 +38,13 @@ with both `ov-runtime` and `ov-dist-spec`).
 
 ```bash
 pip install torch transformers openvino safetensors huggingface_hub nncf
-tahoma shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
-             --output-dir ~/tahoma/llama-8b-2stage \
+cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
+             --output-dir ~/cascadia/llama-8b-2stage \
              --num-stages 2 --quantization int4
 ```
 
 Drops the previous dependency on rainier (the sister Python repo). The
-exporter is bundled into the tahoma binary via `include_str!` and
+exporter is bundled into the cascadia binary via `include_str!` and
 written to a temp file at runtime — no extra files to deploy.
 
 Architectures explicitly tested: Llama (1, 2, 3, 3.1, 3.2), Mistral 7B+,
@@ -56,12 +56,12 @@ models are not yet supported. Full table + tuning guide in
 
 ```bash
 # Node B (last stage):
-tahoma worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
-              --model ~/tahoma/llama-8b-2stage --listen :9100
+cascadia worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
+              --model ~/cascadia/llama-8b-2stage --listen :9100
 
 # Node A (first stage + API):
-tahoma worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
-              --model ~/tahoma/llama-8b-2stage \
+cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
+              --model ~/cascadia/llama-8b-2stage \
               --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 5 \
               --next 10.0.0.2:9100 --api :8000
 ```
@@ -71,7 +71,7 @@ OpenAI-compatible `/v1/chat/completions` endpoint with SSE streaming.
 ### Single-node serving (no sharding)
 
 ```bash
-tahoma worker --rank 0 --total 1 --engine ov-genai --device GPU \
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --model unsloth/Meta-Llama-3.1-8B-Instruct \
               --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 5 \
               --api :8000
@@ -104,12 +104,12 @@ Distributed `ov-dist-spec` (29.62 tok/s) beats the best single-node
 config (`ov-genai` + FastDraft 150M, 28.04 tok/s) only on **long-form
 generation** (≥ 1000 tokens). Below that, single-node wins because the
 per-round network coordination overhead doesn't amortize. See
-[experiments on the autolab branch](https://github.com/labscommunity/tahoma/tree/autolab/distributed-perf)
+[experiments on the autolab branch](https://github.com/labscommunity/cascadia/tree/autolab/distributed-perf)
 for the full investigation.
 
 ## Recent changes
 
-* **PR #6 (`feat/standalone-sharding`, May 3, 2026)** — adds `tahoma
+* **PR #6 (`feat/standalone-sharding`, May 3, 2026)** — adds `cascadia
   shard` subcommand, drops the rainier dependency. Generalized
   exporter for Llama-family architectures. `ov-runtime` engine now
   handles both v3 and v5 IR input layouts. New `docs/SHARDING.md`.
@@ -131,19 +131,19 @@ Per-crate breakdown:
 
 | Crate | Tests |
 |---|---:|
-| `tahoma-types` | 13 |
-| `tahoma-topology` | 4 |
-| `tahoma-transport` | 5 |
-| `tahoma-engine-mock` | 4 |
-| `tahoma-ov-genai-shim` | 3 |
-| `tahoma-engine-openvino` | 5 |
-| `tahoma-runner` | 3 |
-| `tahoma-api` | 3 |
-| `tahoma-discovery` | 2 |
-| `tahoma-download` | 3 |
-| `tahoma-tests-e2e` | 2 |
+| `cascadia-types` | 13 |
+| `cascadia-topology` | 4 |
+| `cascadia-transport` | 5 |
+| `cascadia-engine-mock` | 4 |
+| `cascadia-ov-genai-shim` | 3 |
+| `cascadia-engine-openvino` | 5 |
+| `cascadia-runner` | 3 |
+| `cascadia-api` | 3 |
+| `cascadia-discovery` | 2 |
+| `cascadia-download` | 3 |
+| `cascadia-tests-e2e` | 2 |
 
-The e2e crate spawns the real `tahoma` binary, polls `/health`, and
+The e2e crate spawns the real `cascadia` binary, polls `/health`, and
 issues concurrent fan-out requests against the mock engine.
 
 ## Build
@@ -152,21 +152,21 @@ Two profiles:
 
 ```bash
 # Stub mode (no OV link). Engines that need OV return a clean runtime error.
-cargo build --release -p tahoma
+cargo build --release -p cascadia
 
 # Real OV (Intel hardware). Requires the OpenVINO GenAI 2026.1 SDK download.
 INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
-  cargo build --release -p tahoma --features openvino
+  cargo build --release -p cascadia --features openvino
 ```
 
-Binary at `target/release/tahoma` (`tahoma.exe` on Windows). Static
+Binary at `target/release/cascadia` (`cascadia.exe` on Windows). Static
 apart from the OV dynamic libraries; copy the binary plus
 `INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and
 `runtime/3rdparty/tbb/bin/` to the worker host's PATH.
 
 ## Security model
 
-Tahoma's network surface is designed for **trusted LAN deployment** —
+Cascadia's network surface is designed for **trusted LAN deployment** —
 think a closet or rack of Intel AI PCs on an isolated subnet, not the
 public internet. The Phase 14 hardening (PR #3) closed the worst
 failure modes (panics, OOM, crash on malformed input) but does NOT
@@ -187,7 +187,7 @@ add authentication or transport encryption.
 * Numerics: NaN-aware `argmax` (warns instead of silently returning
   token 0 on a broken forward pass). Rotary `compute()` clamps `start`
   to 16 M positions and `seq_len` to 1 M tokens.
-* Registry (`tahoma-download`): atomic write (tmp + fsync + rename),
+* Registry (`cascadia-download`): atomic write (tmp + fsync + rename),
   reject symlink at registry path, 16 MiB cap, parse errors are hard
   failures.
 
@@ -203,30 +203,31 @@ proxy in front of the `--api` port, firewall the inter-stage TCP ports
 threat model and defense-in-depth limits are summarized in the
 binary's `--help` long_about.
 
-Cascadia (the enterprise repo) is where multi-tenancy, auth, fault
-tolerance, and the rest of the production-grade story live. Tahoma's
-job is to be the hobbyist-friendly OSS substrate.
+Cascadia-enterprise (the enterprise repo) is where multi-tenancy,
+auth, fault tolerance, and the rest of the production-grade story
+live. Cascadia's job is to be the hobbyist-friendly OSS substrate.
 
 ## Known limitations / not yet done
 
 In rough order of "how often this comes up":
 
 1. **mDNS auto-discovery is built but not wired** into the worker CLI.
-   `tahoma-discovery` advertises `_tahoma._tcp.local.` and populates
-   `tahoma-topology` (latency + bandwidth per edge), but `tahoma
+   `cascadia-discovery` advertises `_cascadia._tcp.local.` and populates
+   `cascadia-topology` (latency + bandwidth per edge), but `cascadia
    worker` still requires explicit `--listen` / `--next host:port`. A
    follow-up PR will let workers auto-resolve peers by node id.
 2. **No automatic placement** across discovered nodes. The operator
    picks which rank goes where.
 3. **Pure-Rust exporter** would drop the Python pip-install
-   requirement for `tahoma shard`. Significant effort; deferred until
+   requirement for `cascadia shard`. Significant effort; deferred until
    the supported-architecture set settles.
 4. **Tensor parallelism** (`tp_size > 1`) is in the type system but no
    engine implements it — pure pipeline parallelism only.
 5. **No multi-tenant batching across requests.** Engines process one
    task at a time. Concurrency happens at the API admission layer
    (16-request semaphore) but not inside the engine. Acceptable for
-   the single-user OSS target; cascadia will own the batching story.
+   the single-user OSS target; cascadia-enterprise will own the
+   batching story.
 6. **Mixtral / MoE export** is not supported by the bundled exporter
    (the script assumes one MLP per layer). Llama / Mistral / Qwen2 /
    Phi-3 / Gemma 2 cover most current OSS deployments.
@@ -240,17 +241,17 @@ In rough order of "how often this comes up":
 
 ## Architecture position
 
-Per the design constraint (cascadia may depend on tahoma; tahoma may
-not depend on cascadia):
+Per the design constraint (cascadia-enterprise may depend on cascadia;
+cascadia may not depend on cascadia-enterprise):
 
-* No cascadia imports anywhere in the workspace.
-* Stable public APIs on the most-reusable crates (`tahoma-types`,
-  `tahoma-topology`, `tahoma-transport`, `tahoma-engine`).
+* No cascadia-enterprise imports anywhere in the workspace.
+* Stable public APIs on the most-reusable crates (`cascadia-types`,
+  `cascadia-topology`, `cascadia-transport`, `cascadia-engine`).
 * The OpenVINO C++ FFI shim defaults to **stub mode** (no link, runtime
   errors only) so dev iteration on macOS / CI Linux without OpenVINO
   installed stays fast. Real link is gated behind `--features openvino`.
 * Wire format for activation transport is **byte-identical to the
-  removed Python prototype's `tahoma/worker/transport.py`** — Python
+  removed Python prototype's `cascadia/worker/transport.py`** — Python
   ranks could in principle still interop. dtype codes: 0=f32, 1=f16,
   2=i8, 3=i32, 4=i64.
 
