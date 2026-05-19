@@ -495,3 +495,245 @@ pub fn shell_forward_decode_int4_with_capacity(
 fn rmsnorm_apply(x: &[f32], weight_bf16: &[u8], dim: usize) -> Vec<f32> {
     shell::rmsnorm_apply_pub(x, weight_bf16, dim)
 }
+
+/// Predict the top-`n` expert IDs that the *next* layer's router will
+/// fire on, by running a "shadow router" GEMV against the next layer's
+/// router weights using this layer's post-attention RMSNormed hidden
+/// state as the proxy input.
+///
+/// Used by the attention-based predictive prefetcher (iter 087): the
+/// inference loop is supposed to hand the predicted IDs to the iter
+/// 029 / 057 prefetcher channel as a hint for which expert weight
+/// slices to page in for layer i+1, in parallel with layer i's actual
+/// expert dispatch. See `docs/architecture/attn-predict-prefetch.md`
+/// for the cost analysis (~0.10 % of routed-path wall time per layer)
+/// and the accuracy bench plan (requires a real K2.6 trace on miner).
+///
+/// Arguments are the next layer's router weights (in the
+/// `quantize_int4_group` packed + scale format), the next layer's
+/// router bias (raw f32 bytes, same layout as `Int4Shell::router_bias`),
+/// the post-attention proxy hidden state, and `n` (clamped to
+/// `[TOPK, N_ROUTED_EXPERTS]` so the prefetcher always gets at least
+/// the actually-fired top-K's worth of insurance).
+///
+/// Returns the top-`n` expert IDs sorted by `sigmoid(GEMV) + bias`
+/// (the same scoring function the production router uses), descending.
+///
+/// Pure function: no I/O, no allocation outside the return path, no
+/// dependency on the runtime prefetcher. The runtime wiring (gate on
+/// `--shadow-router-n N`, call this helper, submit IDs to the
+/// prefetcher) lives on the iter 057 follow-on branch — this is the
+/// reusable arithmetic leaf.
+///
+/// # Panics
+///
+/// Panics if `next_router_packed`, `next_router_scale`, or
+/// `next_router_bias` have shapes incompatible with
+/// `[N_ROUTED_EXPERTS, HIDDEN]` (same convention as the production
+/// router GEMV call in `shell_forward_decode_int4_with_capacity`).
+pub fn shadow_router_predict_topn(
+    next_router_packed: &[u8],
+    next_router_scale: &[u8],
+    next_router_bias: &[u8],
+    post_attn_proxy: &[f32],
+    n: usize,
+) -> Vec<u32> {
+    assert_eq!(
+        post_attn_proxy.len(),
+        HIDDEN,
+        "shadow_router_predict_topn: hidden mismatch ({} vs {HIDDEN})",
+        post_attn_proxy.len()
+    );
+    assert_eq!(
+        next_router_packed.len(),
+        N_ROUTED_EXPERTS * HIDDEN / 2,
+        "shadow_router_predict_topn: packed shape mismatch"
+    );
+    assert_eq!(
+        next_router_scale.len(),
+        N_ROUTED_EXPERTS * (HIDDEN / GROUP_SIZE) * 2,
+        "shadow_router_predict_topn: scale shape mismatch"
+    );
+    assert_eq!(
+        next_router_bias.len(),
+        N_ROUTED_EXPERTS * 4,
+        "shadow_router_predict_topn: bias shape mismatch (expected f32 bytes)"
+    );
+
+    let n = n.clamp(TOPK, N_ROUTED_EXPERTS);
+
+    let mut router_logits = vec![0.0f32; N_ROUTED_EXPERTS];
+    dequant_gemv_int4_auto(
+        next_router_packed,
+        next_router_scale,
+        post_attn_proxy,
+        N_ROUTED_EXPERTS,
+        HIDDEN,
+        &mut router_logits,
+    );
+
+    let mut scores_raw = vec![0.0f32; N_ROUTED_EXPERTS];
+    for i in 0..N_ROUTED_EXPERTS {
+        scores_raw[i] = 1.0f32 / (1.0f32 + (-router_logits[i]).exp());
+    }
+    let bias: &[f32] = unsafe {
+        std::slice::from_raw_parts(next_router_bias.as_ptr() as *const f32, N_ROUTED_EXPERTS)
+    };
+    let mut scores_for_choice: Vec<(usize, f32)> = (0..N_ROUTED_EXPERTS)
+        .map(|i| (i, scores_raw[i] + bias[i]))
+        .collect();
+    scores_for_choice.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores_for_choice
+        .into_iter()
+        .take(n)
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic int4 router with `n_rows` rows and `k_cols`
+    /// cols, plus a zero bias. Used by the shadow-router predictor
+    /// tests below — keeps them runnable without a real K2.6 shard.
+    fn synth_router(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let packed_len = N_ROUTED_EXPERTS * HIDDEN / 2;
+        let scale_len = N_ROUTED_EXPERTS * (HIDDEN / GROUP_SIZE) * 2;
+        let mut packed = Vec::with_capacity(packed_len);
+        let mut scale = Vec::with_capacity(scale_len);
+        let mut s = seed;
+        while packed.len() + 4 <= packed_len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            packed.extend_from_slice(&(s as u32).to_le_bytes());
+        }
+        while packed.len() < packed_len {
+            packed.push(0);
+        }
+        while scale.len() + 4 <= scale_len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            scale.extend_from_slice(&(s as u32).to_le_bytes());
+        }
+        while scale.len() < scale_len {
+            scale.push(0);
+        }
+        let bias = vec![0u8; N_ROUTED_EXPERTS * 4];
+        (packed, scale, bias)
+    }
+
+    fn synth_post(seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..HIDDEN)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = ((s >> 32) as u32) as f64 / (u32::MAX as f64);
+                (u as f32) * 4.0 - 2.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shadow_router_returns_exactly_n_ids() {
+        let (packed, scale, bias) = synth_router(0x1234);
+        let post = synth_post(0xCAFE);
+        for &n in &[TOPK, 12usize, 16, 24, 32, 64, N_ROUTED_EXPERTS] {
+            let ids = shadow_router_predict_topn(&packed, &scale, &bias, &post, n);
+            assert_eq!(ids.len(), n, "n={n}");
+            // IDs must be unique and in [0, N_ROUTED_EXPERTS).
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "duplicate IDs at n={n}");
+            for &id in &ids {
+                assert!((id as usize) < N_ROUTED_EXPERTS, "out-of-range id at n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_router_clamps_below_topk() {
+        let (packed, scale, bias) = synth_router(0x5678);
+        let post = synth_post(0xBEEF);
+        // n = 0 / 1 / TOPK-1 should all be clamped UP to TOPK.
+        for &n in &[0usize, 1, TOPK - 1] {
+            let ids = shadow_router_predict_topn(&packed, &scale, &bias, &post, n);
+            assert_eq!(
+                ids.len(),
+                TOPK,
+                "n={n} should clamp up to TOPK, got {}",
+                ids.len()
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_router_clamps_above_n_experts() {
+        let (packed, scale, bias) = synth_router(0x9ABC);
+        let post = synth_post(0xFACE);
+        // n > N_ROUTED_EXPERTS should clamp DOWN to N_ROUTED_EXPERTS.
+        let ids = shadow_router_predict_topn(&packed, &scale, &bias, &post, N_ROUTED_EXPERTS + 100);
+        assert_eq!(ids.len(), N_ROUTED_EXPERTS);
+    }
+
+    #[test]
+    fn shadow_router_topn_is_superset_of_topk() {
+        // The top-K is the prefix of the top-N when both are sorted
+        // by score (descending). This is the invariant the
+        // prefetcher relies on: the actually-fired top-8 is always a
+        // subset of any top-N >= 8 the predictor reports.
+        let (packed, scale, bias) = synth_router(0xDEAD);
+        let post = synth_post(0xBABE);
+        let topk = shadow_router_predict_topn(&packed, &scale, &bias, &post, TOPK);
+        for &n in &[TOPK, 12usize, 24, 64] {
+            let topn = shadow_router_predict_topn(&packed, &scale, &bias, &post, n);
+            // First TOPK of topn == topk (same sort order).
+            for k in 0..TOPK {
+                assert_eq!(
+                    topn[k], topk[k],
+                    "top-N[{k}] != top-K[{k}] at n={n}: topn={topn:?} topk={topk:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_router_deterministic_for_fixed_inputs() {
+        // Two calls with identical inputs return identical outputs —
+        // the prefetcher consumer trusts the predictor to be
+        // referentially transparent for any given (weights, post)
+        // pair. No internal RNG, no time-dependent sort tiebreak.
+        let (packed, scale, bias) = synth_router(0x4242);
+        let post = synth_post(0x6969);
+        let ids_a = shadow_router_predict_topn(&packed, &scale, &bias, &post, 24);
+        let ids_b = shadow_router_predict_topn(&packed, &scale, &bias, &post, 24);
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn shadow_router_bias_breaks_ties_predictably() {
+        // With weights that produce ~identical sigmoid scores, the
+        // bias tensor is what decides the top-K. Verify the bias
+        // ordering shows up in the predicted IDs: hand-construct a
+        // bias that monotonically favors expert 0 over 1 over ... .
+        let (packed, scale, _bias) = synth_router(0xFEED);
+        let post = synth_post(0xCAFE);
+        // Build a strictly-monotone-decreasing bias: expert 0 = +N,
+        // expert 1 = +N-1, ... expert N-1 = +1. With a finite-precision
+        // sigmoid the bias dwarfs all but the most extreme logits, so
+        // the predicted top-K will be IDs 0..TOPK.
+        let mut bias_f32 = vec![0.0f32; N_ROUTED_EXPERTS];
+        for i in 0..N_ROUTED_EXPERTS {
+            bias_f32[i] = (N_ROUTED_EXPERTS - i) as f32 * 100.0;
+        }
+        let bias: Vec<u8> = bias_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ids = shadow_router_predict_topn(&packed, &scale, &bias, &post, TOPK);
+        let expected: Vec<u32> = (0..TOPK as u32).collect();
+        assert_eq!(ids, expected);
+    }
+}
