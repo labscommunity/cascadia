@@ -2615,37 +2615,43 @@ mod tests {
         let prefix_len = 6; // "turn 1 prompt + assistant reply"
         let suffix_len = 4; // "turn 2 user message"
         let total = prefix_len + suffix_len;
+        // bf16/u16 stamp: deterministic 16-bit signature per cell.
+        let stamp_k = |h: usize, s: usize, d: usize| -> u16 {
+            ((h * 1_000_000 + s * 1_000 + d) & 0xFFFF) as u16
+        };
+        let stamp_v =
+            |h: usize, s: usize, d: usize| -> u16 { stamp_k(h, s, d).wrapping_add(0x8000) };
 
         // Cold path: fill slots 0..total directly. The stamp function
-        // mimics a deterministic forward: cell(h,s,d) = h*1e6 + s*1e3 + d.
-        let mut cold_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
-        let mut cold_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        // mimics a deterministic forward.
+        let mut cold_k = vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut cold_v = vec![0u16; NUM_HEADS * cap * V_HEAD_DIM];
         for h in 0..NUM_HEADS {
             for s in 0..total {
                 for d in 0..QK_HEAD_DIM {
                     let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
-                    cold_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                    cold_k[off] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
                     let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
-                    cold_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    cold_v[off] = stamp_v(h, s, d);
                 }
             }
         }
 
         // Warm path turn 1: fill slots 0..prefix_len, then pack
         // (mimics end-of-turn-1 snapshot insertion).
-        let mut warm_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
-        let mut warm_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        let mut warm_k = vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut warm_v = vec![0u16; NUM_HEADS * cap * V_HEAD_DIM];
         for h in 0..NUM_HEADS {
             for s in 0..prefix_len {
                 for d in 0..QK_HEAD_DIM {
                     let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
-                    warm_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                    warm_k[off] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
                     let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
-                    warm_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    warm_v[off] = stamp_v(h, s, d);
                 }
             }
         }
@@ -2654,8 +2660,8 @@ mod tests {
         // Turn 2: start from a FRESH buffer (mimics a stateless
         // engine that just woke up from cache). Restore the snapshot,
         // then continue filling slots prefix_len..total.
-        let mut warm2_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
-        let mut warm2_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        let mut warm2_k = vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut warm2_v = vec![0u16; NUM_HEADS * cap * V_HEAD_DIM];
         unpack_layer_slice(&mut warm2_k, &mut warm2_v, &snapshot, prefix_len, cap)
             .expect("restore");
         // "Suffix prefill" — write the new tokens' KV cells.
@@ -2663,11 +2669,11 @@ mod tests {
             for s in prefix_len..total {
                 for d in 0..QK_HEAD_DIM {
                     let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
-                    warm2_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                    warm2_k[off] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
                     let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
-                    warm2_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    warm2_v[off] = stamp_v(h, s, d);
                 }
             }
         }
@@ -2675,28 +2681,23 @@ mod tests {
         // Bit-identity: every populated slot of warm2 must match cold
         // exactly. We don't compare slots [total..cap] — those were
         // never read by the forward path; their contents are
-        // intentionally undefined (the warm path may have ZEROS where
-        // cold has ZEROS, but in production both are NaN-ish).
+        // intentionally undefined.
         for h in 0..NUM_HEADS {
             for s in 0..total {
                 for d in 0..QK_HEAD_DIM {
                     let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
                     assert_eq!(
-                        warm2_k[off].to_bits(),
-                        cold_k[off].to_bits(),
+                        warm2_k[off], cold_k[off],
                         "K mismatch at h={h} s={s} d={d}: warm={} cold={}",
-                        warm2_k[off],
-                        cold_k[off]
+                        warm2_k[off], cold_k[off]
                     );
                 }
                 for d in 0..V_HEAD_DIM {
                     let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
                     assert_eq!(
-                        warm2_v[off].to_bits(),
-                        cold_v[off].to_bits(),
+                        warm2_v[off], cold_v[off],
                         "V mismatch at h={h} s={s} d={d}: warm={} cold={}",
-                        warm2_v[off],
-                        cold_v[off]
+                        warm2_v[off], cold_v[off]
                     );
                 }
             }
@@ -2716,19 +2717,24 @@ mod tests {
         let prefix_len = 5;
         let suffix_len = 6;
         let total = prefix_len + suffix_len;
+        // bf16/u16 storage stamps: a 16-bit signature per cell so any
+        // mis-indexing across a grow surfaces as a bit mismatch.
+        let stamp_k = |h: usize, s: usize, d: usize| -> u16 {
+            ((h * 1_000_000 + s * 1_000 + d) & 0xFFFF) as u16
+        };
+        let stamp_v =
+            |h: usize, s: usize, d: usize| -> u16 { stamp_k(h, s, d).wrapping_add(0x8000) };
 
         // Turn 1 buffer at src_cap.
-        let mut warm_k = vec![0.0f32; NUM_HEADS * src_cap * QK_HEAD_DIM];
-        let mut warm_v = vec![0.0f32; NUM_HEADS * src_cap * V_HEAD_DIM];
+        let mut warm_k = vec![0u16; NUM_HEADS * src_cap * QK_HEAD_DIM];
+        let mut warm_v = vec![0u16; NUM_HEADS * src_cap * V_HEAD_DIM];
         for h in 0..NUM_HEADS {
             for s in 0..prefix_len {
                 for d in 0..QK_HEAD_DIM {
-                    warm_k[h * src_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
-                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                    warm_k[h * src_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
-                    warm_v[h * src_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
-                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    warm_v[h * src_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] = stamp_v(h, s, d);
                 }
             }
         }
@@ -2736,19 +2742,17 @@ mod tests {
 
         // Turn 2 buffer at dst_cap (= 2 × src_cap, simulating one
         // grow_kv_capacity doubling).
-        let mut warm2_k = vec![0.0f32; NUM_HEADS * dst_cap * QK_HEAD_DIM];
-        let mut warm2_v = vec![0.0f32; NUM_HEADS * dst_cap * V_HEAD_DIM];
+        let mut warm2_k = vec![0u16; NUM_HEADS * dst_cap * QK_HEAD_DIM];
+        let mut warm2_v = vec![0u16; NUM_HEADS * dst_cap * V_HEAD_DIM];
         unpack_layer_slice(&mut warm2_k, &mut warm2_v, &snapshot, prefix_len, dst_cap)
             .expect("restore");
         for h in 0..NUM_HEADS {
             for s in prefix_len..total {
                 for d in 0..QK_HEAD_DIM {
-                    warm2_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
-                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                    warm2_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
-                    warm2_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
-                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    warm2_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] = stamp_v(h, s, d);
                 }
             }
         }
@@ -2756,17 +2760,15 @@ mod tests {
         // The cold-path equivalent: a single dst_cap buffer filled
         // 0..total. Both must match cell-by-cell across the populated
         // prefix AND suffix slots.
-        let mut cold_k = vec![0.0f32; NUM_HEADS * dst_cap * QK_HEAD_DIM];
-        let mut cold_v = vec![0.0f32; NUM_HEADS * dst_cap * V_HEAD_DIM];
+        let mut cold_k = vec![0u16; NUM_HEADS * dst_cap * QK_HEAD_DIM];
+        let mut cold_v = vec![0u16; NUM_HEADS * dst_cap * V_HEAD_DIM];
         for h in 0..NUM_HEADS {
             for s in 0..total {
                 for d in 0..QK_HEAD_DIM {
-                    cold_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
-                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                    cold_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] = stamp_k(h, s, d);
                 }
                 for d in 0..V_HEAD_DIM {
-                    cold_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
-                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                    cold_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] = stamp_v(h, s, d);
                 }
             }
         }
@@ -2774,11 +2776,11 @@ mod tests {
             for s in 0..total {
                 for d in 0..QK_HEAD_DIM {
                     let off = h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
-                    assert_eq!(warm2_k[off].to_bits(), cold_k[off].to_bits());
+                    assert_eq!(warm2_k[off], cold_k[off]);
                 }
                 for d in 0..V_HEAD_DIM {
                     let off = h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
-                    assert_eq!(warm2_v[off].to_bits(), cold_v[off].to_bits());
+                    assert_eq!(warm2_v[off], cold_v[off]);
                 }
             }
         }

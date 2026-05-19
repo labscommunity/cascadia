@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn insert_then_lookup_returns_same_snapshot() {
         let mut c = KvPrefixCache::new(4);
-        let snap = mk_snapshot(3, 7.0);
+        let snap = mk_snapshot(3, 7);
         c.insert(vec![10, 20, 30], &fp_a(), snap.clone());
         let got = c
             .lookup(&[10, 20, 30, 40, 50], &fp_a())
@@ -999,8 +999,8 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let mut c = KvPrefixCache::new(4);
-        let s1 = mk_snapshot(3, 1.0);
-        let s2 = mk_snapshot(5, 7.5);
+        let s1 = mk_snapshot(3, 1);
+        let s2 = mk_snapshot(5, 42);
         c.insert(vec![10, 20, 30], &fp_a(), s1.clone());
         c.insert(vec![1, 2, 3, 4, 5], &fp_a(), s2.clone());
 
@@ -1042,7 +1042,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let mut c = KvPrefixCache::new(2);
-        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1.0));
+        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.save_to_disk(&path, &fp_a()).unwrap();
 
         let mut c2 = KvPrefixCache::new(2);
@@ -1107,14 +1107,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_path_buf();
         let mut c = KvPrefixCache::new(2);
-        c.insert(vec![1, 1, 1], &fp_a(), mk_snapshot(3, 1.0)); // A
-        c.insert(vec![2, 2, 2], &fp_a(), mk_snapshot(3, 2.0)); // B (MRU)
+        c.insert(vec![1, 1, 1], &fp_a(), mk_snapshot(3, 1)); // A
+        c.insert(vec![2, 2, 2], &fp_a(), mk_snapshot(3, 2)); // B (MRU)
         c.save_to_disk(&path, &fp_a()).unwrap();
 
         let mut c2 = KvPrefixCache::new(2);
         let _ = c2.load_from_disk(&path, &fp_a());
         // Insert C — eviction must drop the LRU (which should be A).
-        c2.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3.0));
+        c2.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3));
         assert!(
             c2.lookup(&[2, 2, 2, 9], &fp_a()).is_some(),
             "B should still be in the cache after eviction"
@@ -1129,7 +1129,7 @@ mod tests {
     fn save_to_existing_dir_writes_default_filename() {
         let tmp = tempfile::tempdir().unwrap();
         let mut c = KvPrefixCache::new(2);
-        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1.0));
+        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.save_to_disk(tmp.path(), &fp_a()).unwrap();
         let target = tmp.path().join(DEFAULT_FILENAME);
         assert!(
@@ -1167,8 +1167,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_path_buf();
         let mut c = KvPrefixCache::new(4);
-        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1.0));
-        c.insert(vec![4, 5, 6], &fp_a(), mk_snapshot(3, 2.0));
+        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
+        c.insert(vec![4, 5, 6], &fp_a(), mk_snapshot(3, 2));
         c.save_to_disk(&path, &fp_a()).unwrap();
         let file = path.join(DEFAULT_FILENAME);
         let bytes = std::fs::read(&file).unwrap();

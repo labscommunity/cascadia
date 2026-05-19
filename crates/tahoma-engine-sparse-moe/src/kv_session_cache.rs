@@ -464,12 +464,7 @@ mod tests {
         let mut c = KvSessionCache::new(1 << 20);
         c.insert("s1".into(), vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         let bytes_after_one = c.total_bytes();
-        c.insert(
-            "s1".into(),
-            vec![1, 2, 3, 4, 5],
-            &fp_a(),
-            mk_snapshot(5, 9),
-        );
+        c.insert("s1".into(), vec![1, 2, 3, 4, 5], &fp_a(), mk_snapshot(5, 9));
         assert_eq!(c.len(), 1);
         // Newer snapshot has more tokens → larger bytes.
         assert!(c.total_bytes() > bytes_after_one);
