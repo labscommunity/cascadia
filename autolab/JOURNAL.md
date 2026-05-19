@@ -73,6 +73,74 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 060 — Static prompt KV cache — Option (A) working impl shipped, byte-identity proven (2026-05-18 ~20:40 PT)
+
+Branch `perf/static-prompt-cache-060` @ `8d60433` (off main, single
+commit).
+
+**What shipped:**
+1. New module `kv_prefix_cache.rs`:
+   - `KvPrefixCache` — LRU cache, capacity-bounded by entry count.
+     `lookup` returns longest matching prefix (O(n) over cap≤8).
+     `insert` evicts LRU on overflow. `enabled() == false` when
+     capacity=0.
+   - `KvSnapshot` / `LayerKvSlice` — packed per-layer K/V (no
+     capacity padding in snapshot)
+   - `ModelFingerprint` — every field that affects KV bits (arch,
+     layer count, hidden/head dims, vocab, layer range). Sampling
+     params deliberately EXCLUDED so temp=0 caches reused at
+     temp=0.7
+2. `Runner` snapshot/restore:
+   - `snapshot_kv() -> KvSnapshot` (validates all layers agree on
+     `past_seq_len`)
+   - `restore_kv(&snap)` (validates shape + lid alignment, grows
+     capacity if needed)
+   - `fingerprint() -> ModelFingerprint`
+   - `pack_layer_slice` / `unpack_layer_slice` strip/re-apply
+     per-head capacity-base offsets — the byte-identity guarantee
+3. `generate_with_cache(prompt, max, cfg, Option<&mut KvPrefixCache>)`.
+   On hit: restore + skip matched prompt tokens in prefill (still
+   pushes them into history for bookkeeping). On miss: full
+   prefill, then snapshot + insert. `generate` is now a thin
+   wrapper that passes `None` — pre-cache behavior byte-identical.
+4. Engine wiring: `SparseMoEBuilderConfig::kv_prefix_cache_size: u32`
+   (default 0) + `with_kv_prefix_cache_size()`. `step_single_stage`
+   threads it through. Multi-stage emits warn + disables (needs
+   transport frame extension; deferred).
+5. CLI flag `--kv-prefix-cache-size N` (default 0).
+
+**Tests:** 32 pass, 13 new:
+- 11 cache unit tests (disabled/enabled, longest-match, model-
+  isolation, LRU promotion + eviction, in-place replace,
+  fingerprint determinism)
+- **`pack_unpack_roundtrip_is_bit_identical`** — the load-bearing
+  byte-identity test using real K2.6 NUM_HEADS/QK_HEAD_DIM/
+  V_HEAD_DIM with unique per-cell signatures
+- `unpack_into_larger_capacity_preserves_layout` (cap-grow)
+- `unpack_rejects_wrong_length_slice` (error path)
+
+**Limitations (honest):**
+- Multi-stage cache is no-op (warned + force-disabled). Restoring
+  KV on workers needs new frame kind on `tahoma-transport`.
+  Separate PR; the brief's chat-workload target is single-stage.
+- No live K2.6 e2e test. Byte-identity via pack/unpack round-trip
+  rather than running the full model twice.
+- bf16 KV migration is future swap: code carries `// iter 032 A8`
+  notes. When `LayerState.past_k` flips Vec<f32> → Vec<u16>,
+  `LayerKvSlice` follows; pack/unpack are pure data movement so
+  no logic change.
+
+**Why this matters for chat:** at iter 003's ~3.3 sec/token baseline,
+a 500-token system prompt = ~1650 sec of redundant prefill per
+request. Cache hit saves ALL of that. For repeated-system-prompt
+workloads (typical chat), this could be the single largest user-
+visible latency win.
+
+`cargo fmt` clean; workspace builds; sparse-moe clippy clean (only
+pre-existing main warnings remain).
+
+---
+
 ## 059 — Continuous batching skeleton — Option (A) shipped + 4 blockers documented (2026-05-18 ~20:25 PT)
 
 Foundation for multi-request serving. Branch
