@@ -30,7 +30,7 @@ use crate::dist::{
     recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
     StageTransport,
 };
-use crate::kv_prefix_cache::KvPrefixCache;
+use crate::kv_prefix_cache::{KvPrefixCache, LoadOutcome};
 use crate::runner::{LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
@@ -53,6 +53,19 @@ pub struct SparseMoEBuilderConfig {
     /// stages requires a new transport frame for snapshot exchange,
     /// deferred to a follow-up. With `total > 1` this field is a no-op.
     pub kv_prefix_cache_size: u32,
+    /// Optional directory (or file) used to persist the KV-prefix
+    /// cache across process restarts. `None` (default) means in-memory
+    /// only — the cache is reseeded on every cold start.
+    ///
+    /// When set:
+    /// - On startup, attempt to load. Missing file / fingerprint
+    ///   mismatch / corruption all degrade silently to a cold start.
+    /// - On `Engine::close`, persist whatever is currently in the
+    ///   cache to disk (atomic via tempfile + rename).
+    ///
+    /// Only meaningful when `kv_prefix_cache_size > 0`. With size = 0
+    /// the path is ignored (no in-memory cache exists to persist).
+    pub kv_prefix_cache_path: Option<PathBuf>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -65,6 +78,7 @@ impl SparseMoEBuilderConfig {
             rank: 0,
             total: 1,
             kv_prefix_cache_size: 0,
+            kv_prefix_cache_path: None,
         }
     }
 
@@ -78,6 +92,13 @@ impl SparseMoEBuilderConfig {
     /// disables the cache.
     pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
         self.kv_prefix_cache_size = n;
+        self
+    }
+
+    /// Set the on-disk persistence path. Pass `None` (default) to
+    /// keep the cache in-memory only.
+    pub fn with_kv_prefix_cache_path(mut self, path: Option<PathBuf>) -> Self {
+        self.kv_prefix_cache_path = path;
         self
     }
 }
@@ -293,12 +314,56 @@ impl Builder for SparseMoEBuilder {
         } else {
             self.config.kv_prefix_cache_size
         };
-        let kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
+        let mut kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
+        // Persistence path is honored only when the cache is enabled.
+        // With size=0 there's no in-memory cache to populate, so a
+        // stray --kv-prefix-cache-path with size=0 is a no-op (warned
+        // about so the operator doesn't think persistence is active).
+        let persistence_path: Option<PathBuf> = if kv_prefix_cache.enabled() {
+            self.config.kv_prefix_cache_path.clone()
+        } else {
+            if self.config.kv_prefix_cache_path.is_some() {
+                warn!("kv-prefix-cache-path set but kv-prefix-cache-size=0; persistence disabled");
+            }
+            None
+        };
         if kv_prefix_cache.enabled() {
             info!(
                 capacity = kv_prefix_cache.capacity(),
+                persistence = ?persistence_path.as_ref().map(|p| p.display().to_string()),
                 "kv-prefix-cache enabled (single-stage)"
             );
+            // Restore from disk if persistence is configured.
+            if let Some(path) = persistence_path.as_ref() {
+                let fp = runner.fingerprint();
+                match kv_prefix_cache.load_from_disk(path, &fp) {
+                    LoadOutcome::Loaded { entries } => {
+                        info!(
+                            entries,
+                            path = %path.display(),
+                            "kv-prefix-cache: restored from disk"
+                        );
+                    }
+                    LoadOutcome::NotFound => {
+                        info!(
+                            path = %path.display(),
+                            "kv-prefix-cache: no on-disk snapshot found; starting cold"
+                        );
+                    }
+                    LoadOutcome::FingerprintMismatch => {
+                        warn!(
+                            path = %path.display(),
+                            "kv-prefix-cache: on-disk fingerprint stale; starting cold"
+                        );
+                    }
+                    LoadOutcome::Corrupted => {
+                        warn!(
+                            path = %path.display(),
+                            "kv-prefix-cache: on-disk file unreadable; starting cold"
+                        );
+                    }
+                }
+            }
         }
         Ok(Box::new(SparseMoEEngine {
             runner,
@@ -313,6 +378,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
             kv_prefix_cache,
+            kv_prefix_cache_path: persistence_path,
         }))
     }
 }
@@ -408,6 +474,11 @@ pub struct SparseMoEEngine {
     /// generate path skips that portion of prefill. See
     /// [`crate::kv_prefix_cache`] for the cache semantics.
     kv_prefix_cache: KvPrefixCache,
+    /// On-disk persistence path for the KV-prefix cache. `None` when
+    /// the user didn't pass `--kv-prefix-cache-path`. When set, the
+    /// cache is loaded from this path during `Builder::build` and
+    /// persisted on `Engine::close`.
+    kv_prefix_cache_path: Option<PathBuf>,
 }
 
 impl SparseMoEEngine {
@@ -481,6 +552,35 @@ impl Engine for SparseMoEEngine {
     }
 
     fn close(&mut self) {
+        // Persist the KV-prefix cache *before* tearing down sockets,
+        // so a hang during transport close doesn't cost us the cache.
+        // No-op when persistence isn't configured or the cache is
+        // disabled / empty.
+        if let Some(path) = self.kv_prefix_cache_path.as_ref() {
+            let fp = self.runner.fingerprint();
+            match self.kv_prefix_cache.save_to_disk(path, &fp) {
+                Ok(0) => {
+                    info!(
+                        path = %path.display(),
+                        "kv-prefix-cache: nothing to persist on shutdown"
+                    );
+                }
+                Ok(n) => {
+                    info!(
+                        path = %path.display(),
+                        entries = n,
+                        "kv-prefix-cache: persisted to disk on shutdown"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "kv-prefix-cache: save_to_disk failed on shutdown"
+                    );
+                }
+            }
+        }
         // Best-effort transport teardown. We block_on each socket's close()
         // sequentially because the engine is being torn down; lock
         // contention isn't a worry. Errors are logged but swallowed —

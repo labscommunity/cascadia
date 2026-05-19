@@ -145,6 +145,20 @@ pub struct WorkerArgs {
     /// is ~150 MiB, so practical caps are 1..8.
     #[arg(long, default_value_t = 0)]
     pub kv_prefix_cache_size: u32,
+
+    /// On-disk persistence path for the KV-prefix cache (sparse-moe
+    /// engine only). May be a directory (preferred; uses
+    /// `<dir>/rank_00.bin`) or a file. When set together with
+    /// `--kv-prefix-cache-size > 0`, the cache is restored on startup
+    /// and saved on shutdown — process restart no longer costs a full
+    /// re-prefill of common system prompts.
+    ///
+    /// Loader is fault-tolerant: missing file, fingerprint mismatch
+    /// (model changed under us), or corruption all degrade silently
+    /// to a cold start with a warning log. Default: disabled (no
+    /// persistence; cache is RAM-only).
+    #[arg(long)]
+    pub kv_prefix_cache_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -332,7 +346,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
                 .with_rank(args.rank, args.total)
-                .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
+                .with_kv_prefix_cache_size(args.kv_prefix_cache_size)
+                .with_kv_prefix_cache_path(args.kv_prefix_cache_path.clone());
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
