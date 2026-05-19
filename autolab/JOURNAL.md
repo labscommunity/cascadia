@@ -73,6 +73,69 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 096 — Failover orchestrator — Track B (composes iter 091+092+094 into FSM) (2026-05-19 ~04:20 PT)
+
+Branch `perf/failover-orchestrator-096` @ `944c4a8` (based on iter 094).
+
+**What shipped:**
+- `orchestrator.rs` (827 lines):
+  - `Orchestrator` struct owning watchdog handle
+    `Arc<Mutex<HeartbeatWatchdog>>` (shared with iter 094's cadence
+    loop), primary + backup `PeerEndpoint`s, pluggable
+    `SpawnReplacement` callback, 7-state `FailoverState` FSM
+  - Linear FSM: Healthy → DetectedDead → BackupSpawned → KvExtracted
+    → KvInstalled → Committed; off-path `Failed { stage, reason }`
+    with `FailoverStage` enum
+  - `on_watchdog_dead(&AtomicU64)` trigger called by iter 094's
+    cadence loop when `HeartbeatOutcome::Dead` fires. **Atomic
+    counter (not oneshot)** so duplicate Dead/WireBroken
+    notifications are idempotent and a trigger fired before `run`
+    is not lost
+  - `SpawnReplacement` async trait + `MockSpawner` test helper
+  - `OrchestratorEvent` bounded mpsc stream for observability
+  - Skeleton stubs for `extract_from_survivor`, `install_on_backup`,
+    `reroute_downstream` return explicit "not yet wired" Err →
+    FSM advances visibly to failure stage instead of hanging
+
+- `docs/architecture/failover-orchestrator.md` (359 lines):
+  state machine ASCII diagram, public API, wiring instructions for
+  iter 094 heartbeat task, **4 documented blockers** (in-flight
+  Forward, mid-decode KV, monitor auth, split brain — each with
+  "what's needed" + "skeleton scope" sections), test coverage
+  matrix, 6-step next-step ordering
+
+**Tests (6 new, 28 sparse-moe lib pass):**
+- `watchdog_dead_fires_spawn_replacement_callback` (spec test)
+- `spawn_callback_failure_halts_fsm_at_spawn_stage`
+- `trigger_fired_before_run_is_not_lost` (regression guard)
+- `duplicate_on_watchdog_dead_calls_do_not_panic`
+- `failover_stage_display_strings_are_stable`
+- `system_ns_elapsed_is_saturating`
+
+**4 blockers (documented):**
+1. **In-flight Forward** — rank 0 parks in `recv_kind_client` on
+   dead downstream socket; can't grab mutex for reroute until 60s
+   transport timeout fires or cancel signal plumbed across sync/
+   async seam
+2. **Mid-decode KV** — iter 091's extract_kv_slab assumes quiesced
+   runner; dead rank may have torn K/V updates. Needs slot-
+   generation counter + torn-write detector
+3. **Monitor auth** — no HMAC/TLS on KvMigration frames; same
+   posture as rest of tahoma wire; cascadia-fleet productization
+4. **Split brain** — no fencing token; if orchestrator's heartbeat
+   link broke but primary is healthy, zombie primary still emits
+   Tokens upstream
+
+**Composition constraint discovered:** iter 091 (`KvMigration` +
+extract/install) and iter 094 (cadence loop + watchdog) are on
+**independent branches off PR #10** — they don't share code.
+Orchestrator skeleton documents this with `extract_from_survivor`
+returning `Err("iter 091 KvMigration wire frame + survivor-rank
+registry not yet composed")`. Compose-onto-one-base step filed as
+follow-up in design doc's next-step ordering.
+
+---
+
 ## 094 — Heartbeat driver cadence loop — Track A working impl (2026-05-19 ~04:05 PT)
 
 iter 092 follow-up step 1. Branch `perf/heartbeat-driver-094` @
