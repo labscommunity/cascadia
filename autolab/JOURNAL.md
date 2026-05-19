@@ -73,6 +73,70 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 061 — Lookahead decoding — IMPL SHIPPED, prompt-wins-on-ties design (2026-05-18 ~21:05 PT)
+
+Extends iter 036 spec-decode draft with PROMPT n-grams (not just KV
+history). Branch `perf/lookahead-decoding-061` @ `821a3bb` (based on
+iter 043 which carries iter 036+039+043).
+
+**What shipped (Option A, working impl):**
+- `ngram_draft.rs`: extended `Draft` with:
+  - `prompt_table: HashMap<Vec<i64>, i64>` — snapshots prompt
+    k-grams once, **never overwritten by append**
+  - `lookahead: bool` + `with_lookahead(bool)` builder (default
+    false = byte-identical iter 036)
+  - `warm_with_prompt` writes to `prompt_table` when lookahead on
+  - `lookup_next` queries BOTH tables — longest match wins; on
+    equal-length ties, **prompt's continuation wins** (critical
+    design choice)
+
+**Why prompt-wins-on-ties matters (agent rationale):**
+Gen-wins-on-ties (the iter 036 implicit behavior from
+single-overwriting-table) makes lookahead structurally unable to
+beat baseline at any single propose call when generation has
+shadowed a prompt k-gram. Prompt-wins-on-ties is what actually
+delivers the headline accept-rate gain on documents-with-repeated-
+phrases prompts. Trade-off documented in module header.
+
+- `engine.rs`: `spec_decode_lookahead` config + `with_spec_decode_
+  lookahead` builder. Wired through both spec-decode call sites:
+  single-stage `generate_speculative` AND pipeline-parallel
+  `drive_generation_first_spec` (new `lookahead: bool` arg). Both
+  log mode on tracing.
+- `tahoma-cli/lib.rs`: `--lookahead-decoding` flag (default off).
+  No effect unless `--prompt-lookup N` also set.
+
+**Tests (7 new, all pass; 50 total sparse-moe):**
+- `lookahead_off_is_default_and_matches_iter036` (backward-compat)
+- `lookahead_warm_with_prompt_does_not_populate_gen_table`
+- `lookahead_append_does_not_overwrite_prompt_table`
+- `lookahead_prompt_entry_recoverable_after_unrelated_generation`
+  (keystone information-preservation)
+- `lookahead_prompt_wins_on_equal_length_tie`
+- `lookahead_longer_prompt_kgram_beats_shorter_gen_kgram`
+- **`lookahead_higher_accept_rate_on_repeated_phrase_prompt`** (the
+  headline test): synthetic prompt with repeated phrase, baseline
+  drafts gen continuation (shadowed by gen overwrites = accept=0),
+  lookahead drafts prompt continuation (preserved = accept=1)
+
+**Blockers (honest):**
+- No e2e bench on real K2.6 (dev machine doesn't have 553 GB model)
+- Unit test demonstrates per-propose mechanism that should drive
+  e2e gain
+- Recommend: re-run iter 044's 10-prompt eval with
+  `--lookahead-decoding` on miner to confirm the 50% → 70-80%
+  accept-rate prediction translates to e2e
+
+**Composes with iter 044 stack:** iter 044 measured +19.7% e2e at
+~52% accept rate. If lookahead pushes accept to 70-80% on chat
+prompts (typical "repeat the system prompt's terminology" pattern),
+expected +30-40% e2e — meaningful jump.
+
+`cargo fmt` clean; clippy clean on new code; `tahoma --help` shows
+the flag.
+
+---
+
 ## 062 — Int4 KV cache — NEGATIVE RESULT (scalar dequant cost > bandwidth savings) (2026-05-18 ~21:00 PT)
 
 Honest negative via investigation-first (path B + scoped C). Did NOT
