@@ -73,6 +73,52 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 067 — Fast sampling kernel — NEGATIVE (not worth as default), opt-in shipped (2026-05-18 ~22:00 PT)
+
+Honest negative via path (B) investigation + opt-in (A) shipped.
+Branch `perf/fast-sampling-067` @ `f4262c7`.
+
+**Microbench at K2.6 scale (vocab=163840, M1 dev box):**
+- Greedy argmax (T=0 default): **174 µs**
+- Default T>0 path (top_p=1): **223 µs**
+- Fast top-K=160 kernel: **244 µs**
+- Full softmax + sort + top-p<1 (worst case): **2685 µs**
+
+**Key finding:** sampling is nowhere near 2% of decode. At miner's
+0.11 tok/s, 223 µs = **0.0024% of decode budget**. The 2685 µs
+worst case isn't even triggered today — `engine::sampling_from_task`
+hardcodes `top_p: 1.0`, which skips the sort branch in `sample`.
+
+**Shipped (A) as opt-in, NOT as default:**
+- `sample_top_p_top_k()` public function in `sampling.rs` (+341 LOC)
+- Runner and engine continue calling existing `sample()` — K2.6
+  quality-eval baseline unchanged
+- One-line edit to switch once top-p-aware policy lands or
+  larger-vocab model arrives
+- `examples/bench_sampling.rs` one-shot profiling tool (+127 LOC)
+
+**13 sampling unit tests pass:**
+- Bit-identity vs full path at T=0 (argmax) across 64 random
+  distributions
+- Distribution-near-identity TV-distance test (50k draws, threshold
+  0.10, empirical ~0.005)
+- Top-K=1 always picks argmax, top-K=2 only returns top-2, top-p
+  truncates tail
+- Edge cases: top_k=0 falls back, top_k > vocab clamps
+
+37 sparse-moe tests pass. fmt + clippy clean.
+
+**Honest caveat:** bench on M1, not Intel. Cost on Lunar Lake / Xeon
+may differ by 2-3× but conclusion (sampling << 2% of decode) is
+robust by orders of magnitude.
+
+**Lesson reinforced (autolab-simd-seams-need-callers + this iter):**
+ALWAYS profile current cost before optimizing. Iter 067 saved a
+"premature optimization" that would have wasted code complexity for
+0% e2e gain.
+
+---
+
 ## 066 — Adaptive routing threshold — FAILED (agent stalled 600s, no branch) (2026-05-18 ~21:45 PT)
 
 Agent stalled mid-implementation ("Now CLI plumbing:" was the last
