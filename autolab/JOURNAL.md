@@ -73,6 +73,55 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 083 — Dynamic spec-K adaptation — Track A AdaptiveK controller (2026-05-19 ~01:40 PT)
+
+Per-request K adjusts based on observed accept rate. Branch
+`perf/dynamic-spec-k-083` @ `61154d5` (based on iter 043).
+
+**What shipped (Track A):**
+1. **`AdaptiveK` + `AdaptiveKConfig`** in `spec_decode.rs`:
+   - Pure-logic controller, sliding window N=8 rounds, **AIMD-style
+     cooldown** (window clears after each decision)
+   - Defaults per task spec: K_max=16, K_min=2, up at rate > 0.7 by
+     +2, down at rate < 0.3 by -1
+   - **Strict threshold comparisons** (`>` / `<`) so steady-state
+     rates at the boundary don't oscillate
+2. **Runner wiring** — `generate_speculative_with_adaptive` in
+   `runner.rs`. Original `generate_speculative` becomes `None`-
+   passing wrapper, **static-K public API byte-identical**.
+3. **Pipeline-parallel wiring** —
+   `drive_generation_first_spec_with_adaptive` mirrors single-stage
+   logic. Draft's per-round ceiling = `k_max` in adaptive mode.
+4. **CLI flag** `--spec-k-adaptive` (default off; ignored with warn
+   if used without `--prompt-lookup`). Existing `--spec-k K` is
+   starting K.
+
+**Tests (10 new, 24 spec_decode total):**
+- 10 `adaptive_k_*` tests including spec test from task description
+- 14 pre-existing reconcile tests (iter 043) still pass
+- `adaptive_k_default_window_eventually_caps_at_kmax` runs 100 rounds
+  under default window=8 and verifies K walks 4→6→8→10→12→14→16
+
+**Honest design note (agent):**
+> The task said "simulate 10 rounds with 80% accept rate, K rises
+> from 4 to 8". With default window=8 + AIMD cooldown, K can change
+> at most once per 8 rounds, so 10 rounds can only walk K=4→6, not
+> all the way to 8. The spec test uses window=5 explicitly so two
+> adjustments fit. If you want the default to pass the literal
+> 10-round test, lower the window from 8 to 4 — a one-line change.
+
+**Workspace:** fmt clean, clippy no new warnings on touched files,
+24 spec_decode tests pass. (E2E tests fail because tahoma binary
+isn't pre-built — pre-existing infra issue per memory.)
+
+**Composes with iter 044 + 063:** iter 063 measured 3.3-86.4%
+accept rate variance per prompt. AdaptiveK now responds: low-accept
+prompts shrink K (less wasted compute), high-accept prompts grow K
+(more throughput). Predicted: smooths out per-prompt variance,
+improves average tok/s.
+
+---
+
 ## 081 — 2-box rank balance — Track A LayerRangeStrategy + CLI flags (2026-05-19 ~01:20 PT)
 
 Branch `perf/rank-balance-081` (2 commits). Foundation for moving
