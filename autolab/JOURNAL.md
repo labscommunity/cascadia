@@ -73,6 +73,51 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 087 — Attention-score predictive prefetch — Track C+B (cost OK, accuracy unresolved) (2026-05-19 ~02:30 PT)
+
+Branch `perf/attn-predict-prefetch-087` @ `49565b4`. 788 LOC across
+3 files.
+
+**What shipped:**
+1. `bench_shadow_router.rs` (298 LOC) — self-contained microbench at
+   K2.6 dims (HIDDEN=7168, N_ROUTED_EXPERTS=384, INTERMEDIATE_DENSE=
+   18432, TOPK=8). Measures router GEMV vs shadow GEMV vs sigmoid+
+   topK vs full expert MLP. Runs ~3s.
+2. `shell_int4.rs` (+242 LOC) — `shadow_router_predict_topn(packed,
+   scale, bias, post_attn_proxy, n) -> Vec<u32>` pure helper + 6
+   unit tests covering returns-exactly-n, clamps below TOPK / above
+   N_ROUTED_EXPERTS, top-K ⊂ top-N invariant, deterministic for
+   fixed inputs, bias breaks ties
+3. `docs/architecture/attn-predict-prefetch.md` (248 LOC) — full
+   investigation: cost analysis (PROCEED), distinction from iter
+   057 (per-token vs cross-token signal), 3 accuracy unknowns
+   requiring real K2.6 trace, concrete 5-step bench plan
+
+**Cost-side: PROCEED.**
+- Shadow router GEMV: ~219µs/layer on M1 (scalar fallback) — same
+  as real router GEMV
+- Shadow overhead (GEMV + sigmoid + top-K) = **0.10% of routed-path
+  wall time per layer** (matches iter 085 prediction of 0.11%)
+- Routed path is 99% expert MLPs (~27ms per expert × 8 = 219ms).
+  Shadow router hides easily behind bandwidth-bound expert dispatch.
+
+**Accuracy-side: UNRESOLVED.** Synthetic random weights cannot
+answer whether `post_norm_{i+1}(attn_residual_i)` is a useful proxy
+for `post_norm_{i+1}(h_{i+1})` on a trained K2.6 — depends on
+activation statistics specific to the model. Doc lays out bench plan
+(recall @ K, cross-layer error correlation, channel-saturation diff
+vs iter 057) for when miner slot opens.
+
+**13 tests pass; fmt + clippy clean on new code.**
+
+**To resolve accuracy half (5-step plumbing in doc):**
+- Miner slot with iter 047/054/056/057 stack rebased on this branch
+- `--shadow-router-n N` CLI flag
+- `forward_shells` hook calling `shadow_router_predict_topn`
+- `shadow_router_hits / shadow_router_chances` counter pair
+
+---
+
 ## 086 — Tokenizer cache for common prompts — full (A) impl (2026-05-19 ~02:15 PT)
 
 Skip re-tokenizing repeated system prompts. Branch
