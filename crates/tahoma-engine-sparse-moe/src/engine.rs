@@ -30,6 +30,7 @@ use crate::dist::{
     recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
     StageTransport,
 };
+use crate::kv_prefix_cache::KvPrefixCache;
 use crate::runner::{LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
@@ -42,6 +43,16 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Max entries in the static-prompt KV-prefix cache. `0` disables
+    /// the cache (default). Each entry holds the populated K/V buffers
+    /// for the cached prompt prefix — at K2.6 dimensions a 512-token
+    /// snapshot is ~150 MiB, so practical caps for a chat workload
+    /// are 1..8. See [`crate::kv_prefix_cache`] for the full design.
+    ///
+    /// Single-stage only on this PR — wiring the cache across pipeline
+    /// stages requires a new transport frame for snapshot exchange,
+    /// deferred to a follow-up. With `total > 1` this field is a no-op.
+    pub kv_prefix_cache_size: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +64,20 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            kv_prefix_cache_size: 0,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    /// Set the KV-prefix cache capacity (number of entries). `0`
+    /// disables the cache.
+    pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
+        self.kv_prefix_cache_size = n;
         self
     }
 }
@@ -259,6 +278,28 @@ impl Builder for SparseMoEBuilder {
         if rank == 0 && self.tokenizer.is_none() {
             return Err(EngineError::Backend("tokenizer.json missing".into()));
         }
+        // KV-prefix cache is single-stage only on this PR. Warn (don't
+        // error) on multi-stage configs so the same CLI flag works in
+        // both topologies — the multi-stage path silently ignores it.
+        let kv_cache_size = if total > 1 {
+            if self.config.kv_prefix_cache_size > 0 {
+                warn!(
+                    requested = self.config.kv_prefix_cache_size,
+                    total,
+                    "kv-prefix-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
+                );
+            }
+            0
+        } else {
+            self.config.kv_prefix_cache_size
+        };
+        let kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
+        if kv_prefix_cache.enabled() {
+            info!(
+                capacity = kv_prefix_cache.capacity(),
+                "kv-prefix-cache enabled (single-stage)"
+            );
+        }
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -271,6 +312,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            kv_prefix_cache,
         }))
     }
 }
@@ -359,6 +401,13 @@ pub struct SparseMoEEngine {
     /// `Reset` so deterministic-seed mode reproduces across runs.
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// Single-stage static-prompt KV-prefix cache. Empty + capacity=0
+    /// when the user didn't pass `--kv-prefix-cache-size` (default).
+    /// Holds at most `capacity` packed snapshots; on lookup we restore
+    /// the longest matching prefix's snapshot into the runner so the
+    /// generate path skips that portion of prefill. See
+    /// [`crate::kv_prefix_cache`] for the cache semantics.
+    kv_prefix_cache: KvPrefixCache,
 }
 
 impl SparseMoEEngine {
@@ -475,14 +524,23 @@ impl SparseMoEEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(task = %task.task_id, "runner failed: {e}");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                return vec![(task.task_id, final_chunk)];
-            }
+        let cache_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
+            Some(&mut self.kv_prefix_cache)
+        } else {
+            None
         };
+        let generated =
+            match self
+                .runner
+                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(task = %task.task_id, "runner failed: {e}");
+                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    return vec![(task.task_id, final_chunk)];
+                }
+            };
         let n_tokens = generated.len() as u32;
         let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
         let mut text = tokenizer

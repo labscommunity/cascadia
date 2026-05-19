@@ -131,6 +131,20 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// KV-prefix cache size (sparse-moe engine only). `0` = disabled
+    /// (default). When > 0, the engine caches the post-prefill KV
+    /// snapshot for each unique prompt-token sequence; subsequent
+    /// requests whose prompt starts with a cached prefix skip the
+    /// matched portion of prefill. Best fit: chat workloads where the
+    /// system prompt is shared across requests.
+    ///
+    /// Single-stage only on this PR; ignored on `--total > 1` configs
+    /// (would require a transport frame to exchange snapshots across
+    /// stages). One snapshot at K2.6 dimensions for a 512-token prompt
+    /// is ~150 MiB, so practical caps are 1..8.
+    #[arg(long, default_value_t = 0)]
+    pub kv_prefix_cache_size: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +331,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
