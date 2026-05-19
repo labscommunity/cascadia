@@ -73,6 +73,54 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 081 — 2-box rank balance — Track A LayerRangeStrategy + CLI flags (2026-05-19 ~01:20 PT)
+
+Branch `perf/rank-balance-081` (2 commits). Foundation for moving
+layers between pipeline ranks to balance per-token wall time.
+
+**What shipped (Track A + skeleton Track B):**
+- New `LayerRangeStrategy` enum in `engine.rs`:
+  - `Even` (default = historical behavior preserved)
+  - `Explicit { start, end }` (operator override)
+  - `Auto` (skeleton — logs warn + falls back to Even until iter-082
+    follow-up wires timing-driven balance)
+- `SparseMoEBuilderConfig.layer_range_strategy` field +
+  `with_layer_range_strategy()` builder. Default = `Even` so all
+  existing callers unaffected (verified by dedicated test).
+- `Builder::load` restructured into match on strategy. Honors
+  `Explicit` first (validated against manifest), falls back to even
+  for `Even` or `Auto`.
+- `validate_explicit_range()` rejects: zero start (overlaps implicit
+  dense layer 0), empty/inverted (start ≥ end), overshoot (end >
+  num_moe + 1)
+- CLI flags in `tahoma-cli/lib.rs`:
+  - `--layer-range start..end` (e.g. `--layer-range 1..29`)
+  - `--rank-balance auto` (skeleton)
+  - **Mutually-exclusive guard** with friendly error
+  - `parse_layer_range()` rejects malformed input via clap-style error
+    before any model loading
+- `LayerRangeStrategy` re-exported from sparse-moe crate root
+
+**Tests (15 new):**
+- 7 engine tests: validates 28/32 split, 25/35 split, rejects
+  zero-start / empty / overshoot, confirms default = Even
+- 8 CLI tests: `parse_layer_range` parses `1..29` + `29..61`,
+  tolerates whitespace, rejects malformed; clap parses
+  `--layer-range` and `--rank-balance auto`; default invocation
+  yields both Options as None
+
+**Verified:** fmt clean, clippy no new warnings, workspace tests
+pass including 2 e2e binary tests, CLI smoke: `--help` shows new
+flags with full docstrings, mutually-exclusive check fires,
+malformed parser produces friendly error.
+
+**Blockers:** none. Auto-balance logic needs per-stage timing
+instrumentation persisted somewhere readable at load time — tagged
+as follow-up. Could compose with iter 003's stage_timing JSONL
+output (a future iter could parse it to seed auto-balance).
+
+---
+
 ## 082 — Selective recomputation — INVESTIGATION ONLY (correct skip) (2026-05-19 ~01:15 PT)
 
 Path C only — investigation showed not worth doing. Branch
