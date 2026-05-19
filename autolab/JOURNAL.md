@@ -2,6 +2,77 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 050 — Linux production spinout — STACK SHIPPED, bench = baseline (SIMD dormant without caller) (2026-05-18 ~19:25 PT)
+
+**HONEST NEUTRAL RESULT + critical architectural lesson.** Branch
+`perf/k26-linux-production-050` @ `251a198` (3 commits off main
+208104e).
+
+**Combined stack:** A8 KV bf16 + C1 prefetch (Linux + iter 038
+Windows port) + iter 042 multi-token AVX-512 tile + iter 046
+row-blocked AVX-512 + iter 048 ProjShape dispatcher +
+forward_shells_multi engine seam.
+
+**Build (clean both substrates):**
+- Mac no-openvino: clean
+- Miner `--features openvino`: clean in 1m19s
+- 113/113 tests pass; fmt + clippy clean (no new warnings vs baseline)
+- 4 bit-identity tests (dispatch_seq_1, multi_seq_1,
+  multi_batched_seq_8_iter046, layer0 multi)
+
+**Measured (miner single-worker, K=6, mt=64, TAHOMA_EXPERT_PREFETCH=1,
+10-prompt eval):**
+- **10/10 quality** (all coherent, substring pass)
+- **0.1586 tok/s aggregate** (640 tokens / 4035s)
+- Per-prompt 0.1453-0.1852 (mean 0.1596 stddev 0.013)
+
+**=== EQUAL TO iter 021 baseline (0.1587). NOT a win. ===**
+
+**Why the SIMD wins didn't materialize (verbatim agent finding):**
+> The iter 042/046/048 SIMD wins are dormant in this branch because
+> no driver invokes `forward_shells_multi` with seq>=2. The OpenAI-
+> API handler still loops seq=1 `step` per token via the unchanged
+> `forward_shells` hot path.
+> C1's +27% only materializes under multi-worker contention (which
+> iter 033 measured under 3-worker load); single-worker, C1 is
+> roughly neutral because the OS readahead already wins on the hot
+> expert set.
+> A8 halved KV memory and ~2.1× the SDPA microbench, but SDPA is
+> only ~3% of decode time at past_seq_len~64 — small e2e delta.
+
+**Critical methodology lesson (saved to memory):**
+**SIMD multi-token kernel speedups are dormant without a caller
+that exercises seq>=2.** Microbenches don't translate to e2e tok/s
+without a driver-loop change. iter 044 (spec-decode) measured +19.7%
+because it WIRED the multi-token caller. iter 050 carries the same
+kernels but no caller → measures baseline.
+
+Memory updated: `autolab-simd-seams-need-callers` codifies the rule.
+
+**What this branch IS (still valuable):**
+- Clean spinout: every Linux architectural win that doesn't depend
+  on driver-loop change
+- forward_shells_multi seam ready for future driver-loop work
+- Seq=1 hot path bit-identical (no regression)
+- The right BRANCH SHAPE for a production PR — just missing iter 044's
+  spec-decode driver merged in
+
+**Recommended next steps for final PR off main:**
+1. Wire spec-decode driver (iter 044's pattern) to invoke
+   `forward_shells_multi` — unlocks iter 042/046/048 wins at K=4-8
+2. Re-bench under multi-worker contention to validate C1's +27%
+3. Direct A/B `forward_shells_multi` vs `forward_shells` at seq=4/8
+   via bench binary before adding a driver
+
+**Worktree note:** merge strategy was to take net file diff of iter
+038 (which already carries A8+C1+Windows) as commit 1, then layer
+iter 042/046/048 on top with manual KV-cache-as-u16 adaptation. This
+avoided pulling ~50 autolab research-doc commits. Conflicts on
+runner.rs/shell_int4.rs resolved by hand-merging multi-token path
+against A8 u16 KV signature; bit-identity tests pass.
+
+---
+
 ## 054 — Persistent expert pinning via mlock — FULL IMPL shipped, bench pending (2026-05-18 ~18:30 PT)
 
 Real architectural lever delivered as full (A) path. Branch
