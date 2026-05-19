@@ -73,6 +73,50 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 085 — Sparse softmax router — NEGATIVE: premise wrong (router is sigmoid, sigmoid is 0.0002%) (2026-05-19 ~01:55 PT)
+
+Path C investigation; decisive skip. Branch `perf/sparse-softmax-085`
+@ `13b90ef`.
+
+**Headline finding (verbatim agent):**
+> K2.6's router is **per-element sigmoid, not softmax** (verified in
+> `shell.rs:273` and `shell_int4.rs:430`). There is no sum-of-exps
+> over 384 entries to threshold pre-norm. The closest coherent
+> reframe — "skip `exp()` on logits unlikely to make top-8" — is
+> what I actually measured.
+
+**Numbers (Apple M1 scalar fallback for int4 GEMV):**
+
+| Stage | ns/layer | % of routed path |
+|-------|---------:|-----------------:|
+| Router sigmoid (384 exp()) | 417 | **0.0002%** |
+| Router GEMV int4 [384, 7168] | 246,298 | 0.11% |
+| Top-K argsort (384→8) | 2,217 | 0.001% |
+| 8 × expert MLP | 218,951,167 | **99.89%** |
+
+On Xeon Gold 6252 miner (AVX-512) GEMV gets ~5-10× faster, sigmoid
+unchanged — absolute sigmoid budget ~800ns/layer, still <0.01% of
+layer time. **Not worth shipping a threshold knob through runner /
+CLI / API.**
+
+**Composition note:** doesn't change for iter 015 routing_threshold
+or iter 047 better predictor — both operate on dispatch side, not
+sigmoid arithmetic. Saving sigmoid work doesn't unlock anything they
+couldn't already do.
+
+**What shipped:**
+- `bench_router_sigmoid.rs` microbench (no model needed; times
+  sigmoid + GEMV + top-K + MLP at K2.6 dims)
+- `docs/architecture/sparse-softmax-router.md` investigation doc
+  (follows iter 082 selective-recomputation precedent for SKIP-impl
+  investigations)
+
+**Pattern:** 7th NEGATIVE this session (049, 053, 062, 064, 067, 082,
+085). ~17% null rate proves loop has rigor. Investigation-first
+pattern continues to save implementation cost.
+
+---
+
 ## 083 — Dynamic spec-K adaptation — Track A AdaptiveK controller (2026-05-19 ~01:40 PT)
 
 Per-request K adjusts based on observed accept rate. Branch
