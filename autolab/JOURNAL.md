@@ -73,6 +73,58 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 095 — Better quality eval (perplexity skeleton + divergence) — IMPL shipped (2026-05-19 ~03:55 PT)
+
+Addresses `autolab-substring-eval-too-weak` memory directly. Branch
+`autolab/quality-eval-095` @ `3119217`.
+
+**3 files under `autolab/bench/`:**
+
+1. **`k26_quality_eval.sh`** (~370 LOC, executable) — A/B harness:
+   - **First-divergence position** in words AND bytes (-1 = identical,
+     length-of-shorter if prefix)
+   - **`length_fraction`** (feature / baseline)
+   - **`SHORT` flag** when feature shrinks past `--eos-garbage-frac`
+     (default 0.5) — catches EOS-on-garbage
+   - **`EARLYDIV` flag** when divergence < `--min-divergence-tok`
+     words (default 8) — catches early quality cliffs
+   - `summary.txt` side-by-side table + `comparison.jsonl` per-prompt
+     rows with full content
+   - Two modes: parallel hosts OR sequential single-host via
+     `--label baseline|feature` then `--compare DIR`
+   - `--prompts-file` overrides default 10-prompt set
+   - **Exit code 3 on regression flag = usable as campaign gate**
+
+2. **`k26_eyeball_eval.sh`** (executable) — pretty-prints baseline
+   vs feature side-by-side from comparison.jsonl, `--idx N` to
+   focus
+
+3. **`README.md`** — adds rows + "when to use which eval" section
+   quoting iter 037, plus stub explanation for not-yet perplexity
+
+**Smoke test (synthetic iter-037 scenario):**
+- Prompt 0 (Paris + garbage): `flag=EARLYDIV div_word=0 len_frac=0.757`
+- Prompt 1 (identical): `flag=ok div_word=-1`
+- Prompt 2 (early EOS): `flag=SHORT+EARLYDIV div_word=0 len_frac=0.216`
+- Exit code 3 as designed
+
+All error paths verified (no-args, bad API, missing comparison).
+
+**Honest scope:**
+- **Perplexity NOT implemented.** Would catch plausible-but-wrong
+  tokens but `tahoma-api` returns content only. Stub fields
+  `logprob_baseline` / `logprob_feature` kept in each JSONL row
+  for future wire-up without schema migration.
+- **Bash not Rust** — matches existing bench/ convention. Deps:
+  curl + jq + python3 (already on miner / matias / mac).
+- **Word-split treats "Paris," ≠ "Paris"** — intentional
+  (punctuation drift is quality signal)
+- **Not wired into a campaign** — sensible follow-up: re-run iter
+  037 W=0 vs W=32 mt=128 through this harness to confirm it would
+  have caught the original regression
+
+---
+
 ## 093 — zstd expert storage at rest — DECISIVE NEGATIVE (real miner measurement) (2026-05-19 ~03:40 PT)
 
 Path C investigation with real miner measurements. Branch
