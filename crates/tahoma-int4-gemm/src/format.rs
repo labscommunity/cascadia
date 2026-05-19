@@ -134,3 +134,70 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     // left by 16 lines it up.
     f32::from_bits((bits as u32) << 16)
 }
+
+/// Single source-of-truth for f32 -> bf16 conversion across the crate.
+///
+/// Round-to-nearest-even rounding, returns the u16 bit-pattern (same
+/// rounding `half::bf16::from_f32` would do). Inlined for hot write
+/// loops; matches the test `f32_to_bf16_bits_matches_half_crate` below
+/// which pins behavior bit-for-bit against the `half` crate so callers
+/// can convert without paying a dep on `half` at the call site.
+///
+/// Used by:
+/// - sparse-moe runner's KV-cache writer (`runner.rs::write_present_kv`)
+/// - the int4 shell's multi-token KV writer (`shell_int4.rs`)
+/// - the int4 layer-0 KV writer (`layer0_int4.rs`)
+/// - the C-FFI bridge (`c_ffi.rs`) staging f32 KV inputs to bf16
+#[inline]
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        // NaN — keep mantissa nonzero so the round-trip stays a NaN
+        // rather than collapsing to ±inf when we shift back.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cross-check our hand-rolled rounding against `half::bf16::from_f32`
+    /// for a handful of values: zero, ±1, ±0.5, small powers of 2,
+    /// a denormal-ish value, and a few transcendentals. This test pins
+    /// the bit-pattern contract callers rely on — the multiple shells
+    /// (runner.rs, shell_int4.rs, layer0_int4.rs, c_ffi.rs) all import
+    /// this function, so the cross-check applies to all of them.
+    #[test]
+    fn f32_to_bf16_bits_matches_half_crate() {
+        use half::bf16;
+        let cases: &[f32] = &[
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            2.0,
+            0.125,
+            1.0e-30,
+            std::f32::consts::PI,
+            -42.5,
+        ];
+        for &x in cases {
+            let ours = f32_to_bf16_bits(x);
+            let theirs = bf16::from_f32(x).to_bits();
+            assert_eq!(
+                ours, theirs,
+                "mismatch for f32={x:?}: ours=0x{ours:04x} theirs=0x{theirs:04x}"
+            );
+        }
+        // NaN: any pattern with exp=0xFF and nonzero mantissa is valid.
+        // Bit-equality not required for NaN.
+        let nan_ours = f32_to_bf16_bits(f32::NAN);
+        let nan_back = f32::from_bits((nan_ours as u32) << 16);
+        assert!(nan_back.is_nan(), "ours: 0x{nan_ours:04x} not NaN");
+    }
+}

@@ -11,6 +11,7 @@
 //! gives layer 0 its own pre-allocated KV cache so it joins the
 //! shells on the O(N) per-token path.
 
+use crate::format::f32_to_bf16_bits as f32_to_bf16_bits_local;
 use crate::kernel_avx512::dequant_gemv_int4_auto;
 use crate::safetensors_source::SafetensorsLayer0;
 use crate::shell::{
@@ -879,16 +880,6 @@ fn write_present_kv_bf16(
             dst[i] = f32_to_bf16_bits_local(src[i]);
         }
     }
-}
-
-#[inline]
-fn f32_to_bf16_bits_local(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
 }
 
 #[cfg(test)]

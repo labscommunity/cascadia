@@ -9,6 +9,7 @@
 //! a Rust-owned `Vec<u8>` so they're heap-resident (never evicted by
 //! the page-cache pressure that would otherwise hit a mmap'd region).
 
+use crate::format::f32_to_bf16_bits as f32_to_bf16_bits_local;
 use crate::kernel_avx512::dequant_gemv_int4_auto;
 use crate::kernel_avx512_multi::dequant_gemm_int4_multi_auto;
 use crate::kernel_avx512_multi_blocked::dequant_gemm_int4_multi_blocked_auto;
@@ -1166,20 +1167,6 @@ fn write_present_kv_bf16(
             dst[i] = f32_to_bf16_bits_local(src[i]);
         }
     }
-}
-
-/// f32 -> bf16 round-to-nearest-even, returns u16 bit-pattern.
-/// Inlined here so the multi-token write loop doesn't depend on the
-/// engine crate's helper.
-#[inline]
-fn f32_to_bf16_bits_local(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        // NaN — keep mantissa nonzero so round-trip stays NaN.
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
 }
 
 /// Re-export the bf16-weight RMSNorm (shell.rs's rmsnorm_apply) for use here.

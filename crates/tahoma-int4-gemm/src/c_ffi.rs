@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use half::bf16;
 
+use crate::format::f32_to_bf16_bits;
 use crate::kernel::expert_forward;
 use crate::safetensors_source::SafetensorsExpertSource;
 use crate::HIDDEN;
@@ -204,19 +205,6 @@ pub unsafe extern "C" fn tahoma_int4_destroy_shell_int4(h: *mut TahomaShellInt4)
     drop(Box::from_raw(h));
 }
 
-/// Convert one f32 to bf16 bits, round-to-nearest-even. Used to bridge
-/// the C-FFI's legacy f32 KV inputs into the inner Rust kernel's
-/// bf16-as-u16 layout (autolab campaign 029 / A8).
-#[inline]
-fn f32_to_bf16_bits_ffi(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
-}
-
 /// Run int4 shell forward.
 ///
 /// **autolab campaign 029 (A8):** The inner Rust kernel now uses
@@ -246,8 +234,8 @@ pub unsafe extern "C" fn tahoma_int4_shell_forward_int4(
     let x = std::slice::from_raw_parts(x_f32, SHELL_HIDDEN);
     let pk_f = std::slice::from_raw_parts(past_k, NUM_HEADS * past_seq_len * QK_HEAD_DIM);
     let pv_f = std::slice::from_raw_parts(past_v, NUM_HEADS * past_seq_len * V_HEAD_DIM);
-    let pk_bf: Vec<u16> = pk_f.iter().map(|&v| f32_to_bf16_bits_ffi(v)).collect();
-    let pv_bf: Vec<u16> = pv_f.iter().map(|&v| f32_to_bf16_bits_ffi(v)).collect();
+    let pk_bf: Vec<u16> = pk_f.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+    let pv_bf: Vec<u16> = pv_f.iter().map(|&v| f32_to_bf16_bits(v)).collect();
     let ShellOutputs {
         attn_out_post_norm,
         attn_residual,

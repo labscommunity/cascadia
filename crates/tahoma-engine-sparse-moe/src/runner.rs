@@ -30,7 +30,7 @@ use tahoma_int4_gemm::shell_int4::{
     Int4Shell,
 };
 use tahoma_int4_gemm::{
-    expert_forward as int4_expert_forward, ExpertWeights, SafetensorsExpert,
+    expert_forward as int4_expert_forward, f32_to_bf16_bits, ExpertWeights, SafetensorsExpert,
     SafetensorsExpertSource,
 };
 use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
@@ -1851,21 +1851,6 @@ fn grow_kv_buffer(
     Ok(dst)
 }
 
-/// Convert one f32 to bf16 bits via round-to-nearest-even. Matches the
-/// rounding `half::bf16::from_f32` would do; inlined here so the hot
-/// per-token write loop doesn't depend on the `half` crate at this site.
-#[inline]
-fn f32_to_bf16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-        // NaN — keep mantissa nonzero so the round-trip stays a NaN
-        // rather than collapsing to ±inf when we shift back.
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-    (rounded >> 16) as u16
-}
-
 /// Write the new step's per-head K (or V) row at slot `past_seq`
 /// inside a `[NUM_HEADS, capacity, HEAD_DIM]` bf16-as-u16 buffer.
 /// `present` is still f32 (we are the conversion site). No allocation,
@@ -1979,39 +1964,10 @@ mod tests {
         assert!(dst.iter().all(|&x| x == 0));
     }
 
-    #[test]
-    fn f32_to_bf16_bits_matches_half_crate() {
-        // Cross-check our hand-rolled rounding against `half::bf16::from_f32`
-        // for a handful of values: zero, ±1, ±0.5, small powers of 2,
-        // a denormal-ish value, and a few transcendentals.
-        use half::bf16;
-        let cases: &[f32] = &[
-            0.0,
-            -0.0,
-            1.0,
-            -1.0,
-            0.5,
-            -0.5,
-            2.0,
-            0.125,
-            1.0e-30,
-            std::f32::consts::PI,
-            -42.5,
-        ];
-        for &x in cases {
-            let ours = super::f32_to_bf16_bits(x);
-            let theirs = bf16::from_f32(x).to_bits();
-            assert_eq!(
-                ours, theirs,
-                "mismatch for f32={x:?}: ours=0x{ours:04x} theirs=0x{theirs:04x}"
-            );
-        }
-        // NaN: any pattern with exp=0xFF and nonzero mantissa is valid.
-        // Bit-equality not required for NaN.
-        let nan_ours = super::f32_to_bf16_bits(f32::NAN);
-        let nan_back = f32::from_bits((nan_ours as u32) << 16);
-        assert!(nan_back.is_nan(), "ours: 0x{nan_ours:04x} not NaN");
-    }
+    // Cross-check of f32_to_bf16_bits against half::bf16::from_f32 now
+    // lives in tahoma-int4-gemm::format::tests, the canonical home for
+    // the helper imported above. Removed from here to avoid duplicating
+    // the contract pin.
 
     #[test]
     fn argmax_i64_finds_max_index() {
