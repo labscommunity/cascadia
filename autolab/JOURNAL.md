@@ -73,6 +73,51 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 056 — Cache-aware expert dispatch order — CODE SHIPPED, bit-identical (2026-05-18 ~19:45 PT)
+
+Composes with iter 054 (pinning) + iter 047 (predictor). Branch
+`perf/cache-aware-dispatch-056` @ `b1a2833` (based on iter 054 for
+`expert_hits` map).
+
+**What shipped:**
+- `forward_shells` dispatch loop split into 3 phases:
+  - **Phase 1:** original-order bookkeeping (threshold skip, prefetch
+    counters, `expert_hits` bumps) — byte-identical to pre-056
+  - **Phase 2:** dispatch in `cache_aware_dispatch_order` (when
+    enabled) OR `active_ks` (default), stashing per-expert outputs
+    indexed by original k
+  - **Phase 3:** weighted-sum accumulation in **ascending original k
+    order** — **THIS IS THE BIT-IDENTITY HINGE**
+- `--cache-aware-dispatch` CLI flag (default off)
+- Pure helper `cache_aware_dispatch_order(routing_ids, hits)` returns
+  permutation of `0..K` by descending hit count, tie-broken by
+  ascending original index. Empty hits → identity (first prefill
+  token byte-identical to router-score order)
+- 8 new unit tests pass, including load-bearing
+  `cache_aware_dispatch_bit_identical_to_router_score_order` and
+  `cache_aware_dispatch_bit_identity_at_k26_hidden` (K=8, HIDDEN=7168
+  production size) asserting **byte-equal `moe[]` across router-
+  score, cache-aware, reverse, AND shuffled dispatch orderings**
+
+**Bit-identity proof:** Phase 3 sums `moe[j] += w * y_f32[j]` in
+ascending original k order regardless of Phase 2 dispatch order. The
+f32 rounding chain is unchanged.
+
+**Tests:** 32/32 sparse-moe pass. fmt + clippy clean.
+
+**Predicted (analytical):** ~12.5% of expert-weight reads turn
+miss→hit (L3 retention of hot experts across layers). ~5-12% tok/s
+uplift on top of iter 054. Bench deferred to autolab on miner.
+
+**Composes:**
+- iter 033 C1 prefetch (warms RAM ahead of dispatch)
+- iter 047 better predictor (warms more experts pre-fetch)
+- iter 054 pinning (hot set never paged)
+- iter 056 (this — keeps L3 stable across layers via dispatch order)
+- All 4 attack different cache levels of the expert-load chain
+
+---
+
 ## 054 — Persistent expert pinning via mlock — FULL IMPL shipped, bench pending (2026-05-18 ~18:30 PT)
 
 Real architectural lever delivered as full (A) path. Branch
