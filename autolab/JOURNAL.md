@@ -73,6 +73,79 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 097 — io_uring milestone 1 (Linux backend) — REAL IMPL, verified on miner (2026-05-19 ~04:35 PT)
+
+Replaces iter 074's stubbed Linux backend with real
+`IoUring::new()` + probe. Branch
+`perf/io-uring-milestone1-097` @ `acfb7ea` (2 commits, based on iter
+074).
+
+**What shipped:**
+1. **`IoUring::new(depth)`** at startup. Depth rounded to power of
+   two (io_uring requirement).
+2. **Functional NOP probe** — submits `opcode::Nop` SQE with
+   sentinel `user_data`, calls `submit_and_wait(1)`, drains CQE,
+   validates round-trip. **Catches WSL2 + Docker seccomp + kernel
+   < 5.1 at startup** instead of on first prefetch.
+3. **Background reaper thread** (`io-uring-reaper`) drains CQEs in
+   loop, flips per-handle `done` atomic, releases slot. Wakes from
+   `Drop` via sentinel-NOP SQE + `shutting_down` atomic.
+4. **Real `queue_read`:** allocates Vec<u8> destination (Arc<UnsafeBuf>
+   shared with slot table so handle drop doesn't yank kernel
+   buffer), claims slot via CAS scan, pushes `opcode::Read` SQE
+   with file's raw FD, calls non-blocking `ring.submit()`. Returns
+   `QueueFull` cleanly when SQ saturated or all slots in flight.
+5. **Graceful fallback** on any failure (1)/(2)/(3) — logs
+   `tracing::warn!` and switches BackendKind to Fallback. Same
+   no-panic contract.
+
+**Cargo:** io-uring always-on for Linux (was opt-in feature),
+tracing dep added, tempfile dev-dep. `io-uring-force` feature
+replaced for diagnostic override.
+
+**Tests (4, all pass on miner kernel 6.17):**
+- `backend_constructs_without_panic_on_any_platform`
+- `backend_clone_is_cheap_and_consistent` (Arc sharing)
+- `fallback_handle_is_immediately_ready_on_non_linux`
+- `linux_io_uring_or_clean_fallback` (cfg target_os linux) — either
+  io_uring lights up + real tempfile read completes < 5s, or
+  fallback is taken cleanly
+
+**Verified on miner (192.168.86.51, kernel 6.17, fresh clone):**
+- All 4 tests pass
+- Standalone end-to-end confirmed `using_io_uring: true` and real
+  read completed **in ~10ms via io_uring path**
+- `cargo clippy` zero warnings on new file (Linux AND macOS)
+- `cargo fmt --check` clean
+
+**Verified on macOS** (dev): 3/3 tests pass, Fallback path used as
+expected.
+
+**Key design notes:**
+- Used `opcode::Read` with single contiguous destination (not
+  iovec/Readv) — each tensor slice is one mmap range
+- No tokio — sync int4-gemm crate; uses `std::thread::Builder`
+  reaper instead of tokio runtime
+- `SubmissionQueue` is `!Send + !Sync` in io-uring 0.6 → SQ pushes
+  serialized via `Mutex<()>` + re-borrow `submission_shared()` per
+  push. Reaper owns CQ side via `completion_shared()`
+- `AsyncIoError::NotImplemented` kept for ABI stability (downstream
+  matches); milestone 1 never returns it
+
+**Honest blockers:**
+- **Reaper latency floor 10ms in idle state** — polling adds
+  per-read worst-case latency = REAPER_IDLE when reaper is asleep.
+  Production submits continuously so no impact; tighter design
+  needs SQ-mutex coordination. v2 opt.
+- **No demand-path wiring** (milestone 4) — `forward_shells` still
+  needs to call `try_submit` for io_uring backend to be exercised
+  by inference loop
+- **No bench harness** (milestone 6) — autolab can now legitimately
+  compare io_uring vs madvise on miner; previous iters got identical
+  numbers because backend was stubbed
+
+---
+
 ## 096 — Failover orchestrator — Track B (composes iter 091+092+094 into FSM) (2026-05-19 ~04:20 PT)
 
 Branch `perf/failover-orchestrator-096` @ `944c4a8` (based on iter 094).
