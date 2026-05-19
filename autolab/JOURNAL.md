@@ -73,6 +73,65 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 075 — Extended SIMD dispatch (LargeShape variant) — IMPL + critical merge fix (2026-05-18 ~23:45 PT)
+
+Two-part deliverable. Branch `perf/extend-simd-dispatch-075` @
+`4b11b37` (with merge commit `b4b7682` underneath).
+
+**Part 1: Merge fix (the bulk of the work):**
+
+iter 048's `_multi*` functions were written against f32 KV; base
+branch `perf/cache-attack-bench-070` has bf16-as-u16 KV (iter 032 A8).
+Surfaced drift required:
+- `shell_forward_decode_int4_multi_*` and
+  `layer0_forward_decode_int4_multi_with_capacity` signatures
+  `&mut [f32]` → `&mut [u16]`
+- `write_present_kv_inplace` does f32→bf16 round-to-nearest-even
+  via new `crate::format::f32_to_bf16_bits` helper
+- Phase B SDPA in `_multi_batched` reads past_k/past_v as bf16 → f32
+  (mirrors seq=1 SDPA)
+- Multi-batched router replaced stable `sort_by` with iter 047
+  `select_top_n_by_score` helper — fixed bit-identity break on
+  test inputs with near-zero scores
+- **All 4 previously-failing iter 048 tests now pass (34/34 in
+  tahoma-int4-gemm, all in tahoma-engine-sparse-moe)**
+
+**Part 2: iter 075 itself (extending dispatch):**
+- Added `ProjShape::LargeShape` variant — uses iter 046 blocked at
+  seq>=8, iter 042 below 8 (hand-rolled threshold)
+- **Routed `shared_gate` and `shared_up` (both 7 MB, +28% at seq=16
+  per iter 046 microbench) to LargeShape**
+- Left q_a_proj / q_b_proj / kv_a_proj / kv_b_proj / router on
+  `Generic` (brief said "maybe stay Generic at seq=4"; commit body
+  notes lifting to LargeShape is defensible at seq>=8 but should
+  wait for engine-level bench data)
+- Updated dispatcher docs with full per-shape table (10 K2.6
+  projections, kernel choice, MB)
+- 2 new bit-identity tests at dispatcher level:
+  - `dispatch_int4_multi_large_shape_seq_4_matches_scalar` (→ iter 042)
+  - `dispatch_int4_multi_large_shape_seq_8_matches_scalar` (→ iter 046 blocked)
+- Updated `dispatch_int4_multi_seq_1_matches_single_token_kernel`
+  to cover all 4 ProjShape variants
+- **36 tests pass in tahoma-int4-gemm**
+
+**Workspace:** builds clean, fmt clean, single-author commits, no
+Co-Authored-By.
+
+**Architectural impact:** the merge fix alone is load-bearing — iter
+048's seam was BROKEN on the iter 032 bf16-KV-era branches until
+this iter. Now the seq>1 multi-tile path actually compiles + tests
+green on the autolab/k26-perf branch family.
+
+Plus extending SIMD dispatch to shared_gate + shared_up captures
+the iter 046 wins on those shapes when callers (spec-decode,
+chunked-prefill, batching) eventually exercise seq>=8.
+
+**Honest blocker:** no engine-level bench. Miner contended (iter 073
+lean bench running). Code + tests + theoretical analysis is the
+deliverable; bench is follow-up.
+
+---
+
 ## 076 — Per-thread CPU affinity pinning — full (A) impl, validated on miner (2026-05-18 ~23:40 PT)
 
 New crate `tahoma-cpu-affinity` + CLI wiring. Branch
