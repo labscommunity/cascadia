@@ -73,6 +73,49 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 068 — Wire compression for 2-box hidden states — opt-in, decode-negative / prefill-positive (2026-05-18 ~22:25 PT)
+
+Track A full impl + honest workload-dependent finding. Branch
+`perf/wire-compression-068` @ `66115b0`.
+
+**What shipped:**
+- `Compression` enum (None / Zstd / Lz4) in `tahoma-transport`
+- Backward-compatible wire format: high byte of existing 4-byte
+  `dtype_code` field overloaded as compression flag. Old senders ↔
+  new receivers (and vice versa) byte-identical at
+  `compression=None`
+- `--wire-compression <none|zstd|lz4>` CLI flag, both ranks must
+  pass same (no negotiation; misconfigured pair fails loud)
+- Send/recv paths use configured scheme on send, read per-frame
+  flag on recv
+- 16 unit tests pass; full `cargo test --workspace` clean
+- `bin/bench_wire_compression.rs` measures ratio + encode/decode µs
+
+**Compression ratios measured (synthetic K2.6 distributions):**
+
+| Workload | Zstd-1 ratio | Lz4 ratio | Zstd enc/dec | Lz4 enc/dec |
+|----------|-------------:|----------:|--------------|-------------|
+| Gaussian 7168 f32 (28 KiB) | 0.881 | 1.004 | 24/19 µs | 1.9/0.7 µs |
+| K2.6 single-token (28 KiB) | 0.923 | 1.004 | 25/19 µs | 1.9/0.7 µs |
+| K2.6 prefill burst (448 KiB) | **0.068** | 0.153 | 90/40 µs | 88/15 µs |
+
+**Honest finding (workload-dependent):**
+- **Per-token decode (28 KiB hidden):** NEITHER scheme is a win.
+  Zstd saves ~37 µs wire but costs ~45 µs CPU = **net -8 µs per
+  token on matias tunnel, -25 µs on LAN**. Lz4 actually expands.
+- **Per-prefill burst (16 tokens × 7168 = 448 KiB):** Zstd hits
+  **6.8% ratio**, saves ~7 ms per burst.
+
+**Architectural takeaway:** different workloads need different
+compression strategies. Decode = no compression (CPU > savings).
+Prefill = Zstd is significant. The opt-in CLI flag lets ops pick
+based on workload mix.
+
+Real per-token-decode gains depend on actual K2.6 hidden-state
+entropy (synthetic model used; real dump would tighten estimate).
+
+---
+
 ## 067 — Fast sampling kernel — NEGATIVE (not worth as default), opt-in shipped (2026-05-18 ~22:00 PT)
 
 Honest negative via path (B) investigation + opt-in (A) shipped.
