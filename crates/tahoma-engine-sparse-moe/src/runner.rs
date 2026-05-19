@@ -38,6 +38,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
+use crate::kv_session_cache::KvSessionCache;
 use crate::manifest::{Manifest, ManifestError};
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
@@ -1492,7 +1493,7 @@ impl Runner {
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
     ) -> Result<Vec<i64>, RunnerError> {
-        self.generate_with_cache(prompt_ids, max_tokens, cfg, None)
+        self.generate_with_caches(prompt_ids, max_tokens, cfg, None, None, None)
     }
 
     /// Generate with an optional KV-prefix cache. Behaviour is byte-
@@ -1508,12 +1509,52 @@ impl Runner {
     /// **full prompt token sequence**; common-prefix matching is
     /// O(entries) at lookup time, not at insert time. See the
     /// [`crate::kv_prefix_cache`] module docs for the cache semantics.
+    ///
+    /// Convenience wrapper around [`Self::generate_with_caches`] for
+    /// callers that only have a prefix cache (no session-cache).
     pub fn generate_with_cache(
         &mut self,
         prompt_ids: &[i64],
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
-        mut cache: Option<&mut KvPrefixCache>,
+        cache: Option<&mut KvPrefixCache>,
+    ) -> Result<Vec<i64>, RunnerError> {
+        self.generate_with_caches(prompt_ids, max_tokens, cfg, cache, None, None)
+    }
+
+    /// Full generate path with both caches.
+    ///
+    /// - `prefix_cache` (iter 060) — shared-prefix cache keyed on the
+    ///   token sequence. Hit when many requests share a system prompt
+    ///   prefix; snapshot taken AFTER PREFILL.
+    /// - `session_cache` + `session_id` (iter 072) — multi-turn chat
+    ///   warm-restart cache keyed on the caller-supplied session id.
+    ///   Hit when the request prompt extends a previously-snapshotted
+    ///   session's `system+user+assistant…` history; snapshot taken
+    ///   AFTER GENERATION (so it includes the assistant's reply, ready
+    ///   for the next turn's user message to append).
+    ///
+    /// When both caches could fire, we pick the LONGER match — the
+    /// session cache will usually win on turn ≥ 2 of a conversation
+    /// (it has the whole prior history); the prefix cache wins on
+    /// the very first turn when only the system prompt is shared.
+    /// Exactly one restore happens, so we never pay restore cost twice.
+    ///
+    /// **Bit-identity contract**: with both caches passed but `None`
+    /// returned by every lookup, this method's behaviour is byte-
+    /// identical to the cache-disabled path. With a hit, the restored
+    /// KV bits are byte-identical to what a full re-prefill would have
+    /// written (the snapshot was packed from those exact KV buffers
+    /// in a prior generation; the runner's snapshot/restore round-trip
+    /// is unit-tested at `pack_unpack_roundtrip_is_bit_identical`).
+    pub fn generate_with_caches(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        mut prefix_cache: Option<&mut KvPrefixCache>,
+        mut session_cache: Option<&mut KvSessionCache>,
+        session_id: Option<&str>,
     ) -> Result<Vec<i64>, RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
@@ -1525,34 +1566,65 @@ impl Runner {
         let mut rng = crate::sampling::init_rng(cfg.seed);
         let mut generated = Vec::with_capacity(max_tokens);
 
-        // Cache lookup. Returns Some(matched_len) if we restored a
-        // snapshot; None otherwise. We capture both `fp` and the
-        // prefix length here because we'll re-use them for insert
-        // after a fresh prefill.
         let fp = self.fingerprint();
-        let mut cache_skip: usize = 0;
-        let mut cache_hit = false;
-        if let Some(c) = cache.as_mut() {
-            if c.enabled() {
-                if let Some(snap) = c.lookup(prompt_ids, &fp) {
-                    // Restore into the runner's KV buffers. The
-                    // restore validates shape against fingerprint;
-                    // a failure here means cache + runner disagree on
-                    // dimensions (should never happen — fingerprint
-                    // covers num_heads/head_dim — but bubble up the
-                    // error rather than silently corrupt).
-                    cache_skip = snap.past_seq_len;
-                    self.restore_kv(&snap)?;
-                    cache_hit = true;
-                    info!(
-                        cached_prefix_len = cache_skip,
-                        full_prompt_len = prompt_ids.len(),
-                        "kv-prefix-cache HIT — skipping prefix tokens"
-                    );
+
+        // --- Cache lookup ----------------------------------------------------
+        //
+        // Consult both caches independently, pick the longer match. We
+        // probe the session cache first because it usually wins on turn
+        // ≥ 2 (includes generated tokens from the previous turn), so
+        // on a session hit we can skip touching the prefix cache at
+        // all. But the prefix cache might still hold a longer match in
+        // edge cases (e.g. shared system prompt + user message identical
+        // across two distinct sessions), so we honestly compare lengths
+        // and pick the bigger one. Restoring is the expensive part —
+        // doing it twice would erase the cache's value.
+        let mut chosen_skip: usize = 0;
+        let mut chosen_source: &'static str = "miss";
+        let mut chosen_snap: Option<KvSnapshot> = None;
+
+        if let (Some(sid), Some(sc)) = (session_id, session_cache.as_mut()) {
+            if sc.enabled() {
+                if let Some(hit) = sc.lookup(sid, prompt_ids, &fp) {
+                    chosen_skip = hit.matched_len;
+                    chosen_snap = Some(hit.snapshot);
+                    chosen_source = "session";
+                }
+            }
+        }
+        if let Some(pc) = prefix_cache.as_mut() {
+            if pc.enabled() {
+                if let Some(snap) = pc.lookup(prompt_ids, &fp) {
+                    if snap.past_seq_len > chosen_skip {
+                        chosen_skip = snap.past_seq_len;
+                        chosen_snap = Some(snap);
+                        chosen_source = "prefix";
+                    }
                 }
             }
         }
 
+        let mut cache_hit = false;
+        let mut prefix_hit = false; // tracks whether to skip prefix-cache insert
+        if let Some(snap) = chosen_snap {
+            // Validates shape against fingerprint defensively; an
+            // error here means cache + runner disagree on dimensions,
+            // which the digest check upstream should prevent — surface
+            // the bug rather than silently corrupt.
+            self.restore_kv(&snap)?;
+            cache_hit = true;
+            prefix_hit = chosen_source == "prefix";
+            info!(
+                source = chosen_source,
+                cached_prefix_len = chosen_skip,
+                full_prompt_len = prompt_ids.len(),
+                "kv-cache HIT — skipping prefix tokens"
+            );
+        }
+        let cache_skip = chosen_skip;
+
+        // --- Prefill ---------------------------------------------------------
+        //
         // Prefill token-by-token to keep shell input shapes uniform (avoids
         // the OV 2026.1.0 CPU snippets shape-specialization bug we hit on
         // shape changes). On a cache hit, `cache_skip` of the prompt
@@ -1602,6 +1674,8 @@ impl Runner {
             "prefill done"
         );
 
+        // --- Prefix-cache insert on miss ------------------------------------
+        //
         // Insert a snapshot on miss. We only cache the FULL prompt
         // (not arbitrary intermediate prefixes) — this keeps the
         // cache small and matches the chat-completion access pattern
@@ -1609,12 +1683,19 @@ impl Runner {
         // the user message varies. Insert happens after prefill so
         // the snapshot reflects what `forward_shells` actually wrote.
         //
+        // Skip the insert when the hit came from the prefix cache
+        // itself — the entry is already there (just promoted by the
+        // lookup). Skip on a session hit too; the prefix cache would
+        // get a different entry for the same KV bits but the
+        // marginal value is low (session snapshot will be more
+        // up-to-date next turn anyway).
+        //
         // We could be cleverer (cache after each step, or at
         // configurable boundaries) — defer until profiling shows
         // demand. The dominant cost on the rainier baseline is
         // prefill, and a full-prompt snapshot pays it off in one hit.
         if !cache_hit {
-            if let Some(c) = cache.as_mut() {
+            if let Some(c) = prefix_cache.as_mut() {
                 if c.enabled() && !prompt_ids.is_empty() {
                     match self.snapshot_kv() {
                         Ok(snap) => {
@@ -1637,11 +1718,29 @@ impl Runner {
                 }
             }
         }
+        // Avoid unused-warning if the only consumer of `prefix_hit` is
+        // gated on future tracing. It's load-bearing once we add a
+        // metric for "hit by source" but is kept here as the boolean
+        // we tested above.
+        let _ = prefix_hit;
 
+        // --- Generate --------------------------------------------------------
         // First generated token from the LAST prefill step's logits.
         if let Some(l) = last_logits {
             let next = crate::sampling::sample(&l, &history, cfg, &mut rng);
             if eos.contains(&next) {
+                // EOS on first generated token: we still insert a
+                // session snapshot so a subsequent turn that begins
+                // with this exact (prompt+EOS-or-nothing) state can
+                // warm-restart. The snapshot at this point covers
+                // `prompt_ids` (no generated tokens were appended to
+                // history before EOS was returned).
+                self.maybe_insert_session_snapshot(
+                    session_id,
+                    session_cache.as_deref_mut(),
+                    &fp,
+                    &history,
+                );
                 return Ok(generated);
             }
             history.push(next);
@@ -1671,7 +1770,68 @@ impl Runner {
                 "decode step"
             );
         }
+
+        // --- Session-cache insert at end of generation ----------------------
+        //
+        // Snapshot the full `prompt + generated` history. This is the
+        // critical move for multi-turn warm-restart: the next turn's
+        // prompt will be `prompt + generated + new_user_message`, and
+        // looking up the same session id with that new prompt will
+        // hit on the prefix `prompt + generated` (matched_len ==
+        // history.len()), letting the runner skip ALL of it.
+        //
+        // We always insert (even on a hit) because `history` has more
+        // tokens now than the snapshot we restored from — the new
+        // entry supersedes the old. The session cache's insert handles
+        // replacement of the same session id in place.
+        self.maybe_insert_session_snapshot(session_id, session_cache.as_deref_mut(), &fp, &history);
         Ok(generated)
+    }
+
+    /// Snapshot the runner's current KV state and insert it into the
+    /// session cache under `session_id`. No-op when no session_id was
+    /// supplied or the cache is disabled. Snapshot failures are
+    /// logged but non-fatal (the generation has already succeeded).
+    fn maybe_insert_session_snapshot(
+        &self,
+        session_id: Option<&str>,
+        session_cache: Option<&mut KvSessionCache>,
+        fingerprint: &ModelFingerprint,
+        history: &[i64],
+    ) {
+        let Some(sid) = session_id else {
+            return;
+        };
+        let Some(sc) = session_cache else {
+            return;
+        };
+        if !sc.enabled() || history.is_empty() {
+            return;
+        }
+        match self.snapshot_kv() {
+            Ok(snap) => {
+                let bytes = snap.approx_bytes();
+                let evicted = sc.insert(sid.to_string(), history.to_vec(), fingerprint, snap);
+                info!(
+                    session_id = sid,
+                    cached_bytes = bytes,
+                    cache_len = sc.len(),
+                    total_bytes = sc.total_bytes(),
+                    evicted,
+                    "kv-session-cache inserted snapshot"
+                );
+            }
+            Err(e) => {
+                // Snapshot failure is non-fatal — the generation has
+                // already completed correctly; we just won't be able
+                // to warm-restart the next turn.
+                warn!(
+                    session_id = sid,
+                    error = %e,
+                    "kv-session-cache snapshot failed; not caching"
+                );
+            }
+        }
     }
 
     /// Back-compat: equivalent to `generate(..., &SamplingConfig::default())`.
@@ -2432,5 +2592,195 @@ mod tests {
             .expect_err("expected length-check error");
         let msg = format!("{err}");
         assert!(msg.contains("past_k"), "error should mention past_k: {msg}");
+    }
+
+    /// Multi-turn session bit-identity. Simulates two scenarios that
+    /// MUST produce identical KV bits after the session cache settles:
+    ///
+    /// 1. Cold-path "no cache": one big prefill that fills slots 0..N.
+    /// 2. Warm-path "session restore": prefill 0..K, pack a snapshot,
+    ///    unpack it back into a FRESH buffer at the same capacity,
+    ///    then prefill K..N. The final populated K and V slots must
+    ///    match cold-path byte-for-byte.
+    ///
+    /// This is the load-bearing invariant the task brief calls out
+    /// for the session cache: "cached-session vs non-cached must
+    /// produce identical tokens". With a deterministic forward
+    /// function (here: a hash-of-(layer,slot,h,d) stamp), identical
+    /// KV bits ⇒ identical attention outputs ⇒ identical logits ⇒
+    /// identical sampled tokens.
+    #[test]
+    fn session_round_trip_matches_full_prefill_bit_identical() {
+        let cap = 16;
+        let prefix_len = 6; // "turn 1 prompt + assistant reply"
+        let suffix_len = 4; // "turn 2 user message"
+        let total = prefix_len + suffix_len;
+
+        // Cold path: fill slots 0..total directly. The stamp function
+        // mimics a deterministic forward: cell(h,s,d) = h*1e6 + s*1e3 + d.
+        let mut cold_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut cold_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..total {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    cold_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    cold_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+
+        // Warm path turn 1: fill slots 0..prefix_len, then pack
+        // (mimics end-of-turn-1 snapshot insertion).
+        let mut warm_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut warm_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..prefix_len {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    warm_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    warm_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+        let snapshot = pack_layer_slice(0, &warm_k, &warm_v, prefix_len, cap);
+
+        // Turn 2: start from a FRESH buffer (mimics a stateless
+        // engine that just woke up from cache). Restore the snapshot,
+        // then continue filling slots prefix_len..total.
+        let mut warm2_k = vec![0.0f32; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut warm2_v = vec![0.0f32; NUM_HEADS * cap * V_HEAD_DIM];
+        unpack_layer_slice(&mut warm2_k, &mut warm2_v, &snapshot, prefix_len, cap)
+            .expect("restore");
+        // "Suffix prefill" — write the new tokens' KV cells.
+        for h in 0..NUM_HEADS {
+            for s in prefix_len..total {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    warm2_k[off] = (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    warm2_v[off] = -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+
+        // Bit-identity: every populated slot of warm2 must match cold
+        // exactly. We don't compare slots [total..cap] — those were
+        // never read by the forward path; their contents are
+        // intentionally undefined (the warm path may have ZEROS where
+        // cold has ZEROS, but in production both are NaN-ish).
+        for h in 0..NUM_HEADS {
+            for s in 0..total {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    assert_eq!(
+                        warm2_k[off].to_bits(),
+                        cold_k[off].to_bits(),
+                        "K mismatch at h={h} s={s} d={d}: warm={} cold={}",
+                        warm2_k[off],
+                        cold_k[off]
+                    );
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    assert_eq!(
+                        warm2_v[off].to_bits(),
+                        cold_v[off].to_bits(),
+                        "V mismatch at h={h} s={s} d={d}: warm={} cold={}",
+                        warm2_v[off],
+                        cold_v[off]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Same multi-turn round-trip as above, but the warm path also
+    /// crosses a grow_kv_capacity boundary (snapshot taken at cap=8,
+    /// restored into a cap=16 buffer, then suffix prefill). The
+    /// per-head bases shift after a grow; this test catches any
+    /// indexing mis-offset that would silently corrupt KV bits when
+    /// a long-running session crosses the initial capacity threshold.
+    #[test]
+    fn session_round_trip_survives_capacity_grow() {
+        let src_cap = 8;
+        let dst_cap = 16;
+        let prefix_len = 5;
+        let suffix_len = 6;
+        let total = prefix_len + suffix_len;
+
+        // Turn 1 buffer at src_cap.
+        let mut warm_k = vec![0.0f32; NUM_HEADS * src_cap * QK_HEAD_DIM];
+        let mut warm_v = vec![0.0f32; NUM_HEADS * src_cap * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..prefix_len {
+                for d in 0..QK_HEAD_DIM {
+                    warm_k[h * src_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
+                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    warm_v[h * src_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
+                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+        let snapshot = pack_layer_slice(0, &warm_k, &warm_v, prefix_len, src_cap);
+
+        // Turn 2 buffer at dst_cap (= 2 × src_cap, simulating one
+        // grow_kv_capacity doubling).
+        let mut warm2_k = vec![0.0f32; NUM_HEADS * dst_cap * QK_HEAD_DIM];
+        let mut warm2_v = vec![0.0f32; NUM_HEADS * dst_cap * V_HEAD_DIM];
+        unpack_layer_slice(&mut warm2_k, &mut warm2_v, &snapshot, prefix_len, dst_cap)
+            .expect("restore");
+        for h in 0..NUM_HEADS {
+            for s in prefix_len..total {
+                for d in 0..QK_HEAD_DIM {
+                    warm2_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
+                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    warm2_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
+                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+
+        // The cold-path equivalent: a single dst_cap buffer filled
+        // 0..total. Both must match cell-by-cell across the populated
+        // prefix AND suffix slots.
+        let mut cold_k = vec![0.0f32; NUM_HEADS * dst_cap * QK_HEAD_DIM];
+        let mut cold_v = vec![0.0f32; NUM_HEADS * dst_cap * V_HEAD_DIM];
+        for h in 0..NUM_HEADS {
+            for s in 0..total {
+                for d in 0..QK_HEAD_DIM {
+                    cold_k[h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d] =
+                        (h * 1_000_000 + s * 1_000 + d) as f32;
+                }
+                for d in 0..V_HEAD_DIM {
+                    cold_v[h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d] =
+                        -((h * 1_000_000 + s * 1_000 + d) as f32);
+                }
+            }
+        }
+        for h in 0..NUM_HEADS {
+            for s in 0..total {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    assert_eq!(warm2_k[off].to_bits(), cold_k[off].to_bits());
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    assert_eq!(warm2_v[off].to_bits(), cold_v[off].to_bits());
+                }
+            }
+        }
     }
 }

@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -203,7 +203,21 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    /// Caller-supplied conversation id for multi-turn warm-restart.
+    /// When set (alongside an engine that has a session cache
+    /// enabled), the next turn of the same `session_id` skips
+    /// re-prefilling the conversation history. Optional; the API
+    /// also accepts an `X-Session-Id` header for clients that
+    /// prefer to keep request bodies OpenAI-shape-clean.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
+
+/// Header name a client can use instead of the `session_id` body
+/// field. Sent verbatim into [`GenerationTask::session_id`] when
+/// present. Header wins if both are set — the header lives at the
+/// transport layer where it's easier to log, scrub, or rate-limit.
+pub const SESSION_ID_HEADER: &str = "x-session-id";
 
 fn default_max_tokens() -> u32 {
     256
@@ -320,6 +334,27 @@ fn render_prompt_with_template(
         .map_err(|e| format!("template render: {e}"))
 }
 
+/// Resolve the effective session id for a chat request: header wins
+/// over body. An empty string from either source is treated as
+/// "no session id supplied" so a client that always sends
+/// `X-Session-Id: ` (e.g. an LB injection that didn't have one to
+/// forward) doesn't accidentally create a global session.
+fn resolve_session_id(headers: &HeaderMap, body_session_id: Option<&str>) -> Option<String> {
+    let from_header = headers
+        .get(SESSION_ID_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    if from_header.is_some() {
+        return from_header;
+    }
+    body_session_id
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+}
+
 fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
     if let Some(tmpl) = &state.chat_template {
         match render_prompt_with_template(tmpl, messages, &state.bos_token, &state.eos_token) {
@@ -334,6 +369,7 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
 
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -351,6 +387,11 @@ async fn chat_completions(
         )
             .into_response();
     }
+    // Header wins over body so an LB / proxy can stamp a stable id
+    // even when downstream clients forget to include one. Both empty
+    // means "no session caching for this request" — the engine's
+    // session cache is a no-op when session_id is None.
+    let session_id = resolve_session_id(&headers, req.session_id.as_deref());
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
@@ -359,6 +400,7 @@ async fn chat_completions(
         logprobs: 0,
         enable_thinking: false,
         trust_remote_code: false,
+        session_id,
     };
 
     // Acquire a request slot before touching the engine. Without this
@@ -643,5 +685,61 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    // ----- session_id resolution -----
+
+    fn mk_headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn resolve_session_id_prefers_header_over_body() {
+        let h = mk_headers(&[(SESSION_ID_HEADER, "header-sid")]);
+        let got = resolve_session_id(&h, Some("body-sid"));
+        // Header wins. This is the documented contract: a proxy /
+        // LB can stamp a stable id and override downstream
+        // misconfiguration.
+        assert_eq!(got.as_deref(), Some("header-sid"));
+    }
+
+    #[test]
+    fn resolve_session_id_falls_back_to_body_when_no_header() {
+        let h = mk_headers(&[]);
+        let got = resolve_session_id(&h, Some("body-sid"));
+        assert_eq!(got.as_deref(), Some("body-sid"));
+    }
+
+    #[test]
+    fn resolve_session_id_empty_header_falls_back_to_body() {
+        // "X-Session-Id: " (empty value) should NOT shadow the body.
+        // This is the common LB-misconfig case: an injection header
+        // that didn't have a value to forward shouldn't collapse
+        // every request into one global session.
+        let h = mk_headers(&[(SESSION_ID_HEADER, "")]);
+        let got = resolve_session_id(&h, Some("body-sid"));
+        assert_eq!(got.as_deref(), Some("body-sid"));
+    }
+
+    #[test]
+    fn resolve_session_id_returns_none_when_both_empty() {
+        let h = mk_headers(&[(SESSION_ID_HEADER, "  ")]);
+        assert!(resolve_session_id(&h, Some("")).is_none());
+        assert!(resolve_session_id(&h, None).is_none());
+        assert!(resolve_session_id(&HeaderMap::new(), None).is_none());
+    }
+
+    #[test]
+    fn resolve_session_id_trims_whitespace() {
+        let h = mk_headers(&[(SESSION_ID_HEADER, "  sid-with-spaces  ")]);
+        let got = resolve_session_id(&h, None);
+        assert_eq!(got.as_deref(), Some("sid-with-spaces"));
     }
 }

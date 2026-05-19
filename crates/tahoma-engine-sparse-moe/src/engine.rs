@@ -32,6 +32,7 @@ use crate::dist::{
     StageTransport,
 };
 use crate::kv_prefix_cache::{KvPrefixCache, LoadOutcome};
+use crate::kv_session_cache::KvSessionCache;
 use crate::runner::{LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
@@ -88,6 +89,16 @@ pub struct SparseMoEBuilderConfig {
     /// Only meaningful when `kv_prefix_cache_size > 0`. With size = 0
     /// the path is ignored (no in-memory cache exists to persist).
     pub kv_prefix_cache_path: Option<PathBuf>,
+    /// Max bytes held by the per-session KV cache used for multi-turn
+    /// chat warm-restart. `0` disables (default). The cache is keyed
+    /// on `GenerationTask::session_id` (typically an `X-Session-Id`
+    /// header propagated through the API layer): when present and the
+    /// new turn's prompt extends a previous turn's history, the
+    /// restored snapshot lets prefill skip the prior
+    /// `system+user+asst+...` content. See [`crate::kv_session_cache`]
+    /// for the cache semantics. Like the prefix cache, single-stage
+    /// only on this iter.
+    pub session_cache_size_mb: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -104,6 +115,7 @@ impl SparseMoEBuilderConfig {
             spec_decode_k: None,
             kv_prefix_cache_size: 0,
             kv_prefix_cache_path: None,
+            session_cache_size_mb: 0,
         }
     }
 
@@ -131,6 +143,16 @@ impl SparseMoEBuilderConfig {
     /// keep the cache in-memory only.
     pub fn with_kv_prefix_cache_path(mut self, path: Option<PathBuf>) -> Self {
         self.kv_prefix_cache_path = path;
+        self
+    }
+
+    /// Set the per-session KV cache byte budget (in MiB). `0` disables
+    /// the cache (default). Sized in MiB rather than entries because
+    /// the multi-turn working set varies per session — a long
+    /// conversation accumulates a much bigger snapshot than a short
+    /// one, so a flat entry cap silently OOMs on the tail.
+    pub fn with_session_cache_size_mb(mut self, mb: u32) -> Self {
+        self.session_cache_size_mb = mb;
         self
     }
 }
@@ -346,6 +368,7 @@ impl Builder for SparseMoEBuilder {
         // KV-prefix cache is single-stage only on this PR. Warn (don't
         // error) on multi-stage configs so the same CLI flag works in
         // both topologies — the multi-stage path silently ignores it.
+        // Same logic applies to the per-session cache (iter 072).
         let kv_cache_size = if total > 1 {
             if self.config.kv_prefix_cache_size > 0 {
                 warn!(
@@ -370,6 +393,18 @@ impl Builder for SparseMoEBuilder {
                 warn!("kv-prefix-cache-path set but kv-prefix-cache-size=0; persistence disabled");
             }
             None
+        };
+        let session_cache_bytes: usize = if total > 1 {
+            if self.config.session_cache_size_mb > 0 {
+                warn!(
+                    requested_mb = self.config.session_cache_size_mb,
+                    total,
+                    "kv-session-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
+                );
+            }
+            0
+        } else {
+            (self.config.session_cache_size_mb as usize) * 1024 * 1024
         };
         if kv_prefix_cache.enabled() {
             info!(
@@ -409,6 +444,14 @@ impl Builder for SparseMoEBuilder {
                 }
             }
         }
+        let kv_session_cache = KvSessionCache::new(session_cache_bytes);
+        if kv_session_cache.enabled() {
+            info!(
+                capacity_bytes = kv_session_cache.capacity_bytes(),
+                capacity_mb = self.config.session_cache_size_mb,
+                "kv-session-cache enabled (single-stage)"
+            );
+        }
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -424,6 +467,7 @@ impl Builder for SparseMoEBuilder {
             spec_decode_k,
             kv_prefix_cache,
             kv_prefix_cache_path: persistence_path,
+            kv_session_cache,
         }))
     }
 }
@@ -528,6 +572,14 @@ pub struct SparseMoEEngine {
     /// cache is loaded from this path during `Builder::build` and
     /// persisted on `Engine::close`.
     kv_prefix_cache_path: Option<PathBuf>,
+    /// Single-stage per-session KV cache for multi-turn chat warm-
+    /// restart. Empty + capacity=0 when the user didn't pass
+    /// `--session-cache-size-mb` (default). Keyed on
+    /// `GenerationTask::session_id`; snapshot taken AT END of every
+    /// generation (post-assistant reply) so the next turn of the same
+    /// session can skip the entire prior history. See
+    /// [`crate::kv_session_cache`] for the cache semantics.
+    kv_session_cache: KvSessionCache,
 }
 
 impl SparseMoEEngine {
@@ -705,10 +757,10 @@ impl SparseMoEEngine {
         // Choose generate path: spec-decode if configured (and the
         // sampling config is greedy — the spec-decode helper falls
         // back to plain generate on temp>0 anyway, but this keeps the
-        // log message accurate). KV-prefix cache is only consulted on
-        // the plain generate path: the spec-decode helper consumes
-        // KV-cache state internally, so wiring prefix-cache replay into
-        // it would need extra plumbing — deferred.
+        // log message accurate). KV-prefix / KV-session caches are
+        // only consulted on the plain generate path: the spec-decode
+        // helper consumes KV-cache state internally, so wiring cache
+        // replay into it would need extra plumbing — deferred.
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
         let generated = if use_spec {
             let k = self.spec_decode_k.unwrap();
@@ -730,15 +782,30 @@ impl SparseMoEEngine {
                 }
             }
         } else {
-            let cache_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
+            // Both caches are borrowed mutably from the engine so we
+            // construct the optional `&mut` borrows in a single pre-call
+            // step. We DON'T pass `Some(&mut cache)` when the cache is
+            // disabled so the runner's enabled() probes can short-circuit
+            // without touching the cache state.
+            let prefix_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
                 Some(&mut self.kv_prefix_cache)
             } else {
                 None
             };
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
+            let session_opt: Option<&mut KvSessionCache> = if self.kv_session_cache.enabled() {
+                Some(&mut self.kv_session_cache)
+            } else {
+                None
+            };
+            let session_id_ref: Option<&str> = task.session_id.as_deref();
+            match self.runner.generate_with_caches(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                prefix_opt,
+                session_opt,
+                session_id_ref,
+            ) {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "runner failed: {e}");
