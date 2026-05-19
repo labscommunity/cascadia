@@ -73,6 +73,52 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 092 — Worker heartbeat + auto-recovery — Track B skeleton + design (2026-05-19 ~03:25 PT)
+
+Branch `perf/heartbeat-recovery-092` @ `844b6c2`.
+
+**What shipped:**
+- **Wire frame:** `FrameKind::HeartbeatPing = 0x534D4540`,
+  `HeartbeatPong = 0x534D4541` (disjoint from Forward/Reset/Token +
+  dist_spec namespace)
+- 12-byte payload (4 B kind + 8 B BE u64 nonce). Nonce echoed back
+  → driver can correlate pong-to-ping + reject stale-pong-after-retry
+- Send/recv helpers symmetric both directions (downstream + upstream)
+- **HeartbeatWatchdog** state machine: `new(max_misses)`, `default()`
+  (max=1 trips on 2nd miss), `record_success()`, `record_miss() →
+  bool` (true once strict > threshold), `is_dead()`,
+  `consecutive_misses()`, `successes()`
+- Engine wiring: Ping on worker upstream → recv nonce → echo Pong
+  on same socket. Unexpected Pong on worker = error
+- `examples/dist_check.rs` updated
+- CLI: `--heartbeat-interval-ms N` on WorkerArgs (default 0 =
+  legacy/off). Sparse-MoE honors; other engines accept-and-ignore.
+
+**Tests (12 new, 40/40 sparse-moe pass):**
+- 6 unit: frame kind round-trip, code disjointness, default-is-2-
+  misses, success-resets-streak, higher tolerance, successes-saturate
+- 6 integration: body bytes pinned to 8, ping/pong round-trip
+  downstream, 5-nonce ordering, upstream direction symmetric,
+  two-misses-via-real-socket-timeout → dead, success in middle of two
+  misses → not dead
+
+**docs/architecture/heartbeat-recovery.md:** wire format diagram,
+why-nonce rationale, watchdog state machine, mutex serialization
+trade-off, **7 documented blockers:**
+1. No driver-side cadence loop yet (FOLLOW-UP step 1, ~50 LOC)
+2. No orchestrator restart path
+3. No mid-Forward heartbeat detection (mutex coupling)
+4. Nonce wraparound (u64 — unlikely concern)
+5. No multi-hop ping (worker echoes locally, doesn't forward)
+6. No auth
+7. Engine-specific CLI flag (other engines accept-and-ignore)
+
+**Composes with iter 091:** orchestrator that handles worker death
+can use iter 091's KV migration to restore state on the new worker.
+Together: full failover story for 2-box pipeline.
+
+---
+
 ## 090 — Warmup profiling for tahoma startup — full (A) impl (2026-05-19 ~03:10 PT)
 
 Branch `perf/warmup-profiling-090` @ `91999d7`.
