@@ -73,6 +73,63 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 064 — Native bf16 SDPA — NEGATIVE (decisive microbench + hardware unavailable) (2026-05-18 ~21:20 PT)
+
+Honest negative via path (B) bench-first. Branch
+`perf/bf16-native-sdpa-064` @ `1f0660b`. Did NOT ship (A).
+
+**Two-part finding (verbatim agent verdict):**
+
+1. **Inline upconvert costs ≤4% of SDPA at any size, statistically
+   zero at long contexts:**
+
+| past_seq_len | bf16 inline | inline – f32 dot only | % of SDPA |
+|-------------:|------------:|----------------------:|----------:|
+|   16         |   5.83 µs   |  0.003 µs             | **0.0%**  |
+|   64         |  22.98 µs   |  0.49 µs              | **2.1%**  |
+|  256         |  90.08 µs   |  3.49 µs              | **3.9%**  |
+| 1024         | 357 µs      | ≈ 0                   | **0.0%**  |
+| 4096         | 1422 µs     | ≈ 0                   | **0.0%**  |
+
+   Split-pass restructure is **6-13% SLOWER** at every size. The
+   compiler already auto-vectorises the inline `(u16 as u32) << 16`
+   + FMA loop optimally.
+
+2. **`VPDPBF16PS` (AVX-512 BF16) has NO target hardware:**
+   - **miner** = Cascade Lake — has avx512f/bw/cd/dq/vl/vnni but
+     NO `avx512_bf16`
+   - **matias-02/03** = Lunar Lake (Core Ultra 7 258V) — **NO
+     AVX-512 at all** (Intel dropped from consumer chips post-Tiger
+     Lake)
+
+   Bf16 hardware FMA is unreachable on every node in tahoma's
+   hardware scope.
+
+**Verdict:** kill iter 064. Iter 032 already extracts the bf16 win.
+The microbench is the keep-able artifact for future iterations
+comparing KV formats.
+
+**What shipped (defensive):**
+- `bin/bench_bf16_upconvert.rs` — 5-way decomposition microbench
+  (f32 SDPA, bf16 inline, bf16 split-pass, bf16 upcvt-only, f32
+  dot-only) at K2.6 attention shapes across past_seq_len ∈ {16, 64,
+  256, 1024, 4096}. Pinned, repeatable, auto-decomposition output.
+- `autolab/experiments/064_bf16_native_sdpa/result.md` — full
+  writeup
+- Bench output captured on both miner (Xeon) + Mac (arm64) for
+  archive
+
+**Memory saved: `tahoma-fleet-simd-capabilities`** — codifies what
+SIMD ISA is on each fleet node. Crucial for planning future
+kernel-level moonshots. Prevents future "design a VPDPBF16PS kernel
+that won't run anywhere" mistakes.
+
+**Lesson:** check ISA availability BEFORE designing kernel-level
+moonshots. Path-B-first should default for any "use SIMD intrinsic X"
+iter.
+
+---
+
 ## 061 — Lookahead decoding — IMPL SHIPPED, prompt-wins-on-ties design (2026-05-18 ~21:05 PT)
 
 Extends iter 036 spec-decode draft with PROMPT n-grams (not just KV
