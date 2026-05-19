@@ -295,6 +295,60 @@ impl Default for AsyncPrefetchBackend {
 /// dedupes; production tuning is a v2 concern.
 pub const DEFAULT_QUEUE_DEPTH: u32 = 256;
 
+/// Which prefetch path the runner should dispatch to.
+///
+/// Selected at startup (via `TAHOMA_PREFETCH_BACKEND` or a CLI flag) and
+/// frozen for the lifetime of the engine. The choice is independent of
+/// the [`AsyncPrefetchBackend`]'s own io_uring-vs-Fallback resolution —
+/// `Madvise` always calls madvise(WILLNEED), `IoUring` tries io_uring
+/// and falls through to Fallback (a no-op) if io_uring isn't available.
+///
+/// Both paths leave the inference path's dispatch logic byte-identical:
+/// they only warm the page cache. The bit-exactness test in
+/// `tahoma-engine-sparse-moe::async_prefetch::tests` proves this
+/// structurally (the prefetcher never feeds bytes back to the runner;
+/// `dispatch_expert` re-resolves through the mmap path either way).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrefetchBackendKind {
+    /// `madvise(MADV_WILLNEED)` on the six tensor byte ranges per
+    /// expert. The iter 033 baseline. Works on every Unix; a no-op on
+    /// Windows (memmap2's `advise_range` returns Ok without doing
+    /// anything there).
+    Madvise,
+    /// `IORING_OP_READ` on each tensor byte range, via the iter 097
+    /// real backend. Linux-only; on every other platform (or on Linux
+    /// without io_uring) constructing the backend silently falls
+    /// through to the `Fallback` arm which is a true no-op. Use
+    /// `Madvise` as the default on non-Linux platforms — the IoUring
+    /// Fallback doesn't even issue a hint, so prefetch is dead there.
+    IoUring,
+}
+
+impl PrefetchBackendKind {
+    /// Parse the `TAHOMA_PREFETCH_BACKEND` env var / `--prefetch-backend`
+    /// CLI flag. Recognized values: `madvise`, `io-uring` (also
+    /// `io_uring` / `iouring`). Anything else returns Err and the caller
+    /// should disable prefetch entirely.
+    pub fn from_str_ci(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "madvise" => Ok(Self::Madvise),
+            "io-uring" | "io_uring" | "iouring" => Ok(Self::IoUring),
+            other => Err(format!(
+                "unknown prefetch backend {other:?}; expected one of \
+                 madvise, io-uring"
+            )),
+        }
+    }
+
+    /// Human-readable name for log lines and `Display`-like uses.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Madvise => "madvise",
+            Self::IoUring => "io-uring",
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Linux io_uring backend (milestone 1).
 // ----------------------------------------------------------------------------

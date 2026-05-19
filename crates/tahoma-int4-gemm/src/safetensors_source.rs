@@ -32,7 +32,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use parking_lot::RwLock;
 
 use crate::async_prefetch::{AsyncIoError, AsyncPrefetchBackend, AsyncReadHandle};
@@ -133,6 +133,29 @@ impl Shard {
             let start = self.data_start + off;
             &self.mmap[start..start + len]
         })
+    }
+
+    /// Hint the OS that we'll need a tensor's byte range soon. Wraps
+    /// `madvise(MADV_WILLNEED)` on the page-aligned range covering the
+    /// tensor. Best-effort: errors swallowed because madvise is a hint
+    /// and the worst case is the read happens on demand later (which is
+    /// exactly the no-prefetch baseline).
+    ///
+    /// This is the "madvise" backend that pairs with the io_uring
+    /// `async_read` backend — both are dispatched by `AsyncPrefetcher`
+    /// based on the [`crate::async_prefetch::PrefetchBackendKind`]
+    /// selected at startup. On non-Unix platforms `advise_range` is a
+    /// no-op in memmap2 — the call still returns Ok and we still bump
+    /// the success counter, mirroring the iter 033 C1 baseline.
+    pub fn advise_willneed(&self, tensor_name: &str) -> bool {
+        let Some(&(off, len)) = self.tensors.get(tensor_name) else {
+            return false;
+        };
+        let start = self.data_start + off;
+        // memmap2's `advise_range` takes a (offset, len) within the mmap.
+        // The kernel rounds the start down and the length up to the next
+        // page boundary, so we don't need to align here.
+        self.mmap.advise_range(Advice::WillNeed, start, len).is_ok()
     }
 
     /// Queue an async read of a tensor's byte range through the given
@@ -332,6 +355,62 @@ impl SafetensorsExpertSource {
         tensor_name: &str,
     ) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
         self.slice(tensor_name)
+    }
+
+    /// Names of the six tensors that compose one expert (gate / up / down
+    /// × packed / scale). Same enumeration `expert()` uses; pulled out so
+    /// prefetch (madvise + io_uring) can iterate them without
+    /// materializing the full [`SafetensorsExpert`] holder.
+    pub fn expert_tensor_names(layer: u32, expert: u32) -> [String; 6] {
+        let base = format!(
+            "language_model.model.layers.{}.mlp.experts.{}",
+            layer, expert
+        );
+        [
+            format!("{}.gate_proj.weight_packed", base),
+            format!("{}.gate_proj.weight_scale", base),
+            format!("{}.up_proj.weight_packed", base),
+            format!("{}.up_proj.weight_scale", base),
+            format!("{}.down_proj.weight_packed", base),
+            format!("{}.down_proj.weight_scale", base),
+        ]
+    }
+
+    /// autolab iter 033 (C1) / iter 098: issue `madvise(MADV_WILLNEED)`
+    /// on every byte slice for one expert via [`Shard::advise_willneed`].
+    /// Non-blocking — the kernel queues async readahead. Returns the
+    /// number of slices for which madvise succeeded (caller can ignore;
+    /// useful for instrumentation).
+    ///
+    /// Designed to be called from a dedicated prefetch thread that's fed
+    /// by the inference path. Holds no locks across madvise calls (the
+    /// shard lookup briefly takes the inner RwLock).
+    ///
+    /// This is the "madvise" half of the iter 098
+    /// [`crate::async_prefetch::AsyncPrefetcher`] dispatch — paired with
+    /// `Shard::async_read` (io_uring) so the runner can pick either path
+    /// at startup via `TAHOMA_PREFETCH_BACKEND`.
+    pub fn prefetch_expert_madvise(&self, layer: u32, expert: u32) -> usize {
+        let mut hits = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            // Resolve the shard. If the tensor isn't in the weight map
+            // we silently skip — prefetch is best-effort.
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            // Open-or-clone the shard. We tolerate the open cost because
+            // (a) prefetch runs off the hot path and (b) once cached
+            // every subsequent prefetch on that shard is one HashMap
+            // hit + one madvise syscall.
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if shard.advise_willneed(name) {
+                hits += 1;
+            }
+        }
+        hits
     }
 }
 
