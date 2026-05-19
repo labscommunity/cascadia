@@ -29,6 +29,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use crate::manifest::{Manifest, ManifestError};
+use crate::startup_profile::PhaseTimer;
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
 #[derive(Debug, Error)]
@@ -233,7 +234,15 @@ impl Runner {
         plugin: PluginConfig,
         range: LayerRange,
     ) -> Result<Self, RunnerError> {
-        let manifest = Manifest::load(&model_dir)?;
+        let manifest = {
+            let _t = PhaseTimer::start("runner.manifest_load");
+            let m = Manifest::load(&model_dir)?;
+            info!(
+                elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                "manifest_load complete"
+            );
+            m
+        };
         info!(
             arch = %manifest.arch,
             num_layers = manifest.num_layers,
@@ -257,12 +266,16 @@ impl Runner {
         let mut layer0_holder: Option<Layer0State> = None;
 
         let head = if range.is_last {
+            let _t = PhaseTimer::start("runner.head_compile");
             let head_xml = manifest.head_xml(&model_dir);
             if !head_xml.exists() {
                 return Err(RunnerError::MissingFile(head_xml));
             }
             let rt = Runtime::compile(&utf8(&head_xml)?, device, &plugin)?;
-            info!("compiled head (RMSNorm + lm_head)");
+            info!(
+                elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                "compiled head (RMSNorm + lm_head)"
+            );
             Some(rt)
         } else {
             info!("skipping head (not last stage)");
@@ -279,23 +292,55 @@ impl Runner {
         } else {
             model_dir.clone()
         };
-        let safetensors_source = Arc::new(
-            SafetensorsExpertSource::open(st_dir)
-                .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
-        );
+        let safetensors_source = {
+            let _t = PhaseTimer::start("runner.safetensors_source_open");
+            let s = Arc::new(
+                SafetensorsExpertSource::open(st_dir)
+                    .map_err(|e| RunnerError::Internal(format!("safetensors open: {e}")))?,
+            );
+            info!(
+                elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                "safetensors_source_open complete (index.json parse)"
+            );
+            s
+        };
 
         if range.is_first {
             // Construct dense layer 0 from safetensors. The old OV IR
             // path was stateless — each decode step ran the full prefix
             // through attention, making prefill O(N²). The Rust path
             // owns a pre-allocated KV cache that mirrors the shells.
-            let st_layer0 = safetensors_source
-                .layer0()
-                .map_err(|e| RunnerError::Internal(format!("safetensors layer0: {e}")))?;
-            let int4_layer0 = Int4Layer0::from_safetensors(&st_layer0);
-            let (embed_pin, embed_bytes) = safetensors_source
-                .embed_tokens()
-                .map_err(|e| RunnerError::Internal(format!("safetensors embed_tokens: {e}")))?;
+            let st_layer0 = {
+                let _t = PhaseTimer::start("runner.layer0_safetensors_fetch");
+                let s = safetensors_source
+                    .layer0()
+                    .map_err(|e| RunnerError::Internal(format!("safetensors layer0: {e}")))?;
+                info!(
+                    elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                    "layer0 safetensors slices fetched"
+                );
+                s
+            };
+            let int4_layer0 = {
+                let _t = PhaseTimer::start("runner.layer0_int4_quantize");
+                let l = Int4Layer0::from_safetensors(&st_layer0);
+                info!(
+                    elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                    "layer0 int4 quantize complete"
+                );
+                l
+            };
+            let (embed_pin, embed_bytes) = {
+                let _t = PhaseTimer::start("runner.embed_tokens_mmap");
+                let r = safetensors_source
+                    .embed_tokens()
+                    .map_err(|e| RunnerError::Internal(format!("safetensors embed_tokens: {e}")))?;
+                info!(
+                    elapsed_ms = _t.elapsed().as_secs_f64() * 1000.0,
+                    "embed_tokens mmap pinned"
+                );
+                r
+            };
             let cap = INITIAL_KV_CAPACITY;
             layer0_holder = Some(Layer0State {
                 int4_layer0,
@@ -324,11 +369,29 @@ impl Runner {
         );
         let mut layers = Vec::with_capacity(in_range.len());
         let shell_load_t0 = Instant::now();
+        // Aggregate the whole shells-load loop under one phase so the
+        // startup-profile table has a single row for "all of this rank's
+        // shells". The per-shell sub-totals are captured separately:
+        // `shell_fetch_us` accumulates safetensors slice lookups,
+        // `shell_quantize_us` accumulates Int4Shell::from_safetensors
+        // (which is dominated by int4 quantization of the eight large
+        // bf16 matrices). These two numbers are emitted at the end of
+        // the loop so the operator can tell whether shell time goes to
+        // mmap/JSON or to the in-process quantizer.
+        let shells_phase = PhaseTimer::start("runner.shells_load");
+        let mut shell_fetch_us: u128 = 0;
+        let mut shell_quantize_us: u128 = 0;
         for (i, &lid) in in_range.iter().enumerate() {
+            let t_fetch = Instant::now();
             let st_shell = safetensors_source
                 .shell(lid)
                 .map_err(|e| RunnerError::Internal(format!("safetensors shell L{lid}: {e}")))?;
+            shell_fetch_us += t_fetch.elapsed().as_micros();
+
+            let t_quant = Instant::now();
             let int4_shell = Int4Shell::from_safetensors(&st_shell);
+            shell_quantize_us += t_quant.elapsed().as_micros();
+
             layers.push(LayerState::new(lid, int4_shell));
             if (i + 1) % 10 == 0 || i + 1 == in_range.len() {
                 info!(
@@ -339,8 +402,17 @@ impl Runner {
                 );
             }
         }
+        info!(
+            elapsed_ms = shells_phase.elapsed().as_secs_f64() * 1000.0,
+            n_shells = in_range.len(),
+            safetensors_fetch_ms = (shell_fetch_us as f64) / 1000.0,
+            int4_quantize_ms = (shell_quantize_us as f64) / 1000.0,
+            "shells_load complete"
+        );
+        drop(shells_phase);
 
         let manifest_clone = manifest.clone();
+        let _experts_phase = PhaseTimer::start("runner.experts_cache_init");
         let experts = match manifest.experts_format.as_str() {
             "int4_bin" => {
                 info!("expert backend: int4_bin (mmap + AVX-512 kernel)");

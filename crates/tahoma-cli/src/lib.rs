@@ -131,6 +131,18 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Emit a per-phase startup timing table to stderr after the
+    /// engine finishes loading (manifest parse, safetensors source
+    /// open, head IR compile, layer-0 quantize, shells load, expert
+    /// cache init, tokenizer load, etc.). Only the sparse-moe engine
+    /// records phases today; for other engines the table will be
+    /// empty.
+    ///
+    /// The point is to break down the K2.6 ~5-min cold-load so we
+    /// know where to spend optimization effort.
+    #[arg(long, default_value_t = false)]
+    pub profile_startup: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -443,6 +455,35 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         None
     };
     runner.start_with_listen(peers, shard, listen).await?;
+
+    // After start_with_listen returns the engine has finished loading
+    // (manifest parsed, safetensors mmapped, all this rank's shells
+    // int4-quantized, head IR compiled if last rank, tokenizer loaded
+    // if rank 0). The sparse-moe engine records each of those phases
+    // into a process-global recorder; drain it and print a table to
+    // stderr when the operator asked for one with --profile-startup.
+    //
+    // Drain unconditionally so we don't leak phases into a later
+    // re-load. Other engines won't have recorded anything; print
+    // logic handles the empty case explicitly.
+    let phases = tahoma_engine_sparse_moe::drain_report();
+    if args.profile_startup {
+        let table = tahoma_engine_sparse_moe::format_report(&phases);
+        eprintln!("\nstartup phase timings:\n{table}");
+    } else if !phases.is_empty() {
+        // Even without the flag, log a brief one-line summary so
+        // operators who forgot the flag still see *something* in the
+        // log. Cheap; the per-phase rows stay behind the flag.
+        let total_ms: f64 = phases
+            .iter()
+            .map(|p| p.elapsed.as_secs_f64() * 1000.0)
+            .sum();
+        info!(
+            n_phases = phases.len(),
+            sum_ms = total_ms,
+            "engine loaded; pass --profile-startup for the phase-by-phase table"
+        );
+    }
 
     if !is_first {
         info!("entering relay loop");

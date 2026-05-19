@@ -31,6 +31,7 @@ use crate::dist::{
     StageTransport,
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
+use crate::startup_profile::PhaseTimer;
 
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
@@ -204,10 +205,20 @@ impl Builder for SparseMoEBuilder {
             is_last,
         };
 
+        // Top-level phase: this covers everything Builder::load does
+        // (the worker-thread spawn + join, plus the tokenizer parse).
+        // The runner phases recorded from inside Runner::load show up
+        // as separate records in the final report, ordered by
+        // completion — `runner.manifest_load` first, ending with
+        // `runner.experts_cache_init` just before the join returns
+        // and we move on to tokenizer_load.
+        let _load_total = PhaseTimer::start("builder.load_total");
+
         let cfg = self.config.clone();
         let plugin_for_worker = plugin.clone();
         let range_for_worker = range.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        let runner_phase = PhaseTimer::start("builder.runner_load");
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
             tx.send(LoadProgress::message("loading sparse-MoE model"))
                 .ok();
@@ -228,13 +239,20 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+        drop(runner_phase);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
+            let _tok_phase = PhaseTimer::start("builder.tokenizer_load");
             let tok_path = self.config.model_dir.join("tokenizer.json");
             if tok_path.exists() {
                 let t = Tokenizer::from_file(&tok_path)
                     .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?;
+                info!(
+                    elapsed_ms = _tok_phase.elapsed().as_secs_f64() * 1000.0,
+                    path = %tok_path.display(),
+                    "tokenizer.json loaded"
+                );
                 self.tokenizer = Some(t);
             } else {
                 warn!(
@@ -246,6 +264,7 @@ impl Builder for SparseMoEBuilder {
 
         self.runner = Some(runner);
 
+        drop(_load_total);
         let drained: Vec<LoadProgress> = rx.try_iter().collect();
         Ok(Box::pin(stream::iter(drained)))
     }
