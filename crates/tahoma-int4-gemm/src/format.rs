@@ -134,3 +134,19 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     // left by 16 lines it up.
     f32::from_bits((bits as u32) << 16)
 }
+
+/// Helper: convert an f32 to bf16 raw u16 bits, round-to-nearest-even
+/// (matching the rounding `half::bf16::from_f32` would do). Inlined here
+/// so hot per-token KV write loops don't depend on the `half` crate at
+/// every callsite. NaNs are preserved (mantissa bit forced nonzero).
+#[inline]
+pub fn f32_to_bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
+        // NaN — keep mantissa nonzero so the round-trip stays a NaN
+        // rather than collapsing to ±inf when we shift back.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
