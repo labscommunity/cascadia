@@ -73,6 +73,49 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 089 — SSE streaming aggregator — NEGATIVE (overhead is invisible) (2026-05-19 ~02:45 PT)
+
+Path C investigation; decisive skip. Branch `perf/sse-aggregator-089`
+@ `33406f1`.
+
+**Measured (M2 Pro, 3 back-to-back runs, 200k iterations):**
+- **~880 ns/frame** (range 810-900)
+- ~254 B/frame
+
+**Overhead vs decode:**
+| Rate | decode_time | overhead |
+|------|------------:|---------:|
+| K2.6 @ 0.11 tok/s | 9.0 s/tok | **0.0000098%** |
+| Post-SIMD @ ~100ms/tok | 100 ms/tok | 0.00088% |
+| Theoretical max OV-genai @ 10ms/tok | 10 ms/tok | 0.0088% |
+
+Way under 0.1% threshold even at hypothetical 10ms/tok future.
+**Aggregation only matters below ~100µs/tok (10,000 tok/s), which
+Intel AI PCs won't hit.**
+
+**What shipped (defensive infra):**
+- Refactored frame encode into `encode_chunk_frame()` function
+  (byte-identical SSE)
+- `bench_sse_frame_encode` `#[ignore]`'d microbench (200k iters,
+  warm-up, release build)
+- **Soft regression guard:** `assert!(ns_per_frame < 1_000_000.0)`
+  flags blow-ups in future runs
+
+**On the wire:** unchanged. Refactor produces byte-identical SSE
+frames; only call site moved into named function so it could be
+measured in isolation.
+
+**Pattern (8th negative this session):** 049, 053, 062, 064, 067,
+082, 085, 089. ~17% null rate. Investigation-first pattern
+continues to save implementation cost.
+
+**Revisit:** if decode_time drops to ~100µs/tok (post-SIMD + spec-
+decode + everything wins), re-run `cargo test -p tahoma-api
+--release -- --ignored --nocapture bench_sse_frame_encode`. Decision
+likely "skip" until <100µs/tok.
+
+---
+
 ## 087 — Attention-score predictive prefetch — Track C+B (cost OK, accuracy unresolved) (2026-05-19 ~02:30 PT)
 
 Branch `perf/attn-predict-prefetch-087` @ `49565b4`. 788 LOC across
