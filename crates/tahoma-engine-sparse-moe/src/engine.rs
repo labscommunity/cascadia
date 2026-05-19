@@ -290,6 +290,51 @@ fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig 
     }
 }
 
+/// Translate the public adaptive-stop fields on `GenerationTask` into
+/// the engine-internal [`StopConditions`]. Lifted out so both the
+/// single-stage path and the rank-0 driver compute the same conditions
+/// from the same task.
+fn stop_conditions_from_task(task: &GenerationTask) -> crate::sampling::StopConditions {
+    crate::sampling::StopConditions {
+        stop: task.stop.clone().unwrap_or_default(),
+        stop_on_repetition: task.stop_on_repetition,
+    }
+}
+
+/// Distributed-mode counterpart to the closure-flavored
+/// `check_adaptive_stop` inside the runner. Borrows the tokenizer
+/// directly (rank 0 owns it) instead of via a closure to keep the
+/// driver loop's borrow checker happy.
+///
+/// Returns true if any configured condition matched; the caller breaks
+/// the decode loop. When `tokenizer` is None, stop-sequence checks are
+/// skipped (the driver still does the repetition check on raw tokens).
+fn check_adaptive_stop_dist(
+    generated: &[i64],
+    stop: &crate::sampling::StopConditions,
+    tokenizer: Option<&Tokenizer>,
+    _task: &GenerationTask,
+) -> bool {
+    if !stop.stop.is_empty() {
+        if let Some(tok) = tokenizer {
+            // Same 64-token tail budget the single-stage path uses;
+            // see comment there for the rationale.
+            const DECODE_TAIL_BUDGET: usize = 64;
+            let n = generated.len().min(DECODE_TAIL_BUDGET);
+            let start = generated.len() - n;
+            let ids_u32: Vec<u32> = generated[start..].iter().map(|&i| i as u32).collect();
+            let tail = tok.decode(&ids_u32, true).unwrap_or_default();
+            if crate::sampling::text_ends_with_any(&tail, &stop.stop) {
+                return true;
+            }
+        }
+    }
+    if stop.stop_on_repetition && crate::sampling::is_repetition_loop(generated) {
+        return true;
+    }
+    false
+}
+
 fn read_manifest_moe_count(model_dir: &std::path::Path) -> EngineResult<u32> {
     let m = crate::manifest::Manifest::load(model_dir)
         .map_err(|e| EngineError::Backend(format!("read manifest: {e}")))?;
@@ -475,12 +520,49 @@ impl SparseMoEEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(task = %task.task_id, "runner failed: {e}");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                return vec![(task.task_id, final_chunk)];
+        let stop_cond = stop_conditions_from_task(&task);
+        // Cap the per-step decode cost: detokenize only the tail of the
+        // running stream, not every emitted token. The longest stop
+        // sequence sets the lower bound; 64 tokens is a comfortable
+        // upper bound for any plausible stop string (the K2.6 BPE rarely
+        // splits a short marker like "Human:" or "\n\n" into more than
+        // a couple of pieces).
+        const DECODE_TAIL_BUDGET: usize = 64;
+        let generated = if stop_cond.any() {
+            let tokenizer_for_tail = tokenizer.clone();
+            let decode_tail = move |gen: &[i64]| -> String {
+                let n = gen.len().min(DECODE_TAIL_BUDGET);
+                let start = gen.len() - n;
+                let ids_u32: Vec<u32> = gen[start..].iter().map(|&i| i as u32).collect();
+                tokenizer_for_tail
+                    .decode(&ids_u32, true)
+                    .unwrap_or_default()
+            };
+            match self.runner.generate_with_stop(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                &stop_cond,
+                Some(decode_tail),
+            ) {
+                Ok((g, reason)) => {
+                    info!(task = %task.task_id, ?reason, "adaptive stop");
+                    g
+                }
+                Err(e) => {
+                    warn!(task = %task.task_id, "runner failed: {e}");
+                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    return vec![(task.task_id, final_chunk)];
+                }
+            }
+        } else {
+            match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(task = %task.task_id, "runner failed: {e}");
+                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    return vec![(task.task_id, final_chunk)];
+                }
             }
         };
         let n_tokens = generated.len() as u32;
@@ -490,6 +572,18 @@ impl SparseMoEEngine {
             .unwrap_or_else(|_| String::new());
         if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
+        }
+        // If the user supplied a stop sequence and the tail of `text`
+        // ends with it, strip the marker so the visible completion
+        // matches OpenAI-style behavior (the stop string is consumed,
+        // not echoed). This is the same convention vLLM uses.
+        if let Some(stops) = task.stop.as_ref() {
+            for s in stops {
+                if !s.is_empty() && text.ends_with(s.as_str()) {
+                    text.truncate(text.len() - s.len());
+                    break;
+                }
+            }
         }
         let elapsed = started.elapsed().as_secs_f64();
         info!(
@@ -528,6 +622,7 @@ impl SparseMoEEngine {
 
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
+        let stop_cond = stop_conditions_from_task(&task);
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
             None => {
@@ -545,14 +640,20 @@ impl SparseMoEEngine {
 
         // Drive the full generation. result_tokens collects new tokens
         // generated AFTER the prompt (we discard the prefill responses).
-        let result_tokens =
-            match self.drive_generation_first(&prompt_ids, max_new, &sampling_cfg, &downstream) {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(task = %task.task_id, "rank-0 driver failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
-                }
-            };
+        let result_tokens = match self.drive_generation_first(
+            &prompt_ids,
+            max_new,
+            &sampling_cfg,
+            &stop_cond,
+            &task,
+            &downstream,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, "rank-0 driver failed: {e}");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+        };
 
         let n_tokens = result_tokens.len() as u32;
         let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
@@ -565,6 +666,17 @@ impl SparseMoEEngine {
             .unwrap_or_else(|_| String::new());
         if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
+        }
+        // Same stop-sequence trim as the single-stage path so multi-
+        // stage output matches the OpenAI convention (stop string is
+        // consumed, not echoed).
+        if let Some(stops) = task.stop.as_ref() {
+            for s in stops {
+                if !s.is_empty() && text.ends_with(s.as_str()) {
+                    text.truncate(text.len() - s.len());
+                    break;
+                }
+            }
         }
         let elapsed = started.elapsed().as_secs_f64();
         info!(
@@ -585,11 +697,17 @@ impl SparseMoEEngine {
     /// step: embed → forward through my shells → send hidden
     /// downstream → recv sampled token back. Discards prefill samples
     /// except the last (which becomes the first generated token).
+    ///
+    /// `stop` and `task` carry the adaptive-stop signals (user stop
+    /// strings, repetition flag). When neither is active the loop is
+    /// byte-for-byte identical to the pre-PR path: EOS or `max_new`.
     fn drive_generation_first(
         &mut self,
         prompt_ids: &[i64],
         max_new: usize,
         cfg: &crate::sampling::SamplingConfig,
+        stop: &crate::sampling::StopConditions,
+        task: &GenerationTask,
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<Vec<i64>, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
@@ -602,6 +720,17 @@ impl SparseMoEEngine {
             .collect();
         let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_new);
         let mut generated: Vec<i64> = Vec::with_capacity(max_new);
+        let stop_active = stop.any();
+        // Tokenizer is only present on rank 0; we keep a clone for the
+        // detokenizer-tail closure so the borrow checker is happy while
+        // we still mutate `self` for the forward call. The clone is
+        // cheap (tokenizers's `Clone` is Arc-backed for the model
+        // table).
+        let tokenizer_for_tail = if stop_active && !stop.stop.is_empty() {
+            self.tokenizer.clone()
+        } else {
+            None
+        };
 
         // Prefill: feed each prompt token; the very last response from
         // last-rank becomes the first generated token.
@@ -621,6 +750,11 @@ impl SparseMoEEngine {
                 }
                 generated.push(token_back);
                 history.push(token_back);
+                if stop_active
+                    && check_adaptive_stop_dist(&generated, stop, tokenizer_for_tail.as_ref(), task)
+                {
+                    return Ok(generated);
+                }
             }
             // Otherwise discard (intermediate prefill samples are stale).
             let _ = token_back;
@@ -636,6 +770,11 @@ impl SparseMoEEngine {
             }
             generated.push(token_back);
             history.push(token_back);
+            if stop_active
+                && check_adaptive_stop_dist(&generated, stop, tokenizer_for_tail.as_ref(), task)
+            {
+                break;
+            }
         }
         let _ = hidden;
         Ok(generated)
@@ -869,5 +1008,50 @@ mod tests {
     fn single_stage_yields_full_range() {
         let (s, e) = even_moe_split(60, 0, 1);
         assert_eq!((s, e), (0, u32::MAX));
+    }
+
+    #[test]
+    fn stop_conditions_from_task_propagates_fields() {
+        // A blank task → no conditions.
+        let t = GenerationTask::new("t", "hi");
+        let sc = stop_conditions_from_task(&t);
+        assert!(sc.stop.is_empty());
+        assert!(!sc.stop_on_repetition);
+        assert!(!sc.any());
+
+        // Populated: both stop list and repetition flag carry over.
+        let t = GenerationTask::new("t", "hi")
+            .with_stop(vec!["\n\n".into(), "Human:".into()])
+            .with_stop_on_repetition(true);
+        let sc = stop_conditions_from_task(&t);
+        assert_eq!(sc.stop, vec!["\n\n".to_string(), "Human:".to_string()]);
+        assert!(sc.stop_on_repetition);
+        assert!(sc.any());
+    }
+
+    #[test]
+    fn check_adaptive_stop_dist_no_tokenizer_skips_stop_seq_but_keeps_repetition() {
+        // Stop sequence is set, but no tokenizer available → that branch
+        // does nothing. Repetition flag still fires on a token-level loop.
+        let task = GenerationTask::new("t", "");
+        let stop = crate::sampling::StopConditions {
+            stop: vec!["\n\n".into()],
+            stop_on_repetition: true,
+        };
+        // 1 2 (very × 12) — well above the repetition floor.
+        let very = 7i64;
+        let mut gen: Vec<i64> = vec![1, 2];
+        for _ in 0..12 {
+            gen.push(very);
+        }
+        // No tokenizer → stop-seq skipped, but repetition trips.
+        assert!(check_adaptive_stop_dist(&gen, &stop, None, &task));
+
+        // Same generation, repetition disabled, no tokenizer → no stop.
+        let stop2 = crate::sampling::StopConditions {
+            stop: vec!["\n\n".into()],
+            stop_on_repetition: false,
+        };
+        assert!(!check_adaptive_stop_dist(&gen, &stop2, None, &task));
     }
 }

@@ -726,6 +726,42 @@ impl Runner {
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
     ) -> Result<Vec<i64>, RunnerError> {
+        // Pass an explicit-type `None` for the unused decode-tail
+        // closure — the compiler can't infer F from None alone.
+        let no_decode: Option<fn(&[i64]) -> String> = None;
+        let (out, _reason) = self.generate_with_stop(
+            prompt_ids,
+            max_tokens,
+            cfg,
+            &crate::sampling::StopConditions::default(),
+            no_decode,
+        )?;
+        Ok(out)
+    }
+
+    /// Generate tokens with optional adaptive early-stop conditions.
+    ///
+    /// `stop`: extra termination signals to evaluate after every emitted
+    /// token. EOS is always checked first; stop sequences require a
+    /// `decode_tail` closure that can turn the last N tokens into text
+    /// (it'll be passed the entire `generated` vector, but most
+    /// implementations only care about the tail). Repetition detection
+    /// is purely token-level and runs without the closure.
+    ///
+    /// Returns `(generated_tokens, stop_reason)`. Default-empty
+    /// `StopConditions` reproduces the legacy behavior exactly: EOS or
+    /// `max_tokens`.
+    pub fn generate_with_stop<F>(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        stop: &crate::sampling::StopConditions,
+        mut decode_tail: Option<F>,
+    ) -> Result<(Vec<i64>, crate::sampling::StopReason), RunnerError>
+    where
+        F: FnMut(&[i64]) -> String,
+    {
         self.reset_kv();
         let eos: Vec<i64> = self
             .manifest
@@ -735,6 +771,7 @@ impl Runner {
             .collect();
         let mut rng = crate::sampling::init_rng(cfg.seed);
         let mut generated = Vec::with_capacity(max_tokens);
+        let stop_active = stop.any();
 
         // Prefill token-by-token to keep shell input shapes uniform (avoids
         // the OV 2026.1.0 CPU snippets shape-specialization bug we hit on
@@ -767,23 +804,38 @@ impl Runner {
         if let Some(l) = last_logits {
             let next = crate::sampling::sample(&l, &history, cfg, &mut rng);
             if eos.contains(&next) {
-                return Ok(generated);
+                return Ok((generated, crate::sampling::StopReason::Eos));
             }
             history.push(next);
             generated.push(next);
+            if stop_active {
+                if let Some(reason) = check_adaptive_stop(&generated, stop, decode_tail.as_mut()) {
+                    debug!(token = next, ?reason, "adaptive stop after first decode");
+                    return Ok((generated, reason));
+                }
+            }
         }
 
         // Decode.
+        let mut reason = crate::sampling::StopReason::MaxTokens;
         for step_i in 1..max_tokens {
             let t_step = Instant::now();
             let logits = self.step(&history, 1)?;
             let next = crate::sampling::sample(&logits, &history, cfg, &mut rng);
             if eos.contains(&next) {
                 debug!(step = step_i, token = next, "EOS — stopping");
+                reason = crate::sampling::StopReason::Eos;
                 break;
             }
             history.push(next);
             generated.push(next);
+            if stop_active {
+                if let Some(r) = check_adaptive_stop(&generated, stop, decode_tail.as_mut()) {
+                    debug!(step = step_i, token = next, ?r, "adaptive stop");
+                    reason = r;
+                    break;
+                }
+            }
             debug!(
                 step = step_i,
                 token = next,
@@ -796,7 +848,7 @@ impl Runner {
                 "decode step"
             );
         }
-        Ok(generated)
+        Ok((generated, reason))
     }
 
     /// Back-compat: equivalent to `generate(..., &SamplingConfig::default())`.
@@ -811,6 +863,33 @@ impl Runner {
             &crate::sampling::SamplingConfig::default(),
         )
     }
+}
+
+/// Evaluate every configured stop condition against the current
+/// generated-token stream. Returns the matched [`StopReason`] or
+/// `None` to keep decoding. Stop-sequence checks invoke the
+/// caller-provided `decode` closure only when sequences are
+/// configured, so a repetition-only run pays no detokenization cost.
+fn check_adaptive_stop<F>(
+    generated: &[i64],
+    stop: &crate::sampling::StopConditions,
+    mut decode: Option<&mut F>,
+) -> Option<crate::sampling::StopReason>
+where
+    F: FnMut(&[i64]) -> String,
+{
+    if !stop.stop.is_empty() {
+        if let Some(d) = decode.as_mut() {
+            let tail = d(generated);
+            if crate::sampling::text_ends_with_any(&tail, &stop.stop) {
+                return Some(crate::sampling::StopReason::StopSequence);
+            }
+        }
+    }
+    if stop.stop_on_repetition && crate::sampling::is_repetition_loop(generated) {
+        return Some(crate::sampling::StopReason::Repetition);
+    }
+    None
 }
 
 fn read_f32(bytes: &[u8]) -> Vec<f32> {
