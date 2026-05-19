@@ -28,21 +28,39 @@ const GROUP_SIZE: usize = 32;
 /// **Why a per-shape table.** Iter 042's tile (`kernel_avx512_multi`)
 /// wins over scalar on every K2.6 projection at seq>=2 (1.4-4.75x in
 /// iter 042 microbench). Iter 046's row-blocked tile
-/// (`kernel_avx512_multi_blocked`) wins +40% *over iter 042* but only
-/// on the largest shapes — oproj (N=7168, K=8192, 28 MB) and
-/// shared_down (N=7168, K=2048, 7 MB). For the smaller shapes (qproj
-/// 5 MB, kvproj 2 MB, router 1.4 MB) the iter 046 commit message
-/// flagged "more variable seq=4 behavior" — the RB=2 register
-/// pressure costs more than it gains on shapes where xs already fits
-/// in L1.
+/// (`kernel_avx512_multi_blocked`) wins +28-41% *over iter 042* on
+/// the medium and large shapes, but the seq threshold where it
+/// wins differs by shape size:
 ///
-/// **Dispatch rules** (matches task spec for iter 048):
-/// - `Oproj` (N=7168, K=8192): iter 046 at seq>=4, iter 042 otherwise
-/// - `SharedDown` (N=7168, K=2048): iter 046 at seq>=4, iter 042 otherwise
-/// - `Generic` (all other shapes): iter 042 (auto-falls-through to
-///   scalar at seq=1)
+/// - 28 MB (oproj) / 7 MB+ aspect-ratio match (shared_down): blocked
+///   wins consistently from seq>=4 onward.
+/// - 7 MB wide-K shapes (shared_gate, shared_up): blocked wins at
+///   seq>=8 (+28% at seq=16). At seq=4 the smaller shapes don't pay
+///   off the RB=2 register pressure, so iter 042 holds.
+/// - 2-5 MB (kvproj, qproj): iter 046 microbench showed wins at
+///   seq>=8 (+62% / +118%) but flagged "variable seq=4 behavior" for
+///   these shapes. **iter 075 keeps them on Generic (iter 042)** —
+///   the win at seq>=8 is real but the engine-level decision needs a
+///   dedicated bench against the actual call distribution (most
+///   forward paths today are seq=1; spec-decode verify is the only
+///   hot seq>=8 caller in flight). A follow-up iter can lift them
+///   once the bench data lands.
 ///
-/// All three kernels are bit-identical per-cell (proved by the
+/// **iter 075 dispatch rules:**
+///
+/// | Shape         | N     | K    | int4 MB | Kernel
+/// |---------------|-------|------|---------|---------
+/// | q_a_proj      |  1536 | 7168 |    5.5  | `Generic` (iter 042)
+/// | q_b_proj      | 12288 | 1536 |    9.4  | `Generic` (iter 042)
+/// | kv_a_proj     |   576 | 7168 |    2.1  | `Generic` (iter 042)
+/// | kv_b_proj     | 16384 |  512 |    4.2  | `Generic` (iter 042)
+/// | router        |   384 | 7168 |    1.4  | `Generic` (iter 042)
+/// | shared_gate   |  2048 | 7168 |    7.3  | **`LargeShape`** (iter 042 < seq=8, iter 046 >= 8)
+/// | shared_up     |  2048 | 7168 |    7.3  | **`LargeShape`** (iter 042 < seq=8, iter 046 >= 8)
+/// | shared_down   |  7168 | 2048 |    7.3  | `SharedDown` (iter 046 >= seq=4 via blocked_auto)
+/// | o_proj        |  7168 | 8192 |   28.0  | `Oproj` (iter 046 >= seq=4 via blocked_auto)
+///
+/// All four kernel paths are bit-identical per-cell (proved by the
 /// `blocked_matches_iter042_multi_seq_8` test in
 /// `kernel_avx512_multi_blocked`), so the dispatch decision is purely
 /// performance — correctness is invariant.
@@ -50,9 +68,18 @@ const GROUP_SIZE: usize = 32;
 enum ProjShape {
     /// Largest shape: N=7168, K=8192. Iter 046 wins +41% at seq>=4.
     Oproj,
-    /// Second-largest where iter 046 also wins (N=7168, K=2048).
+    /// 7 MB with the same N=7168 aspect: N=7168, K=2048. Iter 046
+    /// wins from seq>=4 onward.
     SharedDown,
-    /// All other projections — iter 042 is consistently best or tied.
+    /// **iter 075:** 7 MB wide-K shapes (shared_gate, shared_up:
+    /// N=2048, K=7168). Iter 046 wins at seq>=8 (+28%); seq=4-7 stays
+    /// on iter 042 because the smaller N=2048 doesn't pay off the
+    /// blocked tile's RB=2 register pressure until xs reuse
+    /// dominates.
+    LargeShape,
+    /// All other projections — iter 042 is consistently best or tied,
+    /// or the iter 046 win is gated by "variable seq=4 behavior" that
+    /// hasn't been re-benched at the engine level.
     Generic,
 }
 
@@ -64,6 +91,10 @@ enum ProjShape {
 /// supports it; for `Oproj` / `SharedDown` at seq>=4 we upgrade to the
 /// row-blocked iter 046 tile via `dequant_gemm_int4_multi_blocked_auto`
 /// (its dispatcher will fall back to iter 042 at seq=2-3 internally).
+/// For `LargeShape` (iter 075) the upgrade threshold is seq>=8 —
+/// hand-rolled here rather than reusing `blocked_auto`'s seq>=4
+/// threshold because the iter 046 microbench showed shared_gate /
+/// shared_up only consistently win at seq>=8.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_int4_multi(
@@ -81,6 +112,21 @@ fn dispatch_int4_multi(
             // iter 046 dispatcher: routes to blocked variant at seq>=4,
             // iter 042 at seq=2-3, scalar at seq=1.
             dequant_gemm_int4_multi_blocked_auto(packed, scale_bits, xs, n_rows, k_cols, seq, ys);
+        }
+        ProjShape::LargeShape => {
+            // iter 075: shared_gate / shared_up bucket. The iter 046
+            // microbench (commit 77bc56f) showed these only
+            // consistently win at seq>=8 — at seq=4 the smaller N=2048
+            // doesn't pay off the blocked tile's RB=2 register
+            // pressure. Keep iter 042 for seq<8 to avoid regressing
+            // the chunked-prefill seq=4 case.
+            if seq >= 8 {
+                dequant_gemm_int4_multi_blocked_auto(
+                    packed, scale_bits, xs, n_rows, k_cols, seq, ys,
+                );
+            } else {
+                dequant_gemm_int4_multi_auto(packed, scale_bits, xs, n_rows, k_cols, seq, ys);
+            }
         }
         ProjShape::Generic => {
             // iter 042 dispatcher: routes to multi tile at seq>=2,
@@ -1027,10 +1073,18 @@ fn shell_forward_decode_int4_multi_batched(
     }
 
     // Batched shared_gate + shared_up.
+    //
+    // **iter 075 dispatch.** Both shared_gate and shared_up are N=2048,
+    // K=7168 → 7 MB packed int4. The iter 046 microbench (commit
+    // 77bc56f) showed +28% over iter 042 at seq=16 on this shape, but
+    // the win only materializes at seq>=8 — at seq=4 the smaller N
+    // doesn't pay off the RB=2 register pressure. `ProjShape::LargeShape`
+    // routes through iter 046 blocked at seq>=8 and stays on iter 042
+    // for seq<8.
     let mut shared_gate_out = vec![0.0f32; seq * INTERMEDIATE_SHARED];
     let mut shared_up_out = vec![0.0f32; seq * INTERMEDIATE_SHARED];
     dispatch_int4_multi(
-        ProjShape::Generic,
+        ProjShape::LargeShape,
         &shell.shared_gate_packed,
         &shell.shared_gate_scale,
         &posts,
@@ -1040,7 +1094,7 @@ fn shell_forward_decode_int4_multi_batched(
         &mut shared_gate_out,
     );
     dispatch_int4_multi(
-        ProjShape::Generic,
+        ProjShape::LargeShape,
         &shell.shared_up_packed,
         &shell.shared_up_scale,
         &posts,
@@ -1272,7 +1326,12 @@ mod tests {
         let mut y_single = vec![0.0f32; n_rows];
         dequant_gemv_int4_auto(&packed, &scales, &xs, n_rows, k_cols, &mut y_single);
 
-        for shape in [ProjShape::Generic, ProjShape::Oproj, ProjShape::SharedDown] {
+        for shape in [
+            ProjShape::Generic,
+            ProjShape::Oproj,
+            ProjShape::SharedDown,
+            ProjShape::LargeShape,
+        ] {
             let mut y_disp = vec![0.0f32; n_rows];
             dispatch_int4_multi(
                 shape,
@@ -1443,5 +1502,136 @@ mod tests {
         // KV cache (bf16-as-u16) bit-identical.
         assert_eq!(batched_past_k, scalar_past_k, "past_k");
         assert_eq!(batched_past_v, scalar_past_v, "past_v");
+    }
+
+    /// iter 075 bit-identity: `LargeShape` at seq=4 must produce
+    /// byte-identical output to the per-token scalar loop (the
+    /// dispatcher routes seq<8 to iter 042, which is bit-identical
+    /// per-cell to the single-token kernel by the existing
+    /// `multi_matches_per_token_loop_*` tests).
+    #[test]
+    fn dispatch_int4_multi_large_shape_seq_4_matches_scalar() {
+        use crate::kernel_avx512::dequant_gemv_int4_auto;
+        let n_rows = 64;
+        let k_cols = 128;
+        let seq = 4;
+        let (packed, scales, xs) = make_dispatcher_test_data(n_rows, k_cols, seq);
+
+        // Per-token scalar reference.
+        let mut y_scalar = vec![0.0f32; seq * n_rows];
+        for t in 0..seq {
+            dequant_gemv_int4_auto(
+                &packed,
+                &scales,
+                &xs[t * k_cols..(t + 1) * k_cols],
+                n_rows,
+                k_cols,
+                &mut y_scalar[t * n_rows..(t + 1) * n_rows],
+            );
+        }
+
+        // LargeShape at seq=4 → iter 042 (blocked threshold is seq>=8).
+        let mut y_disp = vec![0.0f32; seq * n_rows];
+        dispatch_int4_multi(
+            ProjShape::LargeShape,
+            &packed,
+            &scales,
+            &xs,
+            n_rows,
+            k_cols,
+            seq,
+            &mut y_disp,
+        );
+        for i in 0..(seq * n_rows) {
+            assert_eq!(
+                y_scalar[i].to_bits(),
+                y_disp[i].to_bits(),
+                "LargeShape seq=4 mismatch at i={i}: scalar={}, dispatch={}",
+                y_scalar[i],
+                y_disp[i]
+            );
+        }
+    }
+
+    /// iter 075 bit-identity: `LargeShape` at seq=8 must produce
+    /// byte-identical output to the per-token scalar loop. At seq=8
+    /// the dispatcher routes to iter 046 blocked, which is also
+    /// bit-identical per-cell (`blocked_matches_iter042_multi_seq_8`).
+    /// This catches any regression in the seq>=8 branch of the
+    /// LargeShape dispatcher.
+    #[test]
+    fn dispatch_int4_multi_large_shape_seq_8_matches_scalar() {
+        use crate::kernel_avx512::dequant_gemv_int4_auto;
+        let n_rows = 64;
+        let k_cols = 128;
+        let seq = 8;
+        let (packed, scales, xs) = make_dispatcher_test_data(n_rows, k_cols, seq);
+
+        let mut y_scalar = vec![0.0f32; seq * n_rows];
+        for t in 0..seq {
+            dequant_gemv_int4_auto(
+                &packed,
+                &scales,
+                &xs[t * k_cols..(t + 1) * k_cols],
+                n_rows,
+                k_cols,
+                &mut y_scalar[t * n_rows..(t + 1) * n_rows],
+            );
+        }
+
+        let mut y_disp = vec![0.0f32; seq * n_rows];
+        dispatch_int4_multi(
+            ProjShape::LargeShape,
+            &packed,
+            &scales,
+            &xs,
+            n_rows,
+            k_cols,
+            seq,
+            &mut y_disp,
+        );
+        for i in 0..(seq * n_rows) {
+            assert_eq!(
+                y_scalar[i].to_bits(),
+                y_disp[i].to_bits(),
+                "LargeShape seq=8 mismatch at i={i}: scalar={}, dispatch={}",
+                y_scalar[i],
+                y_disp[i]
+            );
+        }
+    }
+
+    /// Factored-out test-data builder (same pattern as the seq=1
+    /// dispatcher test). Returns deterministic packed/scales/xs for
+    /// the given dimensions and seq count.
+    fn make_dispatcher_test_data(
+        n_rows: usize,
+        k_cols: usize,
+        seq: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
+        let mut packed = vec![0u8; n_rows * k_cols / 2];
+        for r in 0..n_rows {
+            for c in 0..(k_cols / 2) {
+                packed[r * (k_cols / 2) + c] = ((r.wrapping_mul(31).wrapping_add(c)) & 0xFF) as u8;
+            }
+        }
+        let n_groups = k_cols / GROUP_SIZE;
+        let mut scales = vec![0u8; n_rows * n_groups * 2];
+        for r in 0..n_rows {
+            for g in 0..n_groups {
+                let s = 0.5f32 + (((r * 7 + g * 3) % 11) as f32) * 0.1;
+                let bits = bf16_round(s);
+                let off = (r * n_groups + g) * 2;
+                scales[off] = (bits & 0xFF) as u8;
+                scales[off + 1] = (bits >> 8) as u8;
+            }
+        }
+        let mut xs = vec![0.0f32; seq * k_cols];
+        for t in 0..seq {
+            for c in 0..k_cols {
+                xs[t * k_cols + c] = ((t * 17 + c * 5) as f32).sin() * 0.5;
+            }
+        }
+        (packed, scales, xs)
     }
 }
