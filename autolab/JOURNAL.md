@@ -73,6 +73,60 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 090 — Warmup profiling for tahoma startup — full (A) impl (2026-05-19 ~03:10 PT)
+
+Branch `perf/warmup-profiling-090` @ `91999d7`.
+
+**What shipped:**
+- New module `startup_profile.rs` — RAII `PhaseTimer` records
+  `(name, duration)` into process-global `Mutex<Vec<PhaseRecord>>`
+  on Drop. `drain_report()` + `format_report()` for CLI seam.
+- **Runner::load instrumented with 8 phases:**
+  - `runner.manifest_load`
+  - `runner.head_compile`
+  - `runner.safetensors_source_open`
+  - `runner.layer0_safetensors_fetch`
+  - `runner.layer0_int4_quantize`
+  - `runner.embed_tokens_mmap`
+  - `runner.shells_load` (sub-totals: `safetensors_fetch_ms` +
+    `int4_quantize_ms` accumulators per shell)
+  - `runner.experts_cache_init`
+  - Each emits `tracing::info!` with `elapsed_ms`
+- **Builder::load with 3 additional phases:**
+  - `builder.load_total` (wraps everything)
+  - `builder.runner_load` (worker spawn+join)
+  - `builder.tokenizer_load`
+- **CLI flag** `--profile-startup` on `tahoma worker`. When set,
+  prints full phase table to stderr after `start_with_listen`. When
+  unset, one-line summary so operators see something fired.
+
+**Tests:** 8 new (6 unit in startup_profile + 2 integration ordering
+in `tests/startup_profile_ordering.rs`). 22 lib + 6 startup_profile
++ 2 ordering + others all pass.
+
+**Verification:** fmt clean, workspace builds, sample CLI `--help`
+confirms flag wired through.
+
+**NOT in scope:**
+- Per-expert lazy-load times (experts come in during inference)
+- OV IR-compile sub-phases inside `Runtime::compile` (would require
+  threading recorder through ov-genai-shim FFI)
+- Flame-graph format
+
+**Caveats:**
+- Workspace `cargo clippy --workspace --lib -- -D warnings` fails on
+  pre-existing issues in `tahoma-int4-gemm` and `tahoma-ov-genai-shim`
+  (verified by stash). Touched crates produce zero new warnings.
+- Profiler is global state, so concurrent loads in same process
+  would interleave — fine for intended single-engine-per-process
+  worker.
+
+**Operator can now run `--profile-startup` against K2.6 to see the
+exact breakdown** of the ~5min cold-start time. Foundation for
+targeted startup optimization.
+
+---
+
 ## 091 — KV migration between ranks — Track B skeleton + design doc (2026-05-19 ~03:00 PT)
 
 Substantial Track B for failover + hot rebalance. Branch
