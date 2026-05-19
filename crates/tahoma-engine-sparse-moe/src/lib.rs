@@ -39,11 +39,15 @@
 pub mod dist;
 pub mod engine;
 pub mod manifest;
+pub mod ngram_draft;
 pub mod runner;
 pub mod sampling;
+pub mod spec_decode;
 pub mod tensors;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use manifest::Manifest;
+pub use ngram_draft::{Draft, DEFAULT_DRAFT_K, MAX_NGRAM, MIN_NGRAM};
 pub use runner::{Runner, RunnerError};
 pub use sampling::SamplingConfig;
+pub use spec_decode::{count_accepted, reconcile_after_round, RoundReconcile};
