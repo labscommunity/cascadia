@@ -73,6 +73,66 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 063 — Lookahead + iter 044 e2e bench — NEUTRAL on factoids, validates per-prompt (2026-05-18 ~22:40 PT)
+
+Branch `perf/lookahead-bench-063` @ `eed28cf` (merge `01e7992` of
+iter 061 lookahead onto iter 044 compound, no conflicts).
+
+**Measured (10-prompt factoid bench, mt=64, temp=0, miner single-stage):**
+
+| Metric | iter 044 (no LA) | iter 063 (LA) | delta |
+|--------|------------------|---------------|-------|
+| Aggregate tok/s | 0.1899 | **0.1869** | **-1.6%** |
+| Quality | 9/10 | 9/10 | tied |
+| Mean accept rate | ~52% | **53.8%** | +2pp |
+| Weighted accept rate | n/a | 56.4% (189/335) | n/a |
+| vs iter 021 baseline (0.1587) | +19.7% | **+17.8%** | both still above baseline |
+
+**Verdict:** -1.6% on this factoid bench. **The +30-40% prediction
+did NOT land on this workload.** But lookahead wins 7/10 per-prompt
+when there's repetition:
+
+**Big wins (lookahead working as designed):**
+- Square root of 144 → **100% accept** (48/48) ← perfect!
+- Water boils → **86%** (38/44)
+- Speed of light → 75% (24/32)
+- Mount Everest → 69% (22/32)
+- Largest planet → 71% (20/28)
+
+**Poor accept (no repetition to exploit):**
+- First president → 3.3% (2/60)
+- Python → 6.7% (1/15)
+- Largest ocean → 15% (3/20)
+
+**Aggregate drag (verbatim agent):**
+> The aggregate is dragged down by **prompt 1 ("The capital of
+> France is") regressing -42.9% (0.341 → 0.195 tok/s) with
+> byte-identical output.** This single prompt drove iter 044's
+> headline number, and iter 063 didn't reproduce it — likely
+> run-to-run variance (load avg 44/48 cores), but also possibly an
+> interaction where lookahead's prompt-table biases the draft toward
+> wrong continuations early in generation.
+
+**Architectural finding:** lookahead's win condition (summarization,
+refactor, QA-over-doc) isn't exercised by factoid prompts. The
+existing 10-prompt eval is the WRONG workload for measuring
+lookahead. Needs a benchmark with:
+- Multi-paragraph prompts with repeated terminology
+- Document summarization prompts
+- Code refactor prompts
+- QA-over-document prompts
+
+**Memory implication:** the `autolab-substring-eval-too-weak` memory
+also applies here — the prompt mix doesn't exercise the feature.
+Adding a "workload-mix" rule: bench MUST match the feature's
+designed-for workload, not just the default 10-prompt set.
+
+**Composes with iter 044:** lookahead is OFF by default; enabling
+it via `--lookahead-decoding` is opt-in. For factoid-only workloads,
+leave off. For chat/doc workloads, enable.
+
+---
+
 ## 069 — Hot-expert buffer (L3 packing) — Track A impl shipped (2026-05-18 ~22:35 PT)
 
 Pack top-N hot experts into contiguous memory for L3 sharing.
