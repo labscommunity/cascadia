@@ -2,6 +2,89 @@
 
 Append-only. Newest at top. One entry per moonshot iteration.
 
+## 054 — Persistent expert pinning via mlock — FULL IMPL shipped, bench pending (2026-05-18 ~18:30 PT)
+
+Real architectural lever delivered as full (A) path. Branch
+`perf/expert-pinning-054` @ `1f5df36` (based on iter 047
+better-predictor, composes with C1 prefetch).
+
+**What shipped (cross-platform):**
+
+1. **Pinning primitives** in `safetensors_source.rs`:
+   - `Shard::pin_range` / `unpin_range`: `libc::mlock` /
+     `libc::munlock` on Unix; `VirtualLock` / `VirtualUnlock` on
+     Windows (reuses iter 038's windows-sys features); no-op
+     fallback elsewhere
+   - `SafetensorsExpertSource::pin_expert(layer, expert)` /
+     `unpin_expert` / `unpin_all_experts`: iterate 6 per-expert
+     tensors, idempotent, cumulative `pinned_bytes` counter
+   - `rlimit_memlock_soft()` reads `getrlimit(RLIMIT_MEMLOCK)`
+     (`u64::MAX` for `RLIM_INFINITY`)
+   - `expert_size_bytes(layer, expert)` for budget probing
+
+2. **Runner integration** in `runner.rs`:
+   - Per-(layer-position, expert) `expert_hits` HashMap, bumped in
+     dispatch loop
+   - `pin_top_n_per_layer(n)`: picks top-N per layer by hit count,
+     calls `pin_expert`
+   - Pure helper `select_top_n_by_hits(hits, n)` factored for
+     testability — stable tie-break ascending expert id
+   - Auto-fires inside `forward_shells` after `pin_after_tokens`
+     decoded tokens (default 16)
+   - `set_pin_top_n` emits `tracing::warn!` if `RLIMIT_MEMLOCK <
+     estimated need` (n × num_layers × 21 MB)
+   - `pinned_stats()` in per-token instrumentation log alongside C1
+     hit-rate
+
+3. **CLI** in `tahoma-cli/src/lib.rs`:
+   - `--pin-top-n N`
+   - `--pin-after-tokens T`
+   - Plumbed through `SparseMoEBuilderConfig` → `Runner`
+
+**Tests (12 new, all pass):**
+- 6 in `safetensors_source::tests`: end-to-end pin/unpin against
+  synthetic hand-rolled safetensors shard (tempfile, no K2.6 needed).
+  Pin tests degrade gracefully when mlock denied (CI sandboxes).
+- 6 in `runner::tests`: pure-function tests for
+  `select_top_n_by_hits` — picks-highest, ties-break-ascending,
+  n>distinct, n=0, empty, insertion-order-independent, **canonical
+  heavy-tail 10%/80% shape**
+
+**Workspace:** 91 lib tests pass (24 sparse-moe + 18 int4-gemm + 49
+others). fmt + clippy clean.
+
+**Predicted coverage (per task spec):**
+- N=38 per layer × 60 layers = **2280 experts × ~21 MB = ~47 GB
+  pinned**, well within miner's 133 GB
+- Expected ~80% dispatch coverage assuming K2.6's heavy-tailed
+  router; C1 prefetch + page cache handles cold 20%
+- **Arithmetic upper-bound tok/s lift: ~2× at 60% disk-IO fraction
+  → from ~0.11 baseline toward ~0.22 tok/s ceiling**
+
+**RLIMIT_MEMLOCK requirement (documented in commit):**
+Linux default 64 KiB → all pins silently fail. Need:
+- `ulimit -l unlimited`, OR
+- `sudo prlimit --pid <pid> --memlock=unlimited:unlimited`, OR
+- `/etc/security/limits.d/tahoma.conf`
+
+Runner logs `tracing::warn!` at startup if soft limit < estimated.
+
+**What's left:**
+- No miner bench. Branch ships impl + tests; future campaign will
+  A/B with N ∈ {0, 12, 24, 38, 64, 96}
+- `expert_hits` persists across `reset_kv` by design (heavy-tail is
+  model property, not prompt property) but NOT to disk. Fresh
+  process restart loses hit history; rebuilds during warmup window.
+- Small caveat: `pinned_bytes` is sum of attempted (not page-rounded)
+  sizes. Real `mlock` rounds to page; actual RSS slightly higher.
+
+**Composes with everything:** stacks with iter 033 C1 prefetch
+(faster page-in), iter 047 better predictor (smarter cache warm-up).
+The pinned set is the "always hot" tier; C1 prefetches the
+"sometimes hot"; cold tier still pages from disk.
+
+---
+
 ## 055 — INT4 router quantization — DISCOVERED: already int4 in production (regression coverage added) (2026-05-18 ~18:25 PT)
 
 **Discovery that overturned the brief.** Branch
