@@ -28,6 +28,7 @@
 
 pub mod c_ffi;
 pub mod format;
+pub mod int4_kv;
 pub mod kernel;
 pub mod kernel_avx512;
 pub mod kernel_bf16;
