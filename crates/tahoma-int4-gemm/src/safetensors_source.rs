@@ -27,20 +27,35 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
 use parking_lot::RwLock;
 
+use crate::async_prefetch::{AsyncIoError, AsyncPrefetchBackend, AsyncReadHandle};
 use crate::format::GemmError;
 
 /// Per-shard mmap + lookup table: tensor name → (data start, length) in
 /// the mmap. Public because it appears in the return type of
 /// `tensor_bytes` / `layer0` / `embed_tokens` (callers pin the Arc to
 /// keep the returned slice valid), but the fields are all private.
+///
+/// As of autolab iter 074, the shard also keeps the underlying `File`
+/// alive so `async_read` can hand the raw FD to `io_uring`. Closing
+/// the `File` after the mmap (the previous behavior) was fine for the
+/// mmap path — mmap pages survive their backing FD — but io_uring
+/// SQEs need a live FD until the CQE lands.
 pub struct Shard {
     mmap: Mmap,
+    /// Kept alive so [`Shard::async_read`] can pass the raw FD to
+    /// io_uring without it racing the close on drop. Unused on
+    /// non-Unix; the fallback `async_read` path doesn't need an FD
+    /// (it issues a hint, not a read).
+    #[cfg(unix)]
+    file: File,
     data_start: usize,
     tensors: HashMap<String, (usize, usize)>, // (data_offset_in_data_section, length)
 }
@@ -106,6 +121,8 @@ impl Shard {
         }
         Ok(Self {
             mmap,
+            #[cfg(unix)]
+            file: f,
             data_start: 8 + header_len,
             tensors,
         })
@@ -116,6 +133,59 @@ impl Shard {
             let start = self.data_start + off;
             &self.mmap[start..start + len]
         })
+    }
+
+    /// Queue an async read of a tensor's byte range through the given
+    /// `io_uring` backend. autolab iter 074 skeleton — see
+    /// `docs/perf/io_uring_prefetch.md` for the design.
+    ///
+    /// Behavior depends on the backend kind:
+    ///
+    ///   * Linux + io_uring (milestone 1+, not yet shipped): pushes an
+    ///     `IORING_OP_READ` SQE into the shared submission queue;
+    ///     returns immediately with a handle whose `is_ready()` flips
+    ///     to true once the matching CQE lands. The kernel populates
+    ///     the page cache as a side-effect — a later mmap fault on the
+    ///     same bytes will resolve from cache.
+    ///
+    ///   * Fallback (current skeleton + non-Linux): returns an
+    ///     immediately-ready handle. **The caller should additionally
+    ///     issue `advise_willneed` for the same range — async_read
+    ///     does NOT also do that.** (This split lets the
+    ///     `AsyncPrefetcher` decide which arm to call based on the
+    ///     backend kind without branching at every shard touch.)
+    ///
+    /// Returns `Err` if the tensor isn't present in this shard, or if
+    /// the backend's submission queue is full (Linux only).
+    pub fn async_read(
+        &self,
+        backend: &AsyncPrefetchBackend,
+        tensor_name: &str,
+    ) -> Result<AsyncReadHandle, AsyncIoError> {
+        let Some(&(off, len)) = self.tensors.get(tensor_name) else {
+            return Err(AsyncIoError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tensor {tensor_name} not in shard"),
+            )));
+        };
+        let abs_off = (self.data_start + off) as u64;
+        backend.queue_read(self.raw_fd(), abs_off, len)
+    }
+
+    /// Raw file descriptor for io_uring SQEs. Returns -1 on platforms
+    /// where Shard doesn't keep an FD (Windows — the fallback path
+    /// doesn't need one, and io_uring doesn't exist there anyway).
+    #[cfg(unix)]
+    fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Windows / wasm32 / other non-Unix targets: io_uring backend is
+    /// unreachable, so any FD value works. We return -1 so a stray
+    /// call wouldn't accidentally read from stdin.
+    #[cfg(not(unix))]
+    fn raw_fd(&self) -> std::os::raw::c_int {
+        -1
     }
 }
 

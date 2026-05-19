@@ -26,6 +26,7 @@
 //! and [`expert_forward`] runs the full silu(gate*x) ⊙ up*x → down*y
 //! pipeline.
 
+pub mod async_prefetch;
 pub mod c_ffi;
 pub mod format;
 pub mod kernel;
