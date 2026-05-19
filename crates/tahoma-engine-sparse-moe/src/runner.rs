@@ -1986,7 +1986,17 @@ mod tests {
         // a denormal-ish value, and a few transcendentals.
         use half::bf16;
         let cases: &[f32] = &[
-            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, 0.125, 1.0e-30, 3.14159265, -42.5,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            2.0,
+            0.125,
+            1.0e-30,
+            std::f32::consts::PI,
+            -42.5,
         ];
         for &x in cases {
             let ours = super::f32_to_bf16_bits(x);
