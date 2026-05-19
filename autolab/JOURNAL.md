@@ -73,6 +73,70 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 069 — Hot-expert buffer (L3 packing) — Track A impl shipped (2026-05-18 ~22:35 PT)
+
+Pack top-N hot experts into contiguous memory for L3 sharing.
+Branch `perf/hot-expert-buffer-069` @ `d9339c6`.
+
+**What shipped (Track A):**
+- New `hot_buffer.rs` module:
+  - `LayerHotBuffer` — contiguous owned `Vec<u8>` containing top-N
+    hot experts' 6 tensor slices packed back-to-back
+  - `ExpertHits` per-(layer, expert) counter with `top_n_for_layer`
+    (sort by count desc, eid tie-break)
+  - `HotExpertView` — borrowed view of 6 sub-slices, slot offsets
+    cached once per layer
+  - `try_reserve_exact` for OOM-safe alloc; per-layer invariant
+    check (same 6 slice sizes per expert)
+- Wired into `Runner`:
+  - `expert_hits` tracked on every dispatch (cheap HashMap update)
+  - `dispatch_expert` records hit, lazy-builds buffer after
+    `total_dispatches >= warmup_dispatches`
+  - Cold path untouched; only `view.is_some()` early return added
+  - Per-layer build only for layers this rank holds
+  - **OvIr backend skipped** (different weight format); only
+    Int4Bin and SafetensorsBin paths get the buffer
+- CLI: `--hot-expert-buffer-n N` (default 0 = disabled),
+  `--hot-expert-warmup-dispatches D` (default 1500 ≈ 3 K2.6 tokens)
+- Plumbed through `SparseMoEBuilderConfig::with_hot_expert_buffer`
+
+**Tests:**
+- `tests/hot_buffer_bit_identity.rs` (always runs): synthetic
+  safetensors shards, non-monotonic eids [2, 0, 3] packed, asserts
+  every byte matches source. **PASSES.**
+- `tests/hot_buffer_k26_parity.rs` (gated on `K26_MODEL_DIR`): same
+  prompt under `hot_n=0` vs `hot_n=16` greedy must produce identical
+  tokens
+- `hot_buffer::tests`: top-N ordering + tie-break + layout roundtrip
+- 33 existing sparse-moe tests still pass; fmt + clippy clean
+
+**Predicted (analytical):**
+- Per-expert read ~25 MiB, top_k=8 × 60 layers = 480 calls/token =
+  ~12 GiB/token bandwidth demand
+- Xeon Gold 6252 L3 ~36 MiB (smaller than one expert), so cold-path
+  L3 hit rate ≈ 0
+- DDR4-2133 hard floor ~207 ms/token vs measured 9-12 s/token →
+  most time is page-fault / TLB / pointer-chase, not bandwidth
+- **Predicted speedup: 1.3-1.7× warm at N=8 hit-rate 0.6; 2-3× when
+  composed with iter 056 / 065**
+
+**Memory caveat:** N=16 × 60 layers × ~25 MiB ≈ **24 GiB** (well
+within miner's 133 GB but would OOM small AI PCs). User must opt
+in via `--hot-expert-buffer-n`.
+
+**Composes with full cache-attack stack:**
+1. iter 033 C1 prefetch
+2. iter 047 better predictor
+3. iter 054 pinning (RAM resident)
+4. iter 056 cache-aware dispatch
+5. iter 057 speculative cross-layer prefetch
+6. iter 065 prefill-hint seeding
+7. **iter 069 hot-expert buffer (THIS — contiguous L3-line sharing)**
+
+7-layer cache attack now complete.
+
+---
+
 ## 068 — Wire compression for 2-box hidden states — opt-in, decode-negative / prefill-positive (2026-05-18 ~22:25 PT)
 
 Track A full impl + honest workload-dependent finding. Branch
