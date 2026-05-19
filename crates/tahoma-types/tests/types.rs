@@ -10,6 +10,8 @@ fn generation_task_defaults() {
     assert_eq!(task.logprobs, 0);
     assert!(!task.enable_thinking);
     assert!(!task.trust_remote_code);
+    assert!(task.stop.is_none());
+    assert!(!task.stop_on_repetition);
 }
 
 #[test]
@@ -22,11 +24,42 @@ fn generation_task_builder() {
 }
 
 #[test]
+fn generation_task_stop_builder_normalizes_empty_to_none() {
+    let task = GenerationTask::new("t1", "hi").with_stop(vec![]);
+    assert!(
+        task.stop.is_none(),
+        "empty stop list should normalize to None"
+    );
+    let task = GenerationTask::new("t1", "hi").with_stop(vec!["\n\n".into()]);
+    assert_eq!(task.stop.as_ref().unwrap(), &vec!["\n\n".to_string()]);
+}
+
+#[test]
+fn generation_task_stop_on_repetition_builder() {
+    let task = GenerationTask::new("t1", "hi").with_stop_on_repetition(true);
+    assert!(task.stop_on_repetition);
+}
+
+#[test]
 fn generation_task_serde_roundtrip() {
-    let task = GenerationTask::new("t1", "prompt").with_max_tokens(8);
+    let task = GenerationTask::new("t1", "prompt")
+        .with_max_tokens(8)
+        .with_stop(vec!["Human:".into(), "\n\n".into()])
+        .with_stop_on_repetition(true);
     let json = serde_json::to_string(&task).unwrap();
     let back: GenerationTask = serde_json::from_str(&json).unwrap();
     assert_eq!(task, back);
+}
+
+#[test]
+fn generation_task_serde_old_payload_without_new_fields() {
+    // Older client without stop / stop_on_repetition should still
+    // deserialize cleanly with the new field defaults.
+    let json = r#"{"task_id":"t1","prompt":"hi","max_tokens":8,"temperature":0.0,
+        "logprobs":0,"enable_thinking":false,"trust_remote_code":false}"#;
+    let task: GenerationTask = serde_json::from_str(json).unwrap();
+    assert!(task.stop.is_none());
+    assert!(!task.stop_on_repetition);
 }
 
 #[test]

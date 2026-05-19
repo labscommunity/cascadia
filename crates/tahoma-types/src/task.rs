@@ -27,6 +27,19 @@ pub struct GenerationTask {
     /// Treat as a security boundary — opt in only.
     #[serde(default)]
     pub trust_remote_code: bool,
+    /// User-supplied stop sequences (OpenAI-compatible). When set, the
+    /// engine stops as soon as the decoded text ends with any of these.
+    /// Engines without text-level stopping (e.g. a pure token relay)
+    /// silently ignore this. Empty list ≡ None.
+    #[serde(default)]
+    pub stop: Option<Vec<String>>,
+    /// When true, stop decoding early if the engine detects a degenerate
+    /// repetition pattern (same 4-gram emitted 3+ times within a sliding
+    /// window). Opt-in: defaults to false because some legitimate outputs
+    /// repeat short n-grams (e.g. code, lists). Cheap to compute — only
+    /// adds an O(window) scan per emitted token.
+    #[serde(default)]
+    pub stop_on_repetition: bool,
 }
 
 fn default_max_tokens() -> u32 {
@@ -43,6 +56,8 @@ impl GenerationTask {
             logprobs: 0,
             enable_thinking: false,
             trust_remote_code: false,
+            stop: None,
+            stop_on_repetition: false,
         }
     }
 
@@ -53,6 +68,18 @@ impl GenerationTask {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    /// Set the list of stop sequences. An empty list is normalized to None.
+    pub fn with_stop(mut self, stop: Vec<String>) -> Self {
+        self.stop = if stop.is_empty() { None } else { Some(stop) };
+        self
+    }
+
+    /// Enable degenerate-repetition detection.
+    pub fn with_stop_on_repetition(mut self, enabled: bool) -> Self {
+        self.stop_on_repetition = enabled;
         self
     }
 }
