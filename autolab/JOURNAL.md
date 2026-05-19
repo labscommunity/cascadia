@@ -73,6 +73,47 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 079 — SSE output streaming — DISCOVERY: already implemented (regression coverage added) (2026-05-19 ~00:50 PT)
+
+Branch `perf/sse-streaming-079` @ `9dfe04b`.
+
+**Discovery (verbatim agent):**
+> the SSE streaming feature was already fully implemented end-to-end
+> before I started. Specifically in `tahoma-api/src/lib.rs`:
+> - `ChatCompletionRequest.stream: bool` with `#[serde(default)]`
+> - Dispatch to `stream_completion` when `stream=true`
+> - `stream_completion` returns `Content-Type: text/event-stream`,
+>   emits `data: {json}\n\n` frames in `chat.completion.chunk`
+>   format via `Body::from_stream`, ends with `data: [DONE]\n\n`
+> - `Engine::step()` already returns tokens chunk-by-chunk; runner's
+>   `ChunkStream` already forwards each chunk
+> - A non-streaming test existed; **no streaming test existed** —
+>   that was the actual gap
+
+**Same pattern as iter 055 router (already int4 in production):**
+assume the world; verify before implementing. Agent did verify
+first.
+
+**What shipped (regression coverage):**
+1. `chat_completion_stream_emits_openai_sse_format` — sends
+   `stream=true`, asserts `Content-Type: text/event-stream` +
+   `Cache-Control: no-cache`, parses each `data:` frame as JSON,
+   validates `object: "chat.completion.chunk"`, `delta.role:
+   assistant`, presence of content, `finish_reason: "stop"` on last
+   data frame, `data: [DONE]` literal terminator
+2. `chat_completion_omitting_stream_defaults_to_non_streaming` —
+   regression guard against future serde refactors that break JSON
+   default for OpenAI clients that don't set `stream`
+3. Drops stale `mut` warning
+
+5 tests pass in crate. fmt + no new clippy warnings.
+
+**Lesson reinforced** (iter 055 already saved as memory in form):
+ALWAYS verify current state before assuming a feature is missing.
+Tahoma has more shipped than expected; check first.
+
+---
+
 ## 077 — Adaptive max_tokens early-stop — Track A working impl (2026-05-19 ~00:25 PT)
 
 Branch `perf/adaptive-stop-077` (3 commits). Full plumbing through
