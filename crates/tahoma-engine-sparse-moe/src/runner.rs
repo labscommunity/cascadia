@@ -217,6 +217,13 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// If `Some(k')` with k' < manifest.top_k, forward_shells dispatches
+    /// only the first k' of the routed top-K experts per token. See
+    /// `docs/A3_TOPK_REDUCTION.md` for the productionization Pareto.
+    top_k_override: Option<u32>,
+    /// If `Some(t)` with t > 0, skip experts whose routing weight is
+    /// below t. Applied AFTER `top_k_override`.
+    routing_threshold: Option<f32>,
 }
 
 impl Runner {
@@ -392,7 +399,27 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            top_k_override: None,
+            routing_threshold: None,
         })
+    }
+
+    /// Set the per-token top-K dispatch override. None = use manifest's top_k.
+    /// Values > manifest.top_k are silently clamped down (no point dispatching
+    /// experts the router didn't route to).
+    pub fn set_top_k_override(&mut self, v: Option<u32>) {
+        self.top_k_override = v;
+        info!(
+            top_k_override = ?v,
+            manifest_top_k = self.manifest.top_k,
+            "set_top_k_override"
+        );
+    }
+
+    /// Set the per-token routing-weight threshold. None / 0.0 = disabled.
+    pub fn set_routing_threshold(&mut self, v: Option<f32>) {
+        self.routing_threshold = v.filter(|t| *t > 0.0);
+        info!(routing_threshold = ?self.routing_threshold, "set_routing_threshold");
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -584,7 +611,16 @@ impl Runner {
         past_seq_len: usize,
     ) -> Result<Vec<f32>, RunnerError> {
         let hidden = self.manifest.hidden_size as usize;
-        let top_k = self.manifest.top_k as usize;
+        let manifest_top_k = self.manifest.top_k as usize;
+        // Per-token effective top-K. The shell router still returns the full
+        // manifest top-K of routing_ids/weights; we skip dispatches based on
+        // the override (fixed K') and the threshold (sigmoid weight gate).
+        let effective_top_k = self
+            .top_k_override
+            .map(|v| (v as usize).min(manifest_top_k))
+            .unwrap_or(manifest_top_k);
+        let threshold = self.routing_threshold.unwrap_or(0.0);
+        let top_k = manifest_top_k; // for the router contract check below
         if h_shape.len() != 3 || h_shape[0] != 1 || h_shape[1] != 1 || h_shape[2] != hidden {
             return Err(RunnerError::Internal(format!(
                 "forward_shells: int4 shells require shape [1, 1, {hidden}], got {h_shape:?}"
@@ -656,9 +692,12 @@ impl Runner {
                 )));
             }
             let mut moe = vec![0.0f32; hidden];
-            for k in 0..top_k {
-                let eid = outs.routing_ids[k] as u32;
+            for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
+                if w < threshold {
+                    continue;
+                }
+                let eid = outs.routing_ids[k] as u32;
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
