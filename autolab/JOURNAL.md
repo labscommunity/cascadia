@@ -73,6 +73,67 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 076 — Per-thread CPU affinity pinning — full (A) impl, validated on miner (2026-05-18 ~23:40 PT)
+
+New crate `tahoma-cpu-affinity` + CLI wiring. Branch
+`perf/cpu-affinity-076` @ `1e45bc5` (2 commits).
+
+**What shipped:**
+- New crate `tahoma-cpu-affinity`:
+  - `Mode` enum (None / Auto / Spec(String)) + `parse_mode`
+  - `Layout` struct: `rayon_cores`, `tokio_cores`, `prefetcher_core`,
+    `hot_buffer_core`
+  - `Layout::plan(mode, online_cpus)` — pure-logic planner, no
+    syscalls
+  - `Layout::apply_to_rayon_global()` — installs global rayon pool
+    with pinned workers via `start_handler`
+  - `Layout::tokio_on_thread_start()` — closure for
+    `tokio::runtime::Builder::on_thread_start`
+  - `pin_current_thread(core_id)` low-level wrapper
+  - `init_global` / `global` via `OnceLock`
+  - Cross-platform via `core_affinity 0.8` (Linux + Windows + macOS;
+    macOS treats pin as hint)
+  - **21 unit tests** covering planner, spec parser (whitespace +
+    pipe alternates), 48-core Xeon canonical case, small-host
+    fallbacks (1c/2c/6c), error rejection
+- Wired into `tahoma-cli` + `tahoma/main.rs`:
+  - Global `--cpu-affinity <auto|none|spec>` flag (default none)
+  - `main()` no longer uses `#[tokio::main]` — manually plans
+    layout, installs pinned rayon global BEFORE any par_*, builds
+    tokio runtime with worker count sized to `tokio_cores.len()`
+    and `on_thread_start` closure attached
+  - spawn-blocking relay-loop pins to first reserved tokio core
+
+**Validation on miner (Xeon 48 logical CPUs, Linux 6.17):**
+- `Layout::plan(Auto, 48)` produced `rayon=[0-43], tokio=[44,45],
+  prefetcher=46, hot-buffer=47` (matches canonical unit test)
+- `core_affinity::set_for_current(0..3)` returns `true` — Linux
+  honors the pin
+- After `apply_to_rayon_global()`, `par_iter` of 256 elements
+  reported via `sched_getcpu` that work ran on cpus `[0,1,2,...,43]`
+  only — none of the reserved tokio/helper cores touched
+
+**Honest blockers / notes:**
+1. iter 033 prefetcher / iter 069 hot-buffer don't exist on main
+   yet (perf branches only). Their cores are reserved future-
+   proofing; when those threads land, just call
+   `cpu_affinity::global().pin_current_to_prefetcher()` from inside
+   the thread closure.
+2. Existing kernels (`kernel.rs`, `kernel_avx512.rs`, `kernel_bf16.rs`)
+   use global rayon pool — pick up pinned pool automatically. No
+   code change needed there.
+3. Pre-existing main clippy issues in `tahoma-ov-genai-shim` and
+   `tahoma-runner` blocked workspace-wide `clippy -D warnings`. New
+   crate passes its own clippy clean.
+4. fmt clean across workspace, all tests green.
+5. **No tok/s number from real K2.6 run** — wiring is verified
+   end-to-end (CLI accepts, plans, log confirms, smoke test
+   confirms pin takes effect). Actual perf delta vs `none` on K2.6
+   is unmeasured. Recommend next miner run flip to
+   `--cpu-affinity auto` and compare to ~0.11 baseline.
+
+---
+
 ## 074 — io_uring async expert reads (Linux) — SCOPING + skeleton (2026-05-18 ~23:30 PT)
 
 Follow-up to iter 070's NVMe bandwidth contention finding. io_uring
