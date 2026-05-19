@@ -73,6 +73,72 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 073 — Lean cache-attack subset bench — ALL LEAN SUBSETS NEGATIVE (24h bench finally complete) (2026-05-19 ~05:30 PT)
+
+**CRITICAL REFINEMENT of iter 070's finding.** The 24-hour bench
+that started post-iter-072 finally landed. Branch
+`perf/lean-cache-attack-073` @ `55b6747` (5 commits).
+
+**Final scoreboard:**
+
+| Config | tok/s | quality | vs iter 021 |
+|--------|------:|---------|------------:|
+| iter 021 baseline (K=6, no opt-ins) | **0.1587** | 10/10 | — |
+| iter 070 full 7-stack (1-prompt) | 0.1108 | pass | -30.2% |
+| 073-A pin only (iter 054 + iter 033) | 0.1492 | 10/10 | -6.0% |
+| 073-B pin + cache-aware (iter 056) | 0.1477 | 10/10 | -6.9% |
+| 073-C pin + cache-aware + hot-buffer (iter 069) | 0.1386 | 10/10 | -12.7% |
+| 073-D above + `--prefetch-n 8` | 0.1368 | 10/10 | -13.8% |
+| 073-E above with prefill-hint (iter 065) | 0.1379 | 10/10 | -13.1% |
+
+**NONE of the lean subsets beat baseline.** Even pin-alone is
+-6.0%. Adding more features makes it WORSE.
+
+**Per-feature attribution (deltas):**
+- iter 054 pin + iter 033 prefetch: -6.0% (slightly negative)
+- iter 056 cache-aware reorder: -1.0% (neutral)
+- **iter 069 hot-expert buffer (+11.3 GB): -6.2% (clearly
+  negative)** ← largest culprit
+- `--prefetch-n 8` == default TOPK: -1.3% (A/A check, spec flaw)
+- iter 065 prefill-hint W=0.5: -0.5% (neutral)
+
+**Refines iter 070's hypothesis:** iter 070 blamed iter 057
+speculative prefetch's I/O competition. **Actually the largest
+culprit is iter 069 hot-buffer's 11.3 GB RAM commitment crowding
+the OS page cache.** Hot-buffer is fast at the kernel level but
+displaces the OS's own cache of paged experts.
+
+**Updated recommendation:**
+- Do NOT compose the cache-attack chain on miner-class hardware
+- Drop iter 069 (RAM cost) and iter 056 (reorder doesn't help when
+  no expert fits in L3)
+- Even just iter 054 pinning is slightly negative on this
+  substrate (single-NVMe, 133 GB RAM, 553 GB model)
+- The chain MIGHT invert on:
+  - Pipeline-parallel (per-rank footprint halved)
+  - 256+ GB AI PCs
+  - Models that fit in RAM (sharded)
+
+**All 5 configs pass 10/10 quality** — no correctness regressions.
+
+**Memory updated:** `autolab-composition-can-be-negative` now
+documents the iter 073 refined attribution: hot-buffer RAM is the
+real culprit, not prefetch I/O contention. Updated rule:
+**disk-bound substrates where model >> RAM hate features that own
+large RAM** (pin, hot-buffer) — they reduce OS page cache for
+cold experts.
+
+**Spec flaw:** `--prefetch-n 8` matches TOPK default (8); Config D
+is an A/A check, not a true prefetch-n datapoint. Future iters
+must use `--prefetch-n 12` or `16`.
+
+**Impact on Tier B PR guidance (SPINOUT_STRATEGY.md):** all
+cache-attack features (047, 054, 056, 057, 065, 069) should ship
+default-off with substrate-warning docs. Default-on only for
+substrates where model fits in RAM.
+
+---
+
 ## 100 — Final retrospective + LEADERBOARD + SPINOUT strategy (2026-05-19 ~05:10 PT)
 
 Loop close. Synchronous consolidation work this turn (no agent).
