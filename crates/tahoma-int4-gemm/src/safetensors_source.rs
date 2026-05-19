@@ -117,12 +117,41 @@ impl Shard {
             &self.mmap[start..start + len]
         })
     }
+
+    /// Total bytes mapped by this shard (header + data). Exposed for
+    /// measurement; equal to the on-disk file length.
+    pub fn mmap_len(&self) -> usize {
+        self.mmap.len()
+    }
+}
+
+/// Options for [`SafetensorsExpertSource::open_with_options`].
+///
+/// `lazy_load` is a skeleton flag that today is informational only:
+/// the source is *always* lazy at shard granularity (see the type-level
+/// note above). The flag is reserved for a future per-tensor lazy mode
+/// — e.g. fault each expert tensor individually with `MAP_POPULATE`
+/// off, or even unmap dead experts after a watermark — once profiling
+/// shows the OS-level mmap policy is no longer free for our workload.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenOptions {
+    /// Today: informational only. Future: opt into per-expert eviction
+    /// and/or skipping of unfired experts.
+    pub lazy_load: bool,
 }
 
 /// Source of safetensors-backed expert weights. Caches mmaps lazily.
 ///
 /// Construct once per process with the model directory; clone is cheap
 /// (Arc'd).
+///
+/// **Laziness contract.** The source already mmaps shards lazily: the
+/// `shards` cache is empty at construction time, and each shard is only
+/// mmap'd the first time a tensor that lives in it is requested. The
+/// `lazy_load` flag captured in [`OpenOptions`] is a skeleton for a
+/// future per-tensor mode and does **not** change behavior in this
+/// version — see `crates/tahoma-int4-gemm/src/bin/mmap_profile.rs` for
+/// the measurement tool that informed this decision.
 #[derive(Clone)]
 pub struct SafetensorsExpertSource {
     model_dir: PathBuf,
@@ -131,11 +160,24 @@ pub struct SafetensorsExpertSource {
     weight_map: Arc<HashMap<String, String>>,
     /// Lazy mmap cache: shard filename → Shard.
     shards: Arc<RwLock<HashMap<String, Arc<Shard>>>>,
+    /// Captured at construction. Today: read by `lazy_load()` for
+    /// instrumentation/tests; does not gate any code path. Reserved for
+    /// a future per-expert lazy mode.
+    lazy_load: bool,
 }
 
 impl SafetensorsExpertSource {
     /// Open the model dir and parse `model.safetensors.index.json`.
+    /// Equivalent to `open_with_options(model_dir, OpenOptions::default())`.
     pub fn open(model_dir: impl Into<PathBuf>) -> Result<Self, GemmError> {
+        Self::open_with_options(model_dir, OpenOptions::default())
+    }
+
+    /// Open the model dir with explicit options. See [`OpenOptions`].
+    pub fn open_with_options(
+        model_dir: impl Into<PathBuf>,
+        opts: OpenOptions,
+    ) -> Result<Self, GemmError> {
         let model_dir = model_dir.into();
         let idx_path = model_dir.join("model.safetensors.index.json");
         let idx_bytes = std::fs::read(&idx_path)?;
@@ -164,7 +206,39 @@ impl SafetensorsExpertSource {
             model_dir,
             weight_map: Arc::new(map),
             shards: Arc::new(RwLock::new(HashMap::new())),
+            lazy_load: opts.lazy_load,
         })
+    }
+
+    /// Returns whether this source was opened in "lazy" mode. Today
+    /// this is informational only (the source is always lazy at shard
+    /// granularity); reserved for a future per-tensor mode.
+    pub fn lazy_load(&self) -> bool {
+        self.lazy_load
+    }
+
+    /// Number of distinct safetensors shards currently mmap'd. Useful
+    /// for measurement / profiling (see `mmap_profile`).
+    pub fn shards_mapped(&self) -> usize {
+        self.shards.read().len()
+    }
+
+    /// Sum of the byte lengths of all currently-mmap'd shards. This is
+    /// virtual address space consumed; the OS may have faulted in
+    /// arbitrarily less than this.
+    pub fn shard_bytes_mapped(&self) -> u64 {
+        self.shards
+            .read()
+            .values()
+            .map(|s| s.mmap_len() as u64)
+            .sum()
+    }
+
+    /// Iterator over every tensor name known to the safetensors index.
+    /// Used by the measurement bin to force-touch every tensor and
+    /// quantify the actual cost of fully mmap'ing the model.
+    pub fn tensor_names(&self) -> Vec<String> {
+        self.weight_map.keys().cloned().collect()
     }
 
     fn shard_for(&self, tensor_name: &str) -> Result<Arc<Shard>, GemmError> {

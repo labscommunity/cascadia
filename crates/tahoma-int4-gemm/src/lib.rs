@@ -39,7 +39,9 @@ pub mod shell_int4;
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;
-pub use safetensors_source::{SafetensorsExpert, SafetensorsExpertSource, SafetensorsLayer0};
+pub use safetensors_source::{
+    OpenOptions, SafetensorsExpert, SafetensorsExpertSource, SafetensorsLayer0,
+};
 
 // Architecture constants for K2.6 — exposed as constants so the kernel
 // and the on-disk format agree.
