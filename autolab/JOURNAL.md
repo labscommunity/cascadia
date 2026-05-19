@@ -73,6 +73,68 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 094 — Heartbeat driver cadence loop — Track A working impl (2026-05-19 ~04:05 PT)
+
+iter 092 follow-up step 1. Branch `perf/heartbeat-driver-094` @
+`ae2e1f3` (based on iter 092). +809 / -57 across 5 files.
+
+**What shipped:**
+1. **`dist.rs` (+201 LOC):**
+   - `HeartbeatOutcome` enum (Alive | Missed | Dead | WireBroken)
+   - `ping_one_round(downstream, nonce, timeout, &watchdog)` —
+     atomic one-round transaction. Acquires socket mutex once across
+     send-ping + recv-pong, drains stale pongs (mismatched nonces
+     from prior timed-out rounds), updates watchdog under its own
+     mutex AFTER releasing socket guard
+   - `run_heartbeat_loop(downstream, watchdog, interval, timeout,
+     cancel)` — monotonic nonce, `tokio::time::sleep(interval)`
+     between rounds, exits on Dead / WireBroken / cancel
+2. **`engine.rs` (+96 LOC):**
+   - `SparseMoEBuilderConfig::heartbeat_interval_ms` +
+     `with_heartbeat_interval_ms()`
+   - `Builder::build` on rank 0 + multi-stage + interval > 0 spawns
+     `run_heartbeat_loop` on runtime handle. Default timeout = 2×
+     interval
+   - On Dead / WireBroken: `tracing::error!` and exit (upper-layer
+     recovery still `FOLLOW-UP-orchestrator`)
+   - Engine carries `heartbeat_task: Option<JoinHandle>`,
+     `heartbeat_cancel: Arc<AtomicBool>`, shared `heartbeat_watchdog`
+     so future orchestrator can read `successes()` /
+     `consecutive_misses()`
+   - `Engine::close` flips cancel → closes socket → aborts JoinHandle
+3. **`tahoma-cli` (+1 LOC):** plumbs `args.heartbeat_interval_ms`
+   into builder config (iter 092 parsed flag but never connected)
+4. **`tests/heartbeat_wire.rs` (+357 LOC):** 9 new tests using
+   `spawn_selective_worker(server, cancel, Fn(round) -> bool)`
+   helper. Covers ping_one_round outcomes, healthy, silent (the
+   task-spec drop-every-Nth-ping → watchdog fires), alternating
+   drop/reply (stays alive), exact-N drops with higher tolerance,
+   intermittent recovery, prompt cancel
+5. **`docs/architecture/heartbeat-recovery.md`:** flipped blocker 1
+   to "shipped with caveat", added "What iter 094 ships" section,
+   updated testing matrix (21 tests across 092 + 094)
+
+**Tests:** 49/49 sparse-moe pass (22 unit + 6 dist_wire + 5
+engine_smoke + 15 heartbeat_wire + 1 K2.6 layer0 eval). fmt + clippy
+clean.
+
+**Honest limitations:**
+- **Mutex contention with Forward path:** ping_one_round is atomic
+  per round, but `forward_one_token_first` releases mutex between
+  `send_forward` and `recv_kind_client`. If heartbeat acquires
+  mutex in that gap, can read a Token response as Pong →
+  WireBroken miss. Rare on LAN (sub-ms Forward RTT vs second-scale
+  heartbeat); proper fix is side-channel socket (still punted).
+- **No upper-layer signal on Dead.** Per task spec — TBD. Loop
+  logs error and exits but nothing tears down engine or notifies
+  orchestrator. Shared watchdog is the seam where future restart
+  callback will hang.
+- Worker auto-restart, KV migration to replacement worker, driver
+  socket re-pointing, multi-hop ping, side-channel socket, auth
+  all remain FOLLOW-UP-orchestrator.
+
+---
+
 ## 095 — Better quality eval (perplexity skeleton + divergence) — IMPL shipped (2026-05-19 ~03:55 PT)
 
 Addresses `autolab-substring-eval-too-weak` memory directly. Branch
