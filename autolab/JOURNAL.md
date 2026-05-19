@@ -73,6 +73,60 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 062 — Int4 KV cache — NEGATIVE RESULT (scalar dequant cost > bandwidth savings) (2026-05-18 ~21:00 PT)
+
+Honest negative via investigation-first (path B + scoped C). Did NOT
+ship full (A) impl. Branch `perf/int4-kv-cache-062` @ `1f3794e`
+(based on iter 032 bf16 KV).
+
+**Microbench finding (verbatim agent):**
+> Scalar int4 SDPA is **5-9% SLOWER than bf16 at every realistic
+> past_seq_len, despite reading 3.55× fewer KV bytes (28% of bf16
+> footprint, 691 KB/token vs 2.46 MB/token at 60 layers).** The
+> per-element dequant cost (nibble extract + sub-8 + mul-by-scale +
+> cvt-to-f32) eats the bandwidth saving in a scalar kernel.
+
+**Same pattern as iter 049 inter-layer bf16:** quantization saves
+memory but costs compute. Net negative without SIMD acceleration.
+
+**What shipped (defensive foundation):**
+- `int4_kv.rs` module: `quantize_kv_row`, `dequantize_kv_row`,
+  `dequant_kv_dot_f32`, `dequant_kv_accum_f32`, `packed_bytes`, 6
+  unit tests. Per-head per-row symmetric int4 with bf16 scales at
+  group_size=32 (matches weight-path format)
+- `bin/bench_kv_sdpa.rs` three-way microbench (f32/bf16/int4) at
+  K2.6 attention shapes across past_seq_len ∈ {16, 64, 256, 1024,
+  4096}
+- `autolab/experiments/062_int4_kv_cache/bench_kv_sdpa_mac_arm64.txt`
+  captured output
+
+**Numerical correctness pinned (6 unit tests):**
+- Roundtrip RMS error ≤ 12% on gaussian rows (matches published
+  symmetric int4 group-32 noise floor)
+- Dot-product within 5% of bf16 baseline
+- Accum within 10%
+- Zero rows roundtrip exact zero (nibble 0x88)
+- Edge cases on bf16 scale precision
+
+**NOT shipped (by design):**
+- `LayerState.past_k/past_v` unchanged (still Vec<u16> bf16 from iter
+  032)
+- shell_int4 / layer0_int4 SDPA call sites unchanged
+- runner::write_present_kv unchanged
+- C-FFI unchanged
+- No quality eval (since A not shipped)
+
+**Follow-up if pursued:** AVX-512 dequant path needed. Instructions
+sketched inline: `VPMOVZXBW + VPSRLW + VBROADCASTW + VCVTDQ2PS +
+VFMADD231PS`. If SIMD gets within ~10% of bf16 at past=64, the
+signature flip + quality eval becomes mechanical.
+
+**Lesson reinforced:** quantization that requires per-element dequant
+needs SIMD before any e2e impl. Path-B-first should be the default
+for any "quantize X further" iter.
+
+---
+
 ## 060 — Static prompt KV cache — Option (A) working impl shipped, byte-identity proven (2026-05-18 ~20:40 PT)
 
 Branch `perf/static-prompt-cache-060` @ `8d60433` (off main, single
