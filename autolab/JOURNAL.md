@@ -73,6 +73,51 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 093 — zstd expert storage at rest — DECISIVE NEGATIVE (real miner measurement) (2026-05-19 ~03:40 PT)
+
+Path C investigation with real miner measurements. Branch
+`perf/zstd-expert-storage-093` @ `f32e062`.
+
+**Deliverable:** 256-line investigation doc
+(`docs/architecture/zstd-expert-storage.md`). No code, no zstd dep.
+
+**Key findings (miner Xeon Gold 6252, NVMe, zstd 1.5.5, real K2.6
+shard `model-00010-of-000064.safetensors`):**
+
+1. **Compression ratio is 1.15× combined, NOT 1.4-1.8× as brief
+   hypothesized.** Packed-int4 stream (89% of every MoE shard,
+   stored as I32 lanes of compressed-tensors quantisation)
+   compresses only **1.10× at zstd-3, -6, -9, -19, and even with
+   trained 128 KB dictionary.** The bf16 scale stream (11%) hits
+   textbook 1.86×. Cross-checked against raw bf16 dense weight
+   (layer-0 up_proj, 1.28×) — confirms rule-of-thumb applies only
+   to non-pre-quantised tensors.
+
+2. **Full-model saving: 80 GB / 553 GB = 14.5%** (not ~40% estimate)
+
+3. **Wall-clock break-even at 62 MB/s disk bandwidth.**
+   Decompression tops out at ~682 MB/s (single-frame .zst doesn't
+   parallelise). On miner (3 GB/s NVMe), compression **adds 12s per
+   shard cold-load** (15.3s decompress vs 2.8s raw cat). Matias /
+   Lunar Lake similar NVMe — same negative verdict.
+
+4. **Defeats two prior wins:**
+   - Cannot mmap compressed data → loses iter 080 shard-lazy
+     property
+   - Decompressed bytes consume iter 054 expert-pinning RAM headroom
+
+**Where to re-ask (documented in doc):**
+- Raw bf16 source models (`tahoma shard` non-quantised path)
+- Sub-50 MB/s network-backed storage
+- Per-expert seekable-frame format
+- None apply to current K2.6 path
+
+**Pattern:** 9th NEGATIVE this session (049, 053, 062, 064, 067, 082,
+085, 089, 093). ~18% null rate. Investigation-first continues to
+prevent ship-and-regret.
+
+---
+
 ## 092 — Worker heartbeat + auto-recovery — Track B skeleton + design (2026-05-19 ~03:25 PT)
 
 Branch `perf/heartbeat-recovery-092` @ `844b6c2`.
