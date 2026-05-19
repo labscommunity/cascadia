@@ -73,6 +73,72 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 072 — Persistent KV chat session cache — full (A) impl shipped (2026-05-18 ~23:20 PT)
+
+Extends iter 060 prompt-cache to multi-turn chat. Branch
+`perf/session-kv-cache-072` @ `caf759d` (based on iter 060).
+
+**What shipped:**
+
+1. **New `KvSessionCache` module** — LRU keyed by `String` session_id
+   with **byte-budget eviction** (not entry count, since multi-turn
+   snapshots grow). Per-session ownership: turn-N supersedes
+   turn-(N-1). Strict-prefix match required for hits (cached tokens
+   precede current prompt with ≥ 1 new suffix token).
+   ModelFingerprint check evicts stale entries after model reload.
+2. **Runner::generate_with_caches(prompt, max_tokens, cfg,
+   prefix_cache, session_cache, session_id)** — both caches probed
+   independently, **longer match wins**, exactly ONE restore. Session
+   snapshot inserted at END of generation (covers `prompt + generated`
+   so next turn warm-restarts the whole prior history).
+3. `GenerationTask::session_id: Option<String>` in `tahoma-types`
+   with `#[serde(default)]` (wire-compat preserved). Builder
+   `with_session_id`.
+4. **API**: `ChatCompletionRequest::session_id` body field +
+   `X-Session-Id` request header (header wins; empty values fall
+   through to body). `resolve_session_id` helper + 5 unit tests.
+5. CLI: `--session-cache-size-mb N` (default 0). Multi-stage warns +
+   silently disables (same constraint as iter 060).
+
+**Bit-identity tests (load-bearing):**
+- `session_round_trip_matches_full_prefill_bit_identical` — 2-turn
+  session at KV layer: full prefill vs (prefill K, snapshot, restore
+  into fresh buffer, prefill N-K). Every populated K/V slot compared
+  `.to_bits() == .to_bits()` across all heads/dims/slots using real
+  K2.6 dims.
+- `session_round_trip_survives_capacity_grow` — same test crossing
+  one `grow_kv_capacity` doubling (cap 8 → 16)
+- 13 `KvSessionCache` unit tests covering disabled-mode, LRU, byte
+  budget, fingerprint isolation, divergent-prompt eviction, no-suffix
+  exact match handled as miss
+
+**Tests:** sparse-moe lib 47 pass (32 existing + 13 new session + 2
+new runner round-trip), tahoma-api 8 pass (3 existing + 5 new
+resolver), workspace builds clean, fmt + clippy clean.
+
+**Defaults byte-identical to pre-iter-072** — every cache-touching
+branch short-circuits via `.enabled()` when size=0.
+
+**Blockers (out-of-scope, documented):**
+- Multi-stage no-op (same as iter 060). Needs per-stage snapshot
+  exchange frame on `tahoma-transport`
+- No live model test — byte-identity at snapshot/restore layer is
+  the strongest testable without K2.6 weights
+- API session-listing/delete endpoint not wired (low-value vs core
+  warm-restart flow)
+
+**Why this matters for chat:** turn 1 prefills 100 sys + 20 user +
+50 asst → 170 tokens. Turn 2 currently re-prefills all 200 tokens.
+With session cache, restore at position 170 and prefill only the new
+30. **Saves ~75% of per-turn prefill** at typical chat history sizes.
+
+**Workflow note (from agent):** initial edits were in the main
+worktree which got moved mid-stream by another agent — recovered via
+git stash, redid work in assigned worktree.
+[[multi-agent-worktree-coordination]] applies.
+
+---
+
 ## 071 — Intel iGPU OneAPI scoping — SCOPING + skeleton crate shipped (2026-05-18 ~23:05 PT)
 
 Track B+C delivered. Branch `perf/igpu-oneapi-scoping-071` @ `3f8127b`.
