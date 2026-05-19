@@ -569,7 +569,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn make_app() -> Router {
-        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -643,5 +643,143 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_omitting_stream_defaults_to_non_streaming() {
+        // Regression guard: OpenAI clients that never set `stream` must
+        // continue to get a single JSON body. `stream` defaults to false
+        // via `#[serde(default)]` on the bool field.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha"}],
+            "max_tokens": 1,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Non-streaming path returns application/json, not text/event-stream.
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/json"),
+            "expected JSON content-type, got {ct:?}"
+        );
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["object"], "chat.completion");
+    }
+
+    #[tokio::test]
+    async fn chat_completion_stream_emits_openai_sse_format() {
+        // End-to-end SSE shape check. We don't pin token text (the mock
+        // engine echoes prompt words) — we pin the OpenAI envelope:
+        //   - Content-Type: text/event-stream
+        //   - One or more `data: {json}\n\n` frames whose JSON has
+        //     `object: "chat.completion.chunk"` and a `choices[0].delta`
+        //     with role/content + finish_reason on the last chunk.
+        //   - Terminator frame `data: [DONE]\n\n`.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+            "max_tokens": 3,
+            "stream": true,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "text/event-stream",
+            "stream=true must return SSE content-type"
+        );
+        let cache = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cache.contains("no-cache"),
+            "SSE response must disable caching, got {cache:?}"
+        );
+
+        // Collect the full body; the mock engine produces only a handful
+        // of frames so a generous 64 KiB cap is plenty.
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).expect("SSE body must be UTF-8");
+
+        // Frames are separated by the SSE delimiter "\n\n". Split and
+        // drop the trailing empty element from the final delimiter.
+        let frames: Vec<&str> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert!(
+            frames.len() >= 2,
+            "expected at least one data frame plus [DONE], got {frames:?}"
+        );
+        // Last frame must be the OpenAI terminator.
+        assert_eq!(
+            *frames.last().unwrap(),
+            "data: [DONE]",
+            "stream must end with `data: [DONE]\\n\\n`"
+        );
+
+        // Every non-terminator frame must be a `data: <json>` line whose
+        // JSON parses and has the chat.completion.chunk shape.
+        let mut saw_content = false;
+        let mut saw_finish = false;
+        for frame in &frames[..frames.len() - 1] {
+            let payload = frame
+                .strip_prefix("data: ")
+                .unwrap_or_else(|| panic!("frame missing `data: ` prefix: {frame:?}"));
+            let v: Value = serde_json::from_str(payload)
+                .unwrap_or_else(|e| panic!("frame is not JSON ({e}): {payload:?}"));
+            assert_eq!(v["object"], "chat.completion.chunk");
+            assert_eq!(v["model"], "mock-model");
+            let choice = &v["choices"][0];
+            assert_eq!(choice["index"], 0);
+            // delta.role MUST be assistant per OpenAI streaming spec.
+            assert_eq!(choice["delta"]["role"], "assistant");
+            if choice["delta"]["content"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+            {
+                saw_content = true;
+            }
+            if choice["finish_reason"] == "stop" {
+                saw_finish = true;
+            }
+        }
+        assert!(saw_content, "expected at least one chunk with content");
+        assert!(
+            saw_finish,
+            "expected at least one chunk with finish_reason=stop"
+        );
     }
 }
