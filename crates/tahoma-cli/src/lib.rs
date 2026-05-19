@@ -131,6 +131,32 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Enable adaptive early-stop heuristics on generations driven
+    /// through this worker (stop sequences, repetition detection). EOS
+    /// stopping is always on regardless of this flag.
+    ///
+    /// Default true matches the long-standing convention that user-
+    /// supplied stop sequences are honored; the only behavior gated by
+    /// this flag is whether `--stop-on-repetition` and `--stop` even
+    /// take effect when set. Pass `--enable-adaptive-stop=false` to
+    /// preserve the strict "decode until EOS / max-tokens" path.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub enable_adaptive_stop: bool,
+
+    /// Repetition early-stop: if the same 4-gram appears 3+ times in
+    /// the trailing 20-token window, terminate decoding. Opt-in
+    /// because some legitimate outputs include short repeated patterns
+    /// (lists, code).
+    #[arg(long, default_value_t = false)]
+    pub stop_on_repetition: bool,
+
+    /// Stop sequence(s) for stdin mode generations. Can be passed
+    /// multiple times: `--stop "\n\n" --stop "Human:"`. Decoded text
+    /// is matched against the tail of these strings after every
+    /// emitted token.
+    #[arg(long)]
+    pub stop: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -507,6 +533,19 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             continue;
         }
         counter += 1;
+        // Stop sequences and repetition detection are only honored
+        // when --enable-adaptive-stop is on (the default). EOS is
+        // intrinsic and unaffected.
+        let (stop, stop_on_repetition) = if args.enable_adaptive_stop {
+            let s = if args.stop.is_empty() {
+                None
+            } else {
+                Some(args.stop.clone())
+            };
+            (s, args.stop_on_repetition)
+        } else {
+            (None, false)
+        };
         let task = GenerationTask {
             task_id: format!("stdin-{counter}"),
             prompt: line,
@@ -515,6 +554,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             logprobs: 0,
             enable_thinking: false,
             trust_remote_code: false,
+            stop,
+            stop_on_repetition,
         };
         let mut stream = runner.generate(task)?;
         while let Some(chunk) = stream.next().await {

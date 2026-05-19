@@ -203,6 +203,36 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    /// OpenAI-compatible stop field. Accepts either a single string
+    /// (`"\n\n"`) or an array (`["Human:", "\n\n"]`) per the spec; both
+    /// are normalized to `Vec<String>` via [`StopField`].
+    #[serde(default)]
+    pub stop: Option<StopField>,
+    /// Custom field (not OpenAI). When true, the engine adds a
+    /// degenerate-loop n-gram check on the emitted token stream and
+    /// terminates early on a positive match. Defaults to false so
+    /// existing clients see no behavior change.
+    #[serde(default)]
+    pub stop_on_repetition: bool,
+}
+
+/// The OpenAI `stop` field can be a single string or an array of
+/// strings. Both are valid per the API spec; we normalize to
+/// `Vec<String>` in [`StopField::into_vec`].
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum StopField {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopField {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            StopField::One(s) => vec![s],
+            StopField::Many(v) => v,
+        }
+    }
 }
 
 fn default_max_tokens() -> u32 {
@@ -351,6 +381,16 @@ async fn chat_completions(
         )
             .into_response();
     }
+    // Normalize stop: empty arrays and empty strings collapse to None
+    // so the engine's `StopConditions::any()` skips the extra work.
+    let stop = req.stop.clone().map(|s| s.into_vec()).and_then(|v| {
+        let filtered: Vec<String> = v.into_iter().filter(|s| !s.is_empty()).collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    });
     let task = GenerationTask {
         task_id: task_id.clone(),
         prompt,
@@ -359,6 +399,8 @@ async fn chat_completions(
         logprobs: 0,
         enable_thinking: false,
         trust_remote_code: false,
+        stop,
+        stop_on_repetition: req.stop_on_repetition,
     };
 
     // Acquire a request slot before touching the engine. Without this
@@ -643,5 +685,45 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[test]
+    fn stop_field_accepts_single_string() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stop":"\n\n"}"#,
+        )
+        .expect("parse single-string stop");
+        let stops = req.stop.unwrap().into_vec();
+        assert_eq!(stops, vec!["\n\n".to_string()]);
+    }
+
+    #[test]
+    fn stop_field_accepts_array() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stop":["Human:","\n\n"]}"#,
+        )
+        .expect("parse array stop");
+        let stops = req.stop.unwrap().into_vec();
+        assert_eq!(stops, vec!["Human:".to_string(), "\n\n".to_string()]);
+    }
+
+    #[test]
+    fn stop_field_absent_is_none() {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        assert!(req.stop.is_none());
+        assert!(!req.stop_on_repetition);
+    }
+
+    #[test]
+    fn stop_on_repetition_parses() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "stop_on_repetition":true}"#,
+        )
+        .unwrap();
+        assert!(req.stop_on_repetition);
     }
 }
