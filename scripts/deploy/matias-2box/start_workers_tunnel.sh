@@ -11,7 +11,7 @@
 # DERP relay (still <2% of K2.6's per-token decode budget).
 #
 # Usage:
-#   autolab/bench/start_workers_tunnel.sh
+#   scripts/deploy/matias-2box/start_workers_tunnel.sh
 #
 # After return, both workers are launched detached and the tunnels are
 # live. Cold start ~40 min historically; poll http://127.0.0.1:18000/health.

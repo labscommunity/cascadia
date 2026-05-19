@@ -7,7 +7,7 @@
 # connects to 127.0.0.1:9100.
 #
 # Deployed to matias-02:%USERPROFILE%\start_rank0_tunnel.ps1 — invoked by
-# autolab/bench/start_workers_tunnel.sh.
+# scripts/deploy/matias-2box/start_workers_tunnel.sh.
 
 $ov = "$env:USERPROFILE\openvino\openvino_genai_windows_2026.1.0.0_x86_64"
 $env:Path = "$ov\runtime\bin\intel64\Release;$ov\runtime\3rdparty\tbb\bin;$env:Path"
