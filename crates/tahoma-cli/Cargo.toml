@@ -19,6 +19,7 @@ tahoma-engine = { workspace = true }
 tahoma-engine-mock = { workspace = true }
 tahoma-engine-openvino = { workspace = true }
 tahoma-engine-sparse-moe = { workspace = true }
+tahoma-cpu-affinity = { workspace = true }
 tahoma-runner = { workspace = true }
 tahoma-api = { workspace = true }
 tokio = { workspace = true }

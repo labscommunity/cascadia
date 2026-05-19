@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
+use tahoma_cpu_affinity::{self as cpu_affinity, Layout as AffinityLayout};
 use tahoma_engine::Builder;
 use tahoma_engine_mock::MockBuilder;
 use tahoma_engine_openvino::{
@@ -18,7 +19,7 @@ use tahoma_engine_openvino::{
 use tahoma_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use tahoma_runner::Runner;
 use tahoma_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -39,6 +40,21 @@ pub struct Cli {
     /// Logging level (overrides RUST_LOG).
     #[arg(long, default_value = "info", global = true)]
     pub log_level: String,
+
+    /// Per-thread CPU affinity policy. One of:
+    ///
+    /// - `none` (default): the OS scheduler is free to move any
+    ///   thread to any core. Safest on shared / virtualized hosts.
+    /// - `auto`: heuristic split — most cores to rayon, 2 cores for
+    ///   tokio I/O, 1 each for the prefetcher and hot-buffer
+    ///   helpers. Recommended on bare-metal Xeon / Threadripper
+    ///   targets where the kernel migration noise costs measurable
+    ///   tok/s.
+    /// - A spec like `rayon=0-43,tokio=44-45,prefetcher=46,hot-buffer=47`.
+    ///   Any role may be omitted (left unpinned). Spans use `-`,
+    ///   alternates use `|`.
+    #[arg(long, default_value = "none", global = true)]
+    pub cpu_affinity: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -199,11 +215,77 @@ impl ShardQuant {
 
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
+    // CPU affinity layout was already applied by `main()` BEFORE the
+    // tokio runtime spun up its worker threads — re-fetch it from the
+    // process-global slot just to log the summary and keep a handle
+    // for the relay-loop helper to call into.
+    let layout = cpu_affinity::global();
+    info!("{}", layout.describe());
+    if layout.has_overlap() {
+        warn!("cpu-affinity layout has overlapping cores; this is almost certainly a spec typo");
+    }
     match cli.cmd {
         Command::Engines => cmd_engines(),
         Command::Worker(args) => cmd_worker(args).await,
         Command::Shard(args) => cmd_shard(args).await,
     }
+}
+
+/// Plan + install the CPU-affinity layout. Must be called from
+/// `main()` BEFORE building the tokio runtime — once tokio has spun
+/// up workers, calling `tokio::runtime::Builder::on_thread_start` no
+/// longer affects them.
+///
+/// The flow inside `main` looks like:
+///
+/// ```ignore
+/// let cli = Cli::parse();
+/// let (layout, tokio_rt) = tahoma_cli::install_cpu_affinity_and_build_runtime(&cli)?;
+/// tokio_rt.block_on(tahoma_cli::run(cli))
+/// ```
+///
+/// Returns the planned layout (also installed via
+/// `cpu_affinity::init_global`) and a fully built tokio runtime that
+/// will pin each worker thread on spawn (or a vanilla multi-thread
+/// runtime, when the mode is `none`).
+pub fn install_cpu_affinity_and_build_runtime(cli: &Cli) -> Result<tokio::runtime::Runtime> {
+    let mode = cpu_affinity::parse_mode(&cli.cpu_affinity)
+        .with_context(|| format!("--cpu-affinity {:?}", cli.cpu_affinity))?;
+    let online = cpu_affinity::detected_online_cpus().max(1);
+    let layout = AffinityLayout::plan(&mode, online)
+        .with_context(|| format!("planning cpu-affinity for {online} online CPUs"))?;
+
+    // Install the global rayon pool BEFORE any `par_*()` call has had
+    // a chance to lazy-init the default. The CLI itself does no rayon
+    // work, but the engine builders pull in `tahoma-int4-gemm` which
+    // uses rayon on first GEMV. We must beat that.
+    if !layout.unpinned && !layout.rayon_cores.is_empty() {
+        layout
+            .apply_to_rayon_global()
+            .context("installing pinned rayon global pool")?;
+    }
+
+    // Build the tokio runtime, optionally with our on_thread_start.
+    // Tokio's worker count defaults to logical-cpus; when we have a
+    // restricted tokio_cores set, size the worker count to match so
+    // we don't oversubscribe the pinned cores.
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if !layout.unpinned && !layout.tokio_cores.is_empty() {
+        builder.worker_threads(layout.tokio_cores.len());
+        if let Some(start) = layout.tokio_on_thread_start() {
+            builder.on_thread_start(start);
+        }
+    }
+    let rt = builder
+        .build()
+        .context("building tokio runtime with cpu-affinity")?;
+
+    // Stash the planned layout so the engine + relay code can call
+    // `cpu_affinity::global()` to find the prefetcher / hot-buffer
+    // cores when those helpers are spawned.
+    cpu_affinity::init_global(layout);
+    Ok(rt)
 }
 
 fn init_tracing(level: &str) {
@@ -447,9 +529,25 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if !is_first {
         info!("entering relay loop");
         let r = runner.clone();
-        tokio::task::spawn_blocking(move || r.run_relay_loop())
-            .await
-            .ok();
+        tokio::task::spawn_blocking(move || {
+            // The relay-loop thread is a long-lived spawn_blocking
+            // thread that drives the engine forever. Pin it to a
+            // reserved tokio core so it doesn't bounce between
+            // sockets — tokio's spawn_blocking pool is separate
+            // from its worker pool and is NOT covered by
+            // `Runtime::on_thread_start`, so we pin from inside
+            // the closure ourselves. No-op when --cpu-affinity is
+            // `none`. We borrow the first reserved tokio core; the
+            // tokio reactor's *other* worker thread is happy on
+            // the second one.
+            let layout = cpu_affinity::global();
+            if let Some(&core) = layout.tokio_cores.first() {
+                cpu_affinity::pin_current_thread(core);
+            }
+            r.run_relay_loop()
+        })
+        .await
+        .ok();
         return Ok(());
     }
 
