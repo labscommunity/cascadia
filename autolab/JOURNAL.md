@@ -73,6 +73,48 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 082 — Selective recomputation — INVESTIGATION ONLY (correct skip) (2026-05-19 ~01:15 PT)
+
+Path C only — investigation showed not worth doing. Branch
+`perf/selective-recomp-082` @ `68c1522`.
+
+**Verdict:** KV cache is NOT the bottleneck for K2.6 on current
+target hardware. Disk-bound expert dispatch dominates.
+
+**What shipped:**
+- `docs/architecture/selective-recomputation.md` — 174-line
+  investigation doc with the math, bottleneck attribution from
+  prior research, and 3 conditions to reopen
+- **No code change. No skeleton.**
+
+**Key findings (verified against codebase + autolab JOURNAL):**
+1. K2.6 MLA: 64 heads × (192 K + 128 V) × 60 layers; bf16 (iter 032)
+   = **2.4 MB/tok**, f32 (main) = 4.8 MB/tok
+2. KV = **0.5-1% of 133 GB miner RAM** at mt=256, ~3-4% at 1024.
+   Disk-paged experts dominate.
+3. Three measurements from research log:
+   - iter 044: 94% of shell cost is expert dispatch
+   - iter 064: SDPA is ~3% of decode at past_seq_len~64
+   - iter 062: int4 KV already lost the "save KV bandwidth, pay
+     more compute" trade by 5-9% — selective recomp pays
+     MILLISECONDS per skipped layer (q_a + q_b + kv_a + kv_b +
+     RoPE + RMSNorms) vs int4's nanoseconds per dequanted row.
+     **Strictly worse trade.**
+
+**Conditions to revisit:**
+- (a) Experts fully resident in RAM post pipeline-parallel sharding
+- (b) Context length ≥ 16K tokens
+- (c) Expert-dispatch ceiling broken (e.g. iter 051 actually ships
+  and measures)
+
+None currently hold.
+
+**Pattern reinforced:** investigate first. iter 082 is the 6th
+NEGATIVE this session (049, 053, 062, 064, 067, 082). Healthy
+~15% null rate proves the loop has rigor.
+
+---
+
 ## 080 — Lazy expert weight load — DISCOVERY: already shard-lazy (skeleton + mmap profiler shipped) (2026-05-19 ~01:00 PT)
 
 Third "verify before implementing" discovery this session. Branch
