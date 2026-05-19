@@ -73,6 +73,51 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 086 — Tokenizer cache for common prompts — full (A) impl (2026-05-19 ~02:15 PT)
+
+Skip re-tokenizing repeated system prompts. Branch
+`perf/tokenizer-cache-086` @ `a407c46`.
+
+**What shipped:**
+- New `tokenizer_cache.rs` (424 lines incl 11 tests)
+- `TokenizerCache` struct mirrors iter 060 KvPrefixCache pattern: LRU,
+  capacity-bounded
+- **Hash:** std `DefaultHasher` (SipHash) — no new workspace dep
+- **Key:** `(prompt_text, add_special_tokens, tokenizer_fingerprint)`;
+  full key re-compared on hit to defend against hash collisions
+- **Fingerprint:** digest of raw `tokenizer.json` bytes computed
+  once at engine load. **Model swap silently invalidates stale
+  entries** (cache-invalidation constraint)
+- LRU: VecDeque-backed (front=MRU, back=LRU). At realistic caps
+  ≤128, O(n) scan is sub-µs
+- Default off: capacity=0 returns None on every get and no-op insert
+  — pre-iter-086 behavior byte-identical
+- Worker ranks always construct capacity-0 cache (only rank 0
+  encodes) — uniform struct layout
+- CLI: `--tokenizer-cache-size N` flag (default 0)
+
+**Tests (11 new, 39 sparse-moe total):**
+- `same_prompt_twice_hits_second_time` (brief-mandated)
+- 10 others covering: hash collision recovery, fingerprint
+  invalidation, LRU promotion, eviction, capacity=0 disabled, MRU
+  preservation, etc.
+
+`cargo fmt --check` clean; `cargo clippy --no-deps` clean on new
+code.
+
+**Operational note (honest):** worktree path confusion caught
+mid-session (initially cd'd into wrong worktree on
+`perf/io-uring-prefetch-074`). Cleaned via `git checkout --` leaving
+that worktree untouched, re-applied changes via patch in correct
+agent worktree. `multi-agent-worktree-coordination` memory continues
+to apply.
+
+**Composes with iter 060 + 072 + 084:** all four caches now in
+place (prompt KV in-mem + session KV in-mem + persistent KV disk +
+tokenizer text→ids). Cold start = warm start when all enabled.
+
+---
+
 ## 084 — Persistent prompt cache (disk persistence) — full (A) impl (2026-05-19 ~02:00 PT)
 
 Extends iter 060's in-memory KvPrefixCache to disk. Branch
