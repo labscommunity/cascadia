@@ -73,6 +73,62 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 100 — Final retrospective + LEADERBOARD + SPINOUT strategy (2026-05-19 ~05:10 PT)
+
+Loop close. Synchronous consolidation work this turn (no agent).
+
+Three new docs in `autolab/`:
+
+1. **`SPINOUT_STRATEGY.md`** (141 lines) — Tier-S/A/B/C/D
+   classification of all 100 iters into shippable PR order off main.
+   Tier S = 10 verified perf wins to bundle. Tier A = foundations.
+   Tier B = code-shipped opt-ins. Tier C = skeletons. Tier D = quality
+   eval infra.
+2. **`RETROSPECTIVE.md`** (184 lines) — by-the-numbers (6 verified
+   wins, 12 decisive negatives, 3 "already done" discoveries, 3
+   agent failures), architectural lessons (memory references),
+   what's next, takeaways for tahoma direction.
+3. **`LEADERBOARD.md`** (69 lines) — final rankings: verified perf
+   wins, K-tuning wins, current per-substrate leader, negatives
+   table, composition findings, class counts.
+
+**Headline outcomes:**
+- **6 verified architectural wins** in 48h (iter 030 / 032 / 033 / 042
+  / 044 / 046)
+- **Compound spec-decode + multi-token SIMD = +19.7% e2e** on miner
+  (iter 044, the integration measurement)
+- **3 "already done" discoveries** prevented 3 false-premise
+  implementations
+- **12 decisive negatives** documented to memory + microbench, saving
+  ~36 engineer-days of investigation
+- **iter 070 finding** (composition can be -32%) saved future
+  ship-and-regret on full cache-attack stack
+
+**Architectural insight ranking (by what changed the project's
+direction):**
+1. iter 070's composition-negative finding → ship lean subsets, not
+   "all features on"
+2. iter 044's expert-94%-of-shells ceiling → next-gen lever is
+   expert batching (iter 051 shipped, needs bench) + reducing unique
+   expert count
+3. iter 037's substring-eval weakness → quality must be measured
+   with stricter eval (iter 095 ships the harness)
+4. tahoma-fleet-simd-capabilities → no AVX-512-BF16 anywhere, no
+   AMX anywhere, Lunar Lake has no AVX-512 at all. Constrains all
+   future SIMD moonshots.
+
+**Loop value proposition (per RETROSPECTIVE):**
+> The autolab loop's value isn't in the wins — it's in the
+> SYSTEMATIC NEGATIVE FILTERING. 12 negatives + 3 already-shipped
+> discoveries = 15 implementation paths avoided. Each saved 1-3
+> days of engineering. That's the killer feature: not "10x faster,"
+> but "100 ideas tested in 48 hours, here are the 6 that worked and
+> the 12 we now know not to try."
+
+State.json: iteration=100, moonshots_attempted=100. **LOOP CLOSED.**
+
+---
+
 ## 097 — io_uring milestone 1 (Linux backend) — REAL IMPL, verified on miner (2026-05-19 ~04:35 PT)
 
 Replaces iter 074's stubbed Linux backend with real

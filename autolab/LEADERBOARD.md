@@ -1,47 +1,69 @@
 # LEADERBOARD — autolab/k26-perf
 
-Best result per topology. Updated whenever a verified win lands.
+Updated at iter 100 close (2026-05-19).
 
-## 1-box (miner, Xeon Gold 6252, 133 GB RAM)
+## Verified perf wins (ranked by measured tok/s impact)
 
-| Rank | tok/s | Config | Date | Campaign |
-|-----:|------:|--------|------|----------|
-| 1 | **0.3253** | **A3: --top-k-override 4, max_tokens=64** (9/10 quality, peak prompt 0.45 tok/s, ~3-5× K=8 in production-realistic workloads) | 2026-05-17 | [011_a3_k4_longcontext](experiments/011_a3_k4_longcontext/) |
-| 2 | 0.2100 | A3: --top-k-override 4, max_tokens=16 (9/10 quality, +146% vs K=8) | 2026-05-17 | [009](experiments/009_a3_robustness_10prompt/) |
-| 2 (narrow) | 0.3050 | A3: --top-k-override 3 — **6/10 on 10-prompt** (was 3/3 on narrow eval, +258% raw); demoted from leader after robustness check | 2026-05-17 | 009 |
-| 3 | 0.1667 | A3: --top-k-override 4, 3-prompt narrow (3/3) | 2026-05-17 | [006](experiments/006_a3_topk_sweep/) |
-| 3 | 0.1547 | A3: --top-k-override 5 (3/3 quality, +94% vs K=8) | 2026-05-17 | 008 |
-| 4 | 0.1116 | A3: --top-k-override 6 (3/3 quality, +40% vs K=8) | 2026-05-17 | [005](experiments/005_a3_topk_miner/) |
-| 5 | 0.0797 | K2.6 top-8 baseline (3/3 quality) | 2026-05-17 | 005 K=8 reference |
-| (excl) | 0.2716 | A3 K=2 — +241% but 2/3 quality (substring fail on "four") | 2026-05-17 | 006 K=2 cliff probe |
-| - | ~0.11 | (historical) main @ 208104e single-stage from PR #7 | 2026-05-16 | (older reference) |
+| Rank | Iter | Win | tok/s impact | Quality | Branch |
+|-----:|-----:|-----|-------------|---------|--------|
+| 1 | 044 | Compound spec-decode | **+19.7% e2e** (0.1899 vs 0.1587 baseline), 1.27× per-prompt, 1.41× paired | 9/10 substring | perf/spec-decode-compound-044 |
+| 2 | 046 | Row-blocked AVX-512 oproj | +40% over iter 042 at seq=4-16 (1.41× at seq=4 = 1.84× scalar) | bit-identical | perf/oproj-amx-or-avx512-blocked-046 |
+| 3 | 042 | AVX-512 multi-token tile | 1.4-4.75× per K2.6 projection at seq=4-16 (peak 4.75× shared_down) | bit-identical | perf/int4-multi-token-avx-vnni-042 |
+| 4 | 033 | C1 expert prefetch (Linux) | +26.8% A/B under 3-worker contention | n/a (no substring eval in A/B) | perf/c1-expert-prefetch-029 |
+| 5 | 032 | A8 KV bf16 | ~2.1× attention kernel (687ms vs 1456ms), KV mem halved | 3/3 substring | perf/a8-kv-bf16-029 |
+| 6 | 030 | Matias 2-box revival | 0.0770 tok/s K=8 (vs iter 000 baseline 0.0553) | 9/10 substring | infra/matias-2box-revival-029 |
 
-## 2-box (matias-02 + matias-03, Lunar Lake 258V × 2, Tailscale DERP)
+## K-tuning wins (early iters, pre-pivot; productionized as PR #29)
 
-| Rank | tok/s | Config | Date | Campaign |
-|-----:|------:|--------|------|----------|
-| 1 | **0.0553** | main @ 208104e, 30/30 split, fp32 KV, K=1, F32 hidden wire | 2026-05-17 | [000_baseline_main](campaigns/000_baseline_main.yaml) |
+| Iter | Setting | tok/s | Quality | Notes |
+|-----:|---------|------:|--------|-------|
+| 011 | K=4 mt=64 chat | 0.3253 | 9/10 | Throughput-max single-stage |
+| 021 | K=6 mt=64 chat | 0.1587 | 10/10 | Universal default (PR #29) |
+| 024 | K=6 mt=128 | 0.1713 | 3/3 | Sustained long-context |
+| 025 | K=4 mt=128 | 0.3209 | 3/3 | Long-context throughput-max |
 
-### Per-prompt detail (campaign 000)
+## Current per-substrate leader (chat-quality-preserving)
 
-| Prompt | wall (s) | tok | tok/s | quality |
-|--------|---------:|----:|------:|---------|
-| Paris       | 123.06 | 8 | **0.065** | ✓ paris   |
-| Pacific     | 170.09 | 8 | **0.047** | ✓ pacific |
-| four        | 140.93 | 8 | **0.057** | ✓ four    |
-| **AGG**     | **434.09** | **24** | **0.055** | **3/3** |
+- **miner single-stage:** iter 044 compound = 0.202 tok/s per-prompt
+  mean (K=6, mt=64, --prompt-lookup 3 --spec-k 4)
+- **miner single-stage throughput-max:** iter 025 K=4 mt=128 =
+  0.3209 tok/s (3/3 quality, deterministic chat)
+- **matias 2-box:** iter 030 = 0.0770 tok/s (K=8, mt=32, SSH-tunnel
+  chain). Tailscale stayed dead; revivable via tunnel.
 
-## 3-box (matias-02 + 03 + extra cascadia box) — staging required
+## Verified architectural negatives (decisive skip)
 
-(no entries yet)
+| Iter | What | Why |
+|-----:|------|-----|
+| 049 | bf16 inter-layer hidden | Compiler auto-vectorizes inline; 0.00007% theoretical saving |
+| 053 | Fused RMSNorm+QKV | RMSNorm is 0.4% of unfused; fits L1d already |
+| 055 | int4 router | Already shipped in PR #7 (verify-before-implement) |
+| 062 | int4 KV (scalar) | Dequant cost > bandwidth savings; 5-9% SLOWER |
+| 064 | Native bf16 SDPA | Upconvert ≤4%; AVX-512-BF16 not in fleet |
+| 067 | Fast sampling | 0.0024% of decode at K2.6 rates |
+| 079 | SSE streaming | Already shipped (verify-before-implement) |
+| 080 | Lazy expert load | Already shard-lazy (verify-before-implement) |
+| 082 | Selective recomputation | KV is 0.5-1% of miner RAM |
+| 085 | Sparse softmax | Router is sigmoid not softmax; 0.0002% |
+| 089 | SSE aggregator | 880ns/frame = 0.0000098% of decode |
+| 093 | zstd expert storage | 1.15× ratio (not 1.4-1.8×); +12s cold load |
 
-## Hardware ceilings (empirical, for context)
+## Composition findings
 
-| Hardware | Read BW | K2.6 ceiling | Source |
-|----------|--------:|-------------:|--------|
-| Miner DDR4-2133 5-ch | 58 GB/s | ~3.5 tok/s | [[PRIOR_ART]] |
-| Matias LPDDR5-6400 | ~50 GB/s* | ~3.0 tok/s* | *estimated, needs measurement |
-| Sapphire Rapids HBM | ~800 GB/s | ~48 tok/s | spec |
-| Gaudi 3 / Gaudi 2 | ~3.7 TB/s | reframes problem | spec |
+- iter 070: **Full 7-feature cache-attack stack = -32% on miner.**
+  Prefetch contention + RAM pressure on demand-path. Lean subset
+  (drop iter 057, lower prefetch-n) recommended.
+- iter 063: Lookahead decoding (iter 061) = -1.6% on factoid prompts
+  (per-prompt 7/10 wins, but aggregate dragged by anomaly).
+  Workload-dependent.
 
-(`*` = needs explicit measurement campaign — add as moonshot if not yet done)
+## Class counts (state.json)
+
+| Class | Count |
+|-------|------:|
+| win (verified perf) | 6 architectural + early K-tuning |
+| neutral / foundation | ~35 |
+| negative (decisive) | 12 |
+| already-shipped discovery | 3 |
+| agent failure | 3 |
+| **total** | 100 |
