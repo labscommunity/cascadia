@@ -56,7 +56,7 @@ after an 8-token warmup window.
 | iter 021 baseline (K=6, no opt-ins)               | 0.1587 | 10/10 | —      | reference |
 | iter 070 full 7-stack (prompt 1 only, abandoned)  | 0.1108 | pass  | -30.1% | the regression we want to avoid |
 | 073-A pin only                                    | 0.1492 | 10/10 | -6.0%  | hit-rate 43.5%, pinned 22.7 GB |
-| 073-B pin + cache-aware dispatch                  | TBD    | TBD   | TBD    | |
+| 073-B pin + cache-aware dispatch                  | 0.1477 | 10/10 | -6.9%  | reorder neutral, same hit-rate 43.5% as A |
 | 073-C pin + dispatch + hot-buffer                 | TBD    | TBD   | TBD    | |
 | 073-D pin + dispatch + hot-buffer + light prefetch | TBD    | TBD   | TBD    | |
 | 073-E pin + dispatch + hot-buffer + prefill-hint  | TBD    | TBD   | TBD    | |
