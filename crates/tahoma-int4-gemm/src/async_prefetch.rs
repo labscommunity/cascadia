@@ -146,7 +146,11 @@ impl AsyncReadHandle {
     /// Test-only: block until ready. Production code should poll
     /// `is_ready` and not wait — the whole point of async prefetch is
     /// to not stall the dispatcher.
-    #[cfg(test)]
+    ///
+    /// Gated to non-Linux because only the fallback-path test on
+    /// non-Linux dev machines calls it; the Linux test in this module
+    /// has its own bounded-spin wait with a 5s panic cap.
+    #[cfg(all(test, not(target_os = "linux")))]
     fn wait_blocking(&self) {
         while !self.is_ready() {
             std::thread::yield_now();
@@ -575,12 +579,8 @@ mod linux {
         // try_init before the ring is shared with any other thread.
         unsafe {
             let mut sq = ring.submission_shared();
-            sq.push(&sqe).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("NOP probe SQE push failed: {e:?}"),
-                )
-            })?;
+            sq.push(&sqe)
+                .map_err(|e| io::Error::other(format!("NOP probe SQE push failed: {e:?}")))?;
         }
         ring.submit_and_wait(1).map_err(|e| {
             io::Error::new(e.kind(), format!("NOP probe submit_and_wait failed: {e}"))
@@ -593,22 +593,18 @@ mod linux {
         match cq.next() {
             Some(cqe) => {
                 if cqe.user_data() != PROBE_TOKEN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "NOP probe CQE user_data mismatch: got {:#x} want {:#x}",
-                            cqe.user_data(),
-                            PROBE_TOKEN
-                        ),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "NOP probe CQE user_data mismatch: got {:#x} want {:#x}",
+                        cqe.user_data(),
+                        PROBE_TOKEN
+                    )));
                 }
                 if cqe.result() < 0 {
                     return Err(io::Error::from_raw_os_error(-cqe.result()));
                 }
                 Ok(())
             }
-            None => Err(io::Error::new(
-                io::ErrorKind::Other,
+            None => Err(io::Error::other(
                 "NOP probe: no CQE returned after submit_and_wait(1)",
             )),
         }
