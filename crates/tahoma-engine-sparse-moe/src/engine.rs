@@ -42,6 +42,13 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// Hot-expert buffer size (top-N hot experts packed contiguously
+    /// per layer). `0` disables the feature. See
+    /// `tahoma_engine_sparse_moe::hot_buffer` for the memory trade-off.
+    pub hot_expert_buffer_n: u32,
+    /// Number of dispatches to record before building the hot buffer.
+    /// Defaults to 1500 (about 3 tokens at top_k=8, 60 layers).
+    pub hot_expert_warmup_dispatches: u64,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +60,20 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            hot_expert_buffer_n: 0,
+            hot_expert_warmup_dispatches: 1500,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    pub fn with_hot_expert_buffer(mut self, n: u32, warmup_dispatches: u64) -> Self {
+        self.hot_expert_buffer_n = n;
+        self.hot_expert_warmup_dispatches = warmup_dispatches;
         self
     }
 }
@@ -207,16 +222,22 @@ impl Builder for SparseMoEBuilder {
         let cfg = self.config.clone();
         let plugin_for_worker = plugin.clone();
         let range_for_worker = range.clone();
+        let hot_n = cfg.hot_expert_buffer_n as usize;
+        let hot_warmup = cfg.hot_expert_warmup_dispatches;
         let (tx, rx) = std::sync::mpsc::channel();
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
             tx.send(LoadProgress::message("loading sparse-MoE model"))
                 .ok();
-            Runner::load(
+            let mut r = Runner::load(
                 cfg.model_dir.clone(),
                 &cfg.device,
                 plugin_for_worker,
                 range_for_worker,
-            )
+            )?;
+            if hot_n > 0 {
+                r.set_hot_expert_buffer_config(hot_n, hot_warmup);
+            }
+            Ok(r)
         });
 
         let runner = match join.join() {

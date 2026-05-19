@@ -131,6 +131,18 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Hot-expert buffer size (sparse-moe only): pack the top-N
+    /// most-frequently-fired experts per layer into a contiguous
+    /// owned buffer for L3-friendly dispatch. `0` (default) disables.
+    /// Memory cost ~= N × 25 MiB × layers_on_this_rank.
+    #[arg(long, default_value_t = 0)]
+    pub hot_expert_buffer_n: u32,
+
+    /// Number of expert dispatches to record before the hot buffer
+    /// is built (sparse-moe only). Default 1500 ≈ 3 K2.6 tokens.
+    #[arg(long, default_value_t = 1500)]
+    pub hot_expert_warmup_dispatches: u64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -320,6 +332,12 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 .with_rank(args.rank, args.total);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
+            }
+            if args.hot_expert_buffer_n > 0 {
+                cfg = cfg.with_hot_expert_buffer(
+                    args.hot_expert_buffer_n,
+                    args.hot_expert_warmup_dispatches,
+                );
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }

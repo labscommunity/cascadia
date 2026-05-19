@@ -28,6 +28,7 @@ use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
 use tracing::{debug, info};
 
+use crate::hot_buffer::{ExpertHits, LayerHotBuffer};
 use crate::manifest::{Manifest, ManifestError};
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
@@ -201,6 +202,11 @@ impl LayerRange {
     }
 }
 
+/// Per-layer hot-expert buffer state. None means feature is disabled
+/// for this layer (either globally disabled via `hot_expert_buffer_n == 0`
+/// or we haven't built it yet — see `hot_buffers_built`).
+type HotBufferMap = HashMap<u32, LayerHotBuffer>;
+
 /// Main inference runner.
 pub struct Runner {
     pub manifest: Manifest,
@@ -217,6 +223,27 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// Per-(layer, expert) dispatch counts. Always populated; cheap
+    /// (HashMap update per expert call). Used to compute the top-N
+    /// hot set when the buffer is built.
+    expert_hits: ExpertHits,
+    /// Number of hot experts to pack per layer. `0` disables the
+    /// feature entirely (the hit map is still tracked but no buffer
+    /// is built).
+    hot_expert_buffer_n: usize,
+    /// Build the hot buffer once `expert_hits.total >= warmup_dispatches`.
+    /// Defaulted to 1 full forward pass per layer; the CLI exposes the
+    /// raw token threshold via `--hot-expert-warmup-tokens`.
+    hot_buffer_warmup_dispatches: u64,
+    /// Layer-to-hot-buffer map. Only populated for layers held by this
+    /// rank, only after warmup, and only when feature is enabled.
+    /// Dispatch checks `hot_buffers.get(&lid)?.slice(eid)` first; misses
+    /// fall through to the mmap source.
+    hot_buffers: HotBufferMap,
+    /// Latched flag: once we've built the hot buffer set, we don't
+    /// rebuild it (would be a waste — distribution stabilizes fast).
+    /// Reset only by `reset_hot_buffer` for tests.
+    hot_buffers_built: bool,
 }
 
 impl Runner {
@@ -392,7 +419,80 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            expert_hits: ExpertHits::new(),
+            hot_expert_buffer_n: 0,
+            // Default: ~3 full forward passes' worth of dispatches
+            // before we trust the distribution. K2.6 fires
+            // n_layers × top_k = 60 × 8 = 480 experts per token, so
+            // the default 1500-dispatch warmup is ~3 tokens. Override
+            // via `set_hot_expert_buffer_config`.
+            hot_buffer_warmup_dispatches: 1500,
+            hot_buffers: HotBufferMap::new(),
+            hot_buffers_built: false,
         })
+    }
+
+    /// Configure the hot-expert buffer.
+    ///
+    /// - `n` == 0: disabled (the default). The hit map is still tracked
+    ///   so per-layer top-N counts are available for inspection, but
+    ///   no buffer is built and dispatch always uses the mmap source.
+    /// - `n` > 0: after `warmup_dispatches` total expert dispatches,
+    ///   build a hot buffer per layer containing the top-`n` experts.
+    ///   Memory cost is `n × per-expert-bytes × n_layers_on_this_rank`
+    ///   (~25 MiB per expert per layer for K2.6).
+    pub fn set_hot_expert_buffer_config(&mut self, n: usize, warmup_dispatches: u64) {
+        self.hot_expert_buffer_n = n;
+        self.hot_buffer_warmup_dispatches = warmup_dispatches;
+        // Reset latch so a re-config takes effect on the next dispatch
+        // after the new warmup threshold is reached.
+        self.hot_buffers.clear();
+        self.hot_buffers_built = false;
+    }
+
+    /// Inspect the per-(layer, expert) dispatch hit counts. Useful
+    /// for benchmarks and the `/v1/debug` introspection surface (not
+    /// yet wired up — exposed for tests + future work).
+    pub fn expert_hits_total(&self) -> u64 {
+        self.expert_hits.total
+    }
+
+    /// Build the per-layer hot buffers from the current dispatch
+    /// histogram. Called automatically inside `dispatch_expert` once
+    /// the warmup threshold is crossed; exposed publicly so callers
+    /// (e.g. tests) can force a build at a known point.
+    pub fn build_hot_buffers_now(&mut self) -> Result<(), RunnerError> {
+        if self.hot_expert_buffer_n == 0 {
+            return Ok(());
+        }
+        let n = self.hot_expert_buffer_n;
+        // Only build for layers this rank actually holds — building
+        // a buffer for a layer we don't dispatch is wasted memory.
+        let lids_held: Vec<u32> = self.layers.iter().map(|l| l.lid).collect();
+        let mut total_bytes: usize = 0;
+        for lid in lids_held {
+            // Skip layers with no recorded hits — they likely had no
+            // chance to fire yet (e.g. distribution is heavily skewed
+            // toward the early shells in a short warmup). Building a
+            // hot buffer with the first N numeric eids would just
+            // burn memory on a wild guess.
+            let top = self.expert_hits.top_n_for_layer(lid, n);
+            if top.is_empty() {
+                continue;
+            }
+            let lhb = LayerHotBuffer::build(&self._safetensors_source, lid, &top)
+                .map_err(|e| RunnerError::Internal(format!("hot buffer L{lid}: {e}")))?;
+            total_bytes += lhb.bytes();
+            self.hot_buffers.insert(lid, lhb);
+        }
+        self.hot_buffers_built = true;
+        info!(
+            n = n,
+            layers_built = self.hot_buffers.len(),
+            bytes_mib = (total_bytes as f64) / (1024.0 * 1024.0),
+            "hot expert buffers built"
+        );
+        Ok(())
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -405,6 +505,49 @@ impl Runner {
         attn_row: &[f32],
     ) -> Result<Vec<f32>, RunnerError> {
         let hidden = self.manifest.hidden_size as usize;
+        // Record the hit before dispatch so build_hot_buffers_now sees
+        // the very last dispatch that crossed the warmup threshold.
+        self.expert_hits.record(lid, eid);
+
+        // Lazy hot-buffer build: once we've crossed the warmup
+        // threshold we copy the per-layer top-N into contiguous owned
+        // memory. After that, dispatches to a hot eid go through the
+        // packed buffer instead of the mmap.
+        if self.hot_expert_buffer_n > 0
+            && !self.hot_buffers_built
+            && self.expert_hits.total >= self.hot_buffer_warmup_dispatches
+        {
+            self.build_hot_buffers_now()?;
+        }
+
+        // Hot path: only valid for the int4 kernel backends. OV IR
+        // path runs through OpenVINO which doesn't share the
+        // gate/up/down byte layout, so the hot buffer is a no-op for
+        // it. Skip the lookup if we know it'll miss.
+        let use_hot_path = matches!(
+            self.experts,
+            ExpertCache::Int4Bin(_) | ExpertCache::SafetensorsBin(_)
+        );
+        if use_hot_path && self.hot_buffers_built {
+            if let Some(lhb) = self.hot_buffers.get(&lid) {
+                if let Some(view) = lhb.slice(eid) {
+                    let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+                    let mut out_bf16 = vec![bf16::ZERO; hidden];
+                    int4_expert_forward(
+                        &x_bf16,
+                        view.gate_packed,
+                        view.gate_scale,
+                        view.up_packed,
+                        view.up_scale,
+                        view.down_packed,
+                        view.down_scale,
+                        &mut out_bf16,
+                    );
+                    return Ok(out_bf16.iter().map(|b| b.to_f32()).collect());
+                }
+            }
+        }
+
         match &mut self.experts {
             ExpertCache::OvIr(c) => {
                 let attn_bf16 = f32_to_bf16_bytes(attn_row);

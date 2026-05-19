@@ -38,6 +38,7 @@
 
 pub mod dist;
 pub mod engine;
+pub mod hot_buffer;
 pub mod manifest;
 pub mod runner;
 pub mod sampling;
