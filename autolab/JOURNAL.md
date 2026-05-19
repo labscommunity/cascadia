@@ -73,6 +73,66 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 065 — Static schedule precompute from prefill — IMPL SHIPPED (2026-05-18 ~21:35 PT)
+
+Closes the warmup gap: decode iter 1 now starts with `expert_hits`
+already populated from prefill observations. Branch
+`perf/prefill-hint-schedule-065` @ `3a27145` (based on iter 057,
+which carries 047 + 054 + 056 + 057 stack).
+
+**What shipped:**
+- `prefill_expert_observations: Vec<HashMap<u32, u64>>` per-layer
+  observation map
+- `prefill_hint_weight: f32` (clamps NaN/inf/negative to 0.0)
+- `in_prefill: bool` gate
+- API: `set_prefill_hint_weight`, `enter_prefill`,
+  `exit_prefill_and_merge_hints() -> usize`,
+  `prefill_expert_observations_snapshot()`
+- `forward_shells` Phase-1 hit bump routes to obs map when
+  `in_prefill && weight > 0.0`, else to `expert_hits` (preserves
+  iter 054 bit-for-bit when disabled)
+- Pure helper `merge_prefill_observations_into_hits(hits, obs, w)`:
+  `hits[i][eid] += round(w * obs_count)` saturating u64 add; skips
+  sub-rounding contributions to avoid phantom zero entries
+- `Runner::generate` brackets prefill loop with enter/exit
+- `reset_kv` clears observations + gate
+- Distributed: rank-0 brackets; worker ranks bump `expert_hits`
+  directly (open follow-up — needs `FrameKind::Prefill/Decode`
+  marker in transport)
+- CLI: `--prefill-hint-weight W` (default 0 = disabled = back-compat)
+
+**Tests (10 new, 50 total sparse-moe pass):**
+- `prefill_firing_l30_e42_produces_hint_count_change` — spec test:
+  `obs[30][42] = 8`, weight 0.5 ⇒ `hits[30][42] = 4`, other layers
+  empty
+- `merge_with_zero_weight_is_a_noop` (back-compat)
+- `merge_with_unit_weight_copies_observations_into_hits`
+- `merge_adds_on_top_of_existing_hits` (ADDs, not overwrites)
+- `merge_preserves_heavy_tail_shape_relative_ordering` (top-N still
+  ranks hot head correctly)
+- `merge_with_empty_observations_merges_nothing`
+- `merge_with_invalid_weight_is_a_noop` (NaN/inf/negative)
+- `merge_rounds_to_nearest_not_truncate` (1×0.5 = 1)
+- `merge_skips_sub_rounding_contributions` (1×0.1 = 0 no insert)
+- `merge_tolerates_length_mismatch_without_panic`
+
+`cargo fmt` clean; clippy same as iter 057 baseline (no new lints).
+
+**Open follow-up:** distributed worker ranks (rank > 0) need
+`FrameKind::Prefill / Decode` marker through `tahoma-transport::dist`
+so they bracket prefill correctly. Single-stage killer-demo path is
+fully covered.
+
+**Composes with the full cache-attack stack:**
+1. iter 033 C1 prefetch (RAM)
+2. iter 047 better predictor (top-N pre-softmax)
+3. iter 054 pinning (hot set never paged)
+4. iter 056 cache-aware dispatch (L3 stable)
+5. iter 057 speculative cross-layer prefetch
+6. **iter 065 prefill-hint seeding (THIS — fixes cold-start window)**
+
+---
+
 ## 064 — Native bf16 SDPA — NEGATIVE (decisive microbench + hardware unavailable) (2026-05-18 ~21:20 PT)
 
 Honest negative via path (B) bench-first. Branch
