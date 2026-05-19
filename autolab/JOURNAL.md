@@ -73,6 +73,54 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 080 — Lazy expert weight load — DISCOVERY: already shard-lazy (skeleton + mmap profiler shipped) (2026-05-19 ~01:00 PT)
+
+Third "verify before implementing" discovery this session. Branch
+`perf/lazy-expert-load-080` @ `3ff9c43`.
+
+**Headline finding (verbatim agent):**
+> `SafetensorsExpertSource::open` already constructs an empty
+> `shards: HashMap<String, Arc<Shard>>` — no shard is mmap'd until a
+> tensor that lives in it is first requested (see `shard_for` at
+> `safetensors_source.rs:170`). At process start the VMA cost is
+> zero. The eager mmap claim in the prompt doesn't match the
+> existing code. Local smoke-test confirms: `after_open` row shows
+> `shards=0, vma_mb=0.0`.
+
+Shard-level lazy loading is already there. Per-expert (finer-grained)
+lazy loading is a hypothetical further win that agent didn't ship
+without miner measurement.
+
+**What shipped (B + C):**
+- `OpenOptions { lazy_load: bool }` + `open_with_options`
+  constructor (skeleton — flag reserved for future per-tensor mode,
+  doesn't gate any code path today)
+- Instrumentation on `SafetensorsExpertSource`: `lazy_load()`,
+  `shards_mapped()`, `shard_bytes_mapped()`, `tensor_names()`,
+  `Shard::mmap_len()`
+- New bin `bin/mmap_profile.rs` (Linux + macOS) with 4 modes
+  (`shells`, `all-experts`, `all-tensors`, `populate`) printing
+  tab-separated `(stage, secs, shards, vma_mb, rss_mb, vmsize_mb)`
+  rows. **`populate` mode actually faults every page so RSS
+  reflects real residency.**
+
+**What was NOT shipped:** no change to mmap behavior. Honest read:
+on modern Linux with overcommit, OS mmap policy is almost certainly
+already free for our workload. (A) — per-expert eviction or
+per-tensor lazy faulting — should not ship without populate-stage
+numbers from the miner.
+
+**Workspace:** `cargo build --workspace`, `cargo fmt --check`,
+`cargo test -p tahoma-int4-gemm --lib` all pass. Clippy clean on new
+code.
+
+**Pattern (3rd occurrence this session):** iter 055 router (already
+int4 in production), iter 079 SSE streaming (already shipped), iter
+080 mmap (already shard-lazy). The autolab loop has ~20% "already
+done" rate. Verify before implementing is the right default.
+
+---
+
 ## 079 — SSE output streaming — DISCOVERY: already implemented (regression coverage added) (2026-05-19 ~00:50 PT)
 
 Branch `perf/sse-streaming-079` @ `9dfe04b`.
