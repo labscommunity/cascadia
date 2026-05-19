@@ -73,6 +73,60 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 091 — KV migration between ranks — Track B skeleton + design doc (2026-05-19 ~03:00 PT)
+
+Substantial Track B for failover + hot rebalance. Branch
+`perf/kv-migration-091` @ `3d90078`. +1217 LOC across 6 files.
+
+**Wire frame** (`FrameKind::KvMigration = 0x534D4530`):
+- `KvMigrationLayer` payload struct with `into_install_slab()`
+- Body carried as I8 carrier tensor — inherits transport 256 MiB cap
+  + shape sanity + 60s read timeout for free
+- `KV_MIGRATION_HEADER_BYTES = 20`: `lid | past_seq_len | num_heads |
+  qk_head_dim | v_head_dim` (BE u32)
+- send/recv helpers symmetric client/server
+
+**Runner API:**
+- `extract_kv_slab(layer_start, layer_end) -> Result<Vec<u8>>` —
+  read-only snapshot of per-layer K/V
+- `install_kv_slab(layer_start, layer_end, &[u8]) -> Result<usize>` —
+  overwrites owned layers in range
+- `past_seq_len_for(lid)` — consistency check for engine layer
+- Both reject `layer_start == 0` (layer-0 migration blocked on
+  Layer0State refactor)
+- `install_layer_kv` grows receiver capacity geometrically if needed
+
+**Engine skeleton handler:** worker accepts KvMigration frame and
+runs install_kv_slab, no ACK yet. Documented in code: orchestrator
+(not yet written) is responsible for quiescing decode.
+
+**Tests:** 8 new (5 integration in `tests/kv_migration_wire.rs`:
+tiny-layer round trip, zero-past_seq_len, two-layer, length-mismatch
+rejection, client-side recv; 3 unit in runner.rs). 19 unit + 13
+integration pass. fmt + clippy clean.
+
+**docs/architecture/kv-migration.md** (~6 KB): wire format table,
+Runner API, 6 blockers, proposed pause-token protocol
+(Quiesce/QuiesceAck/KvMigrationAck), testing matrix, 6-step next-
+step ordering.
+
+**6 blockers (documented, justify Track B):**
+1. **Atomicity & consistency** — single-layer migration breaks
+   coherence if other layers came from different generation
+2. **In-flight requests** — no quiesce/NAK protocol; workers
+   serialize today but rank-0 driver gets no signal
+3. **Layer-0 migration not supported** — Layer0State structurally
+   different (embed mmap, no lid, no Int4Shell). Blocks rank-0
+   failover.
+4. **Long context (past_seq_len > ~2k)** — single-layer body exceeds
+   256 MiB at K2.6 64 heads × 320 dims × 4B. Needs slot-chunked
+   variant.
+5. **Cross-architecture compatibility** — shape constants hard-coded
+   to K2.6
+6. **No authentication** — productization punted to cascadia-fleet
+
+---
+
 ## 088 — Cross-layer expert sharing detection — Track C+B (2026-05-19 ~02:55 PT)
 
 Branch `perf/cross-layer-expert-share-088` @ `f15b0f3`. Tracks when
