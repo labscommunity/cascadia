@@ -36,6 +36,7 @@
 //!
 //! The expert IRs are lazy-loaded on first use into an LRU cache.
 
+pub mod batcher;
 pub mod dist;
 pub mod engine;
 pub mod manifest;
@@ -43,6 +44,10 @@ pub mod runner;
 pub mod sampling;
 pub mod tensors;
 
+pub use batcher::{
+    BatchPlan, ContinuousBatcher, PlannedSlot, RequestSlot, SlotPhase, StepOutcome,
+    MAX_BATCH_SLOTS_DEFAULT,
+};
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use manifest::Manifest;
 pub use runner::{Runner, RunnerError};
