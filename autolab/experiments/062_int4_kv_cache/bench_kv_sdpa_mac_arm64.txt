@@ -1,0 +1,36 @@
+=== K2.6 KV SDPA inner-loop bench ===
+host: Mac M-series (Darwin 25.2.0)
+date: 2026-05-18
+binary: cargo run --release -p tahoma-int4-gemm --bin bench_kv_sdpa
+caveat: scalar kernels only; no AVX-512. The miner (Xeon Gold 6252)
+        results will differ — see analysis below for bandwidth ceilings.
+
+=== past_seq_len = 16 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  per-head bytes read:  f32=20480  bf16=10240  int4= 2880
+f32 SDPA            0.99 us/iter   20.64 GB/s read
+bf16 SDPA           1.09 us/iter    9.43 GB/s read
+int4 SDPA           1.15 us/iter    2.50 GB/s read
+
+=== past_seq_len = 64 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  per-head bytes read:  f32=81920  bf16=40960  int4=11520
+f32 SDPA            3.80 us/iter   21.57 GB/s read
+bf16 SDPA           4.05 us/iter   10.11 GB/s read
+int4 SDPA           4.35 us/iter    2.65 GB/s read
+
+=== past_seq_len = 256 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  per-head bytes read:  f32=327680  bf16=163840  int4=46080
+f32 SDPA           14.96 us/iter   21.91 GB/s read
+bf16 SDPA          16.18 us/iter   10.12 GB/s read
+int4 SDPA          17.19 us/iter    2.68 GB/s read
+
+=== past_seq_len = 1024 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  per-head bytes read:  f32=1310720  bf16=655360  int4=184320
+f32 SDPA           59.37 us/iter   22.08 GB/s read
+bf16 SDPA          64.16 us/iter   10.21 GB/s read
+int4 SDPA          68.63 us/iter    2.69 GB/s read
+
+=== past_seq_len = 4096 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  per-head bytes read:  f32=5242880  bf16=2621440  int4=737280
+f32 SDPA          236.94 us/iter   22.13 GB/s read
+bf16 SDPA         256.36 us/iter   10.23 GB/s read
+int4 SDPA         274.07 us/iter    2.69 GB/s read
