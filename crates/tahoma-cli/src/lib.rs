@@ -131,6 +131,24 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// autolab iter 088 (cross-layer expert share): reorder each
+    /// non-first MoE layer's expert dispatch so experts that also
+    /// fired in the immediately preceding layer of the same token
+    /// run first, keeping their int4 weights L3-resident across the
+    /// layer boundary. Bit-identical output (Phase 3 of
+    /// `forward_shells` walks ascending k for the weighted sum).
+    /// Sparse-MoE engine only; ignored by other engines.
+    #[arg(long, default_value_t = false)]
+    pub cross_layer_dispatch: bool,
+
+    /// autolab iter 088: enable per-(prev-pos, this-pos, eid)
+    /// co-occurrence tracking for the cross-layer share research
+    /// bench. Costs one HashMap insert per dispatched expert per
+    /// layer N+1; the share-fraction metric works without this. Use
+    /// with a debug bin that dumps `Runner::cross_layer_pair_snapshot`.
+    #[arg(long, default_value_t = false)]
+    pub cross_layer_pair_tracking: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -317,7 +335,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total);
+                .with_rank(args.rank, args.total)
+                .with_cross_layer_dispatch(args.cross_layer_dispatch)
+                .with_cross_layer_pair_tracking(args.cross_layer_pair_tracking);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }

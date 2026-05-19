@@ -8,7 +8,7 @@
 //! Not async, not Send. Each generation owns its own KV state; the
 //! Engine wrapper above this drives one call at a time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -217,6 +217,48 @@ pub struct Runner {
     /// expert weights at runtime. Held in an Arc so the expert cache
     /// can clone it without duplicating mmaps.
     _safetensors_source: Arc<SafetensorsExpertSource>,
+    /// autolab iter 088 (cross-layer expert share): per-(layer-position,
+    /// expert) fire count. Same shape as iter 054's `expert_hits` —
+    /// kept here standalone (the iter 054 branch isn't merged into
+    /// main) so this iteration's investigation doesn't depend on it.
+    /// One HashMap per layer slot held by this rank. Persists across
+    /// `reset_kv` so steady-state stats reflect the full workload.
+    expert_hits: Vec<HashMap<u32, u64>>,
+    /// autolab iter 088 (cross-layer expert share): IDs actually
+    /// dispatched in the *previously processed* MoE layer of the
+    /// current token. Cleared at the start of every `forward_shells`
+    /// call so the cross-layer sharing signal only counts experts
+    /// that fire in immediately consecutive layers of the same token.
+    /// Rebuilt at the end of each layer iteration.
+    last_layer_routing_ids: HashSet<u32>,
+    /// autolab iter 088: cumulative count of (layer-position, expert)
+    /// dispatches across all (token, layer N+1) pairs that this rank
+    /// has run since startup. Denominator of the "share fraction"
+    /// metric. Excludes the first layer of each token (it has no
+    /// "previous layer" within the current token).
+    cross_layer_total: u64,
+    /// autolab iter 088: cumulative count of (layer-position, expert)
+    /// dispatches that ALSO appeared in the immediately preceding
+    /// layer of the same token. Numerator of the share fraction.
+    cross_layer_overlap: u64,
+    /// autolab iter 088: per-(prev-layer-position, this-layer-position,
+    /// expert) co-occurrence count, optional and gated by
+    /// `cross_layer_pair_tracking_enabled`. Bounded in size by the
+    /// number of distinct (prev-pos, this-pos, eid) triples that ever
+    /// fire — for K2.6 top-K=8 across 60 layers, this is at most
+    /// ~60 * 8 * 384 = 184K entries in the absolute worst case but
+    /// dispatch sparsity drops the practical max into the low
+    /// thousands. Off by default to keep the steady-state work
+    /// proportional to top-K, not top-K * cache-miss-rate.
+    cross_layer_pair_hits: HashMap<(u32, u32, u32), u64>,
+    cross_layer_pair_tracking_enabled: bool,
+    /// autolab iter 088: when true, `forward_shells` reorders each
+    /// layer N+1's dispatch sequence so experts that ALSO fired in
+    /// layer N run first, keeping their weights L3-resident across
+    /// the layer boundary. Phase 3 weighted-sum still walks the
+    /// original `k = 0..top_k` order so the FP rounding chain is
+    /// byte-identical regardless of dispatch sequence.
+    cross_layer_dispatch: bool,
 }
 
 impl Runner {
@@ -381,6 +423,7 @@ impl Runner {
             }
         };
 
+        let n_my_layers = layers.len();
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -392,7 +435,74 @@ impl Runner {
             layers,
             experts,
             _safetensors_source: safetensors_source,
+            // iter 088: per-position hit maps + cross-layer share counters,
+            // all zero at startup. Pair tracking + reorder both default
+            // OFF; turn them on via `set_cross_layer_pair_tracking` /
+            // `set_cross_layer_dispatch` before generation.
+            expert_hits: (0..n_my_layers).map(|_| HashMap::new()).collect(),
+            last_layer_routing_ids: HashSet::new(),
+            cross_layer_total: 0,
+            cross_layer_overlap: 0,
+            cross_layer_pair_hits: HashMap::new(),
+            cross_layer_pair_tracking_enabled: false,
+            cross_layer_dispatch: false,
         })
+    }
+
+    /// autolab iter 088: enable per-(prev-pos, this-pos, eid)
+    /// co-occurrence tracking. Costs one `HashMap<(u32,u32,u32),u64>`
+    /// insert per dispatched expert per layer N+1; off by default
+    /// because the main per-token metric (`cross_layer_total` /
+    /// `cross_layer_overlap`) doesn't need it. Used by the iter 088
+    /// research bench to inspect *which* layer pairs share the most.
+    pub fn set_cross_layer_pair_tracking(&mut self, enabled: bool) {
+        self.cross_layer_pair_tracking_enabled = enabled;
+    }
+
+    /// autolab iter 088: enable cross-layer-share-aware dispatch
+    /// reordering. When true, `forward_shells` permutes each non-first
+    /// layer's dispatch order so experts that ALSO fired in the
+    /// immediately preceding layer of the same token run FIRST.
+    /// Phase 3 weighted sum still walks the original `k = 0..top_k`
+    /// order so the FP rounding chain is unchanged and the output is
+    /// byte-identical regardless of this flag. Off by default; turn
+    /// on for the iter 088 A/B bench.
+    pub fn set_cross_layer_dispatch(&mut self, enabled: bool) {
+        self.cross_layer_dispatch = enabled;
+    }
+
+    /// autolab iter 088: read accessor — used by the engine layer to
+    /// echo the flag back out of `Engine::warmup` / logs without
+    /// owning a duplicate copy.
+    pub fn cross_layer_dispatch_enabled(&self) -> bool {
+        self.cross_layer_dispatch
+    }
+
+    /// autolab iter 088: snapshot of the cross-layer share counters.
+    /// Returns `(total, overlap)` — the share fraction is
+    /// `overlap as f64 / total as f64` (guard against zero on cold
+    /// start). Cumulative since `Runner::load`; not reset by
+    /// `reset_kv` so the bench can read a single number at the end
+    /// of a 100-prompt sweep.
+    pub fn cross_layer_share_snapshot(&self) -> (u64, u64) {
+        (self.cross_layer_total, self.cross_layer_overlap)
+    }
+
+    /// autolab iter 088: snapshot of the per-(prev-pos, this-pos, eid)
+    /// co-occurrence map. Empty unless `set_cross_layer_pair_tracking`
+    /// was called with `true` before generation. Clone is bounded by
+    /// the number of distinct triples — at most ~hundreds of K entries
+    /// even for K2.6's 60-layer top-8 dispatch in steady state. Used
+    /// by the iter 088 bench to drive a heatmap of which layer pairs
+    /// have the densest share.
+    pub fn cross_layer_pair_snapshot(&self) -> HashMap<(u32, u32, u32), u64> {
+        self.cross_layer_pair_hits.clone()
+    }
+
+    /// autolab iter 088: read accessor for the per-layer-position hit
+    /// map. Cumulative since `Runner::load`; not reset by `reset_kv`.
+    pub fn expert_hits_snapshot(&self) -> Vec<HashMap<u32, u64>> {
+        self.expert_hits.clone()
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -592,6 +702,12 @@ impl Runner {
         }
         let mut h_f32 = h_in.to_vec();
 
+        // iter 088 (cross-layer expert share): the "previously dispatched
+        // experts" signal only counts experts that fire in *immediately
+        // consecutive* layers of the same token. Clear at token boundary
+        // (= start of `forward_shells`) so signal is per-token.
+        self.last_layer_routing_ids.clear();
+
         let n_layers = self.layers.len();
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
@@ -655,11 +771,98 @@ impl Runner {
                     top_k
                 )));
             }
-            let mut moe = vec![0.0f32; hidden];
+
+            // iter 088 (cross-layer expert share): three-phase
+            // restructure modeled on iter 056. Gates the optional
+            // dispatch reorder while preserving byte-identical output
+            // (Phase 3 enforces ascending-k FP accumulation order).
+            //
+            // Phase 1 (original-order bookkeeping): walk
+            // `k = 0..top_k` in router-score order to update
+            // (a) per-position hit count, (b) cross-layer share
+            // numerator + denominator, (c) optional per-pair
+            // co-occurrence map. Byte-identical side-effect ordering
+            // to the pre-088 loop's hit-rate counters (none, since
+            // those were added in iter 054 which isn't merged into
+            // main — iter 088 introduces them standalone).
+            //
+            // The "previous layer" reference is `last_layer_routing_ids`,
+            // built at the END of the *previous* iteration of this
+            // for-loop. For i == 0 it's empty (cleared above before the
+            // for-loop), so the first layer of every token contributes
+            // 0 to the share denominator/numerator and the reorder
+            // degenerates to identity (router-score order).
+            let is_first_layer_of_token = i == 0;
             for k in 0..top_k {
                 let eid = outs.routing_ids[k] as u32;
-                let w = outs.routing_weights[k];
+                *self
+                    .expert_hits
+                    .get_mut(i)
+                    .expect("layer-indexed hit map")
+                    .entry(eid)
+                    .or_insert(0) += 1;
+                if !is_first_layer_of_token {
+                    // Cross-layer share metric: this layer's dispatched
+                    // expert counts toward the denominator unconditionally
+                    // (we touched it). Counts toward the numerator iff
+                    // it also fired in the *immediately preceding* layer
+                    // of this same token.
+                    self.cross_layer_total += 1;
+                    if self.last_layer_routing_ids.contains(&eid) {
+                        self.cross_layer_overlap += 1;
+                    }
+                    if self.cross_layer_pair_tracking_enabled {
+                        // Layer pair key: (prev-position, this-position,
+                        // eid). The position is `i - 1` / `i` (zero-
+                        // based index into this rank's layer slice),
+                        // NOT the lid — pair stats are meaningful per
+                        // *adjacent* layers of this rank's stage, and
+                        // the next stage's first layer is a different
+                        // story (it sees a fresh `last_layer_routing_ids`
+                        // = {} since that state lives in this Runner
+                        // and doesn't cross the wire).
+                        *self
+                            .cross_layer_pair_hits
+                            .entry((i as u32 - 1, i as u32, eid))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Phase 2 (dispatch in cross-layer-aware OR router-score
+            // order): compute each expert and stash its output indexed
+            // by the original `k`. With `cross_layer_dispatch == false`
+            // (default) the sequence is the identity = byte-identical
+            // to the pre-088 path. With it enabled and we're past the
+            // first layer of this token, the sequence puts experts
+            // that overlap with the previous layer FIRST (ascending
+            // k tie-break), so the kernel re-reads weights still warm
+            // in L3 from the just-finished layer.
+            let dispatch_seq: Vec<usize> = if self.cross_layer_dispatch && !is_first_layer_of_token
+            {
+                cross_layer_dispatch_order(&outs.routing_ids, &self.last_layer_routing_ids)
+            } else {
+                (0..top_k).collect()
+            };
+            let mut expert_outs: Vec<Option<Vec<f32>>> = (0..top_k).map(|_| None).collect();
+            for &k in dispatch_seq.iter() {
+                let eid = outs.routing_ids[k] as u32;
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
+                expert_outs[k] = Some(y_f32);
+            }
+
+            // Phase 3 (original-order weighted sum): accumulate into
+            // `moe` in ascending `k` so the FP rounding chain is
+            // identical regardless of `dispatch_seq` ordering. THIS
+            // is the bit-identity hinge — without it, reordering
+            // Phase 2 would silently flip output bits via different
+            // f32 accumulation roundings.
+            let mut moe = vec![0.0f32; hidden];
+            for (k, slot) in expert_outs.iter().enumerate() {
+                let y_f32 = slot
+                    .as_ref()
+                    .expect("Phase 2 dispatched every k (no threshold gating on main)");
+                let w = outs.routing_weights[k];
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
                 }
@@ -669,7 +872,37 @@ impl Runner {
             for j in 0..hidden {
                 h_f32[j] = outs.attn_residual[j] + outs.shared_expert_out[j] + moe[j];
             }
+
+            // iter 088: stash the IDs we just dispatched so the next
+            // iteration of this for-loop can see them. We rebuild
+            // (rather than incrementally update) so the set reflects
+            // *exactly* what fired this layer — no stale entries from
+            // older layers. Cheap: top-K=8 inserts per layer.
+            self.last_layer_routing_ids.clear();
+            for k in 0..top_k {
+                self.last_layer_routing_ids
+                    .insert(outs.routing_ids[k] as u32);
+            }
         }
+
+        // iter 088: emit a one-line per-token summary of the cross-layer
+        // share metric. Cumulative counters so the bench can read the
+        // final ratio at the end of a sweep; logged here for the
+        // research loop to scrape per-step deltas if needed.
+        debug!(
+            stage = "cross_layer_share",
+            n_layers,
+            past_seq_len,
+            cross_layer_total = self.cross_layer_total,
+            cross_layer_overlap = self.cross_layer_overlap,
+            share_frac = if self.cross_layer_total == 0 {
+                0.0
+            } else {
+                self.cross_layer_overlap as f64 / self.cross_layer_total as f64
+            },
+            cross_layer_dispatch = self.cross_layer_dispatch,
+            "iter 088 cross-layer share snapshot"
+        );
 
         Ok(h_f32)
     }
@@ -811,6 +1044,64 @@ impl Runner {
             &crate::sampling::SamplingConfig::default(),
         )
     }
+}
+
+/// autolab iter 088 (cross-layer expert share): produce a permutation
+/// of `0..routing_ids.len()` ordered so that any expert ID also
+/// present in `prev_layer_ids` appears FIRST, with ascending
+/// original index as the tie-break. Returns indices into
+/// `routing_ids`, NOT expert IDs — the dispatch loop uses these to
+/// look up `routing_ids[k]` and `routing_weights[k]` from the shell
+/// output without losing the original alignment.
+///
+/// Example: `routing_ids = [42, 99, 7, 200, 50, 1, 88, 12]` (router
+/// top-8 by score), `prev_layer_ids = {7, 50, 88}` ⇒ returned
+/// permutation `[2, 4, 6, 0, 1, 3, 5, 7]`. The three shared experts
+/// (7, 50, 88) land at slots 0-2 in router-score order amongst
+/// themselves; the five non-shared experts follow in router-score
+/// order.
+///
+/// **Pure function — no side effects.** The runner's dispatch loop
+/// preserves byte-identical output by:
+/// (a) doing all hit-rate / cross-layer-share bookkeeping in the
+///     original `k = 0..top_k` order (Phase 1),
+/// (b) calling `dispatch_expert` in the cross-layer-aware order
+///     (Phase 2, this permutation),
+/// (c) summing the weighted expert outputs into `moe` in original
+///     order (Phase 3) so the float-addition rounding chain is
+///     unchanged.
+///
+/// `prev_layer_ids` empty (= first layer of a token, or the cross-
+/// layer-dispatch flag is off) implies the permutation degenerates
+/// to the identity — every "is-shared" key is `false` and the tie-
+/// break collapses to the original index. Identical to router-score
+/// dispatch order.
+///
+/// Separated from `Runner::forward_shells` so unit tests can verify
+/// the permutation logic without a loaded model.
+fn cross_layer_dispatch_order(routing_ids: &[i64], prev_layer_ids: &HashSet<u32>) -> Vec<usize> {
+    let mut order: Vec<(usize, bool)> = routing_ids
+        .iter()
+        .enumerate()
+        .map(|(k, &id)| {
+            // Guard cast: router IDs are non-negative expert ids in
+            // [0, num_experts). A pathological negative id would look
+            // up as non-shared (false), keeping it at the tail of the
+            // permutation.
+            let shared = if id >= 0 {
+                prev_layer_ids.contains(&(id as u32))
+            } else {
+                false
+            };
+            (k, shared)
+        })
+        .collect();
+    // Primary key: `shared` (true first). Secondary: ascending
+    // original index = router-score order. Using `bool::cmp` and
+    // reversing for descending — `true.cmp(&false) == Greater`, so
+    // `b.1.cmp(&a.1)` puts true first.
+    order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    order.into_iter().map(|(k, _)| k).collect()
 }
 
 fn read_f32(bytes: &[u8]) -> Vec<f32> {
@@ -996,5 +1287,114 @@ mod tests {
         let dst = grow_kv_buffer(&src, 0, 2, 4, QK_HEAD_DIM).expect("alloc");
         assert_eq!(dst.len(), NUM_HEADS * 4 * QK_HEAD_DIM);
         assert!(dst.iter().all(|&x| x == 0.0));
+    }
+
+    // ----- iter 088: cross-layer expert share helper tests -----
+    //
+    // These exercise the *pure* permutation logic in
+    // `cross_layer_dispatch_order` without spinning up a full Runner
+    // (which would require K2.6 weights on disk). The bit-identity
+    // properties of the Phase 1/2/3 dispatch loop in `forward_shells`
+    // depend on Phase 3 walking ascending k — that's enforced by the
+    // shape of the loop and not by these tests, but the permutation
+    // helper IS what we tune for L3 locality.
+
+    #[test]
+    fn cross_layer_dispatch_order_empty_prev_is_identity() {
+        // First layer of every token: prev_layer_ids is empty,
+        // permutation degenerates to identity. Important: this is the
+        // semantic that makes the cross-layer-dispatch flag safe to
+        // turn on for prompts where the first layer hasn't seen any
+        // prior dispatch — output stays byte-identical because the
+        // dispatch order doesn't change.
+        let routing_ids: Vec<i64> = vec![42, 99, 7, 200, 50, 1, 88, 12];
+        let prev = HashSet::new();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        assert_eq!(perm, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_shared_first() {
+        // 3 of 8 routing_ids overlap with prev_layer_ids: 7, 50, 88.
+        // They land at slots 0..3 in router-score order amongst
+        // themselves (k=2: id 7, k=4: id 50, k=6: id 88). The five
+        // non-shared experts follow in router-score order.
+        let routing_ids: Vec<i64> = vec![42, 99, 7, 200, 50, 1, 88, 12];
+        let prev: HashSet<u32> = [7u32, 50, 88].iter().copied().collect();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        assert_eq!(perm, vec![2, 4, 6, 0, 1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_all_shared_is_identity() {
+        // Pathological: every routing_id was in the previous layer.
+        // All keys tie on `true`, tie-break to ascending original k =
+        // identity. This is the upper-bound case for the L3 win —
+        // every dispatched expert is already warm in L3.
+        let routing_ids: Vec<i64> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let prev: HashSet<u32> = (1u32..=8).collect();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        assert_eq!(perm, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_no_shared_is_identity() {
+        // No expert in prev_layer_ids appears in routing_ids: every
+        // key is `false`, tie-break to ascending k = identity. Same
+        // ordering as the all-shared case (= router-score), which is
+        // the floor on the L3 win (no shared experts to warm).
+        let routing_ids: Vec<i64> = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let prev: HashSet<u32> = [1u32, 2, 3].iter().copied().collect();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        assert_eq!(perm, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_is_a_permutation() {
+        // Output must be a valid permutation of 0..K: no duplicates,
+        // no gaps. Property check across a few hand-picked shapes.
+        for &k in &[1usize, 2, 4, 8] {
+            let routing_ids: Vec<i64> = (0..k as i64).collect();
+            let prev: HashSet<u32> = (0..k).filter(|i| i % 2 == 0).map(|i| i as u32).collect();
+            let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+            assert_eq!(perm.len(), k);
+            let mut sorted = perm.clone();
+            sorted.sort();
+            assert_eq!(
+                sorted,
+                (0..k).collect::<Vec<_>>(),
+                "k={k}: not a permutation"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_negative_id_treated_as_not_shared() {
+        // Pathological: a routing_id is negative (shouldn't happen in
+        // K2.6, but the cast guard is part of the contract). It hashes
+        // as "not shared" and lands in the tail by router-score order.
+        let routing_ids: Vec<i64> = vec![5, -1, 7];
+        let prev: HashSet<u32> = [5u32].iter().copied().collect();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        // Order: k=0 (id 5, shared) first; then k=1 (id -1, not shared)
+        // and k=2 (id 7, not shared) in ascending k.
+        assert_eq!(perm, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cross_layer_dispatch_order_preserves_router_score_among_shared() {
+        // When multiple shared experts exist, they are in router-score
+        // order amongst themselves (= ascending original k). This is
+        // a deliberate choice: among the L3-warm set, the highest-
+        // scored expert is the one whose weights are most likely to
+        // be MOST warm (it was the last one called previous layer if
+        // dispatch order was reverse-score, or first if forward —
+        // either way, ascending-k keeps the secondary order stable).
+        let routing_ids: Vec<i64> = vec![100, 99, 98, 97, 96, 95, 94, 93];
+        let prev: HashSet<u32> = [93u32, 99, 96].iter().copied().collect();
+        let perm = cross_layer_dispatch_order(&routing_ids, &prev);
+        // Shared in router-score (ascending k): k=1 (99), k=4 (96), k=7 (93).
+        // Non-shared in router-score: k=0, 2, 3, 5, 6.
+        assert_eq!(perm, vec![1, 4, 7, 0, 2, 3, 5, 6]);
     }
 }

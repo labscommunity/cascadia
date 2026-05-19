@@ -42,6 +42,17 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// autolab iter 088: reorder each non-first MoE layer's dispatch
+    /// so experts that ALSO fired in the immediately preceding layer
+    /// run first. Bit-identical output (Phase 3 of `forward_shells`
+    /// walks ascending k). Off by default. See `Runner::set_cross_
+    /// layer_dispatch` for the full contract.
+    pub cross_layer_dispatch: bool,
+    /// autolab iter 088: enable per-(prev-pos, this-pos, eid)
+    /// co-occurrence tracking. Off by default — the share fraction
+    /// metric works without this. Turn on when running the iter 088
+    /// research bench so the operator can dump the per-pair heatmap.
+    pub cross_layer_pair_tracking: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +64,28 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            cross_layer_dispatch: false,
+            cross_layer_pair_tracking: false,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    /// autolab iter 088: builder-style setter for the cross-layer
+    /// dispatch flag.
+    pub fn with_cross_layer_dispatch(mut self, enabled: bool) -> Self {
+        self.cross_layer_dispatch = enabled;
+        self
+    }
+
+    /// autolab iter 088: builder-style setter for per-pair
+    /// co-occurrence tracking.
+    pub fn with_cross_layer_pair_tracking(mut self, enabled: bool) -> Self {
+        self.cross_layer_pair_tracking = enabled;
         self
     }
 }
@@ -219,7 +246,7 @@ impl Builder for SparseMoEBuilder {
             )
         });
 
-        let runner = match join.join() {
+        let mut runner = match join.join() {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 return Err(EngineError::Backend(format!("runner load: {e}")));
@@ -228,6 +255,18 @@ impl Builder for SparseMoEBuilder {
                 return Err(EngineError::Backend("runner load worker panicked".into()));
             }
         };
+
+        // iter 088: apply cross-layer-share flags. Defaults are
+        // off-off, so this is a no-op for unmodified callers.
+        runner.set_cross_layer_dispatch(self.config.cross_layer_dispatch);
+        runner.set_cross_layer_pair_tracking(self.config.cross_layer_pair_tracking);
+        if self.config.cross_layer_dispatch || self.config.cross_layer_pair_tracking {
+            info!(
+                cross_layer_dispatch = self.config.cross_layer_dispatch,
+                cross_layer_pair_tracking = self.config.cross_layer_pair_tracking,
+                "iter 088 (cross-layer expert share) flags applied"
+            );
+        }
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {
