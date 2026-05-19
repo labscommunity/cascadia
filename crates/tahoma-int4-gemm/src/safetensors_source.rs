@@ -27,20 +27,35 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use parking_lot::RwLock;
 
+use crate::async_prefetch::{AsyncIoError, AsyncPrefetchBackend, AsyncReadHandle};
 use crate::format::GemmError;
 
 /// Per-shard mmap + lookup table: tensor name → (data start, length) in
 /// the mmap. Public because it appears in the return type of
 /// `tensor_bytes` / `layer0` / `embed_tokens` (callers pin the Arc to
 /// keep the returned slice valid), but the fields are all private.
+///
+/// As of autolab iter 074, the shard also keeps the underlying `File`
+/// alive so `async_read` can hand the raw FD to `io_uring`. Closing
+/// the `File` after the mmap (the previous behavior) was fine for the
+/// mmap path — mmap pages survive their backing FD — but io_uring
+/// SQEs need a live FD until the CQE lands.
 pub struct Shard {
     mmap: Mmap,
+    /// Kept alive so [`Shard::async_read`] can pass the raw FD to
+    /// io_uring without it racing the close on drop. Unused on
+    /// non-Unix; the fallback `async_read` path doesn't need an FD
+    /// (it issues a hint, not a read).
+    #[cfg(unix)]
+    file: File,
     data_start: usize,
     tensors: HashMap<String, (usize, usize)>, // (data_offset_in_data_section, length)
 }
@@ -106,6 +121,8 @@ impl Shard {
         }
         Ok(Self {
             mmap,
+            #[cfg(unix)]
+            file: f,
             data_start: 8 + header_len,
             tensors,
         })
@@ -116,6 +133,82 @@ impl Shard {
             let start = self.data_start + off;
             &self.mmap[start..start + len]
         })
+    }
+
+    /// Hint the OS that we'll need a tensor's byte range soon. Wraps
+    /// `madvise(MADV_WILLNEED)` on the page-aligned range covering the
+    /// tensor. Best-effort: errors swallowed because madvise is a hint
+    /// and the worst case is the read happens on demand later (which is
+    /// exactly the no-prefetch baseline).
+    ///
+    /// This is the "madvise" backend that pairs with the io_uring
+    /// `async_read` backend — both are dispatched by `AsyncPrefetcher`
+    /// based on the [`crate::async_prefetch::PrefetchBackendKind`]
+    /// selected at startup. On non-Unix platforms `advise_range` is a
+    /// no-op in memmap2 — the call still returns Ok and we still bump
+    /// the success counter, mirroring the iter 033 C1 baseline.
+    pub fn advise_willneed(&self, tensor_name: &str) -> bool {
+        let Some(&(off, len)) = self.tensors.get(tensor_name) else {
+            return false;
+        };
+        let start = self.data_start + off;
+        // memmap2's `advise_range` takes a (offset, len) within the mmap.
+        // The kernel rounds the start down and the length up to the next
+        // page boundary, so we don't need to align here.
+        self.mmap.advise_range(Advice::WillNeed, start, len).is_ok()
+    }
+
+    /// Queue an async read of a tensor's byte range through the given
+    /// `io_uring` backend. autolab iter 074 skeleton — see
+    /// `docs/perf/io_uring_prefetch.md` for the design.
+    ///
+    /// Behavior depends on the backend kind:
+    ///
+    ///   * Linux + io_uring (milestone 1+, not yet shipped): pushes an
+    ///     `IORING_OP_READ` SQE into the shared submission queue;
+    ///     returns immediately with a handle whose `is_ready()` flips
+    ///     to true once the matching CQE lands. The kernel populates
+    ///     the page cache as a side-effect — a later mmap fault on the
+    ///     same bytes will resolve from cache.
+    ///
+    ///   * Fallback (current skeleton + non-Linux): returns an
+    ///     immediately-ready handle. **The caller should additionally
+    ///     issue `advise_willneed` for the same range — async_read
+    ///     does NOT also do that.** (This split lets the
+    ///     `AsyncPrefetcher` decide which arm to call based on the
+    ///     backend kind without branching at every shard touch.)
+    ///
+    /// Returns `Err` if the tensor isn't present in this shard, or if
+    /// the backend's submission queue is full (Linux only).
+    pub fn async_read(
+        &self,
+        backend: &AsyncPrefetchBackend,
+        tensor_name: &str,
+    ) -> Result<AsyncReadHandle, AsyncIoError> {
+        let Some(&(off, len)) = self.tensors.get(tensor_name) else {
+            return Err(AsyncIoError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tensor {tensor_name} not in shard"),
+            )));
+        };
+        let abs_off = (self.data_start + off) as u64;
+        backend.queue_read(self.raw_fd(), abs_off, len)
+    }
+
+    /// Raw file descriptor for io_uring SQEs. Returns -1 on platforms
+    /// where Shard doesn't keep an FD (Windows — the fallback path
+    /// doesn't need one, and io_uring doesn't exist there anyway).
+    #[cfg(unix)]
+    fn raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Windows / wasm32 / other non-Unix targets: io_uring backend is
+    /// unreachable, so any FD value works. We return -1 so a stray
+    /// call wouldn't accidentally read from stdin.
+    #[cfg(not(unix))]
+    fn raw_fd(&self) -> std::os::raw::c_int {
+        -1
     }
 }
 
@@ -262,6 +355,62 @@ impl SafetensorsExpertSource {
         tensor_name: &str,
     ) -> Result<(Arc<Shard>, &'static [u8]), GemmError> {
         self.slice(tensor_name)
+    }
+
+    /// Names of the six tensors that compose one expert (gate / up / down
+    /// × packed / scale). Same enumeration `expert()` uses; pulled out so
+    /// prefetch (madvise + io_uring) can iterate them without
+    /// materializing the full [`SafetensorsExpert`] holder.
+    pub fn expert_tensor_names(layer: u32, expert: u32) -> [String; 6] {
+        let base = format!(
+            "language_model.model.layers.{}.mlp.experts.{}",
+            layer, expert
+        );
+        [
+            format!("{}.gate_proj.weight_packed", base),
+            format!("{}.gate_proj.weight_scale", base),
+            format!("{}.up_proj.weight_packed", base),
+            format!("{}.up_proj.weight_scale", base),
+            format!("{}.down_proj.weight_packed", base),
+            format!("{}.down_proj.weight_scale", base),
+        ]
+    }
+
+    /// autolab iter 033 (C1) / iter 098: issue `madvise(MADV_WILLNEED)`
+    /// on every byte slice for one expert via [`Shard::advise_willneed`].
+    /// Non-blocking — the kernel queues async readahead. Returns the
+    /// number of slices for which madvise succeeded (caller can ignore;
+    /// useful for instrumentation).
+    ///
+    /// Designed to be called from a dedicated prefetch thread that's fed
+    /// by the inference path. Holds no locks across madvise calls (the
+    /// shard lookup briefly takes the inner RwLock).
+    ///
+    /// This is the "madvise" half of the iter 098
+    /// [`crate::async_prefetch::AsyncPrefetcher`] dispatch — paired with
+    /// `Shard::async_read` (io_uring) so the runner can pick either path
+    /// at startup via `TAHOMA_PREFETCH_BACKEND`.
+    pub fn prefetch_expert_madvise(&self, layer: u32, expert: u32) -> usize {
+        let mut hits = 0usize;
+        for name in Self::expert_tensor_names(layer, expert).iter() {
+            // Resolve the shard. If the tensor isn't in the weight map
+            // we silently skip — prefetch is best-effort.
+            if !self.weight_map.contains_key(name) {
+                continue;
+            }
+            // Open-or-clone the shard. We tolerate the open cost because
+            // (a) prefetch runs off the hot path and (b) once cached
+            // every subsequent prefetch on that shard is one HashMap
+            // hit + one madvise syscall.
+            let shard = match self.shard_for(name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if shard.advise_willneed(name) {
+                hits += 1;
+            }
+        }
+        hits
     }
 }
 

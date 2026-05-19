@@ -34,6 +34,9 @@ use tahoma_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use thiserror::Error;
 use tracing::{debug, info};
 
+use tahoma_int4_gemm::async_prefetch::PrefetchBackendKind;
+
+use crate::async_prefetch::AsyncPrefetcher;
 use crate::manifest::{Manifest, ManifestError};
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
@@ -234,6 +237,23 @@ pub struct Runner {
     /// Per-token effective K varies; safer than fixed K if router
     /// confidence is uneven.
     routing_threshold: Option<f32>,
+    /// autolab iter 098: background expert prefetcher. `None` when
+    /// disabled (env var `TAHOMA_PREFETCH_BACKEND=off`, unknown value,
+    /// or non-safetensors expert backend). When `Some`, `forward_shells`
+    /// pushes the previous token's routed expert IDs to the worker
+    /// thread at the top of each call so the OS can warm pages while
+    /// this token's attention runs. See `async_prefetch.rs` for the
+    /// madvise vs io-uring split.
+    prefetcher: Option<AsyncPrefetcher>,
+    /// autolab iter 098: cache of the *previous* token's routed expert
+    /// IDs per layer (indexed by position in `self.layers`, not by
+    /// `lid`). Empty `Vec<u32>` means "no history yet" (just after
+    /// `reset_kv` or first prefill token). The prefetcher uses this as
+    /// a same-as-last-token predictor at the start of each
+    /// `forward_shells`. We always track this — toggling the
+    /// prefetcher mid-run is a fast path then, and the per-token cost
+    /// is `k * u32` per layer (negligible).
+    last_routing_ids: Vec<Vec<u32>>,
 }
 
 impl Runner {
@@ -398,6 +418,19 @@ impl Runner {
             }
         };
 
+        // autolab iter 098: spin up the async expert prefetcher when the
+        // safetensors backend is in use and the operator opted in via
+        // `TAHOMA_PREFETCH_BACKEND`. The default is `off` so this PR is
+        // a pure no-op for callers that don't ask for it (avoids
+        // changing behavior on production benches that haven't yet
+        // confirmed the prefetcher is a net win on their workload).
+        //
+        // Other expert backends (ov_ir, int4_bin) don't benefit because
+        // their weights aren't served from the safetensors mmaps — the
+        // prefetcher would warm pages no one reads.
+        let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
+        let prefetcher = construct_prefetcher(&experts, &safetensors_source);
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -411,6 +444,8 @@ impl Runner {
             _safetensors_source: safetensors_source,
             top_k_override: None,
             routing_threshold: None,
+            prefetcher,
+            last_routing_ids,
         })
     }
 
@@ -517,6 +552,26 @@ impl Runner {
         if let Some(l0) = self.layer0.as_mut() {
             l0.past_seq_len = 0;
         }
+        // autolab iter 098: a fresh prompt has zero correlation with the
+        // previous prompt's expert routing — wipe the
+        // same-as-last-token predictor so we don't waste prefetch
+        // bandwidth (and SQ slots) on irrelevant experts.
+        for hist in self.last_routing_ids.iter_mut() {
+            hist.clear();
+        }
+    }
+
+    /// Snapshot of the runner-side prefetch counters. Returns `None`
+    /// when prefetch is disabled. Used by the per-token instrumentation
+    /// log in `forward_shells` and by external bench harnesses.
+    pub fn prefetch_stats(&self) -> Option<crate::async_prefetch::PrefetchStats> {
+        self.prefetcher.as_ref().map(|p| p.snapshot())
+    }
+
+    /// Which prefetch backend is wired in, if any. `None` means prefetch
+    /// is disabled.
+    pub fn prefetch_backend(&self) -> Option<PrefetchBackendKind> {
+        self.prefetcher.as_ref().map(|p| p.kind())
     }
 
     /// Truncate the per-layer KV caches by `n` slots. Used by speculative
@@ -698,6 +753,28 @@ impl Runner {
         let mut h_f32 = h_in.to_vec();
 
         let n_layers = self.layers.len();
+
+        // autolab iter 098: kick off async prefetch for every predicted
+        // next-token expert before we run any layer's attention.
+        // Predictor is "same as last token" — i.e. the IDs we stored in
+        // `last_routing_ids[i]` after the previous call. This races the
+        // OS readahead (madvise) or kernel-async-read (io_uring) against
+        // this token's compute, so by the time we hit each layer's
+        // `dispatch_expert` the pages are (hopefully) already warm.
+        // Skipped for the very first token after `reset_kv` when
+        // `last_routing_ids[i]` is still empty.
+        if let Some(pf) = self.prefetcher.as_ref() {
+            for (i, hist) in self.last_routing_ids.iter().enumerate() {
+                if hist.is_empty() {
+                    continue;
+                }
+                let lid = self.layers[i].lid;
+                for &eid in hist.iter() {
+                    pf.try_submit(lid, eid);
+                }
+            }
+        }
+
         for i in 0..n_layers {
             let lid = self.layers[i].lid;
             if self.layers[i].past_seq_len != past_seq_len {
@@ -767,19 +844,29 @@ impl Runner {
             // autolab campaign 007 (A2): apply routing-weight threshold.
             // We still iterate over `effective_top_k` to honor the A3 cap,
             // but skip experts below the threshold within that range.
+            //
+            // autolab iter 098: also collect this token's *actually-dispatched*
+            // expert IDs so the next forward_shells call can use them as the
+            // prefetch predictor (same-as-last-token heuristic). We track only
+            // the experts that survive A3+A2 filtering — the prefetcher should
+            // predict what will be accessed, not the full routed top_k. The
+            // storage cost is `<= effective_top_k * u32` per layer (negligible).
             let threshold = self.routing_threshold.unwrap_or(0.0);
+            let mut this_token_ids: Vec<u32> = Vec::with_capacity(effective_top_k);
             for k in 0..effective_top_k {
                 let w = outs.routing_weights[k];
                 if w < threshold {
                     continue;
                 }
                 let eid = outs.routing_ids[k] as u32;
+                this_token_ids.push(eid);
                 let y_f32 = self.dispatch_expert(lid, eid, &outs.attn_out_post_norm)?;
                 for j in 0..hidden {
                     moe[j] += w * y_f32[j];
                 }
             }
             experts_total_us += experts_t0.elapsed().as_micros() as u64;
+            self.last_routing_ids[i] = this_token_ids;
 
             // Combine: h_next = residual + shared + moe (single token).
             let combine_t0 = Instant::now();
@@ -1565,6 +1652,71 @@ fn read_f32(bytes: &[u8]) -> Vec<f32> {
         out.push(f32::from_le_bytes(a));
     }
     out
+}
+
+/// Default channel depth for the async prefetcher. Matches the iter 033
+/// C1 sizing: ~22 tokens of 6 experts × 30 layers at K=6. Large enough
+/// to absorb a short prefill burst without dropping; small enough that
+/// a stalled worker doesn't pin a lot of memory in the channel itself.
+const PREFETCH_CHANNEL_DEPTH: usize = 4096;
+
+/// Decide whether to construct an [`AsyncPrefetcher`] for this Runner.
+///
+/// Returns `None` (= prefetch disabled) if any of the following:
+///
+///   * Expert backend isn't `safetensors_bin` — the prefetcher only
+///     wins when the on-disk format is what `dispatch_expert` reads.
+///     OV IR and `int4_bin` paths copy weights at load time and never
+///     touch the safetensors mmaps again.
+///   * `TAHOMA_PREFETCH_BACKEND` is unset, empty, or one of `off` /
+///     `0` / `disabled` — operator opted out.
+///   * The env var value isn't a known backend name. We log a warn
+///     (so a typo doesn't silently disable optimization) and disable.
+///
+/// Otherwise spawns the prefetcher with the parsed backend.
+fn construct_prefetcher(
+    experts: &ExpertCache,
+    source: &Arc<SafetensorsExpertSource>,
+) -> Option<AsyncPrefetcher> {
+    // Only the safetensors path benefits — the other backends don't
+    // read from the safetensors mmaps at inference time.
+    if !matches!(experts, ExpertCache::SafetensorsBin(_)) {
+        return None;
+    }
+
+    let raw = std::env::var("TAHOMA_PREFETCH_BACKEND").ok();
+    let Some(raw) = raw.as_deref() else {
+        info!("expert prefetch: disabled (TAHOMA_PREFETCH_BACKEND unset)");
+        return None;
+    };
+
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed == "off" || trimmed == "0" || trimmed == "disabled" {
+        info!(
+            "expert prefetch: disabled (TAHOMA_PREFETCH_BACKEND={:?})",
+            raw
+        );
+        return None;
+    }
+
+    let kind = match PrefetchBackendKind::from_str_ci(raw) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(
+                requested = %raw,
+                err = %e,
+                "expert prefetch: disabled (unknown TAHOMA_PREFETCH_BACKEND value)"
+            );
+            return None;
+        }
+    };
+
+    info!(backend = kind.as_str(), "expert prefetch: enabled");
+    Some(AsyncPrefetcher::spawn(
+        source.clone(),
+        kind,
+        PREFETCH_CHANNEL_DEPTH,
+    ))
 }
 
 /// Double the per-head slot capacity of one layer's KV buffers,

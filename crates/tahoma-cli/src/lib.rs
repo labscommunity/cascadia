@@ -149,6 +149,41 @@ pub struct WorkerArgs {
     /// autolab campaign 007.
     #[arg(long)]
     pub routing_threshold: Option<f32>,
+
+    /// Sparse-MoE async expert prefetch backend. `off` (default) keeps
+    /// the historical no-prefetch path; `madvise` issues
+    /// `madvise(WILLNEED)` on the next-token expert byte ranges (iter
+    /// 033 baseline); `io-uring` uses real `IORING_OP_READ` SQEs on
+    /// Linux ≥ 5.6 (iter 097). Equivalent to setting
+    /// `TAHOMA_PREFETCH_BACKEND` on the engine env; CLI flag wins when
+    /// both are set. Only honored for `--engine sparse-moe`.
+    #[arg(long, value_enum, default_value_t = PrefetchBackendArg::Off)]
+    pub prefetch_backend: PrefetchBackendArg,
+}
+
+/// CLI surface for the sparse-MoE prefetch backend. Mirrored from
+/// [`tahoma_int4_gemm::async_prefetch::PrefetchBackendKind`] with an
+/// extra `Off` variant for "disabled" (the engine itself only knows
+/// "on / off via env var" — the CLI flag adds the third value so a
+/// user doesn't have to know to *unset* `TAHOMA_PREFETCH_BACKEND`).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefetchBackendArg {
+    Off,
+    Madvise,
+    #[clap(name = "io-uring", aliases = ["io_uring", "iouring"])]
+    IoUring,
+}
+
+impl PrefetchBackendArg {
+    /// Env-var string the engine reads. `Off` returns `"off"` so the
+    /// engine's `construct_prefetcher` short-circuits cleanly.
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Madvise => "madvise",
+            Self::IoUring => "io-uring",
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -355,6 +390,22 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             };
             if let Some(k) = spec_k {
                 cfg = cfg.with_spec_decode_k(k);
+            }
+            // Plumb `--prefetch-backend` into the engine env. The
+            // SparseMoE runner reads `TAHOMA_PREFETCH_BACKEND` at load
+            // time (see `runner::construct_prefetcher`). Setting it
+            // here means the CLI flag is the source of truth — and if
+            // the user *both* sets the env var and passes the flag,
+            // the flag wins (env::set_var clobbers).
+            //
+            // SAFETY: env mutation must happen before any thread reads it.
+            // SparseMoEBuilder::load spawns a worker thread that calls
+            // Runner::load which reads TAHOMA_PREFETCH_BACKEND. We're
+            // still on the CLI's tokio main here — no other writers, no
+            // earlier readers.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("TAHOMA_PREFETCH_BACKEND", args.prefetch_backend.as_env());
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }

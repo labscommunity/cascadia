@@ -26,6 +26,7 @@
 //! and [`expert_forward`] runs the full silu(gate*x) ⊙ up*x → down*y
 //! pipeline.
 
+pub mod async_prefetch;
 pub mod c_ffi;
 pub mod format;
 pub mod kernel;
@@ -37,6 +38,7 @@ pub mod safetensors_source;
 pub mod shell;
 pub mod shell_int4;
 
+pub use async_prefetch::{AsyncPrefetchBackend, PrefetchBackendKind};
 pub use format::{ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;
