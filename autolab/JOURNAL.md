@@ -73,6 +73,55 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 057 — Async kernel scheduling (speculative prefetch layer N+1) — CODE SHIPPED, bit-identical (2026-05-18 ~20:00 PT)
+
+Composes with the iter 047/054/056 cache-attack stack. Branch
+`perf/async-kernel-sched-057` @ `6d528ba` (based on iter 056 →
+stacks the whole 047/054/056 chain on iter 029 C1 prefetch).
+
+**Option 1 chosen (simplest, lowest risk):** speculative prefetch of
+layer N+1's hit-frequent experts, fired inside per-layer loop right
+before each layer's ~150ms expert dispatch. Reuses existing iter 029
+`Prefetcher` thread + iter 054 `expert_hits` histogram. **No new
+threads. No new channels. No synchronization complexity.**
+
+**+407 LOC across 3 files:**
+- `runner.rs`: `speculative_prefetch_n` field + setter + accessor +
+  counter; pure helper `speculative_prefetch_expert_ids`; scheduling
+  hook in `forward_shells` between shell forward and dispatch loop;
+  new tracing fields on `stage_timing` log; 8 unit tests
+- `engine.rs`: `speculative_prefetch_n: Option<u32>` on
+  `SparseMoEBuilderConfig`; plumbed into `Builder::load`
+- `tahoma-cli/lib.rs`: `--speculative-prefetch <N>` (default off)
+
+**Tests (8 new, 40 total sparse-moe pass):** top-N selection from hot
+histogram, empty-hits degenerate (first-prefill-token bit-identity to
+iter 056), N=0 off case, N>distinct returns all, A/B tie-breaking,
+K2.6 heavy-tail head + cold tail, composition with iter 054 pin
+selection (same IDs for matching N), runner-loop last-layer boundary.
+
+**Bit-identity by construction:** prefetcher's `try_submit` is a
+one-way kernel hint (`madvise(MADV_WILLNEED)` only schedules
+readahead, never alters page contents). Dispatch path still calls
+`dispatch_expert` with the real routing decision on the real hidden
+state. First-prefill-token is byte-identical to iter 056 (empty
+`expert_hits[i+1]` returns empty target set).
+
+**Workspace:** clean build, fmt clean, clippy clean on new code.
+
+**Predicted:** +3-8% tok/s on top of iter 047+054+056 stack under
+disk-pressure conditions where per-token predictor misses on the
+cold tail. Bench gated on miner free.
+
+**Composes — full 5-layer cache attack:**
+1. iter 033 C1 prefetch (warms RAM ahead of dispatch)
+2. iter 047 better predictor (top-N pre-softmax)
+3. iter 054 pinning (hot set never paged)
+4. iter 056 cache-aware dispatch (keeps L3 stable)
+5. iter 057 speculative cross-layer prefetch (hides layer N+1's disk wait)
+
+---
+
 ## 056 — Cache-aware expert dispatch order — CODE SHIPPED, bit-identical (2026-05-18 ~19:45 PT)
 
 Composes with iter 054 (pinning) + iter 047 (predictor). Branch
