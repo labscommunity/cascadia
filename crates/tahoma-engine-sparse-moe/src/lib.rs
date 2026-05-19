@@ -44,7 +44,11 @@ pub mod runner;
 pub mod sampling;
 pub mod tensors;
 
+pub use async_prefetch::{AsyncPrefetcher, PrefetchStats};
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use manifest::Manifest;
 pub use runner::{Runner, RunnerError};
 pub use sampling::SamplingConfig;
+// Re-export the backend kind so CLI / API layers can construct it
+// without depending on tahoma-int4-gemm directly.
+pub use tahoma_int4_gemm::async_prefetch::PrefetchBackendKind;
