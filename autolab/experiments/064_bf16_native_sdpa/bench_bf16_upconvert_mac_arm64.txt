@@ -1,0 +1,64 @@
+=== K2.6 KV SDPA: bf16 upconvert cost decomposition ===
+Single-head, scalar Rust. Cache lives in L1/L2 at small past_seq_len.
+Goal: quantify the inline `f32::from_bits((u16 as u32) << 16)` upconvert cost
+in iter 032's SDPA loop. Decision rule in source-file doc comment.
+
+=== past_seq_len = 16 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  f32 SDPA               0.993 us/iter   20.62 GB/s read   (sink=0)
+  bf16 inline            1.081 us/iter    9.48 GB/s read   (sink=0)
+  bf16 split             1.363 us/iter    7.51 GB/s read   (sink=0)
+  bf16 upcvt only        0.211 us/iter   48.61 GB/s read   (sink=0)
+  f32 dot only           0.991 us/iter   20.66 GB/s read   (sink=0)
+  ---
+  upconvert cost (inline - f32 dot only):   0.089 us  (  8.3% of bf16 inline)
+  upconvert cost (isolated upcvt only):     0.211 us  ( 19.5% of bf16 inline)
+  split-pass slowdown vs inline:           -26.13% (negative = split is slower)
+  f32 (raw, no cvt):                        0.993 us
+
+=== past_seq_len = 64 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  f32 SDPA               3.684 us/iter   22.24 GB/s read   (sink=0)
+  bf16 inline            4.046 us/iter   10.12 GB/s read   (sink=0)
+  bf16 split             5.028 us/iter    8.15 GB/s read   (sink=0)
+  bf16 upcvt only        0.721 us/iter   56.77 GB/s read   (sink=0)
+  f32 dot only           3.722 us/iter   22.01 GB/s read   (sink=0)
+  ---
+  upconvert cost (inline - f32 dot only):   0.324 us  (  8.0% of bf16 inline)
+  upconvert cost (isolated upcvt only):     0.721 us  ( 17.8% of bf16 inline)
+  split-pass slowdown vs inline:           -24.27% (negative = split is slower)
+  f32 (raw, no cvt):                        3.684 us
+
+=== past_seq_len = 256 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  f32 SDPA              14.937 us/iter   21.94 GB/s read   (sink=0)
+  bf16 inline           16.140 us/iter   10.15 GB/s read   (sink=0)
+  bf16 split            19.719 us/iter    8.31 GB/s read   (sink=0)
+  bf16 upcvt only        3.329 us/iter   49.21 GB/s read   (sink=0)
+  f32 dot only          14.905 us/iter   21.98 GB/s read   (sink=0)
+  ---
+  upconvert cost (inline - f32 dot only):   1.234 us  (  7.6% of bf16 inline)
+  upconvert cost (isolated upcvt only):     3.329 us  ( 20.6% of bf16 inline)
+  split-pass slowdown vs inline:           -22.17% (negative = split is slower)
+  f32 (raw, no cvt):                       14.937 us
+
+=== past_seq_len = 1024 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  f32 SDPA              59.336 us/iter   22.09 GB/s read   (sink=0)
+  bf16 inline           64.078 us/iter   10.23 GB/s read   (sink=0)
+  bf16 split            78.085 us/iter    8.39 GB/s read   (sink=0)
+  bf16 upcvt only       14.135 us/iter   46.36 GB/s read   (sink=0)
+  f32 dot only          59.373 us/iter   22.08 GB/s read   (sink=0)
+  ---
+  upconvert cost (inline - f32 dot only):   4.705 us  (  7.3% of bf16 inline)
+  upconvert cost (isolated upcvt only):    14.135 us  ( 22.1% of bf16 inline)
+  split-pass slowdown vs inline:           -21.86% (negative = split is slower)
+  f32 (raw, no cvt):                       59.336 us
+
+=== past_seq_len = 4096 (QK_HEAD_DIM=192, V_HEAD_DIM=128) ===
+  f32 SDPA             236.808 us/iter   22.14 GB/s read   (sink=0)
+  bf16 inline          256.108 us/iter   10.24 GB/s read   (sink=0)
+  bf16 split           312.859 us/iter    8.38 GB/s read   (sink=0)
+  bf16 upcvt only       56.569 us/iter   46.34 GB/s read   (sink=0)
+  f32 dot only         236.789 us/iter   22.14 GB/s read   (sink=0)
+  ---
+  upconvert cost (inline - f32 dot only):  19.319 us  (  7.5% of bf16 inline)
+  upconvert cost (isolated upcvt only):    56.569 us  ( 22.1% of bf16 inline)
+  split-pass slowdown vs inline:           -22.16% (negative = split is slower)
+  f32 (raw, no cvt):                      236.808 us
