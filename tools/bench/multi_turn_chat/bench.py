@@ -195,7 +195,10 @@ def run_single_turn_repeat(
     ]
     workload = "single_turn_repeat"
     convo_id = f"convo-{uuid.uuid4().hex[:8]}"
-    for batch, max_tokens in (("prefill", 1), ("e2e", args.max_tokens_decode)):
+    batches = [("prefill", 1)]
+    if not args.skip_e2e:
+        batches.append(("e2e", args.max_tokens_decode))
+    for batch, max_tokens in batches:
         for i in range(args.repeats):
             started = time.time()
             elapsed, body, err = chat_completion(
@@ -253,11 +256,14 @@ def run_multi_turn_chat(
         messages: list[dict] = [
             {"role": "system", "content": args.system_prompt},
         ]
+        batches = [("prefill", 1)]
+        if not args.skip_e2e:
+            batches.append(("e2e", args.max_tokens_decode))
         for t in range(args.turns):
             messages.append(
                 {"role": "user", "content": canned_user[t % len(canned_user)]}
             )
-            for batch, max_tokens in (("prefill", 1), ("e2e", args.max_tokens_decode)):
+            for batch, max_tokens in batches:
                 started = time.time()
                 elapsed, body, err = chat_completion(
                     args.url,
@@ -346,6 +352,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--turns", type=int, default=5, help="multi_turn_chat: turns per conversation")
     ap.add_argument("--use-session-id", action="store_true", help="multi_turn_chat: send X-Session-Id header")
     ap.add_argument("--max-tokens-decode", type=int, default=32, help="end-to-end batch max_tokens")
+    ap.add_argument("--skip-e2e", action="store_true", help="skip max_tokens=N batch; only measure max_tokens=1 (prefill cost)")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument(
