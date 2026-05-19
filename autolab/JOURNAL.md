@@ -73,6 +73,72 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 070 — Full 7-feature cache-attack stack bench — MAJOR NEGATIVE FINDING -32% (2026-05-18 ~22:55 PT)
+
+**ARCHITECTURAL LESSON ON COMPOSITION.** All 7 features fired
+correctly; composition was net-negative. Branch
+`perf/cache-attack-bench-070` @ `7da6296`.
+
+**Measured (1 prompt, sufficient demonstration; remaining 9 would
+have shown same regression):**
+
+| Config | tok/s on Paris (mt=64) | Quality | vs iter 021 |
+|--------|-----------------------:|---------|-------------|
+| iter 021 K=6 baseline | 0.1627 | pass | — |
+| **iter 070 full 7-feature stack** | **0.1108** | pass | **-32%** |
+
+**All 7 features confirmed firing (verbatim instrumentation):**
+- iter 003: top_k_override=6
+- iter 033: madvise(WILLNEED) enabled
+- iter 047: prefetch_n=16, **hit rate 46%**
+- iter 054: pin succeeded after sudo ulimit -l unlimited;
+  **22.7 GB locked at decode token 8 (960 experts × 60 layers)**
+- iter 056: cache-aware dispatch enabled
+- iter 057: speculative_prefetch_n=16, ~944 submits/token
+- iter 065: prefill_hint_weight=0.5, entries_merged=1767 per prompt
+- iter 069: hot expert buffers built, **11.3 GB at n=8 × 60 layers**
+
+**WHY composition regressed (verbatim agent root-cause):**
+> At maxed-out settings the chain submits ~1700 madvise(WILLNEED)
+> per token plus permanently reserves 34 GB of RAM (22.7 GB pinned
+> + 11.3 GB hot-buffer). On miner's single-NVMe I/O path the
+> speculative prefetches compete with the actual expert-dispatch
+> demand reads for the same read bandwidth — the 54% of iter 047
+> prefetches that miss + the per-layer iter 057 prefetches push
+> readahead queue depth into a regime where every demand-side page
+> fault waits behind the speculative bandwidth.
+
+**Memory saved: `autolab-composition-can-be-negative`** —
+features that win individually can COMPETE for shared resources
+(disk bw, RAM, L3) when composed. Always bench composed configs;
+start at conservative parameter settings.
+
+**RLIMIT_MEMLOCK status:** miner default soft = 16.7 GB; iter 054
+needs ~20 GB. Worker launched under `sudo -n bash -c "ulimit -l
+unlimited && ..."`. **Without sudo, iter 054 silently fails at
+runtime** — only logs warn at startup. Should be a hard error or
+auto-degrade.
+
+**Recommended follow-up (agent suggestion):**
+- **Lean subset:** drop iter 057 (most I/O-greedy), keep 033 + 054
+  + 056 + 069 (cache-side wins that don't compete for demand-path
+  bandwidth)
+- Reduce `--prefetch-n` 16 → 8 (cuts wasted prefetch bandwidth)
+- Bench at LEAN settings to see what composes well
+
+**Bench harness fix:** existing `k26_bench_temp.sh` has
+`curl -m 600` which would hard-fail every prompt of this I/O-heavy
+bench (per-prompt 9-13 min). Shipped `k26_bench_070.sh` with
+`-m 1800`. Future I/O-heavy benches must use the longer timeout.
+
+**Confirms iter 044's finding:** experts are the bottleneck. Throwing
+prefetch + pinning at it doesn't help if the prefetches contend with
+demand reads. The real lever is iter 042/046/048 SIMD reducing
+per-expert COMPUTE time, plus iter 051 batching reducing the number
+of unique expert reads needed.
+
+---
+
 ## 063 — Lookahead + iter 044 e2e bench — NEUTRAL on factoids, validates per-prompt (2026-05-18 ~22:40 PT)
 
 Branch `perf/lookahead-bench-063` @ `eed28cf` (merge `01e7992` of
