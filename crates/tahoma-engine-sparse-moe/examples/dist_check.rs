@@ -93,6 +93,18 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::Token => {
                 println!("[server] unexpected TOKEN from upstream — ignoring");
             }
+            FrameKind::HeartbeatPing => {
+                // dist_check is a wire smoke test, not a full worker —
+                // we don't run a heartbeat responder here. Just log
+                // and drain the body so the stream stays in sync if a
+                // future driver sends a ping during the test.
+                let _ = tahoma_engine_sparse_moe::dist::recv_heartbeat_body_server(&server).await?;
+                println!("[server] recv HEARTBEAT_PING (dist_check does not respond)");
+            }
+            FrameKind::HeartbeatPong => {
+                let _ = tahoma_engine_sparse_moe::dist::recv_heartbeat_body_server(&server).await?;
+                println!("[server] unexpected HEARTBEAT_PONG from upstream — ignoring");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");

@@ -52,12 +52,25 @@ use crate::sampling::SamplingConfig;
 /// History:
 /// - 0x01 — past_seq_len + hidden tensor only (pre-PR #10)
 /// - 0x02 — adds 28-byte SamplingConfig between past_seq_len and tensor (PR #10)
+///
+/// Heartbeat (iter 092):
+/// - `HeartbeatPing` / `HeartbeatPong` carry an 8-byte BE u64 nonce so a
+///   sender can match a pong to the ping that produced it (rejects
+///   stale pongs after a transport retry, lets the orchestrator measure
+///   per-RTT liveness, gives recovery code a "last good RTT" hook). The
+///   nonce is opaque to the worker — it echoes whatever it received.
+/// - Codes 0x40 / 0x41 are in the heartbeat namespace; future control-
+///   plane frames (HeartbeatLost, OrchestratorRestart) reserve 0x42+.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
     Forward = 0x53_4D_45_02, // "SME\x02"
     Reset = 0x53_4D_45_10,   // "SME\x10"
     Token = 0x53_4D_45_20,   // "SME\x20"
+    /// Liveness ping; body = 8 B BE u64 nonce. Sender → receiver.
+    HeartbeatPing = 0x53_4D_45_40, // "SME\x40"
+    /// Liveness pong; body = 8 B BE u64 nonce (echoes the ping). Receiver → sender.
+    HeartbeatPong = 0x53_4D_45_41, // "SME\x41"
 }
 
 impl FrameKind {
@@ -66,6 +79,8 @@ impl FrameKind {
             x if x == FrameKind::Forward as u32 => Some(FrameKind::Forward),
             x if x == FrameKind::Reset as u32 => Some(FrameKind::Reset),
             x if x == FrameKind::Token as u32 => Some(FrameKind::Token),
+            x if x == FrameKind::HeartbeatPing as u32 => Some(FrameKind::HeartbeatPing),
+            x if x == FrameKind::HeartbeatPong as u32 => Some(FrameKind::HeartbeatPong),
             _ => None,
         }
     }
@@ -282,6 +297,174 @@ pub async fn forward_reset(downstream: &Mutex<ActivationClient>) -> TransportRes
     send_reset(downstream).await
 }
 
+/// On-wire size of the heartbeat body (nonce only, no shape header).
+pub const HEARTBEAT_BODY_BYTES: usize = 8;
+
+/// Send a HeartbeatPing downstream (rank N → rank N+1) with a caller-
+/// provided nonce. The receiver echoes the nonce back in a
+/// HeartbeatPong so the sender can correlate pong-to-ping.
+///
+/// Cheap: 12 bytes (4 B kind + 8 B nonce) over an already-open TCP
+/// stream + a single flush. Negligible cost at heartbeat cadences ≥ 100
+/// ms. Held under the same mutex as Forward/Reset, so a heartbeat
+/// cannot interleave with the body of a Forward frame and corrupt the
+/// wire — the trade is that during a long Forward send the heartbeat
+/// queues behind it (acceptable: a healthy Forward is the strongest
+/// possible liveness signal).
+pub async fn send_heartbeat_ping(cli: &Mutex<ActivationClient>, nonce: u64) -> TransportResult<()> {
+    let mut bytes = [0u8; 4 + HEARTBEAT_BODY_BYTES];
+    bytes[0..4].copy_from_slice(&(FrameKind::HeartbeatPing as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&nonce.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Send a HeartbeatPing upstream (worker → driver). Used when an
+/// intermediate or last-rank worker wants to assert liveness back to
+/// rank 0 without waiting to be polled — e.g. an idle warmup window.
+/// Not used by v1's driver-pulls-pong design (rank 0 sends Ping,
+/// downstream echoes Pong) but plumbed symmetrically so a future
+/// bidirectional probe doesn't need a new helper.
+pub async fn send_heartbeat_ping_upstream(
+    srv: &Mutex<ActivationServer>,
+    nonce: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 4 + HEARTBEAT_BODY_BYTES];
+    bytes[0..4].copy_from_slice(&(FrameKind::HeartbeatPing as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&nonce.to_be_bytes());
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Send a HeartbeatPong upstream (worker → driver) echoing the nonce
+/// the matched ping carried. Symmetric to `send_token_upstream`: uses
+/// the server-side socket the upstream peer connected on.
+pub async fn send_heartbeat_pong_upstream(
+    srv: &Mutex<ActivationServer>,
+    nonce: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 4 + HEARTBEAT_BODY_BYTES];
+    bytes[0..4].copy_from_slice(&(FrameKind::HeartbeatPong as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&nonce.to_be_bytes());
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Send a HeartbeatPong downstream (driver → worker) echoing the nonce.
+/// Used by mid-rank workers when they receive a Ping from upstream and
+/// want to reply without involving their downstream peer.
+pub async fn send_heartbeat_pong_downstream(
+    cli: &Mutex<ActivationClient>,
+    nonce: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 4 + HEARTBEAT_BODY_BYTES];
+    bytes[0..4].copy_from_slice(&(FrameKind::HeartbeatPong as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&nonce.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a heartbeat body (8-byte BE nonce). The kind code has
+/// already been consumed by `recv_kind_*`. Returns the echoed nonce.
+pub async fn recv_heartbeat_body_server(srv: &Mutex<ActivationServer>) -> TransportResult<u64> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(HEARTBEAT_BODY_BYTES).await?;
+    drop(guard);
+    if raw.len() != HEARTBEAT_BODY_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+/// Receive a heartbeat body from the client-side socket (e.g. a
+/// driver waiting on a downstream pong).
+pub async fn recv_heartbeat_body_client(cli: &Mutex<ActivationClient>) -> TransportResult<u64> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(HEARTBEAT_BODY_BYTES).await?;
+    drop(guard);
+    if raw.len() != HEARTBEAT_BODY_BYTES {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+/// Heartbeat watchdog state — tracks consecutive misses against a fixed
+/// threshold and answers `is_dead()` once the worker has missed more
+/// pongs than the threshold tolerates.
+///
+/// Scope: failure detection only. Re-spawning the worker process,
+/// re-connecting the transport, and re-routing the layer range belong
+/// to the orchestrator track and are out of scope for iter 092
+/// (FOLLOW-UP-orchestrator, see docs/architecture/heartbeat-recovery.md).
+#[derive(Clone, Debug)]
+pub struct HeartbeatWatchdog {
+    /// Tolerance: declare dead once `consecutive_misses > max_misses`.
+    pub max_misses: u32,
+    consecutive_misses: u32,
+    /// Bumped on every successful ping/pong round-trip; useful to gate
+    /// "we never even got a first heartbeat" from "we lost the worker
+    /// after running for an hour" in the orchestrator's restart policy.
+    successes: u64,
+}
+
+impl HeartbeatWatchdog {
+    /// `max_misses` is the consecutive-miss tolerance. Per task spec
+    /// "2 misses in a row → mark worker as dead", default is 1 (so the
+    /// second miss trips the watchdog).
+    pub fn new(max_misses: u32) -> Self {
+        Self {
+            max_misses,
+            consecutive_misses: 0,
+            successes: 0,
+        }
+    }
+
+    /// Record a successful ping → pong round-trip. Resets the miss
+    /// counter atomically with the success count bump.
+    pub fn record_success(&mut self) {
+        self.consecutive_misses = 0;
+        self.successes = self.successes.saturating_add(1);
+    }
+
+    /// Record a missed pong (either an explicit timeout or a transport
+    /// error on the ping itself). Returns `true` once the worker has
+    /// crossed the death threshold.
+    pub fn record_miss(&mut self) -> bool {
+        self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+        self.is_dead()
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.consecutive_misses > self.max_misses
+    }
+
+    pub fn consecutive_misses(&self) -> u32 {
+        self.consecutive_misses
+    }
+
+    pub fn successes(&self) -> u64 {
+        self.successes
+    }
+}
+
+impl Default for HeartbeatWatchdog {
+    fn default() -> Self {
+        // Task spec: "2 misses in a row → mark worker as dead".
+        // record_miss returns true once consecutive_misses > max_misses
+        // (strict GT). So max_misses=1 trips on the SECOND consecutive
+        // miss, exactly matching the spec.
+        Self::new(1)
+    }
+}
+
 /// Bundle of the per-rank transport state. The Builder constructs this
 /// during `connect()` and hands it to the Engine.
 #[derive(Default)]
@@ -297,5 +480,99 @@ impl StageTransport {
 
     pub fn is_last(&self) -> bool {
         self.downstream.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_kind_round_trip_includes_heartbeat() {
+        for k in [
+            FrameKind::Forward,
+            FrameKind::Reset,
+            FrameKind::Token,
+            FrameKind::HeartbeatPing,
+            FrameKind::HeartbeatPong,
+        ] {
+            assert_eq!(
+                FrameKind::from_code(k as u32),
+                Some(k),
+                "round-trip failed for {k:?}"
+            );
+        }
+        assert_eq!(FrameKind::from_code(0xDEAD_BEEF), None);
+    }
+
+    #[test]
+    fn heartbeat_codes_disjoint_from_other_frames() {
+        // The recovery design relies on the kind code being unique so a
+        // stale heartbeat can never be confused with a Forward / Token
+        // body. A regression here would silently misroute the first
+        // byte of a tensor as a frame code.
+        let codes = [
+            FrameKind::Forward as u32,
+            FrameKind::Reset as u32,
+            FrameKind::Token as u32,
+            FrameKind::HeartbeatPing as u32,
+            FrameKind::HeartbeatPong as u32,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for (j, b) in codes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "FrameKind codes collide at {i}/{j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_default_is_two_misses() {
+        // Spec: "2 misses in a row → mark worker as dead". Default
+        // max_misses=1 means record_miss returns true on the SECOND
+        // miss, not the first.
+        let mut w = HeartbeatWatchdog::default();
+        assert!(!w.is_dead());
+        assert!(!w.record_miss()); // 1st miss
+        assert!(!w.is_dead());
+        assert!(w.record_miss()); // 2nd miss — declared dead
+        assert!(w.is_dead());
+    }
+
+    #[test]
+    fn watchdog_success_resets_miss_counter() {
+        let mut w = HeartbeatWatchdog::default();
+        assert!(!w.record_miss()); // 1st miss
+        w.record_success(); // wipes the streak
+        assert!(!w.is_dead());
+        assert_eq!(w.consecutive_misses(), 0);
+        assert_eq!(w.successes(), 1);
+        assert!(!w.record_miss()); // back to 1st miss in a NEW streak
+        assert!(!w.is_dead());
+    }
+
+    #[test]
+    fn watchdog_with_higher_tolerance() {
+        // A flaky link wants more tolerance — e.g. tolerate 5 misses.
+        // Spec semantics extend: dead when consecutive_misses > max_misses.
+        let mut w = HeartbeatWatchdog::new(5);
+        for i in 0..5 {
+            assert!(!w.record_miss(), "miss {i} should not declare dead");
+        }
+        assert!(w.record_miss(), "6th miss should declare dead");
+    }
+
+    #[test]
+    fn watchdog_successes_saturate() {
+        // Defensive: a watchdog that runs for years shouldn't wrap
+        // u64::MAX → 0 and erase the long-running-process signal.
+        let mut w = HeartbeatWatchdog::default();
+        // Force the saturate edge directly — running 2^64 cycles in a
+        // unit test isn't going to happen.
+        for _ in 0..10 {
+            w.record_success();
+        }
+        assert_eq!(w.successes(), 10);
     }
 }

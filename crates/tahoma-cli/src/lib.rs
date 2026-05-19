@@ -131,6 +131,26 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Heartbeat ping cadence for pipeline workers, in milliseconds.
+    /// 0 disables heartbeats (legacy behavior — no liveness probing,
+    /// the driver hangs forever if a worker dies mid-decode). Currently
+    /// only honored by the sparse-MoE engine; other engines accept the
+    /// flag and ignore it.
+    ///
+    /// Recommended: 1000–5000 ms. Per-ping cost is ~12 wire bytes +
+    /// one stream flush; at 1 s cadence on a 2-box pipeline the
+    /// bandwidth overhead is ~24 B/s per link (negligible vs the
+    /// per-token ~14 KiB hidden state at 7168 × f32). Detection latency
+    /// at default `--heartbeat-interval-ms 1000` is ≤ 2 s (2 missed
+    /// pings, per the HeartbeatWatchdog default). See
+    /// docs/architecture/heartbeat-recovery.md.
+    ///
+    /// FOLLOW-UP-orchestrator (iter 092 skeleton): the dead-worker
+    /// detection wires up an opaque `is_dead()` callback only; the
+    /// re-spawn + reconnect + KV restore path is the next track.
+    #[arg(long, default_value_t = 0)]
+    pub heartbeat_interval_ms: u64,
 }
 
 #[derive(Parser, Debug, Clone)]

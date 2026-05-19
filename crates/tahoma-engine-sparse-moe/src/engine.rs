@@ -26,9 +26,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::dist::{
-    forward_reset, recv_forward_body_server, recv_kind_client, recv_kind_server,
-    recv_token_body_client, send_forward, send_reset, send_token_upstream, FrameKind,
-    StageTransport,
+    forward_reset, recv_forward_body_server, recv_heartbeat_body_server, recv_kind_client,
+    recv_kind_server, recv_token_body_client, send_forward, send_heartbeat_pong_upstream,
+    send_reset, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
 
@@ -832,6 +832,27 @@ impl SparseMoEEngine {
             }
             FrameKind::Token => Err(format!(
                 "rank {} received unexpected TOKEN from upstream",
+                self.rank
+            )),
+            FrameKind::HeartbeatPing => {
+                // Liveness probe from upstream. Echo the nonce back on
+                // the same server socket (upstream channel) — the
+                // driver matches pong-to-ping by nonce. Intentionally
+                // does NOT forward downstream: each rank answers for
+                // its own liveness, the driver pings each rank
+                // independently for end-to-end coverage. (v1 only
+                // pings the immediate downstream; multi-hop pings are
+                // a follow-up in docs/architecture/heartbeat-recovery.md.)
+                let nonce = self
+                    .block_on(recv_heartbeat_body_server(upstream))
+                    .map_err(|e| format!("recv_heartbeat: {e}"))?;
+                self.block_on(send_heartbeat_pong_upstream(upstream, nonce))
+                    .map_err(|e| format!("send_heartbeat_pong: {e}"))?;
+                Ok(())
+            }
+            FrameKind::HeartbeatPong => Err(format!(
+                "rank {} received unexpected HEARTBEAT_PONG from upstream \
+                 (workers receive Ping and reply Pong; only the driver receives Pong)",
                 self.rank
             )),
         }
