@@ -73,6 +73,55 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 078 — Continuous batching engine wiring — Blocker 3 done (per-request sampling state) (2026-05-19 ~00:15 PT)
+
+Extends iter 059 ContinuousBatcher skeleton. Branch
+`perf/continuous-batching-wiring-078` @ `60d8d81` (based on iter 059).
+
+**Blocker 3 addressed: per-request sampling state.**
+
+**What shipped:**
+- `ContinuousBatcher` now owns parallel
+  `samplers: Vec<Option<SamplerState>>` keyed by `slot_idx`
+- Kept in lockstep with `slots` by `submit` / `fill_from_pending` /
+  `gc`
+- New public method `sample_for_plan(planned, logits_per_slot) ->
+  Vec<StepOutcome>` — runs `sampling::sample` once per planned slot
+  with that slot's (rng, history)
+- History read directly from `RequestSlot.generated` (already
+  maintained by `commit_step` from iter 059) — slot lifecycle stays
+  source of truth
+- RNG lazy-seeded from `sampling.seed` on first use → bit-for-bit
+  determinism matches existing single-rank sampler
+
+**Tests (5 new, 28 total sparse-MoE pass):**
+- **Headline:** `two_slots_different_seeds_independent_streams` —
+  two slots with identical logits but different seeds produce
+  different sampled tokens
+- `two_slots_different_history_independent_streams` — rep-penalty
+  histories are per-slot; slots literally swap their preferred
+  token after force-divergent commits
+
+**Single-request path UNCHANGED.** `SparseMoEEngine::step` not
+touched.
+
+**Remaining blockers (out of scope, documented):**
+- **Blocker 1: per-request KV slabs** — load-bearing layout choice
+  (padded slab vs paged-attention); own PR
+- **Blocker 2: [N, 1, H] shell forward** — requires int4 shell
+  kernel to grow N axis. iter 048's `forward_shells_multi` treats N
+  tokens as one request (spec-decode), not what's needed here
+- **Blocker 4: API admission control** — `tahoma-api` + runner +
+  Engine trait changes (would gain `submit_streaming`). Per-slot
+  sampler reachable only via batcher's public surface today
+
+**Workspace:** 28 lib tests pass; fmt clean; clippy no new warnings.
+
+**Composes with iter 059:** module doc updated to mark Blocker 3
+DONE; remaining Blockers 1/2/4 still listed as future work.
+
+---
+
 ## 075 — Extended SIMD dispatch (LargeShape variant) — IMPL + critical merge fix (2026-05-18 ~23:45 PT)
 
 Two-part deliverable. Branch `perf/extend-simd-dispatch-075` @
