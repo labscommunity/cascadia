@@ -73,6 +73,17 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 066 — Adaptive routing threshold — FAILED (agent stalled 600s, no branch) (2026-05-18 ~21:45 PT)
+
+Agent stalled mid-implementation ("Now CLI plumbing:" was the last
+visible step). Branch not pushed. No deliverable.
+
+Could retry with tighter scope (single CLI flag + score-tracking
+struct only, no per-layer adaptive yet). Not relaunching this turn;
+moving to iter 067 to keep momentum on net-new territory.
+
+---
+
 ## 065 — Static schedule precompute from prefill — IMPL SHIPPED (2026-05-18 ~21:35 PT)
 
 Closes the warmup gap: decode iter 1 now starts with `expert_hits`
