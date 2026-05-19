@@ -73,6 +73,59 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 058 — Int4 embedding quantization — IMPL SHIPPED, real-model quality eval pending (2026-05-18 ~20:10 PT)
+
+Branch `perf/int4-embedding-058` @ `d23d7c5`. Path (B) — working
+impl with synthetic validation; real-K2.6 quality eval is follow-up.
+
+**Embedding was indeed bf16 (not already int4 like router was).**
+Confirmed by reading `safetensors_source.rs::embed_tokens()` and
+`runner.rs::Layer0State` — held a raw bf16 mmap slice unchanged.
+Iter 055 router work + PR #7 shell quantization had not touched
+embedding.
+
+**What shipped:**
+1. `Int4Embedding` struct + `from_bf16_table` + `embed_token_int4`
+   in `layer0_int4.rs` (+410 LOC). Group=32 symmetric int4 with
+   bf16 scales — identical scheme to router/expert/shell paths.
+   Streams safetensors mmap row-by-row (no transient 4.7 GB f32
+   expansion)
+2. `EmbeddingTable` enum in `runner.rs` (bf16 mmap default or int4
+   owned variant); same `embed(token_id) -> Vec<f32>` contract
+3. `--int4-embedding` CLI flag (default off, back-compat)
+4. `SparseMoEBuilderConfig::int4_embedding` field +
+   `with_int4_embedding(bool)` builder
+5. **5 regression tests**: constant-row exactness, zero-row no-NaN,
+   footprint layout, L2 round-trip relative-error (synthetic 32-row
+   vocab, threshold 12% on adversarial i.i.d.-Normal with per-row
+   magnitude variance, measured ~9.4%)
+
+**Memory impact on K2.6:**
+- bf16 mmap: 2.34 GB
+- int4 packed (587 MB) + bf16 scales (73 MB) = **~660 MB heap-owned**
+- **Caveat (honest from agent):** `SafetensorsExpertSource` shard
+  cache keeps the bf16 shard mmap pinned until source is dropped;
+  VMA stays mapped. **Actionable win is page-cache eviction of
+  untouched bf16 bytes under memory pressure** (Linux page-reclaim).
+  Operators looking for hard RSS drop should profile under realistic
+  expert pressure, not at idle.
+
+**Quality:**
+- 5 unit tests pass on synthetic
+- Top-1 token-match eval on real K2.6 NOT included (needs multi-GB
+  safetensors + AVX-512 host). Existing `tests/k26_layer0_eval.rs`
+  updated to compile with new signature; natural home for follow-up
+  miner eval.
+- Feature OFF by default — existing call paths byte-identical
+
+**Composes with iter 054** (pinning): freeing 1+ GB of effective RAM
+means more headroom for additional pinned experts (47 GB → could
+push to 48+ GB pinnable while staying under miner's 133 GB).
+
+28 tests pass (16 int4-gemm + 12 sparse-moe), fmt clean.
+
+---
+
 ## 057 — Async kernel scheduling (speculative prefetch layer N+1) — CODE SHIPPED, bit-identical (2026-05-18 ~20:00 PT)
 
 Composes with the iter 047/054/056 cache-attack stack. Branch
