@@ -39,6 +39,7 @@
 pub mod dist;
 pub mod engine;
 pub mod kv_prefix_cache;
+pub mod kv_session_cache;
 pub mod manifest;
 pub mod runner;
 pub mod sampling;
@@ -46,6 +47,7 @@ pub mod tensors;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
+pub use kv_session_cache::{KvSessionCache, SessionHit};
 pub use manifest::Manifest;
 pub use runner::{Runner, RunnerError};
 pub use sampling::SamplingConfig;

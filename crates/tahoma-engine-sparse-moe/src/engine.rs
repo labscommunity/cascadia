@@ -31,6 +31,7 @@ use crate::dist::{
     StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
+use crate::kv_session_cache::KvSessionCache;
 use crate::runner::{LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
@@ -53,6 +54,16 @@ pub struct SparseMoEBuilderConfig {
     /// stages requires a new transport frame for snapshot exchange,
     /// deferred to a follow-up. With `total > 1` this field is a no-op.
     pub kv_prefix_cache_size: u32,
+    /// Max bytes held by the per-session KV cache used for multi-turn
+    /// chat warm-restart. `0` disables (default). The cache is keyed
+    /// on `GenerationTask::session_id` (typically an `X-Session-Id`
+    /// header propagated through the API layer): when present and the
+    /// new turn's prompt extends a previous turn's history, the
+    /// restored snapshot lets prefill skip the prior
+    /// `system+user+asst+...` content. See [`crate::kv_session_cache`]
+    /// for the cache semantics. Like the prefix cache, single-stage
+    /// only on this iter.
+    pub session_cache_size_mb: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -65,6 +76,7 @@ impl SparseMoEBuilderConfig {
             rank: 0,
             total: 1,
             kv_prefix_cache_size: 0,
+            session_cache_size_mb: 0,
         }
     }
 
@@ -78,6 +90,16 @@ impl SparseMoEBuilderConfig {
     /// disables the cache.
     pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
         self.kv_prefix_cache_size = n;
+        self
+    }
+
+    /// Set the per-session KV cache byte budget (in MiB). `0` disables
+    /// the cache (default). Sized in MiB rather than entries because
+    /// the multi-turn working set varies per session — a long
+    /// conversation accumulates a much bigger snapshot than a short
+    /// one, so a flat entry cap silently OOMs on the tail.
+    pub fn with_session_cache_size_mb(mut self, mb: u32) -> Self {
+        self.session_cache_size_mb = mb;
         self
     }
 }
@@ -281,6 +303,7 @@ impl Builder for SparseMoEBuilder {
         // KV-prefix cache is single-stage only on this PR. Warn (don't
         // error) on multi-stage configs so the same CLI flag works in
         // both topologies — the multi-stage path silently ignores it.
+        // Same logic applies to the per-session cache (iter 072).
         let kv_cache_size = if total > 1 {
             if self.config.kv_prefix_cache_size > 0 {
                 warn!(
@@ -293,11 +316,31 @@ impl Builder for SparseMoEBuilder {
         } else {
             self.config.kv_prefix_cache_size
         };
+        let session_cache_bytes: usize = if total > 1 {
+            if self.config.session_cache_size_mb > 0 {
+                warn!(
+                    requested_mb = self.config.session_cache_size_mb,
+                    total,
+                    "kv-session-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
+                );
+            }
+            0
+        } else {
+            (self.config.session_cache_size_mb as usize) * 1024 * 1024
+        };
         let kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
         if kv_prefix_cache.enabled() {
             info!(
                 capacity = kv_prefix_cache.capacity(),
                 "kv-prefix-cache enabled (single-stage)"
+            );
+        }
+        let kv_session_cache = KvSessionCache::new(session_cache_bytes);
+        if kv_session_cache.enabled() {
+            info!(
+                capacity_bytes = kv_session_cache.capacity_bytes(),
+                capacity_mb = self.config.session_cache_size_mb,
+                "kv-session-cache enabled (single-stage)"
             );
         }
         Ok(Box::new(SparseMoEEngine {
@@ -313,6 +356,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
             kv_prefix_cache,
+            kv_session_cache,
         }))
     }
 }
@@ -408,6 +452,14 @@ pub struct SparseMoEEngine {
     /// generate path skips that portion of prefill. See
     /// [`crate::kv_prefix_cache`] for the cache semantics.
     kv_prefix_cache: KvPrefixCache,
+    /// Single-stage per-session KV cache for multi-turn chat warm-
+    /// restart. Empty + capacity=0 when the user didn't pass
+    /// `--session-cache-size-mb` (default). Keyed on
+    /// `GenerationTask::session_id`; snapshot taken AT END of every
+    /// generation (post-assistant reply) so the next turn of the same
+    /// session can skip the entire prior history. See
+    /// [`crate::kv_session_cache`] for the cache semantics.
+    kv_session_cache: KvSessionCache,
 }
 
 impl SparseMoEEngine {
@@ -524,23 +576,37 @@ impl SparseMoEEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let cache_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
+        // Both caches are borrowed mutably from the engine so we
+        // construct the optional `&mut` borrows in a single pre-call
+        // step. We DON'T pass `Some(&mut cache)` when the cache is
+        // disabled so the runner's enabled() probes can short-circuit
+        // without touching the cache state.
+        let prefix_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
             Some(&mut self.kv_prefix_cache)
         } else {
             None
         };
-        let generated =
-            match self
-                .runner
-                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
-            {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!(task = %task.task_id, "runner failed: {e}");
-                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                    return vec![(task.task_id, final_chunk)];
-                }
-            };
+        let session_opt: Option<&mut KvSessionCache> = if self.kv_session_cache.enabled() {
+            Some(&mut self.kv_session_cache)
+        } else {
+            None
+        };
+        let session_id_ref: Option<&str> = task.session_id.as_deref();
+        let generated = match self.runner.generate_with_caches(
+            &prompt_ids,
+            max_new,
+            &sampling_cfg,
+            prefix_opt,
+            session_opt,
+            session_id_ref,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, "runner failed: {e}");
+                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                return vec![(task.task_id, final_chunk)];
+            }
+        };
         let n_tokens = generated.len() as u32;
         let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
         let mut text = tokenizer

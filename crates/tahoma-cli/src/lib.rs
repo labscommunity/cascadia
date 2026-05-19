@@ -145,6 +145,24 @@ pub struct WorkerArgs {
     /// is ~150 MiB, so practical caps are 1..8.
     #[arg(long, default_value_t = 0)]
     pub kv_prefix_cache_size: u32,
+
+    /// Per-session KV cache size in MiB (sparse-moe engine only). `0`
+    /// = disabled (default). When > 0, the engine snapshots KV state
+    /// at the END of every generation and indexes it by
+    /// `GenerationTask::session_id` (set by the API layer from the
+    /// `X-Session-Id` header). The next turn of the same session
+    /// warm-restarts from the snapshot: prefill skips the entire
+    /// prior `system+user+asst+...` history.
+    ///
+    /// Best fit: multi-turn chat workloads. Each accumulating session
+    /// snapshot grows by ~KV-bytes-per-token × (prompt+generated)
+    /// — at K2.6 dims roughly 300 KiB/token, so a 4k-token session
+    /// is ~1.2 GiB. Size accordingly.
+    ///
+    /// Single-stage only on this PR (same reason as
+    /// `--kv-prefix-cache-size`).
+    #[arg(long, default_value_t = 0)]
+    pub session_cache_size_mb: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -332,7 +350,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
                 .with_rank(args.rank, args.total)
-                .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
+                .with_kv_prefix_cache_size(args.kv_prefix_cache_size)
+                .with_session_cache_size_mb(args.session_cache_size_mb);
             if let Some(dir) = &args.ov_cache_dir {
                 cfg.cache_dir = Some(dir.clone());
             }
@@ -530,6 +549,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             logprobs: 0,
             enable_thinking: false,
             trust_remote_code: false,
+            session_id: None,
         };
         let mut stream = runner.generate(task)?;
         while let Some(chunk) = stream.next().await {
