@@ -73,6 +73,60 @@ against A8 u16 KV signature; bit-identity tests pass.
 
 ---
 
+## 074 — io_uring async expert reads (Linux) — SCOPING + skeleton (2026-05-18 ~23:30 PT)
+
+Follow-up to iter 070's NVMe bandwidth contention finding. io_uring
+gives true async I/O, decouples prefetch from demand-path queue.
+Branch `perf/io-uring-prefetch-074` (3 commits).
+
+**What shipped (Option B + plan):**
+1. **Design doc** `docs/perf/io_uring_prefetch.md` (282 lines):
+   - TL;DR + iter 070 regression analysis (problem being solved)
+   - Current C1 chain property table vs io_uring property table
+   - Composition: separate prefetch buffer; demand path stays on
+     mmap; kernel page cache resolves overlap
+   - Why io_uring beats aio/threadpool/O_DIRECT
+   - API sketch for `Shard::async_read` and `AsyncPrefetcher`
+   - **6-PR milestone plan**
+   - Blockers section: kernel ≥ 5.1/5.6/5.10, WSL2 unsupported,
+     Docker/k8s seccomp, NVMe queue depth, page cache pressure,
+     buffer alignment, FD lifetime
+   - Explicit non-goals
+2. **Skeleton in tahoma-int4-gemm:**
+   - `async_prefetch.rs` (+250 LOC): `AsyncPrefetchBackend`,
+     `AsyncReadHandle`, `AsyncIoError`. Linux io_uring path STUBBED
+     (constructor falls through to Fallback until milestone 1).
+     Fallback returns immediately-ready handles so call sites don't
+     branch.
+   - `safetensors_source.rs`: `Shard` keeps underlying `File` alive
+     on Unix (mmap survives FD close but io_uring needs live FD);
+     added `Shard::async_read(backend, tensor_name)`
+   - `Cargo.toml`: `io-uring = "0.6"` as Linux-only optional dep
+     behind `io-uring` feature flag (off by default)
+3. **Skeleton in tahoma-engine-sparse-moe:**
+   - `async_prefetch.rs` (+250 LOC): `AsyncPrefetcher`, `PrefetchReq`,
+     `PrefetchStats` with SAME try_submit/snapshot/Drop shape as
+     iter 033's `Prefetcher` so runner wiring can swap
+   - Background thread fed by `try_submit`; resolves each request to
+     six `Shard::async_read` SQEs
+
+**Tests:** workspace builds clean, 38 tests pass (including 3 new
+for skeleton). fmt + clippy clean on new files.
+
+**Honest disclosures:**
+- Linux backend STUBBED — `BackendKind::IoUring` unreachable today,
+  always picks Fallback. Milestone 1 replaces with real
+  `io_uring::IoUring::new` + availability probe
+- Hot-path wiring in `runner.rs::forward_shells` NOT added because
+  this branch is based on main which doesn't have iter 033 C1.
+  Runner wiring lands in milestones 3-4 after iter 033 merges. Shape
+  matches iter 033 `Prefetcher` for drop-in swap.
+- io_uring 0.6 picked by dep resolver (0.7 newer); will revisit at
+  milestone 1
+- WSL2 / Docker seccomp / kernel < 5.6 fall back to existing madvise
+
+---
+
 ## 072 — Persistent KV chat session cache — full (A) impl shipped (2026-05-18 ~23:20 PT)
 
 Extends iter 060 prompt-cache to multi-turn chat. Branch
