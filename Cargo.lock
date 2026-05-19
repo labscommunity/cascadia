@@ -356,6 +356,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core_affinity"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a034b3a7b624016c6e13f5df875747cc25f884156aad2abd12b6c46797971342"
+dependencies = [
+ "libc",
+ "num_cpus",
+ "winapi",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,6 +2260,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tahoma-api",
+ "tahoma-cpu-affinity",
  "tahoma-engine",
  "tahoma-engine-mock",
  "tahoma-engine-openvino",
@@ -2260,6 +2272,16 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tahoma-cpu-affinity"
+version = "0.1.0"
+dependencies = [
+ "core_affinity",
+ "rayon",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

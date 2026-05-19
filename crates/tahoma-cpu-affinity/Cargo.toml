@@ -1,0 +1,26 @@
+[package]
+name = "tahoma-cpu-affinity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-thread CPU affinity layout + applier. Pins rayon, tokio, and helper threads to specific cores so the OS scheduler stops migrating hot working sets across L1/L2 boundaries on big-core hosts."
+
+[features]
+default = ["rayon-glue"]
+# Pull rayon to install a pinned global pool via Layout::apply_to_rayon_global.
+# Off-by-default would let downstream pick, but tahoma's only consumer (the CLI)
+# always wants rayon pinning, so default it on. Drop the feature with
+# `default-features = false` on a tahoma-cpu-affinity dep to skip the rayon dep
+# entirely (handy for a future test-only crate that just wants pin_current_thread).
+rayon-glue = ["dep:rayon"]
+
+[dependencies]
+core_affinity = "0.8"
+rayon = { version = "1", optional = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Pure-logic tests don't need anything extra; the layout planner is
+# fully testable without touching real cores.
