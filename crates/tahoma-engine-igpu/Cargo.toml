@@ -1,0 +1,38 @@
+[package]
+name = "tahoma-engine-igpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Scoping crate for the Intel iGPU acceleration path on the sparse-MoE engine (OneAPI/SYCL int4 GEMV, attention SDPA). Stub-only on PR `perf/igpu-oneapi-scoping-071`; first real kernel lands later — see `src/lib.rs` and `docs/IGPU_PLAN.md`."
+
+[features]
+# `oneapi-sycl`: link the C++ shim at `cpp/shim.cpp` against the Intel
+# OneAPI Base Toolkit (`icpx -fsycl`) and the Level Zero loader so we can
+# launch SYCL kernels on the Intel iGPU. Off by default — the stub Rust
+# implementation surfaces a clean runtime error when not built.
+#
+# `opencl-fallback`: build the equivalent kernels in OpenCL C against any
+# Intel GPU exposing a `cl_intel_subgroups` / `cl_khr_subgroup_*`
+# implementation. Useful on stripped-down Windows installs that don't
+# ship the OneAPI toolkit (the Intel Graphics driver bundles an OpenCL
+# runtime out of the box). Not yet implemented.
+default = []
+oneapi-sycl = []
+opencl-fallback = []
+
+[dependencies]
+tahoma-types = { workspace = true }
+tahoma-engine = { workspace = true }
+tahoma-int4-gemm = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+half = "2"
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

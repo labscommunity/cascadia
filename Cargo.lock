@@ -2301,6 +2301,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tahoma-engine-igpu"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cc",
+ "futures",
+ "half",
+ "tahoma-engine",
+ "tahoma-int4-gemm",
+ "tahoma-types",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "tahoma-engine-mock"
 version = "0.1.0"
 dependencies = [
