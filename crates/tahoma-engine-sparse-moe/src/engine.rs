@@ -32,6 +32,37 @@ use crate::dist::{
 };
 use crate::runner::{LayerRange, Runner, RunnerError};
 
+/// How this rank decides which MoE layers to hold.
+///
+/// `Even` (the default) computes the historical floor/ceiling split
+/// from `rank` and `total`. `Explicit` honors operator-supplied
+/// `(layer_start, layer_end)` half-open bounds in manifest coordinates
+/// (MoE layer ids are 1-based; dense layer 0 is implicit). `Auto` is a
+/// placeholder that today falls back to `Even` with a warning — the
+/// auto-rebalance logic that reads per-stage timing instrumentation
+/// and reshapes the split is iter-082's follow-up. The flag ships now
+/// so callers can wire it without later having to thread a new arg
+/// through every layer of the stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerRangeStrategy {
+    /// Floor/ceiling split: layers `total_moe / total` per rank, with
+    /// the first `total_moe % total` ranks getting one extra.
+    Even,
+    /// Operator-supplied half-open `[start, end)` range in manifest
+    /// MoE-layer-id coordinates (1-based; dense layer 0 implicit).
+    Explicit { start: u32, end: u32 },
+    /// Read per-stage timing instrumentation and compute a balanced
+    /// split. **Not implemented yet** — currently degrades to `Even`
+    /// with a warning. Tracking issue: iter 082.
+    Auto,
+}
+
+impl Default for LayerRangeStrategy {
+    fn default() -> Self {
+        Self::Even
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
     pub model_dir: PathBuf,
@@ -42,6 +73,9 @@ pub struct SparseMoEBuilderConfig {
     pub rank: u32,
     /// Number of pipeline stages.
     pub total: u32,
+    /// How to derive this rank's `[layer_start, layer_end)` slice.
+    /// Default is `Even`, matching the historical behavior.
+    pub layer_range_strategy: LayerRangeStrategy,
 }
 
 impl SparseMoEBuilderConfig {
@@ -53,12 +87,18 @@ impl SparseMoEBuilderConfig {
             max_cached_experts: 200,
             rank: 0,
             total: 1,
+            layer_range_strategy: LayerRangeStrategy::Even,
         }
     }
 
     pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
         self.rank = rank;
         self.total = total;
+        self
+    }
+
+    pub fn with_layer_range_strategy(mut self, strategy: LayerRangeStrategy) -> Self {
+        self.layer_range_strategy = strategy;
         self
     }
 }
@@ -160,16 +200,22 @@ impl Builder for SparseMoEBuilder {
 
         // Build a LayerRange from the ShardSpec + config. For total==1
         // we keep the historical behavior (load everything). For
-        // multi-stage we honor layer_start/layer_end. If they're zero
-        // (e.g. the CLI hasn't computed them), derive an even split
-        // from the manifest's num_layers and our rank/total.
+        // multi-stage we honor:
+        //   1) `layer_range_strategy = Explicit { start, end }` first
+        //      (operator override via `--layer-range`),
+        //   2) then non-zero ShardSpec.layer_start/layer_end if the
+        //      caller pre-computed them,
+        //   3) then `Auto` — which today falls back to Even with a
+        //      warning (iter-082 wires the timing-driven rebalance),
+        //   4) finally an even floor/ceiling split from the manifest's
+        //      num_moe and our rank/total.
         let total = self.config.total.max(1);
         let rank = self.config.rank.min(total - 1);
         let is_first = shard.is_first_stage || rank == 0;
         let is_last = shard.is_last_stage || rank == total - 1;
         let mut layer_start = shard.layer_start;
         let mut layer_end = shard.layer_end;
-        if total > 1 && layer_start == 0 && layer_end == 0 {
+        if total > 1 {
             let total_moe = read_manifest_moe_count(&self.config.model_dir)?;
             // Reject splits that would leave a rank with zero MoE layers
             // — that rank is dead weight (still on the wire, still pays
@@ -180,20 +226,61 @@ impl Builder for SparseMoEBuilder {
                     "total={total} > num_moe_layers={total_moe}; some rank would hold zero layers"
                 )));
             }
-            let (s, e) = even_moe_split(total_moe, rank, total);
-            layer_start = s;
-            layer_end = e;
-            info!(
-                rank,
-                total,
-                total_moe_layers = total_moe,
-                layer_start,
-                layer_end,
-                "computed even MoE-layer split"
-            );
-        } else if total == 1 {
+            match &self.config.layer_range_strategy {
+                LayerRangeStrategy::Explicit { start, end } => {
+                    validate_explicit_range(*start, *end, total_moe)?;
+                    layer_start = *start;
+                    layer_end = *end;
+                    info!(
+                        rank,
+                        total,
+                        total_moe_layers = total_moe,
+                        layer_start,
+                        layer_end,
+                        "honoring operator-supplied --layer-range"
+                    );
+                }
+                LayerRangeStrategy::Auto => {
+                    // Skeleton: auto-balance reads instrumentation +
+                    // emits a per-rank split. Not yet implemented;
+                    // fall back to Even so a misconfigured `--rank-balance
+                    // auto` doesn't take a deployment down. Audited by
+                    // iter-082.
+                    warn!(
+                        rank,
+                        total,
+                        "--rank-balance auto requested but auto-balance \
+                         is not implemented yet; falling back to even split. \
+                         See iter-082 for the timing-driven rebalance."
+                    );
+                    let (s, e) = even_moe_split(total_moe, rank, total);
+                    layer_start = s;
+                    layer_end = e;
+                }
+                LayerRangeStrategy::Even => {
+                    // Only compute the even split if the ShardSpec
+                    // didn't already pre-fill non-zero bounds (some
+                    // callers — like a future scheduler — may push the
+                    // per-rank slice into the ShardSpec instead of
+                    // using the strategy enum).
+                    if layer_start == 0 && layer_end == 0 {
+                        let (s, e) = even_moe_split(total_moe, rank, total);
+                        layer_start = s;
+                        layer_end = e;
+                        info!(
+                            rank,
+                            total,
+                            total_moe_layers = total_moe,
+                            layer_start,
+                            layer_end,
+                            "computed even MoE-layer split"
+                        );
+                    }
+                }
+            }
+        } else {
             // Single-stage: load every MoE layer, regardless of what
-            // ShardSpec says.
+            // ShardSpec or the strategy says.
             layer_start = 0;
             layer_end = u32::MAX;
         }
@@ -294,6 +381,36 @@ fn read_manifest_moe_count(model_dir: &std::path::Path) -> EngineResult<u32> {
     let m = crate::manifest::Manifest::load(model_dir)
         .map_err(|e| EngineError::Backend(format!("read manifest: {e}")))?;
     Ok(m.moe_layer_ids().len() as u32)
+}
+
+/// Validate that an operator-supplied `[start, end)` range is a
+/// sensible slice of the manifest's MoE layer ids. MoE layer ids are
+/// 1-based (dense layer 0 is implicit), so the smallest legal start
+/// is 1 and the largest legal end is `total_moe + 1` (i.e. the
+/// half-open interval includes layer `total_moe`).
+///
+/// Note this rejects zero-length ranges (`start == end`) — a rank
+/// with no MoE layers still pays every round-trip's latency and is
+/// almost certainly a config bug. See the matching check on `total`
+/// vs `total_moe` upstream.
+fn validate_explicit_range(start: u32, end: u32, total_moe: u32) -> EngineResult<()> {
+    if start == 0 {
+        return Err(EngineError::InvalidConfig(format!(
+            "--layer-range start must be >= 1 (MoE layer ids are 1-based; layer 0 is the implicit dense layer); got {start}..{end}"
+        )));
+    }
+    if start >= end {
+        return Err(EngineError::InvalidConfig(format!(
+            "--layer-range start ({start}) must be < end ({end})"
+        )));
+    }
+    if end > total_moe + 1 {
+        return Err(EngineError::InvalidConfig(format!(
+            "--layer-range end ({end}) > num_moe_layers+1 ({}); model has {total_moe} MoE layers (ids 1..={total_moe})",
+            total_moe + 1
+        )));
+    }
+    Ok(())
 }
 
 /// Even split of the MoE layer indices across `total` ranks.
@@ -869,5 +986,71 @@ mod tests {
     fn single_stage_yields_full_range() {
         let (s, e) = even_moe_split(60, 0, 1);
         assert_eq!((s, e), (0, u32::MAX));
+    }
+
+    #[test]
+    fn validate_explicit_range_accepts_balanced_28_32_split() {
+        // K2.6 has 60 MoE layers. A 28/32 split (rank 0 holds layer 0
+        // + 28 shells, rank 1 holds 32 shells + head) is the headline
+        // case for iter-081: rank 1 was the bottleneck by ~830 ms in
+        // iter-003 instrumentation, so moving 2 shells onto rank 0
+        // equalizes per-token wall time.
+        validate_explicit_range(1, 29, 60).expect("rank 0: 1..29 (28 shells)");
+        validate_explicit_range(29, 61, 60).expect("rank 1: 29..61 (32 shells)");
+    }
+
+    #[test]
+    fn validate_explicit_range_accepts_extreme_25_35_split() {
+        // A more aggressive 25/35 split — useful if rank 0 is on faster
+        // silicon (e.g. Arrow Lake + NPU) than rank 1.
+        validate_explicit_range(1, 26, 60).expect("25-shell rank 0");
+        validate_explicit_range(26, 61, 60).expect("35-shell rank 1");
+    }
+
+    #[test]
+    fn validate_explicit_range_rejects_zero_start() {
+        // MoE ids are 1-based — start=0 would claim the implicit dense
+        // layer 0, which is already on rank 0 unconditionally.
+        let err = validate_explicit_range(0, 30, 60).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("start must be >= 1"), "got {msg}");
+    }
+
+    #[test]
+    fn validate_explicit_range_rejects_empty() {
+        // Empty / inverted ranges leave a rank with zero work but still
+        // on the wire, paying every round-trip's latency.
+        assert!(validate_explicit_range(5, 5, 60).is_err());
+        assert!(validate_explicit_range(10, 5, 60).is_err());
+    }
+
+    #[test]
+    fn validate_explicit_range_rejects_overshoot() {
+        // For 60 MoE layers, the largest legal end is 61 (half-open
+        // bound includes layer 60). 62 overshoots.
+        let err = validate_explicit_range(1, 62, 60).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("> num_moe_layers+1"), "got {msg}");
+    }
+
+    #[test]
+    fn layer_range_strategy_default_is_even() {
+        // Default strategy must be Even so existing CLI invocations
+        // (no --layer-range, no --rank-balance) keep the historical
+        // floor/ceiling behavior.
+        assert_eq!(
+            LayerRangeStrategy::default(),
+            LayerRangeStrategy::Even,
+            "default must be Even to preserve historical behavior"
+        );
+    }
+
+    #[test]
+    fn builder_config_default_keeps_even_split() {
+        // SparseMoEBuilderConfig::new() must produce a config whose
+        // strategy is Even — guards against accidental future changes
+        // that would silently flip the default on a release.
+        let cfg = SparseMoEBuilderConfig::new("/tmp/k26", "CPU");
+        assert_eq!(cfg.layer_range_strategy, LayerRangeStrategy::Even);
     }
 }

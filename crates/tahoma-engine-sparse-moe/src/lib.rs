@@ -43,7 +43,7 @@ pub mod runner;
 pub mod sampling;
 pub mod tensors;
 
-pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
+pub use engine::{LayerRangeStrategy, SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use manifest::Manifest;
 pub use runner::{Runner, RunnerError};
 pub use sampling::SamplingConfig;
