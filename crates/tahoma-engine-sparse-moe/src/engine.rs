@@ -983,6 +983,7 @@ impl SparseMoEEngine {
             }
 
             let mut hit_eos = false;
+            let mut bonus_pushed_to_history = false;
             for &t in drafts.iter().take(accepted) {
                 if eos.contains(&t) {
                     hit_eos = true;
@@ -1001,8 +1002,29 @@ impl SparseMoEEngine {
                     history.push(bonus);
                     draft.append(bonus);
                     generated.push(bonus);
+                    bonus_pushed_to_history = true;
                 }
             }
+
+            // Debug invariant — same shape as the single-stage runner's
+            // generate_speculative path. After this round's reconcile,
+            // every layer's past_seq_len must trail history.len() by
+            // exactly 1 when the bonus rode through (the next round's
+            // first verify forward will fill its KV slot), and by 0
+            // when we cut the round short (EOS hit or max_new saturated
+            // before the bonus push). Strip from prod paths.
+            //
+            // The pipeline-parallel driver uses
+            // `pending_token_in_history=true` in reconcile_after_round
+            // for the same reason: history pre-pushes first_gen and
+            // appends each round's bonus, both riding ahead of KV by
+            // one slot. See fix/spec-decode-reconcile-off-by-one-043
+            // for the regression tests that pin this convention.
+            let expected_drift = if bonus_pushed_to_history { 1 } else { 0 };
+            debug_assert!(
+                self.runner.kv_invariant_holds(&history, expected_drift),
+                "KV invariant broken in distributed spec-decode (expected drift {expected_drift})"
+            );
 
             if hit_eos {
                 break;
