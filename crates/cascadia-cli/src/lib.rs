@@ -607,7 +607,27 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
                 );
             }
         }
-        runner.close();
+        // Bounded close so a stuck peer / transport doesn't force the
+        // operator to escalate `kill` → `kill -9`. `Runner::close()` is
+        // sync (parking_lot::Mutex) and may block_on async transport
+        // teardown internally; dispatch via spawn_blocking so the timer
+        // can actually fire, then await with a deadline. On timeout we
+        // log loudly and return — the process exit will SIGKILL any
+        // straggler threads, which is the right outcome at that point.
+        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let r = runner.clone();
+        let close_task = tokio::task::spawn_blocking(move || r.close());
+        match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
+            Ok(Ok(())) => info!("runner.close() complete"),
+            Ok(Err(join_err)) => tracing::warn!(
+                error = %join_err,
+                "runner.close() task panicked"
+            ),
+            Err(_) => tracing::warn!(
+                timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+                "runner.close() exceeded timeout; abandoning teardown"
+            ),
+        }
         return Ok(());
     }
 
