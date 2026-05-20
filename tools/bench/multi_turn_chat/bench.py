@@ -263,6 +263,7 @@ def run_multi_turn_chat(
             messages.append(
                 {"role": "user", "content": canned_user[t % len(canned_user)]}
             )
+            real_response: str | None = None
             for batch, max_tokens in batches:
                 started = time.time()
                 elapsed, body, err = chat_completion(
@@ -290,10 +291,26 @@ def run_multi_turn_chat(
                 records.append(rec)
                 out.write(rec.as_jsonl() + "\n")
                 out.flush()
-            # Use the canned filler instead of replaying actual model output so
-            # all conversations share identical message structure across runs.
+                # Capture the e2e batch's actual response so we can thread it
+                # back as the assistant message. The session cache stores the
+                # snapshot of [prompt + generated_tokens]; appending canned
+                # filler instead causes turn N+1's prefix to diverge from the
+                # cached one (cache miss). Threading the real response keeps
+                # the prefix monotonically extending and lets the cache hit.
+                if batch == "e2e" and body is not None:
+                    choice = (body.get("choices") or [{}])[0]
+                    msg = choice.get("message") or {}
+                    content = msg.get("content")
+                    if isinstance(content, str) and content:
+                        real_response = content
+            # Prefer the model's actual e2e output (so the next turn extends
+            # the cached prefix exactly). Fall back to canned filler when no
+            # e2e batch ran (--skip-e2e) or the request errored.
             messages.append(
-                {"role": "assistant", "content": canned_assistant_filler}
+                {
+                    "role": "assistant",
+                    "content": real_response or canned_assistant_filler,
+                }
             )
 
 
