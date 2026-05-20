@@ -722,9 +722,7 @@ mod tests {
             .cycle()
             .take(hidden * n_mid_groups * 2)
             .collect();
-        let x_f32: Vec<f32> = (0..hidden)
-            .map(|i| (i as f32) * 0.05 - 0.5)
-            .collect();
+        let x_f32: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.05 - 0.5).collect();
 
         // Reference: three inline GEMVs + the canonical swiglu_mul.
         let mut ref_gate = vec![0.0f32; intermediate];

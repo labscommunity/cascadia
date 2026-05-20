@@ -27,8 +27,8 @@ use cascadia_int4_gemm::shell::{
     HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM, TOPK as SHELL_TOPK, V_HEAD_DIM,
 };
 use cascadia_int4_gemm::shell_int4::{
-    shell_forward_decode_int4_multi_with_capacity,
-    shell_forward_decode_int4_with_capacity_sparse, Int4Shell,
+    shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity_sparse,
+    Int4Shell,
 };
 use cascadia_int4_gemm::{
     expert_forward_sparse as int4_expert_forward_sparse, f32_to_bf16_bits, ExpertWeights,
