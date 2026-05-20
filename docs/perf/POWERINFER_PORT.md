@@ -46,6 +46,41 @@ cite that source too.
 | 10 | TurboSparse dReLU surgery + 150 B-token continued pretrain | TurboSparse §3.2, §5 | **Not applicable.** Training-side, not inference-side. The realistic path is to consume the published `huggingface.co/PowerInfer/TurboSparse-Mixtral-47B` checkpoint when we add Mixtral support; for K2.6 the training cost is prohibitive (paper figure is for 7B / 47B parameter models; K2.6 is ~1 T params). | See deferred §. |
 | 11 | CUDA sparse-matmul kernels (`dequantize_mul_mat_axpy_sparse`, etc.) | PowerInfer `ggml-cuda.cu` | **Not applicable.** Wrong backend — replaced on the Intel side by OpenVINO + cascadia-int4-gemm. | — |
 
+## Generalization beyond K2.6
+
+| Change | K2.6-specific? | Other MoE models | Other dense models | OV-served models |
+|---|---|---|---|---|
+| Bounded LRU expert cache | No | ✓ applies (any backend served by `ExpertCache`) | n/a (no expert pool) | n/a (managed inside OV) |
+| FFN sparsity kernel (`dequant_gemv_int4_rows_subset_auto`) | No | ✓ applies (any int4 matmul) | ✓ applies (any int4 matmul) | needs OV custom op |
+| FFN sparsity forward (`ffn_forward_sparse_f32`) | No (SwiGLU-generic) | ✓ applies (Mixtral, Qwen-MoE, DeepSeek-MoE all SwiGLU) | ✓ applies (LLaMA, Mistral; would need a `dense_ffn_forward` wrapper in cascadia-int4-gemm) | needs OV custom op |
+| Wired into routed expert FFN | yes (cascadia-engine-sparse-moe::dispatch_expert) | reusable across MoE backends in this crate | n/a | needs separate work |
+| Wired into K2.6 layer 0 dense FFN | yes | n/a (K2.6-style) | ✓ applies (same SwiGLU pattern) | needs separate work |
+| Wired into shell shared expert | yes (K2.6 has shared expert + routed) | applies to any model with shared expert (DeepSeek-V2, Qwen2-MoE) | n/a | needs separate work |
+
+Three things in this PR that other-model adoption needs:
+
+- **The kernel primitives** (`dequant_gemv_int4_rows_subset_auto`,
+  `ffn_forward_sparse_f32`) — these are now public in
+  `cascadia-int4-gemm` and reusable by any caller.
+- **The threshold-and-mask pattern** in
+  `cascadia-int4-gemm::ffn_sparsity` — drop-in for any SwiGLU FFN.
+- **The bounded LRU pattern** in
+  `cascadia-engine-sparse-moe::runner::ExpertCache` — already
+  abstracted over backend (OvIr / Int4Bin / SafetensorsBin) so any
+  future MoE backend gets it for free.
+
+Three things that *don't* yet generalize:
+
+- **Multi-token prefill paths** stay dense — the AVX-512 tile shape
+  assumes a uniform mask across tokens, which sparse activations
+  break. Could be added with a slower per-token-mask variant of the
+  multi-token kernel.
+- **OpenVINO-served engines** (`ov-genai`, `ov-runtime`,
+  `ov-dist-spec`) don't benefit — the FFN runs inside OV. Sparsity
+  there needs an OV custom op or model-side surgery.
+- **GeLU / ReLU activations** would need separate variants of the
+  mask + dense fallback (the current code is SwiGLU-specific).
+
 ## What's in this PR
 
 Two perf-relevant changes, both opt-in, both byte-identical to the
@@ -141,17 +176,72 @@ absolute terms (the constant per-rayon-task overhead is a larger
 fraction of the work). The qualitative trend is the same: speedup is
 roughly linear in `1/active_frac` until the overhead floor dominates.
 
-### End-to-end gain on K2.6
+### End-to-end gain on K2.6 — measured
 
-End-to-end (full K2.6 decode) gain depends on the model's activation
-distribution at the chosen threshold. CATS / CHESS report 30–50%
-sparsity at τ ≈ 0.10 with <1% perplexity hit on SwiGLU LLMs. On miner
-that translates to a roughly **1.5–1.8× FFN-compute speedup** for the
-expert dispatch step (the FFN matmuls inside `dispatch_expert`).
-Total tok/s gain depends on the FFN fraction of decode wall time
-(currently ~60% on the autolab K2.6 baseline) — i.e. ~1.3–1.5× tok/s
-is plausible at τ=0.10 with no quality regression. K2.6-specific
-calibration is part of the autolab loop work, not this PR.
+| Run                 | Sparsity (routed FFN) | Output (4 tokens)        | Wall (sec, warm) | Speedup vs dense |
+|---------------------|-----------------------|--------------------------|------------------|------------------|
+| Dense (τ=0.0)       | 0 % (none)            | "Paris. The E"           | 86–88            | 1.00× (ref)      |
+| τ=0.05              | ≈26 %                 | "Paris. The capital"     | 88–92            | **0.96× (no gain)** |
+| τ=0.10              | ≈49 %                 | "a very popular tourist" | 87–114           | 0.77–1.01× (variable; **quality fails** — first token wrong) |
+| τ=0.20              | ≈78 %                 | garbage                  | ≥ baseline       | n/a              |
+
+**Honest read-out:** the FFN sparsity work is *correct and tested* —
+the kernel skips lanes faithfully, the active-fraction matches the
+threshold, dense fallback at τ=0.0 is bit-identical. But on K2.6 at
+the only threshold that preserves quality (τ=0.05), the end-to-end
+speedup is **negligible** (within timing noise of dense). The kernel
+microbench shows 1.49× at p=0.5 because it benches the *up* matmul in
+isolation. The full FFN forward in this PR sparsifies *only* the up
+projection — the down projection still runs dense over a
+sparse-but-not-skipped intermediate vector. The theoretical
+end-to-end FFN speedup at p=0.5 is therefore bounded above by ~1.2×,
+and per-call alloc + rayon scheduling overhead eats the remainder.
+
+**Production recommendation today:** **do not enable FFN sparsity for
+serving K2.6** (`--ffn-sparsity-threshold` should stay at 0.0). The
+infrastructure is in place and *will* pay off on follow-up work
+(below); shipping the knob early lets us measure per-model curves on
+other architectures without churning the API later.
+
+**Follow-up work to turn this into a real-world win:**
+
+1. **Column-sparse down kernel** — `dequant_gemv_int4_cols_subset_auto`.
+   Skip K-dim cols where the intermediate is zero. At p=0.5 this
+   should ~2× the down kernel, lifting total FFN speedup from ~1.1×
+   to ~1.5–1.7×.
+2. **Caller-owned scratch buffers** — remove the 7 per-call
+   `Vec::new()` allocs in `ffn_forward_sparse_f32` (currently 7 ×
+   60 × top_K × N_tokens allocs per generation).
+3. **Threshold-by-channel (CHESS)** — single global τ is a blunt
+   instrument; per-channel τ can hold quality longer at higher
+   sparsity.
+
+Each is a separate small PR. The bounded LRU + the kernel primitive
+(`dequant_gemv_int4_rows_subset_auto`) added in this PR are the
+prerequisites for all three.
+
+### LRU expert cache — measured
+
+| max_cached_experts | Output                  | Wall (sec, warm) | Peak RSS (GB) | Notes                           |
+|--------------------|--------------------------|------------------|---------------|---------------------------------|
+| 0 (unbounded)      | "Paris. The E"           | 86–88            | 96            | reference                       |
+| 600 (> min_useful) | "Paris. The E"           | 87               | 96            | identical output                |
+| 480 (= min_useful) | "Paris. The E"           | 86               | 96            | identical output                |
+| 100 (< min_useful) | "Paris. The E"           | 86               | 96            | warning fires; identical output |
+
+The LRU is **functionally transparent** at every cap — output is
+identical to unbounded. On the K2.6 / `safetensors_bin` backend the
+RSS doesn't drop with smaller caps because each expert is a slice
+into the *shared shard* mmap; evicting a Rust slot drops the
+`SafetensorsExpert` struct but the underlying mmap pages stay in the
+kernel page cache. Memory savings are real on the `int4_bin` backend
+(each expert is a separate file mmap; eviction releases it).
+
+**Production recommendation today:** enable bounded LRU on
+memory-constrained AI PCs with the `int4_bin` backend (`--max-cached-experts 480`
+or higher for K2.6); harmless on `safetensors_bin` but adds no real
+RAM bound there. The cap-too-small warning prevents the
+mid-token-thrash pathology.
 
 ## Acknowledgements
 
