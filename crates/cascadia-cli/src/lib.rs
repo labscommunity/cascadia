@@ -412,6 +412,34 @@ async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router
     }
 }
 
+/// Resolve when the process receives SIGTERM (operator `kill <pid>`) or
+/// SIGINT (Ctrl-C). Used by the worker to break out of the axum serve
+/// loop so `Runner::close()` gets a chance to run before the process
+/// exits — without this, a plain `kill` exits the tokio runtime
+/// mid-request and skips any teardown work close() does (flushing
+/// caches, draining transports, etc.).
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to install SIGTERM handler; only SIGINT will be caught");
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -520,9 +548,20 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // is in cascadia_api::stream_completion (Body::from_stream of
         // raw bytes, not the axum::Sse wrapper which has its own
         // KeepAlive batching).
-        serve_with_nodelay(listener, app)
-            .await
-            .context("serve_with_nodelay")?;
+        // Race the axum serve against SIGTERM/SIGINT. Without this,
+        // `kill <pid>` exits the tokio runtime before `Runner::close()`
+        // runs, which silently drops any teardown work close() does
+        // (flushing caches, draining transports, etc.). On signal we
+        // fall through to runner.close() below.
+        tokio::select! {
+            res = serve_with_nodelay(listener, app) => {
+                res.context("serve_with_nodelay")?;
+            }
+            _ = wait_for_shutdown_signal() => {
+                info!("shutdown signal received; running graceful close");
+            }
+        }
+        runner.close();
         return Ok(());
     }
 
