@@ -412,6 +412,68 @@ async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router
     }
 }
 
+/// Which signal triggered shutdown. Logged for postmortem context so an
+/// operator looking at worker logs can distinguish an orchestrator
+/// `SIGTERM` (typical) from an interactive `Ctrl-C` (rare in prod).
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    Sigterm,
+    Sigint,
+}
+
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sigterm => f.write_str("SIGTERM"),
+            Self::Sigint => f.write_str("SIGINT"),
+        }
+    }
+}
+
+/// Pre-install signal handlers (SIGTERM via `tokio::signal::unix` +
+/// SIGINT via `tokio::signal::ctrl_c`) and return a future that resolves
+/// to whichever signal fires first.
+///
+/// **Why pre-install rather than install-on-poll inside `select!`**:
+/// `signal(SignalKind::terminate())` registers the handler with the
+/// async signal driver — until that call completes, the process uses
+/// the default disposition (terminate). If we installed it on the first
+/// poll of the select! arm, a signal arriving in the narrow window
+/// between `listener.bind()` and the first `select!` poll would kill
+/// the worker before any graceful path runs. Pre-installing closes
+/// that gap.
+///
+/// On unix: catches both SIGTERM (operator `kill <pid>` / systemd
+/// stop / k8s pod termination) and SIGINT (Ctrl-C).
+///
+/// On non-unix (Windows): only Ctrl-C is supported by tokio
+/// (`SignalKind` is unix-only). A Windows `taskkill /F` will NOT
+/// trigger graceful close — it sends SIGKILL-equivalent and the
+/// process exits immediately. That's a Windows-platform limitation,
+/// not a bug in this code; document accordingly so on-call doesn't
+/// chase it as a leak.
+#[cfg(unix)]
+fn install_shutdown_signal_handler(
+) -> std::io::Result<impl std::future::Future<Output = ShutdownSignal>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigterm.recv() => ShutdownSignal::Sigterm,
+            _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handler(
+) -> std::io::Result<impl std::future::Future<Output = ShutdownSignal>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+        ShutdownSignal::Sigint
+    })
+}
+
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if args.rank >= args.total {
         return Err(anyhow!(
@@ -520,9 +582,52 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // is in cascadia_api::stream_completion (Body::from_stream of
         // raw bytes, not the axum::Sse wrapper which has its own
         // KeepAlive batching).
-        serve_with_nodelay(listener, app)
-            .await
-            .context("serve_with_nodelay")?;
+        // Pre-install the SIGTERM/SIGINT handler BEFORE the select! so
+        // there's no window between bind() and the first poll where a
+        // signal would default-terminate the worker. If install fails
+        // we surface it instead of silently falling back to SIGINT-only:
+        // a worker that quietly ignores SIGTERM is a graveyard for
+        // orphaned processes under systemd / k8s.
+        let shutdown_signal =
+            install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
+        // Race the axum serve against SIGTERM/SIGINT. Without this,
+        // `kill <pid>` exits the tokio runtime before `Runner::close()`
+        // runs, which silently drops any teardown work close() does
+        // (flushing caches, draining transports, etc.). On signal we
+        // fall through to runner.close() below.
+        tokio::select! {
+            res = serve_with_nodelay(listener, app) => {
+                res.context("serve_with_nodelay")?;
+            }
+            sig = shutdown_signal => {
+                info!(
+                    signal = %sig,
+                    pid = std::process::id(),
+                    "shutdown signal received; running graceful close"
+                );
+            }
+        }
+        // Bounded close so a stuck peer / transport doesn't force the
+        // operator to escalate `kill` → `kill -9`. `Runner::close()` is
+        // sync (parking_lot::Mutex) and may block_on async transport
+        // teardown internally; dispatch via spawn_blocking so the timer
+        // can actually fire, then await with a deadline. On timeout we
+        // log loudly and return — the process exit will SIGKILL any
+        // straggler threads, which is the right outcome at that point.
+        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let r = runner.clone();
+        let close_task = tokio::task::spawn_blocking(move || r.close());
+        match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
+            Ok(Ok(())) => info!("runner.close() complete"),
+            Ok(Err(join_err)) => tracing::warn!(
+                error = %join_err,
+                "runner.close() task panicked"
+            ),
+            Err(_) => tracing::warn!(
+                timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+                "runner.close() exceeded timeout; abandoning teardown"
+            ),
+        }
         return Ok(());
     }
 
