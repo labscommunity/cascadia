@@ -339,10 +339,46 @@ impl Builder for SparseMoEBuilder {
         };
         let kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
         if kv_prefix_cache.enabled() {
+            // Estimate footprint from the loaded runner's per-rank
+            // KV layer count + manifest head dims. Assume a 512-token
+            // representative prompt; the actual cost scales linearly.
+            // At K2.6 single-stage (61 KV layers, 64 heads, 320 dim,
+            // bf16) one 512-token snapshot is ~1.25 GiB, so even a
+            // cap of 4 puts ~5 GiB on the resident set. Print a hard
+            // warning above 16 entries; INFO otherwise.
+            const REPRESENTATIVE_PROMPT_TOKENS: usize = 512;
+            const HEAVY_ENTRY_THRESHOLD: usize = 16;
+            let bytes_per_token = runner.estimated_snapshot_bytes_per_token();
+            let est_per_snapshot = bytes_per_token * REPRESENTATIVE_PROMPT_TOKENS;
+            let est_total = est_per_snapshot.saturating_mul(kv_prefix_cache.capacity());
             info!(
                 capacity = kv_prefix_cache.capacity(),
+                est_bytes_per_snapshot_512tok = est_per_snapshot,
+                est_total_bytes_512tok = est_total,
                 "kv-prefix-cache enabled (single-stage)"
             );
+            if kv_prefix_cache.capacity() > HEAVY_ENTRY_THRESHOLD {
+                warn!(
+                    capacity = kv_prefix_cache.capacity(),
+                    est_total_gib_512tok = est_total as f64 / (1024.0 * 1024.0 * 1024.0),
+                    "kv-prefix-cache size is large; at K2.6 single-stage dims one snapshot is ~{:.0} MiB so resident-set growth is unbounded by capacity * snapshot bytes. Consider a smaller cap.",
+                    est_per_snapshot as f64 / (1024.0 * 1024.0),
+                );
+            }
+            // Spec-decode and the cache are orthogonal optimisations
+            // today: the spec-decode generate path doesn't consult or
+            // populate the cache (see `step_single_stage`). For greedy
+            // requests with spec-decode on, the cache is silently
+            // bypassed; for temp > 0 requests spec-decode falls back to
+            // plain generate which does use the cache. Surface the
+            // partial-coverage caveat at startup so the user isn't
+            // surprised by missing hits in greedy mode.
+            if let Some(k) = spec_decode_k {
+                warn!(
+                    spec_decode_k = k,
+                    "kv-prefix-cache is bypassed on the spec-decode (greedy) generate path; only temperature>0 requests will populate / hit the cache while --spec-decode-k is active"
+                );
+            }
         }
         Ok(Box::new(SparseMoEEngine {
             runner,

@@ -717,6 +717,21 @@ impl Runner {
         out
     }
 
+    /// Estimated bytes the KV-prefix cache would consume per cached
+    /// **token**, summed across every layer the rank owns (layer 0
+    /// when `is_first`, every MoE shell). Multiply by the typical
+    /// prompt length to budget a [`KvPrefixCache`] capacity.
+    ///
+    /// Formula: `kv_layers * NUM_HEADS * (qk_head_dim + v_head_dim) * 2`
+    /// — bf16 storage matches the runner's live KV layout. Excludes
+    /// the IndexMap key + hash overhead, which is negligible next to
+    /// the KV tensors at K2.6 dims (~150 MiB / 512-token snapshot).
+    pub fn estimated_snapshot_bytes_per_token(&self) -> usize {
+        let kv_layers = self.layers.len() + if self.layer0.is_some() { 1 } else { 0 };
+        let per_head_dim = self.manifest.qk_head_dim as usize + self.manifest.v_head_dim as usize;
+        kv_layers * NUM_HEADS * per_head_dim * std::mem::size_of::<u16>()
+    }
+
     /// Build a [`ModelFingerprint`] from the manifest + the rank's
     /// `LayerRange`. Used as part of the [`KvPrefixCache`] key — see
     /// the cache module docs for the "what affects KV bits" rule.
