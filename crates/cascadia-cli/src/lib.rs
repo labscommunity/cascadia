@@ -412,32 +412,66 @@ async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: axum::Router
     }
 }
 
-/// Resolve when the process receives SIGTERM (operator `kill <pid>`) or
-/// SIGINT (Ctrl-C). Used by the worker to break out of the axum serve
-/// loop so `Runner::close()` gets a chance to run before the process
-/// exits — without this, a plain `kill` exits the tokio runtime
-/// mid-request and skips any teardown work close() does (flushing
-/// caches, draining transports, etc.).
-#[cfg(unix)]
-async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to install SIGTERM handler; only SIGINT will be caught");
-            tokio::signal::ctrl_c().await.ok();
-            return;
+/// Which signal triggered shutdown. Logged for postmortem context so an
+/// operator looking at worker logs can distinguish an orchestrator
+/// `SIGTERM` (typical) from an interactive `Ctrl-C` (rare in prod).
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    Sigterm,
+    Sigint,
+}
+
+impl std::fmt::Display for ShutdownSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sigterm => f.write_str("SIGTERM"),
+            Self::Sigint => f.write_str("SIGINT"),
         }
-    };
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
     }
 }
 
+/// Pre-install signal handlers (SIGTERM via `tokio::signal::unix` +
+/// SIGINT via `tokio::signal::ctrl_c`) and return a future that resolves
+/// to whichever signal fires first.
+///
+/// **Why pre-install rather than install-on-poll inside `select!`**:
+/// `signal(SignalKind::terminate())` registers the handler with the
+/// async signal driver — until that call completes, the process uses
+/// the default disposition (terminate). If we installed it on the first
+/// poll of the select! arm, a signal arriving in the narrow window
+/// between `listener.bind()` and the first `select!` poll would kill
+/// the worker before any graceful path runs. Pre-installing closes
+/// that gap.
+///
+/// On unix: catches both SIGTERM (operator `kill <pid>` / systemd
+/// stop / k8s pod termination) and SIGINT (Ctrl-C).
+///
+/// On non-unix (Windows): only Ctrl-C is supported by tokio
+/// (`SignalKind` is unix-only). A Windows `taskkill /F` will NOT
+/// trigger graceful close — it sends SIGKILL-equivalent and the
+/// process exits immediately. That's a Windows-platform limitation,
+/// not a bug in this code; document accordingly so on-call doesn't
+/// chase it as a leak.
+#[cfg(unix)]
+fn install_shutdown_signal_handler(
+) -> std::io::Result<impl std::future::Future<Output = ShutdownSignal>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = sigterm.recv() => ShutdownSignal::Sigterm,
+            _ = tokio::signal::ctrl_c() => ShutdownSignal::Sigint,
+        }
+    })
+}
+
 #[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+fn install_shutdown_signal_handler(
+) -> std::io::Result<impl std::future::Future<Output = ShutdownSignal>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+        ShutdownSignal::Sigint
+    })
 }
 
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
@@ -548,6 +582,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // is in cascadia_api::stream_completion (Body::from_stream of
         // raw bytes, not the axum::Sse wrapper which has its own
         // KeepAlive batching).
+        // Pre-install the SIGTERM/SIGINT handler BEFORE the select! so
+        // there's no window between bind() and the first poll where a
+        // signal would default-terminate the worker. If install fails
+        // we surface it instead of silently falling back to SIGINT-only:
+        // a worker that quietly ignores SIGTERM is a graveyard for
+        // orphaned processes under systemd / k8s.
+        let shutdown_signal =
+            install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
         // Race the axum serve against SIGTERM/SIGINT. Without this,
         // `kill <pid>` exits the tokio runtime before `Runner::close()`
         // runs, which silently drops any teardown work close() does
@@ -557,8 +599,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             res = serve_with_nodelay(listener, app) => {
                 res.context("serve_with_nodelay")?;
             }
-            _ = wait_for_shutdown_signal() => {
-                info!("shutdown signal received; running graceful close");
+            sig = shutdown_signal => {
+                info!(
+                    signal = %sig,
+                    pid = std::process::id(),
+                    "shutdown signal received; running graceful close"
+                );
             }
         }
         runner.close();
