@@ -100,6 +100,15 @@ pub struct WorkerArgs {
 
     /// OpenVINO compiled-blob cache dir (sets plugin CACHE_DIR).
     /// Used by ov-genai (and ov-runtime / ov-dist-spec when ported).
+    ///
+    /// When unset (the CLI default), the engine builders default to
+    /// `<cache_root>/cascadia/ov-cache` where `<cache_root>` is the
+    /// platform user-cache dir (`~/.cache` on Linux, `~/Library/Caches`
+    /// on macOS, `%LOCALAPPDATA%` on Windows). This converts the
+    /// ~20-second cold-start GPU compile of a fresh Qwen3-1.7B IR into
+    /// a ~1-second warm load on every subsequent invocation — the
+    /// single biggest operator-facing latency win for the ov-genai
+    /// path. Pass `--ov-cache-dir ""` (empty string) to disable.
     #[arg(long)]
     pub ov_cache_dir: Option<String>,
 
@@ -290,6 +299,36 @@ fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
     Ok((h.to_string(), p.parse().context("port")?))
 }
 
+/// Pick the OV plugin's CACHE_DIR for this worker.
+///
+/// Resolution order:
+/// 1. If `arg` is `Some("")`, return `None` (explicit disable).
+/// 2. If `arg` is `Some(path)`, return `Some(path)` (operator override).
+/// 3. If `arg` is `None`, return the platform user-cache dir +
+///    `cascadia/ov-cache` (Linux: `~/.cache/cascadia/ov-cache`,
+///    macOS: `~/Library/Caches/cascadia/ov-cache`, Windows:
+///    `%LOCALAPPDATA%/cascadia/ov-cache`).
+/// 4. If even the platform default isn't resolvable, return `None`
+///    (the OV plugin then runs without a cache — pre-PR behaviour).
+///
+/// The implicit default exists because a cold ov-genai LLMPipeline
+/// compile on Intel iGPU takes ~20 s for a 1.7 B model (measured on
+/// Lunar Lake), versus ~1 s when the cache is warm. PowerInfer's
+/// SmallThinker fork ships an equivalent default in `llama-cli`. We
+/// match that operator UX.
+fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
+    match arg {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => dirs::cache_dir().map(|p| {
+            p.join("cascadia")
+                .join("ov-cache")
+                .to_string_lossy()
+                .into_owned()
+        }),
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -303,8 +342,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 ));
             }
             let mut b = OvGenaiBuilder::new(&args.model, &args.device);
-            if let Some(dir) = &args.ov_cache_dir {
-                b = b.with_cache_dir(dir);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
             }
             if let Some(prec) = &args.ov_kv_precision {
                 b = b.with_kv_cache_precision(prec);
@@ -325,8 +364,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::OvRuntime => {
             let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
-            if let Some(dir) = &args.ov_cache_dir {
-                b = b.with_cache_dir(dir);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
             }
             if let Some(prec) = &args.ov_kv_precision {
                 b = b.with_kv_cache_precision(prec);
@@ -376,8 +415,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
                 .with_rank(args.rank, args.total)
                 .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
-            if let Some(dir) = &args.ov_cache_dir {
-                cfg.cache_dir = Some(dir.clone());
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                cfg.cache_dir = Some(dir);
             }
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
