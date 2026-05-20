@@ -1529,15 +1529,19 @@ impl Runner {
         let mut generated = Vec::with_capacity(max_tokens);
 
         // Cache lookup. Returns Some(matched_len) if we restored a
-        // snapshot; None otherwise. We capture both `fp` and the
-        // prefix length here because we'll re-use them for insert
-        // after a fresh prefill.
-        let fp = self.fingerprint();
+        // snapshot; None otherwise. `fp` is only computed when the
+        // cache is actually present + enabled so the `generate` →
+        // `generate_with_cache(None)` path stays allocation-identical
+        // to the pre-cache `generate` (preserves the strict
+        // "default off = byte-identical" invariant called out in the
+        // PR description and CLI flag docs).
+        let mut fp: Option<ModelFingerprint> = None;
         let mut cache_skip: usize = 0;
         let mut cache_hit = false;
         if let Some(c) = cache.as_mut() {
             if c.enabled() {
-                if let Some(snap) = c.lookup(prompt_ids, &fp) {
+                let fingerprint = fp.insert(self.fingerprint());
+                if let Some(snap) = c.lookup(prompt_ids, fingerprint) {
                     // Restore into the runner's KV buffers. The
                     // restore validates shape against fingerprint;
                     // a failure here means cache + runner disagree on
@@ -1619,10 +1623,14 @@ impl Runner {
         if !cache_hit {
             if let Some(c) = cache.as_mut() {
                 if c.enabled() && !prompt_ids.is_empty() {
+                    // `fp` was computed at lookup time on the
+                    // enabled-cache path; reuse it instead of paying
+                    // a second fingerprint clone here.
+                    let fingerprint = fp.get_or_insert_with(|| self.fingerprint());
                     match self.snapshot_kv() {
                         Ok(snap) => {
                             let bytes = snap.approx_bytes();
-                            let evicted = c.insert(prompt_ids.to_vec(), &fp, snap);
+                            let evicted = c.insert(prompt_ids.to_vec(), fingerprint, snap);
                             info!(
                                 cached_bytes = bytes,
                                 cache_len = c.len(),
