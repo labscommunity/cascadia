@@ -480,7 +480,7 @@ impl Runner {
     ///
     /// Attribution: the bounded-LRU pattern follows PowerInfer
     /// SmallThinker's `MAX_N_CACHED` env var (Song et al., SJTU-IPADS,
-    /// 2024; MIT-licensed). See `docs/perf/POWERINFER_PORT.md`.
+    /// 2024; MIT-licensed). See rainier `docs/POWERINFER_PORT.md`.
     pub fn load_with_options(
         model_dir: PathBuf,
         device: &str,
@@ -735,7 +735,7 @@ impl Runner {
     /// `|silu(gate)|` falls below `threshold · max_i |silu(gate_i)|`
     /// before the up / down phases. See
     /// [`cascadia_int4_gemm::expert_forward_sparse`] for the algorithm
-    /// and `docs/perf/POWERINFER_PORT.md` for the PowerInfer-2 §4.4
+    /// and rainier `docs/POWERINFER_PORT.md` for the PowerInfer-2 §4.4
     /// attribution.
     pub fn set_ffn_sparsity_threshold(&mut self, v: f32) {
         self.ffn_sparsity_threshold = if v > 0.0 { v } else { 0.0 };

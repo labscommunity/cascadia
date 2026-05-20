@@ -81,7 +81,7 @@ pub struct SparseMoEBuilderConfig {
     /// skip — see [`crate::runner::Runner::set_ffn_sparsity_threshold`].
     /// `0.0` = disabled (dense fallback; output bit-identical).
     /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
-    /// quality. See `docs/perf/POWERINFER_PORT.md`.
+    /// quality. See rainier `docs/POWERINFER_PORT.md`.
     pub ffn_sparsity_threshold: f32,
 }
 
@@ -94,7 +94,7 @@ impl SparseMoEBuilderConfig {
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
             // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT) —
-            // `docs/perf/POWERINFER_PORT.md`.
+            // rainier `docs/POWERINFER_PORT.md`.
             max_cached_experts: 0,
             rank: 0,
             total: 1,
@@ -133,7 +133,7 @@ impl SparseMoEBuilderConfig {
     /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var.
     /// At K2.6 dimensions each cached expert is ≈25 MiB so a cap of 256
     /// roughly bounds the expert pool at 6.4 GiB. See
-    /// `docs/perf/POWERINFER_PORT.md` for guidance.
+    /// rainier `docs/POWERINFER_PORT.md` for guidance.
     pub fn with_max_cached_experts(mut self, n: u32) -> Self {
         self.max_cached_experts = n;
         self
@@ -143,7 +143,7 @@ impl SparseMoEBuilderConfig {
     /// sparsity. `0.0` = dense (default; output bit-identical to the
     /// pre-port path). `0.05`–`0.15` is the useful range for SwiGLU.
     /// See [`crate::runner::Runner::set_ffn_sparsity_threshold`] and
-    /// `docs/perf/POWERINFER_PORT.md`.
+    /// rainier `docs/POWERINFER_PORT.md`.
     pub fn with_ffn_sparsity_threshold(mut self, t: f32) -> Self {
         self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
         self

@@ -177,8 +177,8 @@ pub struct WorkerArgs {
     /// resident expert RAM at ~6–20 GiB depending on backend.
     ///
     /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var
-    /// (MIT-licensed; see `docs/perf/POWERINFER_PORT.md`). The env var
-    /// `CASCADIA_MAX_EXPERTS_CACHED` overrides this flag at runtime.
+    /// (MIT-licensed; see rainier `docs/POWERINFER_PORT.md`). The env
+    /// var `CASCADIA_MAX_EXPERTS_CACHED` overrides this flag at runtime.
     #[arg(long, default_value_t = 0, env = "CASCADIA_MAX_EXPERTS_CACHED")]
     pub max_cached_experts: u32,
 
@@ -194,7 +194,7 @@ pub struct WorkerArgs {
     ///
     /// Inspired by PowerInfer-2 §4.4 (skip Up/Down when Gate=0; ReLU)
     /// adapted to SwiGLU via the CATS / CHESS magnitude-threshold
-    /// approach. See `docs/perf/POWERINFER_PORT.md`.
+    /// approach. See rainier `docs/POWERINFER_PORT.md`.
     #[arg(long, default_value_t = 0.0, env = "CASCADIA_FFN_SPARSITY_THRESHOLD")]
     pub ffn_sparsity_threshold: f32,
 }

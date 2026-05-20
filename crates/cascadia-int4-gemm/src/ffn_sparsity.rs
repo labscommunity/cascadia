@@ -44,8 +44,8 @@
 //!   and CHESS (Liu et al. 2024) — Apache-2.0 / MIT.
 //!
 //! Both are referenced (not copied) — this is an independent Rust
-//! implementation. See `docs/perf/POWERINFER_PORT.md` for the full
-//! technique map.
+//! implementation. See rainier `docs/POWERINFER_PORT.md` for the
+//! full technique map.
 
 use half::bf16;
 use rayon::prelude::*;

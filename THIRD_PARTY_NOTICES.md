@@ -24,7 +24,8 @@ plus the upstream `ggml` / `llama.cpp` authors led by Georgi Gerganov.
 
 **Implementation:** clean-room Rust re-implementation. No PowerInfer
 source files have been copied into the cascadia tree. See
-`docs/perf/POWERINFER_PORT.md` for the full technique map.
+rainier `docs/POWERINFER_PORT.md` for the full technique map
+([github.com/labscommunity/rainier](https://github.com/labscommunity/rainier/blob/main/docs/POWERINFER_PORT.md)).
 
 **Papers cited:**
 - PowerInfer, arxiv:2312.12456
