@@ -20,15 +20,15 @@ use lru::LruCache;
 
 use cascadia_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
-    layer0_forward_decode_int4_with_capacity, Int4Layer0,
+    layer0_forward_decode_int4_with_capacity_sparse, Int4Layer0,
 };
 use cascadia_int4_gemm::safetensors_source::Shard;
 use cascadia_int4_gemm::shell::{
     HIDDEN as SHELL_HIDDEN, NUM_HEADS, QK_HEAD_DIM, TOPK as SHELL_TOPK, V_HEAD_DIM,
 };
 use cascadia_int4_gemm::shell_int4::{
-    shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity,
-    Int4Shell,
+    shell_forward_decode_int4_multi_with_capacity,
+    shell_forward_decode_int4_with_capacity_sparse, Int4Shell,
 };
 use cascadia_int4_gemm::{
     expert_forward_sparse as int4_expert_forward_sparse, f32_to_bf16_bits, ExpertWeights,
@@ -601,6 +601,28 @@ impl Runner {
             max_cached_experts = ?cap.map(NonZeroUsize::get),
             "expert cache capacity (None = unbounded)"
         );
+        // Warn if the LRU cap is below the minimum useful working set
+        // (one expert per layer per top-K dispatch on this rank). Below
+        // that bound the LRU evicts mid-token, causing thrash without
+        // any memory-budget benefit — the user almost certainly wants
+        // a larger cap. We don't panic — there might be reasons to
+        // explore that regime — but we surface the issue loudly.
+        if let Some(c) = cap {
+            let rank_layers = in_range.len().max(1);
+            let top_k = manifest.top_k.max(1);
+            let min_useful = rank_layers.saturating_mul(top_k as usize);
+            if c.get() < min_useful {
+                warn!(
+                    cap = c.get(),
+                    rank_layers,
+                    top_k,
+                    min_useful,
+                    "max_cached_experts is below the single-token working set \
+                     (rank_layers * top_k); the LRU will evict mid-token, \
+                     causing thrash. Consider cap >= {min_useful}."
+                );
+            }
+        }
         let experts = match manifest.experts_format.as_str() {
             "int4_bin" => {
                 info!("expert backend: int4_bin (mmap + AVX-512 kernel)");
@@ -1100,13 +1122,14 @@ impl Runner {
         let capacity = l0.kv_capacity;
         let past_seq_len = l0.past_seq_len;
 
-        let outs = layer0_forward_decode_int4_with_capacity(
+        let outs = layer0_forward_decode_int4_with_capacity_sparse(
             &l0.int4_layer0,
             &x_f32,
             &l0.past_k,
             &l0.past_v,
             past_seq_len,
             capacity,
+            self.ffn_sparsity_threshold,
         );
 
         write_present_kv(
@@ -1223,13 +1246,14 @@ impl Runner {
             // lets us pass a pre-allocated [H, capacity, D] buffer
             // with only the first `past_seq_len` slots populated.
             let shell_t0 = Instant::now();
-            let outs = shell_forward_decode_int4_with_capacity(
+            let outs = shell_forward_decode_int4_with_capacity_sparse(
                 &self.layers[i].int4_shell,
                 &h_f32,
                 &self.layers[i].past_k,
                 &self.layers[i].past_v,
                 past_seq_len,
                 capacity,
+                self.ffn_sparsity_threshold,
             );
             shell_attn_total_us += shell_t0.elapsed().as_micros() as u64;
 

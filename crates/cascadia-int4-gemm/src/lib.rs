@@ -41,7 +41,7 @@ pub mod shell_int4;
 
 pub use ffn_sparsity::{
     build_active_mask, dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto,
-    expert_forward_sparse,
+    expert_forward_sparse, ffn_forward_sparse_f32,
 };
 pub use format::{bf16_bits_to_f32, f32_to_bf16_bits, ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};

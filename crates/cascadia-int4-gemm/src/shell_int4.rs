@@ -376,6 +376,41 @@ pub fn shell_forward_decode_int4_with_capacity(
     past_seq_len: usize,
     capacity: usize,
 ) -> ShellOutputs {
+    shell_forward_decode_int4_with_capacity_sparse(
+        shell,
+        x_f32,
+        past_k,
+        past_v,
+        past_seq_len,
+        capacity,
+        0.0,
+    )
+}
+
+/// Same as [`shell_forward_decode_int4_with_capacity`] but with an
+/// extra `ffn_sparsity_threshold` knob that controls the two-phase
+/// Gate-first FFN sparsity in the shared-expert SwiGLU block.
+///
+/// `ffn_sparsity_threshold == 0.0` (used by the back-compat wrapper
+/// `shell_forward_decode_int4_with_capacity`) is bit-identical to the
+/// pre-port path.
+///
+/// Positive values activate the same magnitude-threshold sparsity
+/// described in [`cascadia_int4_gemm::ffn_forward_sparse_f32`]. The
+/// routed-expert FFNs are dispatched separately by the caller (the
+/// runner) — see `Runner::dispatch_expert`. Per-token compute
+/// breakdown at K2.6 / top_K=8: routed experts ~87%, shared experts
+/// ~11%, layer 0 ~2%. Sparsifying the shared expert here covers the
+/// 11%.
+pub fn shell_forward_decode_int4_with_capacity_sparse(
+    shell: &Int4Shell,
+    x_f32: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
+    past_seq_len: usize,
+    capacity: usize,
+    ffn_sparsity_threshold: f32,
+) -> ShellOutputs {
     // Reuse the shell.rs forward but swap bf16_gemv_auto -> dequant_gemv_int4_auto.
     // Easiest: copy the body and adapt. (Generic functions over a trait would
     // be cleaner but pure functions are fine here.)
@@ -585,35 +620,25 @@ pub fn shell_forward_decode_int4_with_capacity(
         *w = *w / s * ROUTED_SCALING_FACTOR;
     }
 
-    // Shared expert (int4 ×3)
-    let mut shared_gate_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    dequant_gemv_int4_auto(
+    // Shared expert (int4 ×3) — SwiGLU FFN, runs unconditionally per
+    // token. Threaded through `ffn_forward_sparse_f32` so the same
+    // `ffn_sparsity_threshold` knob that gates per-routed-expert
+    // sparsity also gates the shared-expert path. At `threshold == 0.0`
+    // (default) this delegates to a back-to-back dense gate/up/down
+    // sequence — bit-identical to the pre-port inline code.
+    let mut shared_out = vec![0.0f32; HIDDEN];
+    let _shared_active_frac = crate::ffn_sparsity::ffn_forward_sparse_f32(
+        &post,
+        HIDDEN,
+        INTERMEDIATE_SHARED,
         &shell.shared_gate_packed,
         &shell.shared_gate_scale,
-        &post,
-        INTERMEDIATE_SHARED,
-        HIDDEN,
-        &mut shared_gate_out,
-    );
-    let mut shared_up_out = vec![0.0f32; INTERMEDIATE_SHARED];
-    dequant_gemv_int4_auto(
         &shell.shared_up_packed,
         &shell.shared_up_scale,
-        &post,
-        INTERMEDIATE_SHARED,
-        HIDDEN,
-        &mut shared_up_out,
-    );
-    let mut shared_inter = vec![0.0f32; INTERMEDIATE_SHARED];
-    shell::swiglu_mul(&shared_gate_out, &shared_up_out, &mut shared_inter);
-    let mut shared_out = vec![0.0f32; HIDDEN];
-    dequant_gemv_int4_auto(
         &shell.shared_down_packed,
         &shell.shared_down_scale,
-        &shared_inter,
-        HIDDEN,
-        INTERMEDIATE_SHARED,
         &mut shared_out,
+        ffn_sparsity_threshold,
     );
 
     ShellOutputs {

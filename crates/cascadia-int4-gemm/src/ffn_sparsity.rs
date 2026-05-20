@@ -268,7 +268,7 @@ pub fn dequant_gemv_int4_rows_subset_auto(
     dequant_gemv_int4_rows_subset(packed, scale_bits, x, n_rows, k_cols, y, active_rows);
 }
 
-/// Two-phase Gate-first sparse expert FFN.
+/// Two-phase Gate-first sparse SwiGLU FFN — **f32 in, f32 out**.
 ///
 ///   1. Gate matmul (full): `gate_out[i] = sum_k W_gate[i,k] · x[k]`
 ///   2. SiLU + threshold:   `silu_gate[i] = silu(gate_out[i])`;
@@ -280,8 +280,127 @@ pub fn dequant_gemv_int4_rows_subset_auto(
 ///      — kept full because the per-token cost of an indexed K-dim
 ///      gather outweighs the savings on inactive lanes (see comment).
 ///
-/// `threshold == 0.0` falls through to the dense path (output
-/// bit-identical to [`crate::kernel::expert_forward`]).
+/// `threshold == 0.0` falls through to a dense call sequence (no
+/// active-mask construction, no sparse-rows kernel — output and
+/// timing equivalent to three back-to-back `dequant_gemv_int4_auto`
+/// calls + SwiGLU + final matmul).
+///
+/// **`hidden` and `intermediate` are explicit parameters** so this
+/// function works for any SwiGLU FFN: per-expert routed FFN
+/// (`intermediate=2048`), shell shared expert (`intermediate=2048`),
+/// or K2.6 layer-0 dense FFN (`intermediate=18432`).
+///
+/// Returns the fraction of lanes that were active (for instrumentation).
+pub fn ffn_forward_sparse_f32(
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed: &[u8],
+    down_scale: &[u8],
+    out_f32: &mut [f32],
+    threshold: f32,
+) -> f32 {
+    debug_assert_eq!(x_f32.len(), hidden);
+    debug_assert_eq!(out_f32.len(), hidden);
+
+    // Phase 1: gate (full).
+    let mut gate_out = vec![0.0f32; intermediate];
+    crate::kernel_avx512::dequant_gemv_int4_auto(
+        gate_packed,
+        gate_scale,
+        x_f32,
+        intermediate,
+        hidden,
+        &mut gate_out,
+    );
+
+    if threshold <= 0.0 {
+        // Dense path: SwiGLU as usual. Bit-identical to the pre-port
+        // inline gate/up/down sequence in layer0_int4.rs and
+        // shell_int4.rs — uses the same kernel calls in the same order
+        // with the same SiLU formulation as `shell::swiglu_mul`
+        // (`g / (1 + (-g).exp())`, IEEE 754-stable: underflows to 0 at
+        // very negative g, saturates to g at very positive g).
+        let mut up_out = vec![0.0f32; intermediate];
+        crate::kernel_avx512::dequant_gemv_int4_auto(
+            up_packed,
+            up_scale,
+            x_f32,
+            intermediate,
+            hidden,
+            &mut up_out,
+        );
+        let mut inter = vec![0.0f32; intermediate];
+        for i in 0..intermediate {
+            let g = gate_out[i];
+            let silu = g / (1.0f32 + (-g).exp());
+            inter[i] = silu * up_out[i];
+        }
+        crate::kernel_avx512::dequant_gemv_int4_auto(
+            down_packed,
+            down_scale,
+            &inter,
+            hidden,
+            intermediate,
+            out_f32,
+        );
+        return 1.0;
+    }
+
+    // Sparse path: SiLU + threshold → mask → sparse up + elementwise + down.
+    let (silu_gate, active) = build_active_mask(&gate_out, threshold);
+    let active_frac = active.len() as f32 / intermediate as f32;
+
+    let mut up_out = vec![0.0f32; intermediate];
+    dequant_gemv_int4_rows_subset_auto(
+        up_packed,
+        up_scale,
+        x_f32,
+        intermediate,
+        hidden,
+        &mut up_out,
+        &active,
+    );
+
+    let mut inter = vec![0.0f32; intermediate];
+    for &r in &active {
+        let r = r as usize;
+        inter[r] = silu_gate[r] * up_out[r];
+    }
+
+    // Phase 3: down (full).
+    //
+    // We could write a column-sparse down kernel that skips groups
+    // where all K-dim cols in the group are zero, but: (a) groups are
+    // 32-wide and a random sparsity pattern leaves few all-zero groups,
+    // (b) the scale-fetch / dequant cost per group is small compared to
+    // the 16-lane FMA chain, and (c) zero × anything still feeds the
+    // FMA pipeline at full throughput. Empirically the win on the K
+    // dim is <5% for typical 50% sparsity — left for a follow-up if
+    // bench shows the FFN bottleneck remains at down.
+    crate::kernel_avx512::dequant_gemv_int4_auto(
+        down_packed,
+        down_scale,
+        &inter,
+        hidden,
+        intermediate,
+        out_f32,
+    );
+    active_frac
+}
+
+/// Two-phase Gate-first sparse expert FFN — **bf16 in, bf16 out**.
+///
+/// Thin wrapper around [`ffn_forward_sparse_f32`] that handles the
+/// bf16 ↔ f32 conversion at the boundary. Used by the per-routed-
+/// expert dispatch in cascadia-engine-sparse-moe.
+///
+/// `threshold == 0.0` is bit-identical to [`crate::kernel::expert_forward`]
+/// (verified by `sparse_expert_threshold_zero_matches_dense`).
 ///
 /// Returns the fraction of lanes that were active (for instrumentation).
 pub fn expert_forward_sparse(
@@ -296,7 +415,11 @@ pub fn expert_forward_sparse(
     threshold: f32,
 ) -> f32 {
     if threshold <= 0.0 {
-        // Dense fallback: byte-identical to the existing path.
+        // Dense fallback: delegate to the existing path so output is
+        // byte-identical to pre-port. (The f32 dense path in
+        // `ffn_forward_sparse_f32` should also be byte-identical, but
+        // we keep the explicit fallback to `expert_forward` for the
+        // hot wire-protocol checksum match.)
         crate::kernel::expert_forward(
             x_bf16,
             gate_packed,
@@ -313,66 +436,24 @@ pub fn expert_forward_sparse(
     let hidden = x_bf16.len();
     let intermediate = gate_scale.len() / 2 / (hidden / GROUP_SIZE);
 
-    // Convert input to f32 once.
     let mut x_f32 = vec![0.0f32; hidden];
     for (i, b) in x_bf16.iter().enumerate() {
         x_f32[i] = b.to_f32();
     }
-
-    // Phase 1: gate (full).
-    let mut gate_out = vec![0.0f32; intermediate];
-    crate::kernel_avx512::dequant_gemv_int4_auto(
+    let mut out_f32 = vec![0.0f32; hidden];
+    let active_frac = ffn_forward_sparse_f32(
+        &x_f32,
+        hidden,
+        intermediate,
         gate_packed,
         gate_scale,
-        &x_f32,
-        intermediate,
-        hidden,
-        &mut gate_out,
-    );
-
-    // SiLU + threshold mask.
-    let (silu_gate, active) = build_active_mask(&gate_out, threshold);
-    let active_frac = active.len() as f32 / intermediate as f32;
-
-    // Phase 2: up (sparse).
-    let mut up_out = vec![0.0f32; intermediate];
-    dequant_gemv_int4_rows_subset_auto(
         up_packed,
         up_scale,
-        &x_f32,
-        intermediate,
-        hidden,
-        &mut up_out,
-        &active,
-    );
-
-    // Elementwise intermediate: only active lanes contribute.
-    let mut inter = vec![0.0f32; intermediate];
-    for &r in &active {
-        let r = r as usize;
-        inter[r] = silu_gate[r] * up_out[r];
-    }
-
-    // Phase 3: down (full, K-dim has zeros on inactive lanes).
-    //
-    // We could write a column-sparse down kernel that skips groups
-    // where all K-dim cols in the group are zero, but: (a) groups are
-    // 32-wide and a random sparsity pattern leaves few all-zero groups,
-    // (b) the scale-fetch / dequant cost per group is small compared to
-    // the 16-lane FMA chain, and (c) zero × anything still feeds the
-    // FMA pipeline at full throughput. Empirically the win on the K
-    // dim is <5% for typical 50% sparsity — left for a follow-up if
-    // bench shows the FFN bottleneck remains at down.
-    let mut out_f32 = vec![0.0f32; hidden];
-    crate::kernel_avx512::dequant_gemv_int4_auto(
         down_packed,
         down_scale,
-        &inter,
-        hidden,
-        intermediate,
         &mut out_f32,
+        threshold,
     );
-
     for (i, v) in out_f32.iter().enumerate() {
         out_bf16[i] = bf16::from_f32(*v);
     }
@@ -613,5 +694,93 @@ mod tests {
             max_dev < dense_scale * 2.0 + 1.0,
             "sparse output diverged: max_dev={max_dev} dense_scale={dense_scale}"
         );
+    }
+
+    /// `ffn_forward_sparse_f32` at threshold=0 must match an inline
+    /// dense gate / up / SwiGLU / down sequence byte-for-byte. This
+    /// is the bit-identity contract that protects the layer-0 and
+    /// shell shared-expert refactor from introducing numerical drift.
+    #[test]
+    fn ffn_f32_threshold_zero_matches_inline_dense() {
+        use crate::kernel_avx512::dequant_gemv_int4_auto;
+        let hidden = 32;
+        let intermediate = 32;
+        let n_in_groups = hidden / GROUP_SIZE;
+        let n_mid_groups = intermediate / GROUP_SIZE;
+
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * n_in_groups * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * n_mid_groups * 2)
+            .collect();
+        let x_f32: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32) * 0.05 - 0.5)
+            .collect();
+
+        // Reference: three inline GEMVs + the canonical swiglu_mul.
+        let mut ref_gate = vec![0.0f32; intermediate];
+        dequant_gemv_int4_auto(
+            &gate_packed,
+            &gate_scale,
+            &x_f32,
+            intermediate,
+            hidden,
+            &mut ref_gate,
+        );
+        let mut ref_up = vec![0.0f32; intermediate];
+        dequant_gemv_int4_auto(
+            &up_packed,
+            &up_scale,
+            &x_f32,
+            intermediate,
+            hidden,
+            &mut ref_up,
+        );
+        let mut ref_inter = vec![0.0f32; intermediate];
+        crate::shell::swiglu_mul(&ref_gate, &ref_up, &mut ref_inter);
+        let mut ref_out = vec![0.0f32; hidden];
+        dequant_gemv_int4_auto(
+            &down_packed,
+            &down_scale,
+            &ref_inter,
+            hidden,
+            intermediate,
+            &mut ref_out,
+        );
+
+        // Test target: ffn_forward_sparse_f32 at τ=0.
+        let mut got_out = vec![0.0f32; hidden];
+        let active_frac = ffn_forward_sparse_f32(
+            &x_f32,
+            hidden,
+            intermediate,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut got_out,
+            0.0,
+        );
+        assert_eq!(active_frac, 1.0);
+        for h in 0..hidden {
+            assert_eq!(
+                ref_out[h].to_bits(),
+                got_out[h].to_bits(),
+                "h={h}: inline-ref={} sparse(τ=0)={}",
+                ref_out[h],
+                got_out[h]
+            );
+        }
     }
 }
