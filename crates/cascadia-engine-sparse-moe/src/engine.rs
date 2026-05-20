@@ -32,7 +32,9 @@ use crate::dist::{
     StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
-use crate::runner::{LayerRange, Runner, RunnerError};
+use std::num::NonZeroUsize;
+
+use crate::runner::{LayerRange, Runner, RunnerError, RunnerOptions};
 
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
@@ -83,7 +85,11 @@ impl SparseMoEBuilderConfig {
             model_dir: model_dir.into(),
             device: device.into(),
             cache_dir: None,
-            max_cached_experts: 200,
+            // 0 = unbounded (default); positive = LRU cap. The env var
+            // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
+            // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT) —
+            // `docs/perf/POWERINFER_PORT.md`.
+            max_cached_experts: 0,
             rank: 0,
             total: 1,
             top_k_override: None,
@@ -111,6 +117,56 @@ impl SparseMoEBuilderConfig {
     pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
         self.kv_prefix_cache_size = n;
         self
+    }
+
+    /// Set the LRU bound on the expert cache (number of entries). `0`
+    /// = unbounded (default; preserves pre-LRU behaviour). Positive =
+    /// cap on resident experts; LRU eviction when the cache is full.
+    ///
+    /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var.
+    /// At K2.6 dimensions each cached expert is ≈25 MiB so a cap of 256
+    /// roughly bounds the expert pool at 6.4 GiB. See
+    /// `docs/perf/POWERINFER_PORT.md` for guidance.
+    pub fn with_max_cached_experts(mut self, n: u32) -> Self {
+        self.max_cached_experts = n;
+        self
+    }
+}
+
+/// Build the [`RunnerOptions`] from the engine config + environment.
+///
+/// Env-var override order (highest precedence first):
+///   1. `CASCADIA_MAX_EXPERTS_CACHED` (decimal integer; `0` = unbounded)
+///   2. `config.max_cached_experts`   (`0` = unbounded)
+///
+/// Bad env-var values (non-integer, negative) are logged and fall
+/// through to the config value.
+pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOptions {
+    let from_env = std::env::var("CASCADIA_MAX_EXPERTS_CACHED")
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .parse::<u32>()
+                .map_err(|e| {
+                    warn!(env = %s, err = %e, "ignoring invalid CASCADIA_MAX_EXPERTS_CACHED");
+                })
+                .ok()
+        });
+    let raw = from_env.unwrap_or(cfg.max_cached_experts);
+    let max_cached_experts = if raw == 0 {
+        None
+    } else {
+        // `raw > 0` ⇒ safe cast.
+        Some(NonZeroUsize::new(raw as usize).expect("raw > 0"))
+    };
+    info!(
+        from_env = ?from_env,
+        from_cfg = cfg.max_cached_experts,
+        resolved = ?max_cached_experts.map(NonZeroUsize::get),
+        "resolved expert-cache LRU cap (None = unbounded)"
+    );
+    RunnerOptions {
+        max_cached_experts,
     }
 }
 
@@ -258,15 +314,17 @@ impl Builder for SparseMoEBuilder {
         let cfg = self.config.clone();
         let plugin_for_worker = plugin.clone();
         let range_for_worker = range.clone();
+        let runner_opts = resolve_runner_options(&cfg);
         let (tx, rx) = std::sync::mpsc::channel();
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
             tx.send(LoadProgress::message("loading sparse-MoE model"))
                 .ok();
-            Runner::load(
+            Runner::load_with_options(
                 cfg.model_dir.clone(),
                 &cfg.device,
                 plugin_for_worker,
                 range_for_worker,
+                runner_opts,
             )
         });
 

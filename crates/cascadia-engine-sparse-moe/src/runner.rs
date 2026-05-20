@@ -8,13 +8,15 @@
 //! Not async, not Send. Each generation owns its own KV state; the
 //! Engine wrapper above this drives one call at a time.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+use lru::LruCache;
 
 use cascadia_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
@@ -121,14 +123,47 @@ impl LayerState {
     }
 }
 
-/// Two-mode expert cache: either compiled OV IR per (layer, expert), or
+/// Three-mode expert cache: either compiled OV IR per (layer, expert),
 /// mmap'd flat int4 binaries served by the cascadia-int4-gemm AVX-512
-/// kernel. The mode is fixed at construction time based on the
-/// manifest's `experts_format` field.
+/// kernel, or shard-sliced safetensors mmaps. The mode is fixed at
+/// construction time based on the manifest's `experts_format` field.
+///
+/// All three modes are LRU-bounded — when `max_cached_experts` is set,
+/// the least-recently-used entry is evicted on insert.
+///
+/// **Attribution**: the bounded-LRU pattern follows PowerInfer
+/// SmallThinker's `MAX_N_CACHED` (Song et al., SJTU-IPADS, 2024 — see
+/// `smallthinker/powerinfer/expert_cache.cpp`). The motivation is the
+/// same: cap RAM used by the expert pool on memory-constrained devices
+/// (Intel AI PCs with 16–32 GiB RAM) while keeping a hot working set
+/// resident.
 enum ExpertCache {
     OvIr(OvIrExpertCache),
     Int4Bin(Int4BinExpertCache),
     SafetensorsBin(SafetensorsExpertCache),
+}
+
+impl ExpertCache {
+    /// Snapshot LRU stats: (currently cached entries, total evictions
+    /// since load). Variants that don't hold cacheable state report
+    /// zeros.
+    fn lru_stats(&self) -> (usize, u64) {
+        match self {
+            ExpertCache::OvIr(c) => (c.map.len(), c.evictions),
+            ExpertCache::Int4Bin(c) => (c.map.len(), c.evictions),
+            ExpertCache::SafetensorsBin(c) => (c.map.len(), c.evictions),
+        }
+    }
+}
+
+/// Construct a fresh expert-keyed LRU. `max_cached` of `None` produces
+/// an unbounded cache (no evictions, preserves pre-LRU behavior); a
+/// `Some(n)` produces a bounded LRU with capacity `n`.
+fn new_expert_lru<V>(max_cached: Option<NonZeroUsize>) -> LruCache<(u32, u32), V> {
+    match max_cached {
+        Some(cap) => LruCache::new(cap),
+        None => LruCache::unbounded(),
+    }
 }
 
 struct OvIrExpertCache {
@@ -136,18 +171,20 @@ struct OvIrExpertCache {
     manifest_layer_xml: Box<dyn Fn(&PathBuf, u32, u32) -> PathBuf + Send>,
     device: String,
     plugin: PluginConfig,
-    map: HashMap<(u32, u32), Runtime>,
+    map: LruCache<(u32, u32), Runtime>,
     compile_count: u64,
     compile_secs: f64,
+    evictions: u64,
 }
 
 struct Int4BinExpertCache {
     model_dir: PathBuf,
     manifest_layer_bin: Box<dyn Fn(&PathBuf, u32, u32) -> PathBuf + Send>,
-    /// Mmap'd expert weights — cheap to hold many of these since the OS
-    /// pages them in lazily, so we keep all (layer, expert) pairs we've
-    /// touched.
-    map: HashMap<(u32, u32), ExpertWeights>,
+    /// Mmap'd expert weights. Each entry holds a file descriptor +
+    /// virtual mapping; evicting the LRU entry drops both, releasing
+    /// the FD and asking the kernel to drop the pages.
+    map: LruCache<(u32, u32), ExpertWeights>,
+    evictions: u64,
 }
 
 /// Variant that reads experts directly from the safetensors shards
@@ -155,14 +192,18 @@ struct Int4BinExpertCache {
 struct SafetensorsExpertCache {
     /// Shared with the Runner; one mmap set, multiple consumers.
     source: Arc<SafetensorsExpertSource>,
-    /// Cached SafetensorsExpert holders. Each pins its shard mmaps.
-    map: HashMap<(u32, u32), SafetensorsExpert>,
+    /// Cached SafetensorsExpert holders. Each pins its shard mmaps for
+    /// the lifetime of the entry; eviction drops the pin so the shard's
+    /// other consumers (other experts, layer 0, head) can reclaim it
+    /// under memory pressure.
+    map: LruCache<(u32, u32), SafetensorsExpert>,
+    evictions: u64,
 }
 
 impl OvIrExpertCache {
     fn get(&mut self, lid: u32, eid: u32) -> Result<&mut Runtime, RunnerError> {
         let key = (lid, eid);
-        if !self.map.contains_key(&key) {
+        if !self.map.contains(&key) {
             let xml = (self.manifest_layer_xml)(&self.model_dir, lid, eid);
             let xml_s = xml
                 .to_str()
@@ -171,23 +212,47 @@ impl OvIrExpertCache {
             let rt = Runtime::compile(xml_s, &self.device, &self.plugin)?;
             self.compile_count += 1;
             self.compile_secs += t0.elapsed().as_secs_f64();
-            self.map.insert(key, rt);
+            // `push` (unlike `put`) returns Some((k,v)) when an entry is
+            // evicted due to capacity — we use it so we can count
+            // evictions accurately. The key didn't exist (we just
+            // checked), so the returned tuple is the evicted LRU entry,
+            // never an overwrite.
+            if self.map.push(key, rt).is_some() {
+                self.evictions += 1;
+            }
         }
-        Ok(self.map.get_mut(&key).unwrap())
+        Ok(self.map.get_mut(&key).expect("just inserted/checked"))
     }
 }
 
 impl Int4BinExpertCache {
     fn get(&mut self, lid: u32, eid: u32) -> Result<&ExpertWeights, RunnerError> {
         let key = (lid, eid);
-        if !self.map.contains_key(&key) {
+        if !self.map.contains(&key) {
             let path = (self.manifest_layer_bin)(&self.model_dir, lid, eid);
             let w = ExpertWeights::open(&path).map_err(|e| {
                 RunnerError::Internal(format!("open expert.bin {}: {}", path.display(), e))
             })?;
-            self.map.insert(key, w);
+            if self.map.push(key, w).is_some() {
+                self.evictions += 1;
+            }
         }
-        Ok(self.map.get(&key).unwrap())
+        Ok(self.map.get(&key).expect("just inserted/checked"))
+    }
+}
+
+impl SafetensorsExpertCache {
+    fn get(&mut self, lid: u32, eid: u32) -> Result<&SafetensorsExpert, RunnerError> {
+        let key = (lid, eid);
+        if !self.map.contains(&key) {
+            let e = self.source.expert(lid, eid).map_err(|e| {
+                RunnerError::Internal(format!("safetensors expert {lid}/{eid}: {e}"))
+            })?;
+            if self.map.push(key, e).is_some() {
+                self.evictions += 1;
+            }
+        }
+        Ok(self.map.get(&key).expect("just inserted/checked"))
     }
 }
 
@@ -293,6 +358,18 @@ impl Drop for Prefetcher {
     }
 }
 
+/// Optional runtime knobs forwarded to [`Runner::load_with_options`].
+///
+/// Adding a field here is backwards-compatible — defaults preserve the
+/// pre-options behaviour of `Runner::load`.
+#[derive(Clone, Debug, Default)]
+pub struct RunnerOptions {
+    /// LRU cap on the expert cache. `None` = unbounded (current
+    /// behaviour). `Some(n)` evicts the least-recently-used expert when
+    /// the cache holds `n` entries.
+    pub max_cached_experts: Option<NonZeroUsize>,
+}
+
 /// Per-rank slice of the model the Runner should hold.
 ///
 /// `layer_start..layer_end` is the half-open range of *MoE layer ids*
@@ -370,6 +447,30 @@ impl Runner {
         device: &str,
         plugin: PluginConfig,
         range: LayerRange,
+    ) -> Result<Self, RunnerError> {
+        Self::load_with_options(model_dir, device, plugin, range, RunnerOptions::default())
+    }
+
+    /// Same as [`Self::load`] but accepts a [`RunnerOptions`] block.
+    ///
+    /// Currently the only configurable knob is `max_cached_experts`:
+    ///   - `None` (default): unbounded expert cache (touched-set
+    ///     retention; matches pre-bounded behaviour).
+    ///   - `Some(n)`: LRU cache with capacity `n` entries. Once the
+    ///     cache reaches `n`, the least-recently-used expert is dropped
+    ///     before each new insert. This bounds steady-state RAM at
+    ///     ~`n * per_expert_bytes` (≈25 MiB per K2.6 expert in the
+    ///     int4_bin path).
+    ///
+    /// Attribution: the bounded-LRU pattern follows PowerInfer
+    /// SmallThinker's `MAX_N_CACHED` env var (Song et al., SJTU-IPADS,
+    /// 2024; MIT-licensed). See `docs/perf/POWERINFER_PORT.md`.
+    pub fn load_with_options(
+        model_dir: PathBuf,
+        device: &str,
+        plugin: PluginConfig,
+        range: LayerRange,
+        opts: RunnerOptions,
     ) -> Result<Self, RunnerError> {
         let manifest = Manifest::load(&model_dir)?;
         info!(
@@ -479,6 +580,11 @@ impl Runner {
         }
 
         let manifest_clone = manifest.clone();
+        let cap = opts.max_cached_experts;
+        info!(
+            max_cached_experts = ?cap.map(NonZeroUsize::get),
+            "expert cache capacity (None = unbounded)"
+        );
         let experts = match manifest.experts_format.as_str() {
             "int4_bin" => {
                 info!("expert backend: int4_bin (mmap + AVX-512 kernel)");
@@ -487,14 +593,16 @@ impl Runner {
                     manifest_layer_bin: Box::new(move |md, lid, eid| {
                         manifest_clone.expert_bin(md, lid, eid)
                     }),
-                    map: HashMap::new(),
+                    map: new_expert_lru(cap),
+                    evictions: 0,
                 })
             }
             "safetensors_bin" => {
                 info!("expert backend: safetensors_bin (shared with shell source)");
                 ExpertCache::SafetensorsBin(SafetensorsExpertCache {
                     source: safetensors_source.clone(),
-                    map: HashMap::new(),
+                    map: new_expert_lru(cap),
+                    evictions: 0,
                 })
             }
             other => {
@@ -512,9 +620,10 @@ impl Runner {
                     }),
                     device: device.to_string(),
                     plugin: plugin.clone(),
-                    map: HashMap::new(),
+                    map: new_expert_lru(cap),
                     compile_count: 0,
                     compile_secs: 0.0,
+                    evictions: 0,
                 })
             }
         };
@@ -625,14 +734,7 @@ impl Runner {
                 Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
             }
             ExpertCache::SafetensorsBin(c) => {
-                let key = (lid, eid);
-                if !c.map.contains_key(&key) {
-                    let e = c.source.expert(lid, eid).map_err(|e| {
-                        RunnerError::Internal(format!("safetensors expert {lid}/{eid}: {e}"))
-                    })?;
-                    c.map.insert(key, e);
-                }
-                let w = c.map.get(&key).unwrap();
+                let w = c.get(lid, eid)?;
                 let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
                 let mut out_bf16 = vec![bf16::ZERO; hidden];
                 int4_expert_forward(
@@ -1685,15 +1787,13 @@ impl Runner {
             }
             history.push(next);
             generated.push(next);
+            let (cached_experts, expert_evictions) = self.experts.lru_stats();
             debug!(
                 step = step_i,
                 token = next,
                 elapsed_ms = t_step.elapsed().as_secs_f64() * 1000.0,
-                cached_experts = match &self.experts {
-                    ExpertCache::OvIr(c) => c.map.len(),
-                    ExpertCache::Int4Bin(c) => c.map.len(),
-                    ExpertCache::SafetensorsBin(c) => c.map.len(),
-                },
+                cached_experts,
+                expert_evictions,
                 "decode step"
             );
         }
@@ -2458,5 +2558,76 @@ mod tests {
             .expect_err("expected length-check error");
         let msg = format!("{err}");
         assert!(msg.contains("past_k"), "error should mention past_k: {msg}");
+    }
+
+    /// `new_expert_lru(None)` constructs an unbounded cache: arbitrarily
+    /// many entries with zero evictions.
+    #[test]
+    fn expert_lru_unbounded_never_evicts() {
+        let mut c: LruCache<(u32, u32), u32> = new_expert_lru(None);
+        for i in 0..500u32 {
+            // `push` returns Some((k,v)) only on capacity eviction; an
+            // unbounded LRU never evicts.
+            let evicted = c.push((0, i), i);
+            assert!(
+                evicted.is_none(),
+                "unbounded LRU evicted on insert {i}: {:?}",
+                evicted
+            );
+        }
+        assert_eq!(c.len(), 500);
+        // Oldest entry still present.
+        assert_eq!(c.get(&(0, 0)).copied(), Some(0));
+    }
+
+    /// `new_expert_lru(Some(n))` evicts the least-recently-used entry
+    /// once `n` is reached. Order: touching k1 before inserting k(n+1)
+    /// evicts k2 (the LRU), not k1.
+    #[test]
+    fn expert_lru_bounded_evicts_least_recently_used() {
+        let cap = NonZeroUsize::new(3).unwrap();
+        let mut c: LruCache<(u32, u32), u32> = new_expert_lru(Some(cap));
+        // Fill exactly to capacity — no eviction yet.
+        for i in 0..3u32 {
+            assert!(c.push((0, i), i).is_none(), "premature evict at {i}");
+        }
+        // Touch (0, 0) so (0, 1) becomes the LRU victim.
+        assert_eq!(c.get(&(0, 0)).copied(), Some(0));
+        // Insert a fresh key → evicts LRU, which is (0, 1).
+        let evicted = c.push((0, 99), 99);
+        assert_eq!(
+            evicted,
+            Some(((0, 1), 1)),
+            "expected eviction of (0,1)→1, got {evicted:?}"
+        );
+        assert!(c.contains(&(0, 0)), "(0,0) was touched and should remain");
+        assert!(!c.contains(&(0, 1)), "(0,1) should have been evicted");
+        assert!(c.contains(&(0, 2)), "(0,2) was inserted after (0,1)");
+        assert!(c.contains(&(0, 99)), "new entry should be present");
+        assert_eq!(c.len(), 3);
+    }
+
+    /// `resolve_runner_options` defaults to unbounded when config and
+    /// env are both zero/unset. Non-zero config → bounded.
+    #[test]
+    fn resolve_runner_options_from_config() {
+        use crate::engine::resolve_runner_options;
+        // Unset env so our test is hermetic. We don't share env across
+        // threads cleanly, so we don't test the env-var path here; that
+        // is exercised end-to-end in the engine integration tests when
+        // CASCADIA_MAX_EXPERTS_CACHED is set.
+        std::env::remove_var("CASCADIA_MAX_EXPERTS_CACHED");
+
+        let mut cfg = crate::engine::SparseMoEBuilderConfig::new(".", "CPU");
+        cfg.max_cached_experts = 0;
+        let opts = resolve_runner_options(&cfg);
+        assert!(
+            opts.max_cached_experts.is_none(),
+            "0 should resolve to unbounded"
+        );
+
+        cfg.max_cached_experts = 256;
+        let opts = resolve_runner_options(&cfg);
+        assert_eq!(opts.max_cached_experts.map(NonZeroUsize::get), Some(256));
     }
 }

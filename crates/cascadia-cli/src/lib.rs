@@ -159,6 +159,19 @@ pub struct WorkerArgs {
     /// is ~150 MiB, so practical caps are 1..8.
     #[arg(long, default_value_t = 0)]
     pub kv_prefix_cache_size: u32,
+
+    /// LRU bound on the expert cache (sparse-moe engine only). `0` =
+    /// unbounded (default; preserves pre-LRU behaviour). Positive =
+    /// max number of resident experts; least-recently-used is dropped
+    /// to make room on miss. At K2.6 dimensions ≈25 MiB per expert
+    /// (int4_bin path) or ≈75 MiB (ov_ir path), so a cap of 256 caps
+    /// resident expert RAM at ~6–20 GiB depending on backend.
+    ///
+    /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var
+    /// (MIT-licensed; see `docs/perf/POWERINFER_PORT.md`). The env var
+    /// `CASCADIA_MAX_EXPERTS_CACHED` overrides this flag at runtime.
+    #[arg(long, default_value_t = 0, env = "CASCADIA_MAX_EXPERTS_CACHED")]
+    pub max_cached_experts: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -352,6 +365,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
+            cfg.max_cached_experts = args.max_cached_experts;
             // N-gram speculative decode (sparse-moe single-stage).
             // The `--prompt-lookup` flag is the canonical opt-in (it
             // already drives the ov-genai prompt-lookup path); when
