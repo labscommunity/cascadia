@@ -1,6 +1,6 @@
 # A3 — MoE top-K dispatch reduction
 
-A small opt-in flag on `tahoma worker` that reduces the number of
+A small opt-in flag on `cascadia worker` that reduces the number of
 experts dispatched per token in the sparse-MoE engine. Significant
 throughput gains on K2.6 (and other sigmoid-router MoE models) at
 negligible quality cost.
@@ -8,7 +8,7 @@ negligible quality cost.
 ## Usage
 
 ```bash
-tahoma worker --engine sparse-moe --top-k-override 4 ...
+cascadia worker --engine sparse-moe --top-k-override 4 ...
 ```
 
 Default is `None` (no behavior change — uses manifest's top_k, which
@@ -20,7 +20,7 @@ weights/ids; we just skip dispatching the tail.
 There's also a complementary flag:
 
 ```bash
-tahoma worker --engine sparse-moe --routing-threshold 0.1 ...
+cascadia worker --engine sparse-moe --routing-threshold 0.1 ...
 ```
 
 which skips experts whose router weight is below the threshold. The

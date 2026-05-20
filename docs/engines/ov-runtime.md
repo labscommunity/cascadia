@@ -47,12 +47,12 @@ For `ov-dist-spec` you need v5 shards instead — see [ov-dist-spec.md](ov-dist-
 
 ```bash
 # Last stage (rank 1):
-tahoma worker --rank 1 --total 2 --engine ov-runtime --device GPU \
+cascadia worker --rank 1 --total 2 --engine ov-runtime --device GPU \
               --model /shards/shards_2stage_v3 \
               --listen 10.10.10.2:9100
 
 # First stage (rank 0):
-tahoma worker --rank 0 --total 2 --engine ov-runtime --device GPU \
+cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
               --model /shards/shards_2stage_v3 \
               --next 10.10.10.2:9100 --api :8000
 ```

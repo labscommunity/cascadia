@@ -9,7 +9,7 @@ PP and TP compose. A typical exo-style cluster of four nodes might run as `total
 The Python prototype shipped a `TPGroup` (ring all-reduce over TCP) plus
 `ShardSpec.tp_size` / `tp_rank` plumbing. The Rust port has not yet
 re-landed TP — `--tp-size` / `--tp-rank` flags do not exist on
-`tahoma worker` today. Re-introducing TP requires:
+`cascadia worker` today. Re-introducing TP requires:
 
 What's **not** here yet (per-engine work, requires re-exported shards):
 
@@ -33,12 +33,12 @@ For a 2 × 2 grid (PP=2, TP=2), each of the four nodes runs a worker with both p
 
 ```bash
 # rank 0, tp_rank 0  (stage 0, TP rank 0)
-tahoma worker --rank 0 --total 2 --tp-size 2 --tp-rank 0 \
+cascadia worker --rank 0 --total 2 --tp-size 2 --tp-rank 0 \
               --engine ov-runtime-tp --device GPU --model ... \
               --next 10.0.0.2:9100 --api :8000
 
 # rank 0, tp_rank 1
-tahoma worker --rank 0 --total 2 --tp-size 2 --tp-rank 1 \
+cascadia worker --rank 0 --total 2 --tp-size 2 --tp-rank 1 \
               --engine ov-runtime-tp --device GPU --model ... \
               --next 10.0.0.2:9101
 

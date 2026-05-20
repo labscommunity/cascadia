@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""tahoma standalone model exporter.
+"""cascadia standalone model exporter.
 
 Takes a HuggingFace model (Llama, Mistral, Qwen2, or any decoder-only LLM
-that follows the same conventions) and produces a tahoma shard directory:
+that follows the same conventions) and produces a cascadia shard directory:
 
     shards/
       pipeline_config.json
@@ -16,12 +16,12 @@ that follows the same conventions) and produces a tahoma shard directory:
         stage_config.json
       ...
 
-This script is invoked by `tahoma shard`. It is also runnable standalone
+This script is invoked by `cascadia shard`. It is also runnable standalone
 for users who want fine-grained control:
 
     python export_shards.py \
         --model unsloth/Meta-Llama-3.1-8B-Instruct \
-        --output-dir ~/tahoma-shards/llama-8b-2stage \
+        --output-dir ~/cascadia-shards/llama-8b-2stage \
         --num-stages 2 \
         --quantization int4
 
@@ -868,7 +868,7 @@ def maybe_download(model_id_or_path: str) -> str:
     # HF id — download.
     from huggingface_hub import snapshot_download
 
-    cache_root = os.path.expanduser("~/.cache/tahoma/models")
+    cache_root = os.path.expanduser("~/.cache/cascadia/models")
     safe_id = model_id_or_path.replace("/", "--")
     local_dir = os.path.join(cache_root, safe_id)
     print(f"Downloading {model_id_or_path} -> {local_dir}", flush=True)
@@ -912,7 +912,7 @@ def copy_tokenizer(model_dir: str, output_dir: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export an HF causal-LM model as tahoma per-stage shards"
+        description="Export an HF causal-LM model as cascadia per-stage shards"
     )
     parser.add_argument(
         "--model",

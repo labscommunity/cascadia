@@ -1,10 +1,10 @@
 [package]
-name = "tahoma-tests-e2e"
+name = "cascadia-tests-e2e"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "End-to-end binary tests — spawn the tahoma binary and exercise its HTTP API."
+description = "End-to-end binary tests — spawn the cascadia binary and exercise its HTTP API."
 
 [dependencies]
 tokio = { workspace = true }

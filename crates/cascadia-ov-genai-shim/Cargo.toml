@@ -1,0 +1,21 @@
+[package]
+name = "cascadia-ov-genai-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C++ FFI shim around openvino-genai for the missing pieces (draft_model, Tokenizer, prompt_lookup property)."
+build = "build.rs"
+
+[features]
+default = []
+# Enable to link against the real openvino-genai C++ library. Without this
+# feature the crate compiles to a no-op stub that returns errors at runtime
+# — useful for CI, Mac dev builds, and any environment without OpenVINO.
+openvino = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
