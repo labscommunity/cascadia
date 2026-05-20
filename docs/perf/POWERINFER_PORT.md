@@ -112,39 +112,32 @@ Both changes ship behind explicit knobs because they trade quality
 for throughput in some configurations. The defaults match the pre-PR
 behaviour exactly.
 
-## What's *not* in this PR (deferred)
+## Follow-up issues
 
-Listed in a single place so the reader can see the full scope of
-PowerInfer's work and what we've intentionally left out — most of it
-is genuinely valuable, just out of scope for *this* PR.
+The PowerInfer ideas that this PR did **not** port are each tracked
+as a GitHub issue so they can be picked up independently. Status:
 
-- **Expert bundle (.cpack) file format.** The PI SmallThinker bundle
-  packs all (layer, expert, matrix) into one 4-KB-aligned binary so a
-  single `io_uring` SQE can load any matrix. cascadia already has
-  efficient mmap'd expert access via the existing safetensors path;
-  the bundle adds FD-pressure / alignment hygiene but not raw
-  throughput. Will revisit if/when the in-flight `io_uring` work
-  needs `O_DIRECT`.
-- **Sparse-aware multi-token FFN kernel.** This PR sparsifies only
-  the single-token (decode) path. Multi-token prefill has a different
-  cache-and-tile structure (per-token masks would break the
-  AVX-512 multi-token tile shape); deferred.
-- **Trained predictor MLP for FFN sparsity.** The CATS / CHESS
-  magnitude-threshold heuristic in this PR is a no-training stand-in.
-  A trained per-layer predictor (PI §5.1) recovers ~5–10% additional
-  sparsity at the same quality budget; needs offline calibration
-  tooling.
-- **Sparse lm_head with profiler MLP.** Same dependency on a trained
-  predictor.
-- **Hot/cold neuron ILP placement** across {iGPU, NPU, CPU}.
-  Foundational for the future cascadia 3-tier model; needs the
-  predictor work first.
-- **TurboSparse dReLU surgery.** Training-side, not inference-side.
-  Realistic path: consume their published TurboSparse-Mixtral-47B
-  checkpoint when we add Mixtral support.
-- **PowerInfer-2 5-stage neuron-cluster pipeline.** Maps to the
-  in-flight `io_uring` prefetch branch (`perf/io-uring-prefetch-074`)
-  rather than this PR.
+| Issue | Technique | Why deferred |
+|---|---|---|
+| [#35](https://github.com/labscommunity/cascadia/issues/35) | Column-sparse down kernel + scratch buffers | The piece that lifts FFN sparsity from "kernel works" to net K2.6 win |
+| [#36](https://github.com/labscommunity/cascadia/issues/36) | OV custom op for sparse FFN | Pushes sparsity into the ov-genai path (Mistral / Qwen3 etc.) |
+| [#37](https://github.com/labscommunity/cascadia/issues/37) | NPU compile-failure triage | Find which models actually compile on Intel NPU 4 |
+| [#38](https://github.com/labscommunity/cascadia/issues/38) | Per-channel FFN threshold (CHESS) | Higher sparsity at preserved quality |
+| [#39](https://github.com/labscommunity/cascadia/issues/39) | Multi-token sparse FFN kernel | Extends sparsity to prefill (long-context win) |
+| [#40](https://github.com/labscommunity/cascadia/issues/40) | Trained predictor MLP (PowerInfer §5.1) | Pre-hoc signal vs current magnitude-threshold heuristic |
+| [#41](https://github.com/labscommunity/cascadia/issues/41) | Three-tier {iGPU, NPU, CPU} ILP placement | Generalizes PI §6.3 to Intel UMA AI PCs |
+| [#42](https://github.com/labscommunity/cascadia/issues/42) | Expert bundle (.cpack) format | 4 KB-aligned storage for the in-flight io_uring prefetch path |
+
+Things we deliberately do **not** plan to port:
+
+- **TurboSparse dReLU surgery** (arxiv 2406.05955) — training-side
+  pipeline at ~$200–500k per checkpoint; prohibitive at K2.6's
+  ~1 T parameter scale. Realistic path is to *consume* the
+  published TurboSparse-Mixtral-47B checkpoint when we add Mixtral
+  support, not to perform the surgery in-house.
+- **PowerInfer-1 CUDA kernels** — wrong backend; the Intel
+  equivalent is OpenVINO (already used) + the SYCL int4 expert
+  kernel in [#21](https://github.com/labscommunity/cascadia/issues/21).
 
 ## Reproducing the kernel bench
 
@@ -199,26 +192,15 @@ and per-call alloc + rayon scheduling overhead eats the remainder.
 
 **Production recommendation today:** **do not enable FFN sparsity for
 serving K2.6** (`--ffn-sparsity-threshold` should stay at 0.0). The
-infrastructure is in place and *will* pay off on follow-up work
-(below); shipping the knob early lets us measure per-model curves on
-other architectures without churning the API later.
+infrastructure is in place and *will* pay off on the follow-up issues
+above ([#35](https://github.com/labscommunity/cascadia/issues/35),
+[#38](https://github.com/labscommunity/cascadia/issues/38)); shipping
+the knob early lets us measure per-model curves on other architectures
+without churning the API later.
 
-**Follow-up work to turn this into a real-world win:**
-
-1. **Column-sparse down kernel** — `dequant_gemv_int4_cols_subset_auto`.
-   Skip K-dim cols where the intermediate is zero. At p=0.5 this
-   should ~2× the down kernel, lifting total FFN speedup from ~1.1×
-   to ~1.5–1.7×.
-2. **Caller-owned scratch buffers** — remove the 7 per-call
-   `Vec::new()` allocs in `ffn_forward_sparse_f32` (currently 7 ×
-   60 × top_K × N_tokens allocs per generation).
-3. **Threshold-by-channel (CHESS)** — single global τ is a blunt
-   instrument; per-channel τ can hold quality longer at higher
-   sparsity.
-
-Each is a separate small PR. The bounded LRU + the kernel primitive
+The bounded LRU and the kernel primitive
 (`dequant_gemv_int4_rows_subset_auto`) added in this PR are the
-prerequisites for all three.
+prerequisites for those follow-ups.
 
 ### LRU expert cache — measured
 
