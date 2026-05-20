@@ -32,7 +32,9 @@ use crate::dist::{
     StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
-use crate::runner::{LayerRange, Runner, RunnerError};
+use std::num::NonZeroUsize;
+
+use crate::runner::{LayerRange, Runner, RunnerError, RunnerOptions};
 
 #[derive(Default, Debug, Clone)]
 pub struct SparseMoEBuilderConfig {
@@ -75,6 +77,12 @@ pub struct SparseMoEBuilderConfig {
     /// stages requires a new transport frame for snapshot exchange,
     /// deferred to a follow-up. With `total > 1` this field is a no-op.
     pub kv_prefix_cache_size: u32,
+    /// Magnitude threshold for the two-phase Gate-first FFN sparsity
+    /// skip — see [`crate::runner::Runner::set_ffn_sparsity_threshold`].
+    /// `0.0` = disabled (dense fallback; output bit-identical).
+    /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
+    /// quality. See rainier `docs/POWERINFER_PORT.md`.
+    pub ffn_sparsity_threshold: f32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -83,13 +91,18 @@ impl SparseMoEBuilderConfig {
             model_dir: model_dir.into(),
             device: device.into(),
             cache_dir: None,
-            max_cached_experts: 200,
+            // 0 = unbounded (default); positive = LRU cap. The env var
+            // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
+            // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT) —
+            // rainier `docs/POWERINFER_PORT.md`.
+            max_cached_experts: 0,
             rank: 0,
             total: 1,
             top_k_override: None,
             routing_threshold: None,
             spec_decode_k: None,
             kv_prefix_cache_size: 0,
+            ffn_sparsity_threshold: 0.0,
         }
     }
 
@@ -111,6 +124,67 @@ impl SparseMoEBuilderConfig {
     pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
         self.kv_prefix_cache_size = n;
         self
+    }
+
+    /// Set the LRU bound on the expert cache (number of entries). `0`
+    /// = unbounded (default; preserves pre-LRU behaviour). Positive =
+    /// cap on resident experts; LRU eviction when the cache is full.
+    ///
+    /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var.
+    /// At K2.6 dimensions each cached expert is ≈25 MiB so a cap of 256
+    /// roughly bounds the expert pool at 6.4 GiB. See
+    /// rainier `docs/POWERINFER_PORT.md` for guidance.
+    pub fn with_max_cached_experts(mut self, n: u32) -> Self {
+        self.max_cached_experts = n;
+        self
+    }
+
+    /// Set the magnitude threshold for two-phase Gate-first FFN
+    /// sparsity. `0.0` = dense (default; output bit-identical to the
+    /// pre-port path). `0.05`–`0.15` is the useful range for SwiGLU.
+    /// See [`crate::runner::Runner::set_ffn_sparsity_threshold`] and
+    /// rainier `docs/POWERINFER_PORT.md`.
+    pub fn with_ffn_sparsity_threshold(mut self, t: f32) -> Self {
+        self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
+        self
+    }
+}
+
+/// Build the [`RunnerOptions`] from the engine config + environment.
+///
+/// Env-var override order (highest precedence first):
+///   1. `CASCADIA_MAX_EXPERTS_CACHED` (decimal integer; `0` = unbounded)
+///   2. `config.max_cached_experts`   (`0` = unbounded)
+///
+/// Bad env-var values (non-integer, negative) are logged and fall
+/// through to the config value.
+pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOptions {
+    let from_env = std::env::var("CASCADIA_MAX_EXPERTS_CACHED")
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .parse::<u32>()
+                .map_err(|e| {
+                    warn!(env = %s, err = %e, "ignoring invalid CASCADIA_MAX_EXPERTS_CACHED");
+                })
+                .ok()
+        });
+    let raw = from_env.unwrap_or(cfg.max_cached_experts);
+    let max_cached_experts = if raw == 0 {
+        None
+    } else {
+        // `raw > 0` ⇒ safe cast.
+        Some(NonZeroUsize::new(raw as usize).expect("raw > 0"))
+    };
+    info!(
+        from_env = ?from_env,
+        from_cfg = cfg.max_cached_experts,
+        resolved = ?max_cached_experts.map(NonZeroUsize::get),
+        "resolved expert-cache LRU cap (None = unbounded)"
+    );
+    RunnerOptions {
+        max_cached_experts,
+        ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
     }
 }
 
@@ -258,15 +332,17 @@ impl Builder for SparseMoEBuilder {
         let cfg = self.config.clone();
         let plugin_for_worker = plugin.clone();
         let range_for_worker = range.clone();
+        let runner_opts = resolve_runner_options(&cfg);
         let (tx, rx) = std::sync::mpsc::channel();
         let join: JoinHandle<Result<Runner, RunnerError>> = std::thread::spawn(move || {
             tx.send(LoadProgress::message("loading sparse-MoE model"))
                 .ok();
-            Runner::load(
+            Runner::load_with_options(
                 cfg.model_dir.clone(),
                 &cfg.device,
                 plugin_for_worker,
                 range_for_worker,
+                runner_opts,
             )
         });
 
@@ -282,6 +358,7 @@ impl Builder for SparseMoEBuilder {
         // Plumb per-token expert-dispatch overrides into the runner.
         runner.set_top_k_override(self.config.top_k_override);
         runner.set_routing_threshold(self.config.routing_threshold);
+        runner.set_ffn_sparsity_threshold(self.config.ffn_sparsity_threshold);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

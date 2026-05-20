@@ -171,6 +171,40 @@ pub fn layer0_forward_decode_int4_with_capacity(
     past_seq_len: usize,
     capacity: usize,
 ) -> Layer0Outputs {
+    layer0_forward_decode_int4_with_capacity_sparse(
+        layer,
+        x_f32,
+        past_k,
+        past_v,
+        past_seq_len,
+        capacity,
+        0.0,
+    )
+}
+
+/// Same as [`layer0_forward_decode_int4_with_capacity`] but with an
+/// extra `ffn_sparsity_threshold` knob that controls the two-phase
+/// Gate-first FFN sparsity in the dense MLP block of layer 0.
+///
+/// `ffn_sparsity_threshold == 0.0` (used by the back-compat wrapper
+/// `layer0_forward_decode_int4_with_capacity`) is bit-identical to the
+/// pre-port path.
+///
+/// Positive values activate the same magnitude-threshold sparsity
+/// described in [`cascadia_int4_gemm::ffn_forward_sparse_f32`]. K2.6's
+/// layer 0 is dense (no MoE) so this is the only place the layer-0
+/// FFN sparsity applies; the FFN inside layer 0 follows the same
+/// SwiGLU pattern as the routed experts, so the same threshold value
+/// is meaningful for both.
+pub fn layer0_forward_decode_int4_with_capacity_sparse(
+    layer: &Int4Layer0,
+    x_f32: &[f32],
+    past_k: &[u16],
+    past_v: &[u16],
+    past_seq_len: usize,
+    capacity: usize,
+    ffn_sparsity_threshold: f32,
+) -> Layer0Outputs {
     assert_eq!(x_f32.len(), HIDDEN);
     assert!(
         capacity >= past_seq_len,
@@ -329,34 +363,25 @@ pub fn layer0_forward_decode_int4_with_capacity(
     let post = rmsnorm_apply_pub(&residual, &layer.post_norm, HIDDEN);
 
     // ----- Dense SwiGLU MLP (the only place layer 0 differs from a shell) -----
-    let mut gate_out = vec![0.0f32; INTERMEDIATE_DENSE];
-    dequant_gemv_int4_auto(
+    //
+    // The two-phase Gate-first sparse path lives in
+    // `cascadia_int4_gemm::ffn_forward_sparse_f32`. At
+    // `ffn_sparsity_threshold == 0.0` it runs a back-to-back
+    // gate / SwiGLU / up / down sequence identical to the pre-port
+    // inline code — bit-identical, no overhead.
+    let mut mlp_out = vec![0.0f32; HIDDEN];
+    let _active_frac = crate::ffn_sparsity::ffn_forward_sparse_f32(
+        &post,
+        HIDDEN,
+        INTERMEDIATE_DENSE,
         &layer.gate_proj_packed,
         &layer.gate_proj_scale,
-        &post,
-        INTERMEDIATE_DENSE,
-        HIDDEN,
-        &mut gate_out,
-    );
-    let mut up_out = vec![0.0f32; INTERMEDIATE_DENSE];
-    dequant_gemv_int4_auto(
         &layer.up_proj_packed,
         &layer.up_proj_scale,
-        &post,
-        INTERMEDIATE_DENSE,
-        HIDDEN,
-        &mut up_out,
-    );
-    let mut inter = vec![0.0f32; INTERMEDIATE_DENSE];
-    swiglu_mul(&gate_out, &up_out, &mut inter);
-    let mut mlp_out = vec![0.0f32; HIDDEN];
-    dequant_gemv_int4_auto(
         &layer.down_proj_packed,
         &layer.down_proj_scale,
-        &inter,
-        HIDDEN,
-        INTERMEDIATE_DENSE,
         &mut mlp_out,
+        ffn_sparsity_threshold,
     );
 
     let mut hidden_out = vec![0.0f32; HIDDEN];
