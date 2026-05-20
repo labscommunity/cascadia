@@ -35,8 +35,9 @@ use cascadia_int4_gemm::{
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use half::bf16;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 use crate::manifest::{Manifest, ManifestError};
 use crate::tensors::{bf16_bytes_to_f32, f16_bytes_to_f32, f32_to_bf16_bytes};
 
@@ -716,6 +717,166 @@ impl Runner {
         out
     }
 
+    /// Estimated bytes the KV-prefix cache would consume per cached
+    /// **token**, summed across every layer the rank owns (layer 0
+    /// when `is_first`, every MoE shell). Multiply by the typical
+    /// prompt length to budget a [`KvPrefixCache`] capacity.
+    ///
+    /// Formula: `kv_layers * NUM_HEADS * (qk_head_dim + v_head_dim) * 2`
+    /// — bf16 storage matches the runner's live KV layout. Excludes
+    /// the IndexMap key + hash overhead, which is negligible next to
+    /// the KV tensors at K2.6 dims (~150 MiB / 512-token snapshot).
+    pub fn estimated_snapshot_bytes_per_token(&self) -> usize {
+        let kv_layers = self.layers.len() + if self.layer0.is_some() { 1 } else { 0 };
+        let per_head_dim = self.manifest.qk_head_dim as usize + self.manifest.v_head_dim as usize;
+        kv_layers * NUM_HEADS * per_head_dim * std::mem::size_of::<u16>()
+    }
+
+    /// Build a [`ModelFingerprint`] from the manifest + the rank's
+    /// `LayerRange`. Used as part of the [`KvPrefixCache`] key — see
+    /// the cache module docs for the "what affects KV bits" rule.
+    pub fn fingerprint(&self) -> ModelFingerprint {
+        ModelFingerprint {
+            arch: self.manifest.arch.clone(),
+            num_layers: self.manifest.num_layers,
+            num_experts: self.manifest.num_experts,
+            top_k: self.manifest.top_k,
+            hidden_size: self.manifest.hidden_size,
+            num_kv_heads: self.manifest.num_kv_heads,
+            qk_head_dim: self.manifest.qk_head_dim,
+            v_head_dim: self.manifest.v_head_dim,
+            vocab_size: self.manifest.vocab_size,
+            layer_start: self.range.layer_start,
+            layer_end: self.range.layer_end,
+            is_first: self.range.is_first,
+            is_last: self.range.is_last,
+        }
+    }
+
+    /// Snapshot the rank's current KV state into a [`KvSnapshot`].
+    /// Captures only the populated `0..past_seq_len` slots per head —
+    /// the live capacity buffers are NOT serialized, so a 32-capacity
+    /// runner with 8 slots filled produces an 8-slot snapshot.
+    ///
+    /// Every layer (layer 0 if owned + every MoE shell) must agree on
+    /// `past_seq_len`; mismatches return an `Internal` error since they
+    /// indicate a bug in the engine's prefill driver, not a recoverable
+    /// state. (Compare `kv_past_seq_lens` on `main` post-spec-decode.)
+    pub fn snapshot_kv(&self) -> Result<KvSnapshot, RunnerError> {
+        let ps = if let Some(l0) = self.layer0.as_ref() {
+            l0.past_seq_len
+        } else if let Some(first) = self.layers.first() {
+            first.past_seq_len
+        } else {
+            return Err(RunnerError::Internal(
+                "snapshot_kv: rank holds neither layer 0 nor any shell".into(),
+            ));
+        };
+        if let Some(l0) = self.layer0.as_ref() {
+            if l0.past_seq_len != ps {
+                return Err(RunnerError::Internal(format!(
+                    "snapshot_kv: layer-0 past_seq_len {} != expected {}",
+                    l0.past_seq_len, ps
+                )));
+            }
+        }
+        for l in &self.layers {
+            if l.past_seq_len != ps {
+                return Err(RunnerError::Internal(format!(
+                    "snapshot_kv: layer {} past_seq_len {} != expected {}",
+                    l.lid, l.past_seq_len, ps
+                )));
+            }
+        }
+        let layer0 = self
+            .layer0
+            .as_ref()
+            .map(|l0| pack_layer_slice(0, &l0.past_k, &l0.past_v, ps, l0.kv_capacity));
+        let shells = self
+            .layers
+            .iter()
+            .map(|l| pack_layer_slice(l.lid, &l.past_k, &l.past_v, ps, l.kv_capacity))
+            .collect();
+        Ok(KvSnapshot {
+            past_seq_len: ps,
+            num_heads: NUM_HEADS as u32,
+            qk_head_dim: QK_HEAD_DIM as u32,
+            v_head_dim: V_HEAD_DIM as u32,
+            layer0,
+            shells,
+        })
+    }
+
+    /// Restore a previously-captured snapshot into the runner's KV
+    /// state. Validates shape against the rank's live layout — wrong
+    /// `num_heads` or `head_dim` is a hard error (the fingerprint check
+    /// upstream should have caught it, but defence in depth).
+    ///
+    /// After this returns Ok, every layer's `past_seq_len` is set to
+    /// the snapshot's value and the populated prefix is bit-identical
+    /// to what `forward_shells` would have written. The next forward
+    /// step writes its new slot at offset `past_seq_len`, exactly as
+    /// it would after a fresh prefill.
+    ///
+    /// Grows capacity buffers if needed (a snapshot from a long prompt
+    /// restored into a freshly-loaded runner with default 32-cap).
+    pub fn restore_kv(&mut self, snap: &KvSnapshot) -> Result<(), RunnerError> {
+        if snap.num_heads as usize != NUM_HEADS
+            || snap.qk_head_dim as usize != QK_HEAD_DIM
+            || snap.v_head_dim as usize != V_HEAD_DIM
+        {
+            return Err(RunnerError::Internal(format!(
+                "restore_kv: snapshot shape ({}H, {}D_qk, {}D_v) != runner ({}H, {}D_qk, {}D_v)",
+                snap.num_heads,
+                snap.qk_head_dim,
+                snap.v_head_dim,
+                NUM_HEADS,
+                QK_HEAD_DIM,
+                V_HEAD_DIM
+            )));
+        }
+        let ps = snap.past_seq_len;
+        let layer0_present = self.layer0.is_some();
+        let snap_layer0_present = snap.layer0.is_some();
+        if layer0_present != snap_layer0_present {
+            return Err(RunnerError::Internal(format!(
+                "restore_kv: layer-0 presence mismatch (runner={}, snapshot={})",
+                layer0_present, snap_layer0_present
+            )));
+        }
+        if snap.shells.len() != self.layers.len() {
+            return Err(RunnerError::Internal(format!(
+                "restore_kv: shell count mismatch (runner={}, snapshot={})",
+                self.layers.len(),
+                snap.shells.len()
+            )));
+        }
+        for (l, s) in self.layers.iter().zip(snap.shells.iter()) {
+            if l.lid != s.lid {
+                return Err(RunnerError::Internal(format!(
+                    "restore_kv: layer-id mismatch at position (runner={}, snapshot={})",
+                    l.lid, s.lid
+                )));
+            }
+        }
+
+        if let (Some(l0), Some(snap_l0)) = (self.layer0.as_mut(), snap.layer0.as_ref()) {
+            while ps > l0.kv_capacity {
+                grow_layer0_kv_capacity(l0)?;
+            }
+            unpack_layer_slice(&mut l0.past_k, &mut l0.past_v, snap_l0, ps, l0.kv_capacity)?;
+            l0.past_seq_len = ps;
+        }
+        for (l, snap_l) in self.layers.iter_mut().zip(snap.shells.iter()) {
+            while ps > l.kv_capacity {
+                grow_kv_capacity(l)?;
+            }
+            unpack_layer_slice(&mut l.past_k, &mut l.past_v, snap_l, ps, l.kv_capacity)?;
+            l.past_seq_len = ps;
+        }
+        Ok(())
+    }
+
     /// Run one forward pass:
     /// - `full_ids` is the FULL prefix-so-far (1D i64), used by stateless
     ///   layer 0.
@@ -1349,6 +1510,29 @@ impl Runner {
         max_tokens: usize,
         cfg: &crate::sampling::SamplingConfig,
     ) -> Result<Vec<i64>, RunnerError> {
+        self.generate_with_cache(prompt_ids, max_tokens, cfg, None)
+    }
+
+    /// Generate with an optional KV-prefix cache. Behaviour is byte-
+    /// identical to `generate` when `cache` is `None` or empty. On a
+    /// hit, the cached snapshot is restored into the runner's KV
+    /// buffers (skipping the matched prefill tokens) and prefill
+    /// proceeds for the remaining suffix tokens only.
+    ///
+    /// On a miss, the full prefill runs as normal and — if the suffix
+    /// after the system-prompt boundary heuristic crosses the
+    /// `min_cache_prefix` threshold — a snapshot is inserted into the
+    /// cache after the prefill completes. The cache is keyed on the
+    /// **full prompt token sequence**; common-prefix matching is
+    /// O(entries) at lookup time, not at insert time. See the
+    /// [`crate::kv_prefix_cache`] module docs for the cache semantics.
+    pub fn generate_with_cache(
+        &mut self,
+        prompt_ids: &[i64],
+        max_tokens: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        mut cache: Option<&mut KvPrefixCache>,
+    ) -> Result<Vec<i64>, RunnerError> {
         self.reset_kv();
         let eos: Vec<i64> = self
             .manifest
@@ -1359,15 +1543,63 @@ impl Runner {
         let mut rng = crate::sampling::init_rng(cfg.seed);
         let mut generated = Vec::with_capacity(max_tokens);
 
+        // Cache lookup. Returns Some(matched_len) if we restored a
+        // snapshot; None otherwise. `fp` is only computed when the
+        // cache is actually present + enabled so the `generate` →
+        // `generate_with_cache(None)` path stays allocation-identical
+        // to the pre-cache `generate` (preserves the strict
+        // "default off = byte-identical" invariant called out in the
+        // PR description and CLI flag docs).
+        let mut fp: Option<ModelFingerprint> = None;
+        let mut cache_skip: usize = 0;
+        let mut cache_hit = false;
+        if let Some(c) = cache.as_mut() {
+            if c.enabled() {
+                let fingerprint = fp.insert(self.fingerprint());
+                if let Some(snap) = c.lookup(prompt_ids, fingerprint) {
+                    // Restore into the runner's KV buffers. The
+                    // restore validates shape against fingerprint;
+                    // a failure here means cache + runner disagree on
+                    // dimensions (should never happen — fingerprint
+                    // covers num_heads/head_dim — but bubble up the
+                    // error rather than silently corrupt).
+                    cache_skip = snap.past_seq_len;
+                    self.restore_kv(&snap)?;
+                    cache_hit = true;
+                    info!(
+                        cached_prefix_len = cache_skip,
+                        full_prompt_len = prompt_ids.len(),
+                        "kv-prefix-cache HIT — skipping prefix tokens"
+                    );
+                }
+            }
+        }
+
         // Prefill token-by-token to keep shell input shapes uniform (avoids
         // the OV 2026.1.0 CPU snippets shape-specialization bug we hit on
-        // shape changes).
-        info!(prompt_len = prompt_ids.len(), "prefill (token-by-token)");
+        // shape changes). On a cache hit, `cache_skip` of the prompt
+        // is already in KV; we still push those tokens into `history`
+        // so the shells' `past_seq_len` accounting agrees with our
+        // bookkeeping. We only execute `step()` on the suffix.
+        info!(
+            prompt_len = prompt_ids.len(),
+            cache_skip, "prefill (token-by-token)"
+        );
         let mut history: Vec<i64> = Vec::with_capacity(prompt_ids.len() + max_tokens);
         let mut last_logits: Option<Vec<f32>> = None;
         let t_pre = Instant::now();
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
+            if i < cache_skip {
+                // Token's KV bits are already in the cache restore.
+                // Skip the forward — but DO NOT skip the last one
+                // (the suffix's first token), because we still need
+                // a logits row from the LAST prefill step to sample
+                // the first generated token from. The `lookup`
+                // contract enforces `cache_skip < prompt.len()`, so
+                // there is always at least one suffix token below.
+                continue;
+            }
             let logits = self.step(&history, 1)?;
             last_logits = Some(logits);
             if (i + 1) % 8 == 0 || i + 1 == prompt_ids.len() {
@@ -1380,11 +1612,57 @@ impl Runner {
             }
         }
         let prefill_secs = t_pre.elapsed().as_secs_f64();
+        let suffix_len = prompt_ids.len().saturating_sub(cache_skip);
         info!(
             secs = prefill_secs,
-            tok_per_s = prompt_ids.len() as f64 / prefill_secs,
+            suffix_len,
+            tok_per_s = if prefill_secs > 0.0 {
+                suffix_len as f64 / prefill_secs
+            } else {
+                0.0
+            },
             "prefill done"
         );
+
+        // Insert a snapshot on miss. We only cache the FULL prompt
+        // (not arbitrary intermediate prefixes) — this keeps the
+        // cache small and matches the chat-completion access pattern
+        // where the system+user prompt is stable across requests but
+        // the user message varies. Insert happens after prefill so
+        // the snapshot reflects what `forward_shells` actually wrote.
+        //
+        // We could be cleverer (cache after each step, or at
+        // configurable boundaries) — defer until profiling shows
+        // demand. The dominant cost on the rainier baseline is
+        // prefill, and a full-prompt snapshot pays it off in one hit.
+        if !cache_hit {
+            if let Some(c) = cache.as_mut() {
+                if c.enabled() && !prompt_ids.is_empty() {
+                    // `fp` was computed at lookup time on the
+                    // enabled-cache path; reuse it instead of paying
+                    // a second fingerprint clone here.
+                    let fingerprint = fp.get_or_insert_with(|| self.fingerprint());
+                    match self.snapshot_kv() {
+                        Ok(snap) => {
+                            let bytes = snap.approx_bytes();
+                            let evicted = c.insert(prompt_ids.to_vec(), fingerprint, snap);
+                            info!(
+                                cached_bytes = bytes,
+                                cache_len = c.len(),
+                                evicted,
+                                "kv-prefix-cache MISS — inserted snapshot"
+                            );
+                        }
+                        Err(e) => {
+                            // Snapshot failure is non-fatal — the
+                            // generation has already completed
+                            // prefill correctly; we just won't cache.
+                            warn!(error = %e, "kv-prefix-cache snapshot failed; not caching");
+                        }
+                    }
+                }
+            }
+        }
 
         // First generated token from the LAST prefill step's logits.
         if let Some(l) = last_logits {
@@ -1854,6 +2132,80 @@ fn grow_kv_buffer(
     Ok(dst)
 }
 
+/// Copy a layer's populated KV prefix (`[NUM_HEADS, past_seq, head_dim]`)
+/// out of its capacity buffer (`[NUM_HEADS, capacity, head_dim]`) into
+/// a fresh packed `Vec<u16>` suitable for serialization. The capacity
+/// buffer's per-head bases shift on grow; packing strips that variance
+/// so a snapshot taken at cap=32 restores correctly into cap=64.
+fn pack_layer_slice(
+    lid: u32,
+    past_k: &[u16],
+    past_v: &[u16],
+    past_seq: usize,
+    capacity: usize,
+) -> LayerKvSlice {
+    debug_assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
+    debug_assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
+    debug_assert!(past_seq <= capacity);
+    let mut k_out = Vec::with_capacity(NUM_HEADS * past_seq * QK_HEAD_DIM);
+    let mut v_out = Vec::with_capacity(NUM_HEADS * past_seq * V_HEAD_DIM);
+    for h in 0..NUM_HEADS {
+        let k_src_base = h * capacity * QK_HEAD_DIM;
+        k_out.extend_from_slice(&past_k[k_src_base..k_src_base + past_seq * QK_HEAD_DIM]);
+        let v_src_base = h * capacity * V_HEAD_DIM;
+        v_out.extend_from_slice(&past_v[v_src_base..v_src_base + past_seq * V_HEAD_DIM]);
+    }
+    LayerKvSlice {
+        lid,
+        past_k: k_out,
+        past_v: v_out,
+    }
+}
+
+/// Inverse of `pack_layer_slice`: copy a packed
+/// `[NUM_HEADS, past_seq, head_dim]` snapshot into a runner's
+/// `[NUM_HEADS, capacity, head_dim]` buffer at the per-head bases
+/// the runner expects. Slots `past_seq..capacity` per head are left
+/// untouched (they were never read; their contents don't matter
+/// because forward_shells only reads `0..past_seq_len`).
+fn unpack_layer_slice(
+    past_k: &mut [u16],
+    past_v: &mut [u16],
+    snap: &LayerKvSlice,
+    past_seq: usize,
+    capacity: usize,
+) -> Result<(), RunnerError> {
+    if snap.past_k.len() != NUM_HEADS * past_seq * QK_HEAD_DIM {
+        return Err(RunnerError::Internal(format!(
+            "unpack: L{} past_k len {} != expected {}",
+            snap.lid,
+            snap.past_k.len(),
+            NUM_HEADS * past_seq * QK_HEAD_DIM
+        )));
+    }
+    if snap.past_v.len() != NUM_HEADS * past_seq * V_HEAD_DIM {
+        return Err(RunnerError::Internal(format!(
+            "unpack: L{} past_v len {} != expected {}",
+            snap.lid,
+            snap.past_v.len(),
+            NUM_HEADS * past_seq * V_HEAD_DIM
+        )));
+    }
+    debug_assert_eq!(past_k.len(), NUM_HEADS * capacity * QK_HEAD_DIM);
+    debug_assert_eq!(past_v.len(), NUM_HEADS * capacity * V_HEAD_DIM);
+    for h in 0..NUM_HEADS {
+        let k_src_base = h * past_seq * QK_HEAD_DIM;
+        let k_dst_base = h * capacity * QK_HEAD_DIM;
+        past_k[k_dst_base..k_dst_base + past_seq * QK_HEAD_DIM]
+            .copy_from_slice(&snap.past_k[k_src_base..k_src_base + past_seq * QK_HEAD_DIM]);
+        let v_src_base = h * past_seq * V_HEAD_DIM;
+        let v_dst_base = h * capacity * V_HEAD_DIM;
+        past_v[v_dst_base..v_dst_base + past_seq * V_HEAD_DIM]
+            .copy_from_slice(&snap.past_v[v_src_base..v_src_base + past_seq * V_HEAD_DIM]);
+    }
+    Ok(())
+}
+
 /// Write the new step's per-head K (or V) row at slot `past_seq`
 /// inside a `[NUM_HEADS, capacity, HEAD_DIM]` bf16-as-u16 buffer.
 /// `present` is still f32 (we are the conversion site). No allocation,
@@ -1995,5 +2347,116 @@ mod tests {
         // Wait — INFINITY.is_finite() is false. So all should skip and
         // best stays 0.
         assert_eq!(argmax_i64(&xs), 0);
+    }
+
+    /// Stamp a capacity buffer with a unique per-(head, slot, dim)
+    /// signature, pack it into a `LayerKvSlice`, then unpack into a
+    /// fresh capacity buffer and verify the populated prefix matches
+    /// bit-for-bit. This is the byte-identity guarantee the task
+    /// brief calls out as load-bearing: "Cache must be byte-identical
+    /// to live prefill (KV bits must match)".
+    #[test]
+    fn pack_unpack_roundtrip_is_bit_identical() {
+        let cap = 8;
+        let past = 5;
+        let mut k = vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut v = vec![0u16; NUM_HEADS * cap * V_HEAD_DIM];
+        // Unique signature per cell so any mis-indexing surfaces.
+        let stamp = |h: usize, s: usize, d: usize| -> u16 {
+            ((h * 100_000 + s * 1_000 + d) & 0xFFFF) as u16
+        };
+        for h in 0..NUM_HEADS {
+            for s in 0..past {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    k[off] = stamp(h, s, d);
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    v[off] = stamp(h, s, d).wrapping_add(0x8000);
+                }
+            }
+        }
+        let slice = pack_layer_slice(7, &k, &v, past, cap);
+        assert_eq!(slice.lid, 7);
+        assert_eq!(slice.past_k.len(), NUM_HEADS * past * QK_HEAD_DIM);
+        assert_eq!(slice.past_v.len(), NUM_HEADS * past * V_HEAD_DIM);
+        // Unpack into a fresh capacity-buffer (sentinel pattern in untouched slots).
+        const SENTINEL: u16 = 0xBEEF;
+        let mut k2 = vec![SENTINEL; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut v2 = vec![SENTINEL; NUM_HEADS * cap * V_HEAD_DIM];
+        unpack_layer_slice(&mut k2, &mut v2, &slice, past, cap).expect("unpack");
+        // Populated prefix must be bit-identical.
+        for h in 0..NUM_HEADS {
+            for s in 0..past {
+                for d in 0..QK_HEAD_DIM {
+                    let off = h * cap * QK_HEAD_DIM + s * QK_HEAD_DIM + d;
+                    assert_eq!(k2[off], k[off], "k[h={h}, s={s}, d={d}] mismatch");
+                }
+                for d in 0..V_HEAD_DIM {
+                    let off = h * cap * V_HEAD_DIM + s * V_HEAD_DIM + d;
+                    assert_eq!(v2[off], v[off], "v[h={h}, s={s}, d={d}] mismatch");
+                }
+            }
+        }
+    }
+
+    /// Unpack from a `past=5` snapshot into a fresh `cap=16` buffer
+    /// (twice the original). Per-head bases shift; the populated
+    /// prefix should still land at the right offsets, and slots
+    /// `past..cap` should be left at their pre-fill value (NaN here)
+    /// so any accidental read past `past_seq_len` surfaces as a test
+    /// failure rather than silently reading stale zeros.
+    #[test]
+    fn unpack_into_larger_capacity_preserves_layout() {
+        let src_cap = 8;
+        let past = 5;
+        let mut k = vec![0u16; NUM_HEADS * src_cap * QK_HEAD_DIM];
+        let mut v = vec![0u16; NUM_HEADS * src_cap * V_HEAD_DIM];
+        let stamp_k = |h: usize, s: usize| -> u16 { ((h * 100 + s) & 0xFFFF) as u16 };
+        let stamp_v = |h: usize, s: usize| -> u16 { stamp_k(h, s).wrapping_add(0x8000) };
+        for h in 0..NUM_HEADS {
+            for s in 0..past {
+                k[h * src_cap * QK_HEAD_DIM + s * QK_HEAD_DIM] = stamp_k(h, s);
+                v[h * src_cap * V_HEAD_DIM + s * V_HEAD_DIM] = stamp_v(h, s);
+            }
+        }
+        let slice = pack_layer_slice(3, &k, &v, past, src_cap);
+        let dst_cap = 16;
+        const SENTINEL: u16 = 0xBEEF;
+        let mut k2 = vec![SENTINEL; NUM_HEADS * dst_cap * QK_HEAD_DIM];
+        let mut v2 = vec![SENTINEL; NUM_HEADS * dst_cap * V_HEAD_DIM];
+        unpack_layer_slice(&mut k2, &mut v2, &slice, past, dst_cap).expect("unpack");
+        for h in 0..NUM_HEADS {
+            for s in 0..past {
+                let k_off = h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                let v_off = h * dst_cap * V_HEAD_DIM + s * V_HEAD_DIM;
+                assert_eq!(k2[k_off], stamp_k(h, s));
+                assert_eq!(v2[v_off], stamp_v(h, s));
+            }
+            // Slots past..dst_cap should still be SENTINEL — never read.
+            for s in past..dst_cap {
+                let k_off = h * dst_cap * QK_HEAD_DIM + s * QK_HEAD_DIM;
+                assert_eq!(k2[k_off], SENTINEL, "unpack wrote into reserved slot");
+            }
+        }
+    }
+
+    #[test]
+    fn unpack_rejects_wrong_length_slice() {
+        let cap = 4;
+        let past = 2;
+        let mut k = vec![0u16; NUM_HEADS * cap * QK_HEAD_DIM];
+        let mut v = vec![0u16; NUM_HEADS * cap * V_HEAD_DIM];
+        // Snapshot claims past=2 but past_k length only matches past=1.
+        let bad = LayerKvSlice {
+            lid: 0,
+            past_k: vec![0u16; NUM_HEADS * QK_HEAD_DIM], // claims past=1 (deliberately wrong)
+            past_v: vec![0u16; NUM_HEADS * past * V_HEAD_DIM],
+        };
+        let err = unpack_layer_slice(&mut k, &mut v, &bad, past, cap)
+            .expect_err("expected length-check error");
+        let msg = format!("{err}");
+        assert!(msg.contains("past_k"), "error should mention past_k: {msg}");
     }
 }

@@ -31,6 +31,7 @@ use crate::dist::{
     send_forward_batch, send_reset, send_token_batch_upstream, send_token_upstream, FrameKind,
     StageTransport,
 };
+use crate::kv_prefix_cache::KvPrefixCache;
 use crate::runner::{LayerRange, Runner, RunnerError};
 
 #[derive(Default, Debug, Clone)]
@@ -64,6 +65,16 @@ pub struct SparseMoEBuilderConfig {
     ///   transparently service ForwardBatch alongside the per-token
     ///   path — no per-rank flag needed.
     pub spec_decode_k: Option<u32>,
+    /// Max entries in the static-prompt KV-prefix cache. `0` disables
+    /// the cache (default). Each entry holds the populated K/V buffers
+    /// for the cached prompt prefix — at K2.6 dimensions a 512-token
+    /// snapshot is ~150 MiB, so practical caps for a chat workload
+    /// are 1..8. See [`crate::kv_prefix_cache`] for the full design.
+    ///
+    /// Single-stage only on this PR — wiring the cache across pipeline
+    /// stages requires a new transport frame for snapshot exchange,
+    /// deferred to a follow-up. With `total > 1` this field is a no-op.
+    pub kv_prefix_cache_size: u32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -78,6 +89,7 @@ impl SparseMoEBuilderConfig {
             top_k_override: None,
             routing_threshold: None,
             spec_decode_k: None,
+            kv_prefix_cache_size: 0,
         }
     }
 
@@ -91,6 +103,13 @@ impl SparseMoEBuilderConfig {
     /// only; ignored on multi-stage configs.
     pub fn with_spec_decode_k(mut self, k: u32) -> Self {
         self.spec_decode_k = if k == 0 { None } else { Some(k) };
+        self
+    }
+
+    /// Set the KV-prefix cache capacity (number of entries). `0`
+    /// disables the cache.
+    pub fn with_kv_prefix_cache_size(mut self, n: u32) -> Self {
+        self.kv_prefix_cache_size = n;
         self
     }
 }
@@ -303,6 +322,64 @@ impl Builder for SparseMoEBuilder {
         // ForwardBatch frames. Worker ranks transparently service either
         // path — they handle ForwardBatch frames as they arrive.
         let spec_decode_k = self.config.spec_decode_k;
+        // KV-prefix cache is single-stage only on this PR. Warn (don't
+        // error) on multi-stage configs so the same CLI flag works in
+        // both topologies — the multi-stage path silently ignores it.
+        let kv_cache_size = if total > 1 {
+            if self.config.kv_prefix_cache_size > 0 {
+                warn!(
+                    requested = self.config.kv_prefix_cache_size,
+                    total,
+                    "kv-prefix-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
+                );
+            }
+            0
+        } else {
+            self.config.kv_prefix_cache_size
+        };
+        let kv_prefix_cache = KvPrefixCache::new(kv_cache_size as usize);
+        if kv_prefix_cache.enabled() {
+            // Estimate footprint from the loaded runner's per-rank
+            // KV layer count + manifest head dims. Assume a 512-token
+            // representative prompt; the actual cost scales linearly.
+            // At K2.6 single-stage (61 KV layers, 64 heads, 320 dim,
+            // bf16) one 512-token snapshot is ~1.25 GiB, so even a
+            // cap of 4 puts ~5 GiB on the resident set. Print a hard
+            // warning above 16 entries; INFO otherwise.
+            const REPRESENTATIVE_PROMPT_TOKENS: usize = 512;
+            const HEAVY_ENTRY_THRESHOLD: usize = 16;
+            let bytes_per_token = runner.estimated_snapshot_bytes_per_token();
+            let est_per_snapshot = bytes_per_token * REPRESENTATIVE_PROMPT_TOKENS;
+            let est_total = est_per_snapshot.saturating_mul(kv_prefix_cache.capacity());
+            info!(
+                capacity = kv_prefix_cache.capacity(),
+                est_bytes_per_snapshot_512tok = est_per_snapshot,
+                est_total_bytes_512tok = est_total,
+                "kv-prefix-cache enabled (single-stage)"
+            );
+            if kv_prefix_cache.capacity() > HEAVY_ENTRY_THRESHOLD {
+                warn!(
+                    capacity = kv_prefix_cache.capacity(),
+                    est_total_gib_512tok = est_total as f64 / (1024.0 * 1024.0 * 1024.0),
+                    "kv-prefix-cache size is large; at K2.6 single-stage dims one snapshot is ~{:.0} MiB so resident-set growth is unbounded by capacity * snapshot bytes. Consider a smaller cap.",
+                    est_per_snapshot as f64 / (1024.0 * 1024.0),
+                );
+            }
+            // Spec-decode and the cache are orthogonal optimisations
+            // today: the spec-decode generate path doesn't consult or
+            // populate the cache (see `step_single_stage`). For greedy
+            // requests with spec-decode on, the cache is silently
+            // bypassed; for temp > 0 requests spec-decode falls back to
+            // plain generate which does use the cache. Surface the
+            // partial-coverage caveat at startup so the user isn't
+            // surprised by missing hits in greedy mode.
+            if let Some(k) = spec_decode_k {
+                warn!(
+                    spec_decode_k = k,
+                    "kv-prefix-cache is bypassed on the spec-decode (greedy) generate path; only temperature>0 requests will populate / hit the cache while --spec-decode-k is active"
+                );
+            }
+        }
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -316,6 +393,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
             spec_decode_k,
+            kv_prefix_cache,
         }))
     }
 }
@@ -408,6 +486,13 @@ pub struct SparseMoEEngine {
     /// decode with draft K. Only honored when `total == 1` — checked at
     /// engine construction. None = plain greedy / sampled generate.
     spec_decode_k: Option<u32>,
+    /// Single-stage static-prompt KV-prefix cache. Empty + capacity=0
+    /// when the user didn't pass `--kv-prefix-cache-size` (default).
+    /// Holds at most `capacity` packed snapshots; on lookup we restore
+    /// the longest matching prefix's snapshot into the runner so the
+    /// generate path skips that portion of prefill. See
+    /// [`crate::kv_prefix_cache`] for the cache semantics.
+    kv_prefix_cache: KvPrefixCache,
 }
 
 impl SparseMoEEngine {
@@ -556,7 +641,10 @@ impl SparseMoEEngine {
         // Choose generate path: spec-decode if configured (and the
         // sampling config is greedy — the spec-decode helper falls
         // back to plain generate on temp>0 anyway, but this keeps the
-        // log message accurate).
+        // log message accurate). KV-prefix cache is only consulted on
+        // the plain generate path: the spec-decode helper consumes
+        // KV-cache state internally, so wiring prefix-cache replay into
+        // it would need extra plumbing — deferred.
         let use_spec = self.spec_decode_k.is_some() && sampling_cfg.temperature <= 0.0;
         let generated = if use_spec {
             let k = self.spec_decode_k.unwrap();
@@ -578,7 +666,15 @@ impl SparseMoEEngine {
                 }
             }
         } else {
-            match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
+            let cache_opt: Option<&mut KvPrefixCache> = if self.kv_prefix_cache.enabled() {
+                Some(&mut self.kv_prefix_cache)
+            } else {
+                None
+            };
+            match self
+                .runner
+                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
+            {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "runner failed: {e}");
