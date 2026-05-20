@@ -31,8 +31,8 @@ use cascadia_int4_gemm::shell_int4::{
     Int4Shell,
 };
 use cascadia_int4_gemm::{
-    expert_forward as int4_expert_forward, f32_to_bf16_bits, ExpertWeights, SafetensorsExpert,
-    SafetensorsExpertSource,
+    expert_forward as int4_expert_forward, expert_forward_sparse as int4_expert_forward_sparse,
+    f32_to_bf16_bits, ExpertWeights, SafetensorsExpert, SafetensorsExpertSource,
 };
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use half::bf16;
@@ -368,6 +368,11 @@ pub struct RunnerOptions {
     /// behaviour). `Some(n)` evicts the least-recently-used expert when
     /// the cache holds `n` entries.
     pub max_cached_experts: Option<NonZeroUsize>,
+    /// Magnitude threshold for the two-phase Gate-first FFN sparsity
+    /// skip — see [`cascadia_int4_gemm::expert_forward_sparse`]. `0.0`
+    /// (default) keeps the dense path. Useful range for SwiGLU is
+    /// 0.05–0.15.
+    pub ffn_sparsity_threshold: f32,
 }
 
 /// Per-rank slice of the model the Runner should hold.
@@ -432,6 +437,17 @@ pub struct Runner {
     /// when prefetching is disabled (env var `CASCADIA_EXPERT_PREFETCH=0`
     /// or experts_format != safetensors_bin).
     prefetcher: Option<Prefetcher>,
+    /// PowerInfer port: relative magnitude threshold for the two-phase
+    /// Gate-first FFN sparsity skip. `0.0` disables the skip
+    /// (output bit-identical to dense). `0.05`–`0.15` is the typical
+    /// useful range for SwiGLU (CATS / CHESS).
+    ffn_sparsity_threshold: f32,
+    /// Running sum of `active_frac` returned by
+    /// [`cascadia_int4_gemm::expert_forward_sparse`] across this
+    /// Runner's lifetime, plus a counter — used to log the average
+    /// active-lane fraction without polluting hot-path logging.
+    ffn_active_sum: f64,
+    ffn_active_count: u64,
 }
 
 impl Runner {
@@ -667,6 +683,9 @@ impl Runner {
             routing_threshold: None,
             last_routing_ids,
             prefetcher,
+            ffn_sparsity_threshold: opts.ffn_sparsity_threshold,
+            ffn_active_sum: 0.0,
+            ffn_active_count: 0,
         })
     }
 
@@ -686,6 +705,44 @@ impl Runner {
     pub fn set_routing_threshold(&mut self, v: Option<f32>) {
         self.routing_threshold = v.filter(|t| *t > 0.0);
         info!(routing_threshold = ?self.routing_threshold, "set_routing_threshold");
+    }
+
+    /// Set the per-token FFN magnitude-sparsity threshold. `0.0`
+    /// disables the two-phase Gate-first skip (output bit-identical to
+    /// dense `expert_forward`). Positive values prune lanes whose
+    /// `|silu(gate)|` falls below `threshold · max_i |silu(gate_i)|`
+    /// before the up / down phases. See
+    /// [`cascadia_int4_gemm::expert_forward_sparse`] for the algorithm
+    /// and `docs/perf/POWERINFER_PORT.md` for the PowerInfer-2 §4.4
+    /// attribution.
+    pub fn set_ffn_sparsity_threshold(&mut self, v: f32) {
+        self.ffn_sparsity_threshold = if v > 0.0 { v } else { 0.0 };
+        // Reset running stats so the next reading reflects the new
+        // threshold.
+        self.ffn_active_sum = 0.0;
+        self.ffn_active_count = 0;
+        info!(
+            ffn_sparsity_threshold = self.ffn_sparsity_threshold,
+            "set_ffn_sparsity_threshold (0 = dense fallback)"
+        );
+    }
+
+    /// Snapshot the average active-lane fraction observed since the
+    /// last `set_ffn_sparsity_threshold` call. Returns `None` if no
+    /// expert calls have run since the reset (no data).
+    pub fn ffn_active_fraction(&self) -> Option<f32> {
+        if self.ffn_active_count == 0 {
+            None
+        } else {
+            Some((self.ffn_active_sum / self.ffn_active_count as f64) as f32)
+        }
+    }
+
+    /// Internal: bump the running average of active-lane fraction.
+    /// Cheap (two ops); doesn't allocate or log.
+    fn accumulate_ffn_sparsity_stat(&mut self, active_frac: f32) {
+        self.ffn_active_sum += active_frac as f64;
+        self.ffn_active_count += 1;
     }
 
     /// Run one expert. Returns the f32 output vector (length = hidden_size).
@@ -721,7 +778,8 @@ impl Runner {
                 let w = c.get(lid, eid)?;
                 let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
                 let mut out_bf16 = vec![bf16::ZERO; hidden];
-                int4_expert_forward(
+                let threshold = self.ffn_sparsity_threshold;
+                let active_frac = int4_expert_forward_sparse(
                     &x_bf16,
                     w.gate_packed_bytes(),
                     w.gate_scale_bits(),
@@ -730,14 +788,17 @@ impl Runner {
                     w.down_packed_bytes(),
                     w.down_scale_bits(),
                     &mut out_bf16,
+                    threshold,
                 );
+                self.accumulate_ffn_sparsity_stat(active_frac);
                 Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
             }
             ExpertCache::SafetensorsBin(c) => {
                 let w = c.get(lid, eid)?;
                 let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
                 let mut out_bf16 = vec![bf16::ZERO; hidden];
-                int4_expert_forward(
+                let threshold = self.ffn_sparsity_threshold;
+                let active_frac = int4_expert_forward_sparse(
                     &x_bf16,
                     w.gate_packed,
                     w.gate_scale,
@@ -746,7 +807,9 @@ impl Runner {
                     w.down_packed,
                     w.down_scale,
                     &mut out_bf16,
+                    threshold,
                 );
+                self.accumulate_ffn_sparsity_stat(active_frac);
                 Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
             }
         }

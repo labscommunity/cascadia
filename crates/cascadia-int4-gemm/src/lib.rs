@@ -27,6 +27,7 @@
 //! pipeline.
 
 pub mod c_ffi;
+pub mod ffn_sparsity;
 pub mod format;
 pub mod kernel;
 pub mod kernel_avx512;
@@ -38,6 +39,10 @@ pub mod safetensors_source;
 pub mod shell;
 pub mod shell_int4;
 
+pub use ffn_sparsity::{
+    build_active_mask, dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto,
+    expert_forward_sparse,
+};
 pub use format::{bf16_bits_to_f32, f32_to_bf16_bits, ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};
 pub use kernel_avx512::dequant_gemv_int4_auto;

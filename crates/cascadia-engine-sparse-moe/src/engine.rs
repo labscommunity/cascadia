@@ -77,6 +77,12 @@ pub struct SparseMoEBuilderConfig {
     /// stages requires a new transport frame for snapshot exchange,
     /// deferred to a follow-up. With `total > 1` this field is a no-op.
     pub kv_prefix_cache_size: u32,
+    /// Magnitude threshold for the two-phase Gate-first FFN sparsity
+    /// skip — see [`crate::runner::Runner::set_ffn_sparsity_threshold`].
+    /// `0.0` = disabled (dense fallback; output bit-identical).
+    /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
+    /// quality. See `docs/perf/POWERINFER_PORT.md`.
+    pub ffn_sparsity_threshold: f32,
 }
 
 impl SparseMoEBuilderConfig {
@@ -96,6 +102,7 @@ impl SparseMoEBuilderConfig {
             routing_threshold: None,
             spec_decode_k: None,
             kv_prefix_cache_size: 0,
+            ffn_sparsity_threshold: 0.0,
         }
     }
 
@@ -129,6 +136,16 @@ impl SparseMoEBuilderConfig {
     /// `docs/perf/POWERINFER_PORT.md` for guidance.
     pub fn with_max_cached_experts(mut self, n: u32) -> Self {
         self.max_cached_experts = n;
+        self
+    }
+
+    /// Set the magnitude threshold for two-phase Gate-first FFN
+    /// sparsity. `0.0` = dense (default; output bit-identical to the
+    /// pre-port path). `0.05`–`0.15` is the useful range for SwiGLU.
+    /// See [`crate::runner::Runner::set_ffn_sparsity_threshold`] and
+    /// `docs/perf/POWERINFER_PORT.md`.
+    pub fn with_ffn_sparsity_threshold(mut self, t: f32) -> Self {
+        self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
         self
     }
 }
@@ -167,6 +184,7 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
     );
     RunnerOptions {
         max_cached_experts,
+        ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
     }
 }
 
@@ -340,6 +358,7 @@ impl Builder for SparseMoEBuilder {
         // Plumb per-token expert-dispatch overrides into the runner.
         runner.set_top_k_override(self.config.top_k_override);
         runner.set_routing_threshold(self.config.routing_threshold);
+        runner.set_ffn_sparsity_threshold(self.config.ffn_sparsity_threshold);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

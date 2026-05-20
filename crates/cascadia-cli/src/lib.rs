@@ -172,6 +172,22 @@ pub struct WorkerArgs {
     /// `CASCADIA_MAX_EXPERTS_CACHED` overrides this flag at runtime.
     #[arg(long, default_value_t = 0, env = "CASCADIA_MAX_EXPERTS_CACHED")]
     pub max_cached_experts: u32,
+
+    /// Two-phase Gate-first FFN sparsity threshold (sparse-moe engine
+    /// only). `0.0` = dense fallback (default; output bit-identical to
+    /// pre-port path). Positive = skip up/down lanes where
+    /// `|silu(gate)|` falls below `threshold · max_i|silu(gate_i)|`
+    /// per token.
+    ///
+    /// Useful range for SwiGLU (K2.6): `0.05`–`0.15`. Higher = more
+    /// skip + lower quality. Validate quality regressions against
+    /// dense before deploying.
+    ///
+    /// Inspired by PowerInfer-2 §4.4 (skip Up/Down when Gate=0; ReLU)
+    /// adapted to SwiGLU via the CATS / CHESS magnitude-threshold
+    /// approach. See `docs/perf/POWERINFER_PORT.md`.
+    #[arg(long, default_value_t = 0.0, env = "CASCADIA_FFN_SPARSITY_THRESHOLD")]
+    pub ffn_sparsity_threshold: f32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -366,6 +382,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
             cfg.max_cached_experts = args.max_cached_experts;
+            cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
             // N-gram speculative decode (sparse-moe single-stage).
             // The `--prompt-lookup` flag is the canonical opt-in (it
             // already drives the ov-genai prompt-lookup path); when
