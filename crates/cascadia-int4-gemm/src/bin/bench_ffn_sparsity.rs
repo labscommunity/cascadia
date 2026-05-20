@@ -44,10 +44,7 @@ fn parse_args() -> (usize, Vec<f32>) {
             }
             "--thresholds" => {
                 if let Some(s) = args.next() {
-                    thresholds = s
-                        .split(',')
-                        .filter_map(|x| x.trim().parse().ok())
-                        .collect();
+                    thresholds = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                 }
             }
             other => panic!("unknown arg: {other}"),
@@ -196,7 +193,10 @@ fn main() {
     println!();
     println!("# Direct kernel bench: dense GEMV vs sparse-rows GEMV");
     println!();
-    println!("Up matmul shape: rows=INTERMEDIATE={}, cols=HIDDEN={}.", INTERMEDIATE, HIDDEN);
+    println!(
+        "Up matmul shape: rows=INTERMEDIATE={}, cols=HIDDEN={}.",
+        INTERMEDIATE, HIDDEN
+    );
     println!("Active fractions emulate the sparsity that real models exhibit.");
     println!();
 

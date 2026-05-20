@@ -199,12 +199,10 @@ mod avx512 {
             // unique row offset.
             unsafe {
                 let row_packed = &packed[r * row_stride_packed..(r + 1) * row_stride_packed];
-                let row_scales =
-                    &scale_bits[r * row_stride_scale..(r + 1) * row_stride_scale];
+                let row_scales = &scale_bits[r * row_stride_scale..(r + 1) * row_stride_scale];
                 let mut acc = _mm512_setzero_ps();
                 for g in 0..n_groups {
-                    let scale_u16 =
-                        u16::from_le_bytes([row_scales[g * 2], row_scales[g * 2 + 1]]);
+                    let scale_u16 = u16::from_le_bytes([row_scales[g * 2], row_scales[g * 2 + 1]]);
                     let scale = bf16_bits_to_f32(scale_u16);
                     let scale_v = _mm512_set1_ps(scale);
                     let p_ptr = row_packed.as_ptr().add(g * (GROUP_SIZE / 2)) as *const __m128i;
@@ -407,7 +405,10 @@ mod tests {
         assert!(silu[0].abs() > 5.0);
         assert!(active.contains(&0), "lane 0 (|silu|≈10) is the max");
         assert!(!active.contains(&1), "lane 1 (|silu|≈0.0005) below cutoff");
-        assert!(!active.contains(&2), "lane 2 (|silu|≈4.97) below 5.0 cutoff");
+        assert!(
+            !active.contains(&2),
+            "lane 2 (|silu|≈4.97) below 5.0 cutoff"
+        );
         assert!(!active.contains(&3), "lane 3 (|silu|≈0.0005) below cutoff");
 
         // With a relaxed threshold (0.1, cutoff = 1.0), lane 2 survives.
@@ -474,22 +475,17 @@ mod tests {
         let mut y = vec![123.0f32; n_rows]; // sentinel.
 
         // Process only row 1.
-        dequant_gemv_int4_rows_subset(
-            &packed,
-            &scale_bits,
-            &x,
-            n_rows,
-            k_cols,
-            &mut y,
-            &[1],
-        );
+        dequant_gemv_int4_rows_subset(&packed, &scale_bits, &x, n_rows, k_cols, &mut y, &[1]);
 
         // Rows 0, 2, 3 untouched (still the sentinel).
         assert_eq!(y[0], 123.0);
         assert_eq!(y[2], 123.0);
         assert_eq!(y[3], 123.0);
         // Row 1 written.
-        assert!((y[1] - 123.0).abs() > 1e-3, "row 1 should have been written");
+        assert!(
+            (y[1] - 123.0).abs() > 1e-3,
+            "row 1 should have been written"
+        );
     }
 
     /// `expert_forward_sparse` with threshold = 0 is byte-identical to

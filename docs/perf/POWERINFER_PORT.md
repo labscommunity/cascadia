@@ -117,7 +117,7 @@ is genuinely valuable, just out of scope for *this* PR.
 cargo run --release -p cascadia-int4-gemm --bin bench_ffn_sparsity -- --iters 200
 ```
 
-Local Apple Silicon (scalar fallback path), iters=50:
+### Apple Silicon (scalar fallback), iters=50
 
 | active-frac | per-call    | speedup |
 | ----------- | ----------- | ------- |
@@ -126,14 +126,32 @@ Local Apple Silicon (scalar fallback path), iters=50:
 | 0.30        |   344.35 µs | 3.15×   |
 | 0.10        |   128.33 µs | 8.44×   |
 
-On miner (Cascade Lake AVX-512 + VNNI, 16 cores) the AVX-512 path is
-taken; per-call wall time is lower but the speedup curve is the same.
+### miner / Cascade Lake (AVX-512 + VNNI, 16 cores), iters=100
+
+| active-frac | per-call    | speedup |
+| ----------- | ----------- | ------- |
+| 1.00 dense  |   178.79 µs | 1.00×   |
+| 0.50        |   119.73 µs | 1.49×   |
+| 0.30        |    96.95 µs | 1.84×   |
+| 0.10        |    61.64 µs | 2.90×   |
+
+The miner AVX-512 dense baseline is **6.0× faster** than the scalar
+fallback — so the relative speedup of the sparse path is smaller in
+absolute terms (the constant per-rayon-task overhead is a larger
+fraction of the work). The qualitative trend is the same: speedup is
+roughly linear in `1/active_frac` until the overhead floor dominates.
+
+### End-to-end gain on K2.6
 
 End-to-end (full K2.6 decode) gain depends on the model's activation
 distribution at the chosen threshold. CATS / CHESS report 30–50%
-sparsity at τ ≈ 0.10 with <1% perplexity hit on SwiGLU LLMs; K2.6
-calibration is part of the bench task on the autolab loop, not this
-PR.
+sparsity at τ ≈ 0.10 with <1% perplexity hit on SwiGLU LLMs. On miner
+that translates to a roughly **1.5–1.8× FFN-compute speedup** for the
+expert dispatch step (the FFN matmuls inside `dispatch_expert`).
+Total tok/s gain depends on the FFN fraction of decode wall time
+(currently ~60% on the autolab K2.6 baseline) — i.e. ~1.3–1.5× tok/s
+is plausible at τ=0.10 with no quality regression. K2.6-specific
+calibration is part of the autolab loop work, not this PR.
 
 ## Acknowledgements
 

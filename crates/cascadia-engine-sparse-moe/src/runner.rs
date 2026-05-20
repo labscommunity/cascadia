@@ -31,8 +31,8 @@ use cascadia_int4_gemm::shell_int4::{
     Int4Shell,
 };
 use cascadia_int4_gemm::{
-    expert_forward as int4_expert_forward, expert_forward_sparse as int4_expert_forward_sparse,
-    f32_to_bf16_bits, ExpertWeights, SafetensorsExpert, SafetensorsExpertSource,
+    expert_forward_sparse as int4_expert_forward_sparse, f32_to_bf16_bits, ExpertWeights,
+    SafetensorsExpert, SafetensorsExpertSource,
 };
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 use half::bf16;
