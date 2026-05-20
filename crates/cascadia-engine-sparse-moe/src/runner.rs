@@ -1884,6 +1884,22 @@ impl Runner {
                 "decode step"
             );
         }
+        // PowerInfer port: surface the running FFN sparsity stats at end
+        // of generation so the operator can see what fraction of FFN
+        // lanes were actually active under the chosen threshold. Logged
+        // at info level so it shows up without RUST_LOG tuning, but
+        // skipped silently when the threshold is 0.0 (no sparsity).
+        if self.ffn_sparsity_threshold > 0.0 {
+            let (cached_experts, expert_evictions) = self.experts.lru_stats();
+            info!(
+                ffn_sparsity_threshold = self.ffn_sparsity_threshold,
+                ffn_active_fraction = self.ffn_active_fraction(),
+                routed_expert_calls = self.ffn_active_count,
+                cached_experts,
+                expert_evictions,
+                "FFN sparsity end-of-generation summary (routed experts only)"
+            );
+        }
         Ok(generated)
     }
 
