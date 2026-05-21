@@ -83,6 +83,12 @@ pub struct SparseMoEBuilderConfig {
     /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
     /// quality. See rainier `docs/POWERINFER_PORT.md`.
     pub ffn_sparsity_threshold: f32,
+    /// Issue #35 — use the AXPY-form down kernel from
+    /// [`cascadia_int4_gemm::ffn_axpy`] in the sparse FFN path. Only
+    /// active when [`Self::ffn_sparsity_threshold`] > 0. Each cached
+    /// expert builds + holds a transposed-and-requantized down
+    /// weight (one-time ~5 ms CPU per expert; ~8.26 MiB extra heap).
+    pub ffn_axpy_down: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -103,6 +109,7 @@ impl SparseMoEBuilderConfig {
             spec_decode_k: None,
             kv_prefix_cache_size: 0,
             ffn_sparsity_threshold: 0.0,
+            ffn_axpy_down: false,
         }
     }
 
@@ -148,6 +155,15 @@ impl SparseMoEBuilderConfig {
         self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
         self
     }
+
+    /// Issue #35 — enable the AXPY-form down kernel. Only has an
+    /// effect when `ffn_sparsity_threshold > 0`. Lazily builds + caches
+    /// transposed-and-requantized down weights per expert (~8.26 MiB
+    /// extra heap per cached expert at K2.6 dimensions).
+    pub fn with_ffn_axpy_down(mut self, on: bool) -> Self {
+        self.ffn_axpy_down = on;
+        self
+    }
 }
 
 /// Build the [`RunnerOptions`] from the engine config + environment.
@@ -185,6 +201,7 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
     RunnerOptions {
         max_cached_experts,
         ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
+        ffn_axpy_down: cfg.ffn_axpy_down,
     }
 }
 
@@ -359,6 +376,7 @@ impl Builder for SparseMoEBuilder {
         runner.set_top_k_override(self.config.top_k_override);
         runner.set_routing_threshold(self.config.routing_threshold);
         runner.set_ffn_sparsity_threshold(self.config.ffn_sparsity_threshold);
+        runner.set_ffn_axpy_down(self.config.ffn_axpy_down);
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

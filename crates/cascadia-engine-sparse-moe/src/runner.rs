@@ -18,6 +18,8 @@ use std::time::Instant;
 
 use lru::LruCache;
 
+use cascadia_int4_gemm::ffn_axpy::{transpose_requantize_down, FfnScratch as IntFfnScratch};
+use cascadia_int4_gemm::ffn_sparsity::ffn_forward_sparse_axpy_f32;
 use cascadia_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
     layer0_forward_decode_int4_with_capacity_sparse, Int4Layer0,
@@ -256,6 +258,34 @@ impl SafetensorsExpertCache {
     }
 }
 
+/// AXPY-form down weight: the original `[hidden, intermediate]` down
+/// matrix transposed and re-quantized into `[intermediate, hidden]`
+/// int4 layout for [`ffn_forward_sparse_axpy_f32`]. Built lazily on
+/// first sparse-AXPY dispatch per expert and held in
+/// `Runner::transposed_down_cache`. Memory cost: ~8.26 MiB per cached
+/// expert at K2.6 dimensions (same as the original down — the
+/// transpose is in-place size-wise).
+struct TransposedDown {
+    packed_t: Vec<u8>,
+    scale_t_bits: Vec<u8>,
+}
+
+impl TransposedDown {
+    fn build(
+        down_packed: &[u8],
+        down_scale_bits: &[u8],
+        n_hidden: usize,
+        n_intermediate: usize,
+    ) -> Self {
+        let (packed_t, scale_t_bits) =
+            transpose_requantize_down(down_packed, down_scale_bits, n_hidden, n_intermediate);
+        Self {
+            packed_t,
+            scale_t_bits,
+        }
+    }
+}
+
 /// autolab iter 029 (C1): one prefetch request — kindly hint the kernel
 /// to start reading the weights for expert `eid` on layer `lid`. The
 /// prefetcher thread translates this into `madvise(MADV_WILLNEED)` calls
@@ -373,6 +403,15 @@ pub struct RunnerOptions {
     /// (default) keeps the dense path. Useful range for SwiGLU is
     /// 0.05–0.15.
     pub ffn_sparsity_threshold: f32,
+    /// When `true` (and `ffn_sparsity_threshold > 0`), use the AXPY-
+    /// form down kernel from [`cascadia_int4_gemm::ffn_axpy`]: each
+    /// expert's down weight is transposed and re-quantized at first
+    /// use; the down projection becomes an AXPY over only the active
+    /// intermediate lanes (kernel speedup ceiling 1/active_frac vs
+    /// dense). Memory cost: one extra down-sized buffer per cached
+    /// expert (~8.26 MiB on K2.6); the transposed cache shares
+    /// [`Self::max_cached_experts`] as its capacity.
+    pub ffn_axpy_down: bool,
 }
 
 /// Per-rank slice of the model the Runner should hold.
@@ -442,6 +481,21 @@ pub struct Runner {
     /// (output bit-identical to dense). `0.05`–`0.15` is the typical
     /// useful range for SwiGLU (CATS / CHESS).
     ffn_sparsity_threshold: f32,
+    /// PowerInfer port (issue #35): when true, use the AXPY-form down
+    /// kernel from [`cascadia_int4_gemm::ffn_axpy`]. Requires per-
+    /// expert transposed-and-requantized down weights, built lazily
+    /// into `transposed_down_cache` on first use.
+    ffn_axpy_down: bool,
+    /// LRU of per-expert transposed-and-requantized down weights
+    /// (one [`TransposedDown`] per `(layer, expert)`). Populated only
+    /// when `ffn_axpy_down` is true. Shares
+    /// [`RunnerOptions::max_cached_experts`] as the LRU bound.
+    transposed_down_cache: LruCache<(u32, u32), TransposedDown>,
+    /// One-per-runner reusable FFN scratch buffers used by the AXPY-
+    /// form path so we don't `Vec::new()` on every routed-expert
+    /// call. Built once at first AXPY dispatch with the manifest's
+    /// hidden + intermediate dims and re-used until reset.
+    ffn_scratch: Option<IntFfnScratch>,
     /// Running sum of `active_frac` returned by
     /// [`cascadia_int4_gemm::expert_forward_sparse`] across this
     /// Runner's lifetime, plus a counter — used to log the average
@@ -706,6 +760,9 @@ impl Runner {
             last_routing_ids,
             prefetcher,
             ffn_sparsity_threshold: opts.ffn_sparsity_threshold,
+            ffn_axpy_down: opts.ffn_axpy_down,
+            transposed_down_cache: new_expert_lru(cap),
+            ffn_scratch: None,
             ffn_active_sum: 0.0,
             ffn_active_count: 0,
         })
@@ -798,43 +855,190 @@ impl Runner {
             }
             ExpertCache::Int4Bin(c) => {
                 let w = c.get(lid, eid)?;
-                let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
-                let mut out_bf16 = vec![bf16::ZERO; hidden];
                 let threshold = self.ffn_sparsity_threshold;
-                let active_frac = int4_expert_forward_sparse(
-                    &x_bf16,
-                    w.gate_packed_bytes(),
-                    w.gate_scale_bits(),
-                    w.up_packed_bytes(),
-                    w.up_scale_bits(),
-                    w.down_packed_bytes(),
-                    w.down_scale_bits(),
-                    &mut out_bf16,
-                    threshold,
-                );
-                self.accumulate_ffn_sparsity_stat(active_frac);
-                Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+                if self.ffn_axpy_down && threshold > 0.0 {
+                    // AXPY-form sparse path (issue #35).
+                    //
+                    // Pull the slice handles out of `w` first so the
+                    // `c.get(...)` borrow ends and we can split-
+                    // borrow `self.transposed_down_cache` +
+                    // `self.ffn_scratch` below. The mmap behind these
+                    // slices is owned by the LRU entry `w` lives in;
+                    // both stay valid for the duration of the inline
+                    // transpose call.
+                    let intermediate = cascadia_int4_gemm::INTERMEDIATE;
+                    let down_packed_ptr = w.down_packed_bytes().as_ptr();
+                    let down_scale_ptr = w.down_scale_bits().as_ptr();
+                    let down_packed_len = w.down_packed_bytes().len();
+                    let down_scale_len = w.down_scale_bits().len();
+                    let gate_packed_ptr = w.gate_packed_bytes().as_ptr();
+                    let gate_packed_len = w.gate_packed_bytes().len();
+                    let gate_scale_ptr = w.gate_scale_bits().as_ptr();
+                    let gate_scale_len = w.gate_scale_bits().len();
+                    let up_packed_ptr = w.up_packed_bytes().as_ptr();
+                    let up_packed_len = w.up_packed_bytes().len();
+                    let up_scale_ptr = w.up_scale_bits().as_ptr();
+                    let up_scale_len = w.up_scale_bits().len();
+                    let key = (lid, eid);
+                    if !self.transposed_down_cache.contains(&key) {
+                        // SAFETY: ExpertWeights mmap outlives the
+                        // synchronous transpose; the slices are read-
+                        // only borrows into the (unchanged) mmap.
+                        let src_packed =
+                            unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
+                        let src_scale =
+                            unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
+                        let td = TransposedDown::build(src_packed, src_scale, hidden, intermediate);
+                        self.transposed_down_cache.push(key, td);
+                    }
+                    // Disjoint field borrow: `td` borrows
+                    // `self.transposed_down_cache`; `scratch` borrows
+                    // `self.ffn_scratch`.
+                    let td = self
+                        .transposed_down_cache
+                        .get(&key)
+                        .expect("just inserted/checked");
+                    let scratch = self
+                        .ffn_scratch
+                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
+                    let mut out_f32 = vec![0.0f32; hidden];
+                    // SAFETY: gate/up slices live in the same
+                    // ExpertWeights mmap as down; valid for this call.
+                    let gate_packed =
+                        unsafe { std::slice::from_raw_parts(gate_packed_ptr, gate_packed_len) };
+                    let gate_scale =
+                        unsafe { std::slice::from_raw_parts(gate_scale_ptr, gate_scale_len) };
+                    let up_packed =
+                        unsafe { std::slice::from_raw_parts(up_packed_ptr, up_packed_len) };
+                    let up_scale =
+                        unsafe { std::slice::from_raw_parts(up_scale_ptr, up_scale_len) };
+                    let active_frac = ffn_forward_sparse_axpy_f32(
+                        scratch,
+                        attn_row,
+                        hidden,
+                        intermediate,
+                        gate_packed,
+                        gate_scale,
+                        up_packed,
+                        up_scale,
+                        &td.packed_t,
+                        &td.scale_t_bits,
+                        &mut out_f32,
+                        threshold,
+                    );
+                    self.accumulate_ffn_sparsity_stat(active_frac);
+                    Ok(out_f32)
+                } else {
+                    let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+                    let mut out_bf16 = vec![bf16::ZERO; hidden];
+                    let active_frac = int4_expert_forward_sparse(
+                        &x_bf16,
+                        w.gate_packed_bytes(),
+                        w.gate_scale_bits(),
+                        w.up_packed_bytes(),
+                        w.up_scale_bits(),
+                        w.down_packed_bytes(),
+                        w.down_scale_bits(),
+                        &mut out_bf16,
+                        threshold,
+                    );
+                    self.accumulate_ffn_sparsity_stat(active_frac);
+                    Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+                }
             }
             ExpertCache::SafetensorsBin(c) => {
                 let w = c.get(lid, eid)?;
-                let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
-                let mut out_bf16 = vec![bf16::ZERO; hidden];
                 let threshold = self.ffn_sparsity_threshold;
-                let active_frac = int4_expert_forward_sparse(
-                    &x_bf16,
-                    w.gate_packed,
-                    w.gate_scale,
-                    w.up_packed,
-                    w.up_scale,
-                    w.down_packed,
-                    w.down_scale,
-                    &mut out_bf16,
-                    threshold,
-                );
-                self.accumulate_ffn_sparsity_stat(active_frac);
-                Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+                if self.ffn_axpy_down && threshold > 0.0 {
+                    let intermediate = cascadia_int4_gemm::INTERMEDIATE;
+                    // Pull the slice handles out of `w` first so the
+                    // `c.get(...)` borrow ends and we can split-
+                    // borrow `self.transposed_down_cache` +
+                    // `self.ffn_scratch` below. SafetensorsExpert
+                    // pins its shard mmaps via internal Arcs; both
+                    // stay valid for this call.
+                    let down_packed_ptr = w.down_packed.as_ptr();
+                    let down_packed_len = w.down_packed.len();
+                    let down_scale_ptr = w.down_scale.as_ptr();
+                    let down_scale_len = w.down_scale.len();
+                    let gate_packed_ptr = w.gate_packed.as_ptr();
+                    let gate_packed_len = w.gate_packed.len();
+                    let gate_scale_ptr = w.gate_scale.as_ptr();
+                    let gate_scale_len = w.gate_scale.len();
+                    let up_packed_ptr = w.up_packed.as_ptr();
+                    let up_packed_len = w.up_packed.len();
+                    let up_scale_ptr = w.up_scale.as_ptr();
+                    let up_scale_len = w.up_scale.len();
+                    let key = (lid, eid);
+                    if !self.transposed_down_cache.contains(&key) {
+                        let src_packed =
+                            unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
+                        let src_scale =
+                            unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
+                        let td = TransposedDown::build(src_packed, src_scale, hidden, intermediate);
+                        self.transposed_down_cache.push(key, td);
+                    }
+                    let td = self
+                        .transposed_down_cache
+                        .get(&key)
+                        .expect("just inserted/checked");
+                    let scratch = self
+                        .ffn_scratch
+                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
+                    let mut out_f32 = vec![0.0f32; hidden];
+                    let gate_packed =
+                        unsafe { std::slice::from_raw_parts(gate_packed_ptr, gate_packed_len) };
+                    let gate_scale =
+                        unsafe { std::slice::from_raw_parts(gate_scale_ptr, gate_scale_len) };
+                    let up_packed =
+                        unsafe { std::slice::from_raw_parts(up_packed_ptr, up_packed_len) };
+                    let up_scale =
+                        unsafe { std::slice::from_raw_parts(up_scale_ptr, up_scale_len) };
+                    let active_frac = ffn_forward_sparse_axpy_f32(
+                        scratch,
+                        attn_row,
+                        hidden,
+                        intermediate,
+                        gate_packed,
+                        gate_scale,
+                        up_packed,
+                        up_scale,
+                        &td.packed_t,
+                        &td.scale_t_bits,
+                        &mut out_f32,
+                        threshold,
+                    );
+                    self.accumulate_ffn_sparsity_stat(active_frac);
+                    Ok(out_f32)
+                } else {
+                    let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
+                    let mut out_bf16 = vec![bf16::ZERO; hidden];
+                    let active_frac = int4_expert_forward_sparse(
+                        &x_bf16,
+                        w.gate_packed,
+                        w.gate_scale,
+                        w.up_packed,
+                        w.up_scale,
+                        w.down_packed,
+                        w.down_scale,
+                        &mut out_bf16,
+                        threshold,
+                    );
+                    self.accumulate_ffn_sparsity_stat(active_frac);
+                    Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
+                }
             }
         }
+    }
+
+    /// Switch the AXPY-form down kernel on/off at runtime. Has no
+    /// effect unless `ffn_sparsity_threshold > 0`. Toggling on
+    /// triggers lazy build of transposed-down weights at first use
+    /// (one-time ~5 ms CPU per expert at K2.6 dims; ~8.26 MiB extra
+    /// heap per cached expert).
+    pub fn set_ffn_axpy_down(&mut self, on: bool) {
+        self.ffn_axpy_down = on;
+        info!(ffn_axpy_down = on, "set_ffn_axpy_down");
     }
 
     /// Reset all per-layer KV caches. Call between independent generations.

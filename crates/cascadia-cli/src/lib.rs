@@ -197,6 +197,25 @@ pub struct WorkerArgs {
     /// approach. See rainier `docs/POWERINFER_PORT.md`.
     #[arg(long, default_value_t = 0.0, env = "CASCADIA_FFN_SPARSITY_THRESHOLD")]
     pub ffn_sparsity_threshold: f32,
+
+    /// Issue #35 — use the AXPY-form down kernel for the sparse FFN
+    /// path. Only meaningful when `--ffn-sparsity-threshold > 0`.
+    ///
+    /// In the AXPY form, the down projection becomes
+    /// `y += silu(gate)[r] * up[r] * down_t[r]` accumulated over only
+    /// the active intermediate lanes `r`. Inactive lanes are skipped
+    /// entirely — no FMA, no weight load. Kernel speedup ceiling
+    /// `1 / active_frac` vs the dense down projection.
+    ///
+    /// Cost: each cached expert builds a transposed-and-requantized
+    /// down weight on first use (~5 ms CPU + ~8.26 MiB extra heap
+    /// per cached expert at K2.6 dimensions). The transposed cache
+    /// shares `--max-cached-experts` as its capacity.
+    ///
+    /// Ports PowerInfer SmallThinker `fused_sparse_moe.cpp:174-186`
+    /// (MIT). See rainier `docs/POWERINFER_PORT.md`.
+    #[arg(long, default_value_t = false, env = "CASCADIA_FFN_AXPY_DOWN")]
+    pub ffn_axpy_down: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -422,6 +441,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.routing_threshold = args.routing_threshold;
             cfg.max_cached_experts = args.max_cached_experts;
             cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
+            cfg.ffn_axpy_down = args.ffn_axpy_down;
             // N-gram speculative decode (sparse-moe single-stage).
             // The `--prompt-lookup` flag is the canonical opt-in (it
             // already drives the ov-genai prompt-lookup path); when
