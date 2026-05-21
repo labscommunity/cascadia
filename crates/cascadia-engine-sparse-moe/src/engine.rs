@@ -98,6 +98,14 @@ pub struct SparseMoEBuilderConfig {
     /// to a fast local NVMe path if the model directory is on a
     /// slow / read-only mount.
     pub ffn_axpy_cache_dir: Option<PathBuf>,
+    /// When `true`, eagerly pre-build the AXPY transposed-down
+    /// cache for every `(layer, expert)` this rank may dispatch,
+    /// at `Builder::build` time. Avoids the in-line build cost on
+    /// the first prompt that touches each expert (recommended for
+    /// diverse-prompt production workloads). At K2.6 dimensions
+    /// the prebuild cost is ~7 min single-threaded or ~20 s with
+    /// rayon; disk cost ~190 GiB on top of the model.
+    pub ffn_axpy_prebuild: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -120,6 +128,7 @@ impl SparseMoEBuilderConfig {
             ffn_sparsity_threshold: 0.0,
             ffn_axpy_down: false,
             ffn_axpy_cache_dir: None,
+            ffn_axpy_prebuild: false,
         }
     }
 
@@ -208,6 +217,9 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
         resolved = ?max_cached_experts.map(NonZeroUsize::get),
         "resolved expert-cache LRU cap (None = unbounded)"
     );
+    // `ffn_axpy_prebuild` is consumed in `Builder::build` after the
+    // Runner is constructed, not via RunnerOptions — keeps the
+    // Runner constructor side-effect-free.
     RunnerOptions {
         max_cached_experts,
         ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
@@ -388,6 +400,11 @@ impl Builder for SparseMoEBuilder {
         runner.set_routing_threshold(self.config.routing_threshold);
         runner.set_ffn_sparsity_threshold(self.config.ffn_sparsity_threshold);
         runner.set_ffn_axpy_down(self.config.ffn_axpy_down);
+        if self.config.ffn_axpy_prebuild {
+            runner
+                .prebuild_axpy_cache()
+                .map_err(|e| EngineError::Backend(format!("AXPY prebuild: {e}")))?;
+        }
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

@@ -1073,11 +1073,115 @@ impl Runner {
     /// Switch the AXPY-form down kernel on/off at runtime. Has no
     /// effect unless `ffn_sparsity_threshold > 0`. Toggling on
     /// triggers lazy build of transposed-down weights at first use
-    /// (one-time ~5 ms CPU per expert at K2.6 dims; ~8.26 MiB extra
-    /// heap per cached expert).
+    /// (one-time ~14 ms per expert at K2.6 dims — ~6 ms CPU +
+    /// ~8 ms disk write — persisted to `<model_dir>/.cascadia_transposed_down_v1/`
+    /// across process restarts).
     pub fn set_ffn_axpy_down(&mut self, on: bool) {
-        self.ffn_axpy_down = on;
-        info!(ffn_axpy_down = on, "set_ffn_axpy_down");
+        self.ffn_axpy_down = on && self.transposed_down_store.is_some();
+        info!(
+            requested = on,
+            effective = self.ffn_axpy_down,
+            "set_ffn_axpy_down (effective=false ⇒ store unavailable; running dense)"
+        );
+    }
+
+    /// Eagerly pre-build the AXPY transposed-down cache for every
+    /// `(layer, expert)` this rank may dispatch. Walks the manifest
+    /// + 0..num_experts in parallel and persists each cache file to
+    /// disk, then mmaps it. Subsequent dispatches are pure mmap
+    /// reads with zero in-line build cost.
+    ///
+    /// Cost: at K2.6 dims ~14 ms per expert (~6 ms compute + ~8 ms
+    /// NVMe write). 480 routed experts × 60 layers = 28 800 unique
+    /// experts ⇒ ~7 minutes on a single thread, ~20 seconds with
+    /// rayon. Disk: ~190 GiB on top of the K2.6 model.
+    ///
+    /// Returns `(built, mmap_hits)`. Returns `Ok((0, 0))` (no-op)
+    /// when AXPY is disabled or the store failed to open.
+    ///
+    /// For workloads with diverse prompts that touch many distinct
+    /// expert routes, this is the recommended pre-deploy step —
+    /// avoids the per-token in-line build cost the lazy mode pays
+    /// on first encounter of each expert.
+    pub fn prebuild_axpy_cache(&mut self) -> Result<(u64, u64), RunnerError> {
+        if !self.ffn_axpy_down {
+            info!("prebuild_axpy_cache: AXPY disabled; skipping");
+            return Ok((0, 0));
+        }
+        if self.transposed_down_store.is_none() {
+            return Ok((0, 0));
+        }
+        let intermediate = cascadia_int4_gemm::INTERMEDIATE;
+        let hidden = self.manifest.hidden_size as usize;
+        let moe_layer_ids = self.manifest.moe_layer_ids();
+        let n_experts = self.manifest.num_experts;
+        let layer_ids_in_range: Vec<u32> = moe_layer_ids
+            .into_iter()
+            .filter(|&lid| lid >= self.range.layer_start && lid < self.range.layer_end)
+            .collect();
+        info!(
+            num_layers = layer_ids_in_range.len(),
+            num_experts_per_layer = n_experts,
+            total_pairs = layer_ids_in_range.len() * (n_experts as usize),
+            "prebuild_axpy_cache: starting eager pre-build of transposed-down cache"
+        );
+        let t0 = Instant::now();
+        // Walk pairs serially per (lid, eid); inside each
+        // get_or_build the transpose itself is rayon-parallel.
+        // Going serial at the outer loop keeps disk-write
+        // contention low (one large NVMe write at a time outperforms
+        // many small concurrent writes on consumer NVMe).
+        for &lid in &layer_ids_in_range {
+            for eid in 0..n_experts {
+                // Skip if already cached; otherwise dispatch a
+                // single AXPY call via the existing path (which
+                // also handles the cache miss + build). The
+                // dummy attn_row is zeros — we don't care about
+                // the output, only the side effect of populating
+                // the transposed-down store.
+                if self
+                    .transposed_down_store
+                    .as_ref()
+                    .map(|s| s.live_mmaps())
+                    .unwrap_or(0)
+                    > 0
+                {
+                    // (live_mmaps grows on each successful
+                    // get_or_build; we use it as a coarse hint to
+                    // log progress.)
+                }
+                // Pull the source weights via the expert cache.
+                // dispatch_expert needs a real input vector even
+                // though we discard the output; allocate once.
+                let attn_row = vec![0.0f32; hidden];
+                let _ = self.dispatch_expert(lid, eid, &attn_row)?;
+            }
+            if let Some(store) = self.transposed_down_store.as_ref() {
+                let (builds, hits) = store.stats();
+                debug!(
+                    layer_done = lid,
+                    builds, hits, "prebuild_axpy_cache: layer complete"
+                );
+            }
+        }
+        let elapsed = t0.elapsed();
+        let (builds, hits) = self
+            .transposed_down_store
+            .as_ref()
+            .map(|s| s.stats())
+            .unwrap_or((0, 0));
+        info!(
+            elapsed_s = elapsed.as_secs_f64(),
+            builds,
+            hits,
+            live_mmaps = self
+                .transposed_down_store
+                .as_ref()
+                .map(|s| s.live_mmaps())
+                .unwrap_or(0),
+            "prebuild_axpy_cache: complete"
+        );
+        Ok((builds, hits))
     }
 
     /// Reset all per-layer KV caches. Call between independent generations.

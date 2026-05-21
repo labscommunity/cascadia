@@ -216,6 +216,15 @@ pub struct WorkerArgs {
     /// (MIT). See rainier `docs/POWERINFER_PORT.md`.
     #[arg(long, default_value_t = false, env = "CASCADIA_FFN_AXPY_DOWN")]
     pub ffn_axpy_down: bool,
+
+    /// Pre-build the AXPY transposed-down cache for every
+    /// `(layer, expert)` at Runner construction (slow one-time
+    /// cost; avoids per-prompt build latency thereafter). Only
+    /// meaningful with `--ffn-axpy-down` enabled. K2.6 prebuild
+    /// is ~20 s with rayon; disk: ~190 GiB on top of the model.
+    /// Recommended for production deployments with diverse prompts.
+    #[arg(long, default_value_t = false, env = "CASCADIA_FFN_AXPY_PREBUILD")]
+    pub ffn_axpy_prebuild: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -442,6 +451,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.max_cached_experts = args.max_cached_experts;
             cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
             cfg.ffn_axpy_down = args.ffn_axpy_down;
+            cfg.ffn_axpy_prebuild = args.ffn_axpy_prebuild;
             // N-gram speculative decode (sparse-moe single-stage).
             // The `--prompt-lookup` flag is the canonical opt-in (it
             // already drives the ov-genai prompt-lookup path); when
