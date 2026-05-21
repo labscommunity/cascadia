@@ -2405,11 +2405,21 @@ impl Runner {
         // of generation so the operator can see what fraction of FFN
         // lanes were actually active under the chosen threshold. Logged
         // at info level so it shows up without RUST_LOG tuning, but
-        // skipped silently when the threshold is 0.0 (no sparsity).
-        if self.ffn_sparsity_threshold > 0.0 {
+        // skipped silently when both the scalar threshold and the
+        // per-channel thresholds are inactive (no sparsity at all). The
+        // per-channel check is needed for issue #38: when the only
+        // sparsity signal is the loaded thresholds file, `ffn_sparsity_threshold`
+        // stays at 0.0 but the dispatcher still runs the sparse path.
+        if self.ffn_sparsity_threshold > 0.0 || self.ffn_sparsity_thresholds.is_some() {
             let (cached_experts, expert_evictions) = self.experts.lru_stats();
+            let per_channel_layers = self
+                .ffn_sparsity_thresholds
+                .as_ref()
+                .map(|t| t.n_layers())
+                .unwrap_or(0);
             info!(
                 ffn_sparsity_threshold = self.ffn_sparsity_threshold,
+                ffn_per_channel_layers = per_channel_layers,
                 ffn_active_fraction = self.ffn_active_fraction(),
                 routed_expert_calls = self.ffn_active_count,
                 cached_experts,
