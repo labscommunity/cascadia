@@ -225,6 +225,31 @@ pub struct WorkerArgs {
     /// Recommended for production deployments with diverse prompts.
     #[arg(long, default_value_t = false, env = "CASCADIA_FFN_AXPY_PREBUILD")]
     pub ffn_axpy_prebuild: bool,
+
+    /// Issue #38 (CHESS) — load per-channel FFN sparsity thresholds
+    /// from this JSON file (produced by the `calibrate_ffn_thresholds`
+    /// tool). Takes precedence over `--ffn-sparsity-threshold` for
+    /// any layer covered by the file; uncovered layers fall back to
+    /// the scalar value.
+    ///
+    /// Per-channel τ typically achieves 2× the sparsity-at-quality of
+    /// a single global τ — some channels reliably dominate the
+    /// magnitude distribution, others are reliably negligible. See
+    /// `docs/perf/CHESS_PER_CHANNEL.md` for the calibration workflow.
+    #[arg(long, env = "CASCADIA_FFN_SPARSITY_THRESHOLDS_FILE")]
+    pub ffn_sparsity_thresholds_file: Option<std::path::PathBuf>,
+
+    /// Issue #38 (CHESS) — capture per-(layer, channel) `silu(gate)`
+    /// histograms during routed expert calls and dump them to this
+    /// directory on shutdown. Feed the dump into
+    /// `calibrate_ffn_thresholds` to produce a per-channel threshold
+    /// file. Only effective when `--ffn-axpy-down` is also on (the
+    /// non-AXPY path doesn't surface `silu(gate)` to the runner).
+    ///
+    /// Memory cost: 60 layers × 2048 channels × 128 bins × 4 B
+    /// ≈ 60 MiB resident on K2.6 single-stage; bounded.
+    #[arg(long, env = "CASCADIA_FFN_SPARSITY_CAPTURE_DIR")]
+    pub ffn_sparsity_capture_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -452,6 +477,18 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             cfg.ffn_sparsity_threshold = args.ffn_sparsity_threshold;
             cfg.ffn_axpy_down = args.ffn_axpy_down;
             cfg.ffn_axpy_prebuild = args.ffn_axpy_prebuild;
+            cfg.ffn_sparsity_thresholds_file = args.ffn_sparsity_thresholds_file.clone();
+            cfg.ffn_sparsity_capture_dir = args.ffn_sparsity_capture_dir.clone();
+            // Issue #38: capture surfaces silu(gate) via the AXPY
+            // scratch — if the user asked to capture but didn't ask
+            // for AXPY, warn (the capture will silently be empty
+            // because the non-AXPY path doesn't expose silu(gate)).
+            if args.ffn_sparsity_capture_dir.is_some() && !args.ffn_axpy_down {
+                tracing::warn!(
+                    "--ffn-sparsity-capture-dir requires --ffn-axpy-down to surface silu(gate); \
+                     capture will be empty without it"
+                );
+            }
             // N-gram speculative decode (sparse-moe single-stage).
             // The `--prompt-lookup` flag is the canonical opt-in (it
             // already drives the ov-genai prompt-lookup path); when

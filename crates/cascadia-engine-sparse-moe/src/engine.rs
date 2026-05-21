@@ -106,6 +106,21 @@ pub struct SparseMoEBuilderConfig {
     /// the prebuild cost is ~7 min single-threaded or ~20 s with
     /// rayon; disk cost ~190 GiB on top of the model.
     pub ffn_axpy_prebuild: bool,
+    /// Issue #38 (CHESS) — load per-channel FFN sparsity thresholds
+    /// from this file. The file is produced by the
+    /// `calibrate_ffn_thresholds` bin from a capture run. `None`
+    /// (default) keeps the scalar [`Self::ffn_sparsity_threshold`]
+    /// behaviour. When set, the per-channel τ vector takes precedence
+    /// over the scalar τ for any layer covered by the file.
+    pub ffn_sparsity_thresholds_file: Option<PathBuf>,
+    /// Issue #38 (CHESS) — when set, record per-(layer, channel)
+    /// `|silu(gate[c])| / max_j |silu(gate[j])|` histograms during
+    /// every routed expert call. The histograms are dumped to this
+    /// directory on engine close. Used as input to
+    /// `calibrate_ffn_thresholds`. `None` (default) disables capture.
+    /// Only meaningful while the AXPY-form path is active — the
+    /// non-AXPY (bf16 boundary) path doesn't surface `silu(gate)`.
+    pub ffn_sparsity_capture_dir: Option<PathBuf>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -129,6 +144,8 @@ impl SparseMoEBuilderConfig {
             ffn_axpy_down: false,
             ffn_axpy_cache_dir: None,
             ffn_axpy_prebuild: false,
+            ffn_sparsity_thresholds_file: None,
+            ffn_sparsity_capture_dir: None,
         }
     }
 
@@ -225,6 +242,8 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
         ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
         ffn_axpy_down: cfg.ffn_axpy_down,
         ffn_axpy_cache_dir: cfg.ffn_axpy_cache_dir.clone(),
+        ffn_sparsity_thresholds_file: cfg.ffn_sparsity_thresholds_file.clone(),
+        ffn_sparsity_capture_dir: cfg.ffn_sparsity_capture_dir.clone(),
     }
 }
 
@@ -718,6 +737,22 @@ impl Engine for SparseMoEEngine {
     }
 
     fn close(&mut self) {
+        // Issue #38: dump the gate-capture histograms before tearing
+        // down the runner. A clean shutdown (SIGTERM via
+        // cascadia-cli's graceful-shutdown wiring) thus persists
+        // calibration data without further user action.
+        match self.runner.dump_gate_capture() {
+            Ok((0, _)) => {}
+            Ok((n_layers, total_samples)) => {
+                info!(
+                    n_layers,
+                    total_samples, "dumped FFN gate-capture histograms (CHESS calibration)"
+                );
+            }
+            Err(e) => {
+                warn!("failed to dump gate-capture histograms on close: {e}");
+            }
+        }
         // Best-effort transport teardown. We block_on each socket's close()
         // sequentially because the engine is being torn down; lock
         // contention isn't a worry. Errors are logged but swallowed —
