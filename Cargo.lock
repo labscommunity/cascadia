@@ -379,6 +379,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "windows-sys 0.59.0",
 ]

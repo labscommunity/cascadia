@@ -85,10 +85,19 @@ pub struct SparseMoEBuilderConfig {
     pub ffn_sparsity_threshold: f32,
     /// Issue #35 — use the AXPY-form down kernel from
     /// [`cascadia_int4_gemm::ffn_axpy`] in the sparse FFN path. Only
-    /// active when [`Self::ffn_sparsity_threshold`] > 0. Each cached
-    /// expert builds + holds a transposed-and-requantized down
-    /// weight (one-time ~5 ms CPU per expert; ~8.26 MiB extra heap).
+    /// active when [`Self::ffn_sparsity_threshold`] > 0. Per-expert
+    /// transposed-and-requantized down weights are persisted to
+    /// [`Self::ffn_axpy_cache_dir`] (default
+    /// `<model_dir>/.cascadia_transposed_down_v1/`) and mmap'd at
+    /// runtime — this is the on-disk-cache fix that addresses PR #43's
+    /// initial mmap-page-cache-eviction regression (see rainier
+    /// `docs/AXPY_REGRESSION_ANALYSIS.md`).
     pub ffn_axpy_down: bool,
+    /// Override location for the AXPY-form transposed-down cache.
+    /// `None` ⇒ `<model_dir>/.cascadia_transposed_down_v1/`. Set
+    /// to a fast local NVMe path if the model directory is on a
+    /// slow / read-only mount.
+    pub ffn_axpy_cache_dir: Option<PathBuf>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -110,6 +119,7 @@ impl SparseMoEBuilderConfig {
             kv_prefix_cache_size: 0,
             ffn_sparsity_threshold: 0.0,
             ffn_axpy_down: false,
+            ffn_axpy_cache_dir: None,
         }
     }
 
@@ -202,6 +212,7 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
         max_cached_experts,
         ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
         ffn_axpy_down: cfg.ffn_axpy_down,
+        ffn_axpy_cache_dir: cfg.ffn_axpy_cache_dir.clone(),
     }
 }
 

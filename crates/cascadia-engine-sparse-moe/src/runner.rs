@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use lru::LruCache;
 
-use cascadia_int4_gemm::ffn_axpy::{transpose_requantize_down, FfnScratch as IntFfnScratch};
+use cascadia_int4_gemm::ffn_axpy::FfnScratch as IntFfnScratch;
 use cascadia_int4_gemm::ffn_sparsity::ffn_forward_sparse_axpy_f32;
 use cascadia_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
@@ -32,6 +32,7 @@ use cascadia_int4_gemm::shell_int4::{
     shell_forward_decode_int4_multi_with_capacity, shell_forward_decode_int4_with_capacity_sparse,
     Int4Shell,
 };
+use cascadia_int4_gemm::transposed_down_store::TransposedDownStore;
 use cascadia_int4_gemm::{
     expert_forward_sparse as int4_expert_forward_sparse, f32_to_bf16_bits, ExpertWeights,
     SafetensorsExpert, SafetensorsExpertSource,
@@ -258,34 +259,6 @@ impl SafetensorsExpertCache {
     }
 }
 
-/// AXPY-form down weight: the original `[hidden, intermediate]` down
-/// matrix transposed and re-quantized into `[intermediate, hidden]`
-/// int4 layout for [`ffn_forward_sparse_axpy_f32`]. Built lazily on
-/// first sparse-AXPY dispatch per expert and held in
-/// `Runner::transposed_down_cache`. Memory cost: ~8.26 MiB per cached
-/// expert at K2.6 dimensions (same as the original down — the
-/// transpose is in-place size-wise).
-struct TransposedDown {
-    packed_t: Vec<u8>,
-    scale_t_bits: Vec<u8>,
-}
-
-impl TransposedDown {
-    fn build(
-        down_packed: &[u8],
-        down_scale_bits: &[u8],
-        n_hidden: usize,
-        n_intermediate: usize,
-    ) -> Self {
-        let (packed_t, scale_t_bits) =
-            transpose_requantize_down(down_packed, down_scale_bits, n_hidden, n_intermediate);
-        Self {
-            packed_t,
-            scale_t_bits,
-        }
-    }
-}
-
 /// autolab iter 029 (C1): one prefetch request — kindly hint the kernel
 /// to start reading the weights for expert `eid` on layer `lid`. The
 /// prefetcher thread translates this into `madvise(MADV_WILLNEED)` calls
@@ -406,12 +379,20 @@ pub struct RunnerOptions {
     /// When `true` (and `ffn_sparsity_threshold > 0`), use the AXPY-
     /// form down kernel from [`cascadia_int4_gemm::ffn_axpy`]: each
     /// expert's down weight is transposed and re-quantized at first
-    /// use; the down projection becomes an AXPY over only the active
-    /// intermediate lanes (kernel speedup ceiling 1/active_frac vs
-    /// dense). Memory cost: one extra down-sized buffer per cached
-    /// expert (~8.26 MiB on K2.6); the transposed cache shares
-    /// [`Self::max_cached_experts`] as its capacity.
+    /// use, persisted to disk in
+    /// [`Self::ffn_axpy_cache_dir`], then mmap'd at runtime.
+    /// The kernel speedup ceiling is `1 / active_frac` vs the dense
+    /// down; the on-disk cache prevents the page-cache eviction
+    /// regression an in-memory cache caused (PR #43 post-mortem:
+    /// rainier `docs/AXPY_REGRESSION_ANALYSIS.md`).
     pub ffn_axpy_down: bool,
+    /// Directory where the AXPY-form transposed-and-requantized
+    /// down weights are persisted. `None` ⇒ default
+    /// `<model_dir>/.cascadia_transposed_down_v1/` (sibling of the
+    /// model). If the directory cannot be created or written, the
+    /// runner logs a warning and falls back to the dense path for
+    /// the duration of the run.
+    pub ffn_axpy_cache_dir: Option<std::path::PathBuf>,
 }
 
 /// Per-rank slice of the model the Runner should hold.
@@ -483,14 +464,23 @@ pub struct Runner {
     ffn_sparsity_threshold: f32,
     /// PowerInfer port (issue #35): when true, use the AXPY-form down
     /// kernel from [`cascadia_int4_gemm::ffn_axpy`]. Requires per-
-    /// expert transposed-and-requantized down weights, built lazily
-    /// into `transposed_down_cache` on first use.
+    /// expert transposed-and-requantized down weights, lazily built
+    /// + persisted to disk + mmap'd via
+    /// [`crate::runner::Runner::transposed_down_store`].
     ffn_axpy_down: bool,
-    /// LRU of per-expert transposed-and-requantized down weights
-    /// (one [`TransposedDown`] per `(layer, expert)`). Populated only
-    /// when `ffn_axpy_down` is true. Shares
-    /// [`RunnerOptions::max_cached_experts`] as the LRU bound.
-    transposed_down_cache: LruCache<(u32, u32), TransposedDown>,
+    /// **On-disk** cache of per-expert transposed-and-requantized
+    /// down weights — the fix for PR #43's mmap page-cache eviction
+    /// regression. Each entry mmaps a `.cxd` file from the cache
+    /// directory; the pages compete in the same LRU as the model
+    /// mmap rather than pinning anon memory. `None` when AXPY is
+    /// disabled or the cache directory isn't writable (the runner
+    /// logs + falls back to the dense path in that case).
+    ///
+    /// On miner-class storage (NVMe) first-touch cost: ~6 ms to
+    /// build + write 8.26 MiB per expert; subsequent dispatches
+    /// across process restarts pay only the mmap-fault cost
+    /// (~ms when warm in page cache, ~ms-tens to re-fault).
+    transposed_down_store: Option<TransposedDownStore>,
     /// One-per-runner reusable FFN scratch buffers used by the AXPY-
     /// form path so we don't `Vec::new()` on every routed-expert
     /// call. Built once at first AXPY dispatch with the manifest's
@@ -744,6 +734,41 @@ impl Runner {
         };
         let last_routing_ids: Vec<Vec<u32>> = (0..layers.len()).map(|_| Vec::new()).collect();
 
+        // PR #43 fix: open the on-disk transposed-down cache only if
+        // AXPY is enabled. If the directory can't be created/written,
+        // log a warning and disable AXPY (we don't ship the in-memory
+        // path because it caused the regression that pivoting to
+        // disk persistence fixes).
+        let transposed_down_store = if opts.ffn_axpy_down {
+            let cache_dir = opts
+                .ffn_axpy_cache_dir
+                .clone()
+                .unwrap_or_else(|| model_dir.join(".cascadia_transposed_down_v1"));
+            match TransposedDownStore::open(&cache_dir) {
+                Ok(store) => {
+                    info!(
+                        cache_dir = %cache_dir.display(),
+                        "AXPY-form down: on-disk transposed-weight cache opened"
+                    );
+                    Some(store)
+                }
+                Err(err) => {
+                    warn!(
+                        cache_dir = %cache_dir.display(),
+                        error = %err,
+                        "AXPY-form down: cache directory not writable; \
+                         disabling AXPY for this run (falling back to dense down)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Drop ffn_axpy_down if the store failed to open, so the
+        // dispatch path stays on the dense-down branch.
+        let ffn_axpy_effective = opts.ffn_axpy_down && transposed_down_store.is_some();
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -760,8 +785,8 @@ impl Runner {
             last_routing_ids,
             prefetcher,
             ffn_sparsity_threshold: opts.ffn_sparsity_threshold,
-            ffn_axpy_down: opts.ffn_axpy_down,
-            transposed_down_cache: new_expert_lru(cap),
+            ffn_axpy_down: ffn_axpy_effective,
+            transposed_down_store,
             ffn_scratch: None,
             ffn_active_sum: 0.0,
             ffn_active_count: 0,
@@ -859,13 +884,20 @@ impl Runner {
                 if self.ffn_axpy_down && threshold > 0.0 {
                     // AXPY-form sparse path (issue #35).
                     //
+                    // The transposed-down weights are persisted to
+                    // disk (`TransposedDownStore`) and mmap'd —
+                    // unlike the original in-memory cache (PR #43)
+                    // the on-disk pages are evictable by the kernel,
+                    // so they don't displace the K2.6 model's mmap
+                    // pages from the page cache. See the post-mortem
+                    // at rainier `docs/AXPY_REGRESSION_ANALYSIS.md`.
+                    //
                     // Pull the slice handles out of `w` first so the
                     // `c.get(...)` borrow ends and we can split-
-                    // borrow `self.transposed_down_cache` +
+                    // borrow `self.transposed_down_store` +
                     // `self.ffn_scratch` below. The mmap behind these
                     // slices is owned by the LRU entry `w` lives in;
-                    // both stay valid for the duration of the inline
-                    // transpose call.
+                    // both stay valid for the duration of the call.
                     let intermediate = cascadia_int4_gemm::INTERMEDIATE;
                     let down_packed_ptr = w.down_packed_bytes().as_ptr();
                     let down_scale_ptr = w.down_scale_bits().as_ptr();
@@ -879,31 +911,15 @@ impl Runner {
                     let up_packed_len = w.up_packed_bytes().len();
                     let up_scale_ptr = w.up_scale_bits().as_ptr();
                     let up_scale_len = w.up_scale_bits().len();
-                    let key = (lid, eid);
-                    if !self.transposed_down_cache.contains(&key) {
-                        // SAFETY: ExpertWeights mmap outlives the
-                        // synchronous transpose; the slices are read-
-                        // only borrows into the (unchanged) mmap.
-                        let src_packed =
-                            unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
-                        let src_scale =
-                            unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
-                        let td = TransposedDown::build(src_packed, src_scale, hidden, intermediate);
-                        self.transposed_down_cache.push(key, td);
-                    }
-                    // Disjoint field borrow: `td` borrows
-                    // `self.transposed_down_cache`; `scratch` borrows
-                    // `self.ffn_scratch`.
-                    let td = self
-                        .transposed_down_cache
-                        .get(&key)
-                        .expect("just inserted/checked");
-                    let scratch = self
-                        .ffn_scratch
-                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
-                    let mut out_f32 = vec![0.0f32; hidden];
-                    // SAFETY: gate/up slices live in the same
-                    // ExpertWeights mmap as down; valid for this call.
+                    // SAFETY for all the slice-from-raw-parts below:
+                    // the ExpertWeights mmap (owned by the LRU entry
+                    // we just got via `c.get`) stays alive for the
+                    // duration of this dispatch call. The slices
+                    // are read-only borrows into that mmap.
+                    let src_packed =
+                        unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
+                    let src_scale =
+                        unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
                     let gate_packed =
                         unsafe { std::slice::from_raw_parts(gate_packed_ptr, gate_packed_len) };
                     let gate_scale =
@@ -912,6 +928,26 @@ impl Runner {
                         unsafe { std::slice::from_raw_parts(up_packed_ptr, up_packed_len) };
                     let up_scale =
                         unsafe { std::slice::from_raw_parts(up_scale_ptr, up_scale_len) };
+                    // Disjoint field borrow: `td` borrows
+                    // `self.transposed_down_store`; `scratch` borrows
+                    // `self.ffn_scratch`.
+                    let store = self
+                        .transposed_down_store
+                        .as_mut()
+                        .expect("ffn_axpy_down true ⇒ store opened at load");
+                    let td = store
+                        .get_or_build(lid, eid, src_packed, src_scale, hidden, intermediate)
+                        .map_err(|e| {
+                            RunnerError::Internal(format!(
+                                "AXPY transposed-down cache failed for (lid={lid}, eid={eid}): {e}"
+                            ))
+                        })?;
+                    let td_packed = td.packed_t();
+                    let td_scale = td.scale_t_bits();
+                    let scratch = self
+                        .ffn_scratch
+                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
+                    let mut out_f32 = vec![0.0f32; hidden];
                     let active_frac = ffn_forward_sparse_axpy_f32(
                         scratch,
                         attn_row,
@@ -921,8 +957,8 @@ impl Runner {
                         gate_scale,
                         up_packed,
                         up_scale,
-                        &td.packed_t,
-                        &td.scale_t_bits,
+                        td_packed,
+                        td_scale,
                         &mut out_f32,
                         threshold,
                     );
@@ -951,12 +987,8 @@ impl Runner {
                 let threshold = self.ffn_sparsity_threshold;
                 if self.ffn_axpy_down && threshold > 0.0 {
                     let intermediate = cascadia_int4_gemm::INTERMEDIATE;
-                    // Pull the slice handles out of `w` first so the
-                    // `c.get(...)` borrow ends and we can split-
-                    // borrow `self.transposed_down_cache` +
-                    // `self.ffn_scratch` below. SafetensorsExpert
-                    // pins its shard mmaps via internal Arcs; both
-                    // stay valid for this call.
+                    // Same on-disk-store pattern as the Int4Bin path
+                    // above. See that branch for the rationale.
                     let down_packed_ptr = w.down_packed.as_ptr();
                     let down_packed_len = w.down_packed.len();
                     let down_scale_ptr = w.down_scale.as_ptr();
@@ -969,23 +1001,13 @@ impl Runner {
                     let up_packed_len = w.up_packed.len();
                     let up_scale_ptr = w.up_scale.as_ptr();
                     let up_scale_len = w.up_scale.len();
-                    let key = (lid, eid);
-                    if !self.transposed_down_cache.contains(&key) {
-                        let src_packed =
-                            unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
-                        let src_scale =
-                            unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
-                        let td = TransposedDown::build(src_packed, src_scale, hidden, intermediate);
-                        self.transposed_down_cache.push(key, td);
-                    }
-                    let td = self
-                        .transposed_down_cache
-                        .get(&key)
-                        .expect("just inserted/checked");
-                    let scratch = self
-                        .ffn_scratch
-                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
-                    let mut out_f32 = vec![0.0f32; hidden];
+                    // SAFETY: SafetensorsExpert pins its shard mmaps
+                    // via internal Arcs for the lifetime of `w`;
+                    // valid for this dispatch call.
+                    let src_packed =
+                        unsafe { std::slice::from_raw_parts(down_packed_ptr, down_packed_len) };
+                    let src_scale =
+                        unsafe { std::slice::from_raw_parts(down_scale_ptr, down_scale_len) };
                     let gate_packed =
                         unsafe { std::slice::from_raw_parts(gate_packed_ptr, gate_packed_len) };
                     let gate_scale =
@@ -994,6 +1016,23 @@ impl Runner {
                         unsafe { std::slice::from_raw_parts(up_packed_ptr, up_packed_len) };
                     let up_scale =
                         unsafe { std::slice::from_raw_parts(up_scale_ptr, up_scale_len) };
+                    let store = self
+                        .transposed_down_store
+                        .as_mut()
+                        .expect("ffn_axpy_down true ⇒ store opened at load");
+                    let td = store
+                        .get_or_build(lid, eid, src_packed, src_scale, hidden, intermediate)
+                        .map_err(|e| {
+                            RunnerError::Internal(format!(
+                                "AXPY transposed-down cache failed for (lid={lid}, eid={eid}): {e}"
+                            ))
+                        })?;
+                    let td_packed = td.packed_t();
+                    let td_scale = td.scale_t_bits();
+                    let scratch = self
+                        .ffn_scratch
+                        .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
+                    let mut out_f32 = vec![0.0f32; hidden];
                     let active_frac = ffn_forward_sparse_axpy_f32(
                         scratch,
                         attn_row,
@@ -1003,8 +1042,8 @@ impl Runner {
                         gate_scale,
                         up_packed,
                         up_scale,
-                        &td.packed_t,
-                        &td.scale_t_bits,
+                        td_packed,
+                        td_scale,
                         &mut out_f32,
                         threshold,
                     );
