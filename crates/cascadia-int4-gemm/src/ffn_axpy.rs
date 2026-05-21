@@ -190,26 +190,38 @@ mod avx512 {
         let bias = _mm_set1_epi8(8);
 
         // Chunked-y parallelism: each worker owns a disjoint
-        // [chunk_start, chunk_start + CHUNK) slice of y and visits
-        // every active lane. Per-(active, chunk) work is one
-        // contiguous packed slice + one contiguous scale slice +
-        // CHUNK / 16 AVX-512 FMAs per group.
+        // [chunk_start, chunk_start + CHUNK) slice of y. The key
+        // perf trick is that the chunk's y values are loaded into
+        // an array of __m512 accumulators ONCE per chunk, all
+        // active lanes FMA into the accumulator array, and the
+        // array is stored back to y ONCE at the end. This keeps
+        // y in registers across all active scalars and eliminates
+        // the per-(active, group) y read+write traffic that
+        // otherwise dominates at p > 0.1.
+        const VECS_PER_CHUNK: usize = CHUNK / 16; // 256/16 = 16 zmm regs
         y.par_chunks_mut(CHUNK)
             .enumerate()
             .for_each(|(ci, y_chunk)| {
                 let chunk_start = ci * CHUNK;
                 let groups_per_chunk = CHUNK / GROUP_SIZE;
                 let group_offset_in_row = chunk_start / GROUP_SIZE;
-                for &r in active {
-                    let r = r as usize;
-                    let scalar = scalars[r];
-                    // SAFETY: each thread owns a disjoint y_chunk; the
-                    // accumulator vectors live entirely in register
-                    // until the final store.
-                    unsafe {
+                // SAFETY: each thread owns a disjoint y_chunk; the
+                // accumulator array lives entirely in stack
+                // (compiler keeps it in registers given AVX-512's
+                // 32 zmm regs and our 16-element footprint).
+                unsafe {
+                    // Load y_chunk into accumulators ONCE per
+                    // chunk. 16 zmm regs = 256 f32 lanes.
+                    let mut acc: [__m512; VECS_PER_CHUNK] = [_mm512_setzero_ps(); VECS_PER_CHUNK];
+                    for v in 0..VECS_PER_CHUNK {
+                        acc[v] = _mm512_loadu_ps(y_chunk.as_ptr().add(v * 16));
+                    }
+
+                    for &r in active {
+                        let r = r as usize;
+                        let scalar = scalars[r];
                         let row_packed_ptr = packed_t.as_ptr().add(r * row_stride_packed);
                         let row_scale_ptr = scale_t_bits.as_ptr().add(r * row_stride_scale);
-                        let scalar_v = _mm512_set1_ps(scalar);
                         for g_in_chunk in 0..groups_per_chunk {
                             let g_in_row = group_offset_in_row + g_in_chunk;
                             let scale_off = g_in_row * 2;
@@ -218,7 +230,6 @@ mod avx512 {
                                 *row_scale_ptr.add(scale_off + 1),
                             ]);
                             let scale = bf16_bits_to_f32(scale_u16);
-                            // scalar × scale → single per-group multiplier
                             let combined = _mm512_set1_ps(scalar * scale);
 
                             // 16 packed bytes = 32 nibbles for this group
@@ -237,17 +248,20 @@ mod avx512 {
                             let hi_i32 = _mm512_cvtepi8_epi32(interleaved_hi);
                             let lo_f = _mm512_cvtepi32_ps(lo_i32);
                             let hi_f = _mm512_cvtepi32_ps(hi_i32);
-                            // y_chunk[g_in_chunk*32 .. + 32] += combined × cols
-                            let y_off = g_in_chunk * GROUP_SIZE;
-                            let y_ptr_lo = y_chunk.as_mut_ptr().add(y_off);
-                            let y_ptr_hi = y_chunk.as_mut_ptr().add(y_off + 16);
-                            let y_lo = _mm512_loadu_ps(y_ptr_lo);
-                            let y_hi = _mm512_loadu_ps(y_ptr_hi);
-                            let y_lo_new = _mm512_fmadd_ps(combined, lo_f, y_lo);
-                            let y_hi_new = _mm512_fmadd_ps(combined, hi_f, y_hi);
-                            _mm512_storeu_ps(y_ptr_lo, y_lo_new);
-                            _mm512_storeu_ps(y_ptr_hi, y_hi_new);
+                            // Each group spans 2 zmm registers
+                            // (16 f32 lanes each). Indices into
+                            // the acc array: 2 * g_in_chunk and
+                            // 2 * g_in_chunk + 1.
+                            let v_idx = g_in_chunk * 2;
+                            acc[v_idx] = _mm512_fmadd_ps(combined, lo_f, acc[v_idx]);
+                            acc[v_idx + 1] = _mm512_fmadd_ps(combined, hi_f, acc[v_idx + 1]);
                         }
+                    }
+
+                    // Store accumulators back to y_chunk ONCE per
+                    // chunk.
+                    for v in 0..VECS_PER_CHUNK {
+                        _mm512_storeu_ps(y_chunk.as_mut_ptr().add(v * 16), acc[v]);
                     }
                 }
             });
