@@ -325,4 +325,150 @@ fn main() {
     println!("AXPY speedup approaches the kernel ceiling 1/active_frac modulo");
     println!("output-buffer write traffic (y[HIDDEN]=7168 reread+rewritten per");
     println!("active scalar) and the rayon-chunked-y scheduling overhead.");
+
+    // ===== Section 4: Full FFN forward — dense vs sparse vs sparse+AXPY =====
+    println!();
+    println!("---");
+    println!();
+    println!("# Full FFN forward at K2.6 active_frac (~0.74 measured on K2.6 τ=0.05)");
+    println!();
+    println!("Compares three FFN forward functions at K2.6 dims with a SYNTHETIC");
+    println!("active mask that matches the real K2.6 active_frac. This catches");
+    println!("per-call overhead the kernel-only benches above hide.");
+    println!();
+
+    use cascadia_int4_gemm::ffn_axpy::{transpose_requantize_down, FfnScratch};
+    use cascadia_int4_gemm::ffn_sparsity::{ffn_forward_sparse_axpy_f32, ffn_forward_sparse_f32};
+    use cascadia_int4_gemm::kernel::expert_forward;
+
+    let x_full: Vec<bf16> = (0..HIDDEN)
+        .map(|i| bf16::from_f32((i as f32) * 0.013 - 0.5))
+        .collect();
+    let x_full_f32: Vec<f32> = x_full.iter().map(|b| b.to_f32()).collect();
+
+    // Pre-build the transposed down for AXPY.
+    let (down_packed_t_full, down_scale_t_bits_full) =
+        transpose_requantize_down(&down_packed, &down_scale, HIDDEN, INTERMEDIATE);
+
+    let mut warm_dense = vec![bf16::ZERO; HIDDEN];
+    let mut warm_sparse = vec![0.0f32; HIDDEN];
+    let mut scratch = FfnScratch::new(HIDDEN, INTERMEDIATE);
+    // warmup
+    expert_forward(
+        &x_full,
+        &gate_packed,
+        &gate_scale,
+        &up_packed,
+        &up_scale,
+        &down_packed,
+        &down_scale,
+        &mut warm_dense,
+    );
+    let _ = ffn_forward_sparse_f32(
+        &x_full_f32,
+        HIDDEN,
+        INTERMEDIATE,
+        &gate_packed,
+        &gate_scale,
+        &up_packed,
+        &up_scale,
+        &down_packed,
+        &down_scale,
+        &mut warm_sparse,
+        0.05,
+    );
+    let _ = ffn_forward_sparse_axpy_f32(
+        &mut scratch,
+        &x_full_f32,
+        HIDDEN,
+        INTERMEDIATE,
+        &gate_packed,
+        &gate_scale,
+        &up_packed,
+        &up_scale,
+        &down_packed_t_full,
+        &down_scale_t_bits_full,
+        &mut warm_sparse,
+        0.05,
+    );
+
+    // Bench dense expert_forward (bf16 in/out).
+    let mut out_dense = vec![bf16::ZERO; HIDDEN];
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        expert_forward(
+            &x_full,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_dense,
+        );
+    }
+    let dense_full = t0.elapsed().as_secs_f64() / iters as f64;
+
+    // Bench ffn_forward_sparse_f32 at τ=0.05 (the PR #34 path).
+    let mut out_sp = vec![0.0f32; HIDDEN];
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = ffn_forward_sparse_f32(
+            &x_full_f32,
+            HIDDEN,
+            INTERMEDIATE,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_sp,
+            0.05,
+        );
+    }
+    let sp_full = t0.elapsed().as_secs_f64() / iters as f64;
+
+    // Bench ffn_forward_sparse_axpy_f32 at τ=0.05 (this PR).
+    let mut out_axpy = vec![0.0f32; HIDDEN];
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = ffn_forward_sparse_axpy_f32(
+            &mut scratch,
+            &x_full_f32,
+            HIDDEN,
+            INTERMEDIATE,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed_t_full,
+            &down_scale_t_bits_full,
+            &mut out_axpy,
+            0.05,
+        );
+    }
+    let axpy_full = t0.elapsed().as_secs_f64() / iters as f64;
+
+    println!("| path                          | per-expert-call | speedup vs dense |");
+    println!("| ----------------------------- | --------------- | ---------------- |");
+    println!(
+        "| `expert_forward` (dense bf16) | {:>15} | 1.00× (ref)      |",
+        fmt_us(dense_full)
+    );
+    println!(
+        "| `ffn_forward_sparse_f32` τ0.05 | {:>14} | {:<5.2}×           |",
+        fmt_us(sp_full),
+        dense_full / sp_full
+    );
+    println!(
+        "| `ffn_forward_sparse_axpy_f32` τ0.05 | {:>9} | {:<5.2}×           |",
+        fmt_us(axpy_full),
+        dense_full / axpy_full
+    );
+    println!();
+    println!("The full-FFN bench includes everything the runner pays per expert");
+    println!("call: gate matmul (full) + silu + threshold-mask build + up sparse +");
+    println!("elementwise + down (dense or AXPY). Use this number, not the");
+    println!("kernel-only numbers above, to predict end-to-end FFN-compute gain.");
 }
