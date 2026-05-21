@@ -27,6 +27,7 @@ windows-sys = { version = "0.59", features = [
 # (canonical reference decompression for cross-validation lives in
 # rainier/scripts/k26_export_per_expert_v2.py — we cross-validate the
 # Rust kernel against bytes-on-disk only).
+tempfile = { workspace = true }
 
 [[bench]]
 name = "expert_gemm"

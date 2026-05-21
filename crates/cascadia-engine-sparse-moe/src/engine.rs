@@ -83,6 +83,29 @@ pub struct SparseMoEBuilderConfig {
     /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
     /// quality. See rainier `docs/POWERINFER_PORT.md`.
     pub ffn_sparsity_threshold: f32,
+    /// Issue #35 — use the AXPY-form down kernel from
+    /// [`cascadia_int4_gemm::ffn_axpy`] in the sparse FFN path. Only
+    /// active when [`Self::ffn_sparsity_threshold`] > 0. Per-expert
+    /// transposed-and-requantized down weights are persisted to
+    /// [`Self::ffn_axpy_cache_dir`] (default
+    /// `<model_dir>/.cascadia_transposed_down_v1/`) and mmap'd at
+    /// runtime — this is the on-disk-cache fix that addresses PR #43's
+    /// initial mmap-page-cache-eviction regression (see rainier
+    /// `docs/AXPY_REGRESSION_ANALYSIS.md`).
+    pub ffn_axpy_down: bool,
+    /// Override location for the AXPY-form transposed-down cache.
+    /// `None` ⇒ `<model_dir>/.cascadia_transposed_down_v1/`. Set
+    /// to a fast local NVMe path if the model directory is on a
+    /// slow / read-only mount.
+    pub ffn_axpy_cache_dir: Option<PathBuf>,
+    /// When `true`, eagerly pre-build the AXPY transposed-down
+    /// cache for every `(layer, expert)` this rank may dispatch,
+    /// at `Builder::build` time. Avoids the in-line build cost on
+    /// the first prompt that touches each expert (recommended for
+    /// diverse-prompt production workloads). At K2.6 dimensions
+    /// the prebuild cost is ~7 min single-threaded or ~20 s with
+    /// rayon; disk cost ~190 GiB on top of the model.
+    pub ffn_axpy_prebuild: bool,
 }
 
 impl SparseMoEBuilderConfig {
@@ -103,6 +126,9 @@ impl SparseMoEBuilderConfig {
             spec_decode_k: None,
             kv_prefix_cache_size: 0,
             ffn_sparsity_threshold: 0.0,
+            ffn_axpy_down: false,
+            ffn_axpy_cache_dir: None,
+            ffn_axpy_prebuild: false,
         }
     }
 
@@ -148,6 +174,15 @@ impl SparseMoEBuilderConfig {
         self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
         self
     }
+
+    /// Issue #35 — enable the AXPY-form down kernel. Only has an
+    /// effect when `ffn_sparsity_threshold > 0`. Lazily builds + caches
+    /// transposed-and-requantized down weights per expert (~8.26 MiB
+    /// extra heap per cached expert at K2.6 dimensions).
+    pub fn with_ffn_axpy_down(mut self, on: bool) -> Self {
+        self.ffn_axpy_down = on;
+        self
+    }
 }
 
 /// Build the [`RunnerOptions`] from the engine config + environment.
@@ -182,9 +217,14 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
         resolved = ?max_cached_experts.map(NonZeroUsize::get),
         "resolved expert-cache LRU cap (None = unbounded)"
     );
+    // `ffn_axpy_prebuild` is consumed in `Builder::build` after the
+    // Runner is constructed, not via RunnerOptions — keeps the
+    // Runner constructor side-effect-free.
     RunnerOptions {
         max_cached_experts,
         ffn_sparsity_threshold: cfg.ffn_sparsity_threshold,
+        ffn_axpy_down: cfg.ffn_axpy_down,
+        ffn_axpy_cache_dir: cfg.ffn_axpy_cache_dir.clone(),
     }
 }
 
@@ -359,6 +399,12 @@ impl Builder for SparseMoEBuilder {
         runner.set_top_k_override(self.config.top_k_override);
         runner.set_routing_threshold(self.config.routing_threshold);
         runner.set_ffn_sparsity_threshold(self.config.ffn_sparsity_threshold);
+        runner.set_ffn_axpy_down(self.config.ffn_axpy_down);
+        if self.config.ffn_axpy_prebuild {
+            runner
+                .prebuild_axpy_cache()
+                .map_err(|e| EngineError::Backend(format!("AXPY prebuild: {e}")))?;
+        }
 
         // Tokenizer is only needed on rank 0 (the API rank).
         if rank == 0 {

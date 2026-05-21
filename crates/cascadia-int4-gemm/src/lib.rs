@@ -27,6 +27,7 @@
 //! pipeline.
 
 pub mod c_ffi;
+pub mod ffn_axpy;
 pub mod ffn_sparsity;
 pub mod format;
 pub mod kernel;
@@ -38,7 +39,11 @@ pub mod layer0_int4;
 pub mod safetensors_source;
 pub mod shell;
 pub mod shell_int4;
+pub mod transposed_down_store;
 
+pub use ffn_axpy::{
+    dequant_axpy_int4_active, dequant_axpy_int4_active_auto, transpose_requantize_down, FfnScratch,
+};
 pub use ffn_sparsity::{
     build_active_mask, dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto,
     expert_forward_sparse, ffn_forward_sparse_f32,
@@ -49,6 +54,7 @@ pub use kernel_avx512::dequant_gemv_int4_auto;
 pub use kernel_avx512_multi::dequant_gemm_int4_multi_auto;
 pub use kernel_avx512_multi_blocked::dequant_gemm_int4_multi_blocked_auto;
 pub use safetensors_source::{SafetensorsExpert, SafetensorsExpertSource, SafetensorsLayer0};
+pub use transposed_down_store::{StoreError, TransposedDownMmap, TransposedDownStore};
 
 // Architecture constants for K2.6 — exposed as constants so the kernel
 // and the on-disk format agree.
