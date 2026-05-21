@@ -28,7 +28,9 @@
 
 pub mod c_ffi;
 pub mod ffn_axpy;
+pub mod ffn_capture;
 pub mod ffn_sparsity;
+pub mod ffn_thresholds;
 pub mod format;
 pub mod kernel;
 pub mod kernel_avx512;
@@ -44,9 +46,17 @@ pub mod transposed_down_store;
 pub use ffn_axpy::{
     dequant_axpy_int4_active, dequant_axpy_int4_active_auto, transpose_requantize_down, FfnScratch,
 };
+pub use ffn_capture::{
+    CaptureError, GateCaptureState, LayerCapture, CAPTURE_FILE_MAGIC, N_BINS as CAPTURE_N_BINS,
+};
 pub use ffn_sparsity::{
-    build_active_mask, dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto,
-    expert_forward_sparse, ffn_forward_sparse_f32,
+    build_active_mask, build_active_mask_mode, build_active_mask_per_channel,
+    dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto, expert_forward_sparse,
+    expert_forward_sparse_mode, expert_forward_sparse_per_channel, ffn_forward_sparse_f32,
+    ffn_forward_sparse_f32_mode, ffn_forward_sparse_f32_per_channel, SparsityMode,
+};
+pub use ffn_thresholds::{
+    LayerThresholds, PerChannelThresholds, ThresholdsError, THRESHOLDS_FILE_VERSION,
 };
 pub use format::{bf16_bits_to_f32, f32_to_bf16_bits, ExpertWeights, GemmError};
 pub use kernel::{dequant_gemv_int4, expert_forward};

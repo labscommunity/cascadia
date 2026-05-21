@@ -53,6 +53,44 @@ use rayon::prelude::*;
 use crate::format::bf16_bits_to_f32;
 use crate::GROUP_SIZE;
 
+/// How the active-lane cutoff is computed.
+///
+/// - `Global(τ)` — a single scalar threshold, applied as `cutoff[i] = τ ·
+///   max_j|silu(gate[j])|` for every lane `i`. This is the CATS / global-τ
+///   formulation (Lee et al. 2024).
+/// - `PerChannel(τ)` — one threshold per intermediate channel, applied as
+///   `cutoff[i] = τ[i] · max_j|silu(gate[j])|`. This is the CHESS
+///   formulation (Liu et al. 2024). The expected source for the `τ[i]`
+///   vector is offline calibration on a representative corpus:
+///   `τ[i] = quantile_{1-active_frac}(|silu(gate[i])| / max_j|silu(gate[j])|)`.
+///
+/// With a `PerChannel(τ)` slice of length `intermediate` and all entries
+/// equal to a single value `τ0`, the mask must be bit-identical to
+/// `Global(τ0)`. That invariant is locked by the unit test
+/// `per_channel_uniform_matches_global` below.
+#[derive(Debug, Clone, Copy)]
+pub enum SparsityMode<'a> {
+    /// One scalar threshold for every channel.
+    Global(f32),
+    /// Per-channel threshold vector; `len()` must equal the intermediate
+    /// dimension at the call site.
+    PerChannel(&'a [f32]),
+}
+
+impl<'a> SparsityMode<'a> {
+    /// `true` when this mode would short-circuit to "all lanes active"
+    /// (no mask construction needed). For `Global`, that's `τ <= 0`. For
+    /// `PerChannel`, every entry must be `<= 0` for the short-circuit;
+    /// otherwise we still walk the full lane set (an empty per-channel
+    /// vector is treated as dense).
+    fn is_dense(&self) -> bool {
+        match self {
+            SparsityMode::Global(t) => *t <= 0.0,
+            SparsityMode::PerChannel(ts) => ts.is_empty() || ts.iter().all(|&t| t <= 0.0),
+        }
+    }
+}
+
 /// Build the active-lane mask for a sparse FFN forward pass.
 ///
 /// Returns `(silu_gate, active_indices)`:
@@ -67,6 +105,31 @@ use crate::GROUP_SIZE;
 /// `|silu(gate)|`, which makes a single threshold value usable across
 /// model layers and inputs of different scales.
 pub fn build_active_mask(gate_out: &[f32], threshold: f32) -> (Vec<f32>, Vec<u32>) {
+    build_active_mask_mode(gate_out, SparsityMode::Global(threshold))
+}
+
+/// Per-channel variant of [`build_active_mask`].
+///
+/// `thresholds.len()` must equal `gate_out.len()` (the intermediate
+/// dimension); the mask is built with `cutoff[i] = thresholds[i] *
+/// max_j|silu(gate[j])|`. Useful when the threshold vector was
+/// calibrated offline per the CHESS recipe.
+pub fn build_active_mask_per_channel(gate_out: &[f32], thresholds: &[f32]) -> (Vec<f32>, Vec<u32>) {
+    assert_eq!(
+        gate_out.len(),
+        thresholds.len(),
+        "per-channel thresholds length {} != gate_out length {}",
+        thresholds.len(),
+        gate_out.len(),
+    );
+    build_active_mask_mode(gate_out, SparsityMode::PerChannel(thresholds))
+}
+
+/// Mode-aware mask builder shared by [`build_active_mask`] and
+/// [`build_active_mask_per_channel`]. Computes `silu(gate)` once,
+/// tracks the per-token max, then applies the per-mode cutoff in a
+/// second pass.
+pub fn build_active_mask_mode(gate_out: &[f32], mode: SparsityMode<'_>) -> (Vec<f32>, Vec<u32>) {
     let n = gate_out.len();
     // Phase 1: silu element-wise and track max-abs.
     let mut silu_gate = vec![0.0f32; n];
@@ -85,17 +148,34 @@ pub fn build_active_mask(gate_out: &[f32], threshold: f32) -> (Vec<f32>, Vec<u32
             max_abs = m;
         }
     }
-    if threshold <= 0.0 || max_abs == 0.0 {
+    if max_abs == 0.0 || mode.is_dense() {
         // No skip: all lanes active.
         let all = (0..n as u32).collect();
         return (silu_gate, all);
     }
-    let cutoff = threshold * max_abs;
-    let active: Vec<u32> = silu_gate
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| (v.abs() >= cutoff).then_some(i as u32))
-        .collect();
+    let active: Vec<u32> = match mode {
+        SparsityMode::Global(threshold) => {
+            let cutoff = threshold * max_abs;
+            silu_gate
+                .iter()
+                .enumerate()
+                .filter_map(|(i, v)| (v.abs() >= cutoff).then_some(i as u32))
+                .collect()
+        }
+        SparsityMode::PerChannel(thresholds) => {
+            // `thresholds.len() == n` is enforced by the public entry
+            // point [`build_active_mask_per_channel`]; debug-assert
+            // here so direct callers of [`build_active_mask_mode`]
+            // also fail loud in dev builds.
+            debug_assert_eq!(thresholds.len(), n);
+            silu_gate
+                .iter()
+                .zip(thresholds.iter())
+                .enumerate()
+                .filter_map(|(i, (v, &t))| (v.abs() >= t * max_abs).then_some(i as u32))
+                .collect()
+        }
+    };
     (silu_gate, active)
 }
 
@@ -304,6 +384,71 @@ pub fn ffn_forward_sparse_f32(
     out_f32: &mut [f32],
     threshold: f32,
 ) -> f32 {
+    ffn_forward_sparse_f32_mode(
+        x_f32,
+        hidden,
+        intermediate,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed,
+        down_scale,
+        out_f32,
+        SparsityMode::Global(threshold),
+    )
+}
+
+/// Per-channel-τ variant of [`ffn_forward_sparse_f32`].
+///
+/// `thresholds.len()` must equal `intermediate`. With every entry equal
+/// to `τ0`, this is bit-identical to `ffn_forward_sparse_f32(..., τ0)`
+/// (verified by `per_channel_uniform_matches_global` below).
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_forward_sparse_f32_per_channel(
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed: &[u8],
+    down_scale: &[u8],
+    out_f32: &mut [f32],
+    thresholds: &[f32],
+) -> f32 {
+    ffn_forward_sparse_f32_mode(
+        x_f32,
+        hidden,
+        intermediate,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed,
+        down_scale,
+        out_f32,
+        SparsityMode::PerChannel(thresholds),
+    )
+}
+
+/// Mode-aware variant of [`ffn_forward_sparse_f32`] — body shared by
+/// the global-τ and per-channel-τ entry points.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_forward_sparse_f32_mode(
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed: &[u8],
+    down_scale: &[u8],
+    out_f32: &mut [f32],
+    mode: SparsityMode<'_>,
+) -> f32 {
     debug_assert_eq!(x_f32.len(), hidden);
     debug_assert_eq!(out_f32.len(), hidden);
 
@@ -318,7 +463,7 @@ pub fn ffn_forward_sparse_f32(
         &mut gate_out,
     );
 
-    if threshold <= 0.0 {
+    if mode.is_dense() {
         // Dense path: SwiGLU as usual. Bit-identical to the pre-port
         // inline gate/up/down sequence in layer0_int4.rs and
         // shell_int4.rs — uses the same kernel calls in the same order
@@ -352,7 +497,7 @@ pub fn ffn_forward_sparse_f32(
     }
 
     // Sparse path: SiLU + threshold → mask → sparse up + elementwise + down.
-    let (silu_gate, active) = build_active_mask(&gate_out, threshold);
+    let (silu_gate, active) = build_active_mask_mode(&gate_out, mode);
     let active_frac = active.len() as f32 / intermediate as f32;
 
     let mut up_out = vec![0.0f32; intermediate];
@@ -436,6 +581,75 @@ pub fn ffn_forward_sparse_axpy_f32(
     out_f32: &mut [f32],
     threshold: f32,
 ) -> f32 {
+    ffn_forward_sparse_axpy_f32_mode(
+        scratch,
+        x_f32,
+        hidden,
+        intermediate,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed_t,
+        down_scale_t_bits,
+        out_f32,
+        SparsityMode::Global(threshold),
+    )
+}
+
+/// Per-channel-τ variant of [`ffn_forward_sparse_axpy_f32`].
+///
+/// `thresholds.len()` must equal `intermediate`. With every entry equal
+/// to `τ0`, this is bit-identical to `ffn_forward_sparse_axpy_f32(...,
+/// τ0)` (verified by `axpy_per_channel_uniform_matches_global` below).
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_forward_sparse_axpy_f32_per_channel(
+    scratch: &mut crate::ffn_axpy::FfnScratch,
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed_t: &[u8],
+    down_scale_t_bits: &[u8],
+    out_f32: &mut [f32],
+    thresholds: &[f32],
+) -> f32 {
+    ffn_forward_sparse_axpy_f32_mode(
+        scratch,
+        x_f32,
+        hidden,
+        intermediate,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed_t,
+        down_scale_t_bits,
+        out_f32,
+        SparsityMode::PerChannel(thresholds),
+    )
+}
+
+/// Mode-aware AXPY-form sparse SwiGLU FFN — body shared by the global-
+/// τ and per-channel-τ entry points.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_forward_sparse_axpy_f32_mode(
+    scratch: &mut crate::ffn_axpy::FfnScratch,
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed_t: &[u8],
+    down_scale_t_bits: &[u8],
+    out_f32: &mut [f32],
+    mode: SparsityMode<'_>,
+) -> f32 {
     debug_assert_eq!(x_f32.len(), hidden);
     debug_assert_eq!(out_f32.len(), hidden);
     scratch.resize_for(hidden, intermediate);
@@ -464,16 +678,26 @@ pub fn ffn_forward_sparse_axpy_f32(
             max_abs = m;
         }
     }
-    if threshold <= 0.0 || max_abs == 0.0 {
+    if max_abs == 0.0 || mode.is_dense() {
         // All lanes active — AXPY-form over the full intermediate.
-        for i in 0..intermediate {
-            scratch.active.push(i as u32);
-        }
+        scratch.active.extend(0..intermediate as u32);
     } else {
-        let cutoff = threshold * max_abs;
-        for i in 0..intermediate {
-            if silu_gate[i].abs() >= cutoff {
-                scratch.active.push(i as u32);
+        match mode {
+            SparsityMode::Global(threshold) => {
+                let cutoff = threshold * max_abs;
+                for (i, &v) in silu_gate.iter().enumerate() {
+                    if v.abs() >= cutoff {
+                        scratch.active.push(i as u32);
+                    }
+                }
+            }
+            SparsityMode::PerChannel(thresholds) => {
+                debug_assert_eq!(thresholds.len(), intermediate);
+                for (i, (&v, &t)) in silu_gate.iter().zip(thresholds.iter()).enumerate() {
+                    if v.abs() >= t * max_abs {
+                        scratch.active.push(i as u32);
+                    }
+                }
             }
         }
     }
@@ -541,7 +765,63 @@ pub fn expert_forward_sparse(
     out_bf16: &mut [bf16],
     threshold: f32,
 ) -> f32 {
-    if threshold <= 0.0 {
+    expert_forward_sparse_mode(
+        x_bf16,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed,
+        down_scale,
+        out_bf16,
+        SparsityMode::Global(threshold),
+    )
+}
+
+/// Per-channel-τ variant of [`expert_forward_sparse`].
+///
+/// `thresholds.len()` must equal the intermediate dim implied by
+/// `gate_scale.len() / 2 / (hidden / GROUP_SIZE)`.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_forward_sparse_per_channel(
+    x_bf16: &[bf16],
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed: &[u8],
+    down_scale: &[u8],
+    out_bf16: &mut [bf16],
+    thresholds: &[f32],
+) -> f32 {
+    expert_forward_sparse_mode(
+        x_bf16,
+        gate_packed,
+        gate_scale,
+        up_packed,
+        up_scale,
+        down_packed,
+        down_scale,
+        out_bf16,
+        SparsityMode::PerChannel(thresholds),
+    )
+}
+
+/// Mode-aware variant of [`expert_forward_sparse`] — body shared by the
+/// global-τ and per-channel-τ entry points.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_forward_sparse_mode(
+    x_bf16: &[bf16],
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed: &[u8],
+    down_scale: &[u8],
+    out_bf16: &mut [bf16],
+    mode: SparsityMode<'_>,
+) -> f32 {
+    if mode.is_dense() {
         // Dense fallback: delegate to the existing path so output is
         // byte-identical to pre-port. (The f32 dense path in
         // `ffn_forward_sparse_f32` should also be byte-identical, but
@@ -568,7 +848,7 @@ pub fn expert_forward_sparse(
         x_f32[i] = b.to_f32();
     }
     let mut out_f32 = vec![0.0f32; hidden];
-    let active_frac = ffn_forward_sparse_f32(
+    let active_frac = ffn_forward_sparse_f32_mode(
         &x_f32,
         hidden,
         intermediate,
@@ -579,7 +859,7 @@ pub fn expert_forward_sparse(
         down_packed,
         down_scale,
         &mut out_f32,
-        threshold,
+        mode,
     );
     for (i, v) in out_f32.iter().enumerate() {
         out_bf16[i] = bf16::from_f32(*v);
@@ -1066,5 +1346,307 @@ mod tests {
             max_dev <= tol,
             "AXPY-form diverged from dense sparse at τ=0.10: max_dev={max_dev} max_dense={max_dense} tol={tol}",
         );
+    }
+
+    /// `build_active_mask_per_channel` with a uniform threshold vector
+    /// must produce the same mask as `build_active_mask` at the same
+    /// scalar value. Pins the per-channel formulation to the global-τ
+    /// formulation when the calibration says "every channel is equal."
+    #[test]
+    fn per_channel_uniform_matches_global() {
+        // 16-lane gate output with a wide magnitude spread so the
+        // threshold actually filters something.
+        let gate_out: Vec<f32> = (0..16)
+            .map(|i| {
+                let s = if i % 2 == 0 { 1.0 } else { -1.0 };
+                s * ((i + 1) as f32) * 0.5
+            })
+            .collect();
+        for τ in [0.05f32, 0.10, 0.20, 0.50, 0.95] {
+            let (silu_g, active_g) = build_active_mask(&gate_out, τ);
+            let τ_vec = vec![τ; gate_out.len()];
+            let (silu_pc, active_pc) = build_active_mask_per_channel(&gate_out, &τ_vec);
+            for (i, (a, b)) in silu_g.iter().zip(silu_pc.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "lane {i}: silu mismatch at τ={τ}: {a} vs {b}",
+                );
+            }
+            assert_eq!(
+                active_g, active_pc,
+                "active set mismatch at τ={τ}: global={active_g:?} per-channel={active_pc:?}",
+            );
+        }
+    }
+
+    /// `build_active_mask_per_channel` with a non-uniform threshold
+    /// vector drops the lanes flagged by their per-channel cutoff and
+    /// keeps the others. Locks the per-channel semantics: a high τ[i]
+    /// excludes lane i even when its `|silu(gate[i])|` would clear a
+    /// lower global threshold.
+    #[test]
+    fn per_channel_nonuniform_drops_expected_lanes() {
+        // 4 lanes; silu(10)≈10, silu(5)≈4.97, silu(1)≈0.73, silu(0.1)≈0.052.
+        // max_abs ≈ 10. Ratios ≈ [1.0, 0.497, 0.073, 0.0052].
+        let gate_out = vec![10.0f32, 5.0, 1.0, 0.1];
+        // Per-channel thresholds:
+        //   lane 0: 0.0  → always active.
+        //   lane 1: 0.6  → cutoff 6.0 > 4.97 → dropped.
+        //   lane 2: 0.05 → cutoff 0.5 < 0.73 → kept.
+        //   lane 3: 0.5  → cutoff 5.0 > 0.052 → dropped.
+        let τ = vec![0.0f32, 0.6, 0.05, 0.5];
+        let (_silu, active) = build_active_mask_per_channel(&gate_out, &τ);
+        assert!(active.contains(&0), "lane 0 (τ=0) must always pass");
+        assert!(!active.contains(&1), "lane 1: |silu|≈4.97 < τ·max=6.0");
+        assert!(active.contains(&2), "lane 2: |silu|≈0.73 ≥ τ·max=0.5");
+        assert!(!active.contains(&3), "lane 3: |silu|≈0.052 < τ·max=5.0");
+    }
+
+    /// All-zero per-channel thresholds short-circuit to "all lanes
+    /// active" exactly like `Global(0.0)` — no mask construction and
+    /// the SparsityMode::is_dense() fast path fires.
+    #[test]
+    fn per_channel_all_zero_is_dense() {
+        let gate_out = vec![1.0f32, -2.0, 0.5, -0.1];
+        let τ = vec![0.0f32; 4];
+        let (_silu, active) = build_active_mask_per_channel(&gate_out, &τ);
+        assert_eq!(active, vec![0, 1, 2, 3]);
+    }
+
+    /// `ffn_forward_sparse_f32_per_channel` with a uniform τ vector
+    /// produces output bit-identical to `ffn_forward_sparse_f32` at
+    /// the same scalar τ. This is the contract that lets us collapse
+    /// the dispatcher's per-channel and global-τ paths under a single
+    /// kernel body.
+    #[test]
+    fn ffn_f32_per_channel_uniform_matches_global() {
+        use crate::kernel_avx512::dequant_gemv_int4_auto;
+        let _ = dequant_gemv_int4_auto;
+        let hidden = 32;
+        let intermediate = 32;
+        let n_in_groups = hidden / GROUP_SIZE;
+        let n_mid_groups = intermediate / GROUP_SIZE;
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * n_in_groups * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * n_mid_groups * 2)
+            .collect();
+        let x_f32: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.05 - 0.5).collect();
+
+        for τ in [0.0f32, 0.05, 0.10, 0.30] {
+            let mut out_global = vec![0.0f32; hidden];
+            let af_g = ffn_forward_sparse_f32(
+                &x_f32,
+                hidden,
+                intermediate,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed,
+                &down_scale,
+                &mut out_global,
+                τ,
+            );
+            let τ_vec = vec![τ; intermediate];
+            let mut out_per_channel = vec![0.0f32; hidden];
+            let af_pc = ffn_forward_sparse_f32_per_channel(
+                &x_f32,
+                hidden,
+                intermediate,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed,
+                &down_scale,
+                &mut out_per_channel,
+                &τ_vec,
+            );
+            assert_eq!(
+                af_g.to_bits(),
+                af_pc.to_bits(),
+                "τ={τ}: active_frac mismatch: global={af_g} per_channel={af_pc}",
+            );
+            for h in 0..hidden {
+                assert_eq!(
+                    out_global[h].to_bits(),
+                    out_per_channel[h].to_bits(),
+                    "τ={τ}, h={h}: out mismatch: global={} per_channel={}",
+                    out_global[h],
+                    out_per_channel[h],
+                );
+            }
+        }
+    }
+
+    /// `ffn_forward_sparse_axpy_f32_per_channel` with a uniform τ
+    /// vector produces output bit-identical to the global-τ AXPY
+    /// path at the same scalar τ. Locks the same invariant for the
+    /// AXPY-down kernel.
+    #[test]
+    fn axpy_per_channel_uniform_matches_global() {
+        use crate::ffn_axpy::{transpose_requantize_down, FfnScratch};
+        let hidden = 64;
+        let intermediate = 64;
+        let n_in_groups = hidden / GROUP_SIZE;
+        let n_mid_groups = intermediate / GROUP_SIZE;
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * n_in_groups * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * n_mid_groups * 2)
+            .collect();
+        let x_f32: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.05 - 0.5).collect();
+        let (down_packed_t, down_scale_t_bits) =
+            transpose_requantize_down(&down_packed, &down_scale, hidden, intermediate);
+
+        for τ in [0.0f32, 0.05, 0.10, 0.30] {
+            let mut scratch_g = FfnScratch::new(hidden, intermediate);
+            let mut out_global = vec![0.0f32; hidden];
+            let af_g = ffn_forward_sparse_axpy_f32(
+                &mut scratch_g,
+                &x_f32,
+                hidden,
+                intermediate,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed_t,
+                &down_scale_t_bits,
+                &mut out_global,
+                τ,
+            );
+            let τ_vec = vec![τ; intermediate];
+            let mut scratch_pc = FfnScratch::new(hidden, intermediate);
+            let mut out_pc = vec![0.0f32; hidden];
+            let af_pc = ffn_forward_sparse_axpy_f32_per_channel(
+                &mut scratch_pc,
+                &x_f32,
+                hidden,
+                intermediate,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed_t,
+                &down_scale_t_bits,
+                &mut out_pc,
+                &τ_vec,
+            );
+            assert_eq!(
+                af_g.to_bits(),
+                af_pc.to_bits(),
+                "τ={τ}: active_frac mismatch"
+            );
+            for h in 0..hidden {
+                assert_eq!(
+                    out_global[h].to_bits(),
+                    out_pc[h].to_bits(),
+                    "τ={τ}, h={h}: AXPY out mismatch: global={} per_channel={}",
+                    out_global[h],
+                    out_pc[h],
+                );
+            }
+        }
+    }
+
+    /// `expert_forward_sparse_per_channel` is the bf16-boundary public
+    /// surface; with uniform τ it matches `expert_forward_sparse` at
+    /// the same scalar.
+    #[test]
+    fn expert_forward_per_channel_uniform_matches_global() {
+        let hidden = 32;
+        let intermediate = 32;
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * (hidden / GROUP_SIZE) * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * (intermediate / GROUP_SIZE) * 2)
+            .collect();
+        let x: Vec<bf16> = (0..hidden)
+            .map(|i| bf16::from_f32((i as f32) * 0.05 - 0.5))
+            .collect();
+        let mut out_global = vec![bf16::ZERO; hidden];
+        let τ = 0.10f32;
+        let af_g = expert_forward_sparse(
+            &x,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_global,
+            τ,
+        );
+        let τ_vec = vec![τ; intermediate];
+        let mut out_pc = vec![bf16::ZERO; hidden];
+        let af_pc = expert_forward_sparse_per_channel(
+            &x,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_pc,
+            &τ_vec,
+        );
+        assert_eq!(af_g.to_bits(), af_pc.to_bits(), "active_frac mismatch");
+        for h in 0..hidden {
+            assert_eq!(
+                out_global[h].to_bits(),
+                out_pc[h].to_bits(),
+                "h={h}: bf16 out mismatch",
+            );
+        }
+    }
+
+    /// Per-channel mask drops more aggressively than a global τ when
+    /// the calibrated thresholds for the heavy-magnitude lanes are
+    /// higher than the global value. Sanity-checks that the per-
+    /// channel formulation can do something the global-τ formulation
+    /// cannot.
+    #[test]
+    fn per_channel_can_be_stricter_than_global() {
+        // gate_out → silu_gate magnitudes: [10, 5, 1, 0.1]; max = 10.
+        let gate_out = vec![10.0f32, 5.0, 1.0, 0.1];
+        // Global τ=0.05 → cutoff 0.5 → active = [0,1,2] (lane 3 drops).
+        let (_, active_global) = build_active_mask(&gate_out, 0.05);
+        assert_eq!(active_global, vec![0, 1, 2]);
+        // Per-channel τ that targets a 25%-active rate: keep only the
+        // top lane. lane 0 τ=0.05, lane 1 τ=0.6 (drops 4.97),
+        // lane 2 τ=0.5 (drops 0.73), lane 3 τ=0.5.
+        let τ = vec![0.05f32, 0.6, 0.5, 0.5];
+        let (_, active_pc) = build_active_mask_per_channel(&gate_out, &τ);
+        assert_eq!(active_pc, vec![0]);
     }
 }
