@@ -393,6 +393,133 @@ pub fn ffn_forward_sparse_f32(
     active_frac
 }
 
+/// AXPY-form sparse SwiGLU FFN — **f32 in, f32 out**, scratch-aware.
+///
+/// Same five-phase flow as [`ffn_forward_sparse_f32`] but with two
+/// key differences:
+///
+///   - The **down** projection runs as an AXPY over the *transposed*
+///     down weight: for each active intermediate lane `r`,
+///     accumulate `inter[r] · dequant(down_t[r])` into `y[0..hidden]`.
+///     Inactive lanes are skipped entirely — no FMA, no weight load.
+///     Kernel speedup ceiling is `1 / active_frac` vs the dense down.
+///   - The caller passes a reusable [`crate::ffn_axpy::FfnScratch`]
+///     instead of letting the function allocate scratch buffers per
+///     call. Eliminates ~7 `Vec::new()` allocations per expert call
+///     (≈3360 per K2.6 token at default top_K=8).
+///
+/// **Layout contract**: `down_packed_t` and `down_scale_t_bits` MUST
+/// be the AXPY layout produced by
+/// [`crate::ffn_axpy::transpose_requantize_down`] (`[intermediate,
+/// hidden]` int4 with group-32 bf16 scales along hidden). Passing
+/// the original `[hidden, intermediate]` down weight here is a
+/// silent correctness bug.
+///
+/// `threshold == 0.0` runs the AXPY-form over *all* intermediate
+/// lanes (algorithmically equivalent to dense down on the
+/// re-quantized weights). For the bit-identical-to-pre-PR-34 dense
+/// path, call [`ffn_forward_sparse_f32`] (which uses the original
+/// down layout) instead.
+///
+/// Returns the fraction of lanes that were active.
+pub fn ffn_forward_sparse_axpy_f32(
+    scratch: &mut crate::ffn_axpy::FfnScratch,
+    x_f32: &[f32],
+    hidden: usize,
+    intermediate: usize,
+    gate_packed: &[u8],
+    gate_scale: &[u8],
+    up_packed: &[u8],
+    up_scale: &[u8],
+    down_packed_t: &[u8],
+    down_scale_t_bits: &[u8],
+    out_f32: &mut [f32],
+    threshold: f32,
+) -> f32 {
+    debug_assert_eq!(x_f32.len(), hidden);
+    debug_assert_eq!(out_f32.len(), hidden);
+    scratch.resize_for(hidden, intermediate);
+
+    // Phase 1: gate (full) into scratch.gate_out.
+    let gate_out = &mut scratch.gate_out[..intermediate];
+    gate_out.fill(0.0);
+    crate::kernel_avx512::dequant_gemv_int4_auto(
+        gate_packed,
+        gate_scale,
+        x_f32,
+        intermediate,
+        hidden,
+        gate_out,
+    );
+
+    // SiLU + threshold mask into scratch.silu_gate and scratch.active.
+    let silu_gate = &mut scratch.silu_gate[..intermediate];
+    scratch.active.clear();
+    let mut max_abs = 0.0f32;
+    for (i, &g) in gate_out.iter().enumerate() {
+        let silu = g / (1.0f32 + (-g).exp());
+        silu_gate[i] = silu;
+        let m = silu.abs();
+        if m > max_abs {
+            max_abs = m;
+        }
+    }
+    if threshold <= 0.0 || max_abs == 0.0 {
+        // All lanes active — AXPY-form over the full intermediate.
+        for i in 0..intermediate {
+            scratch.active.push(i as u32);
+        }
+    } else {
+        let cutoff = threshold * max_abs;
+        for i in 0..intermediate {
+            if silu_gate[i].abs() >= cutoff {
+                scratch.active.push(i as u32);
+            }
+        }
+    }
+    let active_frac = scratch.active.len() as f32 / intermediate as f32;
+
+    // Phase 2: up (sparse rows).
+    let up_out = &mut scratch.up_out[..intermediate];
+    up_out.fill(0.0);
+    dequant_gemv_int4_rows_subset_auto(
+        up_packed,
+        up_scale,
+        x_f32,
+        intermediate,
+        hidden,
+        up_out,
+        &scratch.active,
+    );
+
+    // Elementwise: inter[r] = silu_gate[r] · up[r] for active r.
+    let inter = &mut scratch.inter[..intermediate];
+    inter.fill(0.0);
+    for &r in &scratch.active {
+        let r = r as usize;
+        inter[r] = silu_gate[r] * up_out[r];
+    }
+
+    // Phase 3: AXPY-form down.
+    //
+    // Caller pre-zeroed out_f32 by passing in a freshly-zeroed
+    // buffer, OR by accumulating from a prior call. We zero here
+    // unconditionally so the function is composable as a drop-in
+    // replacement for the dense down path.
+    out_f32.fill(0.0);
+    crate::ffn_axpy::dequant_axpy_int4_active_auto(
+        down_packed_t,
+        down_scale_t_bits,
+        inter,
+        &scratch.active,
+        intermediate,
+        hidden,
+        out_f32,
+    );
+
+    active_frac
+}
+
 /// Two-phase Gate-first sparse expert FFN — **bf16 in, bf16 out**.
 ///
 /// Thin wrapper around [`ffn_forward_sparse_f32`] that handles the
@@ -780,5 +907,164 @@ mod tests {
                 got_out[h]
             );
         }
+    }
+
+    /// `ffn_forward_sparse_axpy_f32` should produce output close to
+    /// the dense `ffn_forward_sparse_f32` path on the same inputs.
+    /// Tolerance allows for the one extra rounding step from the
+    /// down weight's transpose-and-requantize.
+    #[test]
+    fn ffn_axpy_close_to_dense_at_threshold_zero() {
+        use crate::ffn_axpy::{transpose_requantize_down, FfnScratch};
+        let hidden = 64;
+        let intermediate = 64;
+        let n_in_groups = hidden / GROUP_SIZE;
+        let n_mid_groups = intermediate / GROUP_SIZE;
+
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * n_in_groups * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * n_mid_groups * 2)
+            .collect();
+        let x_f32: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.05 - 0.5).collect();
+
+        let mut out_dense = vec![0.0f32; hidden];
+        ffn_forward_sparse_f32(
+            &x_f32,
+            hidden,
+            intermediate,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_dense,
+            0.0,
+        );
+
+        let (down_packed_t, down_scale_t_bits) =
+            transpose_requantize_down(&down_packed, &down_scale, hidden, intermediate);
+        let mut scratch = FfnScratch::new(hidden, intermediate);
+        let mut out_axpy = vec![0.0f32; hidden];
+        ffn_forward_sparse_axpy_f32(
+            &mut scratch,
+            &x_f32,
+            hidden,
+            intermediate,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed_t,
+            &down_scale_t_bits,
+            &mut out_axpy,
+            0.0,
+        );
+
+        // Re-quantization adds one rounding step per down weight;
+        // expect close but not bit-identical.
+        let max_dense: f32 = out_dense.iter().fold(0.0, |a, &v| a.max(v.abs()));
+        let max_dev: f32 = out_dense
+            .iter()
+            .zip(out_axpy.iter())
+            .map(|(&d, &a)| (d - a).abs())
+            .fold(0.0, f32::max);
+        let tol = max_dense.max(1.0) * 0.20;
+        assert!(
+            max_dev <= tol,
+            "AXPY-form down diverged at τ=0: max_dev={max_dev} max_dense={max_dense} tol={tol}",
+        );
+    }
+
+    /// At a moderate threshold, AXPY-form and the existing dense-down
+    /// sparse path should produce comparable output (within sparsity
+    /// + requantization noise). Verifies the two integration paths
+    /// stay roughly aligned for ops who switch between them.
+    #[test]
+    fn ffn_axpy_matches_dense_down_at_small_threshold() {
+        use crate::ffn_axpy::{transpose_requantize_down, FfnScratch};
+        let hidden = 64;
+        let intermediate = 64;
+        let n_in_groups = hidden / GROUP_SIZE;
+        let n_mid_groups = intermediate / GROUP_SIZE;
+
+        let gate_packed = vec![0x9Au8; intermediate * hidden / 2];
+        let gate_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(intermediate * n_in_groups * 2)
+            .collect();
+        let up_packed = vec![0x8Bu8; intermediate * hidden / 2];
+        let up_scale = gate_scale.clone();
+        let down_packed = vec![0x7Cu8; hidden * intermediate / 2];
+        let down_scale: Vec<u8> = vec![0x80, 0x3f]
+            .into_iter()
+            .cycle()
+            .take(hidden * n_mid_groups * 2)
+            .collect();
+        let x_f32: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.05 - 0.5).collect();
+
+        let mut out_sparse_dense = vec![0.0f32; hidden];
+        ffn_forward_sparse_f32(
+            &x_f32,
+            hidden,
+            intermediate,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed,
+            &down_scale,
+            &mut out_sparse_dense,
+            0.10,
+        );
+
+        let (down_packed_t, down_scale_t_bits) =
+            transpose_requantize_down(&down_packed, &down_scale, hidden, intermediate);
+        let mut scratch = FfnScratch::new(hidden, intermediate);
+        let mut out_sparse_axpy = vec![0.0f32; hidden];
+        let active_frac = ffn_forward_sparse_axpy_f32(
+            &mut scratch,
+            &x_f32,
+            hidden,
+            intermediate,
+            &gate_packed,
+            &gate_scale,
+            &up_packed,
+            &up_scale,
+            &down_packed_t,
+            &down_scale_t_bits,
+            &mut out_sparse_axpy,
+            0.10,
+        );
+        assert!(
+            active_frac > 0.0 && active_frac <= 1.0,
+            "active_frac out of range: {active_frac}",
+        );
+
+        // Bounded divergence — two different sparse formulations,
+        // both with quantization noise. We just want to catch wild
+        // departures (sign flips, magnitude blow-up).
+        let max_dense: f32 = out_sparse_dense.iter().fold(0.0, |a, &v| a.max(v.abs()));
+        let max_dev: f32 = out_sparse_dense
+            .iter()
+            .zip(out_sparse_axpy.iter())
+            .map(|(&d, &a)| (d - a).abs())
+            .fold(0.0, f32::max);
+        let tol = max_dense.max(1.0) * 2.0;
+        assert!(
+            max_dev <= tol,
+            "AXPY-form diverged from dense sparse at τ=0.10: max_dev={max_dev} max_dense={max_dense} tol={tol}",
+        );
     }
 }

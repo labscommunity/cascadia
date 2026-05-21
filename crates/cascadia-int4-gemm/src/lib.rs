@@ -27,6 +27,7 @@
 //! pipeline.
 
 pub mod c_ffi;
+pub mod ffn_axpy;
 pub mod ffn_sparsity;
 pub mod format;
 pub mod kernel;
@@ -39,6 +40,9 @@ pub mod safetensors_source;
 pub mod shell;
 pub mod shell_int4;
 
+pub use ffn_axpy::{
+    dequant_axpy_int4_active, dequant_axpy_int4_active_auto, transpose_requantize_down, FfnScratch,
+};
 pub use ffn_sparsity::{
     build_active_mask, dequant_gemv_int4_rows_subset, dequant_gemv_int4_rows_subset_auto,
     expert_forward_sparse, ffn_forward_sparse_f32,

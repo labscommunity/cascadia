@@ -241,4 +241,88 @@ fn main() {
     println!();
     println!("Direct kernel speedup ≈ 1 / active-frac (rayon parallelizes over active");
     println!("rows; the constant overhead floor sets the lower bound on per-call time).");
+
+    // ===== Section 3: AXPY-form down kernel (issue #35) =====
+    println!();
+    println!("---");
+    println!();
+    println!("# Direct kernel bench: dense GEMV vs AXPY-form sparse down (#35)");
+    println!();
+    println!(
+        "Down matmul shape: rows=HIDDEN={}, cols=INTERMEDIATE={}.",
+        HIDDEN, INTERMEDIATE
+    );
+    println!();
+    println!("Dense path runs `dequant_gemv_int4_auto(down, scale, inter, ...)`");
+    println!("(reads all intermediate cols). AXPY path runs the transposed-down");
+    println!("kernel: for each active intermediate lane r, accumulate");
+    println!("`y += inter[r] * dequant(down_t[r])` into the hidden output.");
+    println!();
+
+    // Construct fake DOWN weights (HIDDEN x INTERMEDIATE) +
+    // transpose them once.
+    let down_packed_dense = make_synthetic_packed(HIDDEN, INTERMEDIATE);
+    let down_scale_dense = make_synthetic_scale_bits(HIDDEN, n_mid_groups);
+    let (down_packed_t, down_scale_t_bits) =
+        cascadia_int4_gemm::ffn_axpy::transpose_requantize_down(
+            &down_packed_dense,
+            &down_scale_dense,
+            HIDDEN,
+            INTERMEDIATE,
+        );
+
+    // Intermediate vector — the AXPY scalars input.
+    let inter: Vec<f32> = (0..INTERMEDIATE)
+        .map(|i| (i as f32) * 0.013 - 0.4)
+        .collect();
+
+    // Dense down baseline (existing kernel).
+    let mut y_dense = vec![0.0f32; HIDDEN];
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        dequant_gemv_int4_auto(
+            &down_packed_dense,
+            &down_scale_dense,
+            &inter,
+            HIDDEN,
+            INTERMEDIATE,
+            &mut y_dense,
+        );
+    }
+    let dense_down = t0.elapsed().as_secs_f64() / iters as f64;
+    println!("| active-frac | per-call    | speedup |");
+    println!("| ----------- | ----------- | ------- |");
+    println!("| 1.00 (dense)| {:>11} | 1.00×   |", fmt_us(dense_down));
+    for &frac in &[0.50f32, 0.30, 0.10] {
+        let n_active = ((INTERMEDIATE as f32) * frac).round() as usize;
+        let stride = INTERMEDIATE / n_active.max(1);
+        let active: Vec<u32> = (0..n_active).map(|i| (i * stride) as u32).collect();
+        let mut y = vec![0.0f32; HIDDEN];
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            // AXPY accumulates into y; zero before each call.
+            y.fill(0.0);
+            cascadia_int4_gemm::ffn_axpy::dequant_axpy_int4_active_auto(
+                &down_packed_t,
+                &down_scale_t_bits,
+                &inter,
+                &active,
+                INTERMEDIATE,
+                HIDDEN,
+                &mut y,
+            );
+        }
+        let elapsed = t0.elapsed().as_secs_f64() / iters as f64;
+        let speedup = dense_down / elapsed;
+        println!(
+            "| {:<11.2} | {:>11} | {:<5.2}×  |",
+            frac,
+            fmt_us(elapsed),
+            speedup
+        );
+    }
+    println!();
+    println!("AXPY speedup approaches the kernel ceiling 1/active_frac modulo");
+    println!("output-buffer write traffic (y[HIDDEN]=7168 reread+rewritten per");
+    println!("active scalar) and the rayon-chunked-y scheduling overhead.");
 }
