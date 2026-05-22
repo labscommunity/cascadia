@@ -1544,9 +1544,29 @@ def fetch_config_json(model_id_or_path: str) -> str:
 
 def maybe_download(model_id_or_path: str) -> str:
     """If `model_id_or_path` is an existing local directory, return it.
-    Otherwise treat as an HF repo id and snapshot_download. Returns the
-    local model directory containing config.json + safetensors + tokenizer.
+    Otherwise treat as an HF repo id (or a cascadia short alias — see
+    `tools/model_aliases.py`) and snapshot_download. Returns the local
+    model directory containing config.json + safetensors + tokenizer.
     """
+    # Resolve short aliases first ("r1-distill-qwen-7b" ->
+    # "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"). Pass-through for
+    # local paths and canonical HF ids.
+    try:
+        import sys as _sys
+
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from model_aliases import resolve as _resolve_alias
+
+        resolved = _resolve_alias(model_id_or_path)
+        if resolved != model_id_or_path:
+            print(
+                f"  alias '{model_id_or_path}' -> '{resolved}'",
+                flush=True,
+            )
+            model_id_or_path = resolved
+    except Exception as e:
+        # model_aliases is optional; don't block if missing.
+        print(f"  warning: alias resolution skipped ({e})", flush=True)
     if os.path.isdir(model_id_or_path):
         # Local path: ensure config.json present.
         if not os.path.exists(os.path.join(model_id_or_path, "config.json")):
