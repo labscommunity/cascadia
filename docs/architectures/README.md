@@ -20,6 +20,11 @@ This directory holds per-family deep-dives for non-trivial cases.
   GraniteMoE, Hunyuan: why the generic exporter can't ship them,
   and how `cascadia-engine-sparse-moe` (Kimi K2.6) hints at the
   shape of a fix.
+- [`mistral.md`](./mistral.md) — Mistral 7B / NeMo / Small 3.x: the
+  `mistral` path, sliding-window handling, and the `text_config` unwrap
+  for `mistral3` multimodal wrappers.
+- [`r1-distill.md`](./r1-distill.md) — DeepSeek R1 Distills (Qwen / Llama):
+  they ride the base qwen2 / llama paths; pipeline-parallel recipe.
 
 ## How to add a new family
 
