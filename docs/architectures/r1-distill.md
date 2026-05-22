@@ -46,9 +46,31 @@ answer = text.split("</think>")[-1].strip() if "</think>" in text else text
 
 ## End-to-end test (miner + beta)
 
-**Known blocker (2026-05-21):** Pipeline-parallel `--engine ov-runtime`
-on the **OpenVINO CPU plugin** currently fails to load `cascadia
-shard`'s v5_canonical_inputs stateful IR with:
+**End-to-end pipeline-parallel works on Intel iGPU (Lunar Lake).**
+Verified 2026-05-21 with `r1-distill-qwen-1.5b` (int4, 917 MB total)
+sharded across **beta** (rank 0, Lunar Lake iGPU) → **charlie**
+(rank 1, Lunar Lake iGPU), API on beta:8000:
+
+```
+$ curl http://192.168.86.31:8000/v1/chat/completions -d '{
+    "model": "r1-distill-qwen-1.5b",
+    "messages": [{"role": "user", "content": "What is 17 * 23? Think step by step."}],
+    "max_tokens": 96
+  }'
+
+{"choices":[{"message":{"role":"assistant","content":
+  "First, I need to multiply 17 by 23.\n\nTo simplify the
+  calculation, I'll break down 23 into 20 and 3.\n\nMultiplying 17
+  by 20 gives 340.\n\nNext, I'll multiply 17 by 3, which equals 51.
+  \n\nFinally, I'll add the two results together: 340 + 51 = 391.\n
+  </think>\n\nTo calculate ("}, ...}]}
+```
+
+(17 × 23 = 391 ✓; the `</think>` marker is the R1 reasoning-chain
+end-of-chain-of-thought.)
+
+**Known CPU-plugin blocker:** Pipeline-parallel via `--engine
+ov-runtime --device CPU` fails with:
 
 ```
 Check 'idx < parentEdges.size()' failed at
@@ -56,74 +78,76 @@ src/plugins/intel_cpu/src/node.cpp:687:
 Node ReadValue_33408 contains less parent edges than 0
 ```
 
-This reproduces with `openvino_genai 2026.1.0` directly (not just via
-cascadia), so it's an upstream OV CPU plugin issue with how
-`apply_make_stateful_transformation` + `fuse_cache_reorder`
-restructure the IR (the `beam_idx` Gather inserted in front of each
-`ReadValue` confuses the CPU plugin's edge accounting). **Workarounds:**
-
-1. **Use `--device GPU` on rank-1 worker** — Intel iGPU plugin
-   accepts the IR. Rank-0 worker still needs a host with iGPU.
-   Verified to *start* on a Lunar Lake AI PC; full e2e generation
-   follows after the upstream fix.
-2. **Use `--engine ov-genai` single-stage** — the single-stage path
-   bundles the optimum-cli export which doesn't hit the same edge
-   accounting issue. Loses pipeline-parallel.
-3. **Wait on the upstream OV fix** — track in a separate cascadia
-   issue.
-
-The pipeline-parallel recipe below is therefore the *intended* shape
-of the test once the CPU plugin is fixed; the test infrastructure
-(shards built on miner, copied to beta, workers wired up, API
-exercised) all works.
+Reproduces with `openvino_genai 2026.1.0`'s `LLMPipeline` directly
+(loading the same v5_canonical_inputs IR), so it's an upstream OV
+CPU plugin issue with how the `apply_make_stateful_transformation`
++ `fuse_cache_reorder` combination restructures the IR (the
+`beam_idx` Gather inserted in front of each `ReadValue` confuses
+the CPU plugin's edge accounting). Use the iGPU path on AI PCs
+until the upstream fix lands; CPU plugin is fine for `--engine
+ov-genai` single-stage.
 
 See `tools/scripts/test_r1_distill_pipeline_parallel.sh`. Steps:
 
-1. Export 2-stage shards on the miner:
+1. Export 2-stage int4 shards on the miner (only needs CPU + plenty
+   of disk; nothing to do with the actual runtime). `int4` is
+   important — `int8` triggers a similar OV stateful issue when the
+   nncf compressed weights interact with `ReadValue` ops.
 
    ```bash
    ssh miner "source ~/.venv/rainier/bin/activate && \
-     cd ~/cascadia && \
-     python tools/export_shards.py \
-       --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-       --output-dir /tmp/r1_distill_15b_2s \
-       --num-stages 2 --quantization int8"
+     python ~/cascadia/tools/export_shards.py \
+       --model r1-distill-qwen-1.5b \
+       --output-dir /tmp/r1_int4 \
+       --num-stages 2 --quantization int4"
    ```
 
-2. Copy the shards to beta:
+   (`r1-distill-qwen-1.5b` resolves via `tools/model_aliases.py` to
+   `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`.)
+
+2. Tarball + ship shards to both AI PCs:
 
    ```bash
-   ssh miner "tar -cz -C /tmp r1_distill_15b_2s" | \
-     ssh cascadia@beta.local "tar -xz -C /tmp"
+   ssh miner 'tar -C /tmp -czf /tmp/r1_int4.tgz r1_int4'
+   scp miner:/tmp/r1_int4.tgz /tmp/r1_int4.tgz
+   scp /tmp/r1_int4.tgz cascadia@beta.local:C:/Users/cascadia/r1_int4.tgz
+   scp /tmp/r1_int4.tgz cascadia@charlie.local:C:/Users/cascadia/r1_int4.tgz
+   ssh cascadia@beta.local    'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
+   ssh cascadia@charlie.local 'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
    ```
 
-3. Launch the rank-1 worker on beta (downstream):
+3. Launch the rank-1 worker on **charlie** (downstream — Lunar Lake
+   iGPU). Keep the SSH session OPEN; on Windows, closing the
+   parent SSH session kills the worker even with
+   `Start-Process -WindowStyle Hidden` (a known OpenSSH-Windows
+   quirk, see `local-ai-pc-fleet` memory):
 
    ```bash
-   ssh cascadia@beta.local "C:\\tahoma\\tahoma.exe worker --rank 1 --total 2 \
-       --engine ov-runtime --device CPU \
-       --model C:\\tmp\\r1_distill_15b_2s --listen 0.0.0.0:9100"
+   ssh cascadia@charlie.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
+     $env:PATH = ''C:\openvino_genai\runtime\bin\intel64\Release;C:\openvino_genai\runtime\3rdparty\tbb\bin;'' + $env:PATH;
+     & C:\tahoma\tahoma.exe worker --rank 1 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --listen 0.0.0.0:9100"'
    ```
 
-4. Launch the rank-0 worker on miner (upstream + API):
+4. In a second terminal, launch the rank-0 worker on **beta**
+   (upstream — Lunar Lake iGPU — serves the API):
 
    ```bash
-   ssh miner "~/cascadia/target/release/cascadia worker --rank 0 --total 2 \
-       --engine ov-runtime --device CPU \
-       --model /tmp/r1_distill_15b_2s \
-       --next 192.168.86.31:9100 --api 0.0.0.0:8000"
+   ssh cascadia@beta.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
+     $env:PATH = ''C:\openvino_genai\runtime\bin\intel64\Release;C:\openvino_genai\runtime\3rdparty\tbb\bin;'' + $env:PATH;
+     & C:\tahoma\tahoma.exe worker --rank 0 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --next 192.168.86.39:9100 --api 0.0.0.0:8000"'
    ```
 
-5. From your laptop:
+5. From a third terminal:
 
    ```bash
-   curl http://miner:8000/v1/chat/completions -d '{
+   curl http://beta.local:8000/v1/chat/completions -d '{
      "model": "r1-distill-qwen-1.5b",
-     "messages": [{"role": "user", "content": "Capital of France?"}],
+     "messages": [{"role": "user", "content": "What is 17 * 23?"}],
      "max_tokens": 64
    }'
    ```
 
-Expected response: a `<think>` chain followed by "Paris" (or
-similar). The shard's KV-cache reset between requests is exercised by
-running the curl twice.
+   Expected response: an R1-style reasoning chain ending in `391`.
+
+The KV-cache reset between requests is exercised by running the curl
+multiple times in a row.
