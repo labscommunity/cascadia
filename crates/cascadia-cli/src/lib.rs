@@ -21,6 +21,9 @@ use futures::StreamExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+pub mod profile;
+use profile::{cmd_profile_devices, ProfileDevicesArgs};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -50,6 +53,11 @@ pub enum Command {
     /// Shard a HuggingFace causal-LM model into per-stage OpenVINO IRs
     /// for distributed inference. See `cascadia shard --help`.
     Shard(ShardArgs),
+    /// Profile available OV devices on this host against a single
+    /// model. Writes `device_profile.json`. See `cascadia
+    /// profile-devices --help`. Step 1 of issue #41 (three-tier
+    /// {iGPU, NPU, CPU} ILP placement).
+    ProfileDevices(ProfileDevicesArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -322,6 +330,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Engines => cmd_engines(),
         Command::Worker(args) => cmd_worker(args).await,
         Command::Shard(args) => cmd_shard(args).await,
+        Command::ProfileDevices(args) => cmd_profile_devices(args),
     }
 }
 

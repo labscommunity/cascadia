@@ -262,6 +262,7 @@ dependencies = [
  "cascadia-engine-mock",
  "cascadia-engine-openvino",
  "cascadia-engine-sparse-moe",
+ "cascadia-ov-genai-shim",
  "cascadia-runner",
  "cascadia-types",
  "clap",
