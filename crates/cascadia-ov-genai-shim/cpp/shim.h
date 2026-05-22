@@ -189,6 +189,27 @@ int32_t cascadia_runtime_output_copy(
     cascadia_runtime_t* handle, size_t output_idx,
     void* out_buf, size_t out_buf_size);
 
+// ---- Core enumeration (no compile) ----------------------------------------
+//
+// Used by `cascadia profile-devices` to discover which OV plugins are
+// available on the worker host without paying the cost of a model compile.
+// Each call constructs a transient `ov::Core` (cheap; plugins are
+// registered on first use, cached process-wide).
+
+/// Get the list of OV plugins available on this host, joined by '\n'.
+/// Use copy_name_to_buf semantics: pass `(NULL, 0, &len)` to size-query,
+/// then allocate `len + 1` and call again to fill. Returns 0 on success.
+int32_t cascadia_core_list_devices(
+    char* out_buf, size_t out_cap, size_t* out_len);
+
+/// Query a single OV property on a single device (e.g. "FULL_DEVICE_NAME",
+/// "DEVICE_ARCHITECTURE"). The returned value is the property's
+/// `to_string()` form. RO properties are safe to query; RW properties
+/// return their current value. Pass `(NULL, 0, &len)` to size-query.
+int32_t cascadia_core_get_property(
+    const char* device, const char* property,
+    char* out_buf, size_t out_cap, size_t* out_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -555,6 +556,39 @@ int32_t cascadia_runtime_output_copy(
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) { set_last_error("unknown exception in output_copy"); return 1; }
+}
+
+// ===================== Core enumeration =====================
+
+int32_t cascadia_core_list_devices(
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    try {
+        ov::Core core;
+        std::string joined;
+        for (const auto& d : core.get_available_devices()) {
+            if (!joined.empty()) joined.push_back('\n');
+            joined += d;
+        }
+        return copy_name_to_buf(joined, out_buf, out_cap, out_len);
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in list_devices"); return 1; }
+}
+
+int32_t cascadia_core_get_property(
+    const char* device, const char* property,
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    if (!device || !property) { set_last_error("null arg in get_property"); return 1; }
+    try {
+        ov::Core core;
+        // OV returns ov::Any; serialise via the stream operator into a
+        // std::string. Works for all built-in property value types
+        // (string, int, enum, vector<*>, ov::PropertyName).
+        ov::Any v = core.get_property(std::string(device), std::string(property));
+        std::ostringstream oss;
+        v.print(oss);
+        return copy_name_to_buf(oss.str(), out_buf, out_cap, out_len);
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in get_property"); return 1; }
 }
 
 }  // extern "C"
