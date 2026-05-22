@@ -19,7 +19,6 @@ use std::time::Instant;
 use lru::LruCache;
 
 use cascadia_int4_gemm::ffn_axpy::FfnScratch as IntFfnScratch;
-use cascadia_int4_gemm::ffn_sparsity::ffn_forward_sparse_axpy_f32;
 use cascadia_int4_gemm::layer0_int4::{
     embed_token_bf16, layer0_forward_decode_int4_multi_with_capacity,
     layer0_forward_decode_int4_with_capacity_sparse, Int4Layer0,
@@ -393,6 +392,21 @@ pub struct RunnerOptions {
     /// runner logs a warning and falls back to the dense path for
     /// the duration of the run.
     pub ffn_axpy_cache_dir: Option<std::path::PathBuf>,
+    /// Issue #38 — load per-channel FFN sparsity thresholds (the CHESS
+    /// extension to global-τ) from a JSON file produced by the
+    /// `calibrate_ffn_thresholds` tool. `None` (default) keeps the
+    /// global-τ / dense behaviour. When set, the per-channel τ
+    /// vector takes precedence over `ffn_sparsity_threshold` for any
+    /// layer present in the file; layers not in the file fall back
+    /// to the global-τ value.
+    pub ffn_sparsity_thresholds_file: Option<std::path::PathBuf>,
+    /// Issue #38 — when set, record per-layer-per-channel
+    /// `|silu(gate[c])| / max_j |silu(gate[j])|` histograms during
+    /// every expert dispatch and dump them to this directory on
+    /// engine close. The histogram dump is fed into
+    /// `calibrate_ffn_thresholds` to compute per-channel τ values.
+    /// `None` (default) disables capture.
+    pub ffn_sparsity_capture_dir: Option<std::path::PathBuf>,
 }
 
 /// Per-rank slice of the model the Runner should hold.
@@ -492,6 +506,19 @@ pub struct Runner {
     /// active-lane fraction without polluting hot-path logging.
     ffn_active_sum: f64,
     ffn_active_count: u64,
+    /// Issue #38 — per-channel FFN sparsity thresholds loaded from
+    /// disk at startup. `None` ⇒ fall back to the scalar
+    /// [`Self::ffn_sparsity_threshold`] for every layer. When set,
+    /// the dispatcher prefers the per-channel τ vector for any
+    /// layer covered by the file.
+    ffn_sparsity_thresholds: Option<Arc<cascadia_int4_gemm::PerChannelThresholds>>,
+    /// Issue #38 — when `Some`, record `silu(gate)` distributions
+    /// per (layer, channel) into this state for offline calibration.
+    /// Dumped to disk on engine close. Capture is silently no-op'd
+    /// for the dense FFN path (we don't compute silu(gate) there) and
+    /// the dense-down sparse path — only the AXPY-form path exposes
+    /// silu(gate) via its scratch.
+    gate_capture: Option<Arc<cascadia_int4_gemm::GateCaptureState>>,
 }
 
 impl Runner {
@@ -769,6 +796,53 @@ impl Runner {
         // dispatch path stays on the dense-down branch.
         let ffn_axpy_effective = opts.ffn_axpy_down && transposed_down_store.is_some();
 
+        // Issue #38: load per-channel thresholds, if a file was
+        // requested. Verify shape; fail-loud on mismatch (a runner
+        // built with the wrong intermediate dim is a config error,
+        // not a runtime fallback).
+        let intermediate = cascadia_int4_gemm::INTERMEDIATE;
+        let ffn_sparsity_thresholds = match opts.ffn_sparsity_thresholds_file.as_ref() {
+            None => None,
+            Some(path) => {
+                let loaded = cascadia_int4_gemm::PerChannelThresholds::load(path).map_err(|e| {
+                    RunnerError::Internal(format!(
+                        "load FFN sparsity thresholds from {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                loaded.verify_for_intermediate(intermediate).map_err(|e| {
+                    RunnerError::Internal(format!(
+                        "thresholds file {} mismatches model intermediate: {e}",
+                        path.display(),
+                    ))
+                })?;
+                info!(
+                    path = %path.display(),
+                    model_id = loaded.model_id,
+                    n_layers = loaded.n_layers(),
+                    target_active_frac = loaded.target_active_frac,
+                    calibration_n_tokens = loaded.calibration_n_tokens,
+                    "loaded per-channel FFN sparsity thresholds (CHESS)"
+                );
+                Some(Arc::new(loaded))
+            }
+        };
+
+        // Issue #38: capture state. We only allocate the histograms
+        // for layers this rank owns (memory ≈ layers × 2048 × 128
+        // bins × 4 B; at K2.6 single-stage that's 60 × 1 MiB =
+        // 60 MiB, easily worth the calibration value).
+        let gate_capture = opts.ffn_sparsity_capture_dir.as_ref().map(|dir| {
+            info!(
+                capture_dir = %dir.display(),
+                "FFN sparsity gate-capture mode enabled (CHESS calibration)"
+            );
+            Arc::new(cascadia_int4_gemm::GateCaptureState::new(
+                dir.clone(),
+                intermediate,
+            ))
+        });
+
         Ok(Self {
             manifest,
             _model_dir: model_dir,
@@ -790,6 +864,8 @@ impl Runner {
             ffn_scratch: None,
             ffn_active_sum: 0.0,
             ffn_active_count: 0,
+            ffn_sparsity_thresholds,
+            gate_capture,
         })
     }
 
@@ -881,7 +957,16 @@ impl Runner {
             ExpertCache::Int4Bin(c) => {
                 let w = c.get(lid, eid)?;
                 let threshold = self.ffn_sparsity_threshold;
-                if self.ffn_axpy_down && threshold > 0.0 {
+                // Issue #38: per-channel thresholds (CHESS) override
+                // the scalar τ for any layer covered by the loaded
+                // file. Resolve here so the dispatch path below sees
+                // a single `mode: SparsityMode` value.
+                let per_channel: Option<&[f32]> = self
+                    .ffn_sparsity_thresholds
+                    .as_ref()
+                    .and_then(|t| t.get(lid));
+                let sparse_active = per_channel.is_some() || threshold > 0.0;
+                if self.ffn_axpy_down && sparse_active {
                     // AXPY-form sparse path (issue #35).
                     //
                     // The transposed-down weights are persisted to
@@ -944,40 +1029,69 @@ impl Runner {
                         })?;
                     let td_packed = td.packed_t();
                     let td_scale = td.scale_t_bits();
+                    // Capture state is an Arc — clone before borrowing
+                    // `self.ffn_scratch` so we can dispatch into it and
+                    // still record from `scratch.silu_gate` without
+                    // re-borrowing `self`.
+                    let gate_capture = self.gate_capture.clone();
                     let scratch = self
                         .ffn_scratch
                         .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
                     let mut out_f32 = vec![0.0f32; hidden];
-                    let active_frac = ffn_forward_sparse_axpy_f32(
-                        scratch,
-                        attn_row,
-                        hidden,
-                        intermediate,
-                        gate_packed,
-                        gate_scale,
-                        up_packed,
-                        up_scale,
-                        td_packed,
-                        td_scale,
-                        &mut out_f32,
-                        threshold,
-                    );
+                    let mode = match per_channel {
+                        Some(τ) => cascadia_int4_gemm::SparsityMode::PerChannel(τ),
+                        None => cascadia_int4_gemm::SparsityMode::Global(threshold),
+                    };
+                    let active_frac =
+                        cascadia_int4_gemm::ffn_sparsity::ffn_forward_sparse_axpy_f32_mode(
+                            scratch,
+                            attn_row,
+                            hidden,
+                            intermediate,
+                            gate_packed,
+                            gate_scale,
+                            up_packed,
+                            up_scale,
+                            td_packed,
+                            td_scale,
+                            &mut out_f32,
+                            mode,
+                        );
+                    if let Some(cap) = gate_capture {
+                        let silu = &scratch.silu_gate[..intermediate];
+                        let max_abs = silu.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                        cap.record(lid, silu, max_abs);
+                    }
+                    // End of scratch borrow — now safe to re-borrow self.
                     self.accumulate_ffn_sparsity_stat(active_frac);
                     Ok(out_f32)
                 } else {
                     let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
                     let mut out_bf16 = vec![bf16::ZERO; hidden];
-                    let active_frac = int4_expert_forward_sparse(
-                        &x_bf16,
-                        w.gate_packed_bytes(),
-                        w.gate_scale_bits(),
-                        w.up_packed_bytes(),
-                        w.up_scale_bits(),
-                        w.down_packed_bytes(),
-                        w.down_scale_bits(),
-                        &mut out_bf16,
-                        threshold,
-                    );
+                    let active_frac = match per_channel {
+                        Some(τ) => cascadia_int4_gemm::expert_forward_sparse_per_channel(
+                            &x_bf16,
+                            w.gate_packed_bytes(),
+                            w.gate_scale_bits(),
+                            w.up_packed_bytes(),
+                            w.up_scale_bits(),
+                            w.down_packed_bytes(),
+                            w.down_scale_bits(),
+                            &mut out_bf16,
+                            τ,
+                        ),
+                        None => int4_expert_forward_sparse(
+                            &x_bf16,
+                            w.gate_packed_bytes(),
+                            w.gate_scale_bits(),
+                            w.up_packed_bytes(),
+                            w.up_scale_bits(),
+                            w.down_packed_bytes(),
+                            w.down_scale_bits(),
+                            &mut out_bf16,
+                            threshold,
+                        ),
+                    };
                     self.accumulate_ffn_sparsity_stat(active_frac);
                     Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
                 }
@@ -985,7 +1099,12 @@ impl Runner {
             ExpertCache::SafetensorsBin(c) => {
                 let w = c.get(lid, eid)?;
                 let threshold = self.ffn_sparsity_threshold;
-                if self.ffn_axpy_down && threshold > 0.0 {
+                let per_channel: Option<&[f32]> = self
+                    .ffn_sparsity_thresholds
+                    .as_ref()
+                    .and_then(|t| t.get(lid));
+                let sparse_active = per_channel.is_some() || threshold > 0.0;
+                if self.ffn_axpy_down && sparse_active {
                     let intermediate = cascadia_int4_gemm::INTERMEDIATE;
                     // Same on-disk-store pattern as the Int4Bin path
                     // above. See that branch for the rationale.
@@ -1029,44 +1148,96 @@ impl Runner {
                         })?;
                     let td_packed = td.packed_t();
                     let td_scale = td.scale_t_bits();
+                    // Capture state is an Arc — clone before borrowing
+                    // `self.ffn_scratch` so we can dispatch into it and
+                    // still record from `scratch.silu_gate` without
+                    // re-borrowing `self`.
+                    let gate_capture = self.gate_capture.clone();
                     let scratch = self
                         .ffn_scratch
                         .get_or_insert_with(|| IntFfnScratch::new(hidden, intermediate));
                     let mut out_f32 = vec![0.0f32; hidden];
-                    let active_frac = ffn_forward_sparse_axpy_f32(
-                        scratch,
-                        attn_row,
-                        hidden,
-                        intermediate,
-                        gate_packed,
-                        gate_scale,
-                        up_packed,
-                        up_scale,
-                        td_packed,
-                        td_scale,
-                        &mut out_f32,
-                        threshold,
-                    );
+                    let mode = match per_channel {
+                        Some(τ) => cascadia_int4_gemm::SparsityMode::PerChannel(τ),
+                        None => cascadia_int4_gemm::SparsityMode::Global(threshold),
+                    };
+                    let active_frac =
+                        cascadia_int4_gemm::ffn_sparsity::ffn_forward_sparse_axpy_f32_mode(
+                            scratch,
+                            attn_row,
+                            hidden,
+                            intermediate,
+                            gate_packed,
+                            gate_scale,
+                            up_packed,
+                            up_scale,
+                            td_packed,
+                            td_scale,
+                            &mut out_f32,
+                            mode,
+                        );
+                    if let Some(cap) = gate_capture {
+                        let silu = &scratch.silu_gate[..intermediate];
+                        let max_abs = silu.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                        cap.record(lid, silu, max_abs);
+                    }
+                    // End of scratch borrow — now safe to re-borrow self.
                     self.accumulate_ffn_sparsity_stat(active_frac);
                     Ok(out_f32)
                 } else {
                     let x_bf16: Vec<bf16> = attn_row.iter().map(|v| bf16::from_f32(*v)).collect();
                     let mut out_bf16 = vec![bf16::ZERO; hidden];
-                    let active_frac = int4_expert_forward_sparse(
-                        &x_bf16,
-                        w.gate_packed,
-                        w.gate_scale,
-                        w.up_packed,
-                        w.up_scale,
-                        w.down_packed,
-                        w.down_scale,
-                        &mut out_bf16,
-                        threshold,
-                    );
+                    let active_frac = match per_channel {
+                        Some(τ) => cascadia_int4_gemm::expert_forward_sparse_per_channel(
+                            &x_bf16,
+                            w.gate_packed,
+                            w.gate_scale,
+                            w.up_packed,
+                            w.up_scale,
+                            w.down_packed,
+                            w.down_scale,
+                            &mut out_bf16,
+                            τ,
+                        ),
+                        None => int4_expert_forward_sparse(
+                            &x_bf16,
+                            w.gate_packed,
+                            w.gate_scale,
+                            w.up_packed,
+                            w.up_scale,
+                            w.down_packed,
+                            w.down_scale,
+                            &mut out_bf16,
+                            threshold,
+                        ),
+                    };
                     self.accumulate_ffn_sparsity_stat(active_frac);
                     Ok(out_bf16.iter().map(|b| b.to_f32()).collect())
                 }
             }
+        }
+    }
+
+    /// Drain the per-channel `silu(gate)` capture state to the
+    /// configured directory. Returns `(n_layers_written, total_samples)`
+    /// or `(0, 0)` if capture wasn't enabled. Called from the engine
+    /// `close` path to persist calibration data before shutdown.
+    pub fn dump_gate_capture(&self) -> Result<(usize, u64), RunnerError> {
+        let Some(cap) = self.gate_capture.as_ref() else {
+            return Ok((0, 0));
+        };
+        cap.dump()
+            .map_err(|e| RunnerError::Internal(format!("dump gate capture: {e}")))
+    }
+
+    /// Inspect the gate-capture state. Returns `(n_layers, total_samples)`
+    /// for instrumentation; `(0, 0)` when capture isn't enabled. Useful
+    /// for periodic "how much have we collected" logging during long
+    /// calibration runs.
+    pub fn gate_capture_stats(&self) -> (usize, u64) {
+        match self.gate_capture.as_ref() {
+            Some(c) => (c.n_layers(), c.total_samples()),
+            None => (0, 0),
         }
     }
 
@@ -1111,7 +1282,6 @@ impl Runner {
         if self.transposed_down_store.is_none() {
             return Ok((0, 0));
         }
-        let intermediate = cascadia_int4_gemm::INTERMEDIATE;
         let hidden = self.manifest.hidden_size as usize;
         let moe_layer_ids = self.manifest.moe_layer_ids();
         let n_experts = self.manifest.num_experts;
@@ -2235,11 +2405,21 @@ impl Runner {
         // of generation so the operator can see what fraction of FFN
         // lanes were actually active under the chosen threshold. Logged
         // at info level so it shows up without RUST_LOG tuning, but
-        // skipped silently when the threshold is 0.0 (no sparsity).
-        if self.ffn_sparsity_threshold > 0.0 {
+        // skipped silently when both the scalar threshold and the
+        // per-channel thresholds are inactive (no sparsity at all). The
+        // per-channel check is needed for issue #38: when the only
+        // sparsity signal is the loaded thresholds file, `ffn_sparsity_threshold`
+        // stays at 0.0 but the dispatcher still runs the sparse path.
+        if self.ffn_sparsity_threshold > 0.0 || self.ffn_sparsity_thresholds.is_some() {
             let (cached_experts, expert_evictions) = self.experts.lru_stats();
+            let per_channel_layers = self
+                .ffn_sparsity_thresholds
+                .as_ref()
+                .map(|t| t.n_layers())
+                .unwrap_or(0);
             info!(
                 ffn_sparsity_threshold = self.ffn_sparsity_threshold,
+                ffn_per_channel_layers = per_channel_layers,
                 ffn_active_fraction = self.ffn_active_fraction(),
                 routed_expert_calls = self.ffn_active_count,
                 cached_experts,

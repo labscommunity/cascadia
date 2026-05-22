@@ -378,6 +378,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rayon",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",

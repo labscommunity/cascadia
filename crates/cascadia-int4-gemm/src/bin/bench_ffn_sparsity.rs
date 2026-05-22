@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use cascadia_int4_gemm::{
     dequant_gemv_int4_auto, dequant_gemv_int4_rows_subset_auto, expert_forward,
-    expert_forward_sparse, GROUP_SIZE, HIDDEN, INTERMEDIATE,
+    expert_forward_sparse, expert_forward_sparse_per_channel, GROUP_SIZE, HIDDEN, INTERMEDIATE,
 };
 use half::bf16;
 
@@ -180,6 +180,83 @@ fn main() {
         );
     }
     println!();
+
+    // --- Per-channel-τ overhead microbench (issue #38) ---
+    //
+    // Compares the global-τ path against the per-channel-τ path with
+    // a UNIFORM threshold vector (every τ[c] = τ0). With uniform
+    // thresholds the two paths must produce bit-identical output (we
+    // assert this in `per_channel_uniform_matches_global`), so any
+    // runtime gap is pure dispatcher + per-element-multiply overhead.
+    println!("---");
+    println!();
+    println!("# Per-channel-τ overhead (uniform vector vs global scalar)");
+    println!();
+    println!("Both runs construct the same mask; per-channel adds one extra");
+    println!("multiply per intermediate lane per token. Expect <1% gap.");
+    println!();
+    println!("| τ0      | global  | per-channel | overhead |");
+    println!("| ------- | ------- | ----------- | -------- |");
+    for &tau in &thresholds {
+        if tau <= 0.0 {
+            continue;
+        }
+        let τ_vec: Vec<f32> = vec![tau; INTERMEDIATE];
+        let mut out_g = vec![bf16::ZERO; HIDDEN];
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            expert_forward_sparse(
+                &x,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed,
+                &down_scale,
+                &mut out_g,
+                tau,
+            );
+        }
+        let per_call_g = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let mut out_pc = vec![bf16::ZERO; HIDDEN];
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            expert_forward_sparse_per_channel(
+                &x,
+                &gate_packed,
+                &gate_scale,
+                &up_packed,
+                &up_scale,
+                &down_packed,
+                &down_scale,
+                &mut out_pc,
+                &τ_vec,
+            );
+        }
+        let per_call_pc = t0.elapsed().as_secs_f64() / iters as f64;
+        let overhead = (per_call_pc - per_call_g) / per_call_g * 100.0;
+
+        // Sanity check: outputs must be bit-identical (uniform-τ →
+        // global-τ contract). Cheap assert that catches accidental
+        // divergence between the two code paths.
+        for h in 0..HIDDEN {
+            assert_eq!(
+                out_g[h].to_bits(),
+                out_pc[h].to_bits(),
+                "τ={tau}, h={h}: global/per-channel output divergence (uniform vector should be bit-identical)",
+            );
+        }
+        println!(
+            "| {:<7.3} | {:>7} | {:>11} | {:>+6.2}%  |",
+            tau,
+            fmt_us(per_call_g),
+            fmt_us(per_call_pc),
+            overhead,
+        );
+    }
+    println!();
+
     println!("Notes:");
     println!(" - τ=0.00 path falls through to dense; speedup ≈1.00 confirms no overhead.");
     println!(" - Active-frac is the per-token fraction of intermediate lanes computed by");
@@ -188,6 +265,9 @@ fn main() {
     println!("   no lanes fall below the relative threshold. Real K2.6 activations have a");
     println!("   heavy tail that yields 30–50% sparsity at τ=0.10 (CATS/CHESS), making");
     println!("   the kernel speedup numbers below the practical upper bound.");
+    println!(" - Per-channel overhead measures the cost of the per-lane threshold vector vs");
+    println!("   a single scalar. Real wins from per-channel come from CHESS calibration");
+    println!("   allowing higher sparsity at the same quality — not from this overhead.");
     println!();
     println!("---");
     println!();
