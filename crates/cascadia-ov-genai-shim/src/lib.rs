@@ -205,6 +205,20 @@ mod sys {
             out_buf: *mut u8,
             out_buf_size: usize,
         ) -> c_int;
+
+        pub fn cascadia_core_list_devices(
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
+
+        pub fn cascadia_core_get_property(
+            device: *const c_char,
+            property: *const c_char,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
     }
 }
 
@@ -737,6 +751,85 @@ impl Drop for Runtime {
     }
 }
 
+// ============ Core enumeration (no compile) ============
+//
+// Free functions over a transient ov::Core; used by `cascadia
+// profile-devices` to discover plugins on the worker host.
+
+/// List the OV device names available on this host (e.g. `["CPU",
+/// "GPU", "NPU"]`). Returns `Err(Stub)` on builds without the
+/// `openvino` feature.
+#[cfg(not(feature = "openvino"))]
+pub fn list_devices() -> Result<Vec<String>> {
+    Err(Error::Stub)
+}
+
+#[cfg(feature = "openvino")]
+pub fn list_devices() -> Result<Vec<String>> {
+    unsafe { fetch_buffered_string(|buf, cap, len| sys::cascadia_core_list_devices(buf, cap, len)) }
+        .map(|s| {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                s.split('\n').map(str::to_owned).collect()
+            }
+        })
+}
+
+/// Query a single OV property (e.g. `FULL_DEVICE_NAME`,
+/// `DEVICE_ARCHITECTURE`) on a single device. The returned value is
+/// the property's `to_string()` form.
+#[cfg(not(feature = "openvino"))]
+pub fn device_property(_device: &str, _property: &str) -> Result<String> {
+    Err(Error::Stub)
+}
+
+#[cfg(feature = "openvino")]
+pub fn device_property(device: &str, property: &str) -> Result<String> {
+    let dev_c = cstr(device)?;
+    let prop_c = cstr(property)?;
+    unsafe {
+        fetch_buffered_string(|buf, cap, len| {
+            sys::cascadia_core_get_property(dev_c.as_ptr(), prop_c.as_ptr(), buf, cap, len)
+        })
+    }
+}
+
+/// Convenience: full human-readable device name (e.g. `Intel(R) Arc(TM)
+/// 140V GPU (16GB)`). Equivalent to `device_property(device,
+/// "FULL_DEVICE_NAME")` but lives at this top level so callers don't
+/// have to remember the property string.
+pub fn device_full_name(device: &str) -> Result<String> {
+    device_property(device, "FULL_DEVICE_NAME")
+}
+
+/// Internal: two-call buffered-string helper. Calls `f(null, 0, &len)`
+/// to size-query, then allocates `len + 1` and calls `f(buf, cap, &len)`
+/// to fill. Pulls non-zero rc into Error::Native via the last_native_error
+/// channel.
+#[cfg(feature = "openvino")]
+unsafe fn fetch_buffered_string<F>(mut f: F) -> Result<String>
+where
+    F: FnMut(*mut c_char, usize, *mut usize) -> c_int,
+{
+    let mut len: usize = 0;
+    let rc = f(ptr::null_mut(), 0, &mut len);
+    if rc != 0 {
+        return Err(Error::Native(last_native_error()));
+    }
+    if len == 0 {
+        return Ok(String::new());
+    }
+    // Allocate len + 1 for the trailing NUL the shim writes.
+    let mut buf: Vec<u8> = vec![0u8; len + 1];
+    let rc2 = f(buf.as_mut_ptr() as *mut c_char, len + 1, &mut len);
+    if rc2 != 0 {
+        return Err(Error::Native(last_native_error()));
+    }
+    buf.truncate(len);
+    String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +861,38 @@ mod tests {
             .with("KV_CACHE_PRECISION", "u8");
         assert_eq!(p.entries.len(), 2);
         assert_eq!(p.entries[0].0, "CACHE_DIR");
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn stub_list_devices_returns_error() {
+        assert!(matches!(list_devices(), Err(Error::Stub)));
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn stub_device_full_name_returns_error() {
+        assert!(matches!(device_full_name("CPU"), Err(Error::Stub)));
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn live_list_devices_includes_cpu() {
+        // OV always exposes CPU plugin on any host with the runtime
+        // installed. If this fails on a real OV install, the shim
+        // construction or the link is broken.
+        let devs = list_devices().expect("list_devices");
+        assert!(
+            devs.iter().any(|d| d == "CPU"),
+            "expected CPU in {:?}",
+            devs
+        );
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn live_cpu_full_name_nonempty() {
+        let name = device_full_name("CPU").expect("FULL_DEVICE_NAME");
+        assert!(!name.is_empty(), "FULL_DEVICE_NAME for CPU was empty");
     }
 }
