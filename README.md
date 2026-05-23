@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.jpg" alt="Cascadia" width="520">
+  <img src="docs/assets/logo.svg" alt="Cascadia" width="520">
 </p>
 
 > Run any model on Intel hardware.
