@@ -10,7 +10,7 @@ Cascadia distributes LLM inference across Intel laptops, desktops, and AI PCs. S
 
 [![ci](https://github.com/labscommunity/cascadia/actions/workflows/ci.yml/badge.svg)](https://github.com/labscommunity/cascadia/actions/workflows/ci.yml)
 
-**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime at the worker. Four engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
+**Pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake / Battlemage Arc). Single Rust binary per node; no Python runtime at the worker. Five engines: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, and a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
 
 ## Why Cascadia
 
@@ -35,7 +35,7 @@ The resulting binary lands at `target/release/cascadia` (`cascadia.exe` on Windo
 
 Build prerequisites:
 
-- Rust 1.75+ (`rustup default stable`)
+- Rust 1.85+ (`rustup default stable`)
 - For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK download from intel.com
 
 ## Quick start
@@ -99,6 +99,7 @@ $ cascadia engines
   ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup
   ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards
   ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards
+  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells
 ```
 
 ## Architecture
@@ -109,6 +110,8 @@ See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key crates:
 - `cascadia-runner/` — Per-stage runner; concurrent-safe chunk streaming
 - `cascadia-engine/` — `Engine` + `Builder` traits — the plugin seam
 - `cascadia-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
+- `cascadia-engine-sparse-moe/` — Kimi K2.6-style sparse-MoE engine; routes only the top-k experts per token
+- `cascadia-int4-gemm/` — hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
 - `cascadia-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
 - `cascadia-transport/` — TCP activation relay (length-prefixed tensor wire format)
 - `cascadia-topology/` — Per-link latency + bandwidth measurements
@@ -119,10 +122,12 @@ Per-engine guides:
 - [ov-genai](docs/engines/ov-genai.md) — single-stage `openvino_genai.LLMPipeline`; FastDraft + Prompt Lookup
 - [ov-runtime](docs/engines/ov-runtime.md) — multi-stage stateful KV cache
 - [ov-dist-spec](docs/engines/ov-dist-spec.md) — multi-stage spec with mask-based rewind
+- sparse-moe — CPU-targeted sparse MoE (Kimi K2.6). Tuning: [docs/A3_TOPK_REDUCTION.md](docs/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md). Consumes a `manifest.json` + per-expert shard tree (not `cascadia shard` output).
 
 ## Cluster
 
 - **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. mDNS auto-discovery is implemented as a library (`cascadia-discovery` advertises `_cascadia._tcp.local.` and populates the topology graph with measured per-link latency + bandwidth) but is not yet wired into the `cascadia worker` CLI — see [docs/STATUS.md](docs/STATUS.md) "Known limitations".
+- **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host — cold-compile time + decode tok/s — and writes `device_profile.json`. Use it to pick `--device` today; it's step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
 - **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
 
 ## Deploying
