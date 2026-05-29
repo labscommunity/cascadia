@@ -87,3 +87,9 @@ Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, alpha+charlie vi
 - Mask-based rewind (v5) is ~free vs the ~40 ms-per-call physical rewind that v3 shards forced. The win shows up most on long generations and low-accept prompts.
 - Per-FORWARD network cost dominates on slow links. Thunderbolt 4/5 between hosts on AC power gives a 25% throughput bump over LAN; on battery the link drops under load.
 - `--device GPU` resolves to whatever Intel iGPU/dGPU OpenVINO sees; `cascadia engines` does not currently list devices.
+
+## Cancellation
+
+`cancel(task_id)` on the driver drops the task from pending and clears the `active` spec-decode state; the next task re-initialises via the normal `start_task` path (`target.reset()` + `draft.reset()`), identical to back-to-back requests. Workers hold no per-task queue and need no cancel.
+
+Limitation: a multi-stage step can block on a downstream `recv` (bounded by the transport recv timeout); because `cancel` and `step` are mutually exclusive (both take `&mut self`), the clear lands only after the in-flight step returns. The blocked step is idle on the wire (not consuming compute), so this is a teardown-latency bound, not wasted work.
