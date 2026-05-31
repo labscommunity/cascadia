@@ -14,8 +14,38 @@ fn main() {
         return;
     }
 
-    let ov_root = std::env::var("INTEL_OPENVINO_DIR")
-        .expect("INTEL_OPENVINO_DIR must be set when building with --features openvino");
+    let ov_root = match std::env::var("INTEL_OPENVINO_DIR") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => panic!(
+            "\n\
+            ────────────────────────────────────────────────────────────\n\
+            cascadia: building with `--features openvino` but INTEL_OPENVINO_DIR is not set.\n\n\
+            Point it at an OpenVINO GenAI 2026.1+ SDK install, e.g.:\n\n\
+            \x20 INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.1.0.0 \\\n\
+            \x20   cargo build --release -p cascadia --features openvino\n\n\
+            Don't have the SDK yet? See INSTALL.md (\"OpenVINO GenAI SDK\")\n\
+            or run scripts/setup-openvino.sh (Linux) / setup-openvino.ps1 (Windows).\n\
+            To build without OpenVINO (stub mode), drop `--features openvino`.\n\
+            ────────────────────────────────────────────────────────────\n"
+        ),
+    };
+
+    // Fail early with an actionable message if the path is set but wrong.
+    // A bad INTEL_OPENVINO_DIR otherwise surfaces as an opaque
+    // missing-header compile error or a link failure deep in cc/ld.
+    let runtime_include_dir = format!("{ov_root}/runtime/include");
+    if !std::path::Path::new(&runtime_include_dir).is_dir() {
+        panic!(
+            "\n\
+            ────────────────────────────────────────────────────────────\n\
+            cascadia: INTEL_OPENVINO_DIR={ov_root:?} does not look like an\n\
+            OpenVINO GenAI SDK — expected to find `runtime/include/` under it.\n\n\
+            Check the path points at the *extracted SDK root* (the directory\n\
+            that contains `runtime/`, `setupvars.sh`, etc.), not a parent or\n\
+            an archive. See INSTALL.md for the expected layout.\n\
+            ────────────────────────────────────────────────────────────\n"
+        );
+    }
 
     let runtime_include = format!("{ov_root}/runtime/include");
     let genai_include = format!("{ov_root}/runtime/include/openvino/genai");
