@@ -23,12 +23,15 @@ cascadia-engine-sparse-moe = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
 cascadia-runner = { workspace = true }
 cascadia-api = { workspace = true }
+cascadia-discovery = { workspace = true }
+cascadia-topology = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 tower = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
