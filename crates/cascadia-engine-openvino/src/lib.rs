@@ -109,4 +109,35 @@ mod cancel_tests {
         assert_eq!(pending.len(), 1);
         assert!(!cleared);
     }
+
+    #[test]
+    fn clears_active_and_leaves_unrelated_pending() {
+        // Cancel the in-flight task; an unrelated queued task must survive.
+        let mut pending = vec![gen_task("keep")];
+        let mut active = Some(FakeActive {
+            task: gen_task("x"),
+        });
+        let cleared = clear_task(&mut pending, &mut active, &"x".to_string(), |a, id| {
+            a.task.task_id == *id
+        });
+        assert!(cleared);
+        assert!(active.is_none());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task_id, "keep");
+    }
+
+    #[test]
+    fn cancels_pending_while_active_keeps_running() {
+        // Cancel a queued task; a different in-flight task keeps running.
+        let mut pending = vec![gen_task("queued")];
+        let mut active = Some(FakeActive {
+            task: gen_task("inflight"),
+        });
+        let cleared = clear_task(&mut pending, &mut active, &"queued".to_string(), |a, id| {
+            a.task.task_id == *id
+        });
+        assert!(!cleared);
+        assert!(active.is_some());
+        assert!(pending.is_empty());
+    }
 }
