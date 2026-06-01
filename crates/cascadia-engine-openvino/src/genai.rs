@@ -283,6 +283,13 @@ impl Engine for OvGenaiEngine {
         let chunk = Chunk::final_marker(task.task_id.clone(), text);
         vec![(task.task_id, chunk)]
     }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Drop a queued task so it never starts. An already-running
+        // generate() is a single blocking FFI call and can't be
+        // interrupted mid-flight.
+        self.pending.retain(|t| t.task_id != *task_id);
+    }
 }
 
 impl OvGenaiEngine {
