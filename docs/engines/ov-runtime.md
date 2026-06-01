@@ -65,4 +65,4 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 ## Cancellation
 
-`cancel(task_id)` drops the task: it is removed from the pending queue and, if it is the in-flight task, the `active` slot is cleared so the next request starts immediately instead of waiting out the abandoned task's `max_tokens`. No explicit engine reset is performed — the next task's activation already calls `reset_state()`, the same as after a normal completion (which clears `active` without resetting). Callers: the `/v1/cancel` endpoint and `ChunkStream::Drop` on client disconnect.
+`cancel(task_id)` drops the task: it is removed from the pending queue and, if it is the in-flight task, the `active` slot is cleared so the next request starts immediately instead of waiting out the abandoned task's `max_tokens`. No explicit engine reset is performed — the next task's activation already calls `reset_state()`, the same as after a normal completion (which clears `active` without resetting). Callers: the `/v1/cancel/:task_id` endpoint and `ChunkStream::Drop` on client disconnect.
