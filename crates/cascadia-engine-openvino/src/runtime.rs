@@ -145,14 +145,6 @@ fn lookup_eos(model_dir: &Path) -> Vec<u32> {
 
 // -------- helpers: bytes <-> typed slices --------
 
-fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out
-}
-
 fn i64_to_bytes(v: &[i64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 8);
     for x in v {
@@ -261,6 +253,34 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
     }
 }
 
+/// Encode the absolute position as its own framed wire tensor (I64 `[1,1,1]`).
+/// The static (NPU) path sends this immediately before each hidden activation
+/// so relay stages reset/align their KV ring; the transport requires
+/// `payload_len == shape*dtype`, so position cannot be packed into the hidden
+/// tensor (and MAX_RANK=3 leaves no spare shape slot). Paired with
+/// `decode_wire_position` — keep the two in sync.
+fn encode_wire_position(position: i64) -> WireTensor {
+    WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
+}
+
+/// Decode + strictly validate a wire position frame. Must be I64 with exactly
+/// 8 payload bytes; anything else (a desynced stream, or a stateful peer that
+/// sent a hidden tensor where a position was expected) is a hard error rather
+/// than a silently zero-padded wrong position.
+fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
+    if t.dtype != WireDType::I64 || t.data.len() != 8 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 8-byte position frame, got dtype={:?} len={} — likely a \
+             stateful/static pipeline mismatch or a desynced activation stream",
+            t.dtype,
+            t.data.len()
+        )));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&t.data);
+    Ok(i64::from_le_bytes(b))
+}
+
 // -------- static-KV (NPU) state --------
 
 /// Per-layer port wiring for a stateless static-shape (NPU) shard.
@@ -288,10 +308,20 @@ struct StaticKv {
     head_dim: usize,
     elem_bytes: usize,
     kv_dtype: ShimDType,
+    /// Resolved primary input port names (cached at build so the per-token
+    /// decode loop does no HashMap lookups / string allocs). `ids_in` is set
+    /// for the embed stage, `hidden_in` for relay/head stages.
+    ids_in: Option<String>,
+    hidden_in: Option<String>,
+    attn_in: String,
+    pos_in: String,
     layers: Vec<StaticKvLayer>,
     key_buf: Vec<Vec<u8>>, // [layer] = kv_heads * past_len * head_dim * elem_bytes
     val_buf: Vec<Vec<u8>>,
     valid: usize, // number of real past tokens currently in the ring
+    /// Reusable attention_mask byte buffer (i64 LE, length context*8), rewritten
+    /// in place each token to avoid a per-token allocation.
+    mask_bytes: Vec<u8>,
 }
 
 impl StaticKv {
@@ -319,16 +349,20 @@ impl StaticKv {
         self.valid = position.min(self.past_len);
     }
 
-    /// attention_mask over `context = past_len + 1`: 1 for the `valid` real
-    /// past slots (left-aligned) + the current token (slot `past_len`), 0 for
-    /// the padding past slots in between.
-    fn attention_mask(&self) -> Vec<i64> {
-        let mut m = vec![0i64; self.context];
-        for v in m.iter_mut().take(self.valid) {
-            *v = 1;
+    /// Rewrite `mask_bytes` (i64 LE) for the current `valid`: 1 for the `valid`
+    /// real past slots (left-aligned) + the current token (slot `past_len`), 0
+    /// for the padding past slots in between. Reuses the buffer's capacity.
+    fn write_mask_bytes(&mut self) {
+        self.mask_bytes.clear();
+        self.mask_bytes.resize(self.context * 8, 0);
+        for i in 0..self.context {
+            let v: i64 = if i < self.valid || i == self.past_len {
+                1
+            } else {
+                0
+            };
+            self.mask_bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         }
-        m[self.past_len] = 1;
-        m
     }
 
     /// Copy the new token's K/V (slot `past_len` of `present`) into the
@@ -615,7 +649,7 @@ impl OvRuntimeEngine {
                 )));
             }
             let (dtype, shape, bytes) = self.static_infer(
-                "input_ids",
+                false,
                 ShimDType::I64,
                 &[1, 1],
                 &i64_to_bytes(input_ids),
@@ -640,7 +674,7 @@ impl OvRuntimeEngine {
         if self.static_kv.is_some() {
             let hs_bytes = f32_to_f16_bytes(hidden);
             let (dtype, out_shape, bytes) =
-                self.static_infer("hidden_states", ShimDType::F16, &shape, &hs_bytes, position)?;
+                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
             return Ok((bytes_to_f32(dtype, &bytes)?, out_shape));
         }
         self.build_feed_relay(hidden, shape, position)?;
@@ -681,11 +715,7 @@ impl OvRuntimeEngine {
         // so we can't pack it into the hidden tensor — send it as its own
         // framed I64 tensor first. recv_hidden_from_upstream mirrors the order.
         let pos = if self.static_kv.is_some() {
-            Some(WireTensor::new(
-                WireDType::I64,
-                [1, 1, 1],
-                position.to_le_bytes().to_vec(),
-            ))
+            Some(encode_wire_position(position))
         } else {
             None
         };
@@ -735,22 +765,24 @@ impl OvRuntimeEngine {
         // hidden activation (see send_hidden_downstream). Each frame's payload
         // must match its shape*dtype, so we recv two separate tensors here.
         let want_pos = self.static_kv.is_some();
-        let (position, tensor) = self
+        let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
-                let position = if want_pos {
-                    let (p, _) = guard.recv().await?;
-                    let mut b = [0u8; 8];
-                    let n = b.len().min(p.data.len());
-                    b[..n].copy_from_slice(&p.data[..n]);
-                    Some(i64::from_le_bytes(b))
+                let pos_tensor = if want_pos {
+                    Some(guard.recv().await?.0)
                 } else {
                     None
                 };
                 let (t, _) = guard.recv().await?;
-                Ok::<_, cascadia_transport::TransportError>((position, t))
+                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        // Decode + strictly validate the position frame outside the transport
+        // closure (so a bad frame yields a clear EngineError, not a desync).
+        let position = match pos_tensor {
+            Some(p) => Some(decode_wire_position(&p)?),
+            None => None,
+        };
         let shape = [
             tensor.shape[0] as usize,
             tensor.shape[1] as usize,
@@ -836,6 +868,9 @@ impl OvRuntimeEngine {
             );
             self.active = None;
             let _ = self.runtime.reset_state();
+            if let Some(sk) = self.static_kv.as_mut() {
+                sk.reset();
+            }
             self.position = 0;
         }
         res
@@ -856,6 +891,15 @@ impl OvRuntimeEngine {
         };
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
 
+        // A generation request must carry at least one prompt token; an empty
+        // prompt would otherwise emit a fabricated token with no inference (and
+        // on the static path skip the position-0 ring reset).
+        if prefill && tokens.is_empty() {
+            return Err(EngineError::Backend(
+                "empty prompt: no tokens to prefill".into(),
+            ));
+        }
+
         let next_token = if self.static_kv.is_some() {
             // Static (NPU): one token per inference (static_seq == 1). Prefill
             // round-trips the whole pipeline once per prompt token so every
@@ -863,6 +907,16 @@ impl OvRuntimeEngine {
             // the final prompt token is the first generated token.
             if prefill {
                 self.position = 0;
+                if let Some(sk) = self.static_kv.as_ref() {
+                    if tokens.len() > sk.past_len {
+                        warn!(
+                            prompt_tokens = tokens.len(),
+                            past_len = sk.past_len,
+                            "prompt exceeds the static KV window (static_context-1); earliest \
+                             tokens will be evicted — attention degrades to a sliding window"
+                        );
+                    }
+                }
             }
             let mut nt = 0i32;
             for &t in &tokens {
@@ -871,15 +925,9 @@ impl OvRuntimeEngine {
                 let (out, shape) = self.run_first(&[t], position)?;
                 let alpha = ts.elapsed();
                 self.position += 1;
-                let ts = std::time::Instant::now();
-                nt = if single_stage {
-                    argmax_logits(&out, &shape)?
-                } else {
-                    let s3 = to_shape3(&shape);
-                    self.send_hidden_downstream(&out, s3, position)?;
-                    self.recv_token_from_downstream()?
-                };
-                let wire = ts.elapsed();
+                let (token, wire) =
+                    self.resolve_next_token(&out, &shape, single_stage, position)?;
+                nt = token;
                 if let Some(a) = self.active.as_mut() {
                     a.t_alpha_compute += alpha;
                     a.t_wire += wire;
@@ -892,27 +940,39 @@ impl OvRuntimeEngine {
             let position = self.position;
             let ts = std::time::Instant::now();
             let (out, shape) = self.run_first(&tokens, position)?;
-            let alpha_dur = ts.elapsed();
+            let alpha = ts.elapsed();
             self.position += tokens.len() as i64;
-            let mut wire_dur = std::time::Duration::ZERO;
-            let nt = if single_stage {
-                argmax_logits(&out, &shape)?
-            } else {
-                let s3 = to_shape3(&shape);
-                let ts = std::time::Instant::now();
-                self.send_hidden_downstream(&out, s3, position)?;
-                let token = self.recv_token_from_downstream()?;
-                wire_dur = ts.elapsed();
-                token
-            };
+            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
             if let Some(a) = self.active.as_mut() {
-                a.t_alpha_compute += alpha_dur;
-                a.t_wire += wire_dur;
+                a.t_alpha_compute += alpha;
+                a.t_wire += wire;
             }
             nt
         };
 
         self.emit_token(next_token)
+    }
+
+    /// From a first-stage output, produce the next token: argmax locally when
+    /// this is the only stage, otherwise forward the hidden state downstream
+    /// and await the token from the pipeline tail. Returns the token + the
+    /// wire round-trip time (zero for single-stage).
+    fn resolve_next_token(
+        &mut self,
+        out: &[f32],
+        shape: &[usize],
+        single_stage: bool,
+        position: i64,
+    ) -> EngineResult<(i32, std::time::Duration)> {
+        if single_stage {
+            Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+        } else {
+            let s3 = to_shape3(shape);
+            let ts = std::time::Instant::now();
+            self.send_hidden_downstream(out, s3, position)?;
+            let token = self.recv_token_from_downstream()?;
+            Ok((token, ts.elapsed()))
+        }
     }
 
     /// Decode the delta text for `next_token`, append it to the active task,
@@ -994,70 +1054,54 @@ impl OvRuntimeEngine {
     /// `position == 0`, so this is correct for any stage in a pipeline.
     fn static_infer(
         &mut self,
-        primary_in: &str,
+        use_hidden: bool,
         in_dtype: ShimDType,
         in_shape: &[usize],
         in_bytes: &[u8],
         position: i64,
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
-        let in_main = self
-            .input_named(primary_in)
-            .ok_or_else(|| EngineError::Backend(format!("static IR missing {primary_in}")))?
-            .to_string();
-        let in_attn = self
-            .input_named("attention_mask")
-            .ok_or_else(|| EngineError::Backend("static IR missing attention_mask".into()))?
-            .to_string();
-        let in_pos = self
-            .input_named("position_ids")
-            .ok_or_else(|| EngineError::Backend("static IR missing position_ids".into()))?
-            .to_string();
-
-        // Align the ring to this absolute position (resets at position 0).
-        let (ctx, past_len, kvh, hd, kv_dtype, mask, expect) = {
+        // Align the ring to this absolute position (resets at position 0) and
+        // refresh the reusable mask buffer.
+        {
             let sk = self.static_kv.as_mut().unwrap();
             sk.begin_token(position as usize);
-            (
-                sk.context,
-                sk.past_len,
-                sk.kv_heads,
-                sk.head_dim,
-                sk.kv_dtype,
-                sk.attention_mask(),
-                sk.present_layer_bytes(),
-            )
-        };
+            sk.write_mask_bytes();
+        }
+        let pos_bytes = position.to_le_bytes();
 
-        self.runtime
-            .set_input(&in_main, in_dtype, in_shape, in_bytes)
-            .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_attn, ShimDType::I64, &[1, ctx], &i64_to_bytes(&mask))
-            .map_err(map_ov_err)?;
-        self.runtime
-            .set_input(&in_pos, ShimDType::I64, &[1, 1], &i64_to_bytes(&[position]))
-            .map_err(map_ov_err)?;
-        // Feed the per-layer past-KV from the ring. self.runtime (mut) and
-        // self.static_kv (shared) are disjoint fields, so we borrow the ring
-        // buffers directly — no per-step clone.
+        // Feed primary input + mask + position + the per-layer past-KV ring.
+        // self.runtime (mut) and self.static_kv (shared) are disjoint fields,
+        // so we borrow cached names + ring buffers directly — no per-token
+        // string or buffer allocation.
         {
             let sk = self.static_kv.as_ref().unwrap();
+            let in_main = if use_hidden {
+                sk.hidden_in.as_deref()
+            } else {
+                sk.ids_in.as_deref()
+            }
+            .ok_or_else(|| EngineError::Backend("static IR missing primary input".into()))?;
+            self.runtime
+                .set_input(in_main, in_dtype, in_shape, in_bytes)
+                .map_err(map_ov_err)?;
+            self.runtime
+                .set_input(
+                    &sk.attn_in,
+                    ShimDType::I64,
+                    &[1, sk.context],
+                    &sk.mask_bytes,
+                )
+                .map_err(map_ov_err)?;
+            self.runtime
+                .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes)
+                .map_err(map_ov_err)?;
+            let shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
             for (li, layer) in sk.layers.iter().enumerate() {
                 self.runtime
-                    .set_input(
-                        &layer.key_in,
-                        kv_dtype,
-                        &[1, kvh, past_len, hd],
-                        &sk.key_buf[li],
-                    )
+                    .set_input(&layer.key_in, sk.kv_dtype, &shape, &sk.key_buf[li])
                     .map_err(map_ov_err)?;
                 self.runtime
-                    .set_input(
-                        &layer.val_in,
-                        kv_dtype,
-                        &[1, kvh, past_len, hd],
-                        &sk.val_buf[li],
-                    )
+                    .set_input(&layer.val_in, sk.kv_dtype, &shape, &sk.val_buf[li])
                     .map_err(map_ov_err)?;
             }
         }
@@ -1067,26 +1111,36 @@ impl OvRuntimeEngine {
         // otherwise — the static export emits it before the present.* outputs.
         let (odt, oshape, obytes) = self.runtime.output(0).map_err(map_ov_err)?;
 
-        // Absorb the new token's K/V. Snapshot only the per-layer output
-        // indices (cheap) so we don't hold a static_kv borrow across the
-        // runtime.output() + absorb_layer() calls.
-        let outs: Vec<(usize, usize)> = self
-            .static_kv
-            .as_ref()
-            .unwrap()
-            .layers
-            .iter()
-            .map(|l| (l.key_out, l.val_out))
-            .collect();
-        for (li, (ko, vo)) in outs.into_iter().enumerate() {
-            let (_, _, kpres) = self.runtime.output(ko).map_err(map_ov_err)?;
-            let (_, _, vpres) = self.runtime.output(vo).map_err(map_ov_err)?;
-            if kpres.len() != expect || vpres.len() != expect {
-                let elem = self.static_kv.as_ref().unwrap().elem_bytes;
+        // Absorb the new token's K/V. Validate each present.* output's byte
+        // length AND shape against [1, kv_heads, context, head_dim] so a
+        // dtype/factorization mismatch is a clear error, not silent corruption.
+        let (n, expect, kvh, ctx, hd) = {
+            let sk = self.static_kv.as_ref().unwrap();
+            (
+                sk.layers.len(),
+                sk.present_layer_bytes(),
+                sk.kv_heads,
+                sk.context,
+                sk.head_dim,
+            )
+        };
+        let want_shape = [1usize, kvh, ctx, hd];
+        for li in 0..n {
+            let (ko, vo) = {
+                let l = &self.static_kv.as_ref().unwrap().layers[li];
+                (l.key_out, l.val_out)
+            };
+            let (_, kshape, kpres) = self.runtime.output(ko).map_err(map_ov_err)?;
+            let (_, vshape, vpres) = self.runtime.output(vo).map_err(map_ov_err)?;
+            if kpres.len() != expect
+                || vpres.len() != expect
+                || kshape != want_shape
+                || vshape != want_shape
+            {
                 return Err(EngineError::Backend(format!(
-                    "static present.{li} byte length key={} val={} != expected {expect} \
-                     (kv_heads*context*head_dim*{elem}); check num_kv_heads/head_dim/KV dtype \
-                     in stage_config",
+                    "static present.{li} mismatch: key shape={kshape:?} len={} val shape={vshape:?} \
+                     len={}; expected shape {want_shape:?} ({expect} bytes f16). Check \
+                     num_kv_heads/head_dim/KV dtype in stage_config.",
                     kpres.len(),
                     vpres.len(),
                 )));
@@ -1252,9 +1306,10 @@ pub struct OvRuntimeBuilder {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     listen_host: String,
     listen_port: Option<u16>,
-    /// (static_seq, context, kv_heads, head_dim) for a stateless static-shape
-    /// (NPU) shard; None for the stateful path.
-    static_params: Option<(u32, u32, u32, u32)>,
+    /// (context, kv_heads, head_dim) for a stateless static-shape (NPU) shard;
+    /// None for the stateful path. static_seq is validated == 1 at load and not
+    /// stored (the ring math assumes one token per step).
+    static_params: Option<(u32, u32, u32)>,
 }
 
 impl OvRuntimeBuilder {
@@ -1376,10 +1431,34 @@ impl Builder for OvRuntimeBuilder {
             events.push(LoadProgress::message(format!(
                 "stateless static-KV shard: context={ctx} kv_heads={kvh} head_dim={hd}"
             )));
-            Some((s, ctx, kvh, hd))
+            // static_seq is validated == 1 above and never stored (the ring math
+            // assumes one token per step); carry only (ctx, kv_heads, head_dim).
+            Some((ctx, kvh, hd))
         } else {
             None
         };
+
+        // A pipeline must be homogeneous: the static path carries a wire
+        // position frame the stateful path does not, so a mixed pipeline would
+        // desync. Fail fast when sibling stage configs are present locally
+        // (single-host multi-process); for distributed deploys each node has
+        // only its own stage dir, so the strict wire-frame validation in
+        // recv_hidden_from_upstream is the backstop at the first activation.
+        for r in 0..pipeline_cfg.num_stages {
+            if r == self.rank {
+                continue;
+            }
+            if let Ok(cfg) = read_stage_config(&self.pipeline_dir.join(format!("stage_{r}"))) {
+                if cfg.stateful != stage_cfg.stateful {
+                    return Err(EngineError::ShardRejected(format!(
+                        "pipeline is not homogeneous: stage_{} stateful={} but stage_{r} \
+                         stateful={} — all stages must share one KV mode (re-export the whole \
+                         pipeline with a single --target)",
+                        self.rank, stage_cfg.stateful, cfg.stateful
+                    )));
+                }
+            }
+        }
 
         let is_first = stage_cfg.has_embed;
         let is_last = stage_cfg.has_head;
@@ -1494,7 +1573,7 @@ impl Builder for OvRuntimeBuilder {
         // past_key_values.* inputs + present.* outputs and allocate the
         // host-side KV ring. The primary output (logits on the head stage,
         // hidden_states otherwise) is output index 0 — no alias guess needed.
-        let static_kv = if let Some((_s, ctx, kvh, hd)) = self.static_params {
+        let static_kv = if let Some((ctx, kvh, hd)) = self.static_params {
             let n_out = runtime.output_count();
             let mut layers: Vec<StaticKvLayer> = Vec::new();
             loop {
@@ -1565,20 +1644,56 @@ impl Builder for OvRuntimeBuilder {
             }
             let (kvh, hd) = (kvh as usize, hd as usize);
             let past_len = (ctx - 1) as usize;
-            let elem_bytes = 2usize; // KV activations are f16 in the static export
+            // KV activations are f16 in the static export; derive elem_bytes
+            // from the dtype so the two can never drift.
+            let kv_dtype = ShimDType::F16;
+            let elem_bytes = match kv_dtype {
+                ShimDType::F16 | ShimDType::Bf16 => 2,
+                ShimDType::F32 | ShimDType::I32 => 4,
+                ShimDType::I64 => 8,
+                ShimDType::I8 => 1,
+            };
             let layer_bytes = kvh * past_len * hd * elem_bytes;
             let n = layers.len();
+            // Cache the resolved primary/aux input port names so the per-token
+            // decode loop does no HashMap lookups or string allocs. A static
+            // shard always has attention_mask + position_ids; embed stages have
+            // input_ids, relay/head stages have hidden_states.
+            let attn_in = canonical_inputs
+                .get("attention_mask")
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::Backend("static IR missing attention_mask input".into())
+                })?;
+            let pos_in = canonical_inputs
+                .get("position_ids")
+                .cloned()
+                .ok_or_else(|| {
+                    EngineError::Backend("static IR missing position_ids input".into())
+                })?;
+            let ids_in = canonical_inputs.get("input_ids").cloned();
+            let hidden_in = canonical_inputs.get("hidden_states").cloned();
+            if ids_in.is_none() && hidden_in.is_none() {
+                return Err(EngineError::Backend(
+                    "static IR has neither input_ids nor hidden_states input".into(),
+                ));
+            }
             Some(StaticKv {
                 past_len,
                 context: ctx as usize,
                 kv_heads: kvh,
                 head_dim: hd,
                 elem_bytes,
-                kv_dtype: ShimDType::F16,
+                kv_dtype,
+                ids_in,
+                hidden_in,
+                attn_in,
+                pos_in,
                 layers,
                 key_buf: vec![vec![0u8; layer_bytes]; n],
                 val_buf: vec![vec![0u8; layer_bytes]; n],
                 valid: 0,
+                mask_bytes: vec![0u8; ctx as usize * 8],
             })
         } else {
             None
