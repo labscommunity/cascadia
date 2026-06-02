@@ -175,7 +175,7 @@ Cascadia does not daemonize itself — run it under systemd / NSSM / launchd. Se
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, and commit conventions. The onboarding research behind the quickstart and tooling lives in [docs/ONBOARDING_RESEARCH.md](docs/ONBOARDING_RESEARCH.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, and commit conventions.
 
 ## License
 
