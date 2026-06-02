@@ -828,41 +828,6 @@ def export_single_stage(
             name = f"present.{layer_local}.{kv_type}"
         out.set_names({name})
 
-    # NPU: EVERY dim (inputs AND outputs) must be static or the compiler
-    # rejects the IR (#37). We pinned the inputs above, but the outputs only
-    # got names — re-infer so they pick up static shapes, then verify. A traced
-    # ShapeOf/Reshape can leave a symbolic output dim even when all inputs are
-    # static; catching it here fails the export instead of producing an IR that
-    # only blows up at NPU load (and which CPU/GPU would happily accept).
-    if npu:
-        ov_model.validate_nodes_and_infer_types()
-
-        def _dynamic(ports):
-            out = []
-            for idx, p in enumerate(ports):
-                ps = p.partial_shape
-                if not ps.is_static:
-                    try:
-                        nm = p.get_any_name()
-                    except Exception:
-                        nm = f"#{idx}"
-                    out.append(f"{nm}{ps}")
-            return out
-
-        bad_in = _dynamic(ov_model.inputs)
-        bad_out = _dynamic(ov_model.outputs)
-        if bad_in or bad_out:
-            raise RuntimeError(
-                f"NPU export (stage {stage_idx}): shapes still dynamic after static pinning "
-                f"— the NPU compiler will reject this IR (#37). Pin or fold these dims. "
-                f"dynamic inputs={bad_in} dynamic outputs={bad_out}"
-            )
-        print(
-            f"  NPU static-shape check OK: all {len(ov_model.inputs)} inputs + "
-            f"{len(ov_model.outputs)} outputs static",
-            flush=True,
-        )
-
     # 6+7. Make stateful with init-bearing ReadValues (+ beam_idx cache-reorder).
     # NPU mode skips this entirely: the NPU stack does not support state
     # variables, so the model stays STATELESS (explicit past_kv in / present_kv
@@ -918,6 +883,43 @@ def export_single_stage(
                 f"  WARNING: INT8 compression failed ({e}); falling back to FP16",
                 flush=True,
             )
+
+    # NPU: EVERY dim (inputs AND outputs) must be static or the compiler
+    # rejects the IR (#37). Run this on the FINAL graph — after make_stateful is
+    # skipped AND after nncf weight compression — so a dynamic dim introduced by
+    # a decompression subgraph is also caught, not just the post-trace shape. We
+    # pinned the inputs earlier (incl. the relay hidden dim); re-infer so the
+    # outputs pick up static shapes, then verify. Catching it here fails the
+    # export instead of producing an IR that only blows up at NPU load (and that
+    # CPU/GPU would happily accept).
+    if npu:
+        ov_model.validate_nodes_and_infer_types()
+
+        def _dynamic(ports):
+            out = []
+            for idx, p in enumerate(ports):
+                ps = p.partial_shape
+                if not ps.is_static:
+                    try:
+                        nm = p.get_any_name()
+                    except Exception:
+                        nm = f"#{idx}"
+                    out.append(f"{nm}{ps}")
+            return out
+
+        bad_in = _dynamic(ov_model.inputs)
+        bad_out = _dynamic(ov_model.outputs)
+        if bad_in or bad_out:
+            raise RuntimeError(
+                f"NPU export (stage {stage_idx}): shapes still dynamic after static pinning "
+                f"+ compression — the NPU compiler will reject this IR (#37). Pin or fold these "
+                f"dims. dynamic inputs={bad_in} dynamic outputs={bad_out}"
+            )
+        print(
+            f"  NPU static-shape check OK: all {len(ov_model.inputs)} inputs + "
+            f"{len(ov_model.outputs)} outputs static",
+            flush=True,
+        )
 
     # 9. Save.
     stage_dir = os.path.join(output_dir, f"stage_{stage_idx}")
@@ -1099,6 +1101,12 @@ def main():
             parser.error(
                 f"--static-context ({args.static_context}) must be > --static-seq "
                 f"({args.static_seq}) so past-KV length >= 1"
+            )
+        if args.default_dtype != "fp16":
+            parser.error(
+                f"--default-dtype must be fp16 for --target npu (the runtime feeds KV as "
+                f"f16; --default-dtype {args.default_dtype} would emit f32 KV ports and fail "
+                f"the present-shape check at first inference)"
             )
     elif args.static_seq != 1 or args.static_context != 1024:
         print(
