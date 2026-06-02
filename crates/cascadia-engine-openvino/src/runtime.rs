@@ -53,6 +53,10 @@ struct PipelineConfig {
     export_version: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct StageConfig {
     #[serde(default)]
@@ -65,6 +69,20 @@ struct StageConfig {
     has_head: bool,
     #[serde(default)]
     export_version: Option<String>,
+    /// NPU (`--target npu`) export: KV is stateless (explicit past_kv-in /
+    /// present-out) and all shapes are static. Old/standard shards omit the
+    /// field and are stateful (default true). When false, the engine drives
+    /// the static-KV path (host-side bounded ring) instead of OV state.
+    #[serde(default = "default_true")]
+    stateful: bool,
+    #[serde(default)]
+    static_seq: Option<u32>,
+    #[serde(default)]
+    static_context: Option<u32>,
+    #[serde(default)]
+    num_kv_heads: Option<u32>,
+    #[serde(default)]
+    head_dim: Option<u32>,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -190,6 +208,91 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+// -------- static-KV (NPU) state --------
+
+/// Per-layer port wiring for a stateless static-shape (NPU) shard.
+struct StaticKvLayer {
+    key_in: String,
+    val_in: String,
+    key_out: usize,
+    val_out: usize,
+}
+
+/// Host-side bounded KV ring for the stateless static-shape (NPU) path.
+/// The exported IR takes explicit `past_key_values.*` (length `past_len`) +
+/// `attention_mask` (length `context = past_len + 1`) + `position_ids`, and
+/// returns `logits` + `present.*` (length `context`). We hold the KV for the
+/// most recent `valid` real tokens left-aligned in `past_len`-slot buffers,
+/// feed them each step, and absorb the new token's KV from `present[past_len]`.
+struct StaticKv {
+    past_len: usize,
+    context: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    elem_bytes: usize,
+    kv_dtype: ShimDType,
+    logits_out: usize,
+    layers: Vec<StaticKvLayer>,
+    key_buf: Vec<Vec<u8>>, // [layer] = kv_heads * past_len * head_dim * elem_bytes
+    val_buf: Vec<Vec<u8>>,
+    valid: usize, // number of real tokens currently in the ring
+}
+
+impl StaticKv {
+    fn reset(&mut self) {
+        for b in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
+            b.iter_mut().for_each(|x| *x = 0);
+        }
+        self.valid = 0;
+    }
+
+    /// attention_mask over `context = past_len + 1`: 1 for the `valid` real
+    /// past slots (left-aligned) + the current token (slot `past_len`), 0 for
+    /// the padding past slots in between.
+    fn attention_mask(&self) -> Vec<i64> {
+        let mut m = vec![0i64; self.context];
+        for v in m.iter_mut().take(self.valid) {
+            *v = 1;
+        }
+        m[self.past_len] = 1;
+        m
+    }
+
+    /// Copy the new token's K/V (slot `past_len` of `present`) into the
+    /// layer's ring buffer, appending at `valid` or sliding the window when
+    /// full. Selects `key_buf[li]` or `val_buf[li]` internally so callers can
+    /// hold `&mut self` without aliasing the buffer field.
+    fn absorb_layer(&mut self, li: usize, is_value: bool, present: &[u8]) {
+        // Read scalar fields into locals before borrowing the buffer field,
+        // so the mutable buffer borrow stays disjoint from these reads.
+        let slot = self.head_dim * self.elem_bytes;
+        let present_row = self.context * slot; // per-head stride in present
+        let buf_row = self.past_len * slot; // per-head stride in the ring
+        let full = self.valid >= self.past_len;
+        let kv_heads = self.kv_heads;
+        let past_len = self.past_len;
+        let valid = self.valid;
+        let buf: &mut [u8] = if is_value {
+            &mut self.val_buf[li]
+        } else {
+            &mut self.key_buf[li]
+        };
+        for h in 0..kv_heads {
+            let src = h * present_row + past_len * slot;
+            let new = &present[src..src + slot];
+            let base = h * buf_row;
+            if full {
+                buf.copy_within(base + slot..base + buf_row, base); // drop oldest
+                let dst = base + (past_len - 1) * slot;
+                buf[dst..dst + slot].copy_from_slice(new);
+            } else {
+                let dst = base + valid * slot;
+                buf[dst..dst + slot].copy_from_slice(new);
+            }
+        }
+    }
+}
+
 // -------- Engine --------
 
 struct ActiveTask {
@@ -230,6 +333,9 @@ pub struct OvRuntimeEngine {
     canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
+    /// Set for stateless static-shape (NPU) shards; drives the host-side
+    /// bounded-KV decode path instead of OV internal state.
+    static_kv: Option<StaticKv>,
 }
 
 impl OvRuntimeEngine {
@@ -581,7 +687,9 @@ impl OvRuntimeEngine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-            self.runtime.reset_state().map_err(map_ov_err)?;
+            if self.static_kv.is_none() {
+                self.runtime.reset_state().map_err(map_ov_err)?;
+            }
             self.position = 0;
             info!(
                 task = %task.task_id,
@@ -623,6 +731,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_first_body(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.static_kv.is_some() {
+            return self.step_first_static();
+        }
         let active = match self.active.as_mut() {
             Some(a) => a,
             None => return Ok(Vec::new()),
@@ -724,6 +835,159 @@ impl OvRuntimeEngine {
             self.active = None;
         }
 
+        Ok(vec![(task_id, chunk)])
+    }
+
+    /// One static-KV (NPU) inference: feed the current token + the host-side
+    /// KV ring + a mask/position for the absolute position, run, return the
+    /// last-row logits, and absorb the new token's K/V into the ring.
+    fn static_infer_one(&mut self, token: i64) -> EngineResult<Vec<f32>> {
+        let in_ids = self
+            .input_named("input_ids")
+            .ok_or_else(|| EngineError::Backend("static IR missing input_ids".into()))?
+            .to_string();
+        let in_attn = self
+            .input_named("attention_mask")
+            .ok_or_else(|| EngineError::Backend("static IR missing attention_mask".into()))?
+            .to_string();
+        let in_pos = self
+            .input_named("position_ids")
+            .ok_or_else(|| EngineError::Backend("static IR missing position_ids".into()))?
+            .to_string();
+        let pos = self.position;
+        // Snapshot params + per-layer wiring (clone to drop the static_kv
+        // borrow before the runtime calls below).
+        let (ctx, past_len, kvh, hd, kv_dtype, logits_out, mask, wiring) = {
+            let sk = self.static_kv.as_ref().unwrap();
+            (
+                sk.context,
+                sk.past_len,
+                sk.kv_heads,
+                sk.head_dim,
+                sk.kv_dtype,
+                sk.logits_out,
+                sk.attention_mask(),
+                sk.layers
+                    .iter()
+                    .map(|l| (l.key_in.clone(), l.val_in.clone(), l.key_out, l.val_out))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        self.runtime
+            .set_input(&in_ids, ShimDType::I64, &[1, 1], &i64_to_bytes(&[token]))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_attn, ShimDType::I64, &[1, ctx], &i64_to_bytes(&mask))
+            .map_err(map_ov_err)?;
+        self.runtime
+            .set_input(&in_pos, ShimDType::I64, &[1, 1], &i64_to_bytes(&[pos]))
+            .map_err(map_ov_err)?;
+        for (li, (kin, vin, _ko, _vo)) in wiring.iter().enumerate() {
+            let (kb, vb) = {
+                let sk = self.static_kv.as_ref().unwrap();
+                (sk.key_buf[li].clone(), sk.val_buf[li].clone())
+            };
+            self.runtime
+                .set_input(kin, kv_dtype, &[1, kvh, past_len, hd], &kb)
+                .map_err(map_ov_err)?;
+            self.runtime
+                .set_input(vin, kv_dtype, &[1, kvh, past_len, hd], &vb)
+                .map_err(map_ov_err)?;
+        }
+        self.runtime.infer().map_err(map_ov_err)?;
+        let (ldt, lshape, lbytes) = self.runtime.output(logits_out).map_err(map_ov_err)?;
+        let logits = match ldt {
+            ShimDType::F32 => lbytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>(),
+            ShimDType::F16 => f16_bytes_to_f32(&lbytes),
+            other => return Err(EngineError::Backend(format!("logits dtype {other:?}"))),
+        };
+        let vocab = lshape[lshape.len() - 1];
+        let last_row = logits[logits.len() - vocab..].to_vec();
+        for (li, (_kin, _vin, ko, vo)) in wiring.iter().enumerate() {
+            let (_, _, kpres) = self.runtime.output(*ko).map_err(map_ov_err)?;
+            let (_, _, vpres) = self.runtime.output(*vo).map_err(map_ov_err)?;
+            let sk = self.static_kv.as_mut().unwrap();
+            sk.absorb_layer(li, false, &kpres);
+            sk.absorb_layer(li, true, &vpres);
+        }
+        {
+            let sk = self.static_kv.as_mut().unwrap();
+            sk.valid = (sk.valid + 1).min(sk.past_len);
+        }
+        self.position += 1;
+        Ok(last_row)
+    }
+
+    /// First-stage step for stateless static-shape (NPU) shards: prefill the
+    /// prompt one token at a time into the KV ring, then emit one token per
+    /// call. Single-stage only (NPU shards are not pipelined).
+    fn step_first_static(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.active.is_none() {
+            return Ok(Vec::new());
+        }
+        let (prefill, ids) = {
+            let a = self.active.as_mut().unwrap();
+            if !a.prefilled {
+                a.prefilled = true;
+                (true, a.prompt_ids.clone())
+            } else {
+                (false, vec![a.last_token as i64])
+            }
+        };
+        let last_row = if prefill {
+            if let Some(sk) = self.static_kv.as_mut() {
+                sk.reset();
+            }
+            self.position = 0;
+            let mut lr = Vec::new();
+            for &t in &ids {
+                lr = self.static_infer_one(t)?;
+            }
+            lr
+        } else {
+            self.static_infer_one(ids[0])?
+        };
+        let vocab = last_row.len();
+        let next_token = argmax_last_row(&last_row, vocab);
+
+        let active = self.active.as_mut().unwrap();
+        active.last_token = next_token;
+        active.generated.push(next_token);
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| EngineError::Backend("static stage requires tokenizer".into()))?;
+        let all_ids: Vec<u32> = active.generated.iter().map(|&t| t as u32).collect();
+        let full_text = tok
+            .decode(&all_ids, true)
+            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
+        let delta = full_text
+            .strip_prefix(active.last_text.as_str())
+            .unwrap_or(&full_text)
+            .to_string();
+        active.last_text = full_text;
+        let max_tokens = active.task.max_tokens.max(1) as usize;
+        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
+        let is_final = active.generated.len() >= max_tokens || is_eos;
+        let task_id = active.task.task_id.clone();
+        let chunk = if is_final {
+            Chunk {
+                task_id: task_id.clone(),
+                token_id: next_token as i64,
+                text: delta,
+                is_final: true,
+                logprobs: None,
+                n_tokens: None,
+            }
+        } else {
+            Chunk::token(task_id.clone(), next_token as i64, delta)
+        };
+        if is_final {
+            self.active = None;
+        }
         Ok(vec![(task_id, chunk)])
     }
 
@@ -858,6 +1122,9 @@ pub struct OvRuntimeBuilder {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     listen_host: String,
     listen_port: Option<u16>,
+    /// (static_seq, context, kv_heads, head_dim) for a stateless static-shape
+    /// (NPU) shard; None for the stateful path.
+    static_params: Option<(u32, u32, u32, u32)>,
 }
 
 impl OvRuntimeBuilder {
@@ -961,6 +1228,26 @@ impl Builder for OvRuntimeBuilder {
         }
         let stage_dir = self.pipeline_dir.join(format!("stage_{}", self.rank));
         let stage_cfg = read_stage_config(&stage_dir)?;
+
+        self.static_params = if !stage_cfg.stateful {
+            let ctx = stage_cfg.static_context.unwrap_or(0);
+            let s = stage_cfg.static_seq.unwrap_or(1);
+            let kvh = stage_cfg.num_kv_heads.unwrap_or(0);
+            let hd = stage_cfg.head_dim.unwrap_or(0);
+            if ctx == 0 || kvh == 0 || hd == 0 || s != 1 {
+                return Err(EngineError::InvalidConfig(format!(
+                    "stateless (NPU) shard needs static_seq=1 + static_context/\
+                     num_kv_heads/head_dim in stage_config; got seq={s} ctx={ctx} \
+                     kvh={kvh} hd={hd}"
+                )));
+            }
+            events.push(LoadProgress::message(format!(
+                "stateless static-KV shard: context={ctx} kv_heads={kvh} head_dim={hd}"
+            )));
+            Some((s, ctx, kvh, hd))
+        } else {
+            None
+        };
 
         let is_first = stage_cfg.has_embed;
         let is_last = stage_cfg.has_head;
@@ -1071,6 +1358,88 @@ impl Builder for OvRuntimeBuilder {
             }
         }
 
+        // Stateless static-shape (NPU) shards: resolve the explicit
+        // past_key_values.* inputs + present.* / logits outputs and allocate
+        // the host-side KV ring.
+        let static_kv = if let Some((_s, ctx, kvh, hd)) = self.static_params {
+            let n_out = runtime.output_count();
+            let mut logits_out = 0usize;
+            for idx in 0..n_out {
+                let al = runtime.output_aliases(idx).map_err(map_ov_err)?;
+                if al.iter().any(|a| a == "logits" || a.contains("logits")) {
+                    logits_out = idx;
+                    break;
+                }
+            }
+            let mut layers: Vec<StaticKvLayer> = Vec::new();
+            loop {
+                let l = layers.len();
+                let kin_s = format!("past_key_values.{l}.key");
+                let vin_s = format!("past_key_values.{l}.value");
+                let kout_s = format!("present.{l}.key");
+                let vout_s = format!("present.{l}.value");
+                let (mut key_in, mut val_in) = (None, None);
+                for idx in 0..n_inputs {
+                    let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
+                    if al.iter().any(|a| a.contains(&kin_s)) {
+                        key_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
+                    } else if al.iter().any(|a| a.contains(&vin_s)) {
+                        val_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
+                    }
+                }
+                let (key_in, val_in) = match (key_in, val_in) {
+                    (Some(k), Some(v)) => (k, v),
+                    _ => break,
+                };
+                let (mut key_out, mut val_out) = (None, None);
+                for idx in 0..n_out {
+                    let al = runtime.output_aliases(idx).map_err(map_ov_err)?;
+                    if al.iter().any(|a| a.contains(&kout_s)) {
+                        key_out = Some(idx);
+                    } else if al.iter().any(|a| a.contains(&vout_s)) {
+                        val_out = Some(idx);
+                    }
+                }
+                let key_out = key_out.ok_or_else(|| {
+                    EngineError::Backend(format!("static shard missing {kout_s}"))
+                })?;
+                let val_out = val_out.ok_or_else(|| {
+                    EngineError::Backend(format!("static shard missing {vout_s}"))
+                })?;
+                layers.push(StaticKvLayer {
+                    key_in,
+                    val_in,
+                    key_out,
+                    val_out,
+                });
+            }
+            if layers.is_empty() {
+                return Err(EngineError::Backend(
+                    "static shard: no past_key_values.* inputs found".into(),
+                ));
+            }
+            let (kvh, hd) = (kvh as usize, hd as usize);
+            let past_len = (ctx - 1) as usize;
+            let elem_bytes = 2usize; // KV activations are f16 in the static export
+            let layer_bytes = kvh * past_len * hd * elem_bytes;
+            let n = layers.len();
+            Some(StaticKv {
+                past_len,
+                context: ctx as usize,
+                kv_heads: kvh,
+                head_dim: hd,
+                elem_bytes,
+                kv_dtype: ShimDType::F16,
+                logits_out,
+                layers,
+                key_buf: vec![vec![0u8; layer_bytes]; n],
+                val_buf: vec![vec![0u8; layer_bytes]; n],
+                valid: 0,
+            })
+        } else {
+            None
+        };
+
         Ok(Box::new(OvRuntimeEngine {
             spec,
             runtime,
@@ -1086,6 +1455,7 @@ impl Builder for OvRuntimeBuilder {
             canonical_inputs,
             pending: Vec::new(),
             active: None,
+            static_kv,
         }))
     }
 }
