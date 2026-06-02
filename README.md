@@ -27,32 +27,53 @@ cargo build --release -p cascadia
 
 # Real OV mode — links against openvino-genai 2026.1.0+. Required to run
 # the OV engines on real Intel hardware.
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0 \
   cargo build --release -p cascadia --features openvino
 ```
 
-The resulting binary lands at `target/release/cascadia` (`cascadia.exe` on Windows). It is statically linked apart from the OV dynamic libraries — copy the binary plus `INTEL_OPENVINO_DIR/runtime/bin/intel64/Release/` and `runtime/3rdparty/tbb/bin/` to the worker host's PATH.
+The resulting binary lands at `target/release/cascadia` (`cascadia.exe` on Windows). It is statically linked apart from the OV dynamic libraries — copy the binary plus `INTEL_OPENVINO_DIR/runtime/lib/intel64/` (Linux) or `runtime/bin/intel64/Release/` + `runtime/3rdparty/tbb/bin/` (Windows) to the worker host's library path.
+
+**New here? Start with [QUICKSTART.md](QUICKSTART.md)** — a 5-minute stub run that needs nothing but Rust. Full setup (C++ toolchain, the OpenVINO GenAI SDK, and on Linux the GPU runtime stack) is in **[INSTALL.md](INSTALL.md)**; on Linux, `./scripts/setup-openvino.sh` installs the GPU runtime packages for you.
 
 Build prerequisites:
 
 - Rust 1.85+ (`rustup default stable`)
-- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK download from intel.com
+- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK ([INSTALL.md](INSTALL.md) has the download links and the Linux GPU runtime steps)
+
+> After building, run **`cascadia doctor`**. It checks your toolchain and — crucially — tells you whether OpenVINO can actually see your GPU. On Intel AI PCs the GPU can be invisible to OpenVINO even with a working driver, and that failure is otherwise silent (you just get slow CPU inference). `doctor` makes it loud and tells you how to fix it.
 
 ## Quick start
+
+See [QUICKSTART.md](QUICKSTART.md) for the full walk-through (including a
+no-OpenVINO path that runs on any machine).
 
 ### Single machine
 
 ```bash
-# Single-stage OV-GenAI engine (auto-export from HF model id):
-cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
-              --model unsloth/Meta-Llama-3.1-8B-Instruct \
-              --api :8000
+# 0. Check the environment + that OpenVINO sees your GPU:
+cascadia doctor
 
-# In another terminal:
+# 1. Run a model. `run` is single-machine sugar — it picks the ov-genai
+#    engine, GPU device, and an OpenAI API on :8000. The model is fetched
+#    from HuggingFace on first use and cached under ~/.cache/cascadia/models/.
+cascadia run unsloth/Meta-Llama-3.1-8B-Instruct
+
+# 2. In another terminal:
 curl http://localhost:8000/v1/chat/completions -d '{
   "model": "llama-3.1-8b",
   "messages": [{"role": "user", "content": "Capital of France?"}]
 }'
+```
+
+You should get back a JSON chat-completion whose `choices[0].message.content`
+answers the question — that's the full path (tokenizer → engine → API)
+working. For full control over engine, device, ports, and the speculative
+/ sparsity knobs, use `cascadia worker` (`cascadia worker --help`):
+
+```bash
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
+              --model unsloth/Meta-Llama-3.1-8B-Instruct \
+              --api :8000
 ```
 
 ### Two machines (pipeline parallel)
@@ -75,7 +96,10 @@ This produces `~/cascadia/llama-8b-2stage/` with `pipeline_config.json`,
 node (`scp -r` / `rsync`), or re-shard separately on each node — pick
 whichever is faster on your network.
 
-Then run a worker on each node:
+Then run **one worker command per node** (start the last stage first so
+the first stage finds it; if it isn't up yet the first stage prints a
+clear "waiting for downstream peer" line and retries rather than hanging
+silently):
 
 ```bash
 # Node B (last stage, listens for activations):
@@ -88,6 +112,9 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
               --model ~/cascadia/llama-8b-2stage \
               --next 10.0.0.2:9100 --api :8000
 ```
+
+Not sure of a node's address? Run `cascadia discover` on either box to
+list Cascadia peers on the LAN and the `host:port` to pass to `--next`.
 
 Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding (see [docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)). See [docs/SHARDING.md](docs/SHARDING.md) for supported architectures and tuning.
 
@@ -126,7 +153,7 @@ Per-engine guides:
 
 ## Cluster
 
-- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. mDNS auto-discovery is implemented as a library (`cascadia-discovery` advertises `_cascadia._tcp.local.` and populates the topology graph with measured per-link latency + bandwidth) but is not yet wired into the `cascadia worker` CLI — see [docs/STATUS.md](docs/STATUS.md) "Known limitations".
+- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN and lists peer `host:port`s to plug into `--next`, but workers still need explicit ranks — full auto-ring formation (rank assignment + stage-count agreement + pipeline ordering) is not yet wired into `cascadia worker` (tracked in [#52](https://github.com/labscommunity/cascadia/issues/52); see [docs/STATUS.md](docs/STATUS.md) "Known limitations").
 - **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host — cold-compile time + decode tok/s — and writes `device_profile.json`. Use it to pick `--device` today; it's step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
 - **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
 
@@ -143,6 +170,12 @@ Cascadia does not daemonize itself — run it under systemd / NSSM / launchd. Se
 **`could not connect to … within 30s`** — Start the downstream worker first; the upstream waits for the upstream socket to bind. Check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
 **Worker dies silently when SSH session closes** — On Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production; for ad-hoc testing keep the SSH session attached.
+
+`cascadia doctor` diagnoses most environment/hardware issues (toolchain, OpenVINO device visibility) before they bite.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, and commit conventions.
 
 ## License
 

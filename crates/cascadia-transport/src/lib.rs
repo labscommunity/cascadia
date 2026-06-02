@@ -344,8 +344,21 @@ impl ActivationClient {
     /// Connect with retries until `timeout` elapses (mirrors the Python
     /// implementation's wait-for-peer behaviour during pipeline startup).
     pub async fn connect_with_timeout(&mut self, timeout: Duration) -> TransportResult<()> {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
+        // Tell the operator up-front what we're waiting on. Without this
+        // the worker looks hung for up to `timeout` with no output — the
+        // single most-reported "is it broken?" moment in multi-node
+        // bring-up. We log the target and the budget so the wait is
+        // legible, then a progress line every few seconds.
+        info!(
+            host = %self.host,
+            port = self.port,
+            timeout_s = timeout.as_secs(),
+            "waiting for downstream peer to accept (start the downstream worker first)"
+        );
         let mut last_err: Option<io::Error> = None;
+        let mut next_progress = start + Duration::from_secs(5);
         while Instant::now() < deadline {
             match TcpStream::connect((self.host.as_str(), self.port)).await {
                 Ok(sock) => {
@@ -356,11 +369,32 @@ impl ActivationClient {
                 }
                 Err(err) => {
                     last_err = Some(err);
+                    let now = Instant::now();
+                    if now >= next_progress {
+                        warn!(
+                            host = %self.host,
+                            port = self.port,
+                            waited_s = now.duration_since(start).as_secs(),
+                            timeout_s = timeout.as_secs(),
+                            "still waiting for downstream peer (not accepting yet)"
+                        );
+                        next_progress = now + Duration::from_secs(5);
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         }
-        warn!(host = %self.host, port = self.port, "ActivationClient connect timed out");
+        // Actionable timeout: name the address and the usual causes so an
+        // operator doesn't have to reverse-engineer a bare io::Error.
+        warn!(
+            host = %self.host,
+            port = self.port,
+            timeout_s = timeout.as_secs(),
+            last_error = ?last_err.as_ref().map(|e| e.to_string()),
+            "could not connect to downstream peer within timeout — check that the \
+             downstream worker is running, that its --listen port matches this \
+             --next, and that no firewall blocks the port"
+        );
         if let Some(err) = last_err {
             return Err(err.into());
         }

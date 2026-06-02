@@ -16,12 +16,17 @@ use cascadia_engine_openvino::{
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
 use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use futures::StreamExt;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+pub mod discover;
+pub mod doctor;
 pub mod profile;
+use discover::{cmd_discover, DiscoverArgs};
+use doctor::{cmd_doctor, DoctorArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
 
 #[derive(Parser, Debug)]
@@ -46,8 +51,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Check the environment + hardware and report what's ready. Run
+    /// this FIRST — it catches the silent OpenVINO CPU-only fallback
+    /// that otherwise shows up as mysterious slowness. See `cascadia
+    /// doctor --help`.
+    Doctor(DoctorArgs),
+    /// Run a model on a single machine (sugar for a one-stage worker
+    /// with an OpenAI API). See `cascadia run --help`.
+    Run(RunArgs),
     /// Run a pipeline-stage worker.
     Worker(WorkerArgs),
+    /// List Cascadia peers advertising on the local network. See
+    /// `cascadia discover --help`.
+    Discover(DiscoverArgs),
     /// List registered inference engines.
     Engines,
     /// Shard a HuggingFace causal-LM model into per-stage OpenVINO IRs
@@ -58,6 +74,9 @@ pub enum Command {
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
     /// {iGPU, NPU, CPU} ILP placement).
     ProfileDevices(ProfileDevicesArgs),
+    /// Generate a shell completion script (bash, zsh, fish, …). See
+    /// `cascadia completions --help`.
+    Completions(CompletionsArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -260,6 +279,77 @@ pub struct WorkerArgs {
     pub ffn_sparsity_capture_dir: Option<std::path::PathBuf>,
 }
 
+/// `cascadia run` — single-machine inference with sane defaults.
+///
+/// This is the "Ollama-style" first-run path: point it at a model and
+/// it serves an OpenAI-compatible API, no rank/total/listen bookkeeping.
+/// It maps onto a one-stage [`WorkerArgs`]. For multi-machine pipeline
+/// parallelism, use `cascadia worker` directly.
+#[derive(Parser, Debug, Clone)]
+pub struct RunArgs {
+    /// HF model id (e.g. `unsloth/Meta-Llama-3.1-8B-Instruct`) or a
+    /// local model / shard directory.
+    pub model: String,
+
+    /// Device hint: GPU / CPU / NPU. Defaults to GPU — run `cascadia
+    /// doctor` first to confirm the iGPU is visible to OpenVINO.
+    #[arg(long, default_value = "GPU")]
+    pub device: String,
+
+    /// Inference engine. Defaults to `ov-genai` (single-stage, auto-
+    /// exports from an HF id).
+    #[arg(long, value_enum, default_value_t = EngineKind::OvGenai)]
+    pub engine: EngineKind,
+
+    /// API bind address. Defaults to `:8000` (all interfaces, port
+    /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
+    #[arg(long, default_value = ":8000")]
+    pub api: String,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+impl WorkerArgs {
+    /// Build a single-stage (`--rank 0 --total 1`) worker config from the
+    /// reduced `cascadia run` surface, leaving every advanced knob at its
+    /// `worker` default. Keeping this here (rather than spreading defaults
+    /// into `cmd_run`) means `run` and `worker` can't silently drift.
+    fn single_node(model: String, device: String, engine: EngineKind, api: String) -> Self {
+        WorkerArgs {
+            rank: 0,
+            total: 1,
+            model,
+            listen: ":9100".into(),
+            next: None,
+            api: Some(api),
+            device,
+            engine,
+            ov_cache_dir: None,
+            ov_kv_precision: None,
+            ov_dyn_quant_group: None,
+            draft_model: None,
+            draft_device: None,
+            spec_k: 5,
+            prompt_lookup: 0,
+            max_tokens: 64,
+            top_k_override: None,
+            routing_threshold: None,
+            kv_prefix_cache_size: 0,
+            max_cached_experts: 0,
+            ffn_sparsity_threshold: 0.0,
+            ffn_axpy_down: false,
+            ffn_axpy_prebuild: false,
+            ffn_sparsity_thresholds_file: None,
+            ffn_sparsity_capture_dir: None,
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
     /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct)
@@ -327,11 +417,28 @@ impl ShardQuant {
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
     match cli.cmd {
+        Command::Doctor(args) => cmd_doctor(args),
+        Command::Run(args) => cmd_run(args).await,
         Command::Engines => cmd_engines(),
         Command::Worker(args) => cmd_worker(args).await,
+        Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
         Command::ProfileDevices(args) => cmd_profile_devices(args),
+        Command::Completions(args) => cmd_completions(args),
     }
+}
+
+async fn cmd_run(args: RunArgs) -> Result<()> {
+    info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
+    let worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    cmd_worker(worker).await
+}
+
+fn cmd_completions(args: CompletionsArgs) -> Result<()> {
+    let mut cmd = Cli::command();
+    let bin = cmd.get_name().to_string();
+    clap_complete::generate(args.shell, &mut cmd, bin, &mut std::io::stdout());
+    Ok(())
 }
 
 fn init_tracing(level: &str) {
