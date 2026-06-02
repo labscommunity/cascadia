@@ -609,8 +609,91 @@ def build_wrapper(
 # ---------------------------------------------------------------------------
 
 
+def make_stateful_with_init(ov_model, add_reorder=True):
+    """Make the (stateless) past_kv-in / present-out model stateful, building
+    ReadValue/Assign nodes WITH explicit inits.
+
+    `apply_make_stateful_transformation` emits init-less ReadValues (0 inputs),
+    which the OpenVINO CPU plugin rejects ("Node ReadValue ... contains less
+    parent edges than 0", #57). Constructing the nodes directly lets us attach
+    a zero-length init of the right shape/element-type, so the IR loads on the
+    CPU plugin AND keeps the beam_idx + Gather IndirectKVCache the GPU needs for
+    speed (`add_reorder`). A zero-length, batch-1 init also gives the first-step
+    KV Concat a correct {1,h,0,d} state instead of an empty {0,h,0,d} one.
+    """
+    import numpy as np
+    import openvino as ov
+    import openvino.opset13 as ops
+    from openvino import PartialShape, Type, Tensor
+    from openvino.op.util import Variable, VariableInfo
+
+    beam_idx = axis0 = None
+    if add_reorder:
+        beam_idx = ops.parameter(PartialShape([-1]), Type.i32)
+        beam_idx.set_friendly_name("beam_idx")
+        beam_idx.output(0).set_names({"beam_idx"})
+        axis0 = ops.constant(np.array(0, dtype=np.int32))
+
+    # present.N.{key,value} sources, mapped by the index-based naming convention.
+    present_src = {}
+    keep_results = []
+    for i, r in enumerate(ov_model.get_results()):
+        if i == 0:
+            keep_results.append(r)  # logits / hidden_states
+            continue
+        kv_idx = i - 1
+        kv = "value" if kv_idx % 2 == 1 else "key"
+        present_src[f"present.{kv_idx // 2}.{kv}"] = r.input_value(0)
+
+    sinks, keep_params = [], []
+    for p in ov_model.get_parameters():
+        nm = p.output(0).get_any_name()
+        if not nm.startswith("past_key_values."):
+            keep_params.append(p)
+            continue
+        src = present_src[nm.replace("past_key_values.", "present.", 1)]
+        et = p.get_element_type()
+        ps = p.get_partial_shape()
+        # The zero-length init below assumes the canonical static
+        # [batch, kv_heads, seq, head_dim] KV layout (only seq is dynamic).
+        # Fail loudly on anything else rather than mis-init silently.
+        if len(ps) != 4 or not ps[1].is_static or not ps[3].is_static:
+            raise RuntimeError(
+                f"{nm}: expected static [batch, kv_heads, seq, head_dim] KV "
+                f"shape, got {ps}"
+            )
+        dims = [
+            (d.get_length() if d.is_static else (0 if idx >= 2 else 1))
+            for idx, d in enumerate(ps)
+        ]
+        vi = VariableInfo()
+        vi.data_shape = ps
+        vi.data_type = et
+        vi.variable_id = nm
+        var = Variable(vi)
+        rv = ops.read_value(ops.constant(Tensor(et, dims)), var)
+        feed = rv.output(0)
+        if add_reorder:
+            feed = ops.gather(rv.output(0), beam_idx, axis0).output(0)
+        p.output(0).replace(feed)
+        # Assign takes a Node (not an Output); the present-KV source is the
+        # sole output of its producing node, so output index must be 0.
+        if src.get_index() != 0:
+            raise RuntimeError(
+                f"present source for {nm} is output #{src.get_index()}; "
+                "assign needs a single-output node"
+            )
+        sinks.append(ops.assign(src.get_node(), var))
+
+    new_params = keep_params + ([beam_idx] if add_reorder else [])
+    new_model = ov.Model(keep_results, sinks, new_params)
+    new_model.validate_nodes_and_infer_types()
+    return new_model
+
+
 def export_single_stage(
-    model_dir, output_dir, stage_plan, config, quantization, rope_theta, arch_tag
+    model_dir, output_dir, stage_plan, config, quantization, rope_theta, arch_tag,
+    cache_reorder=True,
 ):
     import openvino as ov
 
@@ -710,6 +793,11 @@ def export_single_stage(
             kv_type = "value" if is_value else "key"
             name = f"past_key_values.{layer_local}.{kv_type}"
             if len(shape) >= 3:
+                # Static batch=1 so the (init-less) stateful KV variable
+                # initialises to batch 1, not 0 — otherwise the first-step KV
+                # Concat fails on the CPU plugin ({0,h,0,d} vs {1,h,S,d}).
+                # cascadia always runs a single sequence (batch 1).
+                shape[0] = 1
                 shape[2] = -1
         inp.node.set_partial_shape(shape)
         inp.set_names({name})
@@ -725,58 +813,18 @@ def export_single_stage(
             name = f"present.{layer_local}.{kv_type}"
         out.set_names({name})
 
-    # 6. Make stateful (KV cache via ReadValue/Assign instead of input/output).
-    print(f"  apply_make_stateful_transformation ({num_layers} KV pairs)...", flush=True)
-    pairs = []
-    for layer_local in range(num_layers):
-        pairs.append(
-            (
-                f"past_key_values.{layer_local}.key",
-                f"present.{layer_local}.key",
-            )
-        )
-        pairs.append(
-            (
-                f"past_key_values.{layer_local}.value",
-                f"present.{layer_local}.value",
-            )
-        )
-    pair_map = dict(pairs)
-
-    from openvino._offline_transformations import apply_make_stateful_transformation
-
-    apply_make_stateful_transformation(ov_model, pair_map)
-
-    # 7. fuse_cache_reorder: add beam_idx + Gather on each ReadValue.
-    # This is what optimum-intel does — required for OV GPU's IndirectKVCache.
-    try:
-        import openvino.opset13 as opset
-        from openvino import PartialShape, Type
-
-        beam_idx_param = opset.parameter(PartialShape([-1]), Type.i32, name="beam_idx")
-        beam_idx_param.set_friendly_name("beam_idx")
-        beam_idx_param.output(0).set_names({"beam_idx"})
-        read_values = [n for n in ov_model.get_ops() if n.get_type_name() == "ReadValue"]
-        axis_const = opset.constant(0, Type.i32)
-        for rv in read_values:
-            rv_out = rv.output(0)
-            gather_node = opset.gather(rv_out, beam_idx_param, axis_const)
-            gather_out = gather_node.output(0)
-            for target_input in list(rv_out.get_target_inputs()):
-                if target_input.get_node() is gather_node:
-                    continue
-                target_input.replace_source_output(gather_out)
-        ov_model.add_parameters([beam_idx_param])
-        ov_model.validate_nodes_and_infer_types()
-        print(
-            f"  fuse_cache_reorder: beam_idx + Gather on {len(read_values)} ReadValue ops",
-            flush=True,
-        )
-    except Exception as e:
-        print(f"  fuse_cache_reorder FAILED: {e}", flush=True)
-        import traceback
-
-        traceback.print_exc()
+    # 6+7. Make stateful with init-bearing ReadValues (+ beam_idx cache-reorder).
+    # Building the stateful nodes directly — instead of
+    # apply_make_stateful_transformation, which emits init-less ReadValues the
+    # OpenVINO CPU plugin rejects (#57) — gives each ReadValue a real init, so
+    # the SAME IR loads on CPU AND keeps the IndirectKVCache (cache_reorder)
+    # that the GPU needs for speed.
+    ov_model = make_stateful_with_init(ov_model, add_reorder=cache_reorder)
+    print(
+        f"  stateful: init-bearing ReadValue/Assign ({num_layers} KV pairs)"
+        + (" + cache_reorder (beam_idx Gather)" if cache_reorder else ""),
+        flush=True,
+    )
 
     # 8. Compress weights.
     if quantization in ("int4", "int4_asym"):
@@ -838,9 +886,11 @@ def export_single_stage(
         "rope_theta": rope_theta,
         "arch_tag": arch_tag,
         "inputs": (
-            "input_ids/hidden_states, attention_mask, position_ids, beam_idx "
-            "(KV cache is internal state)"
+            "input_ids/hidden_states, attention_mask, position_ids"
+            + (", beam_idx" if cache_reorder else "")
+            + " (KV cache is internal state)"
         ),
+        "cache_reorder": cache_reorder,
         "export_version": "v5_canonical_inputs",
     }
     with open(os.path.join(stage_dir, "stage_config.json"), "w") as f:
