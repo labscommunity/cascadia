@@ -782,6 +782,12 @@ def export_single_stage(
             name = "input_ids" if has_embed else "hidden_states"
             if len(shape) >= 2:
                 shape[1] = static_seq if npu else -1
+            # Relay/last stages take hidden_states [batch, seq, hidden]; the
+            # hidden dim is dynamic out of the tracer, so pin it for NPU too
+            # (the seq pin above is not enough — the NPU compiler rejects the
+            # dynamic last dim).
+            if npu and not has_embed and len(shape) >= 3:
+                shape[2] = config.hidden_size
         elif i == 1:
             name = "attention_mask"
             if len(shape) >= 2:
@@ -821,6 +827,41 @@ def export_single_stage(
             kv_type = "value" if is_value else "key"
             name = f"present.{layer_local}.{kv_type}"
         out.set_names({name})
+
+    # NPU: EVERY dim (inputs AND outputs) must be static or the compiler
+    # rejects the IR (#37). We pinned the inputs above, but the outputs only
+    # got names — re-infer so they pick up static shapes, then verify. A traced
+    # ShapeOf/Reshape can leave a symbolic output dim even when all inputs are
+    # static; catching it here fails the export instead of producing an IR that
+    # only blows up at NPU load (and which CPU/GPU would happily accept).
+    if npu:
+        ov_model.validate_nodes_and_infer_types()
+
+        def _dynamic(ports):
+            out = []
+            for idx, p in enumerate(ports):
+                ps = p.partial_shape
+                if not ps.is_static:
+                    try:
+                        nm = p.get_any_name()
+                    except Exception:
+                        nm = f"#{idx}"
+                    out.append(f"{nm}{ps}")
+            return out
+
+        bad_in = _dynamic(ov_model.inputs)
+        bad_out = _dynamic(ov_model.outputs)
+        if bad_in or bad_out:
+            raise RuntimeError(
+                f"NPU export (stage {stage_idx}): shapes still dynamic after static pinning "
+                f"— the NPU compiler will reject this IR (#37). Pin or fold these dims. "
+                f"dynamic inputs={bad_in} dynamic outputs={bad_out}"
+            )
+        print(
+            f"  NPU static-shape check OK: all {len(ov_model.inputs)} inputs + "
+            f"{len(ov_model.outputs)} outputs static",
+            flush=True,
+        )
 
     # 6+7. Make stateful with init-bearing ReadValues (+ beam_idx cache-reorder).
     # NPU mode skips this entirely: the NPU stack does not support state
@@ -1043,6 +1084,28 @@ def main():
         help="NPU only: fixed total context; past-KV length = context - seq.",
     )
     args = parser.parse_args()
+
+    # The NPU runtime decodes one token per step and derives past-KV length as
+    # static_context - 1, so reject configs it cannot load (fail fast — the
+    # export takes minutes). chunked prefill (static_seq > 1) is not yet wired
+    # into the runtime.
+    if args.target == "npu":
+        if args.static_seq != 1:
+            parser.error(
+                "--static-seq must be 1 for --target npu (the runtime decodes one token "
+                "per step; chunked prefill is not implemented yet)"
+            )
+        if args.static_context <= args.static_seq:
+            parser.error(
+                f"--static-context ({args.static_context}) must be > --static-seq "
+                f"({args.static_seq}) so past-KV length >= 1"
+            )
+    elif args.static_seq != 1 or args.static_context != 1024:
+        print(
+            "WARNING: --static-seq/--static-context are ignored without --target npu "
+            "(the cpu-gpu export is dynamic-shape)",
+            flush=True,
+        )
 
     if args.default_dtype == "fp16":
         torch.set_default_dtype(torch.float16)
