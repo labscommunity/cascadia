@@ -694,6 +694,7 @@ def make_stateful_with_init(ov_model, add_reorder=True):
 def export_single_stage(
     model_dir, output_dir, stage_plan, config, quantization, rope_theta, arch_tag,
     cache_reorder=True,
+    target="cpu-gpu", static_seq=1, static_context=1024,
 ):
     import openvino as ov
 
@@ -771,21 +772,24 @@ def export_single_stage(
     del traced
     gc.collect()
 
-    # 5. Name inputs/outputs and set dynamic shapes.
+    # 5. Name inputs/outputs and set shapes. NPU requires fully STATIC shapes
+    # (it cannot compile dynamic dims — #37); cpu-gpu keeps dynamic seq/KV.
+    npu = target == "npu"
+    past_len = max(static_context - static_seq, 1)
     for i, inp in enumerate(ov_model.inputs):
         shape = inp.partial_shape
         if i == 0:
             name = "input_ids" if has_embed else "hidden_states"
             if len(shape) >= 2:
-                shape[1] = -1
+                shape[1] = static_seq if npu else -1
         elif i == 1:
             name = "attention_mask"
             if len(shape) >= 2:
-                shape[1] = -1
+                shape[1] = static_context if npu else -1
         elif i == 2:
             name = "position_ids"
             if len(shape) >= 2:
-                shape[1] = -1
+                shape[1] = static_seq if npu else -1
         else:
             kv_idx = i - 3
             layer_local = kv_idx // 2
@@ -793,12 +797,17 @@ def export_single_stage(
             kv_type = "value" if is_value else "key"
             name = f"past_key_values.{layer_local}.{kv_type}"
             if len(shape) >= 3:
-                # Static batch=1 so the (init-less) stateful KV variable
+                # Static batch=1 so the cpu-gpu stateful KV variable
                 # initialises to batch 1, not 0 — otherwise the first-step KV
                 # Concat fails on the CPU plugin ({0,h,0,d} vs {1,h,S,d}).
-                # cascadia always runs a single sequence (batch 1).
+                # cascadia always runs a single sequence (batch 1). For NPU the
+                # past length is also pinned static (context - seq).
                 shape[0] = 1
-                shape[2] = -1
+                shape[2] = past_len if npu else -1
+        if npu and len(shape) >= 1:
+            # NPU: batch must be static (=1) on EVERY input, not just KV —
+            # a dynamic batch leaves unbounded upper bounds the compiler rejects.
+            shape[0] = 1
         inp.node.set_partial_shape(shape)
         inp.set_names({name})
 
@@ -814,17 +823,26 @@ def export_single_stage(
         out.set_names({name})
 
     # 6+7. Make stateful with init-bearing ReadValues (+ beam_idx cache-reorder).
-    # Building the stateful nodes directly — instead of
-    # apply_make_stateful_transformation, which emits init-less ReadValues the
-    # OpenVINO CPU plugin rejects (#57) — gives each ReadValue a real init, so
-    # the SAME IR loads on CPU AND keeps the IndirectKVCache (cache_reorder)
-    # that the GPU needs for speed.
-    ov_model = make_stateful_with_init(ov_model, add_reorder=cache_reorder)
-    print(
-        f"  stateful: init-bearing ReadValue/Assign ({num_layers} KV pairs)"
-        + (" + cache_reorder (beam_idx Gather)" if cache_reorder else ""),
-        flush=True,
-    )
+    # NPU mode skips this entirely: the NPU stack does not support state
+    # variables, so the model stays STATELESS (explicit past_kv in / present_kv
+    # out) with static shapes — #37. The cpu-gpu path builds the stateful nodes
+    # directly (init-bearing ReadValues) instead of
+    # apply_make_stateful_transformation, whose init-less ReadValues the
+    # OpenVINO CPU plugin rejects (#57) — the same IR then loads on CPU AND
+    # keeps the IndirectKVCache (cache_reorder) the GPU needs for speed.
+    if not npu:
+        ov_model = make_stateful_with_init(ov_model, add_reorder=cache_reorder)
+        print(
+            f"  stateful: init-bearing ReadValue/Assign ({num_layers} KV pairs)"
+            + (" + cache_reorder (beam_idx Gather)" if cache_reorder else ""),
+            flush=True,
+        )
+    else:
+        print(
+            "  NPU mode: stateless (explicit KV in/out) + static shapes — "
+            "skipping make_stateful + cache_reorder (#37)",
+            flush=True,
+        )
 
     # 8. Compress weights.
     if quantization in ("int4", "int4_asym"):
@@ -882,11 +900,17 @@ def export_single_stage(
         "num_layers_total": config.num_hidden_layers,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
-        "stateful": True,
+        "stateful": not npu,
         "rope_theta": rope_theta,
         "arch_tag": arch_tag,
+        "target": target,
+        "static_seq": static_seq if npu else None,
+        "static_context": static_context if npu else None,
         "inputs": (
-            "input_ids/hidden_states, attention_mask, position_ids"
+            "input_ids/hidden_states, attention_mask, position_ids, "
+            "past_key_values.* (explicit KV in/out)"
+            if npu
+            else "input_ids/hidden_states, attention_mask, position_ids"
             + (", beam_idx" if cache_reorder else "")
             + " (KV cache is internal state)"
         ),
@@ -999,6 +1023,25 @@ def main():
     parser.add_argument(
         "--stage", type=int, default=None, help="Export only this stage index (debug)"
     )
+    parser.add_argument(
+        "--target",
+        choices=["cpu-gpu", "npu"],
+        default="cpu-gpu",
+        help="Deployment target. 'npu' emits a STATELESS, STATIC-shape IR "
+        "(no make_stateful, fixed seq/KV) that the NPU compiler accepts (#37).",
+    )
+    parser.add_argument(
+        "--static-seq",
+        type=int,
+        default=1,
+        help="NPU only: fixed query-window length (default 1 = decode step).",
+    )
+    parser.add_argument(
+        "--static-context",
+        type=int,
+        default=1024,
+        help="NPU only: fixed total context; past-KV length = context - seq.",
+    )
     args = parser.parse_args()
 
     if args.default_dtype == "fp16":
@@ -1078,6 +1121,9 @@ def main():
             args.quantization,
             rope_theta,
             arch_tag,
+            target=args.target,
+            static_seq=args.static_seq,
+            static_context=args.static_context,
         )
         total_mb += size
         gc.collect()
