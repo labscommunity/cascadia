@@ -415,6 +415,185 @@ def parse_layers(spec, n):
     return [x for x in out if 0 <= x < n]
 
 
+def _ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
+
+class StReader:
+    """Reads weights from a sharded safetensors checkpoint one tensor at a
+    time, dequantizing block-FP8 (`<base>.weight` + `<base>.weight_scale_inv`)
+    to fp32. Used by the streaming full-model export so we never hold the
+    whole 230B model in RAM."""
+
+    def __init__(self, model_dir: Path):
+        from safetensors import safe_open  # noqa: F401
+        self._safe_open = safe_open
+        idx = json.loads((model_dir / "model.safetensors.index.json").read_text())
+        self.wm = idx["weight_map"]
+        self.dir = model_dir
+        self._open = {}
+
+    def _handle(self, shard: str):
+        h = self._open.get(shard)
+        if h is None:
+            h = self._safe_open(str(self.dir / shard), framework="pt")
+            self._open[shard] = h
+        return h
+
+    def _raw(self, name: str):
+        return self._handle(self.wm[name]).get_tensor(name)
+
+    def has(self, name: str) -> bool:
+        return name in self.wm
+
+    def weight(self, base: str) -> torch.Tensor:
+        """fp32 weight for `<base>.weight`, block-FP8-dequantized if a
+        `<base>.weight_scale_inv` sibling exists."""
+        w = self._raw(base + ".weight")
+        sk = base + ".weight_scale_inv"
+        if self.has(sk):
+            return dequant_fp8_block(w, self._raw(sk))
+        return w.to(torch.float32)
+
+    def tensor(self, name: str) -> torch.Tensor:
+        return self._raw(name).to(torch.float32)
+
+
+def export_full_streaming(args, out: Path):
+    """Export the full MiniMax-M2 from a local FP8 checkout WITHOUT loading
+    the whole model into RAM. Reads each component's weights from the
+    safetensors shards on demand, builds the same validated wrappers via
+    lightweight namespaces, traces+quantizes, and frees before the next."""
+    md = Path(args.model)
+    config = json.loads((md / "config.json").read_text())
+    rope = config.get("rope_parameters") or {}
+    head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
+    prf = float(rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0)))
+    cfg = dict(
+        arch="minimax_m2",
+        hidden_size=config["hidden_size"],
+        num_q_heads=config["num_attention_heads"],
+        num_kv_heads=config["num_key_value_heads"],
+        head_dim=head_dim,
+        num_layers=config["num_hidden_layers"],
+        num_experts=config["num_local_experts"],
+        top_k=config["num_experts_per_tok"],
+        partial_rotary_dim=int(head_dim * prf),
+        rope_theta=float(rope.get("rope_theta", config.get("rope_theta", 1e4))),
+        rms_norm_eps=float(config["rms_norm_eps"]),
+        vocab_size=config["vocab_size"],
+    )
+    print(f"[cfg] {json.dumps(cfg)}", flush=True)
+    reader = StReader(md)
+    H = cfg["hidden_size"]
+    KV, D = cfg["num_kv_heads"], cfg["head_dim"]
+    qmode = "none" if args.no_quant else "int4"
+    expert_q = "int8" if args.experts_int8 else qmode
+    layer_ids = parse_layers(args.layers, cfg["num_layers"])
+
+    # embed (layer0) — embed_tokens is not FP8-quantized
+    print("[embed] layer0", flush=True)
+    ew = reader.weight("model.embed_tokens")
+    embed = _ns(num_embeddings=ew.shape[0], embedding_dim=ew.shape[1], weight=ew)
+    convert_and_save(EmbedWrapper(embed), (torch.zeros((1, 1), dtype=torch.int64),),
+                     out / "layer0" / "openvino_model.xml", {0: [1]},
+                     ["input_ids"], ["hidden"], "none" if args.no_quant else "int8")
+    del ew, embed
+
+    # head
+    print("[head] norm + lm_head", flush=True)
+    head = HeadWrapper(_ns(weight=reader.weight("model.norm")),
+                       _ns(weight=reader.weight("lm_head")), cfg["rms_norm_eps"])
+    convert_and_save(head, (torch.zeros((1, 1, H)),), out / "head" / "openvino_model.xml",
+                     {0: [1]}, ["x"], ["logits"], qmode)
+    del head
+
+    shell_in_names = ["x", "past_k", "past_v", "past_seq_len"]
+    shell_out_names = ["attn_out_post_norm", "attn_residual", "shared_expert_out",
+                       "routing_ids", "routing_weights", "present_k", "present_v"]
+    for li in layer_ids:
+        b = f"model.layers.{li}"
+        a = b + ".self_attn"
+        m = b + ".block_sparse_moe"
+        attn = _ns(
+            q_proj=_ns(weight=reader.weight(a + ".q_proj")),
+            k_proj=_ns(weight=reader.weight(a + ".k_proj")),
+            v_proj=_ns(weight=reader.weight(a + ".v_proj")),
+            o_proj=_ns(weight=reader.weight(a + ".o_proj")),
+            q_norm=_ns(weight=reader.weight(a + ".q_norm")),
+            k_norm=_ns(weight=reader.weight(a + ".k_norm")),
+        )
+        moe = _ns(gate=_ns(weight=reader.weight(m + ".gate")),
+                  e_score_correction_bias=reader.tensor(m + ".e_score_correction_bias"))
+        layer = _ns(self_attn=attn, mlp=moe,
+                    input_layernorm=_ns(weight=reader.weight(b + ".input_layernorm")),
+                    post_attention_layernorm=_ns(weight=reader.weight(b + ".post_attention_layernorm")))
+        ex = (torch.zeros((1, 1, H)), torch.zeros((1, KV, 3, D)),
+              torch.zeros((1, KV, 3, D)), torch.tensor(3, dtype=torch.int64))
+        convert_and_save(ShellWrapper(layer, cfg), ex,
+                         out / "shells" / f"layer_{li:02d}" / "openvino_model.xml",
+                         {1: [2], 2: [2]}, shell_in_names, shell_out_names, qmode)
+        del attn, moe, layer
+
+        edir = out / "experts" / f"layer_{li:02d}"
+        for ei in range(cfg["num_experts"]):
+            eb = f"{m}.experts.{ei}"
+            w1 = reader.weight(eb + ".w1")   # gate
+            w3 = reader.weight(eb + ".w3")   # up
+            w2 = reader.weight(eb + ".w2")   # down
+            experts_mod = _ns(gate_up_proj=[torch.cat([w1, w3], dim=0)], down_proj=[w2])
+            convert_and_save(ExpertWrapper(experts_mod, 0), (torch.zeros((1, 1, H)),),
+                             edir / f"expert_{ei:03d}" / "openvino_model.xml",
+                             {0: [1]}, ["x"], ["y"], expert_q)
+            del w1, w3, w2, experts_mod
+        print(f"[layer {li}] shell + {cfg['num_experts']} experts done", flush=True)
+
+    # eos: prefer generation_config.json, else tokenizer/config, else last id
+    eos = []
+    gc = md / "generation_config.json"
+    if gc.exists():
+        g = json.loads(gc.read_text())
+        e = g.get("eos_token_id")
+        eos = e if isinstance(e, list) else ([e] if isinstance(e, int) else [])
+    if not eos:
+        e = config.get("eos_token_id")
+        eos = e if isinstance(e, list) else ([e] if isinstance(e, int) else [cfg["vocab_size"] - 1])
+    manifest = {
+        "arch": "minimax_m2",
+        "num_layers": cfg["num_layers"],
+        "dense_layers": [],
+        "num_experts": cfg["num_experts"],
+        "top_k": cfg["top_k"],
+        "hidden_size": cfg["hidden_size"],
+        "num_kv_heads": cfg["num_kv_heads"],
+        "qk_head_dim": cfg["head_dim"],
+        "v_head_dim": cfg["head_dim"],
+        "vocab_size": cfg["vocab_size"],
+        "eos_token_ids": eos,
+        "experts_format": "ov_ir",
+        "shell_backend": "ov_ir",
+        "embed_is_layer0": True,
+        "num_q_heads": cfg["num_q_heads"],
+        "head_dim": cfg["head_dim"],
+        "partial_rotary_dim": cfg["partial_rotary_dim"],
+        "rope_theta": cfg["rope_theta"],
+        "rms_norm_eps": cfg["rms_norm_eps"],
+        "routing": "sigmoid",
+        "use_qk_norm": True,
+        "has_shared_expert": False,
+        "exported_layers": layer_ids,
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    for fn in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+               "special_tokens_map.json", "vocab.json", "merges.txt"):
+        src = md / fn
+        if src.exists():
+            shutil.copy(src, out / fn)
+    print(f"[manifest] wrote {out/'manifest.json'} (eos={eos})", flush=True)
+    print("[done streaming export]", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="path/hub id of MiniMax-M2 (FP8)")
@@ -434,10 +613,18 @@ def main():
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+
+    # Full model: stream per-layer from safetensors (the model is far too
+    # large to load into RAM via from_pretrained). --tiny uses the
+    # in-memory path below (and writes a reference.json for the test).
+    if args.model and not args.tiny:
+        export_full_streaming(args, out)
+        return
+
     qmode = "none" if args.no_quant else "int4"
     expert_q = "int8" if args.experts_int8 else qmode
 
-    print(f"[load] reference model ...", flush=True)
+    print("[load] reference model ...", flush=True)
     model, cfg = load_reference(args)
     H = cfg["hidden_size"]
     base = model.model  # MiniMaxM2Model
