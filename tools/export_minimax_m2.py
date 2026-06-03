@@ -300,7 +300,15 @@ class HeadWrapper(nn.Module):
 # --------------------------------------------------------------------------
 def convert_and_save(wrapper, example_inputs, out_xml: Path, dyn_axes,
                      in_names, out_names, quant_mode="int4", group_size=128):
-    """Trace -> OV -> set dynamic axes / names -> NNCF compress -> save."""
+    """Trace -> OV -> set dynamic axes / names -> NNCF compress -> save.
+
+    Resumable: if a non-empty IR already exists at `out_xml`, skip it. This
+    lets a long full-model export (15k+ expert IRs) restart where it left
+    off after an interruption."""
+    if out_xml.exists() and out_xml.stat().st_size > 0:
+        bin_path = out_xml.with_suffix(".bin")
+        if bin_path.exists():
+            return
     wrapper.eval()
     with torch.no_grad():
         traced = torch.jit.trace(wrapper, example_inputs, check_trace=False)
@@ -466,23 +474,34 @@ def export_full_streaming(args, out: Path):
     safetensors shards on demand, builds the same validated wrappers via
     lightweight namespaces, traces+quantizes, and frees before the next."""
     md = Path(args.model)
-    config = json.loads((md / "config.json").read_text())
-    rope = config.get("rope_parameters") or {}
-    head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
-    prf = float(rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0)))
+    # Load via the canonical config so rotary is derived exactly as the
+    # model does it: MiniMax-M2's config.json carries a top-level
+    # `rotary_dim` (64) which transformers converts to
+    # partial_rotary_factor = rotary_dim/head_dim = 0.5. Reading the raw
+    # JSON would miss this (no rope_parameters/partial_rotary_factor) and
+    # wrongly default to full rotary.
+    from transformers import AutoConfig
+    hf = AutoConfig.from_pretrained(md, trust_remote_code=True)
+    head_dim = getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads)
+    prf = getattr(hf, "partial_rotary_factor", None)
+    if prf is None:
+        prf = (getattr(hf, "rope_parameters", None) or {}).get("partial_rotary_factor", 1.0)
+    rope_theta = getattr(hf, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = (getattr(hf, "rope_parameters", None) or {}).get("rope_theta", 1e4)
     cfg = dict(
         arch="minimax_m2",
-        hidden_size=config["hidden_size"],
-        num_q_heads=config["num_attention_heads"],
-        num_kv_heads=config["num_key_value_heads"],
+        hidden_size=hf.hidden_size,
+        num_q_heads=hf.num_attention_heads,
+        num_kv_heads=hf.num_key_value_heads,
         head_dim=head_dim,
-        num_layers=config["num_hidden_layers"],
-        num_experts=config["num_local_experts"],
-        top_k=config["num_experts_per_tok"],
-        partial_rotary_dim=int(head_dim * prf),
-        rope_theta=float(rope.get("rope_theta", config.get("rope_theta", 1e4))),
-        rms_norm_eps=float(config["rms_norm_eps"]),
-        vocab_size=config["vocab_size"],
+        num_layers=hf.num_hidden_layers,
+        num_experts=hf.num_local_experts,
+        top_k=hf.num_experts_per_tok,
+        partial_rotary_dim=int(head_dim * float(prf)),
+        rope_theta=float(rope_theta),
+        rms_norm_eps=float(hf.rms_norm_eps),
+        vocab_size=hf.vocab_size,
     )
     print(f"[cfg] {json.dumps(cfg)}", flush=True)
     reader = StReader(md)
@@ -557,7 +576,7 @@ def export_full_streaming(args, out: Path):
         e = g.get("eos_token_id")
         eos = e if isinstance(e, list) else ([e] if isinstance(e, int) else [])
     if not eos:
-        e = config.get("eos_token_id")
+        e = getattr(hf, "eos_token_id", None)
         eos = e if isinstance(e, list) else ([e] if isinstance(e, int) else [cfg["vocab_size"] - 1])
     manifest = {
         "arch": "minimax_m2",
