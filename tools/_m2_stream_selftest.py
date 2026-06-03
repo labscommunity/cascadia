@@ -87,8 +87,13 @@ def main():
                  "first_next_token": gen[len(prompt)]}
 
     # --- run the streaming exporter ---
+    # free_source_shards=True exercises the progressive-deletion path; on a
+    # single-shard checkpoint the shard's last expert-layer is the final
+    # layer, so it's deleted only at the very end (must not break export).
     sargs = argparse.Namespace(model=str(src), tiny=False, out=str(out),
-                               layers="", no_quant=True, experts_int8=False)
+                               layers="", no_quant=True, experts_int8=False,
+                               experts="ov_ir", shell_quant="int4", head_quant="int4",
+                               free_source_shards=True)
     E.export_full_streaming(sargs, out)
     (out / "reference.json").write_text(json.dumps(reference))
 

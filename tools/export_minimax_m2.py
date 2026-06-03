@@ -495,6 +495,12 @@ class StReader:
     def _raw(self, name: str):
         return self._handle(self.wm[name]).get_tensor(name)
 
+    def close_shard(self, shard: str):
+        """Drop the cached handle so the mmap is released (lets the file be
+        deleted to reclaim space — used by --free-source-shards)."""
+        h = self._open.pop(shard, None)
+        del h
+
     def has(self, name: str) -> bool:
         return name in self.wm
 
@@ -560,22 +566,53 @@ def export_full_streaming(args, out: Path):
     head_qmode = "none" if args.no_quant else args.head_quant
     layer_ids = parse_layers(args.layers, cfg["num_layers"])
 
+    # --free-source-shards: delete each layer's FP8 expert shards once its
+    # int8/int4 experts are written, so a re-quant that's larger than the
+    # free disk still fits (peak ≈ one layer of slack). Safe because M2's
+    # FP8 experts are layer-contiguous (each shard = one layer's experts)
+    # and we skip already-exported embed/head/shells (no other reads).
+    # shards_done_after[N] = shards whose LAST expert-layer is N, i.e. safe
+    # to delete once layer N is exported. Keying on last-consumer (not
+    # "contains layer N") is correct even if a shard holds multiple layers
+    # (e.g. a single-shard checkpoint deletes only at the very end).
+    shards_done_after = {}
+    if args.free_source_shards:
+        import re as _re
+        import collections as _collections
+        shard_max_layer = {}
+        for name, sh in reader.wm.items():
+            mm = _re.match(r"model\.layers\.(\d+)\.block_sparse_moe\.experts\.", name)
+            if mm:
+                L = int(mm.group(1))
+                shard_max_layer[sh] = max(shard_max_layer.get(sh, -1), L)
+        agg = _collections.defaultdict(list)
+        for sh, L in shard_max_layer.items():
+            agg[L].append(sh)
+        shards_done_after = dict(agg)
+
+    def done(p: Path) -> bool:
+        return p.exists() and p.stat().st_size > 0
+
     # embed (layer0) — embed_tokens is not FP8-quantized
-    print("[embed] layer0", flush=True)
-    ew = reader.weight("model.embed_tokens")
-    embed = _ns(num_embeddings=ew.shape[0], embedding_dim=ew.shape[1], weight=ew)
-    convert_and_save(EmbedWrapper(embed), (torch.zeros((1, 1), dtype=torch.int64),),
-                     out / "layer0" / "openvino_model.xml", {0: [1]},
-                     ["input_ids"], ["hidden"], "none" if args.no_quant else "int8")
-    del ew, embed
+    embed_xml = out / "layer0" / "openvino_model.xml"
+    if not done(embed_xml):
+        print("[embed] layer0", flush=True)
+        ew = reader.weight("model.embed_tokens")
+        embed = _ns(num_embeddings=ew.shape[0], embedding_dim=ew.shape[1], weight=ew)
+        convert_and_save(EmbedWrapper(embed), (torch.zeros((1, 1), dtype=torch.int64),),
+                         embed_xml, {0: [1]},
+                         ["input_ids"], ["hidden"], "none" if args.no_quant else "int8")
+        del ew, embed
 
     # head
-    print("[head] norm + lm_head", flush=True)
-    head = HeadWrapper(_ns(weight=reader.weight("model.norm")),
-                       _ns(weight=reader.weight("lm_head")), cfg["rms_norm_eps"])
-    convert_and_save(head, (torch.zeros((1, 1, H)),), out / "head" / "openvino_model.xml",
-                     {0: [1]}, ["x"], ["logits"], head_qmode)
-    del head
+    head_xml = out / "head" / "openvino_model.xml"
+    if not done(head_xml):
+        print("[head] norm + lm_head", flush=True)
+        head = HeadWrapper(_ns(weight=reader.weight("model.norm")),
+                           _ns(weight=reader.weight("lm_head")), cfg["rms_norm_eps"])
+        convert_and_save(head, (torch.zeros((1, 1, H)),), head_xml,
+                         {0: [1]}, ["x"], ["logits"], head_qmode)
+        del head
 
     shell_in_names = ["x", "past_k", "past_v", "past_seq_len"]
     shell_out_names = ["attn_out_post_norm", "attn_residual", "shared_expert_out",
@@ -584,25 +621,26 @@ def export_full_streaming(args, out: Path):
         b = f"model.layers.{li}"
         a = b + ".self_attn"
         m = b + ".block_sparse_moe"
-        attn = _ns(
-            q_proj=_ns(weight=reader.weight(a + ".q_proj")),
-            k_proj=_ns(weight=reader.weight(a + ".k_proj")),
-            v_proj=_ns(weight=reader.weight(a + ".v_proj")),
-            o_proj=_ns(weight=reader.weight(a + ".o_proj")),
-            q_norm=_ns(weight=reader.weight(a + ".q_norm")),
-            k_norm=_ns(weight=reader.weight(a + ".k_norm")),
-        )
-        moe = _ns(gate=_ns(weight=reader.weight(m + ".gate")),
-                  e_score_correction_bias=reader.tensor(m + ".e_score_correction_bias"))
-        layer = _ns(self_attn=attn, mlp=moe,
-                    input_layernorm=_ns(weight=reader.weight(b + ".input_layernorm")),
-                    post_attention_layernorm=_ns(weight=reader.weight(b + ".post_attention_layernorm")))
-        ex = (torch.zeros((1, 1, H)), torch.zeros((1, KV, 3, D)),
-              torch.zeros((1, KV, 3, D)), torch.tensor(3, dtype=torch.int64))
-        convert_and_save(ShellWrapper(layer, cfg), ex,
-                         out / "shells" / f"layer_{li:02d}" / "openvino_model.xml",
-                         {1: [2], 2: [2]}, shell_in_names, shell_out_names, shell_qmode)
-        del attn, moe, layer
+        shell_xml = out / "shells" / f"layer_{li:02d}" / "openvino_model.xml"
+        if not done(shell_xml):
+            attn = _ns(
+                q_proj=_ns(weight=reader.weight(a + ".q_proj")),
+                k_proj=_ns(weight=reader.weight(a + ".k_proj")),
+                v_proj=_ns(weight=reader.weight(a + ".v_proj")),
+                o_proj=_ns(weight=reader.weight(a + ".o_proj")),
+                q_norm=_ns(weight=reader.weight(a + ".q_norm")),
+                k_norm=_ns(weight=reader.weight(a + ".k_norm")),
+            )
+            moe = _ns(gate=_ns(weight=reader.weight(m + ".gate")),
+                      e_score_correction_bias=reader.tensor(m + ".e_score_correction_bias"))
+            layer = _ns(self_attn=attn, mlp=moe,
+                        input_layernorm=_ns(weight=reader.weight(b + ".input_layernorm")),
+                        post_attention_layernorm=_ns(weight=reader.weight(b + ".post_attention_layernorm")))
+            ex = (torch.zeros((1, 1, H)), torch.zeros((1, KV, 3, D)),
+                  torch.zeros((1, KV, 3, D)), torch.tensor(3, dtype=torch.int64))
+            convert_and_save(ShellWrapper(layer, cfg), ex, shell_xml,
+                             {1: [2], 2: [2]}, shell_in_names, shell_out_names, shell_qmode)
+            del attn, moe, layer
 
         edir = out / "experts" / f"layer_{li:02d}"
         for ei in range(cfg["num_experts"]):
@@ -617,6 +655,8 @@ def export_full_streaming(args, out: Path):
                 export_expert_bin(w1, w3, w2, binp)
                 del w1, w3, w2
             else:
+                if done(edir / f"expert_{ei:03d}" / "openvino_model.xml"):
+                    continue  # resume
                 w1 = reader.weight(eb + ".w1")   # gate
                 w3 = reader.weight(eb + ".w3")   # up
                 w2 = reader.weight(eb + ".w2")   # down
@@ -626,6 +666,18 @@ def export_full_streaming(args, out: Path):
                                  {0: [1]}, ["x"], ["y"], expert_q)
                 del w1, w3, w2, experts_mod
         print(f"[layer {li}] shell + {cfg['num_experts']} experts done", flush=True)
+
+        # Reclaim FP8 shards whose last expert-layer is this one (embed /
+        # head / shells are already exported, so experts are the only
+        # remaining reads — a shard with no later expert-layer is dead).
+        if args.free_source_shards:
+            import os as _os
+            for sh in shards_done_after.get(li, ()):
+                reader.close_shard(sh)
+                try:
+                    _os.remove(md / sh)
+                except FileNotFoundError:
+                    pass
 
     # eos: prefer generation_config.json, else tokenizer/config, else last id
     eos = []
@@ -690,6 +742,10 @@ def main():
                          "'none' (fp16) keeps routing precise — M2 keeps the gate full-precision")
     ap.add_argument("--head-quant", choices=["none", "int8", "int4"], default="int4",
                     help="precision for the head IR (final norm + lm_head); M2 keeps lm_head full-precision")
+    ap.add_argument("--free-source-shards", action="store_true",
+                    help="delete each layer's FP8 expert shards from --model after its experts are "
+                         "written (DESTRUCTIVE — for re-quantizing in place when the new experts "
+                         "won't fit alongside the FP8 source). Safe: experts are layer-contiguous.")
     ap.add_argument("--ref-prompt", default="1,2,3,4,5",
                     help="comma token ids for the --tiny reference forward")
     ap.add_argument("--ref-gen", type=int, default=6, help="reference greedy tokens")
