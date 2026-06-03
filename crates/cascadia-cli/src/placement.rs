@@ -299,6 +299,32 @@ pub struct PlaceArgs {
     /// Where to write the solved `placement.json`.
     #[arg(long, default_value = "placement.json")]
     pub output: PathBuf,
+
+    /// Estimated resident overhead **per worker process** in GiB — the OV
+    /// runtime + device context + KV/activations each stage's worker holds
+    /// beyond its weights. Used only to warn when a placement's total
+    /// footprint (Σ weights + n_stages × this) would exhaust the shared pool
+    /// and swap. Measured ~1 GiB/worker for a 12-stage fp16 run on Lunar Lake.
+    #[arg(long, default_value_t = 1.0)]
+    pub worker_overhead_gb: f64,
+}
+
+/// Total resident footprint of a placement and whether it risks swapping.
+/// The solver's memory gate counts **weights only**; in practice each stage is
+/// a worker process whose OV runtime + device context + KV/activations add
+/// real resident memory, so a placement that "fits" the weight pool can still
+/// drive the box to ~0 free RAM and thrash. Returns the footprint and pool in
+/// bytes plus whether footprint exceeds the pool. Pure — unit-tested.
+fn swap_risk(
+    stage_mem: &[u64],
+    worker_overhead_bytes: u64,
+    pool_bytes: Option<u64>,
+) -> Option<(u64, u64)> {
+    let pool = pool_bytes?;
+    let weights: u64 = stage_mem.iter().sum();
+    let footprint =
+        weights.saturating_add((stage_mem.len() as u64).saturating_mul(worker_overhead_bytes));
+    (footprint > pool).then_some((footprint, pool))
 }
 
 pub fn cmd_place(args: PlaceArgs) -> Result<()> {
@@ -315,6 +341,29 @@ pub fn cmd_place(args: PlaceArgs) -> Result<()> {
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     println!("{}", placement.summary());
+
+    // Warn if the real footprint (weights + per-worker runtime overhead) would
+    // exhaust the shared UMA pool. The solver's gate counts weights only, but
+    // each stage is a worker process whose OV runtime + device context +
+    // KV/activations add ~1 GiB; a placement that "fits" the weights can still
+    // drive the box to ~0 free RAM and swap (slow + highly variable tok/s).
+    let overhead = (args.worker_overhead_gb * (1024.0 * 1024.0 * 1024.0)) as u64;
+    let stage_mem: Vec<u64> = profile.stages.iter().map(|s| s.mem_bytes).collect();
+    if let Some((footprint, pool)) = swap_risk(&stage_mem, overhead, profile.pool_bytes) {
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        eprintln!(
+            "WARNING: placement footprint ~{:.1} GiB (weights {:.1} + {} workers x {:.1} GiB \
+             overhead) exceeds the usable pool ~{:.1} GiB. Expect heavy swapping and slow, \
+             unstable tok/s. Reduce --num-stages (fewer, larger stages = less per-worker \
+             overhead), use a smaller model, or raise --pool-gb only if you have the RAM.",
+            gib(footprint),
+            gib(stage_mem.iter().sum::<u64>()),
+            stage_mem.len(),
+            args.worker_overhead_gb,
+            gib(pool),
+        );
+    }
+
     println!("wrote {}", args.output.display());
     Ok(())
 }
@@ -546,5 +595,27 @@ mod tests {
         assert_eq!(p.assignment.len(), 20);
         assert_eq!(p.per_device_mem.get("GPU"), Some(&(16 * GB)));
         assert_eq!(p.per_device_mem.get("NPU"), Some(&(4 * GB)));
+    }
+
+    #[test]
+    fn swap_risk_flags_footprint_over_pool_including_worker_overhead() {
+        // 12 stages x 1.67 GiB weights = ~20 GiB (fits the 28 GiB pool on
+        // weights alone), but + 12 workers x 1 GiB overhead = ~32 GiB > 28 GiB
+        // -> swap risk. This is the SOLAR-on-Lunar-Lake case from #67.
+        let weights: Vec<u64> = (0..12).map(|_| (1.67 * GB as f64) as u64).collect();
+        let pool = Some(28 * GB);
+        let risk = swap_risk(&weights, GB, pool);
+        assert!(risk.is_some(), "weights+overhead should exceed the pool");
+        let (footprint, p) = risk.unwrap();
+        assert_eq!(p, 28 * GB);
+        assert!(footprint > 28 * GB && footprint < 33 * GB);
+
+        // Same weights with NO worker overhead fit (weights ~20 < 28).
+        assert!(swap_risk(&weights, 0, pool).is_none());
+        // No pool gate -> never a swap warning.
+        assert!(swap_risk(&weights, GB, None).is_none());
+        // A comfortable model: 4 small stages + overhead well under pool.
+        let small: Vec<u64> = (0..4).map(|_| 2 * GB).collect();
+        assert!(swap_risk(&small, GB, pool).is_none()); // 8 + 4 = 12 < 28
     }
 }
