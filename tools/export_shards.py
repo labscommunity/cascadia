@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """cascadia standalone model exporter.
 
-Takes a HuggingFace model (Llama, Mistral, Qwen2, or any decoder-only LLM
-that follows the same conventions) and produces a cascadia shard directory:
+Takes a HuggingFace dense decoder-only model (Llama, Mistral, Qwen2/3, Phi-3,
+Gemma 1/2 — see the architecture-support note below; mixture-of-experts models
+are detected and rejected) and produces a cascadia shard directory:
 
     shards/
       pipeline_config.json
@@ -86,6 +87,13 @@ def detect_architecture(config) -> str:
         return "qwen2"
     if "phi" in model_type or "phi" in arch_first:
         return "phi"
+    # Distinguish Gemma generations — they have different decoder structures
+    # (Gemma-1 2-norm, Gemma-2 4-norm + softcapping, Gemma-3 different again).
+    # Check the more specific tags first since each name contains the prior.
+    if "gemma3" in model_type or "gemma3" in arch_first:
+        return "gemma3"
+    if "gemma2" in model_type or "gemma2" in arch_first:
+        return "gemma2"
     if "gemma" in model_type or "gemma" in arch_first:
         return "gemma"
     print(
@@ -105,14 +113,32 @@ def is_moe_config(config) -> bool:
     reject early with a clear message instead of silently falling back to a
     dense Llama layer and emitting garbage (#60).
     """
-    for field in ("num_local_experts", "n_routed_experts", "num_experts"):
+    # 1. Top-level expert-count fields — definitive (dense models lack these).
+    for field in ("num_local_experts", "n_routed_experts", "num_experts", "moe_num_experts"):
         v = getattr(config, field, None)
         if isinstance(v, int) and v > 1:
             return True
+    # 2. Nested expert config — DBRX puts the count under config.ffn_config.
+    ffn = getattr(config, "ffn_config", None)
+    if ffn is not None:
+        n = ffn.get("moe_num_experts") if isinstance(ffn, dict) else getattr(ffn, "moe_num_experts", None)
+        if isinstance(n, int) and n > 1:
+            return True
+    # 3. A per-token expert router count is a dense-model-free MoE signal.
+    if isinstance(getattr(config, "num_experts_per_tok", None), int):
+        return True
+    # 4. Known MoE model_types (exact) + architecture class names. Exact
+    #    model_type avoids false-positives from a dense model merely named
+    #    "*moe*"; class names ending in MoEForCausalLM are reliably MoE.
     model_type = getattr(config, "model_type", "").lower()
     arch_first = ((getattr(config, "architectures", []) or [""])[0]).lower()
-    markers = ("mixtral", "moe", "deepseek_v2", "deepseek_v3", "llama4", "grok")
-    return any(m in model_type or m in arch_first for m in markers)
+    moe_types = {
+        "mixtral", "dbrx", "deepseek_v2", "deepseek_v3", "qwen2_moe", "qwen3_moe",
+        "phimoe", "jamba", "granitemoe", "olmoe", "grok", "grok-1", "llama4",
+    }
+    if model_type in moe_types:
+        return True
+    return arch_first.endswith("moeforcausallm") or "mixtral" in arch_first or "grok" in arch_first
 
 
 def get_decoder_layer_cls(arch_tag: str):
@@ -143,15 +169,16 @@ def get_decoder_layer_cls(arch_tag: str):
             from transformers.models.phi.modeling_phi import PhiDecoderLayer
 
             return PhiDecoderLayer
+    if arch_tag == "gemma2":
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+
+        return Gemma2DecoderLayer
     if arch_tag == "gemma":
-        try:
-            from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+        # Gemma-1 (2-norm). Must NOT use Gemma2DecoderLayer — its attention
+        # reads config.query_pre_attn_scalar, which GemmaConfig lacks.
+        from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
 
-            return Gemma2DecoderLayer
-        except ImportError:
-            from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
-
-            return GemmaDecoderLayer
+        return GemmaDecoderLayer
     raise ValueError(f"unsupported arch tag: {arch_tag}")
 
 
@@ -173,15 +200,14 @@ def get_norm_cls(arch_tag: str):
         from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
         return Qwen3RMSNorm
+    if arch_tag == "gemma2":
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2RMSNorm
+
+        return Gemma2RMSNorm
     if arch_tag == "gemma":
-        try:
-            from transformers.models.gemma2.modeling_gemma2 import Gemma2RMSNorm
+        from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
 
-            return Gemma2RMSNorm
-        except ImportError:
-            from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
-
-            return GemmaRMSNorm
+        return GemmaRMSNorm
     # Phi3 uses RMSNorm too
     if arch_tag == "phi":
         try:
@@ -337,6 +363,11 @@ def cached_layer_forward_sdpa(
         qkv = layer.self_attn.qkv_proj(hidden_states)
         q_sz = num_heads * head_dim
         kv_sz = num_kv_heads * head_dim
+        if qkv.shape[-1] != q_sz + 2 * kv_sz:
+            raise ValueError(
+                f"fused qkv_proj width {qkv.shape[-1]} != q({q_sz})+k({kv_sz})+v({kv_sz}); "
+                f"this arch packs qkv differently than the assumed [Q,K,V] contiguous layout"
+            )
         q = qkv[..., :q_sz]
         k = qkv[..., q_sz : q_sz + kv_sz]
         v = qkv[..., q_sz + kv_sz : q_sz + 2 * kv_sz]
@@ -432,22 +463,22 @@ class ArchSpec:
 
 
 def arch_spec_from_config(config, arch_tag, head_dim) -> "ArchSpec":
-    """Build the ArchSpec for a model from its HF config."""
-    model_type = getattr(config, "model_type", "").lower()
+    """Build the ArchSpec for a model from its HF config (keyed off the
+    architecture tag from detect_architecture)."""
+    if arch_tag == "gemma2":
+        # Scaled embeddings + attention/final-logit softcapping + query
+        # pre-attn scalar + the 4-norm decoder structure.
+        qpas = getattr(config, "query_pre_attn_scalar", None) or head_dim
+        return ArchSpec(
+            embed_scale=float(config.hidden_size) ** 0.5,
+            attn_softcap=getattr(config, "attn_logit_softcapping", None),
+            final_softcap=getattr(config, "final_logit_softcapping", None),
+            query_scale=1.0 / math.sqrt(qpas),
+            gemma2_norms=True,
+        )
     if arch_tag == "gemma":
-        # Gemma scales embeddings by sqrt(hidden_size) (the "normalizer").
-        embed_scale = float(config.hidden_size) ** 0.5
-        if model_type == "gemma2":
-            qpas = getattr(config, "query_pre_attn_scalar", None) or head_dim
-            return ArchSpec(
-                embed_scale=embed_scale,
-                attn_softcap=getattr(config, "attn_logit_softcapping", None),
-                final_softcap=getattr(config, "final_logit_softcapping", None),
-                query_scale=1.0 / math.sqrt(qpas),
-                gemma2_norms=True,
-            )
         # Gemma-1: scaled embeddings only (standard 2-norm layer, no softcap).
-        return ArchSpec(embed_scale=embed_scale)
+        return ArchSpec(embed_scale=float(config.hidden_size) ** 0.5)
     return ArchSpec()
 
 
@@ -508,6 +539,19 @@ class _BaseStage(nn.Module):
             present_kv.extend([pk, pv])
         return hidden_states, present_kv
 
+    def _scale_embeds(self, hidden_states):
+        """Gemma scales token embeddings by sqrt(hidden_size) (#61); no-op
+        otherwise. Single source of truth so embed/full stages can't drift."""
+        if self.arch.embed_scale != 1.0:
+            return hidden_states * self.arch.embed_scale
+        return hidden_states
+
+    def _softcap_logits(self, logits):
+        """Gemma-2 tanh-softcaps the final logits (#61); no-op otherwise."""
+        if self.arch.final_softcap is not None:
+            return self.arch.final_softcap * torch.tanh(logits / self.arch.final_softcap)
+        return logits
+
 
 class CachedEmbedStageWrapper(_BaseStage):
     def __init__(
@@ -517,10 +561,7 @@ class CachedEmbedStageWrapper(_BaseStage):
         self.embed_tokens = embed_tokens
 
     def forward(self, input_ids, attention_mask, position_ids, *past_kv):
-        hidden_states = self.embed_tokens(input_ids)
-        if self.arch.embed_scale != 1.0:
-            # Gemma scales token embeddings by sqrt(hidden_size) (#61).
-            hidden_states = hidden_states * self.arch.embed_scale
+        hidden_states = self._scale_embeds(self.embed_tokens(input_ids))
         hidden_states, present_kv = self._run_layers(
             hidden_states, attention_mask, position_ids, past_kv
         )
@@ -548,12 +589,7 @@ class CachedHeadStageWrapper(_BaseStage):
             hidden_states, attention_mask, position_ids, past_kv
         )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-        if self.arch.final_softcap is not None:
-            # Gemma-2 tanh-softcaps the final logits (#61).
-            logits = self.arch.final_softcap * torch.tanh(
-                logits / self.arch.final_softcap
-            )
+        logits = self._softcap_logits(self.lm_head(hidden_states))
         return (logits, *present_kv)
 
 
@@ -575,20 +611,12 @@ class CachedFullStageWrapper(_BaseStage):
         self.lm_head = lm_head
 
     def forward(self, input_ids, attention_mask, position_ids, *past_kv):
-        hidden_states = self.embed_tokens(input_ids)
-        if self.arch.embed_scale != 1.0:
-            # Gemma scales token embeddings by sqrt(hidden_size) (#61).
-            hidden_states = hidden_states * self.arch.embed_scale
+        hidden_states = self._scale_embeds(self.embed_tokens(input_ids))
         hidden_states, present_kv = self._run_layers(
             hidden_states, attention_mask, position_ids, past_kv
         )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-        if self.arch.final_softcap is not None:
-            # Gemma-2 tanh-softcaps the final logits (#61).
-            logits = self.arch.final_softcap * torch.tanh(
-                logits / self.arch.final_softcap
-            )
+        logits = self._softcap_logits(self.lm_head(hidden_states))
         return (logits, *present_kv)
 
 
@@ -631,20 +659,35 @@ def load_stage_weights(model_dir, layer_start, layer_end, has_embed, has_head, t
         return state_dict
 
     # Fallback: legacy PyTorch .bin checkpoints (e.g. deepseek-llm-7b ships
-    # only pytorch_model*.bin, no safetensors) — #59. torch.load each shard on
-    # CPU and keep just the keys this stage needs.
-    bin_files = sorted(glob.glob(os.path.join(model_dir, "pytorch_model*.bin"))) or sorted(
-        glob.glob(os.path.join(model_dir, "*.bin"))
-    )
+    # only pytorch_model*.bin, no safetensors) — #59. Match ONLY weight-shard
+    # filename patterns (never bare *.bin, which would pick up training_args.bin
+    # / optimizer.bin and choke torch.load).
+    bin_files = []
+    for pat in ("pytorch_model*.bin", "model*.bin", "consolidated*.bin"):
+        bin_files += glob.glob(os.path.join(model_dir, pat))
+    bin_files = sorted(set(bin_files))
     if not bin_files:
         raise FileNotFoundError(
-            f"no *.safetensors or *.bin weight files in {model_dir}"
+            f"no *.safetensors or weight *.bin (pytorch_model*/model*/consolidated*) "
+            f"in {model_dir}"
         )
     for bf in bin_files:
-        shard = torch.load(bf, map_location="cpu", weights_only=True)
+        try:
+            # mmap=True lazy-maps the shard, so we materialize only the few
+            # layers this stage keeps (via .clone()) instead of loading the
+            # whole multi-GB shard into RAM.
+            shard = torch.load(bf, map_location="cpu", weights_only=True, mmap=True)
+        except Exception as e:
+            # Older torch (no mmap kwarg) or a checkpoint weights_only can't
+            # unpickle — fall back loudly for trusted local/HF weights.
+            print(
+                f"  torch.load(weights_only,mmap) failed ({e}); retrying full unpickle",
+                flush=True,
+            )
+            shard = torch.load(bf, map_location="cpu", weights_only=False)
         for key, tensor in shard.items():
             if wanted(key):
-                state_dict[key] = tensor
+                state_dict[key] = tensor.clone() if hasattr(tensor, "clone") else tensor
         del shard
         gc.collect()
     return state_dict
@@ -1084,21 +1127,29 @@ def maybe_download(model_id_or_path: str) -> str:
     safe_id = model_id_or_path.replace("/", "--")
     local_dir = os.path.join(cache_root, safe_id)
     print(f"Downloading {model_id_or_path} -> {local_dir}", flush=True)
+    common = ["*.json", "tokenizer.*", "*.model", "special_tokens_map.json"]
+    # Prefer safetensors. Only fetch legacy .bin shards if the repo has no
+    # safetensors — avoids pulling a redundant multi-GB .bin for the many repos
+    # that ship both, and only matches weight-shard names (not training_args.bin).
     snapshot_download(
         repo_id=model_id_or_path,
         local_dir=local_dir,
-        allow_patterns=[
-            "*.safetensors",
-            # Legacy PyTorch checkpoints (e.g. deepseek-llm-7b ships only
-            # pytorch_model*.bin) — fall back to these when no safetensors.
-            "*.bin",
-            "*.json",
-            "tokenizer.*",
-            "*.model",
-            "special_tokens_map.json",
-        ],
+        allow_patterns=["*.safetensors", *common],
         max_workers=8,
     )
+    if not glob.glob(os.path.join(local_dir, "*.safetensors")):
+        print("  no safetensors in repo; fetching legacy .bin weight shards", flush=True)
+        snapshot_download(
+            repo_id=model_id_or_path,
+            local_dir=local_dir,
+            allow_patterns=[
+                "pytorch_model*.bin",
+                "model*.bin",
+                "consolidated*.bin",
+                *common,
+            ],
+            max_workers=8,
+        )
     return local_dir
 
 
@@ -1171,8 +1222,11 @@ def main():
 
     from transformers import AutoConfig
 
-    model_dir = maybe_download(args.model)
-    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=False)
+    # Read the config FIRST (cheap — just config.json, no weights) so we can
+    # reject unsupported models before downloading tens-to-hundreds of GB.
+    # AutoConfig.from_pretrained works on an HF id (fetches only config.json)
+    # or a local dir.
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
     if is_moe_config(config):
         sys.exit(
             f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
@@ -1181,7 +1235,29 @@ def main():
             f"implemented, and falling back to a dense layer would silently emit "
             f"garbage. Aborting rather than producing a broken shard."
         )
+    # The traced RoPE rotates the FULL head_dim with plain inv_freq. Reject
+    # models needing partial rotary (rotating only a head_dim slice, e.g.
+    # phi-2) — they would silently emit garbage. Long-context rope_scaling
+    # (llama3/yarn/longrope) is identity-ish within the original context, so
+    # short generations match; warn rather than reject those.
+    prf = getattr(config, "partial_rotary_factor", None)
+    if isinstance(prf, (int, float)) and prf < 1.0:
+        sys.exit(
+            f"ERROR: {args.model} uses partial rotary (partial_rotary_factor={prf}); the "
+            f"exporter applies RoPE to the full head_dim and would emit garbage. Not supported."
+        )
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rtype = (rope_scaling.get("rope_type") or rope_scaling.get("type") or "").lower()
+        if rtype in ("longrope", "su", "yarn"):
+            print(
+                f"  WARNING: rope_scaling type {rtype!r} is not modeled (plain RoPE baked); "
+                f"output will diverge from reference beyond the original context length.",
+                flush=True,
+            )
     arch_tag = detect_architecture(config)
+    # Accepted — now fetch the weights.
+    model_dir = maybe_download(args.model)
     # transformers 4.x exposes rope_theta directly; 5.x moved it under
     # config.rope_parameters = {"rope_theta": ..., "rope_type": ...}.
     # Handle both — wrong rope_theta gets silently baked into the traced
