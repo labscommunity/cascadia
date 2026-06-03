@@ -49,6 +49,12 @@ ALIASES: dict[str, str] = {
     "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
     "phi-4": "microsoft/phi-4",
     "phi-4-mini": "microsoft/Phi-4-mini-instruct",
+
+    # Gemma 4 — dispatched to the dedicated tools/export_gemma4.py exporter
+    # (#48). google/gemma-4-* is gated; use unsloth's re-uploads.
+    "gemma-4-e2b": "unsloth/gemma-4-E2B-it",
+    "gemma-4-e4b": "unsloth/gemma-4-E4B-it",
+    "gemma-4-31b": "unsloth/gemma-4-31B-it",
 }
 
 
