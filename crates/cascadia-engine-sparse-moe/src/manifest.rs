@@ -62,6 +62,10 @@ pub struct Manifest {
     /// Empty = all `0..num_layers`. Only consulted by the ov_ir backend.
     #[serde(default)]
     pub exported_layers: Vec<u32>,
+    /// Expert FFN intermediate dim (e.g. 1536 for M2). Needed by the
+    /// `int4_bin` backend to compute per-expert byte offsets. 0 = unset.
+    #[serde(default)]
+    pub expert_intermediate: u32,
 }
 
 fn default_experts_format() -> String {

@@ -109,19 +109,48 @@ fn minimax_m2_full_generate_smoke() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .and_then(std::num::NonZeroUsize::new);
-    let mut runner =
-        OvMoeRunner::load(model_dir, &device, PluginConfig::new(), cap).expect("load OvMoeRunner");
+    let mut plugin = PluginConfig::new();
+    if let Ok(dir) = std::env::var("CASCADIA_OV_CACHE") {
+        plugin = plugin.with("CACHE_DIR", dir);
+    }
+    let mut runner = OvMoeRunner::load(model_dir, &device, plugin, cap).expect("load OvMoeRunner");
+
+    // Sampling knobs for the greedy-vs-repetition-penalty comparison.
+    let env_f32 = |k: &str, d: f32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    let cfg = cascadia_engine_sparse_moe::SamplingConfig {
+        temperature: env_f32("M2_TEMP", 0.0),
+        top_p: env_f32("M2_TOP_P", 1.0),
+        repetition_penalty: env_f32("M2_REP_PENALTY", 1.0),
+        repetition_window: std::env::var("M2_REP_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        seed: Some(42),
+    };
+    eprintln!(
+        "sampling: temp={} top_p={} rep_penalty={} rep_window={}",
+        cfg.temperature, cfg.top_p, cfg.repetition_penalty, cfg.repetition_window
+    );
 
     let started = std::time::Instant::now();
-    let generated = runner
-        .generate_argmax(&ids, max_new)
-        .expect("generate_argmax");
+    let (generated, stats) = runner
+        .generate_timed(&ids, max_new, &cfg)
+        .expect("generate");
     let secs = started.elapsed().as_secs_f64();
     let text = tokenizer.decode(&generated, true).unwrap_or_default();
+    let first_decode = stats.decode_secs.first().copied().unwrap_or(0.0);
     eprintln!(
-        "generated {} tokens in {:.1}s ({:.2} tok/s)",
+        "generated {} tokens in {:.1}s | prefill {:.1}s | first decode-step {:.1}s | warm {:.3} tok/s | overall {:.3} tok/s",
         generated.len(),
         secs,
+        stats.prefill_secs,
+        first_decode,
+        stats.warm_tok_s(),
         generated.len() as f64 / secs.max(1e-9)
     );
     eprintln!("completion: {text:?}");

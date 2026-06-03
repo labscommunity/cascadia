@@ -1805,7 +1805,8 @@ impl Engine for OvMoeEngine {
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
-        let generated = match self.runner.generate_argmax(&prompt_ids, max_new) {
+        let sampling_cfg = sampling_from_task(&task);
+        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
             Ok(g) => g,
             Err(e) => {
                 warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");

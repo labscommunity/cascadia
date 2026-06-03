@@ -402,6 +402,7 @@ def load_reference(args):
         num_layers=hf.num_hidden_layers,
         num_experts=hf.num_local_experts,
         top_k=hf.num_experts_per_tok,
+        expert_intermediate=int(getattr(hf, "intermediate_size", 0)),
         partial_rotary_dim=rotary_dim,
         rope_theta=rope_theta,
         rms_norm_eps=float(hf.rms_norm_eps),
@@ -426,6 +427,48 @@ def parse_layers(spec, n):
 def _ns(**kw):
     import types
     return types.SimpleNamespace(**kw)
+
+
+# --------------------------------------------------------------------------
+# int4_bin expert quantization (matches cascadia-int4-gemm's dequant:
+# per-32-col-group symmetric int4, value = (nibble - 8) * scale, nibbles
+# packed two-per-byte with the even column in the low nibble, bf16 LE
+# per-group scales). Validated against the kernel by the Rust unit test
+# `int4_bin_expert_matches_fp32_within_tolerance`.
+# --------------------------------------------------------------------------
+_INT4_GROUP = 32
+
+
+def _pack_int4_grouped(w: np.ndarray):
+    """Pack `[out, in]` fp32 -> (packed u8 [out, in/2], scale bf16-LE [out, in/32])."""
+    w = np.ascontiguousarray(w, dtype=np.float32)
+    out, inn = w.shape
+    g = _INT4_GROUP
+    assert inn % g == 0, f"in_dim {inn} not divisible by group {g}"
+    ng = inn // g
+    wg = w.reshape(out, ng, g)
+    max_abs = np.abs(wg).max(axis=2)
+    s = np.where(max_abs > 0, max_abs / 7.0, 1.0).astype(np.float32)  # [out, ng]
+    q = np.clip(np.round(wg / s[:, :, None]), -8, 7).astype(np.int32)
+    nib = (q + 8).astype(np.uint8).reshape(out, inn)
+    lo = nib[:, 0::2]
+    hi = nib[:, 1::2]
+    packed = (lo | (hi << 4)).astype(np.uint8)
+    u = s.view(np.uint32)
+    bf = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2")  # bf16 round-to-nearest-even
+    return packed.tobytes(), bf.tobytes()
+
+
+def export_expert_bin(w1: np.ndarray, w3: np.ndarray, w2: np.ndarray, path: Path):
+    """Write one expert's flat int4 binary: gate/up/down each as
+    packed-nibbles followed by bf16 scales (the layout OvMoeRunner's
+    int4_bin backend slices). w1=gate, w3=up, w2=down."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        for w in (w1, w3, w2):  # gate, up, down
+            packed, scale = _pack_int4_grouped(w)
+            f.write(packed)
+            f.write(scale)
 
 
 class StReader:
@@ -498,6 +541,7 @@ def export_full_streaming(args, out: Path):
         num_layers=hf.num_hidden_layers,
         num_experts=hf.num_local_experts,
         top_k=hf.num_experts_per_tok,
+        expert_intermediate=int(hf.intermediate_size),
         partial_rotary_dim=int(head_dim * float(prf)),
         rope_theta=float(rope_theta),
         rms_norm_eps=float(hf.rms_norm_eps),
@@ -558,14 +602,24 @@ def export_full_streaming(args, out: Path):
         edir = out / "experts" / f"layer_{li:02d}"
         for ei in range(cfg["num_experts"]):
             eb = f"{m}.experts.{ei}"
-            w1 = reader.weight(eb + ".w1")   # gate
-            w3 = reader.weight(eb + ".w3")   # up
-            w2 = reader.weight(eb + ".w2")   # down
-            experts_mod = _ns(gate_up_proj=[torch.cat([w1, w3], dim=0)], down_proj=[w2])
-            convert_and_save(ExpertWrapper(experts_mod, 0), (torch.zeros((1, 1, H)),),
-                             edir / f"expert_{ei:03d}" / "openvino_model.xml",
-                             {0: [1]}, ["x"], ["y"], expert_q)
-            del w1, w3, w2, experts_mod
+            if args.experts == "int4_bin":
+                binp = edir / f"expert_{ei:03d}.bin"
+                if binp.exists() and binp.stat().st_size > 0:
+                    continue  # resume
+                w1 = reader.weight(eb + ".w1").numpy()
+                w3 = reader.weight(eb + ".w3").numpy()
+                w2 = reader.weight(eb + ".w2").numpy()
+                export_expert_bin(w1, w3, w2, binp)
+                del w1, w3, w2
+            else:
+                w1 = reader.weight(eb + ".w1")   # gate
+                w3 = reader.weight(eb + ".w3")   # up
+                w2 = reader.weight(eb + ".w2")   # down
+                experts_mod = _ns(gate_up_proj=[torch.cat([w1, w3], dim=0)], down_proj=[w2])
+                convert_and_save(ExpertWrapper(experts_mod, 0), (torch.zeros((1, 1, H)),),
+                                 edir / f"expert_{ei:03d}" / "openvino_model.xml",
+                                 {0: [1]}, ["x"], ["y"], expert_q)
+                del w1, w3, w2, experts_mod
         print(f"[layer {li}] shell + {cfg['num_experts']} experts done", flush=True)
 
     # eos: prefer generation_config.json, else tokenizer/config, else last id
@@ -590,7 +644,8 @@ def export_full_streaming(args, out: Path):
         "v_head_dim": cfg["head_dim"],
         "vocab_size": cfg["vocab_size"],
         "eos_token_ids": eos,
-        "experts_format": "ov_ir",
+        "experts_format": args.experts,
+        "expert_intermediate": cfg["expert_intermediate"],
         "shell_backend": "ov_ir",
         "embed_is_layer0": True,
         "num_q_heads": cfg["num_q_heads"],
@@ -622,6 +677,9 @@ def main():
     ap.add_argument("--no-quant", action="store_true", help="skip INT4 (fp32 weights)")
     ap.add_argument("--experts-int8", action="store_true",
                     help="INT8 experts instead of INT4 (debug numerics)")
+    ap.add_argument("--experts", choices=["ov_ir", "int4_bin"], default="ov_ir",
+                    help="full-model expert backend: per-expert OV IR (default) or "
+                         "flat int4 binaries for the AVX-512 kernel (faster decode)")
     ap.add_argument("--ref-prompt", default="1,2,3,4,5",
                     help="comma token ids for the --tiny reference forward")
     ap.add_argument("--ref-gen", type=int, default=6, help="reference greedy tokens")
@@ -718,6 +776,7 @@ def main():
         "v_head_dim": cfg["head_dim"],
         "vocab_size": cfg["vocab_size"],
         "eos_token_ids": eos,
+        "expert_intermediate": cfg.get("expert_intermediate", 0),
         "experts_format": "ov_ir",
         # M2-specific runtime hints (read by the OV-IR shell backend):
         "shell_backend": "ov_ir",
