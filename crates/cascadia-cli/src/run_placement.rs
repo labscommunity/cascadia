@@ -33,8 +33,9 @@ pub struct RunPlacementArgs {
     #[arg(long, default_value = "127.0.0.1:8000")]
     pub api: String,
 
-    /// Host the relay `--listen`/`--next` sockets bind/dial. Loopback for a
-    /// single-host run; a routable address to span machines.
+    /// Host the relay `--listen`/`--next` sockets bind/dial. This launcher
+    /// spawns all stages as **local** child processes, so this is normally
+    /// loopback; to span machines, launch `cascadia worker` per box by hand.
     #[arg(long, default_value = "127.0.0.1")]
     pub relay_host: String,
 
@@ -193,8 +194,12 @@ mod spawn {
         // dials them.
         for argv in plans.iter().enumerate().rev() {
             let (rank, argv) = argv;
+            // kill_on_drop: if a later spawn fails (the `?` below) or we return
+            // early, dropping `children` tears down the already-spawned workers
+            // instead of leaking them as orphans holding relay ports + devices.
             let child = tokio::process::Command::new(&exe)
                 .args(argv)
+                .kill_on_drop(true)
                 .spawn()
                 .with_context(|| format!("spawning stage {rank}"))?;
             children.push((rank, child));
