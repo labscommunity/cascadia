@@ -21,7 +21,6 @@ from model_aliases import ALIASES, resolve  # noqa: E402
         ("r1-distill-llama-8b", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"),
         ("llama-3.1-8b", "unsloth/Meta-Llama-3.1-8B-Instruct"),
         ("mistral-nemo-12b", "mistralai/Mistral-Nemo-Instruct-2407"),
-        ("gemma-4-e2b", "unsloth/gemma-4-E2B-it"),
         ("phi-4", "microsoft/phi-4"),
         ("phi-4-mini", "microsoft/Phi-4-mini-instruct"),
         ("qwen3-1.7b", "Qwen/Qwen3-1.7B"),

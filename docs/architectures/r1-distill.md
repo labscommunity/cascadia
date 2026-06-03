@@ -44,12 +44,14 @@ text = resp.choices[0].message.content
 answer = text.split("</think>")[-1].strip() if "</think>" in text else text
 ```
 
-## End-to-end test (miner + beta)
+## End-to-end test (iGPU + iGPU)
 
 **End-to-end pipeline-parallel works on Intel iGPU (Lunar Lake).**
 Verified 2026-05-21 with `r1-distill-qwen-1.5b` (int4, 917 MB total)
-sharded across **beta** (rank 0, Lunar Lake iGPU) → **charlie**
-(rank 1, Lunar Lake iGPU), API on beta:8000:
+sharded across two Lunar Lake iGPU AI PCs (rank 0 → rank 1), API on
+rank 0:8000. (The original `beta`/`charlie` validation hosts were
+retired 2026-05-29; the recipe below is host-agnostic — substitute
+any two AI PCs reachable over the network.)
 
 ```
 $ curl http://192.168.86.31:8000/v1/chat/completions -d '{
@@ -69,8 +71,9 @@ $ curl http://192.168.86.31:8000/v1/chat/completions -d '{
 (17 × 23 = 391 ✓; the `</think>` marker is the R1 reasoning-chain
 end-of-chain-of-thought.)
 
-**Known CPU-plugin blocker:** Pipeline-parallel via `--engine
-ov-runtime --device CPU` fails with:
+**CPU-plugin note (fixed):** an earlier exporter emitted init-less
+`ReadValue` nodes (via `apply_make_stateful_transformation`) that the
+OpenVINO CPU plugin rejected with:
 
 ```
 Check 'idx < parentEdges.size()' failed at
@@ -78,16 +81,13 @@ src/plugins/intel_cpu/src/node.cpp:687:
 Node ReadValue_33408 contains less parent edges than 0
 ```
 
-Reproduces with `openvino_genai 2026.1.0`'s `LLMPipeline` directly
-(loading the same v5_canonical_inputs IR), so it's an upstream OV
-CPU plugin issue with how the `apply_make_stateful_transformation`
-+ `fuse_cache_reorder` combination restructures the IR (the
-`beam_idx` Gather inserted in front of each `ReadValue` confuses
-the CPU plugin's edge accounting). Use the iGPU path on AI PCs
-until the upstream fix lands; CPU plugin is fine for `--engine
-ov-genai` single-stage.
+This is fixed (#57/#62): `make_stateful_with_init` now builds the
+`ReadValue`/`Assign` nodes directly with explicit zero-length inits, so
+the v5_canonical_inputs shards load on the CPU plugin as well as the
+iGPU. Pipeline-parallel `--engine ov-runtime` runs on `--device CPU`,
+`GPU`, and `NPU`.
 
-See `tools/scripts/test_r1_distill_pipeline_parallel.sh`. Steps:
+Steps to reproduce the pipeline-parallel run:
 
 1. Export 2-stage int4 shards on the miner (only needs CPU + plenty
    of disk; nothing to do with the actual runtime). `int4` is

@@ -1,10 +1,12 @@
 """Short aliases for commonly-tested models.
 
-`cascadia shard --model <name>` consults this map first; if a match is
-found, the canonical HuggingFace repo id is used in its place. This
-saves typing for the test recipes and gives a stable spelling we can
-quote in docs that survives upstream renames (e.g. when a model is
-republished under a different org).
+The exporter (`tools/export_shards.py`) resolves `--model <name>` through
+this map first; if a match is found, the canonical HuggingFace repo id is
+used in its place. This saves typing for the test recipes and gives a
+stable spelling we can quote in docs that survives upstream renames (e.g.
+when a model is republished under a different org). (When run via
+`cascadia shard`, this module must be bundled alongside the exporter —
+wired up with the dedicated-exporter bundling in #48.)
 
 Adding a new alias is a one-line change. Aliases must be lowercase,
 hyphen-separated, and unique across the map.
@@ -43,18 +45,10 @@ ALIASES: dict[str, str] = {
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-8b": "Qwen/Qwen3-8B",
 
-    # Phi-3 / Phi-4 — partial-rotary handled by export_shards.py
-    # after fix/exporter-arch-robustness.
+    # Phi-3 / Phi-4 — partial rotary handled by export_shards.py (#69).
     "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
     "phi-4": "microsoft/phi-4",
     "phi-4-mini": "microsoft/Phi-4-mini-instruct",
-
-    # Gemma 4 — handled via tools/export_gemma4.py
-    # after feat/gemma4-cached-shards-port. Needs unsloth re-upload
-    # because google/gemma-4-* is gated.
-    "gemma-4-e2b": "unsloth/gemma-4-E2B-it",
-    "gemma-4-e4b": "unsloth/gemma-4-E4B-it",
-    "gemma-4-31b": "unsloth/gemma-4-31B-it",
 }
 
 
