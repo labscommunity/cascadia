@@ -76,8 +76,10 @@ pub struct PerStageArgs {
 
 /// Fingerprint of the inputs a profile was measured for: the per-stage
 /// (name, weight-bytes), the device set, and the pool. Lets `profile-stages`
-/// reuse a cached profile instead of re-measuring. Deterministic across runs
-/// (`DefaultHasher` has fixed keys) — it's a cache key, not a security hash.
+/// reuse a cached profile instead of re-measuring. It's a cache key, not a
+/// security hash; stable within a build, and a toolchain change that alters
+/// `DefaultHasher` only causes a harmless cache miss + re-measure (never stale
+/// reuse — a mismatch always re-measures).
 #[cfg_attr(not(feature = "openvino"), allow(dead_code))]
 fn profile_fingerprint(stages: &[(String, u64)], devices: &[String], pool: Option<u64>) -> String {
     use std::hash::{Hash, Hasher};
@@ -205,6 +207,17 @@ mod openvino_impl {
     use crate::placement::{DeviceCap, PlacementProfile, StageCost};
 
     pub fn run(args: PerStageArgs) -> Result<()> {
+        if !(args.mem_headroom > 0.0 && args.mem_headroom <= 1.0) {
+            bail!(
+                "--mem-headroom must be in (0, 1]; got {}",
+                args.mem_headroom
+            );
+        }
+        if let Some(g) = args.pool_gb {
+            if !(g > 0.0 && g.is_finite()) {
+                bail!("--pool-gb must be a positive number; got {g}");
+            }
+        }
         let stages = stage_dirs(&args.shard)?;
         if stages.is_empty() {
             bail!(
@@ -254,7 +267,7 @@ mod openvino_impl {
         // Device memory budgets.
         let mut dev_caps: Vec<DeviceCap> = Vec::with_capacity(device_names.len());
         for d in &device_names {
-            let reported = device_reported_mem(d, pool_bytes)?;
+            let reported = device_reported_mem(d, pool_bytes);
             dev_caps.push(DeviceCap {
                 device: d.clone(),
                 mem_bytes: usable_cap(reported, args.mem_headroom),
@@ -331,26 +344,39 @@ mod openvino_impl {
     /// Reported byte budget for a device: OV's total-mem property for
     /// GPU/NPU, the operator's pool for CPU (or a large sentinel if no pool
     /// was given, since the CPU can use whatever RAM exists).
-    fn device_reported_mem(device: &str, pool_bytes: Option<u64>) -> Result<u64> {
+    fn device_reported_mem(device: &str, pool_bytes: Option<u64>) -> u64 {
         let up = device.to_ascii_uppercase();
-        let prop = if up.starts_with("GPU") {
+        let key = if up.starts_with("GPU") {
             Some("GPU_DEVICE_TOTAL_MEM_SIZE")
         } else if up.starts_with("NPU") {
             Some("NPU_DEVICE_TOTAL_MEM_SIZE")
         } else {
             None
         };
-        if let Some(key) = prop {
-            let raw = shim::device_property(device, key)
-                .with_context(|| format!("querying {key} on {device}"))?;
-            return raw
-                .trim()
-                .parse::<u64>()
-                .with_context(|| format!("parsing {key}='{raw}' as bytes"));
+        // CPU / other: the shared pool, or a large sentinel (256 GiB) when the
+        // operator didn't bound it. Also the fallback for GPU/NPU when the OV
+        // property is missing or not a bare byte count — warn rather than abort
+        // the whole profile (a UMA device that can't report its budget can
+        // still be profiled against the pool).
+        let fallback = pool_bytes.unwrap_or(256 * 1024 * 1024 * 1024);
+        let Some(key) = key else {
+            return fallback;
+        };
+        match shim::device_property(device, key) {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    warn!(device, key, value = %raw.trim(),
+                        "device memory property is not a bare byte count; using fallback budget");
+                    fallback
+                }
+            },
+            Err(e) => {
+                warn!(device, key, error = %e,
+                    "could not query device memory budget; using fallback budget");
+                fallback
+            }
         }
-        // CPU / other: the shared pool, or a large sentinel (256 GiB) when
-        // the operator didn't bound it.
-        Ok(pool_bytes.unwrap_or(256 * 1024 * 1024 * 1024))
     }
 
     /// Compile a stage on a device and time a forward pass with zeroed
