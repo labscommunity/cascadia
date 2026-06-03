@@ -91,9 +91,8 @@ The `pool` constraint is what makes this a UMA problem rather than N
 independent devices: the cheapest-latency assignment that satisfies the
 per-device caps can still exceed the physical 31.6 GB, so the solver
 rejects any model whose total resident memory exceeds usable system RAM.
-*(Status: the v1 solver in `placement.rs` enforces the per-device caps +
-op-support gate; the `pool` constraint is the first refinement landing
-next, with the per-stage profiler.)*
+*(The solver in `placement.rs` enforces the per-device caps, the op-support
+gate, AND this global pool constraint.)*
 
 Problem size is tiny (stages ≤ ~16, devices = 3), so we solve it
 **exactly in pure Rust** (no `good_lp`/CBC system dependency — keeps the
@@ -103,27 +102,41 @@ placed run equals GPU-alone — the correctness/no-regression check). For
 the memory-forced case the cap constraint forces overflow, and minimizing
 `lat` puts the overflow on NPU before CPU.
 
-## Build plan
+## Pipeline (implemented)
 
-1. **`cascadia profile-devices --per-stage <multi-stage-shard>`** — extend
-   the existing tool to compile + time each stage IR on each available
-   device (incl. the NPU static path) and record `lat`/`mem`/op-support →
-   `placement_profile.json`. *(the ILP cost table)*
-2. **ILP solver** (`crates/cascadia-cli` or a small `placement` module) —
-   exact memory-capped assignment; emits `placement.json`
-   (per-stage device list) + the objective + a human summary.
-3. **Apply** — launch the heterogeneous multi-stage pipeline from
-   `placement.json` (the multi-process ring already supports per-stage
-   `--device`; #63 validated 2-stage). Add a launcher that spawns one
-   worker per stage with its assigned device.
-4. **Validate on pawan-01**:
-   - *Correctness:* fitting model → ILP picks all-GPU → placed run matches
-     `--device GPU` (no regression).
-   - *≥10% win:* a >16.5 GB model (exported on the miner, IR shipped to
-     pawan) → `--device GPU` OOMs; the ILP-placed GPU+NPU+CPU run executes
-     it and beats a naive uniform/HETERO spill by ≥10% steady-state tok/s.
-   - *Graceful degrade:* a stage that fails op-support on a device is
-     excluded by the ILP (`lat=+∞`), placement still solves.
+The three steps are three subcommands; the static export from
+`cascadia shard --target npu` is the shared input (its shards run on
+GPU/CPU/NPU alike via the #63 static-KV path, so one export covers all
+tiers):
+
+1. **`cascadia profile-stages --shard <dir> [--pool-gb N]`**
+   (`profile_stage.rs`) — compiles each stage IR on each available device
+   and times a zeroed forward pass; records `lat`/`mem`/op-support and the
+   per-device + shared-pool budgets → `placement_profile.json`. A device
+   that fails to compile a stage is omitted (op-support gate). *(cost table)*
+2. **`cascadia place --profile placement_profile.json`** (`placement.rs`)
+   — the exact branch-and-bound ILP above; emits `placement.json`
+   (per-stage device list + objective + per-device memory). Solved exactly
+   in pure Rust — no `good_lp`/CBC dependency. Fitting model → all-GPU;
+   over-budget → overflow onto NPU before CPU; over-pool → `ExceedsPool`.
+3. **`cascadia run-placement --shard <dir> --placement placement.json`**
+   (`run_placement.rs`) — spawns one `cascadia worker` per stage pinned to
+   its assigned device, wired into the pipeline ring (rank 0 = API head).
+   The argv planning is pure + unit-tested; the spawner tears the ring down
+   on any stage exit / Ctrl-C.
+
+## Validation on pawan-01
+
+- *Flow + correctness (fitting):* a small 2-stage static model → ILP picks
+  all-GPU → `run-placement` serves it correctly (the no-regression check —
+  the ILP never recommends a slower tier when the model fits the iGPU).
+- *≥10% win (memory-forced):* Qwen2.5-32B-Instruct int4 = **16.9 GB > the
+  16.5 GB iGPU budget**, so an all-GPU placement OOMs (`--device GPU` can't
+  hold it) while the ILP's GPU+NPU placement runs it — and the cost-aware
+  overflow (NPU, not CPU) beats a naive memory-only spill-to-CPU by ≥10%
+  steady-state tok/s.
+- *Graceful degrade:* a stage that fails op-support on a device is excluded
+  by the ILP (omitted from `lat`), and placement still solves.
 
 ## References
 - PowerInfer §6.3 (offline ILP placement), PowerInfer-2 §4.1.3 (dynamic
