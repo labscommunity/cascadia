@@ -50,10 +50,26 @@ pub struct Manifest {
     /// miner Xeon for tiny experts like K2.6's 2048×7168 MLPs.
     #[serde(default = "default_experts_format")]
     pub experts_format: String,
+    /// Shell execution backend. "rust_k26" (default) runs the hardcoded
+    /// K2.6 MLA Rust kernel reading shell weights from safetensors.
+    /// "ov_ir" runs each layer's attention+routing as a compiled
+    /// OpenVINO shell graph (the [`crate::ov_moe`] path) — used for
+    /// architectures whose math lives in the traced graph (e.g.
+    /// MiniMax-M2: GQA + QK-norm + partial RoPE + sigmoid routing).
+    #[serde(default = "default_shell_backend")]
+    pub shell_backend: String,
+    /// Subset of layer ids actually exported (debug/partial exports).
+    /// Empty = all `0..num_layers`. Only consulted by the ov_ir backend.
+    #[serde(default)]
+    pub exported_layers: Vec<u32>,
 }
 
 fn default_experts_format() -> String {
     "ov_ir".to_string()
+}
+
+fn default_shell_backend() -> String {
+    "rust_k26".to_string()
 }
 
 impl Manifest {
@@ -107,5 +123,21 @@ impl Manifest {
         (0..self.num_layers)
             .filter(|i| !self.dense_layers.contains(i))
             .collect()
+    }
+
+    /// True when shells should run as compiled OV-IR graphs (MiniMax-M2
+    /// and other arch-in-graph models) rather than the K2.6 Rust kernel.
+    pub fn is_ov_shell(&self) -> bool {
+        self.shell_backend == "ov_ir"
+    }
+
+    /// Layers the ov_ir backend should compile shells for. Falls back to
+    /// every layer when `exported_layers` is empty.
+    pub fn ov_layer_ids(&self) -> Vec<u32> {
+        if self.exported_layers.is_empty() {
+            (0..self.num_layers).collect()
+        } else {
+            self.exported_layers.clone()
+        }
     }
 }

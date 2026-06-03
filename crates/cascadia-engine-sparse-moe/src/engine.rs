@@ -32,6 +32,8 @@ use crate::dist::{
     StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
+use crate::manifest::Manifest;
+use crate::ov_moe::OvMoeRunner;
 use std::num::NonZeroUsize;
 
 use crate::runner::{LayerRange, Runner, RunnerError, RunnerOptions};
@@ -250,6 +252,9 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
 pub struct SparseMoEBuilder {
     pub config: SparseMoEBuilderConfig,
     runner: Option<Runner>,
+    /// Set instead of `runner` when the manifest selects the OV-IR shell
+    /// backend (MiniMax-M2). Single-stage only.
+    ov_runner: Option<OvMoeRunner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -261,6 +266,7 @@ impl SparseMoEBuilder {
         Self {
             config,
             runner: None,
+            ov_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -340,6 +346,54 @@ impl Builder for SparseMoEBuilder {
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.config.cache_dir {
             plugin = plugin.with("CACHE_DIR", d.clone());
+        }
+
+        // OV-IR shell backend (MiniMax-M2): the whole architecture lives in
+        // the traced graphs, so we run a dedicated single-stage runner
+        // instead of the K2.6 MLA kernel. Pipeline-parallel isn't wired for
+        // this backend yet (the K2.6 transport path assumes the Rust shell).
+        let is_ov = Manifest::load(&self.config.model_dir)
+            .map(|m| m.is_ov_shell())
+            .unwrap_or(false);
+        if is_ov {
+            if self.config.total > 1 {
+                return Err(EngineError::InvalidConfig(
+                    "ov_ir shell backend (MiniMax-M2) is single-stage only; total must be 1".into(),
+                ));
+            }
+            let cfg = self.config.clone();
+            let opts = resolve_runner_options(&cfg);
+            let cap = opts.max_cached_experts;
+            let plugin_for_worker = plugin.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let join: JoinHandle<Result<OvMoeRunner, crate::ov_moe::OvMoeError>> =
+                std::thread::spawn(move || {
+                    tx.send(LoadProgress::message(
+                        "loading MiniMax-M2 (OV-IR sparse-MoE)",
+                    ))
+                    .ok();
+                    OvMoeRunner::load(cfg.model_dir.clone(), &cfg.device, plugin_for_worker, cap)
+                });
+            let ov_runner = match join.join() {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(EngineError::Backend(format!("ov-moe load: {e}"))),
+                Err(_) => return Err(EngineError::Backend("ov-moe load worker panicked".into())),
+            };
+            let tok_path = self.config.model_dir.join("tokenizer.json");
+            if tok_path.exists() {
+                self.tokenizer = Some(
+                    Tokenizer::from_file(&tok_path)
+                        .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
+                );
+            } else {
+                warn!(
+                    "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
+                    tok_path.display()
+                );
+            }
+            self.ov_runner = Some(ov_runner);
+            let drained: Vec<LoadProgress> = rx.try_iter().collect();
+            return Ok(Box::pin(stream::iter(drained)));
         }
 
         // Build a LayerRange from the ShardSpec + config. For total==1
@@ -447,6 +501,15 @@ impl Builder for SparseMoEBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(ov) = self.ov_runner {
+            if self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the MiniMax-M2 engine)".into(),
+                ));
+            }
+            info!("built MiniMax-M2 OV-IR engine (single-stage)");
+            return Ok(Box::new(OvMoeEngine::new(ov, self.tokenizer)));
+        }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
         let total = self.config.total.max(1);
         let rank = self.config.rank.min(total - 1);
@@ -1674,6 +1737,94 @@ impl SparseMoEEngine {
             })?;
             Ok(())
         }
+    }
+}
+
+const OV_MAX_PENDING: usize = 64;
+
+/// Single-stage engine for the OV-IR shell backend (MiniMax-M2).
+///
+/// Greedy-only for v1: `OvMoeRunner` argmaxes each step, so sampling
+/// config (temperature / penalties) is ignored. The whole architecture is
+/// baked into the exported OV graphs, so this engine just tokenizes, drives
+/// [`OvMoeRunner::generate_argmax`], and decodes — no pipeline transport.
+pub struct OvMoeEngine {
+    runner: OvMoeRunner,
+    tokenizer: Option<Tokenizer>,
+    pending: VecDeque<GenerationTask>,
+}
+
+impl OvMoeEngine {
+    fn new(runner: OvMoeRunner, tokenizer: Option<Tokenizer>) -> Self {
+        Self {
+            runner,
+            tokenizer,
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl Engine for OvMoeEngine {
+    fn warmup(&mut self) {
+        if let Some(tok) = self.tokenizer.as_ref() {
+            let ids: Vec<u32> = tok
+                .encode("Hello", false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_else(|_| vec![1]);
+            let _ = self.runner.generate_argmax(&ids, 1);
+            info!("warmup: generated 1 token (MiniMax-M2)");
+        }
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.pending.len() >= OV_MAX_PENDING {
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: OV_MAX_PENDING,
+            });
+        }
+        self.pending.push_back(task);
+        Ok(())
+    }
+
+    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+        let task = match self.pending.pop_front() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let Some(tok) = self.tokenizer.as_ref() else {
+            warn!(task = %task.task_id, "MiniMax-M2 engine has no tokenizer");
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        };
+        let started = Instant::now();
+        let prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                warn!(task = %task.task_id, "tokenizer encode failed: {e}");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+        };
+        let max_new = task.max_tokens.max(1) as usize;
+        let generated = match self.runner.generate_argmax(&prompt_ids, max_new) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+        };
+        let n_tokens = generated.len() as u32;
+        let text = tok.decode(&generated, true).unwrap_or_default();
+        let elapsed = started.elapsed().as_secs_f64();
+        info!(
+            task = %task.task_id,
+            tokens = n_tokens,
+            elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            "task done (MiniMax-M2 single-stage)"
+        );
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
+        chunk.n_tokens = Some(n_tokens);
+        vec![(task.task_id.clone(), chunk)]
     }
 }
 
