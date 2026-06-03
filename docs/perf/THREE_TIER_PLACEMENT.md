@@ -119,7 +119,8 @@ single-static-binary, Rust-only invariant). For the fitting case the
 optimum is trivially "all stages on GPU" (the tool reports this and the
 placed run equals GPU-alone — the correctness/no-regression check). For
 the memory-forced case the cap constraint forces overflow, and minimizing
-`lat` puts the overflow on NPU before CPU.
+`lat` puts the overflow on the cheaper measured tier — **CPU before NPU** on
+Lunar Lake, since the NPU is the slowest tier for decode.
 
 ## Pipeline (implemented)
 
