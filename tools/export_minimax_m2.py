@@ -553,6 +553,11 @@ def export_full_streaming(args, out: Path):
     KV, D = cfg["num_kv_heads"], cfg["head_dim"]
     qmode = "none" if args.no_quant else "int4"
     expert_q = "int8" if args.experts_int8 else qmode
+    # Routing + lm_head are precision-sensitive (MiniMax-M2 keeps gate /
+    # e_score_correction_bias / lm_head full-precision); the shell graph
+    # carries the router gate, so default shells + head to fp16.
+    shell_qmode = "none" if args.no_quant else args.shell_quant
+    head_qmode = "none" if args.no_quant else args.head_quant
     layer_ids = parse_layers(args.layers, cfg["num_layers"])
 
     # embed (layer0) — embed_tokens is not FP8-quantized
@@ -569,7 +574,7 @@ def export_full_streaming(args, out: Path):
     head = HeadWrapper(_ns(weight=reader.weight("model.norm")),
                        _ns(weight=reader.weight("lm_head")), cfg["rms_norm_eps"])
     convert_and_save(head, (torch.zeros((1, 1, H)),), out / "head" / "openvino_model.xml",
-                     {0: [1]}, ["x"], ["logits"], qmode)
+                     {0: [1]}, ["x"], ["logits"], head_qmode)
     del head
 
     shell_in_names = ["x", "past_k", "past_v", "past_seq_len"]
@@ -596,7 +601,7 @@ def export_full_streaming(args, out: Path):
               torch.zeros((1, KV, 3, D)), torch.tensor(3, dtype=torch.int64))
         convert_and_save(ShellWrapper(layer, cfg), ex,
                          out / "shells" / f"layer_{li:02d}" / "openvino_model.xml",
-                         {1: [2], 2: [2]}, shell_in_names, shell_out_names, qmode)
+                         {1: [2], 2: [2]}, shell_in_names, shell_out_names, shell_qmode)
         del attn, moe, layer
 
         edir = out / "experts" / f"layer_{li:02d}"
@@ -680,6 +685,11 @@ def main():
     ap.add_argument("--experts", choices=["ov_ir", "int4_bin"], default="ov_ir",
                     help="full-model expert backend: per-expert OV IR (default) or "
                          "flat int4 binaries for the AVX-512 kernel (faster decode)")
+    ap.add_argument("--shell-quant", choices=["none", "int8", "int4"], default="int4",
+                    help="precision for the per-layer shell IR (attention + router gate). "
+                         "'none' (fp16) keeps routing precise — M2 keeps the gate full-precision")
+    ap.add_argument("--head-quant", choices=["none", "int8", "int4"], default="int4",
+                    help="precision for the head IR (final norm + lm_head); M2 keeps lm_head full-precision")
     ap.add_argument("--ref-prompt", default="1,2,3,4,5",
                     help="comma token ids for the --tiny reference forward")
     ap.add_argument("--ref-gen", type=int, default=6, help="reference greedy tokens")
