@@ -37,15 +37,25 @@ RoPE rotary will work. This covers:
   - Phi-3 (fused qkv_proj — #58)
   - Gemma 1 (scaled embeddings) and Gemma-2 (+ attention/final-logit
     softcapping + the 4-norm decoder structure — #61)
+  - Partial-rotary models (Phi-1/2, StableLM-2, Persimmon): only the
+    leading `partial_rotary_factor * head_dim` dims are rotated.
 
 Weights load from *.safetensors or, as a fallback, legacy pytorch_model*.bin
 (e.g. deepseek-llm — #59).
 
-Mixture-of-experts models (Mixtral, DeepSeek-V2/V3, Qwen*-MoE, Llama-4, …)
-are detected and rejected up front (#60): the exporter builds dense decoder
-layers and does not implement MoE routing / per-expert MLPs. Other
-non-standard architectures (custom sliding-window kernels, multimodal) may
-export but won't match HF reference outputs; benchmark before trusting.
+Unsupported models are rejected up front (before the multi-GB download)
+with a specific message rather than silently emitting garbage:
+  - Mixture-of-experts (Mixtral, DeepSeek-V2/V3, Qwen*-MoE, Llama-4, gpt-oss,
+    …) — is_moe_config (#60): the exporter builds dense decoder layers.
+  - Gemma 3 / Gemma 4 — interleaved local/global attention, per-layer-type
+    RoPE, KV sharing, per-layer embeddings (detect_architecture). Note
+    "gemma4" contains "gemma", so it is rejected explicitly before the
+    Gemma-1 path catches it.
+Lossier-but-runnable quirks (long-context RoPE scaling, sliding-window
+attention) warn and proceed (correct within the original context window);
+features that corrupt even short prompts (asymmetric head_dim, per-layer
+embeddings, KV sharing, QK-norm off the qwen3 path) abort unless
+CASCADIA_ALLOW_LOSSY_EXPORT=1 (check_export_quirks).
 """
 
 import argparse
@@ -68,33 +78,170 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 
 
+class UnsupportedModelError(RuntimeError):
+    """Raised when the model needs a feature the exporter doesn't honour.
+
+    Distinct from generic RuntimeError so callers can catch it and emit a
+    cleaner user-facing message instead of a traceback.
+    """
+
+
+def _text_config(config):
+    """Unwrap a multimodal wrapper if present.
+
+    Models like Gemma 3, Gemma 4, Llama 4 and Mistral 3.x ship a
+    multimodal config with the text backbone nested under
+    ``config.text_config``. Architecture detection (and the per-stage
+    field reads) want the text-tower config, not the wrapper's.
+    """
+    inner = getattr(config, "text_config", None)
+    if inner is not None and hasattr(inner, "model_type"):
+        return inner
+    return config
+
+
+class _RawConfigNS:
+    """Lightweight stand-in for a transformers config built from raw
+    config.json.
+
+    Used only as a fallback: transformers' ``AutoConfig.from_pretrained``
+    raises ``ValueError`` on unknown model_types for very-new families
+    (e.g. gemma4), which would block our specific rejection message. This
+    wraps the raw JSON dict (recursing into ``text_config``) so
+    ``detect_architecture`` sees the same shape it would on a real config.
+    """
+
+    def __init__(self, cfg_dict):
+        self._cfg = dict(cfg_dict)
+        if isinstance(cfg_dict.get("text_config"), dict):
+            self.text_config = _RawConfigNS(cfg_dict["text_config"])
+
+    def __getattr__(self, name):
+        # Names starting with "_" (incl. the "_cfg" backing dict itself) are
+        # never config fields. Reject them BEFORE touching self._cfg, so that
+        # an instance with no _cfg (e.g. constructed by copy/pickle without
+        # __init__) raises AttributeError instead of recursing forever.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._cfg[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+def _print_unsupported(exc: "UnsupportedModelError") -> None:
+    """Single chokepoint for the user-facing rejection block."""
+    print("", flush=True)
+    print("=" * 60, flush=True)
+    print("ERROR: model architecture not supported by cascadia shard.", flush=True)
+    print("=" * 60, flush=True)
+    print(str(exc), flush=True)
+    print("", flush=True)
+    print(
+        "If you really want to attempt the export anyway (e.g. for "
+        "experimental work), set CASCADIA_ALLOW_LOSSY_EXPORT=1.",
+        flush=True,
+    )
+
+
 def detect_architecture(config) -> str:
     """Return a short tag identifying the model family. Used to pick the
-    right decoder-layer class. Falls back to 'llama' for unknown models
+    right decoder-layer class.
+
+    Raises UnsupportedModelError for families we recognise but can't honour
+    today (Gemma 3, Gemma 4, gpt-oss). MoE models are caught separately by
+    is_moe_config(). Falls back to 'llama' for genuinely unknown models
     (most modern decoder-only LLMs have a Llama-compatible layer shape).
     """
-    model_type = getattr(config, "model_type", "").lower()
-    arch_list = getattr(config, "architectures", []) or []
+    inner = _text_config(config)
+    model_type = getattr(inner, "model_type", "").lower()
+    arch_list = getattr(inner, "architectures", []) or []
     arch_first = (arch_list[0] if arch_list else "").lower()
+    # Some multimodal configs carry the family-identifying type on the
+    # OUTER wrapper rather than the inner text_config — inspect both.
+    outer_type = getattr(config, "model_type", "").lower()
+    outer_arch_list = getattr(config, "architectures", []) or []
+    outer_arch_first = (outer_arch_list[0] if outer_arch_list else "").lower()
 
-    if "llama" in model_type or "llama" in arch_first:
+    def _has(needle):
+        return (
+            needle in model_type
+            or needle in arch_first
+            or needle in outer_type
+            or needle in outer_arch_first
+        )
+
+    # ---- Explicit reject list (non-MoE) — recognised but not yet honoured.
+    # MoE families (mixtral/llama4/qwen*_moe/deepseek/jamba/…) are rejected
+    # earlier by is_moe_config(); we don't duplicate them here.
+
+    # gpt-oss — OpenAI's open-weight MoE (Aug 2025): sigmoid-routed top-k,
+    # alternating sliding/full attention, YARN, MXFP4. is_moe_config catches
+    # the expert count, but name the family explicitly for a clear message.
+    if _has("gpt_oss") or _has("gpt-oss") or "gptoss" in model_type:
+        raise UnsupportedModelError(
+            "gpt-oss (model_type 'gpt_oss') is OpenAI's open-weight MoE: "
+            "sigmoid-routed top-k experts, alternating sliding/full "
+            "attention, YARN RoPE, MXFP4 native quant. Multiple features "
+            "the generic exporter does not support."
+        )
+
+    # Gemma 4 — per-layer-type asymmetric attention, per-layer-type RoPE
+    # ('proportional' scaling), KV-shared layers, per-layer embeddings,
+    # restored logit softcap. Note "gemma4" CONTAINS "gemma", so without
+    # this branch it would fall through to the Gemma-1 path below and be
+    # silently mis-exported as Gemma-1 (garbage output).
+    if _has("gemma4") or _has("gemma_4") or _has("gemma-4"):
+        raise UnsupportedModelError(
+            "Gemma 4 (model_type 'gemma4' / 'gemma4_text') requires "
+            "per-layer-type asymmetric attention, per-layer-type RoPE "
+            "(incl. 'proportional' scaling), KV-shared layers, per-layer "
+            "embeddings, and a restored final logit softcap. The generic "
+            "exporter cannot honour these and would emit garbage if it "
+            "fell back to the Gemma-1 path."
+        )
+
+    # Gemma 3 — different decoder structure again (interleaved local/global
+    # attention, query-key norm, per-layer RoPE base). No Gemma3DecoderLayer
+    # wiring here; reject up front with a clear message rather than failing
+    # late inside get_decoder_layer_cls() after the weights are downloaded.
+    if _has("gemma3") or _has("gemma_3") or _has("gemma-3"):
+        raise UnsupportedModelError(
+            "Gemma 3 (model_type 'gemma3') uses interleaved local/global "
+            "attention, QK-norm, and per-layer RoPE bases that the generic "
+            "exporter does not model. Not supported."
+        )
+
+    # Mamba / hybrid Mamba-Transformer (Falcon-Mamba, Nemotron-H, …). NOT
+    # caught by is_moe_config (pure Mamba isn't MoE), and "mamba" doesn't
+    # match any accept branch below, so it would otherwise fall through to
+    # the Llama path and silently mis-export. (Jamba is MoE + Mamba and is
+    # already rejected by is_moe_config; "jamba" does not contain "mamba".)
+    if _has("mamba"):
+        raise UnsupportedModelError(
+            "Mamba / hybrid Mamba-Transformer architectures (Falcon-Mamba, "
+            "Nemotron-H, …) need a state-space-model kernel the generic "
+            "OpenVINO IR exporter does not implement. Out of scope."
+        )
+
+    # ---- Accept list — families that load and run.
+
+    if _has("llama"):
         return "llama"
-    if "mistral" in model_type or "mistral" in arch_first:
+    if _has("mistral"):
         return "mistral"
-    if "qwen3" in model_type or "qwen3" in arch_first:
+    if _has("qwen3"):
         return "qwen3"
-    if "qwen2" in model_type or "qwen2" in arch_first:
+    if _has("qwen2"):
         return "qwen2"
-    if "phi" in model_type or "phi" in arch_first:
+    if _has("phi"):
         return "phi"
-    # Distinguish Gemma generations — they have different decoder structures
-    # (Gemma-1 2-norm, Gemma-2 4-norm + softcapping, Gemma-3 different again).
-    # Check the more specific tags first since each name contains the prior.
-    if "gemma3" in model_type or "gemma3" in arch_first:
-        return "gemma3"
-    if "gemma2" in model_type or "gemma2" in arch_first:
+    # Gemma 1 (2-norm) and Gemma-2 (4-norm + softcapping) — check the more
+    # specific gemma2 first since "gemma2" contains "gemma". Gemma 3/4 were
+    # rejected above.
+    if _has("gemma2"):
         return "gemma2"
-    if "gemma" in model_type or "gemma" in arch_first:
+    if _has("gemma"):
         return "gemma"
     print(
         f"  warning: unknown model_type={model_type!r}, architectures={arch_list!r};"
@@ -139,6 +286,115 @@ def is_moe_config(config) -> bool:
     if model_type in moe_types:
         return True
     return arch_first.endswith("moeforcausallm") or "mixtral" in arch_first or "grok" in arch_first
+
+
+def check_export_quirks(config, arch_tag: str):
+    """Inspect the (text-inner) config for features the exporter handles
+    imperfectly and classify them.
+
+    Returns ``(hard, soft)`` lists of human-readable strings:
+
+    - ``hard`` — features that corrupt output even for short prompts, or
+      make the weights fail to load. ``main()`` aborts on these unless
+      ``CASCADIA_ALLOW_LOSSY_EXPORT=1``.
+    - ``soft`` — features that are correct within the original context
+      window and only degrade beyond it (long-context RoPE scaling,
+      sliding-window attention). ``main()`` warns and proceeds, matching
+      the exporter's prior behaviour.
+
+    Features the exporter now fully supports are deliberately NOT flagged:
+    Gemma-2 softcapping (the gemma2 path applies attn + final softcap),
+    partial rotary (TracedRotaryEmbedding zero-pads inv_freq), and Qwen3
+    QK-norm (the qwen3 decoder layer applies it).
+    """
+    cfg = _text_config(config)
+    hard: list[str] = []
+    soft: list[str] = []
+
+    # MoE — last line of defence (is_moe_config should have caught it in main()
+    # first). Reuse it rather than re-scanning a hand-copied subset of expert
+    # fields, so the two can't drift (is_moe_config also covers nested
+    # ffn_config / num_experts_per_tok / known model_types).
+    if is_moe_config(cfg):
+        hard.append(
+            "config indicates a mixture-of-experts model; the exporter builds "
+            "dense layers and would treat layer.mlp as a single dense MLP "
+            "(garbage output)."
+        )
+
+    # Long-context RoPE scaling — correct within the original window; plain
+    # baked RoPE diverges beyond it. Same set the exporter warned on before.
+    rope_scaling = getattr(cfg, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rtype = (rope_scaling.get("rope_type") or rope_scaling.get("type") or "").lower()
+        if rtype in ("longrope", "su", "yarn"):
+            soft.append(
+                f"rope_scaling type {rtype!r} is not modeled (plain RoPE baked); "
+                "output will diverge from the HF reference beyond "
+                f"original_max_position_embeddings="
+                f"{rope_scaling.get('original_max_position_embeddings', '?')}."
+            )
+
+    # Softcap on a NON-gemma2 model. The gemma2 path applies both attention
+    # and final-logit softcap; any other family carrying softcap fields is one
+    # we don't honour, and the distribution is wrong even on short prompts.
+    if arch_tag != "gemma2":
+        attn_cap = getattr(cfg, "attn_logit_softcapping", None)
+        final_cap = getattr(cfg, "final_logit_softcapping", None)
+        if attn_cap or final_cap:
+            hard.append(
+                f"logit softcapping (attn={attn_cap}, final={final_cap}) on a "
+                f"non-Gemma-2 model (arch_tag={arch_tag!r}); the SDPA forward and "
+                "head stage do not apply it, so the distribution will be wrong."
+            )
+
+    # Mixed per-layer attention types (sliding/full) — correct within the
+    # sliding window, attends to too much context beyond it.
+    layer_types = getattr(cfg, "layer_types", None)
+    if isinstance(layer_types, list) and len(set(layer_types)) > 1:
+        sw = getattr(cfg, "sliding_window", "?")
+        soft.append(
+            f"mixed layer_types {sorted(set(layer_types))} (sliding_window={sw}); "
+            "the exporter treats every layer as full causal — sliding-window "
+            "layers attend to too much context beyond the window."
+        )
+
+    # Asymmetric head_dim (e.g. Gemma 4 global vs local) — the wrapper assumes
+    # one head_dim per stage and would fail to load the weights.
+    global_hd = getattr(cfg, "global_head_dim", None)
+    head_dim = getattr(cfg, "head_dim", None)
+    if global_hd is not None and head_dim is not None and global_hd != head_dim:
+        hard.append(
+            f"asymmetric head_dim (head_dim={head_dim}, global_head_dim={global_hd}); "
+            "the exporter assumes a single head_dim per stage and will fail to "
+            "load weights."
+        )
+
+    # Per-layer embeddings side channel (Gemma 4 E2B/E4B).
+    pli = getattr(cfg, "hidden_size_per_layer_input", 0) or 0
+    if isinstance(pli, int) and pli > 0:
+        hard.append(
+            f"hidden_size_per_layer_input={pli}: model uses per-layer embeddings "
+            "as a side channel, not wired through the exporter or transport."
+        )
+
+    # KV sharing across layers.
+    kv_shared = getattr(cfg, "num_kv_shared_layers", 0) or 0
+    if isinstance(kv_shared, int) and kv_shared > 0:
+        hard.append(
+            f"num_kv_shared_layers={kv_shared}: model reuses KV cache across "
+            "layers; the exporter allocates a fresh cache per layer."
+        )
+
+    # QK-norm outside the qwen3 path (the only one applying q_norm/k_norm
+    # before RoPE). Wrong attention for every token, not just long prompts.
+    if getattr(cfg, "use_qk_norm", False) and arch_tag != "qwen3":
+        hard.append(
+            f"use_qk_norm=True but arch_tag={arch_tag!r} (only the qwen3 path "
+            "applies q_norm/k_norm before RoPE); attention will be wrong."
+        )
+
+    return hard, soft
 
 
 def get_decoder_layer_cls(arch_tag: str):
@@ -282,14 +538,45 @@ def compute_stage_plan(num_layers: int, num_stages: int, layer_split: str | None
 
 
 class TracedRotaryEmbedding(nn.Module):
-    """RoPE from position_ids, traced into a graph OV's RoPEFusion can match."""
+    """RoPE from position_ids, traced into a graph OV's RoPEFusion can match.
 
-    def __init__(self, head_dim, rope_theta=500000.0):
+    Supports partial rotary: when ``partial_rotary_factor < 1.0`` (Phi-1/2,
+    StableLM-2, Persimmon, Phi-4-mini, …) only the leading
+    ``rotary_dim = int(partial_rotary_factor * head_dim)`` dims of each head
+    are rotated and the trailing ``head_dim - rotary_dim`` dims pass through.
+
+    cos/sin are emitted at width ``rotary_dim`` (NOT head_dim), and
+    ``apply_rotary`` rotates only the leading ``rotary_dim`` slice of each
+    head (``rotate_half`` splitting at ``rotary_dim/2``), concatenating the
+    untouched tail — exactly transformers' Phi/Phi3 ``apply_rotary_pos_emb``.
+    Verified against the APPLIED q/k (not just cos/sin) on transformers 4.57
+    and 5.9. An earlier approach that zero-padded inv_freq to head_dim width
+    and rotated the full head was WRONG: with one rotate_half split at
+    head_dim/2 it pairs each dim with the wrong partner for prf<1 and
+    corrupts ~all dims even though the cos/sin values matched HF.
+    """
+
+    def __init__(self, head_dim, rope_theta=500000.0, partial_rotary_factor=1.0):
         super().__init__()
         self.head_dim = head_dim
+        self.partial_rotary_factor = float(partial_rotary_factor)
+        if self.partial_rotary_factor >= 1.0:
+            rotary_dim = head_dim
+        else:
+            # HF rotates the leading int(head_dim * partial_rotary_factor) dims
+            # (Phi/Phi3 rotary_ndims). The inv_freq denominator is this same
+            # rotary_dim — using head_dim shifts every frequency.
+            rotary_dim = int(self.partial_rotary_factor * head_dim)
+        if rotary_dim <= 0 or rotary_dim % 2 != 0:
+            raise ValueError(
+                f"partial_rotary_factor={self.partial_rotary_factor} with "
+                f"head_dim={head_dim} gives rotary_dim={rotary_dim}; the number "
+                f"of rotated dims must be positive and even"
+            )
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (
             rope_theta
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -304,17 +591,34 @@ class TracedRotaryEmbedding(nn.Module):
 
 
 def apply_rotary(q, k, cos, sin):
+    """Apply RoPE to q/k. cos/sin width determines the rotary dim.
+
+    When cos spans the full head (rotary_dim == head_dim) the whole head is
+    rotated (unchanged from the original full-rotary path). When it is
+    narrower (partial rotary) only the leading ``rotary_dim`` dims rotate and
+    the tail is concatenated back untouched — matching HF Phi/Phi3.
+    """
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
-    half = q.shape[-1] // 2
+    rotary_dim = cos.shape[-1]
+    half = rotary_dim // 2
 
     def rotate_half(x):
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat((-x2, x1), dim=-1)
 
-    q_rot = (q * cos) + (rotate_half(q) * sin)
-    k_rot = (k * cos) + (rotate_half(k) * sin)
-    return q_rot, k_rot
+    # rotary_dim == head_dim is resolved at trace time, so full-rotary models
+    # trace the original whole-head path with no extra slice/concat ops.
+    if rotary_dim == q.shape[-1]:
+        q_rot = (q * cos) + (rotate_half(q) * sin)
+        k_rot = (k * cos) + (rotate_half(k) * sin)
+        return q_rot, k_rot
+
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -488,13 +792,21 @@ def arch_spec_from_config(config, arch_tag, head_dim) -> "ArchSpec":
 
 
 class _BaseStage(nn.Module):
-    def __init__(self, layers, num_heads, num_kv_heads, head_dim, rope_theta):
+    def __init__(
+        self,
+        layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor=1.0,
+    ):
         super().__init__()
         self.layers = nn.ModuleList(layers)
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.rotary = TracedRotaryEmbedding(head_dim, rope_theta)
+        self.rotary = TracedRotaryEmbedding(head_dim, rope_theta, partial_rotary_factor)
         # Per-architecture deviations; build_wrapper overrides for Gemma(-2).
         self.arch = ArchSpec()
 
@@ -555,9 +867,18 @@ class _BaseStage(nn.Module):
 
 class CachedEmbedStageWrapper(_BaseStage):
     def __init__(
-        self, embed_tokens, layers, num_heads, num_kv_heads, head_dim, rope_theta
+        self,
+        embed_tokens,
+        layers,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor=1.0,
     ):
-        super().__init__(layers, num_heads, num_kv_heads, head_dim, rope_theta)
+        super().__init__(
+            layers, num_heads, num_kv_heads, head_dim, rope_theta, partial_rotary_factor
+        )
         self.embed_tokens = embed_tokens
 
     def forward(self, input_ids, attention_mask, position_ids, *past_kv):
@@ -578,9 +899,19 @@ class CachedMiddleStageWrapper(_BaseStage):
 
 class CachedHeadStageWrapper(_BaseStage):
     def __init__(
-        self, layers, norm, lm_head, num_heads, num_kv_heads, head_dim, rope_theta
+        self,
+        layers,
+        norm,
+        lm_head,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        rope_theta,
+        partial_rotary_factor=1.0,
     ):
-        super().__init__(layers, num_heads, num_kv_heads, head_dim, rope_theta)
+        super().__init__(
+            layers, num_heads, num_kv_heads, head_dim, rope_theta, partial_rotary_factor
+        )
         self.norm = norm
         self.lm_head = lm_head
 
@@ -604,8 +935,11 @@ class CachedFullStageWrapper(_BaseStage):
         num_kv_heads,
         head_dim,
         rope_theta,
+        partial_rotary_factor=1.0,
     ):
-        super().__init__(layers, num_heads, num_kv_heads, head_dim, rope_theta)
+        super().__init__(
+            layers, num_heads, num_kv_heads, head_dim, rope_theta, partial_rotary_factor
+        )
         self.embed_tokens = embed_tokens
         self.norm = norm
         self.lm_head = lm_head
@@ -702,6 +1036,7 @@ def build_wrapper(
     has_head,
     rope_theta,
     arch_tag,
+    partial_rotary_factor=1.0,
 ):
     """Construct the appropriate stage wrapper for this rank."""
     DecoderLayer = get_decoder_layer_cls(arch_tag)
@@ -760,13 +1095,15 @@ def build_wrapper(
             num_kv_heads,
             head_dim,
             rope_theta,
+            partial_rotary_factor,
         )
     if has_embed:
         embed = nn.Embedding(config.vocab_size, config.hidden_size)
         embed.load_state_dict({"weight": state_dict["model.embed_tokens.weight"]})
         del state_dict["model.embed_tokens.weight"]
         return CachedEmbedStageWrapper(
-            embed, layers, num_heads, num_kv_heads, head_dim, rope_theta
+            embed, layers, num_heads, num_kv_heads, head_dim, rope_theta,
+            partial_rotary_factor,
         )
     if has_head:
         norm = NormCls(config.hidden_size, eps=rms_eps)
@@ -793,10 +1130,11 @@ def build_wrapper(
                 " — tied_embeddings detection failed?"
             )
         return CachedHeadStageWrapper(
-            layers, norm, lm_head, num_heads, num_kv_heads, head_dim, rope_theta
+            layers, norm, lm_head, num_heads, num_kv_heads, head_dim, rope_theta,
+            partial_rotary_factor,
         )
     return CachedMiddleStageWrapper(
-        layers, num_heads, num_kv_heads, head_dim, rope_theta
+        layers, num_heads, num_kv_heads, head_dim, rope_theta, partial_rotary_factor
     )
 
 
@@ -889,6 +1227,7 @@ def make_stateful_with_init(ov_model, add_reorder=True):
 
 def export_single_stage(
     model_dir, output_dir, stage_plan, config, quantization, rope_theta, arch_tag,
+    partial_rotary_factor=1.0,
     cache_reorder=True,
     target="cpu-gpu", static_seq=1, static_context=1024,
 ):
@@ -933,6 +1272,7 @@ def export_single_stage(
         has_head,
         rope_theta,
         arch_tag,
+        partial_rotary_factor,
     )
     # Attach per-architecture export deviations (Gemma embed scale, Gemma-2
     # softcapping / 4-norm structure — #61). Default ArchSpec is a no-op for
@@ -1150,6 +1490,7 @@ def export_single_stage(
         "head_dim": head_dim,
         "stateful": not npu,
         "rope_theta": rope_theta,
+        "partial_rotary_factor": partial_rotary_factor,
         "arch_tag": arch_tag,
         "target": target,
         "static_seq": static_seq if npu else None,
@@ -1173,6 +1514,32 @@ def export_single_stage(
 # ---------------------------------------------------------------------------
 # Top-level export pipeline
 # ---------------------------------------------------------------------------
+
+
+def fetch_config_json(model_id_or_path: str) -> str:
+    """Return a local path to config.json for ``model_id_or_path``.
+
+    For a local directory, point at the file. For an HF repo id, download
+    ONLY config.json (a few KB) without the tokenizer or safetensors. Used
+    by the fallback rejection path so a multi-GB model isn't pulled before
+    detect_architecture can reject a model_type transformers can't parse.
+    """
+    if os.path.isdir(model_id_or_path):
+        path = os.path.join(model_id_or_path, "config.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{model_id_or_path} is a directory but has no config.json"
+            )
+        return path
+    from huggingface_hub import hf_hub_download
+
+    cache_root = os.path.expanduser("~/.cache/cascadia/models")
+    safe_id = model_id_or_path.replace("/", "--")
+    local_dir = os.path.join(cache_root, safe_id)
+    os.makedirs(local_dir, exist_ok=True)
+    return hf_hub_download(
+        repo_id=model_id_or_path, filename="config.json", local_dir=local_dir
+    )
 
 
 def maybe_download(model_id_or_path: str) -> str:
@@ -1301,6 +1668,14 @@ def main():
         default=1024,
         help="NPU only: fixed total context; past-KV length = context - seq.",
     )
+    parser.add_argument(
+        "--partial-rotary-factor",
+        type=float,
+        default=None,
+        help="Override partial_rotary_factor (default: read from "
+        "config.partial_rotary_factor, else 1.0). Values < 1.0 rotate only "
+        "the leading fraction of each head's dims (Phi-1/2, StableLM-2).",
+    )
     args = parser.parse_args()
 
     # The NPU runtime decodes one token per step and derives past-KV length as
@@ -1336,40 +1711,102 @@ def main():
 
     from transformers import AutoConfig
 
+    moe_msg = (
+        f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
+        f"cascadia exporter does not support (#60). It builds dense decoder "
+        f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
+        f"implemented, and falling back to a dense layer would silently emit "
+        f"garbage. Aborting rather than producing a broken shard."
+    )
+
     # Read the config FIRST (cheap — just config.json, no weights) so we can
     # reject unsupported models before downloading tens-to-hundreds of GB.
     # AutoConfig.from_pretrained works on an HF id (fetches only config.json)
     # or a local dir.
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    try:
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    except ValueError as exc:
+        # transformers raises ValueError on model_types it can't parse (e.g. a
+        # gemma4 on an older transformers). Read the raw config.json so we can
+        # emit OUR specific rejection instead of an opaque transformers error.
+        try:
+            with open(fetch_config_json(args.model)) as f:
+                raw_ns = _RawConfigNS(json.load(f))
+        except Exception:
+            # Can't even read config.json — the original parse error is the
+            # most useful thing to surface.
+            raise exc
+        if is_moe_config(raw_ns):
+            sys.exit(moe_msg)
+        try:
+            detect_architecture(raw_ns)
+        except UnsupportedModelError as ue:
+            _print_unsupported(ue)
+            # CASCADIA_ALLOW_LOSSY_EXPORT cannot rescue this: building the model
+            # needs a transformers config class it does not have. Always stop.
+            sys.exit(2)
+        # Recognised as a supported family, but transformers itself cannot
+        # build this config (too old) — we cannot construct the layers without
+        # it. Surface a clear, actionable error, not the raw ValueError.
+        sys.exit(
+            f"ERROR: {args.model} looks like a supported family, but the "
+            f"installed transformers cannot parse its config (unknown "
+            f"model_type). Upgrade transformers and retry.\n"
+            f"  (original error: {exc})"
+        )
+
     if is_moe_config(config):
-        sys.exit(
-            f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
-            f"cascadia exporter does not support (#60). It builds dense decoder "
-            f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
-            f"implemented, and falling back to a dense layer would silently emit "
-            f"garbage. Aborting rather than producing a broken shard."
+        sys.exit(moe_msg)
+
+    try:
+        arch_tag = detect_architecture(config)
+    except UnsupportedModelError as exc:
+        _print_unsupported(exc)
+        if not os.environ.get("CASCADIA_ALLOW_LOSSY_EXPORT"):
+            sys.exit(2)
+        print(
+            "  CASCADIA_ALLOW_LOSSY_EXPORT=1 set — proceeding via Llama fallback.",
+            flush=True,
         )
-    # The traced RoPE rotates the FULL head_dim with plain inv_freq. Reject
-    # models needing partial rotary (rotating only a head_dim slice, e.g.
-    # phi-2) — they would silently emit garbage. Long-context rope_scaling
-    # (llama3/yarn/longrope) is identity-ish within the original context, so
-    # short generations match; warn rather than reject those.
-    prf = getattr(config, "partial_rotary_factor", None)
-    if isinstance(prf, (int, float)) and prf < 1.0:
-        sys.exit(
-            f"ERROR: {args.model} uses partial rotary (partial_rotary_factor={prf}); the "
-            f"exporter applies RoPE to the full head_dim and would emit garbage. Not supported."
+        arch_tag = "llama"
+
+    # Pre-export quirk gate: features the arch tag alone misses. SOFT quirks
+    # (long-context RoPE scaling, sliding window) are correct within the
+    # original context window and only degrade beyond it — warn and proceed,
+    # as the exporter did before. HARD quirks (MoE that slipped past,
+    # asymmetric head_dim, per-layer embeddings, KV sharing, QK-norm off the
+    # qwen3 path, non-Gemma-2 softcap) corrupt even short prompts — abort
+    # unless CASCADIA_ALLOW_LOSSY_EXPORT=1.
+    hard, soft = check_export_quirks(config, arch_tag)
+    for w in soft:
+        print(
+            f"  WARNING: {w} (correct within the original context window)",
+            flush=True,
         )
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if isinstance(rope_scaling, dict):
-        rtype = (rope_scaling.get("rope_type") or rope_scaling.get("type") or "").lower()
-        if rtype in ("longrope", "su", "yarn"):
+    if hard:
+        print("", flush=True)
+        print("=" * 60, flush=True)
+        print("EXPORT WOULD DROP UNSUPPORTED FEATURES:", flush=True)
+        print("=" * 60, flush=True)
+        for w in hard:
+            print(f"  - {w}", flush=True)
+        if not os.environ.get("CASCADIA_ALLOW_LOSSY_EXPORT"):
             print(
-                f"  WARNING: rope_scaling type {rtype!r} is not modeled (plain RoPE baked); "
-                f"output will diverge from reference beyond the original context length.",
+                "\nSet CASCADIA_ALLOW_LOSSY_EXPORT=1 to export anyway "
+                "(output WILL diverge from the HF reference). See docs/SHARDING.md.",
                 flush=True,
             )
-    arch_tag = detect_architecture(config)
+            sys.exit(2)
+        print("  CASCADIA_ALLOW_LOSSY_EXPORT=1 set — proceeding.", flush=True)
+
+    # Detection + the quirk gate above inspect both the wrapper and its inner
+    # text_config. From here on we read per-stage fields (layer count, dims,
+    # rope_theta, partial_rotary_factor) and build the wrapper, so collapse to
+    # the text tower once: for a multimodal wrapper (e.g. Mistral 3.x) those
+    # fields live under config.text_config, not the wrapper. For a plain
+    # decoder-only config _text_config is the identity, so this is a no-op.
+    config = _text_config(config)
+
     # Accepted — now fetch the weights.
     model_dir = maybe_download(args.model)
     # transformers 4.x exposes rope_theta directly; 5.x moved it under
@@ -1384,12 +1821,35 @@ def main():
         rope_theta_raw = 500000.0
     rope_theta = float(rope_theta_raw)
 
+    # Partial rotary (Phi-1/2, StableLM-2, Persimmon, Phi-4-mini, …): rotate
+    # only the leading partial_rotary_factor * head_dim dims of each head; the
+    # rest pass through. Default 1.0 (full rotary). NB: read without `or 1.0`
+    # so a genuine 0.0 (NoPE) is preserved — TracedRotaryEmbedding then rejects
+    # it (rotary_dim=0) rather than silently exporting full rotary.
+    prf_raw = getattr(config, "partial_rotary_factor", None)
+    partial_rotary_factor = 1.0 if prf_raw is None else float(prf_raw)
+    if args.partial_rotary_factor is not None:
+        print(
+            f"  partial_rotary_factor override: {partial_rotary_factor} "
+            f"-> {args.partial_rotary_factor}",
+            flush=True,
+        )
+        partial_rotary_factor = float(args.partial_rotary_factor)
+    if partial_rotary_factor != 1.0:
+        print(
+            f"  partial_rotary_factor={partial_rotary_factor}: rotating the "
+            f"leading {partial_rotary_factor * 100:.0f}% of each head's dims; "
+            "trailing dims pass through.",
+            flush=True,
+        )
+
     print(
         f"\nModel: {config.num_hidden_layers} layers,"
         f" hidden={config.hidden_size},"
         f" kv_heads={getattr(config, 'num_key_value_heads', config.num_attention_heads)},"
         f" rope_theta={rope_theta},"
-        f" arch={arch_tag}",
+        f" arch={arch_tag},"
+        f" partial_rotary_factor={partial_rotary_factor}",
         flush=True,
     )
 
@@ -1422,6 +1882,7 @@ def main():
         ),
         "vocab_size": config.vocab_size,
         "rope_theta": rope_theta,
+        "partial_rotary_factor": partial_rotary_factor,
         "arch_tag": arch_tag,
         "quantization": args.quantization,
         "export_version": "v5_canonical_inputs",
@@ -1441,6 +1902,7 @@ def main():
             args.quantization,
             rope_theta,
             arch_tag,
+            partial_rotary_factor=partial_rotary_factor,
             target=args.target,
             static_seq=args.static_seq,
             static_context=args.static_context,
