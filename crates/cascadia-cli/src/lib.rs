@@ -24,9 +24,11 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod placement;
 pub mod profile;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
+use placement::{cmd_place, PlaceArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
 
 #[derive(Parser, Debug)]
@@ -74,6 +76,10 @@ pub enum Command {
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
     /// {iGPU, NPU, CPU} ILP placement).
     ProfileDevices(ProfileDevicesArgs),
+    /// Solve three-tier {iGPU, NPU, CPU} placement from a per-stage cost
+    /// profile and write `placement.json`. Step 2 of issue #41 — the ILP
+    /// over `profile-devices --per-stage` output.
+    Place(PlaceArgs),
     /// Generate a shell completion script (bash, zsh, fish, …). See
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
@@ -424,6 +430,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
         Command::ProfileDevices(args) => cmd_profile_devices(args),
+        Command::Place(args) => cmd_place(args),
         Command::Completions(args) => cmd_completions(args),
     }
 }
