@@ -77,10 +77,53 @@ cascadia worker --engine sparse-moe --model /path/to/m2_export --device CPU
 ```
 
 The builder reads `manifest.json`; `shell_backend: "ov_ir"` automatically
-selects the M2 engine (no extra flag). Generation is greedy in v1
-(sampling config is ignored). Bound expert RAM with
-`--max-cached-experts N` / `CASCADIA_MAX_EXPERTS_CACHED` so experts stream
-from disk rather than all staying resident.
+selects the M2 engine (no extra flag). Generation honors the request's
+sampling config (temperature / top-p / repetition penalty); with the
+defaults it is greedy. Bound expert RAM with `--max-cached-experts N` /
+`CASCADIA_MAX_EXPERTS_CACHED` so experts stream rather than all staying
+resident.
+
+## Expert backends: OV-IR vs int4_bin
+
+Experts can run two ways (manifest `experts_format`, exporter `--experts`):
+
+- **`ov_ir`** — one compiled OpenVINO model per expert. Simple; pays the
+  OV CPU-plugin per-call overhead (and a large cold-start compiling the
+  touched experts).
+- **`int4_bin`** — flat int4-packed expert binaries (group-size 32,
+  compressed-tensors layout) fed to the `cascadia-int4-gemm` AVX-512
+  kernel. No per-call OV overhead, no compilation. Convention validated by
+  the Rust unit test `int4_bin_expert_matches_fp32_within_tolerance` and a
+  Python packer round-trip.
+
+Measured on the miner (Xeon Gold 6252, full 230B M2, 24 tokens, identical
+fp32 shells; warm = steady-state, excluding cold first-step):
+
+| Expert backend | warm tok/s | first decode-step |
+| --- | --- | --- |
+| ov_ir   | ~0.063 | ~18–23 s |
+| int4_bin | **~0.21** | **~6–7 s** |
+
+≈ **3.2× faster warm** and ≈3.5× faster first token, at equal output
+quality. int4_bin is the recommended backend; `ov_ir` is the simpler
+fallback / reference.
+
+## Output quality
+
+The full INT4 model recalls facts correctly ("The capital of France is
+Paris. The capital of the United States is Washington…") but degrades into
+incoherent (often multilingual) tokens after ~12–14 tokens. Findings from
+the comparison runs:
+
+- **Repetition penalty** (`repetition_penalty` 1.3, window 64) removes the
+  literal `capital capital both both` loops greedy falls into.
+- **Precise routing** (`--shell-quant none --head-quant none`, keeping the
+  router gate + lm_head full-precision as M2 itself does) extends coherent
+  output from one fact to two, but does not fix the deeper degradation.
+- The residual incoherence is dominated by the **int4 experts** (the bulk
+  of the model at ~4 bits). Restoring sustained coherence needs
+  higher-precision experts (int8) or calibrated quant (AWQ/GPTQ-style) —
+  future work; int8 experts ≈ 230 GB, beyond the current test disk.
 
 ## Tests
 
