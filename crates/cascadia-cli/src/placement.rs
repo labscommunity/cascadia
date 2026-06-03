@@ -160,9 +160,11 @@ pub fn solve(profile: &PlacementProfile) -> std::result::Result<Placement, Place
         let mut opts: Vec<(usize, f64)> = Vec::new();
         for (di, dev) in devices.iter().enumerate() {
             if let Some(&lat) = st.lat_ms.get(&dev.device) {
-                // A device can only hold the stage if its *total* budget
-                // covers it; otherwise it is not an option at all.
-                if dev.mem_bytes >= st.mem_bytes {
+                // Skip non-finite latencies (NaN/±inf): a NaN would poison the
+                // sort/prune and could be chosen with a NaN total; treat it as
+                // "not a usable option" (a hand-built profile, or a future
+                // producer using +inf as a soft op-support marker).
+                if lat.is_finite() && dev.mem_bytes >= st.mem_bytes {
                     opts.push((di, lat));
                 }
             }
@@ -373,10 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn gpu_cap_forces_overflow_to_npu_before_cpu() {
+    fn gpu_cap_forces_overflow_to_cheaper_feasible_tier() {
         // GPU holds only 2 of the 4 stages (2 GiB cap, 1 GiB each); the
-        // remaining 2 must overflow. NPU is cheaper than CPU, so the overflow
-        // lands on NPU (which has room for both), not CPU.
+        // remaining 2 overflow to the *cheaper* feasible tier. Here the
+        // synthetic latencies make NPU (1.4) cheaper than CPU (3.0), so the
+        // solver picks NPU — the data-driven mechanic. (On real Lunar Lake
+        // hardware CPU < NPU for decode, so the same mechanic overflows to CPU
+        // — see docs/perf/THREE_TIER_PLACEMENT.md.)
         let profile = profile(
             "spill",
             three_tier(2, 8, 16),
@@ -390,6 +395,48 @@ mod tests {
         assert_eq!(p.per_device_mem.get("CPU"), None);
         // 2×GPU(1.0) + 2×NPU(1.4) = 4.8
         assert!((p.total_lat_ms - 4.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prefers_earlier_listed_device_on_a_latency_tie() {
+        // All devices equally fast + everything fits → the solver must pick the
+        // earliest-listed (most-preferred) device for every stage. Locks in the
+        // tie-break (the `.then(a.0.cmp(&b.0))` sort + `>=` prune).
+        let profile = profile(
+            "tie",
+            three_tier(16, 16, 16),
+            (0..3)
+                .map(|i| stage(i, 1, &[("GPU", 2.0), ("NPU", 2.0), ("CPU", 2.0)]))
+                .collect(),
+        );
+        let p = solve(&profile).unwrap();
+        assert_eq!(p.assignment, vec!["GPU", "GPU", "GPU"]);
+    }
+
+    #[test]
+    fn single_device_places_everything_there() {
+        let profile = profile(
+            "solo",
+            vec![dev("CPU", 16)],
+            (0..3).map(|i| stage(i, 1, &[("CPU", 5.0)])).collect(),
+        );
+        let p = solve(&profile).unwrap();
+        assert_eq!(p.assignment, vec!["CPU", "CPU", "CPU"]);
+        assert!((p.total_lat_ms - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_finite_latency_is_not_chosen() {
+        // A NaN/inf latency must be ignored (not selected, not NaN-poisoning the
+        // total). Here GPU is NaN, so the stage lands on CPU.
+        let profile = profile(
+            "nan",
+            three_tier(16, 16, 16),
+            vec![stage(0, 1, &[("GPU", f64::NAN), ("CPU", 4.0)])],
+        );
+        let p = solve(&profile).unwrap();
+        assert_eq!(p.assignment, vec!["CPU"]);
+        assert!((p.total_lat_ms - 4.0).abs() < 1e-9);
     }
 
     #[test]
