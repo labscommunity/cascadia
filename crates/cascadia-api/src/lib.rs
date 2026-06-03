@@ -374,6 +374,28 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
     render_prompt_legacy(messages)
 }
 
+/// Render `messages` through the model's chat template, falling back to
+/// [`render_prompt_legacy`] when no template is configured or rendering
+/// fails. Public, `AppState`-free counterpart to [`render_prompt`] for
+/// in-process callers that hold a [`ChatTemplateConfig`] from
+/// [`load_chat_template_config`].
+pub fn render_chat_prompt(cfg: &ChatTemplateConfig, messages: &[ChatMessage]) -> String {
+    if let Some(tmpl) = &cfg.template {
+        match render_prompt_with_template(
+            tmpl,
+            messages,
+            cfg.bos_token.as_deref().unwrap_or_default(),
+            cfg.eos_token.as_deref().unwrap_or_default(),
+        ) {
+            Ok(s) => return s,
+            Err(e) => {
+                warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+            }
+        }
+    }
+    render_prompt_legacy(messages)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
