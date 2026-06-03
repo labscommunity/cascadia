@@ -53,6 +53,14 @@ pub struct PlacementProfile {
     pub model: String,
     pub devices: Vec<DeviceCap>,
     pub stages: Vec<StageCost>,
+    /// Usable shared-memory pool in bytes — the **UMA** total (system RAM
+    /// minus headroom). On Intel AI PCs the iGPU/NPU/CPU "device budgets"
+    /// above are addressing limits over ONE physical pool, so a placement
+    /// that satisfies every per-device cap can still exceed physical memory.
+    /// When set, the total resident memory of all stages must fit here.
+    /// `None` (the default, and for non-UMA topologies) skips the global gate.
+    #[serde(default)]
+    pub pool_bytes: Option<u64>,
 }
 
 /// The solver output.
@@ -79,6 +87,9 @@ pub enum PlacementError {
     /// Every stage is individually placeable, but no assignment fits all of
     /// them within the per-device memory budgets simultaneously.
     Infeasible,
+    /// The model's total resident memory exceeds the shared UMA pool — no
+    /// placement across any mix of tiers can hold it on this host.
+    ExceedsPool { needed_bytes: u64, pool_bytes: u64 },
 }
 
 impl std::fmt::Display for PlacementError {
@@ -95,6 +106,16 @@ impl std::fmt::Display for PlacementError {
                 "no assignment fits all stages within the device memory budgets \
                  (total model memory exceeds total device capacity)"
             ),
+            PlacementError::ExceedsPool {
+                needed_bytes,
+                pool_bytes,
+            } => write!(
+                f,
+                "model needs {:.1} GiB resident but the shared UMA pool is only \
+                 {:.1} GiB — too big for this host on any tier mix",
+                *needed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                *pool_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            ),
         }
     }
 }
@@ -110,6 +131,20 @@ pub fn solve(profile: &PlacementProfile) -> std::result::Result<Placement, Place
         return Err(PlacementError::Empty);
     }
     let devices = &profile.devices;
+
+    // Global UMA gate. Total resident memory is assignment-independent — every
+    // stage is placed exactly once and consumes its bytes from the one shared
+    // pool no matter which tier — so a pool overflow can't be fixed by any
+    // tier mix. Reject up front (and before the per-device search).
+    if let Some(pool) = profile.pool_bytes {
+        let needed: u64 = profile.stages.iter().map(|s| s.mem_bytes).sum();
+        if needed > pool {
+            return Err(PlacementError::ExceedsPool {
+                needed_bytes: needed,
+                pool_bytes: pool,
+            });
+        }
+    }
 
     // Per stage: the feasible (device_index, latency) options, sorted by
     // (latency, device_index) so the DFS explores the cheapest — and, on a
@@ -304,16 +339,26 @@ mod tests {
         vec![dev("GPU", gpu_gb), dev("NPU", npu_gb), dev("CPU", cpu_gb)]
     }
 
+    /// A profile with no global pool gate (per-device caps only).
+    fn profile(model: &str, devices: Vec<DeviceCap>, stages: Vec<StageCost>) -> PlacementProfile {
+        PlacementProfile {
+            model: model.into(),
+            devices,
+            stages,
+            pool_bytes: None,
+        }
+    }
+
     #[test]
     fn fitting_model_goes_all_gpu() {
         // 4 equal stages, GPU fastest for all, everything fits → all GPU.
-        let profile = PlacementProfile {
-            model: "fits".into(),
-            devices: three_tier(16, 8, 16),
-            stages: (0..4)
+        let profile = profile(
+            "fits",
+            three_tier(16, 8, 16),
+            (0..4)
                 .map(|i| stage(i, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]))
                 .collect(),
-        };
+        );
         let p = solve(&profile).unwrap();
         assert_eq!(p.assignment, vec!["GPU", "GPU", "GPU", "GPU"]);
         assert!((p.total_lat_ms - 4.0).abs() < 1e-9);
@@ -325,13 +370,13 @@ mod tests {
         // GPU holds only 2 of the 4 stages (2 GiB cap, 1 GiB each); the
         // remaining 2 must overflow. NPU is cheaper than CPU, so the overflow
         // lands on NPU (which has room for both), not CPU.
-        let profile = PlacementProfile {
-            model: "spill".into(),
-            devices: three_tier(2, 8, 16),
-            stages: (0..4)
+        let profile = profile(
+            "spill",
+            three_tier(2, 8, 16),
+            (0..4)
                 .map(|i| stage(i, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]))
                 .collect(),
-        };
+        );
         let p = solve(&profile).unwrap();
         assert_eq!(p.per_device_mem.get("GPU"), Some(&(2 * GB)));
         assert_eq!(p.per_device_mem.get("NPU"), Some(&(2 * GB)));
@@ -344,15 +389,15 @@ mod tests {
     fn op_support_gate_excludes_device() {
         // Stage 1 can't run on GPU (e.g. NPU-only attention shape). It must go
         // to NPU/CPU even though GPU has room and would be faster.
-        let profile = PlacementProfile {
-            model: "gate".into(),
-            devices: three_tier(16, 8, 16),
-            stages: vec![
+        let profile = profile(
+            "gate",
+            three_tier(16, 8, 16),
+            vec![
                 stage(0, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]),
                 stage(1, 1, &[("NPU", 1.4), ("CPU", 3.0)]), // no GPU
                 stage(2, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]),
             ],
-        };
+        );
         let p = solve(&profile).unwrap();
         assert_eq!(p.assignment[0], "GPU");
         assert_eq!(p.assignment[1], "NPU"); // cheapest feasible for the gated stage
@@ -362,44 +407,40 @@ mod tests {
     #[test]
     fn infeasible_when_total_memory_exceeds_total_capacity() {
         // 10 GiB of stages, 6 GiB total capacity across all devices.
-        let profile = PlacementProfile {
-            model: "too-big".into(),
-            devices: three_tier(2, 2, 2),
-            stages: (0..10)
+        let profile = profile(
+            "too-big",
+            three_tier(2, 2, 2),
+            (0..10)
                 .map(|i| stage(i, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]))
                 .collect(),
-        };
+        );
         assert_eq!(solve(&profile), Err(PlacementError::Infeasible));
     }
 
     #[test]
     fn unplaceable_stage_when_no_device_supports_it() {
-        let profile = PlacementProfile {
-            model: "no-device".into(),
-            devices: three_tier(16, 8, 16),
-            stages: vec![stage(0, 1, &[])], // supported nowhere
-        };
+        let profile = profile(
+            "no-device",
+            three_tier(16, 8, 16),
+            vec![stage(0, 1, &[])], // supported nowhere
+        );
         assert_eq!(solve(&profile), Err(PlacementError::UnplaceableStage(0)));
     }
 
     #[test]
     fn unplaceable_stage_when_it_exceeds_every_budget() {
         // A 4 GiB stage, but no device has 4 GiB.
-        let profile = PlacementProfile {
-            model: "stage-too-big".into(),
-            devices: three_tier(2, 2, 3),
-            stages: vec![stage(0, 4, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)])],
-        };
+        let profile = profile(
+            "stage-too-big",
+            three_tier(2, 2, 3),
+            vec![stage(0, 4, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)])],
+        );
         assert_eq!(solve(&profile), Err(PlacementError::UnplaceableStage(0)));
     }
 
     #[test]
     fn empty_profile_is_an_error() {
-        let profile = PlacementProfile {
-            model: "empty".into(),
-            devices: three_tier(16, 8, 16),
-            stages: vec![],
-        };
+        let profile = profile("empty", three_tier(16, 8, 16), vec![]);
         assert_eq!(solve(&profile), Err(PlacementError::Empty));
     }
 
@@ -410,18 +451,46 @@ mod tests {
         // stages. Stage 2 benefits most from GPU (huge CPU penalty), so the
         // optimum keeps GPU for stages 1 and 2 and pushes stage 0 (which is
         // cheap everywhere) to NPU.
-        let profile = PlacementProfile {
-            model: "global".into(),
-            devices: three_tier(2, 8, 16),
-            stages: vec![
+        let profile = profile(
+            "global",
+            three_tier(2, 8, 16),
+            vec![
                 stage(0, 1, &[("GPU", 1.0), ("NPU", 1.1), ("CPU", 1.2)]), // cheap anywhere
                 stage(1, 1, &[("GPU", 1.0), ("NPU", 5.0), ("CPU", 9.0)]),
                 stage(2, 1, &[("GPU", 1.0), ("NPU", 5.0), ("CPU", 9.0)]),
             ],
-        };
+        );
         let p = solve(&profile).unwrap();
         assert_eq!(p.assignment, vec!["NPU", "GPU", "GPU"]);
         // 1.1 + 1.0 + 1.0 = 3.1  (vs greedy 1.0+1.0+5.0 = 7.0)
         assert!((p.total_lat_ms - 3.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exceeds_uma_pool_is_rejected_even_when_per_device_caps_allow() {
+        // Per-device caps (16+16 = 32 GiB) would accept this 20 GiB model, but
+        // the shared UMA pool is only 12 GiB → no tier mix can hold it.
+        let mut prof = profile(
+            "pool",
+            three_tier(16, 16, 16),
+            (0..20)
+                .map(|i| stage(i, 1, &[("GPU", 1.0), ("NPU", 1.4), ("CPU", 3.0)]))
+                .collect(),
+        );
+        prof.pool_bytes = Some(12 * GB);
+        assert_eq!(
+            solve(&prof),
+            Err(PlacementError::ExceedsPool {
+                needed_bytes: 20 * GB,
+                pool_bytes: 12 * GB,
+            })
+        );
+        // With a 24 GiB pool the same model places fine (still memory-forced
+        // off the 16 GiB GPU onto the NPU).
+        prof.pool_bytes = Some(24 * GB);
+        let p = solve(&prof).unwrap();
+        assert_eq!(p.assignment.len(), 20);
+        assert_eq!(p.per_device_mem.get("GPU"), Some(&(16 * GB)));
+        assert_eq!(p.per_device_mem.get("NPU"), Some(&(4 * GB)));
     }
 }

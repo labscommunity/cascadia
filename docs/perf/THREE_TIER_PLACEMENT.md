@@ -29,7 +29,7 @@ runtime. The conclusion that drives the design:
 | Tier | OV name | int8 TOPS | fp16 TFLOPS | Memory budget | Streams |
 |---|---|---|---|---|---|
 | iGPU | Arc 140V | **63.9** | 31.9 | **16.48 GB** (`GPU_DEVICE_TOTAL_MEM_SIZE`) | 1–2 |
-| NPU | AI Boost (arch 4000) | **46.7** | 23.3 | `NPU_DEVICE_TOTAL_MEM_SIZE` (queryable) | 1–4 |
+| NPU | AI Boost (arch 4000) | **46.7** | 23.3 | **16.0 GB** (`NPU_DEVICE_TOTAL_MEM_SIZE`) | 1–4 |
 | CPU | Ultra 7 258V | — | — | system RAM (31.6 GB shared) | 1–8 |
 
 Key facts:
@@ -41,6 +41,16 @@ Key facts:
   model whose int4 weights exceed ~16 GB (≈ 32B params) **cannot load on
   the iGPU alone** → memory-forced. (Confirmed empirically in the bench
   below.)
+- **UMA: the per-device caps overlap — they all draw from ONE 31.6 GB
+  pool.** The iGPU and NPU each *report* ~16 GB, but that is an
+  addressing limit, not private memory; placing 16 GB on the iGPU **and**
+  16 GB on the NPU would need 32 GB > 31.6 GB physical and OOM. So the ILP
+  needs **two** memory constraints: a per-device cap (`≤ cap[d]`, the
+  addressing limit) **and** a global cap (`Σ over all stages ≤ usable
+  system RAM`, the shared pool). A model that forces multi-device on
+  Lunar Lake therefore lives in a narrow band: int4 weights in
+  `(16.5 GB, ~28 GB]` — bigger than the iGPU can address, small enough to
+  fit the pool. ≈ 32B–48B int4.
 - `MAX_BATCH_SIZE = 1`, `OPTIMAL_BATCH_SIZE = 1` on the iGPU; the runtime
   has no cross-request pipelining today (see "Why not throughput").
 - NPU has **no bf16** (`DEVICE_GOPS[bf16]=0`); its path is int4/int8
@@ -72,9 +82,18 @@ Decision: `x[s][d] ∈ {0,1}`, each stage on exactly one device.
 ```
 minimize    Σ_s Σ_d  lat[s][d] · x[s][d]        (+ transport between tiers)
 subject to  Σ_d x[s][d] = 1                       ∀ stage s
-            Σ_s mem[s] · x[s][d] ≤ cap[d]          ∀ device d
+            Σ_s mem[s] · x[s][d] ≤ cap[d]          ∀ device d   (addressing limit)
+            Σ_s mem[s]            ≤ pool                        (shared UMA pool)
             x[s][d] = 0  where lat[s][d] = +∞      (op-support gate)
 ```
+
+The `pool` constraint is what makes this a UMA problem rather than N
+independent devices: the cheapest-latency assignment that satisfies the
+per-device caps can still exceed the physical 31.6 GB, so the solver
+rejects any model whose total resident memory exceeds usable system RAM.
+*(Status: the v1 solver in `placement.rs` enforces the per-device caps +
+op-support gate; the `pool` constraint is the first refinement landing
+next, with the per-stage profiler.)*
 
 Problem size is tiny (stages ≤ ~16, devices = 3), so we solve it
 **exactly in pure Rust** (no `good_lp`/CBC system dependency — keeps the
