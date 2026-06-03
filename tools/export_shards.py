@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """cascadia standalone model exporter.
 
-Takes a HuggingFace model (Llama, Mistral, Qwen2, or any decoder-only LLM
-that follows the same conventions) and produces a cascadia shard directory:
+Takes a HuggingFace dense decoder-only model (Llama, Mistral, Qwen2/3, Phi-3,
+Gemma 1/2 — see the architecture-support note below; mixture-of-experts models
+are detected and rejected) and produces a cascadia shard directory:
 
     shards/
       pipeline_config.json
@@ -27,18 +28,24 @@ for users who want fine-grained control:
 
 Architecture support: The script uses HuggingFace's AutoModelForCausalLM
 to load layers, so any model whose decoder layers expose the standard
-attribute names (`self_attn.{q_proj,k_proj,v_proj,o_proj}`,
-`mlp`, `input_layernorm`, `post_attention_layernorm`) and uses RoPE
-rotary will work. This covers:
-  - Llama 1/2/3/3.1/3.2 family
-  - Mistral 7B / Mixtral (single-expert per shard only)
-  - Qwen2 / Qwen2.5
-  - Some Phi-3 variants (those with standard attention)
-  - DeepSeek-V2-Lite
+attribute names (`self_attn.{q_proj,k_proj,v_proj,o_proj}` or a fused
+`qkv_proj`, `mlp`, `input_layernorm`, `post_attention_layernorm`) and uses
+RoPE rotary will work. This covers:
+  - Llama 1/2/3/3.1/3.2 family (+ Llama-arch models like deepseek-llm)
+  - Mistral 7B
+  - Qwen2 / Qwen2.5 / Qwen3
+  - Phi-3 (fused qkv_proj — #58)
+  - Gemma 1 (scaled embeddings) and Gemma-2 (+ attention/final-logit
+    softcapping + the 4-norm decoder structure — #61)
 
-Models with non-standard architectures (sliding-window attention with
-custom kernels, MoE routing per layer, multimodal) may export but won't
-match HF reference outputs; benchmark before trusting the result.
+Weights load from *.safetensors or, as a fallback, legacy pytorch_model*.bin
+(e.g. deepseek-llm — #59).
+
+Mixture-of-experts models (Mixtral, DeepSeek-V2/V3, Qwen*-MoE, Llama-4, …)
+are detected and rejected up front (#60): the exporter builds dense decoder
+layers and does not implement MoE routing / per-expert MLPs. Other
+non-standard architectures (custom sliding-window kernels, multimodal) may
+export but won't match HF reference outputs; benchmark before trusting.
 """
 
 import argparse
@@ -80,6 +87,13 @@ def detect_architecture(config) -> str:
         return "qwen2"
     if "phi" in model_type or "phi" in arch_first:
         return "phi"
+    # Distinguish Gemma generations — they have different decoder structures
+    # (Gemma-1 2-norm, Gemma-2 4-norm + softcapping, Gemma-3 different again).
+    # Check the more specific tags first since each name contains the prior.
+    if "gemma3" in model_type or "gemma3" in arch_first:
+        return "gemma3"
+    if "gemma2" in model_type or "gemma2" in arch_first:
+        return "gemma2"
     if "gemma" in model_type or "gemma" in arch_first:
         return "gemma"
     print(
@@ -88,6 +102,43 @@ def detect_architecture(config) -> str:
         flush=True,
     )
     return "llama"
+
+
+def is_moe_config(config) -> bool:
+    """True if `config` describes a mixture-of-experts model.
+
+    cascadia's exporter builds dense decoder layers (one MLP per layer). MoE
+    models route each token through a subset of many expert MLPs per layer,
+    which this exporter does not implement. Detecting them lets the caller
+    reject early with a clear message instead of silently falling back to a
+    dense Llama layer and emitting garbage (#60).
+    """
+    # 1. Top-level expert-count fields — definitive (dense models lack these).
+    for field in ("num_local_experts", "n_routed_experts", "num_experts", "moe_num_experts"):
+        v = getattr(config, field, None)
+        if isinstance(v, int) and v > 1:
+            return True
+    # 2. Nested expert config — DBRX puts the count under config.ffn_config.
+    ffn = getattr(config, "ffn_config", None)
+    if ffn is not None:
+        n = ffn.get("moe_num_experts") if isinstance(ffn, dict) else getattr(ffn, "moe_num_experts", None)
+        if isinstance(n, int) and n > 1:
+            return True
+    # 3. A per-token expert router count is a dense-model-free MoE signal.
+    if isinstance(getattr(config, "num_experts_per_tok", None), int):
+        return True
+    # 4. Known MoE model_types (exact) + architecture class names. Exact
+    #    model_type avoids false-positives from a dense model merely named
+    #    "*moe*"; class names ending in MoEForCausalLM are reliably MoE.
+    model_type = getattr(config, "model_type", "").lower()
+    arch_first = ((getattr(config, "architectures", []) or [""])[0]).lower()
+    moe_types = {
+        "mixtral", "dbrx", "deepseek_v2", "deepseek_v3", "qwen2_moe", "qwen3_moe",
+        "phimoe", "jamba", "granitemoe", "olmoe", "grok", "grok-1", "llama4",
+    }
+    if model_type in moe_types:
+        return True
+    return arch_first.endswith("moeforcausallm") or "mixtral" in arch_first or "grok" in arch_first
 
 
 def get_decoder_layer_cls(arch_tag: str):
@@ -118,15 +169,16 @@ def get_decoder_layer_cls(arch_tag: str):
             from transformers.models.phi.modeling_phi import PhiDecoderLayer
 
             return PhiDecoderLayer
+    if arch_tag == "gemma2":
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+
+        return Gemma2DecoderLayer
     if arch_tag == "gemma":
-        try:
-            from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+        # Gemma-1 (2-norm). Must NOT use Gemma2DecoderLayer — its attention
+        # reads config.query_pre_attn_scalar, which GemmaConfig lacks.
+        from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
 
-            return Gemma2DecoderLayer
-        except ImportError:
-            from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
-
-            return GemmaDecoderLayer
+        return GemmaDecoderLayer
     raise ValueError(f"unsupported arch tag: {arch_tag}")
 
 
@@ -148,15 +200,14 @@ def get_norm_cls(arch_tag: str):
         from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
         return Qwen3RMSNorm
+    if arch_tag == "gemma2":
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2RMSNorm
+
+        return Gemma2RMSNorm
     if arch_tag == "gemma":
-        try:
-            from transformers.models.gemma2.modeling_gemma2 import Gemma2RMSNorm
+        from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
 
-            return Gemma2RMSNorm
-        except ImportError:
-            from transformers.models.gemma.modeling_gemma import GemmaRMSNorm
-
-            return GemmaRMSNorm
+        return GemmaRMSNorm
     # Phi3 uses RMSNorm too
     if arch_tag == "phi":
         try:
@@ -282,12 +333,23 @@ def cached_layer_forward_sdpa(
     num_heads,
     num_kv_heads,
     head_dim,
+    attn_softcap=None,
+    query_scale=None,
+    gemma2_norms=False,
 ):
     """One decoder layer forward, attention via SDPA, KV-cached.
 
     Works for any decoder layer that exposes the conventional projection
-    names (`self_attn.q_proj/k_proj/v_proj/o_proj`, `input_layernorm`,
-    `post_attention_layernorm`, `mlp`).
+    names (`self_attn.q_proj/k_proj/v_proj/o_proj` or a fused `qkv_proj`,
+    `input_layernorm`, `post_attention_layernorm`, `mlp`).
+
+    Gemma-2 needs three deviations (#61), gated by the optional args:
+      - `query_scale`: attention scale = 1/sqrt(query_pre_attn_scalar) instead
+        of 1/sqrt(head_dim);
+      - `attn_softcap`: tanh-softcap the attention logits (SDPA can't, so we do
+        attention manually when set);
+      - `gemma2_norms`: the 4-norm residual structure (post_attention_layernorm
+        AFTER attn + pre/post_feedforward_layernorm around the MLP).
     """
     bsz, seq_len, _ = hidden_states.shape
     num_kv_groups = num_heads // num_kv_heads
@@ -295,9 +357,24 @@ def cached_layer_forward_sdpa(
     residual = hidden_states
     hidden_states = layer.input_layernorm(hidden_states)
 
-    q = layer.self_attn.q_proj(hidden_states)
-    k = layer.self_attn.k_proj(hidden_states)
-    v = layer.self_attn.v_proj(hidden_states)
+    if hasattr(layer.self_attn, "qkv_proj"):
+        # Fused QKV projection (e.g. Phi-3, #58): one matmul, split by size into
+        # q (num_heads), k/v (num_kv_heads), each * head_dim.
+        qkv = layer.self_attn.qkv_proj(hidden_states)
+        q_sz = num_heads * head_dim
+        kv_sz = num_kv_heads * head_dim
+        if qkv.shape[-1] != q_sz + 2 * kv_sz:
+            raise ValueError(
+                f"fused qkv_proj width {qkv.shape[-1]} != q({q_sz})+k({kv_sz})+v({kv_sz}); "
+                f"this arch packs qkv differently than the assumed [Q,K,V] contiguous layout"
+            )
+        q = qkv[..., :q_sz]
+        k = qkv[..., q_sz : q_sz + kv_sz]
+        v = qkv[..., q_sz + kv_sz : q_sz + 2 * kv_sz]
+    else:
+        q = layer.self_attn.q_proj(hidden_states)
+        k = layer.self_attn.k_proj(hidden_states)
+        v = layer.self_attn.v_proj(hidden_states)
 
     q = q.view(bsz, seq_len, num_heads, head_dim).transpose(1, 2)
     k = k.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2)
@@ -322,26 +399,87 @@ def cached_layer_forward_sdpa(
     v_exp = v[:, :, None, :, :].expand(bsz, num_kv_heads, num_kv_groups, -1, head_dim)
     v_exp = v_exp.reshape(bsz, num_heads, -1, head_dim)
 
-    attn_output = F.scaled_dot_product_attention(
-        q,
-        k_exp,
-        v_exp,
-        attn_mask=causal_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=1.0 / math.sqrt(head_dim),
-    )
+    scale = query_scale if query_scale is not None else (1.0 / math.sqrt(head_dim))
+    if attn_softcap is not None:
+        # SDPA cannot tanh-softcap the logits, so do attention by hand
+        # (Gemma-2): scores = softcap * tanh((q·kᵀ)·scale / softcap) + mask.
+        scores = torch.matmul(q, k_exp.transpose(2, 3)) * scale
+        scores = attn_softcap * torch.tanh(scores / attn_softcap)
+        scores = scores + causal_mask
+        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(probs, v_exp)
+    else:
+        attn_output = F.scaled_dot_product_attention(
+            q,
+            k_exp,
+            v_exp,
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )
 
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, seq_len, -1)
     attn_output = layer.self_attn.o_proj(attn_output)
 
-    hidden_states = residual + attn_output
-    residual = hidden_states
-    hidden_states = layer.post_attention_layernorm(hidden_states)
-    hidden_states = layer.mlp(hidden_states)
-    hidden_states = residual + hidden_states
+    if gemma2_norms:
+        # Gemma-2: norm AFTER attn (pre-residual) + pre/post norms around MLP.
+        attn_output = layer.post_attention_layernorm(attn_output)
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = layer.pre_feedforward_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = layer.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+    else:
+        hidden_states = residual + attn_output
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
     return hidden_states, k, v
+
+
+class ArchSpec:
+    """Per-architecture export deviations. Defaults are the Llama-family
+    behaviour; Gemma needs scaled embeddings, and Gemma-2 additionally needs
+    attention/final-logit softcapping, a query pre-attn scalar, and the 4-norm
+    decoder structure (#61)."""
+
+    def __init__(
+        self,
+        embed_scale=1.0,
+        attn_softcap=None,
+        final_softcap=None,
+        query_scale=None,
+        gemma2_norms=False,
+    ):
+        self.embed_scale = embed_scale
+        self.attn_softcap = attn_softcap
+        self.final_softcap = final_softcap
+        self.query_scale = query_scale  # None → 1/sqrt(head_dim) in the layer fn
+        self.gemma2_norms = gemma2_norms
+
+
+def arch_spec_from_config(config, arch_tag, head_dim) -> "ArchSpec":
+    """Build the ArchSpec for a model from its HF config (keyed off the
+    architecture tag from detect_architecture)."""
+    if arch_tag == "gemma2":
+        # Scaled embeddings + attention/final-logit softcapping + query
+        # pre-attn scalar + the 4-norm decoder structure.
+        qpas = getattr(config, "query_pre_attn_scalar", None) or head_dim
+        return ArchSpec(
+            embed_scale=float(config.hidden_size) ** 0.5,
+            attn_softcap=getattr(config, "attn_logit_softcapping", None),
+            final_softcap=getattr(config, "final_logit_softcapping", None),
+            query_scale=1.0 / math.sqrt(qpas),
+            gemma2_norms=True,
+        )
+    if arch_tag == "gemma":
+        # Gemma-1: scaled embeddings only (standard 2-norm layer, no softcap).
+        return ArchSpec(embed_scale=float(config.hidden_size) ** 0.5)
+    return ArchSpec()
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +495,8 @@ class _BaseStage(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.rotary = TracedRotaryEmbedding(head_dim, rope_theta)
+        # Per-architecture deviations; build_wrapper overrides for Gemma(-2).
+        self.arch = ArchSpec()
 
     def _build_causal_mask(self, attention_mask, seq_len, past_kv_len, dtype):
         """attention_mask: [bsz, past_kv_len + seq_len] with 1=allowed, 0=masked.
@@ -392,9 +532,25 @@ class _BaseStage(nn.Module):
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                attn_softcap=self.arch.attn_softcap,
+                query_scale=self.arch.query_scale,
+                gemma2_norms=self.arch.gemma2_norms,
             )
             present_kv.extend([pk, pv])
         return hidden_states, present_kv
+
+    def _scale_embeds(self, hidden_states):
+        """Gemma scales token embeddings by sqrt(hidden_size) (#61); no-op
+        otherwise. Single source of truth so embed/full stages can't drift."""
+        if self.arch.embed_scale != 1.0:
+            return hidden_states * self.arch.embed_scale
+        return hidden_states
+
+    def _softcap_logits(self, logits):
+        """Gemma-2 tanh-softcaps the final logits (#61); no-op otherwise."""
+        if self.arch.final_softcap is not None:
+            return self.arch.final_softcap * torch.tanh(logits / self.arch.final_softcap)
+        return logits
 
 
 class CachedEmbedStageWrapper(_BaseStage):
@@ -405,7 +561,7 @@ class CachedEmbedStageWrapper(_BaseStage):
         self.embed_tokens = embed_tokens
 
     def forward(self, input_ids, attention_mask, position_ids, *past_kv):
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self._scale_embeds(self.embed_tokens(input_ids))
         hidden_states, present_kv = self._run_layers(
             hidden_states, attention_mask, position_ids, past_kv
         )
@@ -433,7 +589,7 @@ class CachedHeadStageWrapper(_BaseStage):
             hidden_states, attention_mask, position_ids, past_kv
         )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        logits = self._softcap_logits(self.lm_head(hidden_states))
         return (logits, *present_kv)
 
 
@@ -455,12 +611,12 @@ class CachedFullStageWrapper(_BaseStage):
         self.lm_head = lm_head
 
     def forward(self, input_ids, attention_mask, position_ids, *past_kv):
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self._scale_embeds(self.embed_tokens(input_ids))
         hidden_states, present_kv = self._run_layers(
             hidden_states, attention_mask, position_ids, past_kv
         )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        logits = self._softcap_logits(self.lm_head(hidden_states))
         return (logits, *present_kv)
 
 
@@ -476,8 +632,6 @@ def load_stage_weights(model_dir, layer_start, layer_end, has_embed, has_head, t
     we also pull `model.embed_tokens.weight` so the head stage can wire it
     into its lm_head. Wastes ~vocab*hidden bytes but avoids re-opening safetensors.
     """
-    from safetensors import safe_open
-
     needed = []
     for i in range(layer_start, layer_end):
         needed.append(f"model.layers.{i}.")
@@ -488,12 +642,54 @@ def load_stage_weights(model_dir, layer_start, layer_end, has_embed, has_head, t
         needed.append("lm_head.")
         if tied_embeddings and not has_embed:
             needed.append("model.embed_tokens.")
+
+    def wanted(key):
+        return any(key.startswith(p) for p in needed)
+
     state_dict = {}
-    for sf in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
-        with safe_open(sf, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                if any(key.startswith(p) for p in needed):
-                    state_dict[key] = f.get_tensor(key)
+    safetensor_files = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if safetensor_files:
+        from safetensors import safe_open
+
+        for sf in safetensor_files:
+            with safe_open(sf, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if wanted(key):
+                        state_dict[key] = f.get_tensor(key)
+        return state_dict
+
+    # Fallback: legacy PyTorch .bin checkpoints (e.g. deepseek-llm-7b ships
+    # only pytorch_model*.bin, no safetensors) — #59. Match ONLY weight-shard
+    # filename patterns (never bare *.bin, which would pick up training_args.bin
+    # / optimizer.bin and choke torch.load).
+    bin_files = []
+    for pat in ("pytorch_model*.bin", "model*.bin", "consolidated*.bin"):
+        bin_files += glob.glob(os.path.join(model_dir, pat))
+    bin_files = sorted(set(bin_files))
+    if not bin_files:
+        raise FileNotFoundError(
+            f"no *.safetensors or weight *.bin (pytorch_model*/model*/consolidated*) "
+            f"in {model_dir}"
+        )
+    for bf in bin_files:
+        try:
+            # mmap=True lazy-maps the shard, so we materialize only the few
+            # layers this stage keeps (via .clone()) instead of loading the
+            # whole multi-GB shard into RAM.
+            shard = torch.load(bf, map_location="cpu", weights_only=True, mmap=True)
+        except Exception as e:
+            # Older torch (no mmap kwarg) or a checkpoint weights_only can't
+            # unpickle — fall back loudly for trusted local/HF weights.
+            print(
+                f"  torch.load(weights_only,mmap) failed ({e}); retrying full unpickle",
+                flush=True,
+            )
+            shard = torch.load(bf, map_location="cpu", weights_only=False)
+        for key, tensor in shard.items():
+            if wanted(key):
+                state_dict[key] = tensor.clone() if hasattr(tensor, "clone") else tensor
+        del shard
+        gc.collect()
     return state_dict
 
 
@@ -737,6 +933,15 @@ def export_single_stage(
         rope_theta,
         arch_tag,
     )
+    # Attach per-architecture export deviations (Gemma embed scale, Gemma-2
+    # softcapping / 4-norm structure — #61). Default ArchSpec is a no-op for
+    # Llama-family models.
+    wrapper.arch = arch_spec_from_config(
+        config,
+        arch_tag,
+        getattr(config, "head_dim", None)
+        or (config.hidden_size // config.num_attention_heads),
+    )
     del state_dict
     gc.collect()
 
@@ -922,18 +1127,29 @@ def maybe_download(model_id_or_path: str) -> str:
     safe_id = model_id_or_path.replace("/", "--")
     local_dir = os.path.join(cache_root, safe_id)
     print(f"Downloading {model_id_or_path} -> {local_dir}", flush=True)
+    common = ["*.json", "tokenizer.*", "*.model", "special_tokens_map.json"]
+    # Prefer safetensors. Only fetch legacy .bin shards if the repo has no
+    # safetensors — avoids pulling a redundant multi-GB .bin for the many repos
+    # that ship both, and only matches weight-shard names (not training_args.bin).
     snapshot_download(
         repo_id=model_id_or_path,
         local_dir=local_dir,
-        allow_patterns=[
-            "*.safetensors",
-            "*.json",
-            "tokenizer.*",
-            "*.model",
-            "special_tokens_map.json",
-        ],
+        allow_patterns=["*.safetensors", *common],
         max_workers=8,
     )
+    if not glob.glob(os.path.join(local_dir, "*.safetensors")):
+        print("  no safetensors in repo; fetching legacy .bin weight shards", flush=True)
+        snapshot_download(
+            repo_id=model_id_or_path,
+            local_dir=local_dir,
+            allow_patterns=[
+                "pytorch_model*.bin",
+                "model*.bin",
+                "consolidated*.bin",
+                *common,
+            ],
+            max_workers=8,
+        )
     return local_dir
 
 
@@ -1006,9 +1222,42 @@ def main():
 
     from transformers import AutoConfig
 
-    model_dir = maybe_download(args.model)
-    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=False)
+    # Read the config FIRST (cheap — just config.json, no weights) so we can
+    # reject unsupported models before downloading tens-to-hundreds of GB.
+    # AutoConfig.from_pretrained works on an HF id (fetches only config.json)
+    # or a local dir.
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if is_moe_config(config):
+        sys.exit(
+            f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
+            f"cascadia exporter does not support (#60). It builds dense decoder "
+            f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
+            f"implemented, and falling back to a dense layer would silently emit "
+            f"garbage. Aborting rather than producing a broken shard."
+        )
+    # The traced RoPE rotates the FULL head_dim with plain inv_freq. Reject
+    # models needing partial rotary (rotating only a head_dim slice, e.g.
+    # phi-2) — they would silently emit garbage. Long-context rope_scaling
+    # (llama3/yarn/longrope) is identity-ish within the original context, so
+    # short generations match; warn rather than reject those.
+    prf = getattr(config, "partial_rotary_factor", None)
+    if isinstance(prf, (int, float)) and prf < 1.0:
+        sys.exit(
+            f"ERROR: {args.model} uses partial rotary (partial_rotary_factor={prf}); the "
+            f"exporter applies RoPE to the full head_dim and would emit garbage. Not supported."
+        )
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rtype = (rope_scaling.get("rope_type") or rope_scaling.get("type") or "").lower()
+        if rtype in ("longrope", "su", "yarn"):
+            print(
+                f"  WARNING: rope_scaling type {rtype!r} is not modeled (plain RoPE baked); "
+                f"output will diverge from reference beyond the original context length.",
+                flush=True,
+            )
     arch_tag = detect_architecture(config)
+    # Accepted — now fetch the weights.
+    model_dir = maybe_download(args.model)
     # transformers 4.x exposes rope_theta directly; 5.x moved it under
     # config.rope_parameters = {"rope_theta": ..., "rope_type": ...}.
     # Handle both — wrong rope_theta gets silently baked into the traced
