@@ -1,0 +1,54 @@
+# Architecture support
+
+Status of decoder-only causal LMs in Cascadia's `cascadia shard` exporter
+and the OpenVINO Rust runtime, as of #69 (partial rotary + config-first
+rejection) and #48 (Gemma 4 exporter).
+
+The authoritative table — what works, what regresses, what is rejected
+— lives in [`../SHARDING.md`](../SHARDING.md#supported-architectures).
+This directory holds per-family deep-dives for non-trivial cases.
+
+## Per-family notes
+
+- [`gemma4-support.md`](./gemma4-support.md) — Gemma 4 (April 2026):
+  what makes it different from Gemma 3, and the dedicated
+  `tools/export_gemma4.py` exporter (#48) that `cascadia shard`
+  auto-dispatches to (exporter-only today; Rust-runtime port is Phase B).
+- [`phi.md`](./phi.md) — Phi-3 / Phi-4 family: partial rotary (handled,
+  #69), LongRoPE (soft-dropped), and sliding window.
+- [`moe.md`](./moe.md) — Mixtral, Qwen3-MoE, Llama 4, gpt-oss,
+  GraniteMoE, Hunyuan: why the generic exporter can't ship them,
+  and how `cascadia-engine-sparse-moe` (Kimi K2.6) hints at the
+  shape of a fix.
+
+## How to add a new family
+
+1. Find the model's `config.json` (HuggingFace download or `cat` on a
+   local snapshot). Note `model_type`, `architectures`, and any
+   `rope_scaling` / `rope_parameters` / `layer_types` fields.
+2. Check whether `transformers.models.<model_type>.modeling_<model_type>`
+   has a `<Foo>DecoderLayer` class. If so, the change to
+   `tools/export_shards.py::get_decoder_layer_cls()` is one branch.
+3. Trace through the quirks table in `SHARDING.md` to see which apply.
+   For each dropped or rejected feature the new family relies on, the
+   exporter needs an explicit branch (and `check_export_quirks` / `is_moe_config`
+   may need updating) — and the Rust runtime
+   (`crates/cascadia-engine-openvino/`) may need a matching change.
+4. Add an e2e test on the fleet: `cascadia shard --model <hf-id>
+   --output-dir /tmp/shards --num-stages 2` on the miner, then
+   `cascadia worker --engine ov-runtime --rank 0` on the miner and
+   `--rank 1` on an AI PC. Hit `/v1/chat/completions` and inspect a
+   short generation.
+
+## Reference
+
+- Rainier's `scripts/export_*` family contains battle-tested Python
+  exporters for several architectures including Gemma 4 E2B and the
+  26B-A4B MoE. Cascadia's `tools/export_shards.py` is a generic
+  refactor of rainier's `export_cached_shards_v5.py`. Use rainier as
+  the reference when porting a new family.
+- [OpenVINO GenAI supported models](https://openvinotoolkit.github.io/openvino.genai/docs/supported-models/)
+  is the upstream list of what `openvino_genai::LLMPipeline` can load
+  via `optimum-cli`. Anything on that list is a candidate for the
+  `ov-genai` single-stage engine without needing changes to our
+  exporter.
