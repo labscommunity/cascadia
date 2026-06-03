@@ -180,6 +180,20 @@ int32_t cascadia_runtime_output_shape(
 int32_t cascadia_runtime_output_dtype(
     cascadia_runtime_t* handle, size_t output_idx, uint32_t* out_dtype);
 
+/// Input-tensor introspection (rank / shape / dtype), mirroring the output
+/// getters. Reports the compiled model's concrete input dims — used by
+/// `profile-devices --per-stage` to size the zeroed inputs it feeds when
+/// timing a stage. On a dynamic-shape model a dim may read back as 0.
+int32_t cascadia_runtime_input_rank(
+    cascadia_runtime_t* handle, size_t input_idx, size_t* out_rank);
+
+int32_t cascadia_runtime_input_shape(
+    cascadia_runtime_t* handle, size_t input_idx,
+    size_t* out_shape, size_t shape_cap);
+
+int32_t cascadia_runtime_input_dtype(
+    cascadia_runtime_t* handle, size_t input_idx, uint32_t* out_dtype);
+
 /// Copy the output tensor's raw bytes into `out_buf`. `out_buf_size` must
 /// equal byte_size of the output tensor (call output_byte_size first).
 int32_t cascadia_runtime_output_byte_size(

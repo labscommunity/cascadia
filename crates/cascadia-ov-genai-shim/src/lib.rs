@@ -194,6 +194,22 @@ mod sys {
             output_idx: usize,
             out_dtype: *mut u32,
         ) -> c_int;
+        pub fn cascadia_runtime_input_rank(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_rank: *mut usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_input_shape(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_shape: *mut usize,
+            shape_cap: usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_input_dtype(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_dtype: *mut u32,
+        ) -> c_int;
         pub fn cascadia_runtime_output_byte_size(
             handle: *mut cascadia_runtime_t,
             output_idx: usize,
@@ -737,6 +753,46 @@ impl Runtime {
                 return Err(Error::Native(last_native_error()));
             }
             Ok((DType::from_code(dtype_code), shape, buf))
+        }
+    }
+
+    /// Input tensor `idx`'s shape — concrete dims for a static (NPU-export)
+    /// model. Used by `profile-devices --per-stage` to size the zeroed
+    /// inputs it feeds when timing a stage.
+    pub fn input_shape(&self, idx: usize) -> Result<Vec<usize>> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = idx;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut rank: usize = 0;
+            if sys::cascadia_runtime_input_rank(self.handle, idx, &mut rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut shape = vec![0usize; rank];
+            if sys::cascadia_runtime_input_shape(self.handle, idx, shape.as_mut_ptr(), rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(shape)
+        }
+    }
+
+    /// Input tensor `idx`'s element type.
+    pub fn input_dtype(&self, idx: usize) -> Result<DType> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = idx;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut code: u32 = 0;
+            if sys::cascadia_runtime_input_dtype(self.handle, idx, &mut code) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(DType::from_code(code))
         }
     }
 }
