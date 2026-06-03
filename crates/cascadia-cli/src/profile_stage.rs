@@ -366,7 +366,7 @@ mod openvino_impl {
             let name = rt.input_name(i)?;
             let shape = rt.input_shape(i)?;
             let dtype = rt.input_dtype(i)?;
-            if shape.iter().any(|&d| d == 0) {
+            if shape.contains(&0) {
                 bail!(
                     "input '{name}' has a dynamic/zero dim {shape:?} — the \
                      per-stage profiler needs a STATIC export (`--target npu`)"
