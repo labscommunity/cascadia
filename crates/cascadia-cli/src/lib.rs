@@ -24,10 +24,16 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod placement;
 pub mod profile;
+pub mod profile_stage;
+pub mod run_placement;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
+use placement::{cmd_place, PlaceArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
+use profile_stage::{cmd_profile_per_stage, PerStageArgs};
+use run_placement::{cmd_run_placement, RunPlacementArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +80,17 @@ pub enum Command {
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
     /// {iGPU, NPU, CPU} ILP placement).
     ProfileDevices(ProfileDevicesArgs),
+    /// Profile each stage of a multi-stage shard on each device (latency +
+    /// memory + op-support) and write `placement_profile.json` — the cost
+    /// table for `cascadia place`. Step 1.5 of issue #41.
+    ProfileStages(PerStageArgs),
+    /// Solve three-tier {iGPU, NPU, CPU} placement from a per-stage cost
+    /// profile and write `placement.json`. Step 2 of issue #41 — the ILP
+    /// over `profile-stages` output.
+    Place(PlaceArgs),
+    /// Launch a heterogeneous pipeline from a `placement.json`: one worker
+    /// per stage, each pinned to its assigned device. Step 3 of issue #41.
+    RunPlacement(RunPlacementArgs),
     /// Generate a shell completion script (bash, zsh, fish, …). See
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
@@ -424,6 +441,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
         Command::ProfileDevices(args) => cmd_profile_devices(args),
+        Command::ProfileStages(args) => cmd_profile_per_stage(args),
+        Command::Place(args) => cmd_place(args),
+        Command::RunPlacement(args) => cmd_run_placement(args).await,
         Command::Completions(args) => cmd_completions(args),
     }
 }

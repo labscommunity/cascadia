@@ -528,6 +528,54 @@ int32_t cascadia_runtime_output_dtype(
     catch (...) { set_last_error("unknown exception in output_dtype"); return 1; }
 }
 
+// Input introspection — mirrors the output_* getters but over
+// get_input_tensor. The pre-allocated input tensor carries the compiled
+// model's shape, so these report concrete dims for a static (NPU-export)
+// model; on a dynamic model a dim may be reported as 0.
+int32_t cascadia_runtime_input_rank(
+    cascadia_runtime_t* handle, size_t input_idx, size_t* out_rank) {
+    if (!handle || !handle->request || !out_rank) {
+        set_last_error("null arg"); return 1;
+    }
+    try {
+        auto t = handle->request->get_input_tensor(input_idx);
+        *out_rank = t.get_shape().size();
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in input_rank"); return 1; }
+}
+
+int32_t cascadia_runtime_input_shape(
+    cascadia_runtime_t* handle, size_t input_idx,
+    size_t* out_shape, size_t shape_cap) {
+    if (!handle || !handle->request || (shape_cap > 0 && !out_shape)) {
+        set_last_error("null arg"); return 1;
+    }
+    try {
+        auto t = handle->request->get_input_tensor(input_idx);
+        auto shp = t.get_shape();
+        if (shape_cap < shp.size()) {
+            set_last_error("shape_cap too small"); return 1;
+        }
+        for (size_t i = 0; i < shp.size(); ++i) out_shape[i] = shp[i];
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in input_shape"); return 1; }
+}
+
+int32_t cascadia_runtime_input_dtype(
+    cascadia_runtime_t* handle, size_t input_idx, uint32_t* out_dtype) {
+    if (!handle || !handle->request || !out_dtype) {
+        set_last_error("null arg"); return 1;
+    }
+    try {
+        auto t = handle->request->get_input_tensor(input_idx);
+        *out_dtype = code_from_dtype(t.get_element_type());
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in input_dtype"); return 1; }
+}
+
 int32_t cascadia_runtime_output_byte_size(
     cascadia_runtime_t* handle, size_t output_idx, size_t* out_byte_size) {
     if (!handle || !handle->request || !out_byte_size) {
