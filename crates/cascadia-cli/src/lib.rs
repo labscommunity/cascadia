@@ -27,11 +27,13 @@ pub mod doctor;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
+pub mod run_placement;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
 use placement::{cmd_place, PlaceArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
 use profile_stage::{cmd_profile_per_stage, PerStageArgs};
+use run_placement::{cmd_run_placement, RunPlacementArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -86,6 +88,9 @@ pub enum Command {
     /// profile and write `placement.json`. Step 2 of issue #41 — the ILP
     /// over `profile-stages` output.
     Place(PlaceArgs),
+    /// Launch a heterogeneous pipeline from a `placement.json`: one worker
+    /// per stage, each pinned to its assigned device. Step 3 of issue #41.
+    RunPlacement(RunPlacementArgs),
     /// Generate a shell completion script (bash, zsh, fish, …). See
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
@@ -438,6 +443,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
+        Command::RunPlacement(args) => cmd_run_placement(args).await,
         Command::Completions(args) => cmd_completions(args),
     }
 }
