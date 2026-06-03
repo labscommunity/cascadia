@@ -454,7 +454,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
-    println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
+    println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
     Ok(())
 }
 
