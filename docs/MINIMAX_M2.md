@@ -120,10 +120,20 @@ the comparison runs:
 - **Precise routing** (`--shell-quant none --head-quant none`, keeping the
   router gate + lm_head full-precision as M2 itself does) extends coherent
   output from one fact to two, but does not fix the deeper degradation.
-- The residual incoherence is dominated by the **int4 experts** (the bulk
-  of the model at ~4 bits). Restoring sustained coherence needs
-  higher-precision experts (int8) or calibrated quant (AWQ/GPTQ-style) —
-  future work; int8 experts ≈ 230 GB, beyond the current test disk.
+- The residual incoherence is the **int4 experts** (the bulk of the model
+  at ~4 bits). This is now *confirmed*: running the experts unquantized
+  (`tools/test_minimax_m2_fp_experts.py`, fp32 experts dequantized from the
+  FP8 source, same fp32 shells) gives fully coherent output —
+
+  > " Paris. The capital of the United States is Washington, D.C. The
+  > capital city (or simply \"capital\") refers …"
+
+  — no degradation. So int8 experts (much closer to fp32 than int4) would
+  restore coherence. The full int8 *artifact* (~225 GB) just can't coexist
+  with the 215 GB FP8 source on the test box's 448 GB disk; producing it
+  needs a larger disk (or calibrated int4, AWQ/GPTQ-style, to keep the
+  int4 footprint while recovering quality) — future work. The exporter's
+  `--experts-int8` path produces int8 OV-IR experts where disk allows.
 
 ## Tests
 
