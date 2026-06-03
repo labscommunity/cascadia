@@ -1678,6 +1678,23 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve cascadia short aliases (e.g. "r1-distill-qwen-7b" ->
+    # "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B") up front, BEFORE the
+    # config-first AutoConfig read + download (#69 reads config before
+    # maybe_download, so resolving inside maybe_download would be too late).
+    # Pass-through for local paths and canonical HF ids; optional (skipped if
+    # model_aliases isn't importable, e.g. running the script outside tools/).
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from model_aliases import resolve as _resolve_alias
+
+        _resolved = _resolve_alias(args.model)
+        if _resolved != args.model:
+            print(f"alias '{args.model}' -> '{_resolved}'", flush=True)
+            args.model = _resolved
+    except Exception as e:
+        print(f"  warning: alias resolution skipped ({e})", flush=True)
+
     # The NPU runtime decodes one token per step and derives past-KV length as
     # static_context - 1, so reject configs it cannot load (fail fast — the
     # export takes minutes). chunked prefill (static_seq > 1) is not yet wired
