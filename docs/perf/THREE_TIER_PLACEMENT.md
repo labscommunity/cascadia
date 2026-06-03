@@ -201,10 +201,21 @@ the NPU, which is the slowest tier for token-by-token decode.
   times each stage *in isolation*) can't see. The ILP found a good placement
   here, but to *target* regime 2 deliberately it needs an end-to-end
   all-GPU-vs-placed probe (or a pressure-penalty term as GPU occupancy → 100%).
-- **NPU is non-competitive for decode** (~1.5× the CPU, ~3× the iGPU per
-  token) and a multi-stage fp16 NPU overflow produced corrupt output in one
-  config — the ILP correctly avoids it. Profiling the NPU is also slow
-  (~100 min/30B); `--devices GPU,CPU` is the practical default.
+- **NPU is non-competitive for decode** (~1.5× the CPU, ~2× the iGPU per
+  token) — the ILP correctly avoids it. Profiling the NPU is also slow
+  (~100 min/30B); `--devices GPU,CPU` is the practical default. (A multi-NPU
+  config once *appeared* to corrupt — #67 — but that was an eval timeout on a
+  RAM-exhausted box, not corruption; output is correct, just slow. NPU
+  multi-stage is verified correct on every topology tested.)
+- **Per-worker overhead / swap (the #67 finding).** The solver's memory gate
+  counts **weights only**, but each stage is a worker process whose OV runtime
+  + device context + KV/activations add ~1 GiB resident. A placement that
+  "fits" the weight pool can still drive the box to ~0 free RAM and swap
+  (slow + highly variable tok/s — a 20 GiB model across 12 workers exhausted a
+  31.6 GiB box). `cascadia place` now **warns** when `Σ weights + n_stages ×
+  --worker-overhead-gb` exceeds the usable pool, advising fewer stages / a
+  smaller model. A fuller fix would fold per-stage runtime footprint into the
+  profiled `mem_bytes` so the solver's gate is exact.
 - **No cross-request pipelining.** Stages run sequentially per token, so the
   throughput-overlap regime (concurrent requests across tiers, potentially
   ~Nx) is untapped — a separate, larger runtime change.
