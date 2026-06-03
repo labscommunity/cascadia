@@ -66,6 +66,31 @@ pub struct PerStageArgs {
     /// only) and leave the CPU budget unbounded.
     #[arg(long)]
     pub pool_gb: Option<f64>,
+
+    /// Re-measure even if `--output` already holds a profile whose fingerprint
+    /// matches this (shard, devices, pool). By default a matching cached
+    /// profile is reused — the expensive part (esp. NPU compiles) is skipped.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+/// Fingerprint of the inputs a profile was measured for: the per-stage
+/// (name, weight-bytes), the device set, and the pool. Lets `profile-stages`
+/// reuse a cached profile instead of re-measuring. Deterministic across runs
+/// (`DefaultHasher` has fixed keys) — it's a cache key, not a security hash.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn profile_fingerprint(stages: &[(String, u64)], devices: &[String], pool: Option<u64>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (name, sz) in stages {
+        name.hash(&mut h);
+        sz.hash(&mut h);
+    }
+    for d in devices {
+        d.hash(&mut h);
+    }
+    pool.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 #[cfg_attr(not(feature = "openvino"), allow(dead_code))]
@@ -195,8 +220,38 @@ mod openvino_impl {
         }
         info!(devices = ?device_names, stages = stages.len(), "per-stage profiling");
 
-        // Device memory budgets.
+        // Cheap pre-pass: per-stage (name, weight-bytes). These are also the
+        // fingerprint inputs, so we can reuse a cached profile before doing any
+        // (expensive) compile.
+        let mut stage_meta: Vec<(String, u64)> = Vec::with_capacity(stages.len());
+        for sd in &stages {
+            let name = sd
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("stage")
+                .to_string();
+            stage_meta.push((name, dir_weight_bytes(sd)?));
+        }
         let pool_bytes = args.pool_gb.map(|g| (g * BYTES_PER_GIB) as u64);
+        let fingerprint = profile_fingerprint(&stage_meta, &device_names, pool_bytes);
+
+        // Cache: reuse a matching profile rather than re-measuring (the NPU
+        // compiles alone can take ~100 min for a 30B-class shard).
+        if !args.force {
+            if let Ok(existing) = std::fs::read_to_string(&args.output) {
+                if let Ok(prof) = serde_json::from_str::<PlacementProfile>(&existing) {
+                    if prof.fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                        info!(output = %args.output.display(), %fingerprint,
+                            "cached profile matches — skipping measurement (--force to re-measure)");
+                        print_summary(&prof);
+                        println!("reused {}", args.output.display());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Device memory budgets.
         let mut dev_caps: Vec<DeviceCap> = Vec::with_capacity(device_names.len());
         for d in &device_names {
             let reported = device_reported_mem(d, pool_bytes)?;
@@ -213,7 +268,7 @@ mod openvino_impl {
             let xml_s = xml
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("non-UTF8 path {}", xml.display()))?;
-            let mem = dir_weight_bytes(sd)?;
+            let mem = stage_meta[i].1;
             let mut lat: BTreeMap<String, f64> = BTreeMap::new();
             for d in &device_names {
                 match time_stage(xml_s, d, args.warmup, args.runs) {
@@ -248,6 +303,7 @@ mod openvino_impl {
             devices: dev_caps,
             stages: stage_costs,
             pool_bytes,
+            fingerprint: Some(fingerprint),
         };
 
         let json = serde_json::to_string_pretty(&profile)?;
@@ -414,5 +470,27 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["stage_0", "stage_2", "stage_10"]);
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic_and_input_sensitive() {
+        let stages = vec![
+            ("stage_0".to_string(), 100u64),
+            ("stage_1".to_string(), 200),
+        ];
+        let devs = vec!["GPU".to_string(), "CPU".to_string()];
+        let base = profile_fingerprint(&stages, &devs, Some(28));
+        // deterministic across calls
+        assert_eq!(base, profile_fingerprint(&stages, &devs, Some(28)));
+        // sensitive to a stage size, the device set, and the pool
+        let mut s2 = stages.clone();
+        s2[0].1 = 101;
+        assert_ne!(base, profile_fingerprint(&s2, &devs, Some(28)));
+        assert_ne!(
+            base,
+            profile_fingerprint(&stages, &["GPU".to_string()], Some(28))
+        );
+        assert_ne!(base, profile_fingerprint(&stages, &devs, Some(27)));
+        assert_ne!(base, profile_fingerprint(&stages, &devs, None));
     }
 }

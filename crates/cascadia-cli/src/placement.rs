@@ -61,6 +61,12 @@ pub struct PlacementProfile {
     /// `None` (the default, and for non-UMA topologies) skips the global gate.
     #[serde(default)]
     pub pool_bytes: Option<u64>,
+    /// Fingerprint of the (shard, device-set, pool) this profile was measured
+    /// for — `profile-stages` reuses an existing profile whose fingerprint
+    /// matches rather than re-running the (expensive) measurement. `None` on
+    /// hand-written profiles; the cache is simply skipped then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// The solver output.
@@ -346,6 +352,7 @@ mod tests {
             devices,
             stages,
             pool_bytes: None,
+            fingerprint: None,
         }
     }
 
