@@ -1728,6 +1728,42 @@ def main():
 
     from transformers import AutoConfig
 
+    # Gemma 4 (gemma4 / gemma4_text) uses a dedicated exporter,
+    # tools/export_gemma4.py: its per-layer-type asymmetric head_dim,
+    # KV-shared layers, and per-layer embeddings cannot share the generic
+    # stage builder. Detect it config-first from the raw config.json (older
+    # transformers reject the "gemma4" model_type inside AutoConfig before we
+    # could route) and dispatch before the generic flow.
+    try:
+        with open(fetch_config_json(args.model)) as _f:
+            _raw_cfg = json.load(_f)
+    except Exception:
+        _raw_cfg = {}
+    _outer_mt = (_raw_cfg.get("model_type") or "").lower()
+    _inner_mt = ((_raw_cfg.get("text_config") or {}).get("model_type") or "").lower()
+    if any(
+        ("gemma4" in t) or ("gemma_4" in t) or ("gemma-4" in t)
+        for t in (_outer_mt, _inner_mt)
+    ):
+        print(
+            "Detected Gemma 4 - dispatching to the dedicated exporter "
+            "tools/export_gemma4.py (per-layer-type attention / KV-sharing / "
+            "per-layer embeddings are not handled by the generic builder).",
+            flush=True,
+        )
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from export_gemma4 import run_export as _gemma4_run_export
+
+        _gemma4_run_export(
+            model_id=args.model,
+            output_dir=args.output_dir,
+            num_stages=args.num_stages,
+            quantization=args.quantization,
+            stage=args.stage,
+            device_verify="CPU",
+        )
+        return
+
     moe_msg = (
         f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
         f"cascadia exporter does not support (#60). It builds dense decoder "

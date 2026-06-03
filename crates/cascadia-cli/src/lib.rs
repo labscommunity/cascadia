@@ -962,8 +962,20 @@ const EXPORT_SCRIPT: &str = include_str!(concat!(
     "/../../tools/export_shards.py"
 ));
 
+/// Sibling modules the exporter imports at runtime: the dedicated Gemma-4
+/// exporter (dispatched for gemma4 models) and the short-alias registry.
+/// They must be written next to export_shards.py in the temp dir so its
+/// `from export_gemma4 import ...` / `from model_aliases import ...` resolve.
+const GEMMA4_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/export_gemma4.py"
+));
+const ALIASES_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/model_aliases.py"
+));
+
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
-    use std::io::Write;
     use std::process::{Command, Stdio};
 
     let python = if let Some(p) = args.python.as_deref() {
@@ -1034,16 +1046,23 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         }
     }
 
-    // Write the embedded script to a temp file so we have a real path.
-    let mut tmp = tempfile::Builder::new()
+    // Write the embedded exporter + its sibling modules into a temp dir so
+    // export_shards.py's `from export_gemma4 import ...` / `from model_aliases
+    // import ...` (run from that dir) resolve. `_tmpdir` is held until the end
+    // of this function so the dir survives until the exporter exits.
+    let _tmpdir = tempfile::Builder::new()
         .prefix("cascadia-export-")
-        .suffix(".py")
-        .tempfile()
-        .context("creating temp file for embedded exporter")?;
-    tmp.write_all(EXPORT_SCRIPT.as_bytes())
-        .context("writing embedded exporter to temp file")?;
-    tmp.flush().ok();
-    let script_path = tmp.path().to_owned();
+        .tempdir()
+        .context("creating temp dir for embedded exporter")?;
+    let script_path = _tmpdir.path().join("export_shards.py");
+    for (name, body) in [
+        ("export_shards.py", EXPORT_SCRIPT),
+        ("export_gemma4.py", GEMMA4_SCRIPT),
+        ("model_aliases.py", ALIASES_SCRIPT),
+    ] {
+        std::fs::write(_tmpdir.path().join(name), body)
+            .with_context(|| format!("writing embedded {name} to temp dir"))?;
+    }
 
     // Build python argv.
     let mut cmd = Command::new(&python);
