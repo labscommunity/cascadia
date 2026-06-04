@@ -231,6 +231,15 @@ impl OvMoeRunner {
                 manifest.shell_backend
             )));
         }
+        // The shells run as OV graphs with a per-token-growing past_k/past_v
+        // dimension, which trips the OV 2026.1 CPU snippets
+        // shape-specialization bug — numerical errors that accumulate over
+        // the sequence and silently corrupt output after ~10 tokens (the
+        // K2.6 path dodges this by running shells in its Rust kernel). The
+        // exporter/Python reference sets SNIPPETS_MODE=DISABLE; the engine
+        // must too. This was THE cause of the int4/int8/NF4 "degrades after
+        // the first sentence" — not expert quantization.
+        let plugin = plugin.with("SNIPPETS_MODE", "DISABLE");
         let utf8 = |p: &PathBuf| -> Result<String, OvMoeError> {
             p.to_str()
                 .map(str::to_owned)
