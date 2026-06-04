@@ -45,8 +45,6 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-use crate::rotary::{load_model_config, Rotary};
-
 // -------- pipeline / stage config --------
 
 #[derive(Debug, Deserialize)]
@@ -55,10 +53,6 @@ struct PipelineConfig {
     num_stages: u32,
     #[serde(default)]
     num_layers: u32,
-    #[serde(default)]
-    hidden_size: u32,
-    #[serde(default)]
-    export_version: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -75,8 +69,6 @@ struct StageConfig {
     has_embed: bool,
     #[serde(default)]
     has_head: bool,
-    #[serde(default)]
-    export_version: Option<String>,
     /// NPU (`--target npu`) export: KV is stateless (explicit past_kv-in /
     /// present-out) and all shapes are static. Old/standard shards omit the
     /// field and are stateful (default true). When false, the engine drives
@@ -446,8 +438,6 @@ struct ActiveTask {
 pub struct Gemma4Engine {
     spec: ShardSpec,
     runtime: OvRuntime,
-    rotary: Rotary,
-    hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
@@ -456,7 +446,6 @@ pub struct Gemma4Engine {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
     position: i64,
-    input_names: Vec<String>,
     /// Map of canonical name (e.g. "input_ids", "attention_mask") to the
     /// IR's primary port name. Resolved at engine build time via the
     /// alias lookup (the IR's primary name is sometimes an internal
@@ -486,14 +475,6 @@ pub struct Gemma4Engine {
 }
 
 impl Gemma4Engine {
-    /// True if the loaded IR uses v5+ canonical inputs (attention_mask +
-    /// position_ids) instead of legacy v3 (cos + sin). Determined from
-    /// the alias-resolved canonical_inputs map populated at build time.
-    fn is_v5_layout(&self) -> bool {
-        self.canonical_inputs.contains_key("attention_mask")
-            && self.canonical_inputs.contains_key("position_ids")
-    }
-
     /// Resolve a canonical input name to the IR's primary port name.
     fn input_named(&self, canonical: &str) -> Option<&str> {
         self.canonical_inputs.get(canonical).map(|s| s.as_str())
@@ -1299,11 +1280,8 @@ pub struct Gemma4Builder {
     pub dyn_quant_group: Option<String>,
     runtime: Option<OvRuntime>,
     spec: Option<ShardSpec>,
-    rotary: Option<Rotary>,
-    hidden_size: usize,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
-    input_names: Vec<String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     listen_host: String,
@@ -1475,7 +1453,6 @@ impl Builder for Gemma4Builder {
             tp_size: 1,
             tp_rank: 0,
         };
-        self.hidden_size = pipeline_cfg.hidden_size as usize;
         self.spec = Some(spec);
 
         events.push(LoadProgress::message(format!(
@@ -1487,31 +1464,14 @@ impl Builder for Gemma4Builder {
         let runtime =
             OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
                 .map_err(map_ov_err)?;
-        self.input_names = runtime.input_names().map_err(map_ov_err)?;
         self.runtime = Some(runtime);
 
-        events.push(LoadProgress::message(
-            "loading rotary + tokenizer".to_string(),
-        ));
+        events.push(LoadProgress::message("loading tokenizer".to_string()));
 
-        // Rotary from the model's HF config.json. Look in the pipeline
-        // tokenizer dir first (rainier exports include config.json there);
-        // fall back to the HF cache via env, else error.
+        // Gemma 4 bakes RoPE into the IR (computed internally from
+        // position_ids), so unlike the v3 path there is no host-side rotary to
+        // load here — only the tokenizer dir, used for the tokenizer + EOS ids.
         let tokenizer_dir = self.pipeline_dir.join("tokenizer");
-        let cfg = match load_model_config(&tokenizer_dir) {
-            Ok(c) => c,
-            Err(e1) => {
-                let alt = self.pipeline_dir.clone();
-                load_model_config(&alt).map_err(|e2| {
-                    EngineError::InvalidConfig(format!(
-                        "config.json not in {tokenizer_dir:?} ({e1}) or {alt:?} ({e2})"
-                    ))
-                })?
-            }
-        };
-        let rotary = Rotary::from_config(&cfg)
-            .map_err(|e| EngineError::InvalidConfig(format!("rotary: {e}")))?;
-        self.rotary = Some(rotary);
 
         if is_first {
             let tok_path = tokenizer_dir.join("tokenizer.json");
@@ -1543,7 +1503,6 @@ impl Builder for Gemma4Builder {
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
         let runtime = self.runtime.ok_or(EngineError::NotLoaded)?;
         let spec = self.spec.ok_or(EngineError::NotLoaded)?;
-        let rotary = self.rotary.ok_or(EngineError::NotLoaded)?;
 
         // Resolve canonical port names via the alias list. v5 IRs export
         // input ports under conventional names ("input_ids", "attention_mask",
@@ -1734,15 +1693,12 @@ impl Builder for Gemma4Builder {
         Ok(Box::new(Gemma4Engine {
             spec,
             runtime,
-            rotary,
-            hidden_size: self.hidden_size,
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
             position: 0,
-            input_names: self.input_names,
             canonical_inputs,
             pending: Vec::new(),
             active: None,
