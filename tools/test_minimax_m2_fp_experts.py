@@ -50,6 +50,24 @@ def quant_dequant(w, mode):
         s = np.abs(wg).max(axis=2, keepdims=True) / 7.0
         s[s == 0] = 1.0
         return (np.round(wg / s).clip(-8, 7) * s).reshape(out, inn)
+    if mode == "nf4":
+        # NormalFloat-4: 16 quantile levels of a unit normal (QLoRA /
+        # bitsandbytes), per-group absmax scale, nearest-level rounding.
+        # Distribution-matched 4-bit — the candidate fix.
+        levels = np.array([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+            0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+            0.7229568362236023, 1.0], dtype=np.float32)
+        out, inn = w.shape
+        g = 64
+        wg = w.reshape(out, inn // g, g)
+        absmax = np.abs(wg).max(axis=2, keepdims=True)
+        absmax[absmax == 0] = 1.0
+        wn = wg / absmax
+        idx = np.abs(wn[..., None] - levels).argmin(axis=-1)
+        return (levels[idx] * absmax).reshape(out, inn)
     raise ValueError(mode)
 
 
@@ -79,7 +97,7 @@ def main():
     ap.add_argument("--rep-penalty", type=float, default=1.0)
     ap.add_argument("--rep-window", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--quant", choices=["none", "int8", "int4"], default="none",
+    ap.add_argument("--quant", choices=["none", "int8", "int4", "nf4"], default="none",
                     help="simulate expert weight quantization (none=fp32/FP8-precision)")
     ap.add_argument("--device", default="CPU")
     args = ap.parse_args()

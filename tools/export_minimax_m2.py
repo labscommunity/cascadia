@@ -329,11 +329,20 @@ def convert_and_save(wrapper, example_inputs, out_xml: Path, dyn_axes,
             o.get_tensor().set_names({out_names[i]})
 
     if quant_mode and quant_mode != "none" and nncf is not None:
+        M = nncf.CompressWeightsMode
         if quant_mode == "int4":
-            m = nncf.compress_weights(m, mode=nncf.CompressWeightsMode.INT4_SYM,
-                                      group_size=group_size, ratio=1.0)
+            m = nncf.compress_weights(m, mode=M.INT4_SYM, group_size=group_size, ratio=1.0)
         elif quant_mode == "int8":
-            m = nncf.compress_weights(m, mode=nncf.CompressWeightsMode.INT8_SYM)
+            m = nncf.compress_weights(m, mode=M.INT8_SYM)
+        elif quant_mode == "nf4":
+            # Distribution-matched 4-bit (NormalFloat). Recovers the
+            # small-magnitude weights linear int4/int8 crush on FP8-native
+            # experts; runs on the OV CPU FullyConnected decompression kernel.
+            m = nncf.compress_weights(m, mode=M.NF4, group_size=group_size, ratio=1.0)
+        elif quant_mode == "mxfp4":
+            m = nncf.compress_weights(m, mode=M.MXFP4)  # MX spec fixes group size 32
+        else:
+            raise ValueError(f"unknown quant_mode {quant_mode!r}")
 
     out_xml.parent.mkdir(parents=True, exist_ok=True)
     ov.save_model(m, str(out_xml), compress_to_fp16=False)
@@ -558,7 +567,16 @@ def export_full_streaming(args, out: Path):
     H = cfg["hidden_size"]
     KV, D = cfg["num_kv_heads"], cfg["head_dim"]
     qmode = "none" if args.no_quant else "int4"
-    expert_q = "int8" if args.experts_int8 else qmode
+    if args.no_quant:
+        expert_q = "none"
+    elif args.experts_int8:           # back-compat alias
+        expert_q = "int8"
+    else:
+        expert_q = args.expert_quant   # int4 (default) | nf4 | mxfp4 | int8
+    # NF4 quality is group-size sensitive on small experts; 64 is the
+    # researched sweet spot (drop to 32 if coherence is marginal).
+    expert_gs = args.expert_group_size if args.expert_group_size > 0 else (
+        64 if expert_q == "nf4" else 128)
     # Routing + lm_head are precision-sensitive (MiniMax-M2 keeps gate /
     # e_score_correction_bias / lm_head full-precision); the shell graph
     # carries the router gate, so default shells + head to fp16.
@@ -663,7 +681,7 @@ def export_full_streaming(args, out: Path):
                 experts_mod = _ns(gate_up_proj=[torch.cat([w1, w3], dim=0)], down_proj=[w2])
                 convert_and_save(ExpertWrapper(experts_mod, 0), (torch.zeros((1, 1, H)),),
                                  edir / f"expert_{ei:03d}" / "openvino_model.xml",
-                                 {0: [1]}, ["x"], ["y"], expert_q)
+                                 {0: [1]}, ["x"], ["y"], expert_q, group_size=expert_gs)
                 del w1, w3, w2, experts_mod
         print(f"[layer {li}] shell + {cfg['num_experts']} experts done", flush=True)
 
@@ -733,7 +751,12 @@ def main():
     ap.add_argument("--layers", default="", help="subset e.g. 0-3 (debug); default all")
     ap.add_argument("--no-quant", action="store_true", help="skip INT4 (fp32 weights)")
     ap.add_argument("--experts-int8", action="store_true",
-                    help="INT8 experts instead of INT4 (debug numerics)")
+                    help="INT8 experts (back-compat alias for --expert-quant int8)")
+    ap.add_argument("--expert-quant", choices=["int4", "int8", "nf4", "mxfp4"], default="int4",
+                    help="expert weight quant. nf4 = distribution-matched 4-bit (recommended for "
+                         "MiniMax-M2's FP8-native experts; linear int4/int8 collapse coherence)")
+    ap.add_argument("--expert-group-size", type=int, default=0,
+                    help="group size for expert quant (0 = auto: 64 for nf4, 128 otherwise)")
     ap.add_argument("--experts", choices=["ov_ir", "int4_bin"], default="ov_ir",
                     help="full-model expert backend: per-expert OV IR (default) or "
                          "flat int4 binaries for the AVX-512 kernel (faster decode)")
