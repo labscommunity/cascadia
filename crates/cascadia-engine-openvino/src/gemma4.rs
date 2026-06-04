@@ -300,7 +300,7 @@ fn encode_cross_kv_header(tags: &[i64]) -> WireTensor {
 /// Decode + validate the cross-KV header (see [`encode_cross_kv_header`]).
 /// Returns the per-frame tags for the frames that follow.
 fn decode_cross_kv_header(t: &WireTensor) -> EngineResult<Vec<i64>> {
-    if t.dtype != WireDType::I64 || t.data.is_empty() || t.data.len() % 8 != 0 {
+    if t.dtype != WireDType::I64 || t.data.is_empty() || !t.data.len().is_multiple_of(8) {
         return Err(EngineError::Backend(format!(
             "expected an I64 cross-KV header frame, got dtype={:?} len={} — likely a \
              desynced activation stream",
@@ -1401,5 +1401,51 @@ mod tests {
     async fn connect_no_peers_is_noop_for_single_stage() {
         let mut b = Gemma4Builder::new("/x", 0, 1, "CPU");
         b.connect(PeerLayout::single_stage()).await.unwrap();
+    }
+
+    /// The load-time adjacency guard must reject a 3-stage pipeline where a
+    /// stage consumes cross-stage KV from a source the immediate upstream does
+    /// NOT produce (non-adjacent / multi-hop sharing) — with a clear error,
+    /// before compiling the IR. Hermetic: only stage_config.json files are
+    /// needed (the guard runs ahead of OV compile), so no IR / transport.
+    #[tokio::test]
+    async fn rejects_non_adjacent_cross_stage_kv() {
+        let dir = std::env::temp_dir().join(format!("cascadia_g4_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("stage_1")).unwrap();
+        std::fs::create_dir_all(dir.join("stage_2")).unwrap();
+        std::fs::write(
+            dir.join("pipeline_config.json"),
+            r#"{"model_id":"m","num_stages":3,"num_layers":30}"#,
+        )
+        .unwrap();
+        // stage_1 (the immediate upstream of stage_2) produces NO cross-stage KV.
+        std::fs::write(
+            dir.join("stage_1/stage_config.json"),
+            r#"{"layer_start":10,"layer_end":20,"stateful":true,"cross_stage_sources_local":[]}"#,
+        )
+        .unwrap();
+        // stage_2 consumes source layer 5 — which lives in stage_0, two hops up.
+        std::fs::write(
+            dir.join("stage_2/stage_config.json"),
+            r#"{"layer_start":20,"layer_end":30,"has_head":true,"stateful":true,
+                "external_shared_sources":[{"src_global_layer":5}]}"#,
+        )
+        .unwrap();
+        let mut b = Gemma4Builder::new(&dir, 2, 3, "CPU");
+        let res = b.load(ShardSpec::single_stage("m", "CPU")).await;
+        std::fs::remove_dir_all(&dir).ok();
+        match res {
+            Err(EngineError::ShardRejected(msg)) => {
+                assert!(
+                    msg.contains("non-adjacent") || msg.contains("does not produce"),
+                    "expected a non-adjacency rejection, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected ShardRejected, got a different error: {e:?}"),
+            Ok(_) => {
+                panic!("expected ShardRejected for non-adjacent KV sharing, but load() succeeded")
+            }
+        }
     }
 }
