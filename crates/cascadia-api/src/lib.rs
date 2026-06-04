@@ -51,11 +51,12 @@ pub struct AppState {
     pub model_id: String,
     pub permits: Arc<Semaphore>,
     pub max_prompt_bytes: usize,
-    /// Optional Jinja2 chat template (from tokenizer_config.json's
-    /// `chat_template` field). When set, /v1/chat/completions renders
-    /// messages through it; when None, falls back to the legacy
-    /// "role: content\n…" join.
-    pub chat_template: Option<Arc<str>>,
+    /// Pre-built minijinja environment for the model's HF chat template (from
+    /// tokenizer_config.json's `chat_template` field or a sibling
+    /// `chat_template.jinja`), parsed ONCE at router construction. When set,
+    /// /v1/chat/completions renders messages through it; when None (no template
+    /// or a parse error), falls back to the legacy "role: content\n…" join.
+    pub chat_env: Option<Arc<minijinja::Environment<'static>>>,
     pub bos_token: Arc<str>,
     pub eos_token: Arc<str>,
 }
@@ -92,8 +93,16 @@ impl Default for Config {
 /// "role: content" formatting in that case. Some HF tokenizer configs
 /// store special tokens as objects ({"content": "...", ...}) rather than
 /// strings; both shapes are handled.
+///
+/// Newer HF exports (Gemma 3/4, recent Llama) drop the inline
+/// `chat_template` JSON field and ship the template as a sibling
+/// `chat_template.jinja` file instead — too large/complex to embed in
+/// JSON. When the inline field is absent we fall back to that file, so
+/// instruct models render through their real template rather than the
+/// legacy formatter (which degenerates instruct models).
 pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
-    let p = model_dir.join("tokenizer").join("tokenizer_config.json");
+    let tok_dir = model_dir.join("tokenizer");
+    let p = tok_dir.join("tokenizer_config.json");
     let Ok(bytes) = std::fs::read(&p) else {
         return ChatTemplateConfig::default();
     };
@@ -103,7 +112,13 @@ pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateCon
     let template = v
         .get("chat_template")
         .and_then(|t| t.as_str())
-        .map(|s| s.to_owned());
+        .map(|s| s.to_owned())
+        .or_else(|| std::fs::read_to_string(tok_dir.join("chat_template.jinja")).ok())
+        // An empty / whitespace-only template (a zero-byte placeholder, or a
+        // download truncated to empty) must NOT be treated as usable: rendering
+        // through it produces an empty prompt, which is worse than the legacy
+        // "role: content" formatter. Drop to None so the caller falls back.
+        .filter(|s| !s.trim().is_empty());
     let extract_token = |key: &str| -> Option<String> {
         let val = v.get(key)?;
         if let Some(s) = val.as_str() {
@@ -136,7 +151,19 @@ pub fn make_router_with_config(
         model_id: model_id.into(),
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
         max_prompt_bytes: cfg.max_prompt_bytes,
-        chat_template: cfg.chat_template.template.map(Arc::from),
+        // Parse the chat template once here (not per request). A parse error
+        // downgrades to the legacy formatter rather than failing every request.
+        chat_env: cfg
+            .chat_template
+            .template
+            .as_deref()
+            .and_then(|src| match build_chat_env(src) {
+                Ok(env) => Some(Arc::new(env)),
+                Err(e) => {
+                    warn!(error = %e, "chat_template failed to parse at startup; using legacy formatter");
+                    None
+                }
+            }),
         bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
     };
@@ -261,17 +288,15 @@ fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
     buf
 }
 
-/// Render messages through the model's HF Jinja2 chat_template. Returns
-/// Err on any template parse/render error so the caller can fall back to
-/// [`render_prompt_legacy`] rather than fail the request entirely.
-fn render_prompt_with_template(
-    template_src: &str,
-    messages: &[ChatMessage],
-    bos_token: &str,
-    eos_token: &str,
-) -> Result<String, String> {
+/// Build the minijinja environment for a model's HF chat template ONCE, with
+/// the template pre-parsed and the HF-compat shims installed. The template is
+/// fixed at model load, so this is built at router construction and reused
+/// across every request — the ~17 KB Gemma 3/4 macro template is parsed once,
+/// not on each `/v1/chat/completions` call. Returns Err on parse failure so the
+/// caller can fall back to the legacy formatter.
+fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
     use minijinja::value::Value;
-    use minijinja::{context, Environment, Error, ErrorKind};
+    use minijinja::{Environment, Error, ErrorKind};
 
     let mut env = Environment::new();
     // HF chat templates were authored against transformers' Jinja2 env,
@@ -293,8 +318,25 @@ fn render_prompt_with_template(
     // inference correctness — a fixed empty string is a safe stand-in.
     env.add_function("strftime_now", |_fmt: String| -> String { String::new() });
 
-    env.add_template("chat", template_src)
+    // add_template_owned (not add_template) so the Environment owns the source
+    // and is 'static — it can then live in AppState behind an Arc.
+    env.add_template_owned("chat", template_src.to_owned())
         .map_err(|e| format!("template parse: {e}"))?;
+    Ok(env)
+}
+
+/// Render messages through a pre-built chat environment (see [`build_chat_env`]).
+/// Returns Err on any render error so the caller can fall back to
+/// [`render_prompt_legacy`] rather than fail the request entirely.
+fn render_with_chat_env(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+) -> Result<String, String> {
+    use minijinja::context;
+    use minijinja::value::Value;
+
     let tmpl = env
         .get_template("chat")
         .map_err(|e| format!("template lookup: {e}"))?;
@@ -302,7 +344,7 @@ fn render_prompt_with_template(
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
-            Value::from_serialize(&serde_json::json!({
+            Value::from_serialize(serde_json::json!({
                 "role": m.role,
                 "content": m.content,
             }))
@@ -321,8 +363,8 @@ fn render_prompt_with_template(
 }
 
 fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
-    if let Some(tmpl) = &state.chat_template {
-        match render_prompt_with_template(tmpl, messages, &state.bos_token, &state.eos_token) {
+    if let Some(env) = &state.chat_env {
+        match render_with_chat_env(env, messages, &state.bos_token, &state.eos_token) {
             Ok(s) => return s,
             Err(e) => {
                 warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
@@ -643,5 +685,83 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[test]
+    fn load_chat_template_falls_back_to_jinja_sibling() {
+        // Gemma 3/4 (and recent Llama) ship the template as a sibling
+        // chat_template.jinja file with no inline `chat_template` field in
+        // tokenizer_config.json. The loader must pick up the .jinja file.
+        let dir = std::env::temp_dir().join(format!("cascadia_g4_tmpl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // robust to leftover dirt (PID reuse)
+        let tok = dir.join("tokenizer");
+        std::fs::create_dir_all(&tok).unwrap();
+        std::fs::write(
+            tok.join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>", "eos_token": {"content": "<eos>"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tok.join("chat_template.jinja"),
+            "{%- macro greet() -%}hello{%- endmacro -%}{{ greet() }}",
+        )
+        .unwrap();
+        let cfg = load_chat_template_config(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            cfg.template.as_deref().unwrap_or("").contains("macro"),
+            "expected template loaded from chat_template.jinja"
+        );
+        assert_eq!(cfg.bos_token.as_deref(), Some("<bos>"));
+        assert_eq!(cfg.eos_token.as_deref(), Some("<eos>"));
+    }
+
+    #[test]
+    fn render_prompt_with_template_supports_macros() {
+        // Guards the minijinja `macros` feature: Gemma-style instruct templates
+        // define `{% macro %}` helpers for role formatting. Without the feature
+        // the template fails to parse and chat silently degrades to the legacy
+        // formatter (which produces incoherent output on instruct models).
+        let tmpl = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
+                    {{ text }}<end_of_turn>\n{% endmacro -%}\
+                    {{ bos_token }}{% for m in messages %}{{ turn(m.role, m.content) }}{% endfor %}\
+                    {% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let env = build_chat_env(tmpl).expect("macro-based template must parse");
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>")
+            .expect("macro-based template must render");
+        assert!(out.contains("<bos>"), "out={out}");
+        assert!(out.contains("<start_of_turn>user"), "out={out}");
+        assert!(out.contains("hi"), "out={out}");
+        assert!(out.contains("<start_of_turn>model"), "out={out}");
+    }
+
+    #[test]
+    fn empty_jinja_template_falls_back_to_none() {
+        // A present-but-empty chat_template.jinja must not be treated as a
+        // usable template — rendering through it would yield an empty prompt,
+        // worse than the legacy formatter. The loader must return None so the
+        // request falls back. Guards #115.
+        let dir = std::env::temp_dir().join(format!("cascadia_g4_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // robust to leftover dirt (PID reuse)
+        let tok = dir.join("tokenizer");
+        std::fs::create_dir_all(&tok).unwrap();
+        std::fs::write(
+            tok.join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>"}"#,
+        )
+        .unwrap();
+        // whitespace-only — the worst case (passes a naive is_empty check)
+        std::fs::write(tok.join("chat_template.jinja"), "   \n\t  ").unwrap();
+        let cfg = load_chat_template_config(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            cfg.template.is_none(),
+            "empty/whitespace chat_template.jinja must yield template=None, got {:?}",
+            cfg.template
+        );
     }
 }

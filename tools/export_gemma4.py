@@ -800,6 +800,77 @@ def build_cached_wrapper(model, text_config, stage_plan):
 # ---------------------------------------------------------------------------
 
 
+def make_stateful_with_init_gemma4(ov_model):
+    """Fold gemma4 own-KV (``present.N`` -> ``past_key_values.N``) into stateful
+    ReadValue/Assign Variables WITH an explicit zero-length, batch-1 init.
+
+    Unlike export_shards.make_stateful_with_init this maps present<->past by
+    NAME (the gemma4 graph interleaves ``cross_kv.*`` outputs and
+    ``external_kv.*`` inputs, so index-based folding does not apply), keeps
+    every non-``present.*`` result (logits/hidden_states + cross_kv.*) and
+    non-``past_key_values.*`` parameter (input_ids/hidden_states, position_ids,
+    external_kv.*), and adds NO beam_idx/cache-reorder (gemma4 has none).
+
+    The init matters: ``apply_make_stateful_transformation`` emits init-less
+    ReadValues that the OV CPU plugin rejects (#57), and even where they load,
+    ``reset_state()`` yields a {0,h,0,d} (batch-0) state whose KV Concat fails
+    against the {1,h,seq,d} new K/V. A {1,h,0,d} init makes ``reset_state()``
+    work uniformly across stages (same approach as the v5 exporter, #62).
+    """
+    import openvino as ov
+    import openvino.opset13 as ops
+    from openvino import Tensor
+    from openvino.op.util import Variable, VariableInfo
+
+    # present.N.{key,value} source outputs, keyed by their port name.
+    present_src = {}
+    keep_results = []
+    for r in ov_model.get_results():
+        name = next(iter(r.output(0).get_names()), "")
+        if name.startswith("present."):
+            present_src[name] = r.input_value(0)
+        else:
+            keep_results.append(r)  # logits / hidden_states + cross_kv.*
+
+    sinks = []
+    keep_params = []
+    for p in ov_model.get_parameters():
+        nm = p.output(0).get_any_name()
+        if not nm.startswith("past_key_values."):
+            keep_params.append(p)  # input_ids/hidden, position_ids, external_kv.*
+            continue
+        src = present_src[nm.replace("past_key_values.", "present.", 1)]
+        et = p.get_element_type()
+        ps = p.get_partial_shape()
+        # Canonical [batch, kv_heads, seq, head_dim]: only seq (axis 2) is
+        # dynamic; batch defaults to 1, seq to 0 for the zero-length init.
+        if len(ps) != 4 or not ps[1].is_static or not ps[3].is_static:
+            raise RuntimeError(
+                f"{nm}: expected static [batch, kv_heads, seq, head_dim], got {ps}"
+            )
+        dims = [
+            (d.get_length() if d.is_static else (0 if idx >= 2 else 1))
+            for idx, d in enumerate(ps)
+        ]
+        vi = VariableInfo()
+        vi.data_shape = ps
+        vi.data_type = et
+        vi.variable_id = nm
+        var = Variable(vi)
+        rv = ops.read_value(ops.constant(Tensor(et, dims)), var)
+        p.output(0).replace(rv.output(0))
+        if src.get_index() != 0:
+            raise RuntimeError(
+                f"present source for {nm} is output #{src.get_index()}; "
+                "assign needs a single-output node"
+            )
+        sinks.append(ops.assign(src.get_node(), var))
+
+    new_model = ov.Model(keep_results, sinks, keep_params)
+    new_model.validate_nodes_and_infer_types()
+    return new_model
+
+
 def export_single_stage(model, text_config, stage_plan, output_dir, quantization, device_verify="CPU"):
     """Trace the Gemma 4 wrapper for one stage, convert to OV, make
     KV state stateful, optionally compress, save under
@@ -929,19 +1000,14 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
         out.set_names({name})
     ov_model.validate_nodes_and_infer_types()
 
-    # Make stateful for own KV (cross_kv stays as regular output; external_kv
-    # stays as regular input).
-    log(f"  apply_make_stateful_transformation ({n_own_kv} KV pairs)...")
-    from openvino._offline_transformations import (
-        apply_make_stateful_transformation,
-    )
-
-    kv_pairs = {}
-    for oi in range(n_own_kv):
-        for kt in ("key", "value"):
-            kv_pairs[f"past_key_values.{oi}.{kt}"] = f"present.{oi}.{kt}"
-    if kv_pairs:
-        apply_make_stateful_transformation(ov_model, kv_pairs)
+    # Make own KV stateful WITH explicit batch-1 zero-length inits (cross_kv
+    # stays a regular output; external_kv stays a regular input). Init-bearing
+    # ReadValues are required so the OV CPU plugin loads the shard AND so
+    # reset_state() yields a {1,h,0,d} state at the runtime (an init-less
+    # ReadValue gives {0,h,0,d}, whose KV Concat fails against the new K/V).
+    log(f"  make_stateful_with_init ({n_own_kv} own-KV pairs)...")
+    if n_own_kv > 0:
+        ov_model = make_stateful_with_init_gemma4(ov_model)
     ov_model.validate_nodes_and_infer_types()
     log(
         f"  Stateful: {len(ov_model.inputs)} inputs, "
