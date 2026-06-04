@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
-    OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+    Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
@@ -102,6 +102,10 @@ pub enum EngineKind {
     OvGenai,
     OvRuntime,
     OvDistSpec,
+    /// Gemma 4 multi-stage engine. Drives `gemma4_cached_v1` shards
+    /// (per-layer-type asymmetric attention, KV-sharing, per-layer
+    /// embeddings, baked softcap) produced by `tools/export_gemma4.py`.
+    Gemma4,
     /// Kimi K2.6-style sparse-MoE engine. Routes only the top-k experts
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
@@ -474,6 +478,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
+    println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
     Ok(())
 }
@@ -553,6 +558,19 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::OvRuntime => {
             let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
+            }
+            if let Some(prec) = &args.ov_kv_precision {
+                b = b.with_kv_cache_precision(prec);
+            }
+            if let Some(group) = &args.ov_dyn_quant_group {
+                b = b.with_dyn_quant_group(group);
+            }
+            Ok(Box::new(b))
+        }
+        EngineKind::Gemma4 => {
+            let mut b = Gemma4Builder::new(&args.model, args.rank, args.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
