@@ -31,6 +31,28 @@ def silu(x):
     return x / (1.0 + np.exp(-x))
 
 
+def quant_dequant(w, mode):
+    """Simulate weight quantization on an fp32 [out,in] matrix, matching the
+    exporter: int8 = per-output-channel symmetric (max/127); int4 = per-
+    32-col-group symmetric (max/7). 'none' returns w unchanged. Lets the
+    probe compare FP8-precision experts vs int8/int4-*linear*-quant experts
+    with everything else (routing, attention, the SwiGLU math) identical."""
+    if mode == "none":
+        return w
+    if mode == "int8":
+        s = np.abs(w).max(axis=1, keepdims=True) / 127.0
+        s[s == 0] = 1.0
+        return np.round(w / s).clip(-127, 127) * s
+    if mode == "int4":
+        out, inn = w.shape
+        g = 32
+        wg = w.reshape(out, inn // g, g)
+        s = np.abs(wg).max(axis=2, keepdims=True) / 7.0
+        s[s == 0] = 1.0
+        return (np.round(wg / s).clip(-8, 7) * s).reshape(out, inn)
+    raise ValueError(mode)
+
+
 def sample(logits, history, rep_penalty, rep_window, temperature):
     work = logits.astype(np.float32).copy()
     if abs(rep_penalty - 1.0) > 1e-9 and history:
@@ -57,6 +79,8 @@ def main():
     ap.add_argument("--rep-penalty", type=float, default=1.0)
     ap.add_argument("--rep-window", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--quant", choices=["none", "int8", "int4"], default="none",
+                    help="simulate expert weight quantization (none=fp32/FP8-precision)")
     ap.add_argument("--device", default="CPU")
     args = ap.parse_args()
 
@@ -87,9 +111,9 @@ def main():
         w = expert_cache.get(key)
         if w is None:
             b = f"model.layers.{li}.block_sparse_moe.experts.{ei}"
-            w = (reader.weight(b + ".w1").numpy(),   # gate [inter,H]
-                 reader.weight(b + ".w3").numpy(),   # up
-                 reader.weight(b + ".w2").numpy())   # down [H,inter]
+            w = (quant_dequant(reader.weight(b + ".w1").numpy(), args.quant),   # gate
+                 quant_dequant(reader.weight(b + ".w3").numpy(), args.quant),   # up
+                 quant_dequant(reader.weight(b + ".w2").numpy(), args.quant))   # down
             if len(expert_cache) < 64:               # tiny cache; recompute keeps RSS low
                 expert_cache[key] = w
         return w

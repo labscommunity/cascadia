@@ -120,20 +120,29 @@ the comparison runs:
 - **Precise routing** (`--shell-quant none --head-quant none`, keeping the
   router gate + lm_head full-precision as M2 itself does) extends coherent
   output from one fact to two, but does not fix the deeper degradation.
-- The residual incoherence is the **int4 experts** (the bulk of the model
-  at ~4 bits). This is now *confirmed*: running the experts unquantized
-  (`tools/test_minimax_m2_fp_experts.py`, fp32 experts dequantized from the
-  FP8 source, same fp32 shells) gives fully coherent output —
+- The residual incoherence is the **quantized experts**, and — the
+  non-obvious finding — **it's the *kind* of quantization, not the bit
+  width.** Three points, everything else (routing, attention, shells)
+  identical:
 
-  > " Paris. The capital of the United States is Washington, D.C. The
-  > capital city (or simply \"capital\") refers …"
+  | experts | "The capital of France is" → |
+  | --- | --- |
+  | fp32 (FP8-precision, `test_minimax_m2_fp_experts.py`) | ` Paris. The capital of the United States is Washington, D.C. The capital city (or simply "capital") refers …` ✅ coherent |
+  | int8 (per-channel linear, NNCF) | ` Paris. … Washington, capitals … 三省三省 . United . and Â 糊 base` ❌ |
+  | int4 (group-32 linear) | ` Paris. … Washington, capitals … 三省三省 United .. 三省 and 俞` ❌ |
 
-  — no degradation. So int8 experts (much closer to fp32 than int4) would
-  restore coherence. The full int8 *artifact* (~225 GB) just can't coexist
-  with the 215 GB FP8 source on the test box's 448 GB disk; producing it
-  needs a larger disk (or calibrated int4, AWQ/GPTQ-style, to keep the
-  int4 footprint while recovering quality) — future work. The exporter's
-  `--experts-int8` path produces int8 OV-IR experts where disk allows.
+  int8 degrades **like int4**, not like fp32 — even though int8 has 2× the
+  bits. The experts are natively **FP8 (e4m3 — float, log-spaced, wide
+  dynamic range)**; the fp32 probe preserves that exactly and is coherent,
+  but **linear** int8/int4 quant (uniform step = max/127 or max/7) collapses
+  the small-magnitude weights that FP8's log spacing kept. So the fix is a
+  **distribution-matched / float quant** (FP8, NF4, or AWQ/GPTQ-style
+  calibrated int4) — *not* more linear bits. A plain int8 artifact is built
+  and runs (exporter `--experts-int8`) but does not recover quality.
+
+  (The int8 artifact was built in place via `--free-source-shards`, which
+  consumed the FP8 source; re-running the fp32/quant-simulation probe to
+  further dissect this needs a fresh FP8 download.)
 
 ## Tests
 
