@@ -693,6 +693,7 @@ mod tests {
         // chat_template.jinja file with no inline `chat_template` field in
         // tokenizer_config.json. The loader must pick up the .jinja file.
         let dir = std::env::temp_dir().join(format!("cascadia_g4_tmpl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // robust to leftover dirt (PID reuse)
         let tok = dir.join("tokenizer");
         std::fs::create_dir_all(&tok).unwrap();
         std::fs::write(
@@ -745,6 +746,7 @@ mod tests {
         // worse than the legacy formatter. The loader must return None so the
         // request falls back. Guards #115.
         let dir = std::env::temp_dir().join(format!("cascadia_g4_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // robust to leftover dirt (PID reuse)
         let tok = dir.join("tokenizer");
         std::fs::create_dir_all(&tok).unwrap();
         std::fs::write(

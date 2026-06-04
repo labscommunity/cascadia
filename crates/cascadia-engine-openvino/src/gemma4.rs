@@ -210,7 +210,7 @@ fn map_ov_err(err: OvError) -> EngineError {
 }
 
 /// Decode a float output port's raw bytes to f32, by its reported dtype.
-/// Shared by every output-reading path (run_first / run_relay / static).
+/// Shared by both output-reading paths (run_first / run_relay).
 fn bytes_to_f32(dtype: ShimDType, bytes: &[u8]) -> EngineResult<Vec<f32>> {
     match dtype {
         ShimDType::F32 => Ok(bytes
@@ -672,6 +672,21 @@ impl Gemma4Engine {
         let position = decode_wire_position(&pos_t)?;
         let tags = decode_cross_kv_header(&header_t)?;
         let n = tags.len();
+        // Strict frame-count guard (restores the old count-based check) AND the
+        // distributed-deploy runtime backstop for the load-time adjacency guard
+        // (which is skipped when the sibling stage_config isn't on local disk):
+        // the immediate upstream must send EXACTLY this stage's external_kv
+        // sources — no more (over-production / non-adjacent >1-hop sharing) and
+        // no fewer. A mismatch is a clear error, not a silently-ignored frame.
+        if n != self.external_kv_in.len() {
+            return Err(EngineError::Backend(format!(
+                "upstream sent {n} cross-KV frame(s) but this stage consumes {} external_kv \
+                 input(s) — a cross-stage KV source/consumer mismatch (non-adjacent KV sharing \
+                 across more than one pipeline hop, or a mis-exported pipeline). The immediate \
+                 upstream must produce exactly this stage's external_kv sources.",
+                self.external_kv_in.len()
+            )));
+        }
         let up2 = self.upstream.clone().unwrap();
         let ext_tensors = self
             .block_on(async move {
@@ -854,8 +869,7 @@ impl Gemma4Engine {
     }
 
     /// Decode the delta text for `next_token`, append it to the active task,
-    /// check stop conditions, and build the streamed chunk. Shared by the
-    /// static and stateful first-stage paths.
+    /// check stop conditions, and build the streamed chunk (first stage only).
     fn emit_token(&mut self, next_token: i32) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let active = self
             .active
