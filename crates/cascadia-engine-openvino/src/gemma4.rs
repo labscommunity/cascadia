@@ -174,6 +174,14 @@ fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
+fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
 fn argmax_last_row(logits: &[f32], vocab: usize) -> i32 {
     let row = &logits[logits.len() - vocab..];
     // NaN-aware (see crate::dist_spec::argmax for rationale).
@@ -541,9 +549,12 @@ impl Gemma4Engine {
             .input_named("position_ids")
             .ok_or_else(|| EngineError::Backend("gemma4 IR missing position_ids".into()))?
             .to_string();
-        let hs_bytes = f32_to_f16_bytes(hidden);
+        // Gemma 4 keeps activations in f32 — the IR's hidden_states input is
+        // f32 (unlike v5, whose hidden is f16). Feed raw f32; the upstream
+        // stage sends it as f32 over the wire (see send_hidden_downstream).
+        let hs_bytes = f32_to_bytes(hidden);
         self.runtime
-            .set_input(&in_hs, ShimDType::F16, &shape, &hs_bytes)
+            .set_input(&in_hs, ShimDType::F32, &shape, &hs_bytes)
             .map_err(map_ov_err)?;
         self.runtime
             .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
@@ -656,7 +667,10 @@ impl Gemma4Engine {
         for (i, d) in shape.iter().enumerate().take(MAX_RANK) {
             wire_shape[i] = *d as u32;
         }
-        let hid = WireTensor::new(WireDType::F16, wire_shape, f32_to_f16_bytes(hidden));
+        // Gemma 4 activations are f32 (the IR's hidden_states input/output are
+        // f32). Send raw f32 so the downstream stage feeds it without a lossy
+        // f16 round-trip — matches the f32 Core reference.
+        let hid = WireTensor::new(WireDType::F32, wire_shape, f32_to_bytes(hidden));
         // Static (NPU) shards need the absolute position downstream so each
         // stage can reset its ring at position 0 and align the visible-past
         // count. The wire shape has only MAX_RANK=3 dims (all used by
