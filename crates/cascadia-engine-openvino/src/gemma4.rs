@@ -1,11 +1,10 @@
-//! Multi-stage OpenVINO Runtime engine.
+//! Gemma 4 multi-stage OpenVINO engine (`--engine gemma4`).
 //!
-//! Rust port of `cascadia/worker/engines/openvino/ov_runtime.py`. Loads
-//! pre-exported per-stage stateful OV IRs (rainier v3+ format), runs them
-//! across the existing TCP transport, with stateful KV cache internal to
-//! the IR and `reset_state()` between independent generation tasks.
+//! Serves per-stage `gemma4_cached_v1` OV IR shards (exported by
+//! `tools/export_gemma4.py`) across the TCP activation transport, single-stage
+//! or pipeline-parallel. Own KV is OV internal state, reset between tasks.
 //!
-//! Pipeline-dir layout (matches rainier's exporter):
+//! Pipeline-dir layout:
 //! ```text
 //! <pipeline-dir>/
 //!     pipeline_config.json
@@ -14,18 +13,18 @@
 //!     stage_N/...
 //! ```
 //!
-//! Wire format between stages: hidden_states f16. Stateful shards have each
-//! stage track its own absolute-position counter (computing cos/sin locally,
-//! no position metadata on the wire); the counter resets when an activation
-//! with seq_len > 1 arrives (a prefill signal for relay/last stages).
+//! Wire format (downstream, per step): an absolute-position frame (relay stages
+//! use it as their `position_ids` base and reset own KV when it is 0 — correct
+//! for any prompt length), then the hidden activation (f32, matching the IR's
+//! f32 ports; PLI rides inside it), then a self-describing cross-KV header
+//! (count + per-frame tags) and that many cross-stage shared-KV frames.
 //!
-//! Stateless static-shape (NPU) shards (`stage_config.stateful == false`)
-//! instead drive a host-side bounded KV ring per stage (see `StaticKv`).
-//! Because static shards are seq=1, the seq>1 prefill signal is unavailable,
-//! so the first stage carries the absolute `position` as an 8-byte prefix on
-//! each activation; downstream stages reset their ring at position 0 and
-//! derive the visible-past count from it, keeping every stage's ring in
-//! lockstep. This path works single- or multi-stage (pipeline-parallel NPU).
+//! Gemma 4 E2B/E4B reuse a few source layers' KV across later layers; when a
+//! shared layer's source sits in an earlier stage, that KV crosses the wire as
+//! `cross_kv.*` outputs → `external_kv.*` inputs, matched by source-identity tag
+//! (`src_layer*2 + is_value`) so pairing is robust to port ordering and stage
+//! count. Dense shards (no KV-sharing) have no such ports and take a zero-cost
+//! hidden-only relay. Non-adjacent (multi-hop) KV sharing is rejected at load.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,20 +68,32 @@ struct StageConfig {
     has_embed: bool,
     #[serde(default)]
     has_head: bool,
-    /// NPU (`--target npu`) export: KV is stateless (explicit past_kv-in /
-    /// present-out) and all shapes are static. Old/standard shards omit the
-    /// field and are stateful (default true). When false, the engine drives
-    /// the static-KV path (host-side bounded ring) instead of OV state.
+    /// All gemma4 shards are stateful (own KV is OV internal state). The field
+    /// is kept so the engine can reject a non-stateful (stateless/NPU) shard
+    /// with a clear message — the gemma4 engine has no static-KV path.
     #[serde(default = "default_true")]
     stateful: bool,
+    /// Local indices (within this stage) of layers whose own KV a LATER stage
+    /// reuses — i.e. the source layers behind this stage's `cross_kv.*` outputs,
+    /// in `cross_kv.0,1,…` order. Global source-layer id = `layer_start + this`.
+    /// Used to tag each cross_kv frame on the wire by source id so the consumer
+    /// pairs explicitly (not positionally). Empty unless this stage produces
+    /// cross-stage shared KV.
     #[serde(default)]
-    static_seq: Option<u32>,
+    cross_stage_sources_local: Vec<u32>,
+    /// The cross-stage shared-KV sources this stage CONSUMES, in
+    /// `external_kv.0,1,…` order. Each carries the GLOBAL source-layer id used
+    /// to match an incoming wire frame to the right `external_kv.*` input.
     #[serde(default)]
-    static_context: Option<u32>,
+    external_shared_sources: Vec<ExternalSrc>,
+}
+
+/// One entry of `external_shared_sources` in stage_config.json. Only the global
+/// source-layer id is needed at runtime (to match cross-stage KV by source).
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ExternalSrc {
     #[serde(default)]
-    num_kv_heads: Option<u32>,
-    #[serde(default)]
-    head_dim: Option<u32>,
+    src_global_layer: u32,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -154,16 +165,6 @@ fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
             f16::from_bits(bits).to_f32()
         })
         .collect()
-}
-
-fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
-    use half::f16;
-    let mut out = Vec::with_capacity(v.len() * 2);
-    for x in v {
-        let h = f16::from_f32(*x);
-        out.extend_from_slice(&h.to_bits().to_le_bytes());
-    }
-    out
 }
 
 fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -258,8 +259,20 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
 /// the transport caps tensor rank at MAX_RANK=3, so we drop it; the receiver
 /// restores it. Payload is unchanged (dropping a unit dim leaves the element
 /// count identical), so the transport's strict `payload == shape*dtype` check
-/// still holds. Errors if the output is not the expected rank-4 batch-1 shape.
-fn pack_cross_kv_frame(shape4: &[usize], bytes: Vec<u8>) -> EngineResult<WireTensor> {
+/// still holds. Errors if the output dtype is not F32 (the gemma4 IR emits f32
+/// KV; mislabeling it would corrupt the consumer) or the shape is not rank-4
+/// batch-1.
+fn pack_cross_kv_frame(
+    dt: ShimDType,
+    shape4: &[usize],
+    bytes: Vec<u8>,
+) -> EngineResult<WireTensor> {
+    if dt != ShimDType::F32 {
+        return Err(EngineError::Backend(format!(
+            "cross_kv output dtype is {dt:?}, expected F32 (the gemma4 IR emits f32 KV); \
+             the wire frame would mislabel it"
+        )));
+    }
     if shape4.len() != 4 || shape4[0] != 1 {
         return Err(EngineError::Backend(format!(
             "cross_kv output shape {shape4:?} is not [1,kvh,ctx,hd]"
@@ -269,12 +282,85 @@ fn pack_cross_kv_frame(shape4: &[usize], bytes: Vec<u8>) -> EngineResult<WireTen
     Ok(WireTensor::new(WireDType::F32, ws, bytes))
 }
 
-/// Encode the absolute position as its own framed wire tensor (I64 `[1,1,1]`).
-/// The static (NPU) path sends this immediately before each hidden activation
-/// so relay stages reset/align their KV ring; the transport requires
-/// `payload_len == shape*dtype`, so position cannot be packed into the hidden
-/// tensor (and MAX_RANK=3 leaves no spare shape slot). Paired with
-/// `decode_wire_position` — keep the two in sync.
+/// Encode the cross-KV header: an I64 frame whose first element is the number
+/// of cross_kv frames that follow, then that many per-frame TAGS (in send
+/// order). Each tag identifies the source layer + key/value role of the frame
+/// (`src_global_layer * 2 + is_value`), so the consumer reads exactly the right
+/// number of frames (desync-proof) and matches each to its `external_kv.*`
+/// input by tag (order- and stage-count-independent). Always sent — a header of
+/// `[0]` means no cross-stage KV (single-stage / dense shards).
+fn encode_cross_kv_header(tags: &[i64]) -> WireTensor {
+    let mut vals = Vec::with_capacity(1 + tags.len());
+    vals.push(tags.len() as i64);
+    vals.extend_from_slice(tags);
+    let n = vals.len() as u32;
+    WireTensor::new(WireDType::I64, [1, 1, n], i64_to_bytes(&vals))
+}
+
+/// Decode + validate the cross-KV header (see [`encode_cross_kv_header`]).
+/// Returns the per-frame tags for the frames that follow.
+fn decode_cross_kv_header(t: &WireTensor) -> EngineResult<Vec<i64>> {
+    if t.dtype != WireDType::I64 || t.data.is_empty() || t.data.len() % 8 != 0 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 cross-KV header frame, got dtype={:?} len={} — likely a \
+             desynced activation stream",
+            t.dtype,
+            t.data.len()
+        )));
+    }
+    let vals: Vec<i64> = t
+        .data
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let count = vals[0];
+    if count < 0 || count as usize != vals.len() - 1 {
+        return Err(EngineError::Backend(format!(
+            "cross-KV header declares {count} frames but carries {} tags",
+            vals.len() - 1
+        )));
+    }
+    Ok(vals[1..].to_vec())
+}
+
+/// Parse a `cross_kv.{i}.key|value` / `external_kv.{i}.key|value` port name into
+/// its `(index, is_value)`. Returns None for any other port.
+fn parse_kv_port(name: &str, prefix: &str) -> Option<(usize, bool)> {
+    let rest = name.strip_prefix(prefix)?;
+    let mut it = rest.split('.');
+    let idx: usize = it.next()?.parse().ok()?;
+    let is_value = match it.next()? {
+        "value" => true,
+        "key" => false,
+        _ => return None,
+    };
+    Some((idx, is_value))
+}
+
+/// A `cross_kv.*` output this stage produces: the OV output port index + the
+/// wire tag (`src_global_layer * 2 + is_value`) identifying the source layer
+/// and key/value role.
+#[derive(Clone)]
+struct CrossKvOut {
+    out_idx: usize,
+    tag: i64,
+}
+
+/// An `external_kv.*` input this stage consumes: the IR port name + the wire tag
+/// (`src_global_layer * 2 + is_value`) it must be fed from.
+#[derive(Clone)]
+struct ExternalKvIn {
+    name: String,
+    tag: i64,
+}
+
+/// Encode the absolute start-position as its own framed wire tensor (I64
+/// `[1,1,1]`), sent before each hidden activation. Relay stages use it directly
+/// as their `position_ids` base and reset their stateful KV when it is 0 (start
+/// of a new sequence) — so a 1-token prompt is handled correctly, unlike a
+/// `seq_len > 1` heuristic. The transport requires `payload_len == shape*dtype`
+/// and MAX_RANK=3 leaves no spare slot in the hidden tensor, so position rides
+/// as its own frame. Paired with `decode_wire_position` — keep the two in sync.
 fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
@@ -287,7 +373,7 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
     if t.dtype != WireDType::I64 || t.data.len() != 8 {
         return Err(EngineError::Backend(format!(
             "expected an I64 8-byte position frame, got dtype={:?} len={} — likely a \
-             stateful/static pipeline mismatch or a desynced activation stream",
+             desynced activation stream",
             t.dtype,
             t.data.len()
         )));
@@ -295,125 +381,6 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&t.data);
     Ok(i64::from_le_bytes(b))
-}
-
-// -------- static-KV (NPU) state --------
-
-/// Per-layer port wiring for a stateless static-shape (NPU) shard.
-struct StaticKvLayer {
-    key_in: String,
-    val_in: String,
-    key_out: usize,
-    val_out: usize,
-}
-
-/// Host-side bounded KV ring for the stateless static-shape (NPU) path.
-/// The exported IR takes explicit `past_key_values.*` (length `past_len`) +
-/// `attention_mask` (length `context = past_len + 1`) + `position_ids`, and
-/// returns its primary output (logits for the head stage, hidden_states
-/// otherwise) at output index 0, plus `present.*` (length `context`). We hold
-/// the KV for the most recent `valid` real tokens left-aligned in
-/// `past_len`-slot buffers, feed them each step, and absorb the new token's KV
-/// from `present[past_len]`. One ring per stage; in a multi-stage pipeline
-/// every stage runs its own ring over its own layers, kept in lockstep by the
-/// absolute `position` the first stage carries with each activation.
-struct StaticKv {
-    past_len: usize,
-    context: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    elem_bytes: usize,
-    kv_dtype: ShimDType,
-    /// Resolved primary input port names (cached at build so the per-token
-    /// decode loop does no HashMap lookups / string allocs). `ids_in` is set
-    /// for the embed stage, `hidden_in` for relay/head stages.
-    ids_in: Option<String>,
-    hidden_in: Option<String>,
-    attn_in: String,
-    pos_in: String,
-    layers: Vec<StaticKvLayer>,
-    key_buf: Vec<Vec<u8>>, // [layer] = kv_heads * past_len * head_dim * elem_bytes
-    val_buf: Vec<Vec<u8>>,
-    valid: usize, // number of real past tokens currently in the ring
-    /// Reusable attention_mask byte buffer (i64 LE, length context*8), rewritten
-    /// in place each token to avoid a per-token allocation.
-    mask_bytes: Vec<u8>,
-}
-
-impl StaticKv {
-    fn reset(&mut self) {
-        for b in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
-            b.iter_mut().for_each(|x| *x = 0);
-        }
-        self.valid = 0;
-    }
-
-    /// Expected byte length of one layer's `present.*` output:
-    /// `kv_heads * context * head_dim * elem_bytes`. Used to validate the IR's
-    /// output shape/dtype before `absorb_layer` slices it.
-    fn present_layer_bytes(&self) -> usize {
-        self.kv_heads * self.context * self.head_dim * self.elem_bytes
-    }
-
-    /// Set how many real past tokens are visible for a token at absolute
-    /// `position`, resetting the ring at the start of a new sequence
-    /// (`position == 0`). The window is bounded by `past_len`.
-    fn begin_token(&mut self, position: usize) {
-        if position == 0 {
-            self.reset();
-        }
-        self.valid = position.min(self.past_len);
-    }
-
-    /// Rewrite `mask_bytes` (i64 LE) for the current `valid`: 1 for the `valid`
-    /// real past slots (left-aligned) + the current token (slot `past_len`), 0
-    /// for the padding past slots in between. Reuses the buffer's capacity.
-    fn write_mask_bytes(&mut self) {
-        self.mask_bytes.clear();
-        self.mask_bytes.resize(self.context * 8, 0);
-        for i in 0..self.context {
-            let v: i64 = if i < self.valid || i == self.past_len {
-                1
-            } else {
-                0
-            };
-            self.mask_bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-
-    /// Copy the new token's K/V (slot `past_len` of `present`) into the
-    /// layer's ring buffer, appending at `valid` or sliding the window when
-    /// full. Selects `key_buf[li]` or `val_buf[li]` internally so callers can
-    /// hold `&mut self` without aliasing the buffer field.
-    fn absorb_layer(&mut self, li: usize, is_value: bool, present: &[u8]) {
-        // Read scalar fields into locals before borrowing the buffer field,
-        // so the mutable buffer borrow stays disjoint from these reads.
-        let slot = self.head_dim * self.elem_bytes;
-        let present_row = self.context * slot; // per-head stride in present
-        let buf_row = self.past_len * slot; // per-head stride in the ring
-        let full = self.valid >= self.past_len;
-        let kv_heads = self.kv_heads;
-        let past_len = self.past_len;
-        let valid = self.valid;
-        let buf: &mut [u8] = if is_value {
-            &mut self.val_buf[li]
-        } else {
-            &mut self.key_buf[li]
-        };
-        for h in 0..kv_heads {
-            let src = h * present_row + past_len * slot;
-            let new = &present[src..src + slot];
-            let base = h * buf_row;
-            if full {
-                buf.copy_within(base + slot..base + buf_row, base); // drop oldest
-                let dst = base + (past_len - 1) * slot;
-                buf[dst..dst + slot].copy_from_slice(new);
-            } else {
-                let dst = base + valid * slot;
-                buf[dst..dst + slot].copy_from_slice(new);
-            }
-        }
-    }
 }
 
 // -------- Engine --------
@@ -453,25 +420,19 @@ pub struct Gemma4Engine {
     canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
-    /// Set for stateless static-shape (NPU) shards; drives the host-side
-    /// bounded-KV decode path instead of OV internal state.
-    static_kv: Option<StaticKv>,
-    /// Output indices of this stage's `cross_kv.*` ports (sorted by name) —
-    /// the cross-stage shared KV this stage's source layers produce for a
-    /// downstream stage (Gemma 4 E2B/E4B KV-sharing). Read after each infer
-    /// and sent downstream alongside the hidden state. Empty for single-stage
-    /// shards and models without cross-stage KV-sharing (e.g. dense 31B).
-    cross_kv_out_idx: Vec<usize>,
-    /// Input names of this stage's `external_kv.*` ports (sorted by name) —
-    /// the cross-stage shared KV this stage's shared layers consume from an
-    /// upstream stage. Fed from `pending_external_kv` each step. Empty unless
-    /// this stage depends on a source layer in an earlier stage.
-    external_kv_in_names: Vec<String>,
-    /// Cross-stage KV received from upstream this step, ready to feed into the
-    /// `external_kv.*` inputs — one (shape, bytes) per name, rank-4
-    /// `[1,kvh,ctx,hd]` f32, in the same name-sorted order as
-    /// `external_kv_in_names`.
-    pending_external_kv: Vec<(Vec<usize>, Vec<u8>)>,
+    /// Cross-stage shared KV this stage PRODUCES (Gemma 4 E2B/E4B KV-sharing):
+    /// each `cross_kv.*` output port + its wire tag (source layer + key/value).
+    /// Read after each infer and sent downstream tagged so the consumer pairs
+    /// by source identity, not port position. Empty for single-stage / dense
+    /// shards (e.g. 31B → zero-cost pure hidden relay).
+    cross_kv_out: Vec<CrossKvOut>,
+    /// Cross-stage shared KV this stage CONSUMES: each `external_kv.*` input
+    /// port + the wire tag it must be fed from. Matched against the tagged
+    /// frames received from upstream each step.
+    external_kv_in: Vec<ExternalKvIn>,
+    /// Cross-stage KV received from upstream this step, keyed by wire tag, ready
+    /// to feed into the `external_kv.*` inputs. Rebuilt each step.
+    pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
 }
 
 impl Gemma4Engine {
@@ -516,7 +477,7 @@ impl Gemma4Engine {
         shape: [usize; 3],
         position: i64,
     ) -> EngineResult<()> {
-        // hidden_states (f16) + position_ids. `shape[2]` is the full width
+        // hidden_states (f32) + position_ids. `shape[2]` is the full width
         // (hidden_size + the per-layer-embedding tail when pli_dim>0); the IR
         // input accepts that width, so PLI rides inside hidden_states with no
         // special handling here.
@@ -545,31 +506,31 @@ impl Gemma4Engine {
     }
 
     /// Feed cross-stage shared KV (`external_kv.{i}.{key,value}` inputs) from
-    /// the frames received from the upstream stage this step. No-op for
-    /// single-stage shards and any stage with no external sources (e.g. dense
-    /// 31B, which has no KV-sharing).
+    /// the frames received from upstream this step, matched by wire TAG (source
+    /// layer + key/value role) rather than by position — so pairing is correct
+    /// regardless of port ordering, and a missing source is a clear error, not
+    /// silent wrong-KV. No-op for stages with no external sources (single-stage
+    /// / dense shards).
     fn feed_external_kv(&mut self) -> EngineResult<()> {
-        if self.external_kv_in_names.is_empty() {
+        if self.external_kv_in.is_empty() {
             return Ok(());
         }
-        if self.pending_external_kv.len() != self.external_kv_in_names.len() {
-            return Err(EngineError::Backend(format!(
-                "external_kv count mismatch: {} frames received from upstream, IR \
-                 expects {} (upstream stage's cross_kv.* count must equal this \
-                 stage's external_kv.* count)",
-                self.pending_external_kv.len(),
-                self.external_kv_in_names.len()
-            )));
-        }
-        // names + pending are both sorted by name, so index i aligns the
-        // sender's cross_kv.i with this stage's external_kv.i. Clone the names
-        // and take the buffers into locals to release the &self borrows before
-        // the &mut self.runtime call.
-        let names = self.external_kv_in_names.clone();
-        let pend = std::mem::take(&mut self.pending_external_kv);
-        for (name, (shape, bytes)) in names.iter().zip(pend.iter()) {
+        // Move pending + clone the (small) input list to release the &self
+        // borrows before the &mut self.runtime calls.
+        let pending = std::mem::take(&mut self.pending_external_kv);
+        let inputs = self.external_kv_in.clone();
+        for ext in &inputs {
+            let (shape, bytes) = pending.get(&ext.tag).ok_or_else(|| {
+                EngineError::Backend(format!(
+                    "external_kv input {} needs cross-stage KV (tag {}) but no matching frame \
+                     arrived from upstream — the immediate upstream stage does not produce it. \
+                     Non-adjacent KV sharing across more than one pipeline hop is not supported; \
+                     export with KV source/consumer on adjacent stages (or fewer stages).",
+                    ext.name, ext.tag
+                ))
+            })?;
             self.runtime
-                .set_input(name, ShimDType::F32, shape, bytes)
+                .set_input(&ext.name, ShimDType::F32, shape, bytes)
                 .map_err(map_ov_err)?;
         }
         Ok(())
@@ -580,24 +541,6 @@ impl Gemma4Engine {
         input_ids: &[i64],
         position: i64,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
-        // Stateless static (NPU): feed one token id + the host-side KV ring.
-        // The caller loops one token at a time (static_seq == 1).
-        if self.static_kv.is_some() {
-            if input_ids.len() != 1 {
-                return Err(EngineError::Backend(format!(
-                    "static shard processes one token per step, got {}",
-                    input_ids.len()
-                )));
-            }
-            let (dtype, shape, bytes) = self.static_infer(
-                false,
-                ShimDType::I64,
-                &[1, 1],
-                &i64_to_bytes(input_ids),
-                position,
-            )?;
-            return Ok((bytes_to_f32(dtype, &bytes)?, shape));
-        }
         self.build_feed_first(input_ids, position)?;
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
@@ -610,14 +553,6 @@ impl Gemma4Engine {
         shape: [usize; 3],
         position: i64,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
-        // Stateless static (NPU): feed the upstream hidden state + the
-        // host-side KV ring for this stage's layers.
-        if self.static_kv.is_some() {
-            let hs_bytes = f32_to_f16_bytes(hidden);
-            let (dtype, out_shape, bytes) =
-                self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
-            return Ok((bytes_to_f32(dtype, &bytes)?, out_shape));
-        }
         self.build_feed_relay(hidden, shape, position)?;
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, out_shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
@@ -652,37 +587,34 @@ impl Gemma4Engine {
         // f32). Send raw f32 so the downstream stage feeds it without a lossy
         // f16 round-trip — matches the f32 Core reference.
         let hid = WireTensor::new(WireDType::F32, wire_shape, f32_to_bytes(hidden));
-        // Static (NPU) shards need the absolute position downstream so each
-        // stage can reset its ring at position 0 and align the visible-past
-        // count. The wire shape has only MAX_RANK=3 dims (all used by
-        // [1,1,hidden]) and the transport requires payload_len == shape*dtype,
-        // so we can't pack it into the hidden tensor — send it as its own
-        // framed I64 tensor first. recv_hidden_from_upstream mirrors the order.
-        let pos = if self.static_kv.is_some() {
-            Some(encode_wire_position(position))
-        } else {
-            None
-        };
+        // The absolute start-position rides as its own frame (sent first): relay
+        // stages use it directly as their position_ids base and reset their KV
+        // when it is 0. MAX_RANK=3 + the strict payload==shape*dtype check leave
+        // no room to pack it into the hidden tensor.
+        let pos = encode_wire_position(position);
         // Gemma 4 E2B/E4B: this stage's source layers produced cross-stage
-        // shared KV (`cross_kv.*` outputs) the downstream stage needs as its
-        // `external_kv.*` inputs. Read each from the just-completed inference
-        // and pack the rank-4 [1,kvh,ctx,hd] tensor into a rank-3 wire frame
-        // [kvh,ctx,hd] (batch is always 1; transport caps rank at MAX_RANK=3).
-        // The cache is the full accumulated source-layer KV (grows each step),
-        // sent as f32 to match the IR output dtype and the Core reference.
-        // Empty for single-stage / dense shards (no cross_kv ports).
-        let cross_idxs = self.cross_kv_out_idx.clone();
-        let mut cross_frames = Vec::with_capacity(cross_idxs.len());
-        for idx in cross_idxs {
-            let (_dt, oshape, bytes) = self.runtime.output(idx).map_err(map_ov_err)?;
-            cross_frames.push(pack_cross_kv_frame(&oshape, bytes)?);
+        // shared KV (`cross_kv.*` outputs) downstream stages consume as their
+        // `external_kv.*` inputs. Read each from the just-completed inference,
+        // pack the rank-4 [1,kvh,ctx,hd] tensor into a rank-3 wire frame
+        // [kvh,ctx,hd] (batch is always 1; transport caps rank at MAX_RANK=3),
+        // and tag it by source so the consumer pairs explicitly. A self-
+        // describing header (count + tags) precedes the frames so the consumer
+        // reads exactly the right number — desync-proof. Empty header [0] for
+        // single-stage / dense shards.
+        let outs = self.cross_kv_out.clone();
+        let mut tags = Vec::with_capacity(outs.len());
+        let mut cross_frames = Vec::with_capacity(outs.len());
+        for o in &outs {
+            let (dt, oshape, bytes) = self.runtime.output(o.out_idx).map_err(map_ov_err)?;
+            cross_frames.push(pack_cross_kv_frame(dt, &oshape, bytes)?);
+            tags.push(o.tag);
         }
+        let header = encode_cross_kv_header(&tags);
         self.block_on(async move {
             let mut guard = downstream.lock().await;
-            if let Some(p) = pos {
-                guard.send(&p).await?;
-            }
+            guard.send(&pos).await?;
             guard.send(&hid).await?;
+            guard.send(&header).await?;
             for f in &cross_frames {
                 guard.send(f).await?;
             }
@@ -718,69 +650,73 @@ impl Gemma4Engine {
         Ok(token)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Static (NPU) shards send a leading I64 position tensor before the
-        // hidden activation (see send_hidden_downstream). Each frame's payload
-        // must match its shape*dtype, so we recv two separate tensors here.
-        let want_pos = self.static_kv.is_some();
-        // Gemma 4 E2B/E4B: after the hidden frame, the upstream stage sends one
-        // frame per `external_kv.*` input this stage consumes (its shared
-        // layers' cross-stage KV). recv exactly that many, in the same
-        // name-sorted order send_hidden_downstream used for cross_kv.*.
-        let n_ext = self.external_kv_in_names.len();
-        let (pos_tensor, tensor, ext_tensors) = self
-            .block_on(async move {
+        // Wire order per step: position frame, hidden frame, cross-KV header,
+        // then `count` cross-KV frames (count from the header). Read the first
+        // three, decode the header to learn `count`, then read that many.
+        let (pos_t, hid_t, header_t) = self
+            .block_on(async {
                 let mut guard = upstream.lock().await;
-                let pos_tensor = if want_pos {
-                    Some(guard.recv().await?.0)
-                } else {
-                    None
-                };
-                let (t, _) = guard.recv().await?;
-                let mut exts = Vec::with_capacity(n_ext);
-                for _ in 0..n_ext {
-                    exts.push(guard.recv().await?.0);
-                }
-                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t, exts))
+                let pos = guard.recv().await?.0;
+                let hid = guard.recv().await?.0;
+                let hdr = guard.recv().await?.0;
+                Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
-        // Decode + strictly validate the position frame outside the transport
-        // closure (so a bad frame yields a clear EngineError, not a desync).
-        let position = match pos_tensor {
-            Some(p) => Some(decode_wire_position(&p)?),
-            None => None,
-        };
-        // Unpack each rank-3 wire frame [kvh,ctx,hd] back to the IR's rank-4
-        // [1,kvh,ctx,hd] f32 for feed_external_kv (called from build_feed_*).
-        self.pending_external_kv = ext_tensors
-            .iter()
-            .map(|wt| {
-                let s = &wt.shape;
+        // Decode + strictly validate the position + header outside the transport
+        // closure (so a bad frame is a clear EngineError, not a silent desync).
+        let position = decode_wire_position(&pos_t)?;
+        let tags = decode_cross_kv_header(&header_t)?;
+        let n = tags.len();
+        let up2 = self.upstream.clone().unwrap();
+        let ext_tensors = self
+            .block_on(async move {
+                let mut guard = up2.lock().await;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(guard.recv().await?.0);
+                }
+                Ok::<_, cascadia_transport::TransportError>(v)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        // Index each cross-KV frame by its tag (validating dtype), so
+        // feed_external_kv can match it to the right `external_kv.*` input.
+        self.pending_external_kv.clear();
+        for (tag, wt) in tags.iter().zip(ext_tensors.iter()) {
+            if wt.dtype != WireDType::F32 {
+                return Err(EngineError::Backend(format!(
+                    "cross-KV frame (tag {tag}) has dtype {:?}, expected F32",
+                    wt.dtype
+                )));
+            }
+            let s = &wt.shape;
+            self.pending_external_kv.insert(
+                *tag,
                 (
                     vec![1usize, s[0] as usize, s[1] as usize, s[2] as usize],
                     wt.data.clone(),
-                )
-            })
-            .collect();
+                ),
+            );
+        }
         let shape = [
-            tensor.shape[0] as usize,
-            tensor.shape[1] as usize,
-            tensor.shape[2] as usize,
+            hid_t.shape[0] as usize,
+            hid_t.shape[1] as usize,
+            hid_t.shape[2] as usize,
         ];
-        let floats = match tensor.dtype {
-            WireDType::F32 => tensor
+        let floats = match hid_t.dtype {
+            WireDType::F32 => hid_t
                 .data
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
-            WireDType::F16 => f16_bytes_to_f32(&tensor.data),
+            WireDType::F16 => f16_bytes_to_f32(&hid_t.data),
             other => {
                 return Err(EngineError::Backend(format!(
-                    "unexpected upstream dtype {other:?}"
+                    "unexpected upstream hidden dtype {other:?}"
                 )))
             }
         };
@@ -813,14 +749,12 @@ impl Gemma4Engine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-            if self.static_kv.is_none() {
-                self.runtime.reset_state().map_err(map_ov_err)?;
-            }
+            self.runtime.reset_state().map_err(map_ov_err)?;
             self.position = 0;
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
-                "task active (ov-runtime)"
+                "gemma4 task active"
             );
             self.active = Some(ActiveTask {
                 task,
@@ -851,9 +785,6 @@ impl Gemma4Engine {
             );
             self.active = None;
             let _ = self.runtime.reset_state();
-            if let Some(sk) = self.static_kv.as_mut() {
-                sk.reset();
-            }
             self.position = 0;
         }
         res
@@ -875,63 +806,27 @@ impl Gemma4Engine {
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
 
         // A generation request must carry at least one prompt token; an empty
-        // prompt would otherwise emit a fabricated token with no inference (and
-        // on the static path skip the position-0 ring reset).
+        // prompt would otherwise emit a fabricated token with no inference.
         if prefill && tokens.is_empty() {
             return Err(EngineError::Backend(
                 "empty prompt: no tokens to prefill".into(),
             ));
         }
 
-        let next_token = if self.static_kv.is_some() {
-            // Static (NPU): one token per inference (static_seq == 1). Prefill
-            // round-trips the whole pipeline once per prompt token so every
-            // stage's KV ring advances in lockstep; the token produced from
-            // the final prompt token is the first generated token.
-            if prefill {
-                self.position = 0;
-                if let Some(sk) = self.static_kv.as_ref() {
-                    if tokens.len() > sk.past_len {
-                        warn!(
-                            prompt_tokens = tokens.len(),
-                            past_len = sk.past_len,
-                            "prompt exceeds the static KV window (static_context-1); earliest \
-                             tokens will be evicted — attention degrades to a sliding window"
-                        );
-                    }
-                }
-            }
-            let mut nt = 0i32;
-            for &t in &tokens {
-                let position = self.position;
-                let ts = std::time::Instant::now();
-                let (out, shape) = self.run_first(&[t], position)?;
-                let alpha = ts.elapsed();
-                self.position += 1;
-                let (token, wire) =
-                    self.resolve_next_token(&out, &shape, single_stage, position)?;
-                nt = token;
-                if let Some(a) = self.active.as_mut() {
-                    a.t_alpha_compute += alpha;
-                    a.t_wire += wire;
-                }
-            }
-            nt
-        } else {
-            // Stateful: the whole prompt (prefill) or one decode token in a
-            // single multi-token inference; the IR keeps KV internally.
-            let position = self.position;
-            let ts = std::time::Instant::now();
-            let (out, shape) = self.run_first(&tokens, position)?;
-            let alpha = ts.elapsed();
-            self.position += tokens.len() as i64;
-            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
-            if let Some(a) = self.active.as_mut() {
-                a.t_alpha_compute += alpha;
-                a.t_wire += wire;
-            }
-            nt
-        };
+        // The whole prompt (prefill) or one decode token in a single
+        // multi-token inference; the IR keeps own KV internally. The absolute
+        // start-position is sent downstream so relay stages align position_ids
+        // and reset on 0.
+        let position = self.position;
+        let ts = std::time::Instant::now();
+        let (out, shape) = self.run_first(&tokens, position)?;
+        let alpha = ts.elapsed();
+        self.position += tokens.len() as i64;
+        let (next_token, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+        if let Some(a) = self.active.as_mut() {
+            a.t_alpha_compute += alpha;
+            a.t_wire += wire;
+        }
 
         self.emit_token(next_token)
     }
@@ -1021,7 +916,7 @@ impl Gemma4Engine {
                 alpha_ms,
                 wire_ms,
                 other_ms,
-                "ov-runtime task done"
+                "gemma4 task done"
             );
             self.active = None;
         }
@@ -1029,152 +924,29 @@ impl Gemma4Engine {
         Ok(vec![(task_id, chunk)])
     }
 
-    /// One static-KV (NPU) inference for the token at absolute `position`.
-    /// Feeds `primary_in` ("input_ids" on the first stage, "hidden_states" on
-    /// a relay stage) + attention_mask + position_ids + this stage's KV ring,
-    /// runs, absorbs the new token's K/V from `present`, and returns output 0
-    /// (logits on the head stage, hidden_states otherwise). The ring resets at
-    /// `position == 0`, so this is correct for any stage in a pipeline.
-    fn static_infer(
-        &mut self,
-        use_hidden: bool,
-        in_dtype: ShimDType,
-        in_shape: &[usize],
-        in_bytes: &[u8],
-        position: i64,
-    ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
-        // Align the ring to this absolute position (resets at position 0) and
-        // refresh the reusable mask buffer.
-        {
-            let sk = self.static_kv.as_mut().unwrap();
-            sk.begin_token(position as usize);
-            sk.write_mask_bytes();
-        }
-        let pos_bytes = position.to_le_bytes();
-
-        // Feed primary input + mask + position + the per-layer past-KV ring.
-        // self.runtime (mut) and self.static_kv (shared) are disjoint fields,
-        // so we borrow cached names + ring buffers directly — no per-token
-        // string or buffer allocation.
-        {
-            let sk = self.static_kv.as_ref().unwrap();
-            let in_main = if use_hidden {
-                sk.hidden_in.as_deref()
-            } else {
-                sk.ids_in.as_deref()
-            }
-            .ok_or_else(|| EngineError::Backend("static IR missing primary input".into()))?;
-            self.runtime
-                .set_input(in_main, in_dtype, in_shape, in_bytes)
-                .map_err(map_ov_err)?;
-            self.runtime
-                .set_input(
-                    &sk.attn_in,
-                    ShimDType::I64,
-                    &[1, sk.context],
-                    &sk.mask_bytes,
-                )
-                .map_err(map_ov_err)?;
-            self.runtime
-                .set_input(&sk.pos_in, ShimDType::I64, &[1, 1], &pos_bytes)
-                .map_err(map_ov_err)?;
-            let shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
-            for (li, layer) in sk.layers.iter().enumerate() {
-                self.runtime
-                    .set_input(&layer.key_in, sk.kv_dtype, &shape, &sk.key_buf[li])
-                    .map_err(map_ov_err)?;
-                self.runtime
-                    .set_input(&layer.val_in, sk.kv_dtype, &shape, &sk.val_buf[li])
-                    .map_err(map_ov_err)?;
-            }
-        }
-        self.runtime.infer().map_err(map_ov_err)?;
-
-        // Primary output (index 0): logits on the head stage, hidden_states
-        // otherwise — the static export emits it before the present.* outputs.
-        let (odt, oshape, obytes) = self.runtime.output(0).map_err(map_ov_err)?;
-
-        // Absorb the new token's K/V. Validate each present.* output's byte
-        // length AND shape against [1, kv_heads, context, head_dim] so a
-        // dtype/factorization mismatch is a clear error, not silent corruption.
-        let (n, expect, kvh, ctx, hd) = {
-            let sk = self.static_kv.as_ref().unwrap();
-            (
-                sk.layers.len(),
-                sk.present_layer_bytes(),
-                sk.kv_heads,
-                sk.context,
-                sk.head_dim,
-            )
-        };
-        let want_shape = [1usize, kvh, ctx, hd];
-        for li in 0..n {
-            let (ko, vo) = {
-                let l = &self.static_kv.as_ref().unwrap().layers[li];
-                (l.key_out, l.val_out)
-            };
-            let (_, kshape, kpres) = self.runtime.output(ko).map_err(map_ov_err)?;
-            let (_, vshape, vpres) = self.runtime.output(vo).map_err(map_ov_err)?;
-            if kpres.len() != expect
-                || vpres.len() != expect
-                || kshape != want_shape
-                || vshape != want_shape
-            {
-                return Err(EngineError::Backend(format!(
-                    "static present.{li} mismatch: key shape={kshape:?} len={} val shape={vshape:?} \
-                     len={}; expected shape {want_shape:?} ({expect} bytes f16). Check \
-                     num_kv_heads/head_dim/KV dtype in stage_config.",
-                    kpres.len(),
-                    vpres.len(),
-                )));
-            }
-            let sk = self.static_kv.as_mut().unwrap();
-            sk.absorb_layer(li, false, &kpres);
-            sk.absorb_layer(li, true, &vpres);
-        }
-        Ok((odt, oshape, obytes))
-    }
-
     fn step_last(&mut self) -> EngineResult<()> {
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let (out, out_shape) = match pos_opt {
-            // Static (NPU): the carried absolute position drives the ring
-            // (reset at 0); seq is always 1.
-            Some(pos) => self.run_relay(&hidden, shape, pos)?,
-            None => {
-                if shape[1] > 1 {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
-                    self.position = 0;
-                }
-                let r = self.run_relay(&hidden, shape, self.position)?;
-                self.position += shape[1] as i64;
-                r
-            }
-        };
+        // The upstream stage carries the absolute start-position; use it
+        // directly as the position_ids base and reset own KV when it is 0 (a
+        // new sequence). Correct for any prompt length, including 1 token.
+        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        if position == 0 {
+            self.runtime.reset_state().map_err(map_ov_err)?;
+        }
+        let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let next = argmax_logits(&out, &out_shape)?;
         self.send_token_to_upstream(next)?;
         Ok(())
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
-        let (out, out_shape, fwd_pos) = match pos_opt {
-            Some(pos) => {
-                let (o, s) = self.run_relay(&hidden, shape, pos)?;
-                (o, s, pos)
-            }
-            None => {
-                if shape[1] > 1 {
-                    self.runtime.reset_state().map_err(map_ov_err)?;
-                    self.position = 0;
-                }
-                let (o, s) = self.run_relay(&hidden, shape, self.position)?;
-                self.position += shape[1] as i64;
-                (o, s, 0)
-            }
-        };
+        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        if position == 0 {
+            self.runtime.reset_state().map_err(map_ov_err)?;
+        }
+        let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let s3 = to_shape3(&out_shape);
-        self.send_hidden_downstream(&out, s3, fwd_pos)?;
+        // Forward the SAME absolute position downstream so every stage aligns.
+        self.send_hidden_downstream(&out, s3, position)?;
         let token = self.recv_token_from_downstream()?;
         self.send_token_to_upstream(token)?;
         Ok(())
@@ -1184,44 +956,39 @@ impl Gemma4Engine {
 impl Engine for Gemma4Engine {
     fn warmup(&mut self) {
         if !(self.spec.is_first_stage) {
-            info!("ov-runtime warmup skipped on non-first stage");
+            info!("gemma4 warmup skipped on non-first stage");
             return;
         }
         let tok = match self.tokenizer.clone() {
             Some(t) => t,
             None => {
-                warn!("ov-runtime warmup skipped: no tokenizer");
+                warn!("gemma4 warmup skipped: no tokenizer");
                 return;
             }
         };
         let enc = match tok.encode("Hi", false) {
             Ok(e) => e,
             Err(e) => {
-                warn!(error = %e, "ov-runtime warmup tokenize failed");
+                warn!(error = %e, "gemma4 warmup tokenize failed");
                 return;
             }
         };
         let ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-        // run_first processes one token per call on the static path, so warm
-        // with a single token (enough to JIT the OV graph) regardless of path.
+        // A single token is enough to JIT the OV graph.
         let warm = &ids[..ids.len().min(1)];
         match self.run_first(warm, 0) {
             Ok(_) => {
-                if let Some(sk) = self.static_kv.as_mut() {
-                    sk.reset();
-                } else {
-                    let _ = self.runtime.reset_state();
-                }
+                let _ = self.runtime.reset_state();
                 self.position = 0;
-                info!("ov-runtime warmup ok");
+                info!("gemma4 warmup ok");
             }
-            Err(e) => warn!(error = %e, "ov-runtime warmup failed"),
+            Err(e) => warn!(error = %e, "gemma4 warmup failed"),
         }
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if !self.spec.is_first_stage {
-            warn!("ov-runtime submit() ignored on non-first stage");
+            warn!("gemma4 submit() ignored on non-first stage");
             return Err(EngineError::Backend(
                 "non-first stage does not accept tasks directly".into(),
             ));
@@ -1238,7 +1005,7 @@ impl Engine for Gemma4Engine {
             warn!(
                 queued = self.pending.len(),
                 cap = crate::dist_spec::MAX_PENDING_TASKS,
-                "ov-runtime: pending queue at cap; rejecting task"
+                "gemma4: pending queue at cap; rejecting task"
             );
             return Err(EngineError::QueueFull {
                 queued: self.pending.len(),
@@ -1260,7 +1027,7 @@ impl Engine for Gemma4Engine {
         match result {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "ov-runtime step failed");
+                warn!(error = %e, "gemma4 step failed");
                 Vec::new()
             }
         }
@@ -1286,10 +1053,13 @@ pub struct Gemma4Builder {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     listen_host: String,
     listen_port: Option<u16>,
-    /// (context, kv_heads, head_dim) for a stateless static-shape (NPU) shard;
-    /// None for the stateful path. static_seq is validated == 1 at load and not
-    /// stored (the ring math assumes one token per step).
-    static_params: Option<(u32, u32, u32)>,
+    /// Global source-layer id for each `cross_kv.{i}` this stage produces, in
+    /// port-index order (= layer_start + cross_stage_sources_local[i]). Used in
+    /// build() to tag each cross_kv frame by source. Populated in load().
+    cross_src_ids: Vec<i64>,
+    /// Global source-layer id for each `external_kv.{i}` this stage consumes, in
+    /// port-index order (= external_shared_sources[i].src_global_layer).
+    external_src_ids: Vec<i64>,
 }
 
 impl Gemma4Builder {
@@ -1394,47 +1164,58 @@ impl Builder for Gemma4Builder {
         let stage_dir = self.pipeline_dir.join(format!("stage_{}", self.rank));
         let stage_cfg = read_stage_config(&stage_dir)?;
 
-        self.static_params = if !stage_cfg.stateful {
-            let ctx = stage_cfg.static_context.unwrap_or(0);
-            let s = stage_cfg.static_seq.unwrap_or(1);
-            let kvh = stage_cfg.num_kv_heads.unwrap_or(0);
-            let hd = stage_cfg.head_dim.unwrap_or(0);
-            // static_seq must be 1 (the runtime decodes one token per step) and
-            // static_context must exceed it so past_len = context - 1 >= 1.
-            if kvh == 0 || hd == 0 || s != 1 || ctx <= s {
-                return Err(EngineError::InvalidConfig(format!(
-                    "stateless (NPU) shard needs static_seq=1, static_context>static_seq, \
-                     and num_kv_heads/head_dim in stage_config; got seq={s} ctx={ctx} \
-                     kvh={kvh} hd={hd}"
-                )));
-            }
-            events.push(LoadProgress::message(format!(
-                "stateless static-KV shard: context={ctx} kv_heads={kvh} head_dim={hd}"
+        // The gemma4 engine only runs stateful shards (own KV is OV internal
+        // state); there is no stateless/static-KV (NPU) path. Reject clearly.
+        if !stage_cfg.stateful {
+            return Err(EngineError::ShardRejected(format!(
+                "stage_{} is a stateless (static-KV/NPU) shard; the gemma4 engine requires \
+                 stateful shards. Re-export without the static/NPU target.",
+                self.rank
             )));
-            // static_seq is validated == 1 above and never stored (the ring math
-            // assumes one token per step); carry only (ctx, kv_heads, head_dim).
-            Some((ctx, kvh, hd))
-        } else {
-            None
-        };
+        }
 
-        // A pipeline must be homogeneous: the static path carries a wire
-        // position frame the stateful path does not, so a mixed pipeline would
-        // desync. Fail fast when sibling stage configs are present locally
-        // (single-host multi-process); for distributed deploys each node has
-        // only its own stage dir, so the strict wire-frame validation in
-        // recv_hidden_from_upstream is the backstop at the first activation.
-        for r in 0..pipeline_cfg.num_stages {
-            if r == self.rank {
-                continue;
-            }
-            if let Ok(cfg) = read_stage_config(&self.pipeline_dir.join(format!("stage_{r}"))) {
-                if cfg.stateful != stage_cfg.stateful {
+        // Cross-stage shared-KV source ids (Gemma 4 E2B/E4B KV-sharing).
+        // Producer: cross_kv.{i} ← layer_start + cross_stage_sources_local[i].
+        // Consumer: external_kv.{i} ← external_shared_sources[i].src_global_layer.
+        // build() tags each wire frame by these so pairing is by source identity,
+        // never by port position.
+        self.cross_src_ids = stage_cfg
+            .cross_stage_sources_local
+            .iter()
+            .map(|s| (stage_cfg.layer_start + s) as i64)
+            .collect();
+        self.external_src_ids = stage_cfg
+            .external_shared_sources
+            .iter()
+            .map(|e| e.src_global_layer as i64)
+            .collect();
+
+        // Load-time adjacency guard: every cross-stage source this stage
+        // consumes must be PRODUCED by the immediately-upstream stage (the only
+        // peer that sends us cross-KV frames). Non-adjacent sharing (a source >1
+        // hop upstream) is not supported — pass-through forwarding is a separate
+        // follow-up. Validate against the sibling config when present locally
+        // (single-host multi-process); for distributed deploys the per-frame tag
+        // match in feed_external_kv is the immediate, deterministic backstop.
+        if self.rank > 0 && !self.external_src_ids.is_empty() {
+            let up_dir = self.pipeline_dir.join(format!("stage_{}", self.rank - 1));
+            if let Ok(up) = read_stage_config(&up_dir) {
+                let produced: std::collections::HashSet<i64> = up
+                    .cross_stage_sources_local
+                    .iter()
+                    .map(|s| (up.layer_start + s) as i64)
+                    .collect();
+                if let Some(missing) = self.external_src_ids.iter().find(|s| !produced.contains(s))
+                {
                     return Err(EngineError::ShardRejected(format!(
-                        "pipeline is not homogeneous: stage_{} stateful={} but stage_{r} \
-                         stateful={} — all stages must share one KV mode (re-export the whole \
-                         pipeline with a single --target)",
-                        self.rank, stage_cfg.stateful, cfg.stateful
+                        "stage_{} consumes cross-stage KV from source layer {missing}, but the \
+                         immediate upstream stage_{} does not produce it (it produces {:?}). \
+                         Non-adjacent KV sharing across more than one pipeline hop is not \
+                         supported — re-export with KV source/consumer on adjacent stages, or \
+                         use fewer stages.",
+                        self.rank,
+                        self.rank - 1,
+                        produced
                     )));
                 }
             }
@@ -1530,162 +1311,51 @@ impl Builder for Gemma4Builder {
             }
         }
 
-        // Stateless static-shape (NPU) shards: resolve the explicit
-        // past_key_values.* inputs + present.* outputs and allocate the
-        // host-side KV ring. The primary output (logits on the head stage,
-        // hidden_states otherwise) is output index 0 — no alias guess needed.
-        let static_kv = if let Some((ctx, kvh, hd)) = self.static_params {
-            let n_out = runtime.output_count();
-            let mut layers: Vec<StaticKvLayer> = Vec::new();
-            loop {
-                let l = layers.len();
-                let kin_s = format!("past_key_values.{l}.key");
-                let vin_s = format!("past_key_values.{l}.value");
-                let kout_s = format!("present.{l}.key");
-                let vout_s = format!("present.{l}.value");
-                let (mut key_in, mut val_in) = (None, None);
-                for idx in 0..n_inputs {
-                    let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
-                    if al.iter().any(|a| a.contains(&kin_s)) {
-                        key_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
-                    } else if al.iter().any(|a| a.contains(&vin_s)) {
-                        val_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
-                    }
-                }
-                let (key_in, val_in) = match (key_in, val_in) {
-                    (Some(k), Some(v)) => (k, v),
-                    _ => break,
-                };
-                let (mut key_out, mut val_out) = (None, None);
-                for idx in 0..n_out {
-                    let al = runtime.output_aliases(idx).map_err(map_ov_err)?;
-                    if al.iter().any(|a| a.contains(&kout_s)) {
-                        key_out = Some(idx);
-                    } else if al.iter().any(|a| a.contains(&vout_s)) {
-                        val_out = Some(idx);
-                    }
-                }
-                let key_out = key_out.ok_or_else(|| {
-                    EngineError::Backend(format!("static shard missing {kout_s}"))
+        // Cross-stage shared-KV ports (Gemma 4 E2B/E4B KV-sharing).
+        // `cross_kv.{i}.{key|value}` are OUTPUTS this stage produces; the global
+        // source-layer id is cross_src_ids[i] (set in load()). `external_kv.{i}`
+        // are INPUTS it consumes, source id external_src_ids[i]. Each gets a
+        // wire TAG = src*2 + is_value so the consumer matches frames to inputs
+        // by source identity, not port position (robust to ordering and >9
+        // ports). Empty for single-stage / dense shards (no such ports).
+        let output_names = runtime.output_names().map_err(map_ov_err)?;
+        let mut cross_kv_out = Vec::new();
+        for (oidx, name) in output_names.iter().enumerate() {
+            if let Some((ci, is_value)) = parse_kv_port(name, "cross_kv.") {
+                let src = *self.cross_src_ids.get(ci).ok_or_else(|| {
+                    EngineError::Backend(format!(
+                        "{name}: no source-id metadata (stage_config \
+                         cross_stage_sources_local has {} entries)",
+                        self.cross_src_ids.len()
+                    ))
                 })?;
-                let val_out = val_out.ok_or_else(|| {
-                    EngineError::Backend(format!("static shard missing {vout_s}"))
-                })?;
-                layers.push(StaticKvLayer {
-                    key_in,
-                    val_in,
-                    key_out,
-                    val_out,
+                cross_kv_out.push(CrossKvOut {
+                    out_idx: oidx,
+                    tag: src * 2 + is_value as i64,
                 });
             }
-            if layers.is_empty() {
-                return Err(EngineError::Backend(
-                    "static shard: no past_key_values.* inputs found".into(),
-                ));
-            }
-            // Cross-check: the contiguous-from-0 discovery above stops at the
-            // first missing index. Compare against the total number of
-            // past_key_values.* input ports so a gap / renamed / folded port is
-            // a hard error instead of silently building fewer layers.
-            let mut kv_input_ports = 0usize;
-            for idx in 0..n_inputs {
-                let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
-                if al.iter().any(|a| a.contains("past_key_values.")) {
-                    kv_input_ports += 1;
-                }
-            }
-            if kv_input_ports != layers.len() * 2 {
-                return Err(EngineError::Backend(format!(
-                    "static shard: resolved {} contiguous KV layers ({} ports) but the IR has \
-                     {kv_input_ports} past_key_values.* input ports — a layer port is missing or \
-                     misnamed (gap in the past_key_values.N sequence)",
-                    layers.len(),
-                    layers.len() * 2,
-                )));
-            }
-            let (kvh, hd) = (kvh as usize, hd as usize);
-            let past_len = (ctx - 1) as usize;
-            // KV activations are f16 in the static export; derive elem_bytes
-            // from the dtype so the two can never drift.
-            let kv_dtype = ShimDType::F16;
-            let elem_bytes = match kv_dtype {
-                ShimDType::F16 | ShimDType::Bf16 => 2,
-                ShimDType::F32 | ShimDType::I32 => 4,
-                ShimDType::I64 => 8,
-                ShimDType::I8 => 1,
-            };
-            let layer_bytes = kvh * past_len * hd * elem_bytes;
-            let n = layers.len();
-            // Cache the resolved primary/aux input port names so the per-token
-            // decode loop does no HashMap lookups or string allocs. A static
-            // shard always has attention_mask + position_ids; embed stages have
-            // input_ids, relay/head stages have hidden_states.
-            let attn_in = canonical_inputs
-                .get("attention_mask")
-                .cloned()
-                .ok_or_else(|| {
-                    EngineError::Backend("static IR missing attention_mask input".into())
+        }
+        let input_names = runtime.input_names().map_err(map_ov_err)?;
+        let mut external_kv_in = Vec::new();
+        for name in &input_names {
+            if let Some((ei, is_value)) = parse_kv_port(name, "external_kv.") {
+                let src = *self.external_src_ids.get(ei).ok_or_else(|| {
+                    EngineError::Backend(format!(
+                        "{name}: no source-id metadata (stage_config \
+                         external_shared_sources has {} entries)",
+                        self.external_src_ids.len()
+                    ))
                 })?;
-            let pos_in = canonical_inputs
-                .get("position_ids")
-                .cloned()
-                .ok_or_else(|| {
-                    EngineError::Backend("static IR missing position_ids input".into())
-                })?;
-            let ids_in = canonical_inputs.get("input_ids").cloned();
-            let hidden_in = canonical_inputs.get("hidden_states").cloned();
-            if ids_in.is_none() && hidden_in.is_none() {
-                return Err(EngineError::Backend(
-                    "static IR has neither input_ids nor hidden_states input".into(),
-                ));
+                external_kv_in.push(ExternalKvIn {
+                    name: name.clone(),
+                    tag: src * 2 + is_value as i64,
+                });
             }
-            Some(StaticKv {
-                past_len,
-                context: ctx as usize,
-                kv_heads: kvh,
-                head_dim: hd,
-                elem_bytes,
-                kv_dtype,
-                ids_in,
-                hidden_in,
-                attn_in,
-                pos_in,
-                layers,
-                key_buf: vec![vec![0u8; layer_bytes]; n],
-                val_buf: vec![vec![0u8; layer_bytes]; n],
-                valid: 0,
-                mask_bytes: vec![0u8; ctx as usize * 8],
-            })
-        } else {
-            None
-        };
-
-        // Enumerate cross-stage shared-KV ports (Gemma 4 E2B/E4B KV-sharing).
-        // `cross_kv.*` are OUTPUTS this stage produces for a downstream stage;
-        // `external_kv.*` are INPUTS it consumes from an upstream stage. Both
-        // sorted by name so cross_kv.i on the sender aligns with external_kv.i
-        // on the receiver. Empty for single-stage shards and dense models
-        // without KV-sharing (e.g. 31B → zero-cost pure hidden relay).
-        let output_names = runtime.output_names().map_err(map_ov_err)?;
-        let mut cross: Vec<(String, usize)> = output_names
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.starts_with("cross_kv"))
-            .map(|(i, n)| (n.clone(), i))
-            .collect();
-        cross.sort_by(|a, b| a.0.cmp(&b.0));
-        let cross_kv_out_idx: Vec<usize> = cross.into_iter().map(|(_, i)| i).collect();
-        let mut external_kv_in_names: Vec<String> = runtime
-            .input_names()
-            .map_err(map_ov_err)?
-            .into_iter()
-            .filter(|n| n.starts_with("external_kv"))
-            .collect();
-        external_kv_in_names.sort();
-        if !cross_kv_out_idx.is_empty() || !external_kv_in_names.is_empty() {
+        }
+        if !cross_kv_out.is_empty() || !external_kv_in.is_empty() {
             info!(
-                cross_kv_out = cross_kv_out_idx.len(),
-                external_kv_in = external_kv_in_names.len(),
+                cross_kv_out = cross_kv_out.len(),
+                external_kv_in = external_kv_in.len(),
                 "gemma4 cross-stage shared KV wired"
             );
         }
@@ -1702,10 +1372,9 @@ impl Builder for Gemma4Builder {
             canonical_inputs,
             pending: Vec::new(),
             active: None,
-            static_kv,
-            cross_kv_out_idx,
-            external_kv_in_names,
-            pending_external_kv: Vec::new(),
+            cross_kv_out,
+            external_kv_in,
+            pending_external_kv: std::collections::HashMap::new(),
         }))
     }
 }
