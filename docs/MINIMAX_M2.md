@@ -97,16 +97,19 @@ Experts can run two ways (manifest `experts_format`, exporter `--experts`):
   Python packer round-trip.
 
 Measured on the miner (Xeon Gold 6252, full 230B M2, 24 tokens, identical
-fp32 shells; warm = steady-state, excluding cold first-step):
+fp32 shells, `SNIPPETS_MODE=DISABLE`; warm = steady-state, excluding cold
+first-step):
 
 | Expert backend | warm tok/s | first decode-step |
 | --- | --- | --- |
-| ov_ir   | ~0.063 | ~18–23 s |
-| int4_bin | **~0.21** | **~6–7 s** |
+| ov_ir   | ~0.05 | ~17–24 s |
+| int4_bin | **~0.19** | **~5–7 s** |
 
-≈ **3.2× faster warm** and ≈3.5× faster first token, at equal output
-quality. int4_bin is the recommended backend; `ov_ir` is the simpler
-fallback / reference.
+≈ **3–4× faster warm** and ≈3× faster first token, at equal (coherent)
+output quality. **int4 (group-32) is the recommended config** — smallest
+(~115 GB), fastest, and fully coherent once the engine bug below is fixed;
+`ov_ir` is the simpler reference. (NF4/int8/fp8 also work but buy nothing
+over int4 here — see below.)
 
 ## Output quality
 
