@@ -92,8 +92,16 @@ impl Default for Config {
 /// "role: content" formatting in that case. Some HF tokenizer configs
 /// store special tokens as objects ({"content": "...", ...}) rather than
 /// strings; both shapes are handled.
+///
+/// Newer HF exports (Gemma 3/4, recent Llama) drop the inline
+/// `chat_template` JSON field and ship the template as a sibling
+/// `chat_template.jinja` file instead — too large/complex to embed in
+/// JSON. When the inline field is absent we fall back to that file, so
+/// instruct models render through their real template rather than the
+/// legacy formatter (which degenerates instruct models).
 pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
-    let p = model_dir.join("tokenizer").join("tokenizer_config.json");
+    let tok_dir = model_dir.join("tokenizer");
+    let p = tok_dir.join("tokenizer_config.json");
     let Ok(bytes) = std::fs::read(&p) else {
         return ChatTemplateConfig::default();
     };
@@ -103,7 +111,8 @@ pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateCon
     let template = v
         .get("chat_template")
         .and_then(|t| t.as_str())
-        .map(|s| s.to_owned());
+        .map(|s| s.to_owned())
+        .or_else(|| std::fs::read_to_string(tok_dir.join("chat_template.jinja")).ok());
     let extract_token = |key: &str| -> Option<String> {
         let val = v.get(key)?;
         if let Some(s) = val.as_str() {
@@ -643,5 +652,55 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[test]
+    fn load_chat_template_falls_back_to_jinja_sibling() {
+        // Gemma 3/4 (and recent Llama) ship the template as a sibling
+        // chat_template.jinja file with no inline `chat_template` field in
+        // tokenizer_config.json. The loader must pick up the .jinja file.
+        let dir = std::env::temp_dir().join(format!("cascadia_g4_tmpl_{}", std::process::id()));
+        let tok = dir.join("tokenizer");
+        std::fs::create_dir_all(&tok).unwrap();
+        std::fs::write(
+            tok.join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>", "eos_token": {"content": "<eos>"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tok.join("chat_template.jinja"),
+            "{%- macro greet() -%}hello{%- endmacro -%}{{ greet() }}",
+        )
+        .unwrap();
+        let cfg = load_chat_template_config(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            cfg.template.as_deref().unwrap_or("").contains("macro"),
+            "expected template loaded from chat_template.jinja"
+        );
+        assert_eq!(cfg.bos_token.as_deref(), Some("<bos>"));
+        assert_eq!(cfg.eos_token.as_deref(), Some("<eos>"));
+    }
+
+    #[test]
+    fn render_prompt_with_template_supports_macros() {
+        // Guards the minijinja `macros` feature: Gemma-style instruct templates
+        // define `{% macro %}` helpers for role formatting. Without the feature
+        // the template fails to parse and chat silently degrades to the legacy
+        // formatter (which produces incoherent output on instruct models).
+        let tmpl = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
+                    {{ text }}<end_of_turn>\n{% endmacro -%}\
+                    {{ bos_token }}{% for m in messages %}{{ turn(m.role, m.content) }}{% endfor %}\
+                    {% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let out = render_prompt_with_template(tmpl, &msgs, "<bos>", "<eos>")
+            .expect("macro-based template must render");
+        assert!(out.contains("<bos>"), "out={out}");
+        assert!(out.contains("<start_of_turn>user"), "out={out}");
+        assert!(out.contains("hi"), "out={out}");
+        assert!(out.contains("<start_of_turn>model"), "out={out}");
     }
 }
