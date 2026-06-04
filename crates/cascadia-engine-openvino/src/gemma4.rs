@@ -253,6 +253,22 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
     }
 }
 
+/// Pack a Gemma 4 `cross_kv.*` output (rank-4 `[1,kvh,ctx,hd]`) into a rank-3
+/// wire frame `[kvh,ctx,hd]`. The batch dim is always 1 (single sequence) and
+/// the transport caps tensor rank at MAX_RANK=3, so we drop it; the receiver
+/// restores it. Payload is unchanged (dropping a unit dim leaves the element
+/// count identical), so the transport's strict `payload == shape*dtype` check
+/// still holds. Errors if the output is not the expected rank-4 batch-1 shape.
+fn pack_cross_kv_frame(shape4: &[usize], bytes: Vec<u8>) -> EngineResult<WireTensor> {
+    if shape4.len() != 4 || shape4[0] != 1 {
+        return Err(EngineError::Backend(format!(
+            "cross_kv output shape {shape4:?} is not [1,kvh,ctx,hd]"
+        )));
+    }
+    let ws = [shape4[1] as u32, shape4[2] as u32, shape4[3] as u32];
+    Ok(WireTensor::new(WireDType::F32, ws, bytes))
+}
+
 /// Encode the absolute position as its own framed wire tensor (I64 `[1,1,1]`).
 /// The static (NPU) path sends this immediately before each hidden activation
 /// so relay stages reset/align their KV ring; the transport requires
@@ -443,6 +459,22 @@ pub struct Gemma4Engine {
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
+    /// Output indices of this stage's `cross_kv.*` ports (sorted by name) —
+    /// the cross-stage shared KV this stage's source layers produce for a
+    /// downstream stage (Gemma 4 E2B/E4B KV-sharing). Read after each infer
+    /// and sent downstream alongside the hidden state. Empty for single-stage
+    /// shards and models without cross-stage KV-sharing (e.g. dense 31B).
+    cross_kv_out_idx: Vec<usize>,
+    /// Input names of this stage's `external_kv.*` ports (sorted by name) —
+    /// the cross-stage shared KV this stage's shared layers consume from an
+    /// upstream stage. Fed from `pending_external_kv` each step. Empty unless
+    /// this stage depends on a source layer in an earlier stage.
+    external_kv_in_names: Vec<String>,
+    /// Cross-stage KV received from upstream this step, ready to feed into the
+    /// `external_kv.*` inputs — one (shape, bytes) per name, rank-4
+    /// `[1,kvh,ctx,hd]` f32, in the same name-sorted order as
+    /// `external_kv_in_names`.
+    pending_external_kv: Vec<(Vec<usize>, Vec<u8>)>,
 }
 
 impl Gemma4Engine {
@@ -521,11 +553,33 @@ impl Gemma4Engine {
     }
 
     /// Feed cross-stage shared KV (`external_kv.{i}.{key,value}` inputs) from
-    /// the host-accumulated buffers. No-op for single-stage shards and any
-    /// stage with no external sources (e.g. 31B, which has no KV-sharing).
+    /// the frames received from the upstream stage this step. No-op for
+    /// single-stage shards and any stage with no external sources (e.g. dense
+    /// 31B, which has no KV-sharing).
     fn feed_external_kv(&mut self) -> EngineResult<()> {
-        // tier 3 (E2B/E4B multi-stage): set each external_kv.* input from the
-        // cross_kv tensors forwarded down the pipeline from the owning stage.
+        if self.external_kv_in_names.is_empty() {
+            return Ok(());
+        }
+        if self.pending_external_kv.len() != self.external_kv_in_names.len() {
+            return Err(EngineError::Backend(format!(
+                "external_kv count mismatch: {} frames received from upstream, IR \
+                 expects {} (upstream stage's cross_kv.* count must equal this \
+                 stage's external_kv.* count)",
+                self.pending_external_kv.len(),
+                self.external_kv_in_names.len()
+            )));
+        }
+        // names + pending are both sorted by name, so index i aligns the
+        // sender's cross_kv.i with this stage's external_kv.i. Clone the names
+        // and take the buffers into locals to release the &self borrows before
+        // the &mut self.runtime call.
+        let names = self.external_kv_in_names.clone();
+        let pend = std::mem::take(&mut self.pending_external_kv);
+        for (name, (shape, bytes)) in names.iter().zip(pend.iter()) {
+            self.runtime
+                .set_input(name, ShimDType::F32, shape, bytes)
+                .map_err(map_ov_err)?;
+        }
         Ok(())
     }
 
@@ -614,12 +668,30 @@ impl Gemma4Engine {
         } else {
             None
         };
+        // Gemma 4 E2B/E4B: this stage's source layers produced cross-stage
+        // shared KV (`cross_kv.*` outputs) the downstream stage needs as its
+        // `external_kv.*` inputs. Read each from the just-completed inference
+        // and pack the rank-4 [1,kvh,ctx,hd] tensor into a rank-3 wire frame
+        // [kvh,ctx,hd] (batch is always 1; transport caps rank at MAX_RANK=3).
+        // The cache is the full accumulated source-layer KV (grows each step),
+        // sent as f32 to match the IR output dtype and the Core reference.
+        // Empty for single-stage / dense shards (no cross_kv ports).
+        let cross_idxs = self.cross_kv_out_idx.clone();
+        let mut cross_frames = Vec::with_capacity(cross_idxs.len());
+        for idx in cross_idxs {
+            let (_dt, oshape, bytes) = self.runtime.output(idx).map_err(map_ov_err)?;
+            cross_frames.push(pack_cross_kv_frame(&oshape, bytes)?);
+        }
         self.block_on(async move {
             let mut guard = downstream.lock().await;
             if let Some(p) = pos {
                 guard.send(&p).await?;
             }
-            guard.send(&hid).await
+            guard.send(&hid).await?;
+            for f in &cross_frames {
+                guard.send(f).await?;
+            }
+            Ok::<(), cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -660,7 +732,12 @@ impl Gemma4Engine {
         // hidden activation (see send_hidden_downstream). Each frame's payload
         // must match its shape*dtype, so we recv two separate tensors here.
         let want_pos = self.static_kv.is_some();
-        let (pos_tensor, tensor) = self
+        // Gemma 4 E2B/E4B: after the hidden frame, the upstream stage sends one
+        // frame per `external_kv.*` input this stage consumes (its shared
+        // layers' cross-stage KV). recv exactly that many, in the same
+        // name-sorted order send_hidden_downstream used for cross_kv.*.
+        let n_ext = self.external_kv_in_names.len();
+        let (pos_tensor, tensor, ext_tensors) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
                 let pos_tensor = if want_pos {
@@ -669,7 +746,11 @@ impl Gemma4Engine {
                     None
                 };
                 let (t, _) = guard.recv().await?;
-                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
+                let mut exts = Vec::with_capacity(n_ext);
+                for _ in 0..n_ext {
+                    exts.push(guard.recv().await?.0);
+                }
+                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t, exts))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         // Decode + strictly validate the position frame outside the transport
@@ -678,6 +759,18 @@ impl Gemma4Engine {
             Some(p) => Some(decode_wire_position(&p)?),
             None => None,
         };
+        // Unpack each rank-3 wire frame [kvh,ctx,hd] back to the IR's rank-4
+        // [1,kvh,ctx,hd] f32 for feed_external_kv (called from build_feed_*).
+        self.pending_external_kv = ext_tensors
+            .iter()
+            .map(|wt| {
+                let s = &wt.shape;
+                (
+                    vec![1usize, s[0] as usize, s[1] as usize, s[2] as usize],
+                    wt.data.clone(),
+                )
+            })
+            .collect();
         let shape = [
             tensor.shape[0] as usize,
             tensor.shape[1] as usize,
@@ -1594,6 +1687,36 @@ impl Builder for Gemma4Builder {
             None
         };
 
+        // Enumerate cross-stage shared-KV ports (Gemma 4 E2B/E4B KV-sharing).
+        // `cross_kv.*` are OUTPUTS this stage produces for a downstream stage;
+        // `external_kv.*` are INPUTS it consumes from an upstream stage. Both
+        // sorted by name so cross_kv.i on the sender aligns with external_kv.i
+        // on the receiver. Empty for single-stage shards and dense models
+        // without KV-sharing (e.g. 31B → zero-cost pure hidden relay).
+        let output_names = runtime.output_names().map_err(map_ov_err)?;
+        let mut cross: Vec<(String, usize)> = output_names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.starts_with("cross_kv"))
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        cross.sort_by(|a, b| a.0.cmp(&b.0));
+        let cross_kv_out_idx: Vec<usize> = cross.into_iter().map(|(_, i)| i).collect();
+        let mut external_kv_in_names: Vec<String> = runtime
+            .input_names()
+            .map_err(map_ov_err)?
+            .into_iter()
+            .filter(|n| n.starts_with("external_kv"))
+            .collect();
+        external_kv_in_names.sort();
+        if !cross_kv_out_idx.is_empty() || !external_kv_in_names.is_empty() {
+            info!(
+                cross_kv_out = cross_kv_out_idx.len(),
+                external_kv_in = external_kv_in_names.len(),
+                "gemma4 cross-stage shared KV wired"
+            );
+        }
+
         Ok(Box::new(Gemma4Engine {
             spec,
             runtime,
@@ -1610,6 +1733,9 @@ impl Builder for Gemma4Builder {
             pending: Vec::new(),
             active: None,
             static_kv,
+            cross_kv_out_idx,
+            external_kv_in_names,
+            pending_external_kv: Vec::new(),
         }))
     }
 }
