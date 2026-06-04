@@ -110,39 +110,42 @@ fallback / reference.
 
 ## Output quality
 
-The full INT4 model recalls facts correctly ("The capital of France is
-Paris. The capital of the United States is Washington…") but degrades into
-incoherent (often multilingual) tokens after ~12–14 tokens. Findings from
-the comparison runs:
+The model recalls facts and stays coherent: greedy on "The capital of
+France is" →
 
-- **Repetition penalty** (`repetition_penalty` 1.3, window 64) removes the
-  literal `capital capital both both` loops greedy falls into.
-- **Precise routing** (`--shell-quant none --head-quant none`, keeping the
-  router gate + lm_head full-precision as M2 itself does) extends coherent
-  output from one fact to two, but does not fix the deeper degradation.
-- The residual incoherence is the **quantized experts**, and — the
-  non-obvious finding — **it's the *kind* of quantization, not the bit
-  width.** Three points, everything else (routing, attention, shells)
-  identical:
+> " Paris. The capital of the United States is Washington, D.C. The
+> capital of the United Kingdom is London. …"
 
-  | experts | "The capital of France is" → |
-  | --- | --- |
-  | fp32 (FP8-precision, `test_minimax_m2_fp_experts.py`) | ` Paris. The capital of the United States is Washington, D.C. The capital city (or simply "capital") refers …` ✅ coherent |
-  | int8 (per-channel linear, NNCF) | ` Paris. … Washington, capitals … 三省三省 . United . and Â 糊 base` ❌ |
-  | int4 (group-32 linear) | ` Paris. … Washington, capitals … 三省三省 United .. 三省 and 俞` ❌ |
+### The bug that took a while to find (and the methodology)
 
-  int8 degrades **like int4**, not like fp32 — even though int8 has 2× the
-  bits. The experts are natively **FP8 (e4m3 — float, log-spaced, wide
-  dynamic range)**; the fp32 probe preserves that exactly and is coherent,
-  but **linear** int8/int4 quant (uniform step = max/127 or max/7) collapses
-  the small-magnitude weights that FP8's log spacing kept. So the fix is a
-  **distribution-matched / float quant** (FP8, NF4, or AWQ/GPTQ-style
-  calibrated int4) — *not* more linear bits. A plain int8 artifact is built
-  and runs (exporter `--experts-int8`) but does not recover quality.
+Early runs degraded into incoherent (often multilingual) tokens after
+~10–14 tokens. The decisive cause was **not** expert quantization — it was
+the **OpenVINO 2026.1 CPU "snippets" shape-specialization bug**. The shells
+run as OV graphs whose `past_k`/`past_v` dimension grows by one every token;
+that per-step shape change triggers a snippets code-gen bug whose numerical
+error accumulates and silently corrupts output mid-sequence. The fix is one
+line — `SNIPPETS_MODE=DISABLE` on the CPU plugin in `OvMoeRunner` (the
+exporter/Python reference always set it; the K2.6 path dodges the bug by
+running shells in its Rust kernel).
 
-  (The int8 artifact was built in place via `--free-source-shards`, which
-  consumed the FP8 source; re-running the fp32/quant-simulation probe to
-  further dissect this needs a fresh FP8 download.)
+It masqueraded as a quantization problem because *every* quantized run was
+the Rust engine (int4 / int4_bin / int8 / NF4 all degraded) while *every*
+coherent run was the Python reference pipeline. The isolation that exposed
+it: run the **same OV graphs** through the Python pipeline vs the Rust
+engine — Python coherent, Rust degraded ⇒ engine config, not the weights.
+A `--quant {none,int8,int4,nf4}` simulate mode in
+`tools/test_minimax_m2_fp_experts.py` (and a `--ov-experts` mode that
+dispatches the compiled expert IRs through the Python pipeline) pinned it
+to the Rust side. **Lesson: when an int8 build degrades exactly like int4,
+suspect a systematic pipeline bug, not precision — and A/B the same
+artifacts across the two pipelines before re-quantizing anything.**
+
+With the fix, expert quantization behaves normally: int4 (group-32),
+int8, and NF4 all produce coherent output. `repetition_penalty` ≈1.3
+remains useful to avoid greedy factoid-loops on open-ended continuations.
+The exporter still exposes `--expert-quant {int4,int8,nf4,mxfp4}` and
+`--shell-quant`/`--head-quant` for precision experiments, but they are not
+needed for coherence.
 
 ## Tests
 
