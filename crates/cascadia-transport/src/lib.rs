@@ -208,6 +208,21 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
     Ok((tensor, stats))
 }
 
+/// Per-hop activation recv timeout. Defaults to `DEFAULT_TIMEOUT` (60s);
+/// override with `CASCADIA_ACTIVATION_TIMEOUT_SECS` for deep N-stage chains
+/// whose cold-compile cascade exceeds the per-hop default.
+fn recv_timeout() -> Duration {
+    use std::sync::OnceLock;
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("CASCADIA_ACTIVATION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TIMEOUT)
+    })
+}
+
 async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
@@ -226,11 +241,12 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
         }
         Ok(())
     };
-    match tokio::time::timeout(DEFAULT_TIMEOUT, read_fut).await {
+    let to = recv_timeout();
+    match tokio::time::timeout(to, read_fut).await {
         Ok(res) => res,
         Err(_) => Err(TransportError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("recv_exact timed out after {DEFAULT_TIMEOUT:?}"),
+            format!("recv_exact timed out after {to:?}"),
         ))),
     }
 }
