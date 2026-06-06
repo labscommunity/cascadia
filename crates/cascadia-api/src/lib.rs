@@ -374,6 +374,36 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
     render_prompt_legacy(messages)
 }
 
+/// Render a chat prompt from a [`ChatTemplateConfig`] in one shot.
+///
+/// The router pre-builds the minijinja env once in `AppState` (see
+/// [`build_chat_env`]) for the request hot path. This convenience entry point
+/// serves embedded / standalone callers that hold a `ChatTemplateConfig`
+/// directly and render outside the router (e.g. an embedded shard backend). It
+/// builds the env per call; on parse or render failure it falls back to
+/// [`render_prompt_legacy`].
+pub fn render_chat_prompt(cfg: &ChatTemplateConfig, messages: &[ChatMessage]) -> String {
+    if let Some(tmpl) = &cfg.template {
+        match build_chat_env(tmpl) {
+            Ok(env) => match render_with_chat_env(
+                &env,
+                messages,
+                cfg.bos_token.as_deref().unwrap_or_default(),
+                cfg.eos_token.as_deref().unwrap_or_default(),
+            ) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "chat_template parse failed; falling back to legacy formatter");
+            }
+        }
+    }
+    render_prompt_legacy(messages)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
