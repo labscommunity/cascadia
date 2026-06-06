@@ -252,11 +252,17 @@ def cached_gemma4_layer_forward(
 
     k = layer.self_attn.k_proj(hidden_states)
     k = k.view(bsz, seq_len, num_kv_heads, head_dim)
+    # k_eq_v (Gemma 4 31B global/full_attention layers): v_proj is None and V
+    # derives from the RAW k_proj output — HF sets value_states = key_states
+    # BEFORE k_norm/rope are applied. Capture v from the pre-norm k here.
+    if layer.self_attn.v_proj is not None:
+        v = layer.self_attn.v_proj(hidden_states)
+        v = v.view(bsz, seq_len, num_kv_heads, head_dim)
+    else:
+        v = k
     k = layer.self_attn.k_norm(k)
     k = k.transpose(1, 2)
 
-    v = layer.self_attn.v_proj(hidden_states)
-    v = v.view(bsz, seq_len, num_kv_heads, head_dim)
     v = layer.self_attn.v_norm(v)
     v = v.transpose(1, 2)
 
@@ -603,7 +609,18 @@ def build_cached_wrapper(model, text_config, stage_plan):
     ]
 
     num_heads = text_config.num_attention_heads
-    num_kv_heads = text_config.num_key_value_heads
+    num_kv_heads_local = text_config.num_key_value_heads
+    # Gemma 4 31B uses asymmetric KV heads per attention type: full_attention
+    # (global) layers have fewer KV heads (num_global_key_value_heads) than
+    # sliding_attention (local) layers, alongside the asymmetric head_dim. E2B/E4B
+    # lack the global field, so this falls back to num_key_value_heads (unchanged).
+    num_kv_heads_global = getattr(
+        text_config, "num_global_key_value_heads", num_kv_heads_local
+    )
+    num_kv_heads_per_layer = [
+        (num_kv_heads_global if lt == "full_attention" else num_kv_heads_local)
+        for lt in stage_layer_types
+    ]
     downstream_pli_count = num_total - le if not has_head else 0
 
     rope_params = getattr(text_config, "rope_parameters", None)
@@ -661,6 +678,7 @@ def build_cached_wrapper(model, text_config, stage_plan):
                 self.lm_head = lm_head_ref
             # Stored attrs for trace fidelity.
             self._head_dims = head_dims
+            self._num_kv_heads = num_kv_heads_per_layer
             self._layer_types = list(stage_layer_types)
             self._unique_types = list(set(stage_layer_types))
             self._is_shared = is_shared
@@ -728,6 +746,7 @@ def build_cached_wrapper(model, text_config, stage_plan):
             for i, layer in enumerate(self.layers):
                 lt = self._layer_types[i]
                 hd = self._head_dims[i]
+                nkv = self._num_kv_heads[i]
                 cos, sin = rotary_cache[lt]
                 pli_slice = stage_pli[:, :, i, :] if stage_pli is not None else None
 
@@ -747,7 +766,7 @@ def build_cached_wrapper(model, text_config, stage_plan):
                         sk,
                         sv,
                         num_heads,
-                        num_kv_heads,
+                        nkv,
                         hd,
                         per_layer_input=pli_slice,
                     )
@@ -760,7 +779,7 @@ def build_cached_wrapper(model, text_config, stage_plan):
                         past_kv[kv_input_idx * 2],
                         past_kv[kv_input_idx * 2 + 1],
                         num_heads,
-                        num_kv_heads,
+                        nkv,
                         hd,
                         per_layer_input=pli_slice,
                     )
@@ -792,7 +811,7 @@ def build_cached_wrapper(model, text_config, stage_plan):
 
     wrapper = CachedStageWrapper()
     wrapper.eval()
-    return wrapper, head_dims, share
+    return wrapper, head_dims, num_kv_heads_per_layer, share
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +905,9 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
     hidden_dim = text_config.hidden_size
     pli_dim = text_config.hidden_size_per_layer_input or 0
     num_kv_heads = text_config.num_key_value_heads
+    num_kv_heads_global = getattr(
+        text_config, "num_global_key_value_heads", num_kv_heads
+    )
     downstream_pli_count = num_total - le if not has_head else 0
 
     log(f"\n{'=' * 60}")
@@ -894,7 +916,7 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
     )
     log("=" * 60)
 
-    wrapper, head_dims, share = build_cached_wrapper(
+    wrapper, head_dims, num_kv_heads_per_layer, share = build_cached_wrapper(
         model, text_config, stage_plan
     )
     log("  Wrapper built")
@@ -904,6 +926,9 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
     external_shared_sources = share["external_shared_sources"]
 
     own_kv_head_dims = [hd for hd, sh in zip(head_dims, is_shared) if not sh]
+    own_kv_num_heads = [
+        nkv for nkv, sh in zip(num_kv_heads_per_layer, is_shared) if not sh
+    ]
     non_shared_local_indices = [
         i for i, sh in enumerate(is_shared) if not sh
     ]
@@ -931,14 +956,15 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
     position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
 
     ext_kv = []
-    for _, _, hd in external_shared_sources:
-        ext_kv.append(torch.randn(1, num_kv_heads, past_seq, hd))
-        ext_kv.append(torch.randn(1, num_kv_heads, past_seq, hd))
+    for _, lt, hd in external_shared_sources:
+        nkv = num_kv_heads_global if lt == "full_attention" else num_kv_heads
+        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
+        ext_kv.append(torch.randn(1, nkv, past_seq, hd))
 
     own_past_kv = []
-    for hd in own_kv_head_dims:
-        own_past_kv.append(torch.randn(1, num_kv_heads, past_seq, hd))
-        own_past_kv.append(torch.randn(1, num_kv_heads, past_seq, hd))
+    for nkv, hd in zip(own_kv_num_heads, own_kv_head_dims):
+        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
+        own_past_kv.append(torch.randn(1, nkv, past_seq, hd))
 
     example_inputs = (main_input, position_ids, *ext_kv, *own_past_kv)
 
