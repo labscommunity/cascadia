@@ -208,19 +208,36 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
     Ok((tensor, stats))
 }
 
-/// Per-hop activation recv timeout. Defaults to `DEFAULT_TIMEOUT` (60s);
-/// override with `CASCADIA_ACTIVATION_TIMEOUT_SECS` for deep N-stage chains
-/// whose cold-compile cascade exceeds the per-hop default.
+/// Config override (seconds) for the activation recv timeout; 0 = unset.
+static ACTIVATION_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the activation recv timeout from node config; takes precedence over the env var.
+pub fn set_activation_timeout_secs(secs: u64) {
+    ACTIVATION_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Precedence: config override > env > default. Pure, for testing.
+fn resolve_recv_timeout(explicit_secs: u64, env_secs: Option<u64>) -> Duration {
+    if explicit_secs > 0 {
+        Duration::from_secs(explicit_secs)
+    } else {
+        env_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TIMEOUT)
+    }
+}
+
+/// Per-hop activation recv timeout: config > `CASCADIA_ACTIVATION_TIMEOUT_SECS` > 60s.
 fn recv_timeout() -> Duration {
     use std::sync::OnceLock;
-    static T: OnceLock<Duration> = OnceLock::new();
-    *T.get_or_init(|| {
+    static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
+    let env = *ENV.get_or_init(|| {
         std::env::var("CASCADIA_ACTIVATION_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_TIMEOUT)
-    })
+    });
+    resolve_recv_timeout(
+        ACTIVATION_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        env,
+    )
 }
 
 async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
@@ -458,6 +475,16 @@ impl ActivationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_timeout_precedence_config_over_env_over_default() {
+        // explicit config override (node.toml) wins over env + default
+        assert_eq!(resolve_recv_timeout(120, Some(30)), Duration::from_secs(120));
+        // no config -> env wins over default
+        assert_eq!(resolve_recv_timeout(0, Some(90)), Duration::from_secs(90));
+        // neither -> 60s default
+        assert_eq!(resolve_recv_timeout(0, None), DEFAULT_TIMEOUT);
+    }
 
     #[tokio::test]
     async fn roundtrip_f32_2d() {
