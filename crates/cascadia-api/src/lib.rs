@@ -374,26 +374,49 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
     render_prompt_legacy(messages)
 }
 
-/// Render `messages` through the model's chat template, falling back to
-/// [`render_prompt_legacy`] when no template is configured or rendering
-/// fails. Public, `AppState`-free counterpart to [`render_prompt`] for
-/// in-process callers that hold a [`ChatTemplateConfig`] from
-/// [`load_chat_template_config`].
-pub fn render_chat_prompt(cfg: &ChatTemplateConfig, messages: &[ChatMessage]) -> String {
-    if let Some(tmpl) = &cfg.template {
-        match render_prompt_with_template(
-            tmpl,
-            messages,
-            cfg.bos_token.as_deref().unwrap_or_default(),
-            cfg.eos_token.as_deref().unwrap_or_default(),
-        ) {
-            Ok(s) => return s,
-            Err(e) => {
-                warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
-            }
+/// `AppState`-free chat-prompt renderer for in-process callers. Parses the
+/// chat template once in [`new`](Self::new); reuse across requests.
+#[derive(Clone)]
+pub struct ChatPromptRenderer {
+    env: Option<Arc<minijinja::Environment<'static>>>,
+    bos_token: String,
+    eos_token: String,
+}
+
+impl ChatPromptRenderer {
+    /// Compile the chat template once. An unparseable template is treated as
+    /// absent so [`render`](Self::render) falls back to the legacy formatter.
+    pub fn new(cfg: &ChatTemplateConfig) -> Self {
+        let env = cfg
+            .template
+            .as_deref()
+            .and_then(|src| match build_chat_env(src) {
+                Ok(env) => Some(Arc::new(env)),
+                Err(e) => {
+                    warn!(error = %e, "chat_template failed to parse; using legacy formatter");
+                    None
+                }
+            });
+        Self {
+            env,
+            bos_token: cfg.bos_token.clone().unwrap_or_default(),
+            eos_token: cfg.eos_token.clone().unwrap_or_default(),
         }
     }
-    render_prompt_legacy(messages)
+
+    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
+    /// template is set or rendering fails.
+    pub fn render(&self, messages: &[ChatMessage]) -> String {
+        if let Some(env) = &self.env {
+            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                }
+            }
+        }
+        render_prompt_legacy(messages)
+    }
 }
 
 async fn chat_completions(
@@ -738,27 +761,57 @@ mod tests {
         assert_eq!(cfg.eos_token.as_deref(), Some("<eos>"));
     }
 
-    #[test]
-    fn render_prompt_with_template_supports_macros() {
-        // Guards the minijinja `macros` feature: Gemma-style instruct templates
-        // define `{% macro %}` helpers for role formatting. Without the feature
-        // the template fails to parse and chat silently degrades to the legacy
-        // formatter (which produces incoherent output on instruct models).
-        let tmpl = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
+    /// Gemma-style chat template for the macro/renderer tests.
+    const MACRO_TEMPLATE: &str = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
                     {{ text }}<end_of_turn>\n{% endmacro -%}\
                     {{ bos_token }}{% for m in messages %}{{ turn(m.role, m.content) }}{% endfor %}\
                     {% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
+
+    #[test]
+    fn chat_env_supports_macro_templates() {
+        // Guards the minijinja `macros` feature; without it Gemma-style
+        // instruct templates fail to parse and silently fall back to legacy.
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
         }];
-        let env = build_chat_env(tmpl).expect("macro-based template must parse");
+        let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>")
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
         assert!(out.contains("hi"), "out={out}");
         assert!(out.contains("<start_of_turn>model"), "out={out}");
+    }
+
+    #[test]
+    fn chat_prompt_renderer_renders_then_falls_back() {
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+
+        // Template present: renders through the parsed env (parsed once in `new`).
+        let r = ChatPromptRenderer::new(&ChatTemplateConfig {
+            template: Some(MACRO_TEMPLATE.into()),
+            bos_token: Some("<bos>".into()),
+            eos_token: Some("<eos>".into()),
+        });
+        let out = r.render(&msgs);
+        assert!(out.contains("<bos>"), "out={out}");
+        assert!(out.contains("<start_of_turn>user"), "out={out}");
+
+        // No template: falls back to the legacy formatter.
+        let none = ChatPromptRenderer::new(&ChatTemplateConfig::default());
+        assert_eq!(none.render(&msgs), render_prompt_legacy(&msgs));
+
+        // Unparseable template is treated as absent → legacy fallback, not a panic.
+        let broken = ChatPromptRenderer::new(&ChatTemplateConfig {
+            template: Some("{% for %}".into()),
+            bos_token: None,
+            eos_token: None,
+        });
+        assert_eq!(broken.render(&msgs), render_prompt_legacy(&msgs));
     }
 
     #[test]
