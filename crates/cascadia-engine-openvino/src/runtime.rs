@@ -1278,6 +1278,9 @@ impl Engine for OvRuntimeEngine {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "ov-runtime step failed");
+                // Back off so a persistently-failing step (e.g. upstream socket
+                // closed during recv) can't tight-loop and peg the CPU / starve sshd.
+                std::thread::sleep(std::time::Duration::from_millis(500));
                 Vec::new()
             }
         }
