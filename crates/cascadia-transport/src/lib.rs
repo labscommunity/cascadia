@@ -208,7 +208,13 @@ pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
 pub async fn recv_tensor_reply_prefill(
     sock: &mut TcpStream,
 ) -> TransportResult<(Tensor, TransferStats)> {
-    recv_tensor_inner(sock, Some(recv_timeout() * PREFILL_REPLY_TIMEOUT_FACTOR)).await
+    // saturating_mul: an absurdly large configured base must clamp, not
+    // panic the engine thread (Duration's Mul panics on overflow).
+    recv_tensor_inner(
+        sock,
+        Some(recv_timeout().saturating_mul(PREFILL_REPLY_TIMEOUT_FACTOR)),
+    )
+    .await
 }
 
 async fn recv_tensor_inner(
