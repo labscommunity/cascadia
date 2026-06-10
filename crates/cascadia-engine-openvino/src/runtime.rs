@@ -982,8 +982,16 @@ impl OvRuntimeEngine {
             let (out, shape) = self.run_first(&tokens, position)?;
             let alpha = ts.elapsed();
             self.position += tokens.len() as i64;
-            let (nt, wire) =
-                self.resolve_next_token(&out, &shape, single_stage, position, prefill)?;
+            // 1-token prompt prefill costs the same downstream as a decode
+            // step — keep the strict deadline (mirrors step_middle's
+            // shape[1] > 1) so wedge eviction stays fast.
+            let (nt, wire) = self.resolve_next_token(
+                &out,
+                &shape,
+                single_stage,
+                position,
+                prefill && tokens.len() > 1,
+            )?;
             if let Some(a) = self.active.as_mut() {
                 a.t_alpha_compute += alpha;
                 a.t_wire += wire;
