@@ -419,6 +419,54 @@ struct ActiveTask {
     t_wire: std::time::Duration,
 }
 
+/// Rate-limits the "step failed" WARN (cascadia-enterprise issue #30: a
+/// persistently-failing step logged one WARN per call — ~90k/s — and grew
+/// chain.log to 770 GB). First failure of a streak logs in full; later
+/// ones are counted and surfaced as a periodic "still failing" summary.
+/// Success closes the streak so the next failure logs immediately again.
+#[derive(Default)]
+struct StepWarnLimiter {
+    /// `Some(last WARN instant)` while in a failing streak.
+    last_warn: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+#[derive(Debug)]
+enum StepWarn {
+    First,
+    StillFailing { suppressed: u64 },
+}
+
+impl StepWarnLimiter {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// What to log for a failure at `now`, if anything.
+    fn on_failure(&mut self, now: std::time::Instant) -> Option<StepWarn> {
+        match self.last_warn {
+            None => {
+                self.last_warn = Some(now);
+                Some(StepWarn::First)
+            }
+            Some(last) if now.duration_since(last) >= Self::INTERVAL => {
+                self.last_warn = Some(now);
+                let suppressed = std::mem::take(&mut self.suppressed);
+                Some(StepWarn::StillFailing { suppressed })
+            }
+            Some(_) => {
+                self.suppressed += 1;
+                None
+            }
+        }
+    }
+
+    /// Closes a failing streak; returns the suppressed count to report.
+    fn on_success(&mut self) -> Option<u64> {
+        self.last_warn
+            .take()
+            .map(|_| std::mem::take(&mut self.suppressed))
+    }
+}
+
 pub struct OvRuntimeEngine {
     spec: ShardSpec,
     runtime: OvRuntime,
@@ -443,6 +491,7 @@ pub struct OvRuntimeEngine {
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
+    step_warn: StepWarnLimiter,
 }
 
 impl OvRuntimeEngine {
@@ -1294,9 +1343,20 @@ impl Engine for OvRuntimeEngine {
             self.step_middle().map(|_| Vec::new())
         };
         match result {
-            Ok(v) => v,
+            Ok(v) => {
+                if let Some(suppressed) = self.step_warn.on_success() {
+                    tracing::info!(suppressed, "ov-runtime step recovered");
+                }
+                v
+            }
             Err(e) => {
-                warn!(error = %e, "ov-runtime step failed");
+                match self.step_warn.on_failure(std::time::Instant::now()) {
+                    Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
+                    Some(StepWarn::StillFailing { suppressed }) => {
+                        warn!(error = %e, suppressed, "ov-runtime step still failing")
+                    }
+                    None => {}
+                }
                 Vec::new()
             }
         }
@@ -1734,6 +1794,7 @@ impl Builder for OvRuntimeBuilder {
             pending: Vec::new(),
             active: None,
             static_kv,
+            step_warn: StepWarnLimiter::default(),
         }))
     }
 }
@@ -1760,5 +1821,59 @@ mod tests {
     async fn connect_no_peers_is_noop_for_single_stage() {
         let mut b = OvRuntimeBuilder::new("/x", 0, 1, "CPU");
         b.connect(PeerLayout::single_stage()).await.unwrap();
+    }
+
+    // -------- StepWarnLimiter (issue #30: WARN flood on failing step) --------
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[test]
+    fn step_warn_limiter_logs_first_failure_then_suppresses() {
+        let mut l = StepWarnLimiter::default();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(l.on_failure(t0), Some(StepWarn::First)));
+        assert!(l.on_failure(t0 + ms(1)).is_none());
+        assert!(l.on_failure(t0 + ms(2)).is_none());
+    }
+
+    #[test]
+    fn step_warn_limiter_emits_periodic_summary_with_suppressed_count() {
+        let mut l = StepWarnLimiter::default();
+        let t0 = std::time::Instant::now();
+        l.on_failure(t0);
+        for i in 1..=5 {
+            assert!(l.on_failure(t0 + ms(i)).is_none());
+        }
+        let later = t0 + StepWarnLimiter::INTERVAL + ms(10);
+        match l.on_failure(later) {
+            Some(StepWarn::StillFailing { suppressed }) => assert_eq!(suppressed, 5),
+            other => panic!("expected StillFailing summary, got {other:?}"),
+        }
+        // Counter resets after each summary; the next interval reports
+        // only what was suppressed since.
+        assert!(l.on_failure(later + ms(1)).is_none());
+        match l.on_failure(later + StepWarnLimiter::INTERVAL + ms(10)) {
+            Some(StepWarn::StillFailing { suppressed }) => assert_eq!(suppressed, 1),
+            other => panic!("expected second summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_warn_limiter_success_ends_streak_and_relatches() {
+        let mut l = StepWarnLimiter::default();
+        let t0 = std::time::Instant::now();
+        // No streak → nothing to report.
+        assert!(l.on_success().is_none());
+        l.on_failure(t0);
+        l.on_failure(t0 + ms(1));
+        // Streak ends: report the one suppressed failure.
+        assert_eq!(l.on_success(), Some(1));
+        // Latch cleared: a new failure logs immediately again.
+        assert!(matches!(l.on_failure(t0 + ms(2)), Some(StepWarn::First)));
+        // Streak with nothing suppressed still closes (count 0).
+        assert_eq!(l.on_success(), Some(0));
+        assert!(l.on_success().is_none());
     }
 }
