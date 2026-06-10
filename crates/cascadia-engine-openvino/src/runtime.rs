@@ -910,7 +910,11 @@ impl OvRuntimeEngine {
         // steps and the API returns `data: [DONE]` with zero chunks.
         let res = self.step_first_body();
         if let Err(ref e) = res {
-            warn!(
+            // DEBUG, not WARN: the outer step() emits the rate-limited
+            // WARN for the same error (StepWarnLimiter); a second
+            // unconditional WARN here would bypass the limiter and
+            // double-log every first-stage failure.
+            tracing::debug!(
                 error = %e,
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
