@@ -737,10 +737,18 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        // MID-TASK reply: we just sent a hidden state and the pipeline owes
+        // us the sampled token back. Use the deadlined `recv_reply`, NOT the
+        // idle-tolerant `recv` — a frame lost between stages (pipeline-leg
+        // reset) would otherwise block this step loop forever with the task
+        // slot held: the live-rig Item-5 wedge ("task active: 1, task done:
+        // 0" all day). On timeout the error propagates to `step_first`'s
+        // catch, which clears the active task and resets state — the slot
+        // is freed and the next submit starts fresh.
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                guard.recv().await
+                guard.recv_reply().await
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
@@ -770,12 +778,20 @@ impl OvRuntimeEngine {
         let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
-                let pos_tensor = if want_pos {
-                    Some(guard.recv().await?.0)
+                // First frame of a task hop is an IDLE wait (no deadline —
+                // "no next request yet" is fine). On the static path the
+                // hidden tensor that must FOLLOW the position frame is a
+                // mid-pair reply: once the pos frame arrived, the peer owes
+                // the hidden promptly — deadline it so a half-sent pair
+                // can't wedge the stage (see `recv_tensor_reply`).
+                let (pos_tensor, t) = if want_pos {
+                    let pos = guard.recv().await?.0;
+                    let (t, _) = guard.recv_reply().await?;
+                    (Some(pos), t)
                 } else {
-                    None
+                    let (t, _) = guard.recv().await?;
+                    (None, t)
                 };
-                let (t, _) = guard.recv().await?;
                 Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;

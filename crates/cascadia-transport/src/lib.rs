@@ -175,9 +175,37 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 /// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
 /// trigger overflow downstream.
 pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+    recv_tensor_inner(sock, false).await
+}
+
+/// Like [`recv_tensor`] but for a MID-TASK reply: the peer owes us a prompt
+/// response to a frame we just sent (e.g. the pipeline tail returning the
+/// sampled token for a hidden state), so the header's FIRST byte is read
+/// under the strict recv timeout instead of the idle-tolerant indefinite
+/// wait. Call-site rule: a stage waiting for the NEXT task idles on
+/// `recv` (no deadline — "no work yet" is not a failure); a stage waiting
+/// for a reply to in-flight work uses `recv_reply` — otherwise a single
+/// frame lost mid-task (e.g. a pipeline-leg reset between stages) blocks
+/// the engine's step loop forever and the task slot is never freed
+/// (overload-backlog Item 5: forwarded-to head wedges, task never
+/// finalizes).
+pub async fn recv_tensor_reply(
+    sock: &mut TcpStream,
+) -> TransportResult<(Tensor, TransferStats)> {
+    recv_tensor_inner(sock, true).await
+}
+
+async fn recv_tensor_inner(
+    sock: &mut TcpStream,
+    deadline_first_byte: bool,
+) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
-    recv_exact_frame_start(sock, &mut header).await?;
+    if deadline_first_byte {
+        recv_exact(sock, &mut header).await?;
+    } else {
+        recv_exact_frame_start(sock, &mut header).await?;
+    }
 
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
     let dtype_code = u32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -496,6 +524,13 @@ impl ActivationServer {
         }
     }
 
+    /// Mid-task reply recv — strict deadline on the first byte. See
+    /// [`recv_tensor_reply`] for the call-site rule.
+    pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        recv_tensor_reply(sock).await
+    }
+
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         send_tensor(sock, tensor).await
@@ -634,6 +669,13 @@ impl ActivationClient {
         if err.is_some_and(recv_error_is_connection_fatal) {
             self.sock = None; // drop closes the fd
         }
+    }
+
+    /// Mid-task reply recv — strict deadline on the first byte. See
+    /// [`recv_tensor_reply`] for the call-site rule.
+    pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        recv_tensor_reply(sock).await
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
@@ -778,6 +820,60 @@ mod tests {
             "idle wait for the next frame must not time out: {:?}",
             got.err()
         );
+    }
+
+    /// A MID-TASK reply (`recv_reply`) is the opposite contract: the peer
+    /// owes us a prompt response, so a silent peer must fail fast instead
+    /// of blocking the engine's step loop forever with the task slot held
+    /// (overload-backlog Item 5).
+    #[tokio::test]
+    async fn reply_wait_longer_than_timeout_fails_fast() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let started = std::time::Instant::now();
+            let res = server.recv_reply().await;
+            (res, started.elapsed())
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        // Send nothing: the "reply" never comes.
+        let (got, waited) = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_err(),
+            "a missing mid-task reply must time out, got {got:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "must fail within ~the recv timeout, waited {waited:?}"
+        );
+    }
+
+    /// Happy path: a reply arriving within the deadline is received normally.
+    #[tokio::test]
+    async fn reply_within_timeout_succeeds() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(2);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv_reply().await
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(got.is_ok(), "in-deadline reply must succeed: {:?}", got.err());
     }
 
     /// Once a frame has started, a stalled peer must still hit the timeout

@@ -635,7 +635,8 @@ impl Gemma4Engine {
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                guard.recv().await
+                // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
+                guard.recv_reply().await
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
@@ -664,9 +665,12 @@ impl Gemma4Engine {
         let (pos_t, hid_t, header_t) = self
             .block_on(async {
                 let mut guard = upstream.lock().await;
+                // First frame of the step is the IDLE wait; the frames that
+                // must follow it are mid-sequence replies — deadlined so a
+                // half-sent step can't wedge the stage (Item 5).
                 let pos = guard.recv().await?.0;
-                let hid = guard.recv().await?.0;
-                let hdr = guard.recv().await?.0;
+                let hid = guard.recv_reply().await?.0;
+                let hdr = guard.recv_reply().await?.0;
                 Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -696,7 +700,7 @@ impl Gemma4Engine {
                 let mut guard = up2.lock().await;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
-                    v.push(guard.recv().await?.0);
+                    v.push(guard.recv_reply().await?.0);
                 }
                 Ok::<_, cascadia_transport::TransportError>(v)
             })
