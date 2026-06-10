@@ -169,7 +169,7 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
-    recv_exact(sock, &mut header).await?;
+    recv_exact_frame_start(sock, &mut header).await?;
 
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
     let dtype_code = u32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -240,6 +240,22 @@ fn recv_timeout() -> Duration {
     )
 }
 
+/// Wait for the first byte of a NEW frame without a deadline, then read the
+/// remainder under the strict recv timeout. A pipeline stage is idle between
+/// requests by design — "no next frame yet" is not a failure, and treating it
+/// as one made every idle chain kill its own sockets on a timer. A dead peer
+/// still fails fast here via EOF/reset; only a silent black-hole peer waits.
+async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+    let n = sock.read(buf).await?;
+    if n == 0 {
+        return Err(TransportError::SocketClosed);
+    }
+    if n < buf.len() {
+        recv_exact(sock, &mut buf[n..]).await?;
+    }
+    Ok(())
+}
+
 async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
@@ -247,6 +263,7 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     // thread forever. 60 s is generous for a single tensor frame on a
     // multi-MB Llama hidden state over Thunderbolt, and small enough
     // that a wedged peer is detected within one or two heartbeats.
+    // Waiting for a frame to BEGIN is exempt — see recv_exact_frame_start.
     let read_fut = async {
         let mut read = 0;
         while read < buf.len() {
@@ -345,7 +362,7 @@ impl ActivationServer {
         }
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact(sock, &mut buf).await?;
+        recv_exact_frame_start(sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -461,7 +478,7 @@ impl ActivationClient {
         }
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact(sock, &mut buf).await?;
+        recv_exact_frame_start(sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -555,5 +572,56 @@ mod tests {
         assert_eq!(DType::I8.bytes_per_element(), 1);
         assert_eq!(DType::I32.bytes_per_element(), 4);
         assert_eq!(DType::I64.bytes_per_element(), 8);
+    }
+
+    /// Serializes tests that mutate the global activation timeout.
+    static TIMEOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A pipeline tail is idle between requests by design; waiting for the
+    /// NEXT frame longer than the recv timeout must not kill the socket.
+    #[tokio::test]
+    async fn idle_gap_longer_than_timeout_does_not_kill_recv() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await; // idle > timeout
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_ok(),
+            "idle wait for the next frame must not time out: {:?}",
+            got.err()
+        );
+    }
+
+    /// Once a frame has started, a stalled peer must still hit the timeout
+    /// (slow-loris / wedged-peer bound is preserved).
+    #[tokio::test]
+    async fn mid_frame_stall_still_times_out() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock.write_all(&[0u8; 4]).await.unwrap(); // partial header, then stall
+        sock.flush().await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(got.is_err(), "partial frame then stall must still time out");
     }
 }
