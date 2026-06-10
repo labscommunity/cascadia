@@ -1327,8 +1327,14 @@ impl Engine for OvRuntimeEngine {
         };
         match result {
             Ok(v) => {
-                if let Some(suppressed) = self.step_warn.on_success() {
-                    tracing::info!(suppressed, "ov-runtime step recovered");
+                // First-stage idle steps return Ok(empty) even mid-failure
+                // (a failed step clears `active`; the next poll no-ops), so
+                // only a step that did real work closes a failing streak.
+                // Relay-stage Ok is always a completed relay round.
+                if !v.is_empty() || !self.spec.is_first_stage {
+                    if let Some(suppressed) = self.step_warn.on_success() {
+                        info!(suppressed, "ov-runtime step recovered");
+                    }
                 }
                 v
             }
