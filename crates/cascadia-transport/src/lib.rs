@@ -175,7 +175,7 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 /// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
 /// trigger overflow downstream.
 pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
-    recv_tensor_inner(sock, false).await
+    recv_tensor_inner(sock, None).await
 }
 
 /// Like [`recv_tensor`] but for a MID-TASK reply: the peer owes us a prompt
@@ -189,22 +189,37 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
 /// the engine's step loop forever and the task slot is never freed
 /// (overload-backlog Item 5: forwarded-to head wedges, task never
 /// finalizes).
-pub async fn recv_tensor_reply(
+pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+    recv_tensor_inner(sock, Some(recv_timeout())).await
+}
+
+/// A PREFILL reply is owed only after every remaining downstream stage has
+/// run whole-prompt inference sequentially — the wait scales with prompt
+/// length × pipeline depth, not with a single frame transfer (which is what
+/// the base recv timeout was sized for). Budget: 10× the base, which at the
+/// 60s default restores the pre-idle-tolerance 600s bound; decode replies
+/// (sub-second when healthy) keep the strict [`recv_tensor_reply`] deadline
+/// so wedge eviction stays fast where it matters.
+pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
+
+/// [`recv_tensor_reply`] with the widened prefill budget. Use for the token
+/// reply to a multi-token (prefill) hidden state; everything else uses
+/// `recv_tensor_reply`.
+pub async fn recv_tensor_reply_prefill(
     sock: &mut TcpStream,
 ) -> TransportResult<(Tensor, TransferStats)> {
-    recv_tensor_inner(sock, true).await
+    recv_tensor_inner(sock, Some(recv_timeout() * PREFILL_REPLY_TIMEOUT_FACTOR)).await
 }
 
 async fn recv_tensor_inner(
     sock: &mut TcpStream,
-    deadline_first_byte: bool,
+    deadline_first_byte: Option<Duration>,
 ) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
-    if deadline_first_byte {
-        recv_exact(sock, &mut header).await?;
-    } else {
-        recv_exact_frame_start(sock, &mut header).await?;
+    match deadline_first_byte {
+        Some(to) => recv_exact_within(sock, &mut header, to).await?,
+        None => recv_exact_frame_start(sock, &mut header).await?,
     }
 
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
@@ -248,6 +263,7 @@ async fn recv_tensor_inner(
 static ACTIVATION_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Set the activation recv timeout from node config; takes precedence over the env var.
+/// Process-global, last writer wins — one value per process, not per shard.
 pub fn set_activation_timeout_secs(secs: u64) {
     ACTIVATION_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
 }
@@ -435,6 +451,14 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     // transfers ever land (e.g. KV-cache blobs), switch to an idle/
     // no-progress timeout (reset the deadline on each read that returns
     // bytes) so progress, not total size, is what's bounded.
+    recv_exact_within(sock, buf, recv_timeout()).await
+}
+
+async fn recv_exact_within(
+    sock: &mut TcpStream,
+    buf: &mut [u8],
+    to: Duration,
+) -> TransportResult<()> {
     let read_fut = async {
         let mut read = 0;
         while read < buf.len() {
@@ -446,7 +470,6 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
         }
         Ok(())
     };
-    let to = recv_timeout();
     match tokio::time::timeout(to, read_fut).await {
         Ok(res) => res,
         Err(_) => Err(TransportError::Io(io::Error::new(
@@ -525,10 +548,39 @@ impl ActivationServer {
     }
 
     /// Mid-task reply recv — strict deadline on the first byte. See
-    /// [`recv_tensor_reply`] for the call-site rule.
+    /// [`recv_tensor_reply`] for the call-site rule. A failed reply
+    /// poisons the connection (see [`Self::poison`]).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor_reply(sock).await
+        let res = recv_tensor_reply(sock).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
+    }
+
+    /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
+    /// A failed reply poisons the connection (see [`Self::poison`]).
+    pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = recv_tensor_reply_prefill(sock).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
+    }
+
+    /// A failed reply leaves the stream in an unknown framing state: a
+    /// late-but-healthy reply may still arrive and would be consumed by the
+    /// NEXT task as fresh data (silent cross-task token corruption), and a
+    /// partially-read header misaligns every later frame. Drop + shutdown
+    /// the connection so later calls fail fast with `NotConnected` instead
+    /// of corrupting — recovery is a fresh connection, not reuse.
+    async fn poison(&mut self) {
+        if let Some(mut s) = self.client.take() {
+            let _ = s.shutdown().await;
+        }
+        self.accepted_addr = None;
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
@@ -672,10 +724,34 @@ impl ActivationClient {
     }
 
     /// Mid-task reply recv — strict deadline on the first byte. See
-    /// [`recv_tensor_reply`] for the call-site rule.
+    /// [`recv_tensor_reply`] for the call-site rule. A failed reply
+    /// poisons the connection (see [`Self::poison`]).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor_reply(sock).await
+        let res = recv_tensor_reply(sock).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
+    }
+
+    /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
+    /// A failed reply poisons the connection (see [`Self::poison`]).
+    pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = recv_tensor_reply_prefill(sock).await;
+        if res.is_err() {
+            self.poison().await;
+        }
+        res
+    }
+
+    /// See [`ActivationServer::poison`]: a failed reply means unknown
+    /// framing state — fail fast on reuse instead of corrupting.
+    async fn poison(&mut self) {
+        if let Some(mut s) = self.sock.take() {
+            let _ = s.shutdown().await;
+        }
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
@@ -873,7 +949,74 @@ mod tests {
         client.send(&tensor).await.unwrap();
         let got = h.await.unwrap();
         set_activation_timeout_secs(0);
-        assert!(got.is_ok(), "in-deadline reply must succeed: {:?}", got.err());
+        assert!(
+            got.is_ok(),
+            "in-deadline reply must succeed: {:?}",
+            got.err()
+        );
+    }
+
+    /// A timed-out reply leaves the stream in an unknown framing state — a
+    /// late-but-healthy reply could otherwise be consumed by the NEXT task
+    /// as fresh data (silent cross-task corruption). The connection must be
+    /// poisoned: later recvs fail fast with NotConnected.
+    #[tokio::test]
+    async fn reply_timeout_poisons_connection() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let first = server.recv_reply().await;
+            let second = server.recv().await;
+            (first, second)
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await; // miss the 1s deadline
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        let _ = client.send(&tensor).await; // late reply — server may have hung up
+        let (first, second) = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            first.is_err(),
+            "the late reply must time out, got {first:?}"
+        );
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "a poisoned connection must fail fast, not serve the stale frame: {second:?}"
+        );
+    }
+
+    /// A prefill reply legitimately includes the remaining stages'
+    /// whole-prompt compute — it gets the widened budget, not the
+    /// single-frame deadline.
+    #[tokio::test]
+    async fn prefill_reply_outlives_base_timeout() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv_reply_prefill().await
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        // > 1s base deadline, < the 10x prefill budget.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_ok(),
+            "a slow-but-in-budget prefill reply must succeed: {:?}",
+            got.err()
+        );
     }
 
     /// Once a frame has started, a stalled peer must still hit the timeout

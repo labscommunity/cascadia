@@ -732,7 +732,7 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    fn recv_token_from_downstream(&mut self) -> EngineResult<i32> {
+    fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
@@ -744,11 +744,18 @@ impl OvRuntimeEngine {
         // slot held: the live-rig Item-5 wedge ("task active: 1, task done:
         // 0" all day). On timeout the error propagates to `step_first`'s
         // catch, which clears the active task and resets state — the slot
-        // is freed and the next submit starts fresh.
+        // is freed and the next submit starts fresh. A prefill reply waits
+        // on every remaining stage's whole-prompt compute, so it gets the
+        // widened budget (see `recv_tensor_reply_prefill`) — a long prompt
+        // on a slow stage must not read as a wedge.
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                guard.recv_reply().await
+                if prefill {
+                    guard.recv_reply_prefill().await
+                } else {
+                    guard.recv_reply().await
+                }
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
@@ -955,8 +962,11 @@ impl OvRuntimeEngine {
                 let (out, shape) = self.run_first(&[t], position)?;
                 let alpha = ts.elapsed();
                 self.position += 1;
+                // Static prefill round-trips per prompt token — each reply
+                // covers one token's relay compute, so it is never a
+                // prefill-budget wait.
                 let (token, wire) =
-                    self.resolve_next_token(&out, &shape, single_stage, position)?;
+                    self.resolve_next_token(&out, &shape, single_stage, position, false)?;
                 nt = token;
                 if let Some(a) = self.active.as_mut() {
                     a.t_alpha_compute += alpha;
@@ -972,7 +982,8 @@ impl OvRuntimeEngine {
             let (out, shape) = self.run_first(&tokens, position)?;
             let alpha = ts.elapsed();
             self.position += tokens.len() as i64;
-            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+            let (nt, wire) =
+                self.resolve_next_token(&out, &shape, single_stage, position, prefill)?;
             if let Some(a) = self.active.as_mut() {
                 a.t_alpha_compute += alpha;
                 a.t_wire += wire;
@@ -993,6 +1004,7 @@ impl OvRuntimeEngine {
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        prefill: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
             Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
@@ -1000,7 +1012,7 @@ impl OvRuntimeEngine {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
             self.send_hidden_downstream(out, s3, position)?;
-            let token = self.recv_token_from_downstream()?;
+            let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
     }
@@ -1210,6 +1222,10 @@ impl OvRuntimeEngine {
 
     fn step_middle(&mut self) -> EngineResult<()> {
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        // Multi-token hidden = stateful prefill: the token reply waits on
+        // every remaining stage's whole-prompt compute (static is seq=1,
+        // so this is always false there).
+        let prefill_reply = shape[1] > 1;
         let (out, out_shape, fwd_pos) = match pos_opt {
             Some(pos) => {
                 let (o, s) = self.run_relay(&hidden, shape, pos)?;
@@ -1227,7 +1243,7 @@ impl OvRuntimeEngine {
         };
         let s3 = to_shape3(&out_shape);
         self.send_hidden_downstream(&out, s3, fwd_pos)?;
-        let token = self.recv_token_from_downstream()?;
+        let token = self.recv_token_from_downstream(prefill_reply)?;
         self.send_token_to_upstream(token)?;
         Ok(())
     }
