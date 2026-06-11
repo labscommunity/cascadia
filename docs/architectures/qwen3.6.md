@@ -74,9 +74,21 @@ GenAI 2026.2 (build 21894); model: `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
   the same prompt (GPU numerics under batched verification) — HF-parity
   checks must compare per decode mode, applied output not intermediates.
 
-Still pending: CPU-device validation, tool-calling validation, HF-parity
-prompt set, `usage` token counts in API responses (currently 0),
-thinking-mode chat-template handling.
+Same-day follow-ups (also validated 2026-06-11):
+
+- **CPU device**: coherent completion through the API (`--device CPU`).
+- **2026.2 engine regression smoke** (ov-genai, dense Qwen3-1.7B-int4-ov):
+  CPU ✅ and GPU ✅ with textually identical outputs; NPU rejected that
+  export (`vpux-compiler ... 16 duplicated names`) — **not** a 2026.2
+  regression: the NPU-proven `llama-3.1-8b-instruct-npu-ov` export served
+  fine on NPU. Dynamic-shape `int4-ov` exports are CPU/GPU artifacts; NPU
+  needs its dedicated static-shape exports, as before.
+- **OVMS 2026.2.0** installed via the repinned `install-ovms.ps1`
+  (URL + SHA256 verified end-to-end).
+
+Still pending: tool-calling validation, HF-parity prompt set, `usage`
+token counts in API responses (currently 0), thinking-mode chat-template
+handling.
 
 ## Why `cascadia shard` rejects it
 
