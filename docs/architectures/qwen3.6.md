@@ -1,7 +1,7 @@
 # Qwen3.6-35B-A3B (and Qwen3.5) — hybrid Gated-DeltaNet MoE
 
-Tracking issue: #77. Status: **single-stage supported (pending hardware
-validation); multi-stage rejected — see
+Tracking issue: #77. Status: **single-stage supported and validated on
+hardware (2026-06-11); multi-stage rejected — see
 [qwen36-moe-support.md](qwen36-moe-support.md) for the deferred sharded
 design.**
 
@@ -24,9 +24,13 @@ architecture class; the expert/MoE fields live under the nested
 ## How to run it: single-stage `ov-genai` (OV GenAI ≥ 2026.2)
 
 OpenVINO 2026.2 natively compiles `qwen3_5_moe` (fused GatedDeltaNet op,
-CPU & GPU, tool-calling included). The `ov-genai` engine hands a model
-directory to `openvino_genai::LLMPipeline`, so no cascadia engine code is
-involved:
+CPU & GPU, tool-calling included). One cascadia-side requirement the
+issue didn't anticipate: the published export is **VLM-layout**
+(`openvino_language_model.xml` + separate embeddings/vision IRs — no
+`openvino_model.xml`), which `LLMPipeline` cannot open ("Port for tensor
+name input_ids was not found"). The `ov-genai` engine auto-detects this
+layout and uses `VLMPipeline` (text-only) via the shim's
+`cascadia_pipeline_create_vlm`:
 
 ```
 # Pre-exported IR (preferred):
@@ -46,10 +50,33 @@ INT4 weights are ~18–20 GB — fits a single 32 GB Intel AI PC via UMA.
 NPU is out of scope (35B does not fit). Vision input is not supported on
 this path (text-only).
 
-TODO(#77): record the exact verified `optimum-intel` + `nncf` versions and
-HF-parity validation results (CPU + iGPU, tool-calling) once run on
-hardware; until then treat this page as the recipe, not a validation
-record.
+## Validation record (2026-06-11, cascadia-pawan-01)
+
+Hardware: Core Ultra 7 258V (Lunar Lake), 32 GB UMA, Windows; SDK: OV
+GenAI 2026.2 (build 21894); model: `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
+(18.3 GB on disk); toolchain probe: transformers 5.4.0 loads the config
+(`norm_topk_prob` is not a config parameter in this family).
+
+- **Served end-to-end**: `cascadia run <model-dir> --device GPU` →
+  `/v1/chat/completions` returned coherent OpenAI-format completions
+  (2/2 requests + `/v1/models`), over the mesh network from a remote
+  client.
+- **Throughput (GPU, ~1K-token prompt, 128 new tokens)**: greedy
+  1.27 tok/s (TPOT 785 ms, TTFT 10.3 s); with prompt-lookup
+  (`num_assistant_tokens=5`, `max_ngram_size=3`) 2.46 tok/s (TPOT
+  406 ms). Lunar Lake serves this model *correctly but slowly*; usable
+  interactive serving wants an Arc/B60-class GPU (the 2026.2 release
+  notes' optimization target for Qwen3 MoE).
+- **Crash fixed during bring-up**: `ov::genai::StreamerVariant{}`
+  default-constructs an empty `std::function` → fast-fail `0xc0000409`
+  mid-generate; the shim passes `std::monostate{}` explicitly.
+- **Caution**: prompt-lookup output diverged textually from greedy on
+  the same prompt (GPU numerics under batched verification) — HF-parity
+  checks must compare per decode mode, applied output not intermediates.
+
+Still pending: CPU-device validation, tool-calling validation, HF-parity
+prompt set, `usage` token counts in API responses (currently 0),
+thinking-mode chat-template handling.
 
 ## Why `cascadia shard` rejects it
 
