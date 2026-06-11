@@ -20,7 +20,7 @@ fn main() {
             "\n\
             ────────────────────────────────────────────────────────────\n\
             cascadia: building with `--features openvino` but INTEL_OPENVINO_DIR is not set.\n\n\
-            Point it at an OpenVINO GenAI 2026.1+ SDK install, e.g.:\n\n\
+            Point it at an OpenVINO GenAI 2026.2+ SDK install, e.g.:\n\n\
             \x20 INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0 \\\n\
             \x20   cargo build --release -p cascadia --features openvino\n\n\
             Don't have the SDK yet? See INSTALL.md (\"OpenVINO GenAI SDK\")\n\

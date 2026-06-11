@@ -48,6 +48,6 @@ fi
 
 echo
 echo "Done. Next:"
-echo "  1. Download the OpenVINO GenAI 2026.1+ SDK and set INTEL_OPENVINO_DIR (see INSTALL.md)."
+echo "  1. Download the OpenVINO GenAI 2026.2+ SDK and set INTEL_OPENVINO_DIR (see INSTALL.md)."
 echo "  2. Build:   INTEL_OPENVINO_DIR=... cargo build --release -p cascadia --features openvino"
 echo "  3. Verify:  cascadia doctor   (should list a GPU device, not just CPU)"
