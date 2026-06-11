@@ -62,6 +62,12 @@ fn shapes(name: &str) -> Vec<(&'static str, usize, usize)> {
         "shared_gate" => vec![("shared_gate", 2048, 7168)],
         "shared_down" => vec![("shared_down", 7168, 2048)],
         "tile" => vec![("tile_64x64", 64, 64)],
+        // Qwen3.6-35B-A3B expert shapes (qwen36 spec M2'-0 probe):
+        // gate/up = [moe_intermediate=512, hidden=2048], down = transpose.
+        "qwen36_expert" => vec![
+            ("qwen36_gate_up", 512, 2048),
+            ("qwen36_down", 2048, 512),
+        ],
         "all" => vec![
             ("tile_64x64", 64, 64),
             ("qproj", 1536, 7168),
@@ -71,7 +77,7 @@ fn shapes(name: &str) -> Vec<(&'static str, usize, usize)> {
             ("oproj", 7168, 8192),
         ],
         other => panic!(
-            "unknown shape: {other} (use qproj|kvproj|oproj|shared_gate|shared_down|tile|all)"
+            "unknown shape: {other} (use qproj|kvproj|oproj|shared_gate|shared_down|tile|qwen36_expert|all)"
         ),
     }
 }
