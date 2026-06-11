@@ -6,10 +6,10 @@
 //!
 //! Stage dirs are stateful OV IRs (DeltaNet conv/ssm + attention KV as
 //! ReadValue/Assign). Linear state cannot be trimmed: every task starts
-//! with `reset_state()` on every stage, and cancellation mid-decode also
-//! resets (position-0 re-entry is the only recovery — spec §4.1).
+//! with `reset_state()` on every stage (position-0 re-entry is the only
+//! recovery — spec §4.1); cancellation drops the task and the next
+//! admission's reset restores the invariant.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -152,7 +152,6 @@ impl Builder for Qwen36Builder {
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
             pending: Vec::new(),
-            cancelled: HashSet::new(),
             active: None,
         }))
     }
@@ -175,7 +174,6 @@ pub struct Qwen36Engine {
     eos: Option<u32>,
     max_tokens_default: u32,
     pending: Vec<GenerationTask>,
-    cancelled: HashSet<TaskId>,
     active: Option<ActiveTask>,
 }
 
@@ -346,7 +344,6 @@ impl Engine for Qwen36Engine {
                 return Vec::new();
             }
             let task = self.pending.remove(0);
-            self.cancelled.remove(&task.task_id);
             self.reset_all();
             let prompt_ids: Vec<u32> = match self.tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
@@ -374,12 +371,6 @@ impl Engine for Qwen36Engine {
         }
         let t = self.active.as_ref().unwrap();
         let task_id = t.task_id.clone();
-
-        // Cancel lands between steps now that step() is per-token.
-        if self.cancelled.remove(&task_id) {
-            info!(task = %task_id, "qwen36: cancelled; resetting state");
-            return self.finalize();
-        }
 
         // Full prefill in one call (the runner closes streams after 3
         // empty steps, so prefill can't be spread one-token-per-step),
@@ -455,8 +446,14 @@ impl Engine for Qwen36Engine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
-        // Pending (not started): drop. In-flight: flag checked per token.
+        // Immediate clear (PR #56 idiom): cancel and step never overlap
+        // (both &mut self behind the runner's mutex), and the next
+        // admission resets state, so dropping active directly is safe
+        // and frees the engine slot without waiting for another poll.
         self.pending.retain(|t| &t.task_id != task_id);
-        self.cancelled.insert(task_id.clone());
+        if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
+            info!(task = %task_id, "qwen36: cancelled; dropping active task");
+            self.active = None;
+        }
     }
 }
