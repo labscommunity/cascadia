@@ -281,9 +281,12 @@ int32_t cascadia_pipeline_generate(
             // Text-only generate on a VLM-layout export; no image tensors.
             ov::genai::GenerationConfig gen_cfg =
                 cfg ? cfg->cfg : ov::genai::GenerationConfig{};
+            // StreamerVariant{} default-constructs its FIRST alternative —
+            // an empty std::function — which fast-fails (0xc0000409) when
+            // invoked. Pass monostate explicitly: "no streamer".
             ov::genai::VLMDecodedResults results = handle->vlm->generate(
                 std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
-                ov::genai::StreamerVariant{});
+                ov::genai::StreamerVariant{std::monostate{}});
             text = results.texts.empty() ? std::string{} : results.texts[0];
             try {
                 generated = static_cast<uint32_t>(
