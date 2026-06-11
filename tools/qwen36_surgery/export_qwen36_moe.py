@@ -179,20 +179,21 @@ def build_feeds(model, hidden=None, embeds=None):
     return feeds
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, help="official int4-ov model dir")
-    ap.add_argument("--out", required=True, help="output dir for stage dirs")
-    ap.add_argument("--total", type=int, default=2)
-    ap.add_argument("--validate", action="store_true",
-                    help="chain stages vs full model on one synthetic token")
-    args = ap.parse_args()
-
-    xml = os.path.join(args.model, "openvino_language_model.xml")
-    ranges = stage_ranges(args.total)
+def run_export(model_dir, output_dir, num_stages=2, validate=False):
+    """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
+    dirs under `output_dir` + manifest + aux files. Entry point for
+    `cascadia shard` dispatch (export_shards.py) and for main() below."""
+    xml = os.path.join(model_dir, "openvino_language_model.xml")
+    if not os.path.exists(xml):
+        raise FileNotFoundError(
+            f"{xml} not found — the qwen3_5_moe exporter does IR surgery on "
+            f"the official int4 OpenVINO IR (e.g. an *-int4-ov model dir), "
+            f"not on safetensors"
+        )
+    ranges = stage_ranges(num_stages)
     manifest = {
         "arch": "qwen3_5_moe", "hidden_size": HIDDEN, "num_layers": NUM_LAYERS,
-        "source": os.path.basename(os.path.abspath(args.model)),
+        "source": os.path.basename(os.path.abspath(model_dir)),
         "stages": [],
     }
 
@@ -200,7 +201,7 @@ def main():
         first, last = i == 0, i == len(ranges) - 1
         t0 = time.time()
         stage = extract_stage(xml, a, b, first, last)
-        sdir = os.path.join(args.out, f"stage{i}")
+        sdir = os.path.join(output_dir, f"stage{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "stage.xml"), compress_to_fp16=False)
         info = {
@@ -213,25 +214,29 @@ def main():
         print(f"stage{i}: layers {a}..{b} saved in {time.time()-t0:.0f}s "
               f"inputs={info['inputs']} states={len(info['state_vars'])}", flush=True)
 
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
     for aux in ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
                 "tokenizer.json", "generation_config.json", "config.json"):
-        src = os.path.join(args.model, aux)
+        src = os.path.join(model_dir, aux)
         if os.path.exists(src):
-            shutil.copy2(src, os.path.join(args.out, aux))
+            shutil.copy2(src, os.path.join(output_dir, aux))
     print("manifest + aux files written", flush=True)
 
-    if not args.validate:
+    if not validate:
         return
 
+    _validate(model_dir, output_dir, xml, ranges)
+
+
+def _validate(model_dir, output_dir, xml, ranges):
     core = ov.Core()
     # Real token embedding (degenerate random embeds make logits near-flat
     # and top-1 noise-sensitive): embed a fixed token via the model dir's
     # own text-embeddings IR — exactly what the runtime feeds.
-    emb_model = core.read_model(os.path.join(args.model, "openvino_text_embeddings_model.xml"))
+    emb_model = core.read_model(os.path.join(model_dir, "openvino_text_embeddings_model.xml"))
     emb_comp = core.compile_model(emb_model, "CPU")
     token = np.array([[1000]], dtype=np.int64)
     embeds = emb_comp.create_infer_request().infer({emb_comp.inputs[0].get_any_name(): token})
@@ -249,7 +254,7 @@ def main():
     hidden = None
     out = None
     for i in range(len(ranges)):
-        sm = core.read_model(os.path.join(args.out, f"stage{i}", "stage.xml"))
+        sm = core.read_model(os.path.join(output_dir, f"stage{i}", "stage.xml"))
         sc = core.compile_model(sm, "CPU")
         feeds = build_feeds(sm, hidden=hidden, embeds=embeds if i == 0 else None)
         out = sc.create_infer_request().infer(feeds)
@@ -281,6 +286,17 @@ def main():
     if ok:
         print("note: multi-token greedy parity (>=64 tokens) is the M3' "
               "engine-level criterion; this validates one decode step.", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, help="official int4-ov model dir")
+    ap.add_argument("--out", required=True, help="output dir for stage dirs")
+    ap.add_argument("--total", type=int, default=2)
+    ap.add_argument("--validate", action="store_true",
+                    help="chain stages vs full model on one synthetic token")
+    args = ap.parse_args()
+    run_export(args.model, args.out, args.total, args.validate)
 
 
 if __name__ == "__main__":

@@ -1775,15 +1775,68 @@ def main():
         )
         return
 
+    # Qwen3.5/3.6 hybrid MoE (model_type qwen3_5_moe) uses a dedicated
+    # exporter, tools/qwen36_surgery/export_qwen36_moe.py: IR surgery on
+    # the official int4 OpenVINO IR (256-expert MoE + GatedDeltaNet layers
+    # cannot go through the generic dense stage builder, and re-exporting
+    # from safetensors would need a ~133 GB host). The --model must be an
+    # *-int4-ov style IR directory (local or HF repo), NOT safetensors.
+    if any(t == "qwen3_5_moe" for t in (_outer_mt, _inner_mt)):
+        print(
+            "Detected Qwen3.5/3.6 hybrid MoE - dispatching to the IR-surgery "
+            "exporter (stages inherit the official int4 IR byte-for-byte; "
+            "--quantization is ignored).",
+            flush=True,
+        )
+        if args.layer_split is not None or args.stage is not None:
+            print(
+                "ERROR: --layer-split/--stage are not supported for "
+                "qwen3_5_moe (stages split uniformly at decoder-layer "
+                "boundaries).",
+                flush=True,
+            )
+            sys.exit(2)
+        if os.path.isdir(args.model):
+            _model_dir = args.model
+        else:
+            # HF repo id: pull the OV IR artifacts (xml/bin + tokenizer).
+            from huggingface_hub import snapshot_download
+
+            cache_root = os.path.expanduser("~/.cache/cascadia/models")
+            _model_dir = os.path.join(cache_root, args.model.replace("/", "--"))
+            os.makedirs(_model_dir, exist_ok=True)
+            print(f"Downloading {args.model} -> {_model_dir}", flush=True)
+            snapshot_download(
+                repo_id=args.model,
+                local_dir=_model_dir,
+                allow_patterns=["*.xml", "*.bin", "*.json", "tokenizer*"],
+                max_workers=8,
+            )
+        _here = os.path.dirname(os.path.abspath(__file__))
+        # in-repo layout (tools/qwen36_surgery/) and the flat temp dir the
+        # CLI extracts the embedded scripts into
+        sys.path.insert(0, os.path.join(_here, "qwen36_surgery"))
+        sys.path.insert(0, _here)
+        from export_qwen36_moe import run_export as _qwen36_run_export
+
+        _qwen36_run_export(
+            _model_dir,
+            args.output_dir,
+            num_stages=args.num_stages,
+            validate=True,
+        )
+        return
+
     moe_msg = (
         f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
         f"cascadia exporter does not support (#60). It builds dense decoder "
         f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
         f"implemented, and falling back to a dense layer would silently emit "
         f"garbage. Aborting rather than producing a broken shard.\n"
-        f"NOTE: hybrid Qwen3.5/Qwen3.6 MoE (model_type qwen3_5_moe) runs\n"
-        f"single-stage instead: `--engine ov-genai` against an Optimum-Intel\n"
-        f"OpenVINO IR on OV GenAI >= 2026.2 — see docs/architectures/qwen3.6.md."
+        f"NOTE: hybrid Qwen3.5/Qwen3.6 MoE (model_type qwen3_5_moe) IS\n"
+        f"supported via a dedicated IR-surgery exporter (dispatched above when\n"
+        f"detected), or single-stage with `--engine ov-genai` on OV GenAI >=\n"
+        f"2026.2 — see docs/architectures/qwen36-moe-support.md."
     )
 
     # Read the config FIRST (cheap — just config.json, no weights) so we can

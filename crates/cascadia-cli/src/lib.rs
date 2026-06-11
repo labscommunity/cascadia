@@ -486,6 +486,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
+    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
     Ok(())
 }
 
@@ -1001,6 +1002,12 @@ const ALIASES_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/model_aliases.py"
 ));
+/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe.
+const QWEN36_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/qwen36_surgery/export_qwen36_moe.py"
+));
 
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
     use std::process::{Command, Stdio};
@@ -1086,6 +1093,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         ("export_shards.py", EXPORT_SCRIPT),
         ("export_gemma4.py", GEMMA4_SCRIPT),
         ("model_aliases.py", ALIASES_SCRIPT),
+        ("export_qwen36_moe.py", QWEN36_SCRIPT),
     ] {
         std::fs::write(_tmpdir.path().join(name), body)
             .with_context(|| format!("writing embedded {name} to temp dir"))?;
