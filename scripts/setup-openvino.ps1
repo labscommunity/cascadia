@@ -39,7 +39,7 @@ if ($env:INTEL_OPENVINO_DIR -and (Test-Path (Join-Path $env:INTEL_OPENVINO_DIR '
 } else {
     Write-Host "INTEL_OPENVINO_DIR: not set / not valid"
     Write-Host "  Download the OpenVINO GenAI 2026.1+ SDK (see INSTALL.md) and set it, e.g.:"
-    Write-Host '    $env:INTEL_OPENVINO_DIR = "C:\openvino_genai_2026.1.0.0"'
+    Write-Host '    $env:INTEL_OPENVINO_DIR = "C:\openvino_genai_2026.2.0.0"'
 }
 
 Write-Host "`nNext:"

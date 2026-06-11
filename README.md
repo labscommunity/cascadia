@@ -27,7 +27,7 @@ cargo build --release -p cascadia
 
 # Real OV mode — links against openvino-genai 2026.1.0+. Required to run
 # the OV engines on real Intel hardware.
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 ```
 
