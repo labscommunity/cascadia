@@ -289,6 +289,21 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   cleanup candidate; and engine finalization of a cancelled task waits
   for the next poll (no poller after stream close), reset still
   precedes next admission so the invariant holds.
+- **M3' TTFT (2026-06-12): chunked batched prefill shipped; GPU-prefill
+  split RULED OUT single-box.** The stage IRs are fully dynamic in T
+  (no re-export), so prefill now runs in 256-token chain passes
+  (`probe_batched_prefill.py`: 54s → 12.8s @313 tokens, 4.2x;
+  engine-measured 290-token prompt ~21s prefill ≈ 13.8 tok/s vs ~5.3
+  at T=1 — chunk-boundary and copy overhead eat part of the probe
+  number). Batched-vs-sequential decode parity 6/8 with a whitespace
+  near-tie flip at token 6 — f16 accumulation-order noise, the same
+  regime every batched-prefill server (incl. whole-model GenAI)
+  operates in. The heterogeneous GPU-prefill design is dead on this
+  node class: all four fleet nodes have 31.6 GB RAM and two ~18 GB
+  int4 weight copies (GPU + CPU compiled) don't fit; the cross-node
+  variant (GPU prefill node streaming states to a CPU decode node) is
+  M4' material and needs the state-transfer FFI (get/set variable
+  states) priced in.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
