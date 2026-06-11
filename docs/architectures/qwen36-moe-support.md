@@ -274,6 +274,21 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   inherits it from the shards, not from the port). Engine tok/s @64
   tokens short-ctx: 8.7 (log-reported), envelope 4.7-8.8 across the
   E2E suite.
+- **M3' robustness (2026-06-12): cancel/disconnect validated** after
+  rewriting `step()` to be incremental (one decode token per call;
+  full prefill in the first call — the runner closes streams after 3
+  empty steps). The monolithic step() held the engine mutex for the
+  whole generation, making cancel unreachable and streaming emit one
+  blob. Now: per-token SSE chunks at the engine's real cadence
+  (~150-250 ms); `/v1/cancel/:id` interrupts mid-decode (29/200
+  tokens, "cancelled; resetting state" in log); SSE client disconnect
+  cancels via ChunkStream::Drop (29/200); follow-up requests coherent;
+  E2E suite re-passed 5/5. Known minor: a cancelled task's deferred
+  final chunk is buffered for a stream nobody drains (Drop removed the
+  cancelled-flag first) — one map entry per cancelled task, runner-side
+  cleanup candidate; and engine finalization of a cancelled task waits
+  for the next poll (no poller after stream close), reset still
+  precedes next admission so the invariant holds.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
