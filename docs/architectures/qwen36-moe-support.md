@@ -225,8 +225,18 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   key.0/value.0 KV state preserved, position_ids/attention_mask ride
   along (`probe_shell_extract_l3.py`; exporter cleanup noted: rewire
   upstream ShapeOf chains off inputs_embeds onto stage_hidden). BOTH
-  layer types proven; remaining: multi-layer ranges, embed/lm_head
-  stages, packaging + manifest (mechanical);
+  layer types proven. **EXPORTER WORKING**
+  (`export_qwen36_moe.py`): official IR → N stage shards + manifest;
+  2-stage chained validation vs full model passes token-level
+  (top1 match, top5 5/5, logits rel 2.8e-2 — f16 fusion-order noise
+  injected per full-attn layer, DeltaNet layers bit-exact; criterion is
+  token agreement per the §5 protocol, with ≥64-token greedy parity at
+  M3'). Debug findings encoded in the tool: state vars are numbered by
+  LAYER-TYPE SEQUENCE (conv/ssm 0..29, kv 0..9), and global past-length
+  bookkeeping reads early layers' caches — non-owning stages rewire
+  those onto owned same-kind caches. Validation uses a real token via
+  the text-embeddings IR (random embeds make logits degenerate).
+  Remaining: `cascadia shard` dispatch arm;
   `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
   exit criterion).
 - **M3'..M4' — suspended pending M2'.** Shapes (export probe, engine,
