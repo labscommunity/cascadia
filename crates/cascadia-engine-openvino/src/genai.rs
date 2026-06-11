@@ -135,7 +135,30 @@ impl Builder for OvGenaiBuilder {
         ))];
 
         let plugin = self.build_plugin_config();
-        let pipe = if let Some(dpath) = &self.draft_model_path {
+        // VLM-layout export (Qwen3.5/3.6 etc.): language model + separate
+        // embeddings IRs, no `openvino_model.xml`. Needs VLMPipeline —
+        // LLMPipeline fails on it with "Port for tensor name input_ids
+        // was not found". Served text-only.
+        let model_dir = PathBuf::from(&self.model_path);
+        let is_vlm_layout = model_dir.join("openvino_language_model.xml").exists()
+            && !model_dir.join("openvino_model.xml").exists();
+        let pipe = if is_vlm_layout {
+            if self.draft_model_path.is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "--draft-model is not supported on VLM-layout exports; \
+                     use --prompt-lookup instead"
+                        .into(),
+                ));
+            }
+            let prompt_lookup = self.prompt_lookup_ngram > 0;
+            progress.push(LoadProgress::message(format!(
+                "VLM-layout export detected; compiling VLMPipeline{} on {}",
+                if prompt_lookup { " + prompt_lookup" } else { "" },
+                self.device
+            )));
+            LlmPipeline::vlm(&self.model_path, &self.device, prompt_lookup, &plugin)
+                .map_err(map_ov_err)?
+        } else if let Some(dpath) = &self.draft_model_path {
             progress.push(LoadProgress::message(format!(
                 "loading draft model {dpath}"
             )));

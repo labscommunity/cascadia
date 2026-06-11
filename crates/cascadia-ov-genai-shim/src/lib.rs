@@ -90,6 +90,15 @@ mod sys {
             out_handle: *mut *mut cascadia_pipeline_t,
         ) -> c_int;
 
+        pub fn cascadia_pipeline_create_vlm(
+            model_path: *const c_char,
+            device: *const c_char,
+            enable_prompt_lookup: i32,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_pipeline_t,
+        ) -> c_int;
+
         pub fn cascadia_pipeline_destroy(handle: *mut cascadia_pipeline_t);
 
         pub fn cascadia_genconfig_new() -> *mut cascadia_genconfig_t;
@@ -324,13 +333,26 @@ impl LlmPipeline {
         Self::do_new(model_path, device, plugin, None, None, true)
     }
 
+    /// VLM-layout export (e.g. Qwen3.5/3.6: `openvino_language_model.xml`
+    /// + separate embeddings IRs), served text-only via `VLMPipeline`.
+    /// `prompt_lookup` enables prompt-lookup decoding (OV GenAI >= 2026.2
+    /// supports it on VLM pipelines).
+    pub fn vlm(
+        model_path: &str,
+        device: &str,
+        prompt_lookup: bool,
+        plugin: &PluginConfig,
+    ) -> Result<Self> {
+        Self::do_new(model_path, device, plugin, None, Some(prompt_lookup), false)
+    }
+
     #[cfg(not(feature = "openvino"))]
     fn do_new(
         _model_path: &str,
         _device: &str,
         _plugin: &PluginConfig,
         _draft: Option<(&str, &str)>,
-        _: Option<()>,
+        _vlm_prompt_lookup: Option<bool>,
         _prompt_lookup: bool,
     ) -> Result<Self> {
         Err(Error::Stub)
@@ -342,7 +364,7 @@ impl LlmPipeline {
         device: &str,
         plugin: &PluginConfig,
         draft: Option<(&str, &str)>,
-        _: Option<()>,
+        vlm_prompt_lookup: Option<bool>,
         prompt_lookup: bool,
     ) -> Result<Self> {
         let model_c = cstr(model_path)?;
@@ -358,7 +380,16 @@ impl LlmPipeline {
 
         let mut handle: *mut sys::cascadia_pipeline_t = ptr::null_mut();
         let rc = unsafe {
-            if let Some((dpath, ddev)) = draft {
+            if let Some(pl) = vlm_prompt_lookup {
+                sys::cascadia_pipeline_create_vlm(
+                    model_c.as_ptr(),
+                    device_c.as_ptr(),
+                    if pl { 1 } else { 0 },
+                    ptrs.as_ptr(),
+                    plugin.entries.len(),
+                    &mut handle,
+                )
+            } else if let Some((dpath, ddev)) = draft {
                 let dpath_c = cstr(dpath)?;
                 let ddev_c = cstr(ddev)?;
                 sys::cascadia_pipeline_create_with_draft(

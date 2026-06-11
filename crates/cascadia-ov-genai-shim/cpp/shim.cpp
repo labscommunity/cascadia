@@ -19,6 +19,7 @@
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/generation_config.hpp>
 #include <openvino/genai/tokenizer.hpp>
+#include <openvino/genai/visual_language/pipeline.hpp>
 
 namespace {
 
@@ -117,7 +118,11 @@ std::string join_port_names(const Set& names) {
 }  // namespace
 
 struct cascadia_pipeline_t {
+    // Exactly one of `pipe` / `vlm` is set; generate / get_tokenizer
+    // dispatch on which. VLM handles are text-only (no image inputs
+    // through this ABI).
     std::unique_ptr<ov::genai::LLMPipeline> pipe;
+    std::unique_ptr<ov::genai::VLMPipeline> vlm;
 };
 struct cascadia_genconfig_t {
     ov::genai::GenerationConfig cfg;
@@ -214,6 +219,32 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     }
 }
 
+int32_t cascadia_pipeline_create_vlm(
+    const char* model_path, const char* device, int32_t enable_prompt_lookup,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_pipeline_t** out_handle) {
+    if (!model_path || !device || !out_handle) {
+        set_last_error("null arg in pipeline_create_vlm"); return 1;
+    }
+    try {
+        auto props = collect_properties(properties_kv, properties_count);
+        if (enable_prompt_lookup) {
+            props[ov::genai::prompt_lookup.name()] = true;
+        }
+        auto vlm = std::make_unique<ov::genai::VLMPipeline>(
+            std::filesystem::path(model_path), std::string(device), props);
+        auto* h = new cascadia_pipeline_t{};
+        h->vlm = std::move(vlm);
+        *out_handle = h;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in pipeline_create_vlm");
+        return 1;
+    }
+}
+
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle) { delete handle; }
 
 cascadia_genconfig_t* cascadia_genconfig_new() {
@@ -240,14 +271,34 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
     char** out_text, uint32_t* out_token_count) {
-    if (!handle || !handle->pipe || !prompt || !out_text) {
+    if (!handle || (!handle->pipe && !handle->vlm) || !prompt || !out_text) {
         set_last_error("null arg in pipeline_generate"); return 1;
     }
     try {
-        ov::genai::DecodedResults results = cfg
-            ? handle->pipe->generate(std::string(prompt), cfg->cfg)
-            : handle->pipe->generate(std::string(prompt));
-        std::string text = results;
+        std::string text;
+        uint32_t generated = 0;
+        if (handle->vlm) {
+            // Text-only generate on a VLM-layout export; no image tensors.
+            ov::genai::GenerationConfig gen_cfg =
+                cfg ? cfg->cfg : ov::genai::GenerationConfig{};
+            ov::genai::VLMDecodedResults results = handle->vlm->generate(
+                std::string(prompt), std::vector<ov::Tensor>{}, gen_cfg,
+                ov::genai::StreamerVariant{});
+            text = results.texts.empty() ? std::string{} : results.texts[0];
+            try {
+                generated = static_cast<uint32_t>(
+                    results.perf_metrics.get_num_generated_tokens());
+            } catch (...) { generated = 0; }
+        } else {
+            ov::genai::DecodedResults results = cfg
+                ? handle->pipe->generate(std::string(prompt), cfg->cfg)
+                : handle->pipe->generate(std::string(prompt));
+            text = results;
+            try {
+                generated = static_cast<uint32_t>(
+                    results.perf_metrics.get_num_generated_tokens());
+            } catch (...) { generated = 0; }
+        }
         if (text.size() > MAX_GENERATED_TEXT_BYTES) {
             set_last_error(
                 "generate produced text larger than MAX_GENERATED_TEXT_BYTES "
@@ -260,10 +311,7 @@ int32_t cascadia_pipeline_generate(
         buf[text.size()] = 0;
         *out_text = buf;
         if (out_token_count) {
-            try {
-                *out_token_count = static_cast<uint32_t>(
-                    results.perf_metrics.get_num_generated_tokens());
-            } catch (...) { *out_token_count = 0; }
+            *out_token_count = generated;
         }
         return 0;
     } catch (const std::exception& e) {
@@ -280,9 +328,11 @@ void cascadia_free_string(char* s) { std::free(s); }
 // the parent pipeline. The Tokenizer object inside is a refcount on
 // model resources; outliving the pipeline triggers UB.
 cascadia_tokenizer_t* cascadia_pipeline_get_tokenizer(cascadia_pipeline_t* handle) {
-    if (!handle || !handle->pipe) return nullptr;
+    if (!handle || (!handle->pipe && !handle->vlm)) return nullptr;
     try {
-        return new cascadia_tokenizer_t{handle->pipe->get_tokenizer()};
+        return new cascadia_tokenizer_t{handle->vlm
+            ? handle->vlm->get_tokenizer()
+            : handle->pipe->get_tokenizer()};
     } catch (const std::exception& e) {
         set_last_error(e); return nullptr;
     } catch (...) {

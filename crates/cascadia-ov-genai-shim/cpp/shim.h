@@ -60,6 +60,20 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     size_t properties_count,
     cascadia_pipeline_t** out_handle);
 
+/// VLMPipeline-backed pipeline for VLM-layout exports (e.g. Qwen3.5/3.6:
+/// `openvino_language_model.xml` + separate embeddings/vision IRs), used
+/// text-only. `enable_prompt_lookup` non-zero turns on prompt-lookup
+/// decoding (OV GenAI >= 2026.2 extends it to VLM pipelines). The handle
+/// is interchangeable with LLMPipeline handles for generate / tokenizer /
+/// destroy.
+int32_t cascadia_pipeline_create_vlm(
+    const char* model_path,
+    const char* device,
+    int32_t enable_prompt_lookup,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_pipeline_t** out_handle);
+
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle);
 
 // ---- GenerationConfig -----------------------------------------------------
