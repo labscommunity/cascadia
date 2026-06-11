@@ -210,9 +210,12 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   an OV model — numpy-vs-OV parity max_rel 7.8e-7**
   (`tools/qwen36_surgery/probe_expert_slice.py`). Eliminates the 133 GB
   export host, re-quantization, and the bin-format conversion entirely
-  (strategy C keeps OV's group layout). Remaining bricks: semantic
-  parity vs the full model's MoE output (activation/gate-vs-up
-  assignment conventions assumed, not yet proven); shell extraction
+  (strategy C keeps OV's group layout). **Brick 2 DONE: semantic
+  parity vs the full model's layer-0 MoE output — max_rel 5.9e-3
+  (f16 noise), top-8 indices exact, all conventions proven from the
+  graph: softmax→top8→renorm, silu, shared expert × sigmoid(gate
+  [1,2048] u4-quantized)** (`probe_moe_parity.py`, staged-tap
+  comparison). Remaining bricks: shell extraction
   (per-layer DeltaNet/attention/router subgraph cuts — the hard half);
   `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
   exit criterion).
