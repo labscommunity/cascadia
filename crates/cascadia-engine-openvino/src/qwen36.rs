@@ -381,23 +381,30 @@ impl Engine for Qwen36Engine {
             return self.finalize();
         }
 
-        // One prefill token (T=1), or one decode token.
+        // Full prefill in one call (the runner closes streams after 3
+        // empty steps, so prefill can't be spread one-token-per-step),
+        // then one decode token per call.
         if t.prefill_idx < t.prompt_ids.len() {
-            let tok = t.prompt_ids[t.prefill_idx];
-            let step = t.step;
-            match self.embed(tok).and_then(|e| self.chain_step(&e, step)) {
-                Ok(l) => {
-                    let t = self.active.as_mut().unwrap();
-                    t.logits = l;
-                    t.prefill_idx += 1;
-                    t.step += 1;
-                    Vec::new()
-                }
-                Err(e) => {
-                    warn!(task = %task_id, error = %e, "prefill failed");
-                    self.finalize()
+            while self.active.as_ref().unwrap().prefill_idx
+                < self.active.as_ref().unwrap().prompt_ids.len()
+            {
+                let t = self.active.as_ref().unwrap();
+                let tok = t.prompt_ids[t.prefill_idx];
+                let step = t.step;
+                match self.embed(tok).and_then(|e| self.chain_step(&e, step)) {
+                    Ok(l) => {
+                        let t = self.active.as_mut().unwrap();
+                        t.logits = l;
+                        t.prefill_idx += 1;
+                        t.step += 1;
+                    }
+                    Err(e) => {
+                        warn!(task = %task_id, error = %e, "prefill failed");
+                        return self.finalize();
+                    }
                 }
             }
+            Vec::new()
         } else {
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize();
