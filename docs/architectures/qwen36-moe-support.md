@@ -248,6 +248,20 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   externalization (the ~17 tok/s envelope; MoE cut points proven in
   brick 2) as the decode optimization. `proto_m3_decode.py` is the
   decode-loop reference for the Rust engine.
+- **M3' engine E2E (2026-06-12): 5/5 API suite green** on pawan-01
+  (`cascadia run <shards> --engine qwen36-moe --device CPU --api`):
+  /v1/models, two sequential chats (state-reset invariant), greedy
+  determinism (identical 13-token outputs), 96-token generation at
+  4.7-8.8 tok/s decode (matches the M2' chain envelope). An earlier
+  2/5 run (empty contents on requests 2+) did NOT reproduce after a
+  server restart with `RUST_LOG=info` → node-side log; OV-level reset
+  was ruled out as the cause (probe_reset_state.py: 40 states on
+  stage0, bit-exact position-0 reproduction after reset). The wedged
+  instance had no logging; keep `RUST_LOG=info` + log file on every
+  serve so a recurrence is attributable. Known gap found while
+  testing: client disconnect on the non-streaming API path does NOT
+  cancel the in-flight task (it runs to completion; server stays
+  healthy) — robustness item, not a wedge.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
