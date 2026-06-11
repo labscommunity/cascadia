@@ -239,7 +239,16 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   Remaining: `cascadia shard` dispatch arm;
   `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
   exit criterion).
-- **M3'..M4' — suspended pending M2'.** Shapes (export probe, engine,
+- **M3' prototype DONE (2026-06-11): 64/64 greedy token parity** over
+  the 2-stage chain vs whole model (f16 drift never flips greedy).
+  Device map measured: CPU decode 7.2 tok/s short-ctx / 4.9 @1K (chain
+  4.8) but CPU prefill 123 s @1K; GPU prefill 6-10 s but decode
+  1.3-2.5. **No single device clears T — the M3' engine design is
+  heterogeneous: GPU prefill + CPU decode**, with routed-dispatch
+  externalization (the ~17 tok/s envelope; MoE cut points proven in
+  brick 2) as the decode optimization. `proto_m3_decode.py` is the
+  decode-loop reference for the Rust engine.
+- **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
   milestone for single-box; a mesh milestone must name a concrete
