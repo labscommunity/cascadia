@@ -201,7 +201,22 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   lm_head/KV-growth modeled, one box. Note: single-box sparse ~17 tok/s
   vs 1.27 whole-model makes **M3' the user-value milestone** (13×)
   independent of any mesh.
-- **M2'..M4' — suspended pending M2'-0.** Shapes (export probe, engine,
+- **M2' — IN PROGRESS via IR surgery (no export host needed).** The
+  official IR's expert stacks are directly sliceable: per layer,
+  gate/up `[256,512,32x64] u4` + down `[256,2048,8x64] u4` (+ zp/scale),
+  expert index = leading axis, contiguous 512 KB strides; offsets in the
+  XML. **Brick 1 DONE (2026-06-11, pawan-01): one-expert slice
+  (layer 0, expert 3) byte-sliced from the .bin, dequantized, rebuilt as
+  an OV model — numpy-vs-OV parity max_rel 7.8e-7**
+  (`tools/qwen36_surgery/probe_expert_slice.py`). Eliminates the 133 GB
+  export host, re-quantization, and the bin-format conversion entirely
+  (strategy C keeps OV's group layout). Remaining bricks: semantic
+  parity vs the full model's MoE output (activation/gate-vs-up
+  assignment conventions assumed, not yet proven); shell extraction
+  (per-layer DeltaNet/attention/router subgraph cuts — the hard half);
+  `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
+  exit criterion).
+- **M3'..M4' — suspended pending M2'.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
   milestone for single-box; a mesh milestone must name a concrete
