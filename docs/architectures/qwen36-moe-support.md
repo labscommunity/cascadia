@@ -221,8 +221,12 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   conv.0 preserved as ReadValue/Assign sinks; only beam_idx needed as
   aux input; saved + compiled + ran standalone vs full-model tap;
   `probe_shell_extract.py`). The hard half of shard creation is
-  de-risked; remaining: a full-attention layer cut (position_ids + KV
-  state path), multi-layer ranges, embed/lm_head stages, packaging;
+  de-risked; **full-attention layer cut (layer 3) also BIT-EXACT (0.0e0)** —
+  key.0/value.0 KV state preserved, position_ids/attention_mask ride
+  along (`probe_shell_extract_l3.py`; exporter cleanup noted: rewire
+  upstream ShapeOf chains off inputs_embeds onto stage_hidden). BOTH
+  layer types proven; remaining: multi-layer ranges, embed/lm_head
+  stages, packaging + manifest (mechanical);
   `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
   exit criterion).
 - **M3'..M4' — suspended pending M2'.** Shapes (export probe, engine,
