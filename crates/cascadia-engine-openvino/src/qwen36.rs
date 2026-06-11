@@ -22,6 +22,9 @@ use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
 const HIDDEN: usize = 2048;
+/// Prefill span per chain pass; bounds the transient [1, T, vocab]
+/// logits buffer (~254 MB f32 at 256 with the 248320 vocab).
+const PREFILL_CHUNK: usize = 256;
 const MROPE_ROWS: usize = 4;
 
 #[derive(serde::Deserialize)]
@@ -211,7 +214,8 @@ fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
 }
 
 impl Qwen36Engine {
-    fn embed(&mut self, tok: u32) -> EngineResult<Vec<f32>> {
+    /// Embed a token span: [1, n] ids -> flattened [1, n, HIDDEN] f32.
+    fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
         let name = self
             .emb
             .input_names()
@@ -219,8 +223,9 @@ impl Qwen36Engine {
             .into_iter()
             .next()
             .ok_or_else(|| EngineError::Backend("embeddings IR has no inputs".into()))?;
+        let ids: Vec<i64> = toks.iter().map(|&t| t as i64).collect();
         self.emb
-            .set_input(&name, DType::I64, &[1, 1], &le_bytes_i64(&[tok as i64]))
+            .set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
         self.emb.infer().map_err(map_ov)?;
         let (dtype, _shape, bytes) = self.emb.output(0).map_err(map_ov)?;
@@ -232,33 +237,36 @@ impl Qwen36Engine {
         Ok(f32_from_le(&bytes))
     }
 
-    /// One T=1 pass through the stage chain. `step` is the absolute
-    /// position; returns the last stage's first output (hidden or logits).
-    fn chain_step(&mut self, embeds: &[f32], step: usize) -> EngineResult<Vec<f32>> {
-        let mask = vec![1i64; step + 1];
-        let pos = vec![step as i64; MROPE_ROWS];
-        let zeros_embeds = vec![0f32; HIDDEN];
+    /// One pass through the stage chain covering absolute positions
+    /// [t0, t1) (T = t1-t0; the stage IRs are dynamic in T). Returns the
+    /// last stage's full first output, flattened [1, T, width].
+    fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
+        let n = t1 - t0;
+        let mask = vec![1i64; t1];
+        let pos: Vec<i64> = (0..MROPE_ROWS)
+            .flat_map(|_| (t0 as i64)..(t1 as i64))
+            .collect();
+        let zeros_embeds = vec![0f32; n * HIDDEN];
         let mut hidden: Vec<f32> = embeds.to_vec();
-        let n = self.stages.len();
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
             for name in &names {
                 match name.as_str() {
                     "stage_hidden" => st
-                        .set_input(name, DType::F32, &[1, 1, HIDDEN], &le_bytes_f32(&hidden))
+                        .set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(&hidden))
                         .map_err(map_ov)?,
                     s if s.contains("embed") => {
                         // first stage: real embeds; mid stages: dummy
                         // (upstream ShapeOf chains read shapes only)
                         let data = if j == 0 { &hidden } else { &zeros_embeds };
-                        st.set_input(name, DType::F32, &[1, 1, HIDDEN], &le_bytes_f32(data))
+                        st.set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(data))
                             .map_err(map_ov)?;
                     }
                     s if s.contains("attention_mask") => st
-                        .set_input(name, DType::I64, &[1, step + 1], &le_bytes_i64(&mask))
+                        .set_input(name, DType::I64, &[1, t1], &le_bytes_i64(&mask))
                         .map_err(map_ov)?,
                     s if s.contains("position") => st
-                        .set_input(name, DType::I64, &[MROPE_ROWS, 1, 1], &le_bytes_i64(&pos))
+                        .set_input(name, DType::I64, &[MROPE_ROWS, 1, n], &le_bytes_i64(&pos))
                         .map_err(map_ov)?,
                     s if s.contains("beam") => st
                         .set_input(name, DType::I32, &[1], &le_bytes_i32(&[0]))
@@ -278,9 +286,18 @@ impl Qwen36Engine {
                 )));
             }
             hidden = f32_from_le(&bytes);
-            let _ = n;
         }
         Ok(hidden)
+    }
+
+    /// Run a token span starting at absolute position `t0`; returns the
+    /// LAST position's logits row.
+    fn run_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
+        let n = toks.len();
+        let e = self.embed_seq(toks)?;
+        let out = self.chain_pass(&e, t0, t0 + n)?;
+        let row = out.len() / n;
+        Ok(out[(n - 1) * row..].to_vec())
     }
 
     fn reset_all(&mut self) {
@@ -321,7 +338,7 @@ impl Qwen36Engine {
 impl Engine for Qwen36Engine {
     fn warmup(&mut self) {
         self.reset_all();
-        match self.embed(1000).and_then(|e| self.chain_step(&e, 0)) {
+        match self.run_span(&[1000], 0) {
             Ok(_) => info!("qwen36-moe warmup ok"),
             Err(e) => warn!(error = %e, "qwen36-moe warmup failed"),
         }
@@ -372,22 +389,25 @@ impl Engine for Qwen36Engine {
         let t = self.active.as_ref().unwrap();
         let task_id = t.task_id.clone();
 
-        // Full prefill in one call (the runner closes streams after 3
-        // empty steps, so prefill can't be spread one-token-per-step),
-        // then one decode token per call.
+        // Full prefill in one step() call (the runner closes streams
+        // after 3 empty steps, so it can't be spread across calls),
+        // batched in PREFILL_CHUNK spans — 4.2x TTFT vs T=1 stepping
+        // (probe_batched_prefill.py); the chunk bounds the transient
+        // [1, T, vocab] logits buffer. Then one decode token per call.
         if t.prefill_idx < t.prompt_ids.len() {
             while self.active.as_ref().unwrap().prefill_idx
                 < self.active.as_ref().unwrap().prompt_ids.len()
             {
                 let t = self.active.as_ref().unwrap();
-                let tok = t.prompt_ids[t.prefill_idx];
-                let step = t.step;
-                match self.embed(tok).and_then(|e| self.chain_step(&e, step)) {
+                let end = (t.prefill_idx + PREFILL_CHUNK).min(t.prompt_ids.len());
+                let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
+                let t0 = t.step;
+                match self.run_span(&toks, t0) {
                     Ok(l) => {
                         let t = self.active.as_mut().unwrap();
                         t.logits = l;
-                        t.prefill_idx += 1;
-                        t.step += 1;
+                        t.prefill_idx = end;
+                        t.step += toks.len();
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "prefill failed");
@@ -411,7 +431,7 @@ impl Engine for Qwen36Engine {
                 return self.finalize();
             }
             let step = t.step;
-            match self.embed(next).and_then(|e| self.chain_step(&e, step)) {
+            match self.run_span(&[next], step) {
                 Ok(l) => {
                     let t = self.active.as_mut().unwrap();
                     t.gen_ids.push(next);
