@@ -274,6 +274,11 @@ def is_moe_config(config) -> bool:
     # 3. A per-token expert router count is a dense-model-free MoE signal.
     if isinstance(getattr(config, "num_experts_per_tok", None), int):
         return True
+    # 3b. VLM wrappers (Qwen3.5/Qwen3.6) nest the text model's expert fields
+    #     under text_config; the outer config carries none of them (#77).
+    text_cfg = getattr(config, "text_config", None)
+    if text_cfg is not None and is_moe_config(text_cfg):
+        return True
     # 4. Known MoE model_types (exact) + architecture class names. Exact
     #    model_type avoids false-positives from a dense model merely named
     #    "*moe*"; class names ending in MoEForCausalLM are reliably MoE.
@@ -281,11 +286,17 @@ def is_moe_config(config) -> bool:
     arch_first = ((getattr(config, "architectures", []) or [""])[0]).lower()
     moe_types = {
         "mixtral", "dbrx", "deepseek_v2", "deepseek_v3", "qwen2_moe", "qwen3_moe",
+        "qwen3_5_moe", "qwen3_5_moe_text",
         "phimoe", "jamba", "granitemoe", "olmoe", "grok", "grok-1", "llama4",
     }
     if model_type in moe_types:
         return True
-    return arch_first.endswith("moeforcausallm") or "mixtral" in arch_first or "grok" in arch_first
+    return (
+        arch_first.endswith("moeforcausallm")
+        or arch_first.endswith("moeforconditionalgeneration")
+        or "mixtral" in arch_first
+        or "grok" in arch_first
+    )
 
 
 def check_export_quirks(config, arch_tag: str):
@@ -1769,7 +1780,10 @@ def main():
         f"cascadia exporter does not support (#60). It builds dense decoder "
         f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
         f"implemented, and falling back to a dense layer would silently emit "
-        f"garbage. Aborting rather than producing a broken shard."
+        f"garbage. Aborting rather than producing a broken shard.\n"
+        f"NOTE: hybrid Qwen3.5/Qwen3.6 MoE (model_type qwen3_5_moe) runs\n"
+        f"single-stage instead: `--engine ov-genai` against an Optimum-Intel\n"
+        f"OpenVINO IR on OV GenAI >= 2026.2 — see docs/architectures/qwen3.6.md."
     )
 
     # Read the config FIRST (cheap — just config.json, no weights) so we can

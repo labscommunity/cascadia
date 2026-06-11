@@ -3,7 +3,11 @@
 Status: **draft for review** — design decisions marked `DECISION`, open items
 marked `TODO(review)`. Rev 2 incorporates adversarial + feasibility review
 (2026-06-11): dense-MoE cost re-gated to M1, exporter pipeline corrected,
-§4.1 preconditions pinned, enterprise gossip-bump priced.
+§4.1 preconditions pinned, enterprise gossip-bump priced. Rev 3 aligns with
+tracking issue #77: this spec is **Part B Path 2 (pipeline-parallel,
+deferred)**; the shipped-first path is single-stage `ov-genai`
+(docs/architectures/qwen3.6.md), and #77's Path-1 validation doubles as
+this spec's M1 throughput measurement.
 
 Goal: run Qwen3.6-35B-A3B (hybrid Gated-DeltaNet linear attention +
 sparse-MoE) sharded across cascadia mesh nodes. Whole-model serving on one
@@ -30,7 +34,12 @@ covers the **sharded engine path only**.
 - Linear attention (Gated DeltaNet): 32 V-heads / 16 K-heads, head_dim 128,
   conv kernel 4. No RoPE in linear layers.
 - Full attention: 16 Q-heads / 2 KV-heads, head_dim 256,
-  `attn_output_gate: true`, `partial_rotary_factor: 0.25`.
+  `attn_output_gate: true`, `partial_rotary_factor: 0.25` with **mRoPE**
+  (`rope_parameters.mrope_section [11,11,10]`, `mrope_interleaved: true`,
+  `rope_theta 1e7`) — multimodal RoPE, not plain partial rotary. M2 parity
+  must verify the text-only rotary contract end-to-end (#77 flags this as
+  exactly the kind of thing that matches intermediates but diverges
+  applied).
 - Native context 262K, but the staged-engine pattern materializes
   full-sequence logits at the head stage — at vocab 248320 a 10K-token
   prefill is a ~10 GB f32 logits tensor. **v1 practical context is
@@ -40,8 +49,9 @@ covers the **sharded engine path only**.
 - **Vision encoder present**; no text-only repo published. v1 is text-only —
   export drops the vision tower (the standard `--language-model-only`
   treatment).
-- MTP fields present (`mtp_num_hidden_layers`) — ignored in v1 (relevant
-  later for speculative decoding; see genai PR #3938 "DFlash").
+- MTP head present (`mtp_num_hidden_layers: 1`) — ignored in v1 (relevant
+  later for speculative decoding; see genai PR #3938 "DFlash"). Note v1
+  fences off ALL spec-decode regardless (§4.1 invariant 2).
 
 ## 2. Why the current stack rejects it
 
