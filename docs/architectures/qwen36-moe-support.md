@@ -262,6 +262,18 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   testing: client disconnect on the non-streaming API path does NOT
   cancel the in-flight task (it runs to completion; server stays
   healthy) — robustness item, not a wedge.
+- **M3' acceptance (2026-06-12): engine ≡ Python chain EXACTLY** —
+  64/64 generated tokens identical on a fresh prompt through the API
+  (`probe_engine_parity.py` whole-model reference +
+  `probe_chain_vs_full_prompt.py` 3-way discriminator). The Rust
+  engine is a bit-faithful port of the validated decode loop. Chain vs
+  whole-model greedy is prompt-dependent: 64/64 on the prototype's
+  reference prompt, first divergence at token 37 on the parity-probe
+  prompt (f16 fusion-order near-tie flip, both continuations coherent
+  — same property already documented at exporter validation; engine
+  inherits it from the shards, not from the port). Engine tok/s @64
+  tokens short-ctx: 8.7 (log-reported), envelope 4.7-8.8 across the
+  E2E suite.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
