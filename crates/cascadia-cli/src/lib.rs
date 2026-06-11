@@ -12,6 +12,7 @@ use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
     Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+    Qwen36Builder,
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
@@ -110,6 +111,11 @@ pub enum EngineKind {
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
+    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
+    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
+    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    Qwen36Moe,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -659,6 +665,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 cfg = cfg.with_spec_decode_k(k);
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
+        }
+        EngineKind::Qwen36Moe => {
+            Ok(Box::new(Qwen36Builder::new(&args.model, &args.device)))
         }
     }
 }

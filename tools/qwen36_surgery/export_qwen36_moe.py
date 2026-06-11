@@ -215,7 +215,14 @@ def main():
 
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    print("manifest written", flush=True)
+    # aux files the engine needs alongside the stages (single-dir UX)
+    import shutil
+    for aux in ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
+                "tokenizer.json", "generation_config.json", "config.json"):
+        src = os.path.join(args.model, aux)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(args.out, aux))
+    print("manifest + aux files written", flush=True)
 
     if not args.validate:
         return
