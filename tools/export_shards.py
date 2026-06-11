@@ -79,8 +79,15 @@ try:
     import torch.nn.functional as F
 except ImportError:
     torch = None
-    nn = None
     F = None
+
+    class _TorchlessNn:
+        """Lets the module-level `class X(nn.Module)` definitions parse;
+        the dense path that instantiates them errors before use."""
+
+        Module = object
+
+    nn = _TorchlessNn()
 
 
 # ---------------------------------------------------------------------------
