@@ -68,9 +68,19 @@ import shutil
 import sys
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+# torch is only needed by the dense/gemma4 export paths; the qwen3_5_moe
+# IR-surgery path runs on openvino + numpy alone (and its target env — an
+# AI PC inference node — typically has no torch). Defer the hard failure
+# to the paths that actually use it.
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
+    nn = None
+    F = None
 
 
 # ---------------------------------------------------------------------------
@@ -1734,10 +1744,8 @@ def main():
             flush=True,
         )
 
-    if args.default_dtype == "fp16":
+    if torch is not None and args.default_dtype == "fp16":
         torch.set_default_dtype(torch.float16)
-
-    from transformers import AutoConfig
 
     # Gemma 4 (gemma4 / gemma4_text) uses a dedicated exporter,
     # tools/export_gemma4.py: its per-layer-type asymmetric head_dim,
@@ -1826,6 +1834,14 @@ def main():
             validate=True,
         )
         return
+
+    # Past the dispatches: the generic dense builder needs the full stack.
+    if torch is None:
+        parser.error(
+            "torch is required for this model's export path. "
+            "Install: pip install torch transformers safetensors nncf"
+        )
+    from transformers import AutoConfig
 
     moe_msg = (
         f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
