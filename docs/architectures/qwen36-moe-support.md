@@ -1,9 +1,8 @@
 # Qwen3.6-35B-A3B sharded support — design spec (rev 6)
 
-Status: **measurement-gated — no implementation decision exists yet.**
-This document defines the open questions, the priors, and the probe
-(M2'-0) that decides whether any sharded design for this model proceeds
-on AI-PC-class hardware. Single-stage (nonsharded) serving already works
+Status: **M2'-0 PASSED (2026-06-11) — strategy chosen: all-CPU OV-IR
+experts.** Measured full-layer-loop envelope ~17 tok/s on Lunar Lake
+(≥ T=10); the sharded design proceeds to M2'. Details in §5. Single-stage (nonsharded) serving already works
 and is documented separately (`qwen3.6.md`).
 
 Review lineage: rev 1 draft → rev 2 (adversarial+feasibility review:
@@ -61,11 +60,12 @@ return only if M2'-0 passes.
 - **ISA wall:** every SIMD path in `cascadia-int4-gemm` is
   AVX-512-gated with a SILENT pure-scalar fallback and no AVX2 path
   (verified; the fallback logs nothing). Lunar Lake has no AVX-512.
-- **ov_ir call-overhead prior:** the repo's own manifest docs record
-  ~5 ms per OV expert call (int4_bin "~6x faster on the miner Xeon").
-  At 8×40 = 320 calls/token that caps **~0.6 tok/s** — the OV-IR-expert
-  option is presumptively dead unless per-layer batching of expert
-  calls changes the constant.
+- **ov_ir call-overhead prior: OVERTURNED by M2'-0.** The manifest's
+  ~5 ms/call (miner-Xeon era) measured as **~0.106 ms/call on Lunar
+  Lake** (OV 2026.2 CPU plugin, oneDNN AVX2): 320 single-expert
+  calls/token = 33.9 ms median. Call overhead is negligible —
+  batching 8 experts/call was *slower* (41.7 ms). Strategy (C) is
+  viable, not dead.
 - **The sparse-moe engine is NOT a portable base today** (feasibility
   review, file:line in review record): the OV shell path is vestigial
   (`manifest.shell_xml` has zero callers); all in-range layers run
@@ -183,18 +183,24 @@ indicative only; any kill/ship decision re-measures under this
 protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
 
 - **M1 — DONE 2026-06-11** (single-run; see §3 for results and caveat).
-- **M2'-0 — strategy probe (Lunar Lake box; no export host).**
-  Includes priced NEW harness work (feasibility review): Qwen shapes
-  (2048×512 / 512×2048) added to `bench_int4_multi`; a synthetic
-  expert-IR per-call-overhead driver (the engine's ov_ir path is
-  unreachable without Kimi artifacts); a synthetic shell→experts→shell
-  round-trip per placement; ISA-path assert instrumentation. Plus paper
-  analysis of §4.3 expert/tensor parallelism (network floor vs measured
-  single-box rates). **Exit: a single chosen strategy whose measured
-  envelope extrapolates ≥ T under the protocol, or the kill condition:
-  no strategy clears → Qwen3.6 sharded is declared unsupported on
-  AI-PC-class nodes and the effort redirects (Xeon hosts or vendor
-  wait), with the single-stage path remaining the shipped answer.**
+- **M2'-0 — strategy probe: DONE 2026-06-11 (pawan-01), PASSED.**
+  Protocol: 3 warmup + 5 runs, medians. Results:
+  (1) scalar Rust GEMV, Qwen shapes, `avx512=false` asserted, rayon×8:
+  gate/up 0.109 ms, down 0.099 ms → ~0.32 ms/expert → ~10 tok/s
+  expert-only floor on the SCALAR path (the scalar-doom prior was
+  wrong: 0.5 MB matrices are cache-friendly).
+  (2) OV per-expert call: 0.106 ms (320 calls = 33.9 ms/token →
+  29.5 tok/s expert ceiling); batched-8 slower (41.7 ms) — launch
+  overhead negligible.
+  (3) Placement: full 40-layer shell+experts loop — all-CPU 58.9 ms
+  (**17.0 tok/s**), GPU-shell+CPU-experts 70.8 ms (14.1 tok/s);
+  ping-pong costs ~12 ms/token, all-CPU wins.
+  **Chosen strategy: (C) all-CPU, OV-IR experts** (Rust AVX2 kernel
+  port demoted to optional optimization). Caveats carried to M2':
+  synthetic f32 shells (real = int4 + fused GatedDeltaNet), no real
+  lm_head/KV-growth modeled, one box. Note: single-box sparse ~17 tok/s
+  vs 1.27 whole-model makes **M3' the user-value milestone** (13×)
+  independent of any mesh.
 - **M2'..M4' — suspended pending M2'-0.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
