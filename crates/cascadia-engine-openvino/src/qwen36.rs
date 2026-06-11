@@ -153,6 +153,7 @@ impl Builder for Qwen36Builder {
             max_tokens_default: self.max_tokens_default,
             pending: Vec::new(),
             cancelled: HashSet::new(),
+            active: None,
         }))
     }
 }
@@ -175,6 +176,24 @@ pub struct Qwen36Engine {
     max_tokens_default: u32,
     pending: Vec<GenerationTask>,
     cancelled: HashSet<TaskId>,
+    active: Option<ActiveTask>,
+}
+
+/// In-flight task state. `step()` advances one token per call so the
+/// runner can interleave cancel() between steps (a monolithic step()
+/// holds the engine mutex for the whole generation, making cancel
+/// unreachable) and so streaming emits at the engine's real cadence.
+struct ActiveTask {
+    task_id: TaskId,
+    prompt_ids: Vec<u32>,
+    prefill_idx: usize,
+    step: usize,
+    logits: Vec<f32>,
+    gen_ids: Vec<u32>,
+    /// Byte length of the decoded prefix already emitted as chunks.
+    emitted: usize,
+    max_tokens: usize,
+    started: Instant,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -273,6 +292,32 @@ impl Qwen36Engine {
             }
         }
     }
+
+    /// Finish the active task: reset state, log, emit the final marker.
+    fn finalize(&mut self) -> Vec<(TaskId, Chunk)> {
+        let Some(t) = self.active.take() else {
+            return Vec::new();
+        };
+        self.reset_all();
+        let elapsed = t.started.elapsed().as_secs_f64();
+        let tok_s = if elapsed > 0.0 {
+            t.gen_ids.len() as f64 / elapsed
+        } else {
+            0.0
+        };
+        info!(
+            task = %t.task_id,
+            prompt_tokens = t.prompt_ids.len(),
+            tokens = t.gen_ids.len(),
+            elapsed_s = elapsed,
+            tok_s,
+            "qwen36 task done"
+        );
+        vec![(
+            t.task_id.clone(),
+            Chunk::final_marker(t.task_id, ""),
+        )]
+    }
 }
 
 impl Engine for Qwen36Engine {
@@ -294,100 +339,112 @@ impl Engine for Qwen36Engine {
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
-        if self.pending.is_empty() {
-            return Vec::new();
-        }
-        let task = self.pending.remove(0);
-        let max_tokens = if task.max_tokens > 0 {
-            task.max_tokens
-        } else {
-            self.max_tokens_default
-        } as usize;
-
-        // Linear state cannot be trimmed: position-0 entry per task.
-        self.reset_all();
-        self.cancelled.remove(&task.task_id);
-
-        let enc = match self.tokenizer.encode(task.prompt.as_str(), true) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(task = %task.task_id, error = %e, "tokenize failed");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        // Admit the next task: position-0 entry per task (linear state
+        // cannot be trimmed — spec §4.1).
+        if self.active.is_none() {
+            if self.pending.is_empty() {
+                return Vec::new();
             }
-        };
-        let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
-
-        let started = Instant::now();
-        let mut step = 0usize;
-        let mut logits: Vec<f32> = Vec::new();
-        let mut gen_ids: Vec<u32> = Vec::new();
-        let mut run = |engine: &mut Self, tok: u32, step: usize| -> EngineResult<Vec<f32>> {
-            let e = engine.embed(tok)?;
-            engine.chain_step(&e, step)
-        };
-
-        // prefill (T=1 steps), then greedy decode
-        let mut failed = false;
-        for &tok in &prompt_ids {
-            match run(self, tok, step) {
-                Ok(l) => logits = l,
+            let task = self.pending.remove(0);
+            self.cancelled.remove(&task.task_id);
+            self.reset_all();
+            let prompt_ids: Vec<u32> = match self.tokenizer.encode(task.prompt.as_str(), true) {
+                Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
-                    warn!(task = %task.task_id, error = %e, "prefill failed");
-                    failed = true;
-                    break;
+                    warn!(task = %task.task_id, error = %e, "tokenize failed");
+                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
                 }
-            }
-            step += 1;
+            };
+            let max_tokens = if task.max_tokens > 0 {
+                task.max_tokens
+            } else {
+                self.max_tokens_default
+            } as usize;
+            self.active = Some(ActiveTask {
+                task_id: task.task_id,
+                prompt_ids,
+                prefill_idx: 0,
+                step: 0,
+                logits: Vec::new(),
+                gen_ids: Vec::new(),
+                emitted: 0,
+                max_tokens,
+                started: Instant::now(),
+            });
         }
-        if !failed {
-            for _ in 0..max_tokens {
-                if self.cancelled.remove(&task.task_id) {
-                    info!(task = %task.task_id, "qwen36: cancelled mid-decode; resetting state");
-                    break;
-                }
-                let next = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0);
-                if Some(next) == self.eos {
-                    break;
-                }
-                gen_ids.push(next);
-                match run(self, next, step) {
-                    Ok(l) => logits = l,
-                    Err(e) => {
-                        warn!(task = %task.task_id, error = %e, "decode failed");
-                        break;
-                    }
-                }
-                step += 1;
-            }
-        }
-        // Any exit path leaves state dirty for the NEXT task; reset now so
-        // the position-0 invariant holds unconditionally (spec §4.1.3).
-        self.reset_all();
+        let t = self.active.as_ref().unwrap();
+        let task_id = t.task_id.clone();
 
-        let text = self.tokenizer.decode(&gen_ids, true).unwrap_or_default();
-        let elapsed = started.elapsed().as_secs_f64();
-        let tok_s = if elapsed > 0.0 {
-            gen_ids.len() as f64 / elapsed
+        // Cancel lands between steps now that step() is per-token.
+        if self.cancelled.remove(&task_id) {
+            info!(task = %task_id, "qwen36: cancelled; resetting state");
+            return self.finalize();
+        }
+
+        // One prefill token (T=1), or one decode token.
+        if t.prefill_idx < t.prompt_ids.len() {
+            let tok = t.prompt_ids[t.prefill_idx];
+            let step = t.step;
+            match self.embed(tok).and_then(|e| self.chain_step(&e, step)) {
+                Ok(l) => {
+                    let t = self.active.as_mut().unwrap();
+                    t.logits = l;
+                    t.prefill_idx += 1;
+                    t.step += 1;
+                    Vec::new()
+                }
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "prefill failed");
+                    self.finalize()
+                }
+            }
         } else {
-            0.0
-        };
-        info!(
-            task = %task.task_id,
-            prompt_tokens = prompt_ids.len(),
-            tokens = gen_ids.len(),
-            elapsed_s = elapsed,
-            tok_s,
-            "qwen36 task done"
-        );
-        vec![(
-            task.task_id.clone(),
-            Chunk::final_marker(task.task_id, text),
-        )]
+            if t.gen_ids.len() >= t.max_tokens {
+                return self.finalize();
+            }
+            let next = t
+                .logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if Some(next) == self.eos {
+                return self.finalize();
+            }
+            let step = t.step;
+            match self.embed(next).and_then(|e| self.chain_step(&e, step)) {
+                Ok(l) => {
+                    let t = self.active.as_mut().unwrap();
+                    t.gen_ids.push(next);
+                    t.logits = l;
+                    t.step += 1;
+                    // Delta detokenization: decode the full sequence and
+                    // emit the unseen suffix. A trailing U+FFFD means a
+                    // multi-token UTF-8 char is still incomplete — hold
+                    // the suffix back until the next token completes it.
+                    let full = self
+                        .tokenizer
+                        .decode(&t.gen_ids, true)
+                        .unwrap_or_default();
+                    let delta = if full.ends_with('\u{FFFD}') {
+                        String::new()
+                    } else {
+                        let d = full.get(t.emitted..).unwrap_or("").to_string();
+                        t.emitted = full.len();
+                        d
+                    };
+                    vec![(
+                        task_id.clone(),
+                        Chunk::token(task_id, next as i64, delta),
+                    )]
+                }
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "decode failed");
+                    self.finalize()
+                }
+            }
+        }
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
