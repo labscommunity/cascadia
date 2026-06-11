@@ -215,8 +215,14 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   (f16 noise), top-8 indices exact, all conventions proven from the
   graph: softmax→top8→renorm, silu, shared expert × sigmoid(gate
   [1,2048] u4-quantized)** (`probe_moe_parity.py`, staged-tap
-  comparison). Remaining bricks: shell extraction
-  (per-layer DeltaNet/attention/router subgraph cuts — the hard half);
+  comparison). **Brick 3 DONE: shell extraction
+  proven BIT-EXACT (rel 0.0e0)** — layer 0 (DeltaNet) cut from the full
+  IR as a standalone stateful stage (boundary Parameter rewire; ssm.0 +
+  conv.0 preserved as ReadValue/Assign sinks; only beam_idx needed as
+  aux input; saved + compiled + ran standalone vs full-model tap;
+  `probe_shell_extract.py`). The hard half of shard creation is
+  de-risked; remaining: a full-attention layer cut (position_ids + KV
+  state path), multi-layer ranges, embed/lm_head stages, packaging;
   `cascadia shard` dispatch arm for `qwen3_5_moe` (same-command UX is an
   exit criterion).
 - **M3'..M4' — suspended pending M2'.** Shapes (export probe, engine,
