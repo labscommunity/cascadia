@@ -1133,11 +1133,28 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    eprintln!(
-        "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
-         --engine ov-runtime --device GPU --model {} \
-         --next <next-host>:9100 --api :8000",
-        args.output_dir, args.num_stages, args.output_dir
-    );
+    // qwen3_5_moe shards run the in-process stage chain, not the
+    // per-stage worker mesh; give the right invocation per manifest arch.
+    let arch = std::fs::read_to_string(
+        std::path::Path::new(&args.output_dir).join("manifest.json"),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    .and_then(|v| v["arch"].as_str().map(String::from))
+    .unwrap_or_default();
+    if arch == "qwen3_5_moe" {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia run {} \
+             --engine qwen36-moe --device CPU --api :8000",
+            args.output_dir, args.output_dir
+        );
+    } else {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
+             --engine ov-runtime --device GPU --model {} \
+             --next <next-host>:9100 --api :8000",
+            args.output_dir, args.num_stages, args.output_dir
+        );
+    }
     Ok(())
 }

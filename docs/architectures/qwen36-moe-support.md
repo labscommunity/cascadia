@@ -304,6 +304,19 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   variant (GPU prefill node streaming states to a CPU decode node) is
   M4' material and needs the state-transfer FFI (get/set variable
   states) priced in.
+- **Same-command shard UX (2026-06-12): `cascadia shard` dispatch arm
+  SHIPPED** (exit criterion met). `cascadia shard --model <int4-ov dir
+  or HF id> --output-dir <out> --num-stages N` detects
+  `model_type qwen3_5_moe` config-first and dispatches to the
+  IR-surgery exporter (embedded in the binary beside the other
+  exporters); --quantization is ignored (stages inherit the official
+  int4 IR), --layer-split/--stage rejected. The qwen3_5_moe path runs
+  on openvino+numpy alone (torch made lazy in export_shards.py — the
+  target env is an inference node without torch). Validated E2E on
+  pawan-01: dispatch → stage saves (40 states each, 7 orphan rewires)
+  → one-token validation EXPORT_VALIDATE_OK with numbers identical to
+  the hand export (rel 2.8e-2, top1 match, top5 5/5). Post-export
+  hint is arch-aware (`cascadia run <dir> --engine qwen36-moe`).
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
