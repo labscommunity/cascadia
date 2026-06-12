@@ -47,7 +47,7 @@ return only if M2'-0 passes.
 
 ## 3. Measured + code-verified priors (what any design must beat/respect)
 
-- **M1 (2026-06-11, pawan-01 = Lunar Lake 258V, 32 GB UMA, GPU,
+- **M1 (2026-06-11, node A = Lunar Lake 258V, 32 GB UMA, GPU,
   single-run — see §5 protocol for why future gates need better):**
   dense whole-model int4 via Intel GenAI: 1.27 tok/s greedy, 2.46
   prompt-lookup. Dense-MoE staged execution is dead (stages of this
@@ -183,7 +183,7 @@ indicative only; any kill/ship decision re-measures under this
 protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
 
 - **M1 — DONE 2026-06-11** (single-run; see §3 for results and caveat).
-- **M2'-0 — strategy probe: DONE 2026-06-11 (pawan-01), PASSED.**
+- **M2'-0 — strategy probe: DONE 2026-06-11 (node A), PASSED.**
   Protocol: 3 warmup + 5 runs, medians. Results:
   (1) scalar Rust GEMV, Qwen shapes, `avx512=false` asserted, rayon×8:
   gate/up 0.109 ms, down 0.099 ms → ~0.32 ms/expert → ~10 tok/s
@@ -205,7 +205,7 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   official IR's expert stacks are directly sliceable: per layer,
   gate/up `[256,512,32x64] u4` + down `[256,2048,8x64] u4` (+ zp/scale),
   expert index = leading axis, contiguous 512 KB strides; offsets in the
-  XML. **Brick 1 DONE (2026-06-11, pawan-01): one-expert slice
+  XML. **Brick 1 DONE (2026-06-11, node A): one-expert slice
   (layer 0, expert 3) byte-sliced from the .bin, dequantized, rebuilt as
   an OV model — numpy-vs-OV parity max_rel 7.8e-7**
   (`tools/qwen36_surgery/probe_expert_slice.py`). Eliminates the 133 GB
@@ -248,7 +248,7 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   externalization (the ~17 tok/s envelope; MoE cut points proven in
   brick 2) as the decode optimization. `proto_m3_decode.py` is the
   decode-loop reference for the Rust engine.
-- **M3' engine E2E (2026-06-12): 5/5 API suite green** on pawan-01
+- **M3' engine E2E (2026-06-12): 5/5 API suite green** on node A
   (`cascadia run <shards> --engine qwen36-moe --device CPU --api`):
   /v1/models, two sequential chats (state-reset invariant), greedy
   determinism (identical 13-token outputs), 96-token generation at
@@ -313,7 +313,7 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   int4 IR), --layer-split/--stage rejected. The qwen3_5_moe path runs
   on openvino+numpy alone (torch made lazy in export_shards.py — the
   target env is an inference node without torch). Validated E2E on
-  pawan-01: dispatch → stage saves (40 states each, 7 orphan rewires)
+  node A: dispatch → stage saves (40 states each, 7 orphan rewires)
   → one-token validation EXPORT_VALIDATE_OK with numbers identical to
   the hand export (rel 2.8e-2, top1 match, top5 5/5). Post-export
   hint is arch-aware (`cascadia run <dir> --engine qwen36-moe`).
@@ -328,12 +328,12 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   Pre-slice shard trees still work (flag defaults false). (3)
   `--validate` adds an 8-token greedy chain-vs-full check (accept
   ≥6/8; measured 8/8). Re-validated E2E via `cascadia shard` on
-  pawan-01: single-step numbers identical (rel 2.8e-2, top1, top5
+  node A: single-step numbers identical (rel 2.8e-2, top1, top5
   5/5), MULTI_TOKEN_PARITY 8/8, and the qwen36_parity golden test
   passes against the polished shards (engine integration, token-
   identical to the blessed golden).
 - **M4' spike 1 (2026-06-12): GPU→CPU state handoff — mechanics PASS,
-  numerics quantified** (`probe_state_handoff.py`, stage0 on pawan-01).
+  numerics quantified** (`probe_state_handoff.py`, stage0 on node A).
   All 40 VariableStates (DeltaNet ssm/conv + KV) are plain f32 tensors:
   export from a GPU request 34.1 MB @32-token ctx in 46 ms, import into
   a CPU request 23 ms; dual residency (stage0 compiled CPU+GPU
@@ -348,9 +348,9 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   attractor (passes its own negative control 7/8) — compare hidden
   VECTORS with a no-state control instead. Remaining spikes before any
   engine transport work: full 2-stage logits version of this probe;
-  per-token wire latency pawan-01↔04 (nodes currently relay via DERP
+  per-token wire latency node-A↔node-B (nodes currently relay via DERP
   "sea", not direct).
-- **M4' spike 2 (2026-06-12): cross-node wire latency pawan-01↔04** —
+- **M4' spike 2 (2026-06-12): cross-node wire latency node-A↔node-B** —
   8 KB ([1,1,2048] f32 hidden state) TCP round-trip, TCP_NODELAY:
   median **14.55 ms**, p95 16.4 ms — over the tailscale DERP relay,
   which is the ONLY path (the nodes' local subnets 192.168.19.x /

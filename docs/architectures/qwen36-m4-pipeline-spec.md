@@ -3,7 +3,7 @@
 Status: **DRAFT rev 2** — rewritten after the 4-angle rev-1 review
 (adversarial, feasibility-vs-code, scope, external/codex). Successor
 milestone to M3' (`qwen36-moe-support.md`). All numbers measured
-(spikes 1–3, 2026-06-12, pawan-01/04) unless marked *extrapolated*.
+(spikes 1–3, 2026-06-12, fleet nodes A/B) unless marked *extrapolated*.
 
 ## 0. Rev-1 → rev-2 changes (review disposition)
 
@@ -49,7 +49,7 @@ as-wired: 14.5 ms relay RTT × ~40 hops/token ≈ 580 ms/token).
 
 ## 2. Measured priors
 
-- Wire: 8 KB round-trip pawan-01↔04 median 14.55 ms, p95 16.4 ms (DERP
+- Wire: 8 KB round-trip node-A↔node-B median 14.55 ms, p95 16.4 ms (DERP
   relay — node subnets do not route directly). Decode budget impact:
   ~7 % on ~210 ms/token → floor ≈ 4.4 tok/s vs 4.8 single-box.
 - 2 MB prefill-chunk frames: latency measured only at 8 KB; sustained
@@ -153,15 +153,15 @@ as sole recovery, no ShardSpec changes). New:
 - **Day-0 probe — RUN 2026-06-12, PASS (with a variance caveat):**
   the full frame sequence (handshake, RESET/ACK, position-prefix +
   4×2 MB prefill chunks, 64 decode frames, stale-epoch drop) ran
-  between pawan-01↔04 over the live relay. Protocol sound end-to-end.
+  between node-A↔node-B over the live relay. Protocol sound end-to-end.
   Prefill wire 2.95 s for 4×2 MB (sustained ~2.7 MB/s — the rev-1
   bandwidth risk is retired). Decode: run 1 p50 13.5 ms / p95 39.2 ms
   (relay burst); run 2 p50 13.5 ms / p95 14.2 ms. Gate (prefill < 5 s,
   decode p95 < 25 ms): PASS on run 2; run 1's tail shows the relay is
   BURSTY — the M4'-1 gate's wire histogram must use a long window and
   the p95>40 ms block-rule stands. Engine work is unblocked.
-- **M4'-1 GATES RUN 2026-06-12 — ALL PASS** (pawan-01 rank 0 ↔
-  pawan-04 rank 1, CPU both, engine a195fd6, identical exporter trees
+- **M4'-1 GATES RUN 2026-06-12 — ALL PASS** (node A rank 0 ↔
+  node B rank 1, CPU both, engine a195fd6, identical exporter trees
   manifest-matched 43066861):
   1. **Token agreement: PARITY_EXACT** — 64-token greedy through the
      2-node pipeline char-identical to the single-box engine on the
@@ -170,7 +170,7 @@ as sole recovery, no ShardSpec changes). New:
      golden at ~token 30 with an f16 near-tie flip (both coherent —
      the documented §5-allowance case); single-box determinism
      reconfirmed before the pipeline run. The parity run itself
-     exercises pawan-04 CPU decode (stage1), covering the
+     exercises node B CPU decode (stage1), covering the
      hardware-homogeneity check. Prompt set 6/6
      (`golden/promptset_pipeline-2node.json`).
   2. **Decode 4.1–4.8 tok/s** short-ctx (≥4 required; single-box
@@ -187,7 +187,7 @@ as sole recovery, no ShardSpec changes). New:
      peer-reported infer time; higher than the day-0 probe's 13.5 ms
      p50 — includes serialize + session mutex.)
 
-  Ops notes from the run: pawan-04 enterprise cascadia-node service
+  Ops notes from the run: node B enterprise cascadia-node service
   uninstalled to free RAM (OVMS held ~19 GB; rank 1 OOM'd at stage
   compile) — restore with `cascadia-node.exe service install`;
   pipeline listens on :9200 (enterprise node owns :9100); the relay
@@ -199,8 +199,8 @@ as sole recovery, no ShardSpec changes). New:
   1. 64-token greedy through the 2-node pipeline matches the single-box
      engine per the M3' §5 token-agreement protocol on the parity
      prompt set (not raw `==`; near-tie allowance per the established
-     criterion), after one hardware-homogeneity check run on pawan-04
-     (one CPU decode measurement — all priors are pawan-01).
+     criterion), after one hardware-homogeneity check run on node B
+     (one CPU decode measurement — all priors are node A).
   2. Decode ≥ 4 tok/s short-ctx.
   3. Robustness matrix, named rows: cancel mid-decode entered at A;
      SSE disconnect at A; kill B mid-decode → A fails task loud; kill A
@@ -229,7 +229,7 @@ as sole recovery, no ShardSpec changes). New:
 3. **Protocol mismatch with the stateful reset heuristic** — designed
    out (§3.1 position-prefix + heuristic disabled); day-0 probe
    double-checks framing.
-4. **pawan-04 hardware non-homogeneity** — retired by the one-run check
+4. **node B hardware non-homogeneity** — retired by the one-run check
    in gate 1.
 
 ## 8. Implementation notes (M4'-1 engine, qwen36.rs)
@@ -275,11 +275,11 @@ generally start the HIGHEST rank first, then descending — each rank's
 listener must be up before its upstream dials):
 
 ```
-# pawan-04 (rank 1: stage1 + logits)
+# node B (rank 1: stage1 + logits)
 cascadia worker --rank 1 --total 2 --engine qwen36-moe `
   --model C:\cascadia\models\qwen36-shards-2stage --device CPU --listen :9100
 
-# pawan-01 (rank 0: embeddings + stage0 + tokenizer + API)
+# node A (rank 0: embeddings + stage0 + tokenizer + API)
 cascadia worker --rank 0 --total 2 --engine qwen36-moe `
   --model C:\cascadia\models\qwen36-shards-2stage --device CPU `
   --next <p04-tailscale-ip>:9100 --api :8000
