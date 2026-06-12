@@ -668,7 +668,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
         EngineKind::Qwen36Moe => {
-            Ok(Box::new(Qwen36Builder::new(&args.model, &args.device)))
+            Ok(Box::new(
+                Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+            ))
         }
     }
 }

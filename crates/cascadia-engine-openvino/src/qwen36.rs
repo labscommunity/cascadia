@@ -1,21 +1,34 @@
-//! Qwen3.6-35B-A3B staged engine (M3' v1): runs the IR-surgery shard
-//! chain (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one
-//! box. Greedy-only, batch=1, per the spec's v1 invariants; the decode
-//! loop is a port of `tools/qwen36_surgery/proto_m3_decode.py`, which
-//! measured 64/64 greedy token parity vs the whole model.
+//! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
+//! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
+//! (M3', --total 1) or as a 2-node stage pipeline (M4'-1, --rank R
+//! --total 2). Greedy-only, batch=1; the decode loop is a port of
+//! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
+//! greedy token parity vs the whole model.
 //!
 //! Stage dirs are stateful OV IRs (DeltaNet conv/ssm + attention KV as
 //! ReadValue/Assign). Linear state cannot be trimmed: every task starts
 //! with `reset_state()` on every stage (position-0 re-entry is the only
 //! recovery — spec §4.1); cancellation drops the task and the next
 //! admission's reset restores the invariant.
+//!
+//! Pipeline mode (qwen36-m4-pipeline-spec.md): rank 0 holds embeddings
+//! + stage0 + tokenizer and drives decode; rank 1 holds stage1 + logits
+//! and answers each FORWARD with the argmax token. Frames are lockstep
+//! on one transport session: 12-byte BE header [kind][epoch][pos], then
+//! a kind-specific body. The stateful `seq>1` reset heuristic is NOT
+//! used — chunked prefill would re-trigger it mid-task; the downstream
+//! resets only on RESET frames (position-0 = new task).
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
+use cascadia_transport::{
+    ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
+};
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 use tokenizers::Tokenizer;
@@ -23,9 +36,39 @@ use tracing::{info, warn};
 
 const HIDDEN: usize = 2048;
 /// Prefill span per chain pass; bounds the transient [1, T, vocab]
-/// logits buffer (~254 MB f32 at 256 with the 248320 vocab).
+/// logits buffer (~254 MB f32 at 256 with the 248320 vocab) and the
+/// per-chunk wire frame (256 * 2048 * 4 B = 2 MiB, day-0 probe sized).
 const PREFILL_CHUNK: usize = 256;
 const MROPE_ROWS: usize = 4;
+
+// M4'-1 wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
+// HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
+// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. Spec §3.1 frames
+// the position as an i64 prefix tensor; this header carries the same
+// information in the day-0 probe's framing (kind+epoch+pos), which the
+// probe validated end-to-end on the live relay.
+const FRAME_HELLO: u32 = 1;
+const FRAME_HELLO_ACK: u32 = 2;
+const FRAME_HELLO_NAK: u32 = 3;
+const FRAME_RESET: u32 = 4;
+const FRAME_RESET_ACK: u32 = 5;
+const FRAME_FORWARD: u32 = 6;
+const FRAME_TOKEN: u32 = 7;
+/// Handshake schema version (spec §3.4).
+const PROTO_VERSION: u32 = 1;
+
+fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
+    let mut h = [0u8; 12];
+    h[0..4].copy_from_slice(&kind.to_be_bytes());
+    h[4..8].copy_from_slice(&epoch.to_be_bytes());
+    h[8..12].copy_from_slice(&pos.to_be_bytes());
+    h
+}
+
+fn parse_header(b: &[u8]) -> (u32, u32, u32) {
+    let f = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    (f(0), f(4), f(8))
+}
 
 #[derive(serde::Deserialize)]
 struct Manifest {
@@ -49,6 +92,14 @@ pub struct Qwen36Builder {
     pub shards_dir: String,
     pub device: String,
     pub max_tokens_default: u32,
+    rank: u32,
+    total: u32,
+    listen_host: String,
+    listen_port: Option<u16>,
+    upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
+    downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    runtime_handle: Option<tokio::runtime::Handle>,
+    manifest_json: Option<String>,
     emb: Option<Runtime>,
     stages: Option<Vec<Runtime>>,
     tokenizer: Option<Tokenizer>,
@@ -62,12 +113,26 @@ impl Qwen36Builder {
             shards_dir: shards_dir.into(),
             device: device.into(),
             max_tokens_default: 256,
+            rank: 0,
+            total: 1,
+            listen_host: "0.0.0.0".to_string(),
+            listen_port: None,
+            upstream: None,
+            downstream: None,
+            runtime_handle: None,
+            manifest_json: None,
             emb: None,
             stages: None,
             tokenizer: None,
             eos: None,
             last_logits_only: false,
         }
+    }
+
+    pub fn with_rank(mut self, rank: u32, total: u32) -> Self {
+        self.rank = rank;
+        self.total = total;
+        self
     }
 }
 
@@ -83,55 +148,115 @@ fn read_eos(dir: &Path) -> Option<u32> {
 
 #[async_trait]
 impl Builder for Qwen36Builder {
+    fn configure_listen(&mut self, host: &str, port: u16) {
+        self.listen_host = host.to_string();
+        self.listen_port = Some(port);
+    }
+
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
-        if peers.upstream.is_some() || peers.downstream.is_some() {
-            return Err(EngineError::PeerRejected(
-                "qwen36-moe v1 is single-box (all stages in-process); \
-                 do not configure peers"
-                    .into(),
-            ));
+        if self.total <= 1 {
+            if peers.upstream.is_some() || peers.downstream.is_some() {
+                return Err(EngineError::PeerRejected(
+                    "qwen36-moe --total 1 runs all stages in-process; \
+                     do not configure peers"
+                        .into(),
+                ));
+            }
+            return Ok(());
+        }
+        self.runtime_handle = Some(tokio::runtime::Handle::current());
+        // Bind the upstream listener before dialing downstream so peers
+        // can connect to us first (ov-runtime order).
+        if peers.upstream.is_some() {
+            let port = self
+                .listen_port
+                .ok_or_else(|| EngineError::PeerRejected("configure_listen() required".into()))?;
+            let mut server = ActivationServer::new(self.listen_host.clone(), port);
+            server
+                .start()
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        }
+        if let Some(downstream) = peers.downstream {
+            let mut client = ActivationClient::new(downstream.host, downstream.port);
+            client
+                .connect_with_timeout(Duration::from_secs(60))
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        }
+        if let Some(srv) = &self.upstream {
+            srv.lock()
+                .await
+                .accept()
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
         }
         Ok(())
     }
 
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
-        if !(shard.is_first_stage && shard.is_last_stage) {
+        let pipeline = self.total > 1;
+        if !pipeline && !(shard.is_first_stage && shard.is_last_stage) {
             return Err(EngineError::ShardRejected(
-                "qwen36-moe v1 requires --total 1 (in-process stage chain)".into(),
+                "qwen36-moe --total 1 requires a single in-process stage chain".into(),
+            ));
+        }
+        if pipeline && self.total != 2 {
+            return Err(EngineError::ShardRejected(
+                "qwen36-moe pipeline supports exactly 2 stages (M4'-1; no middle ranks)".into(),
             ));
         }
         let dir = PathBuf::from(&self.shards_dir);
         let manifest_path = dir.join("manifest.json");
-        let manifest: Manifest = serde_json::from_str(
-            &std::fs::read_to_string(&manifest_path)
-                .map_err(|e| EngineError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?,
-        )
-        .map_err(|e| EngineError::InvalidConfig(format!("manifest.json: {e}")))?;
+        let manifest_raw = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| EngineError::ModelNotFound(format!("{}: {e}", manifest_path.display())))?;
+        let manifest: Manifest = serde_json::from_str(&manifest_raw)
+            .map_err(|e| EngineError::InvalidConfig(format!("manifest.json: {e}")))?;
         if manifest.arch != "qwen3_5_moe" {
             return Err(EngineError::InvalidConfig(format!(
                 "manifest arch {:?} is not qwen3_5_moe",
                 manifest.arch
             )));
         }
+        if pipeline && manifest.stages.len() != self.total as usize {
+            return Err(EngineError::ShardRejected(format!(
+                "--total ({}) does not match manifest stage count ({})",
+                self.total,
+                manifest.stages.len()
+            )));
+        }
 
         let mut progress = vec![LoadProgress::message(format!(
-            "qwen36-moe: {} stages from {}",
+            "qwen36-moe: {} stages from {} (rank {}/{})",
             manifest.stages.len(),
-            dir.display()
+            dir.display(),
+            self.rank,
+            self.total
         ))];
         let plugin = PluginConfig::new();
 
-        let emb_xml = dir.join("openvino_text_embeddings_model.xml");
-        progress.push(LoadProgress::message("compiling text-embeddings IR".to_string()));
-        let emb = Runtime::compile(
-            emb_xml.to_str().unwrap_or_default(),
-            &self.device,
-            &plugin,
-        )
-        .map_err(map_ov)?;
+        // Embeddings + tokenizer + eos live with the decode driver only.
+        if self.rank == 0 {
+            let emb_xml = dir.join("openvino_text_embeddings_model.xml");
+            progress.push(LoadProgress::message("compiling text-embeddings IR".to_string()));
+            self.emb = Some(
+                Runtime::compile(emb_xml.to_str().unwrap_or_default(), &self.device, &plugin)
+                    .map_err(map_ov)?,
+            );
+            self.tokenizer = Some(
+                Tokenizer::from_file(dir.join("tokenizer.json"))
+                    .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?,
+            );
+            self.eos = read_eos(&dir);
+        }
 
-        let mut stages = Vec::with_capacity(manifest.stages.len());
+        let mut stages = Vec::new();
         for s in &manifest.stages {
+            if pipeline && s.stage != self.rank as usize {
+                continue;
+            }
             let xml = dir.join(format!("stage{}", s.stage)).join("stage.xml");
             progress.push(LoadProgress::message(format!(
                 "compiling stage{} (layers {}..{}) on {}",
@@ -143,26 +268,34 @@ impl Builder for Qwen36Builder {
             );
         }
 
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-            .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?;
-
-        self.eos = read_eos(&dir);
+        self.manifest_json = Some(manifest_raw);
         self.last_logits_only = manifest.last_logits_only;
-        self.emb = Some(emb);
         self.stages = Some(stages);
-        self.tokenizer = Some(tokenizer);
         progress.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(progress)))
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if self.rank == 0 && (self.emb.is_none() || self.tokenizer.is_none()) {
+            return Err(EngineError::NotLoaded);
+        }
         Ok(Box::new(Qwen36Engine {
-            emb: self.emb.ok_or(EngineError::NotLoaded)?,
+            emb: self.emb,
             stages: self.stages.ok_or(EngineError::NotLoaded)?,
-            tokenizer: self.tokenizer.ok_or(EngineError::NotLoaded)?,
+            tokenizer: self.tokenizer,
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
             last_logits_only: self.last_logits_only,
+            rank: self.rank,
+            total: self.total,
+            upstream: self.upstream,
+            downstream: self.downstream,
+            runtime_handle: self.runtime_handle,
+            manifest_json: self.manifest_json.unwrap_or_default(),
+            epoch: 0,
+            peer_epoch: 0,
+            handshake_done: false,
+            poisoned: None,
             pending: Vec::new(),
             active: None,
         }))
@@ -179,13 +312,36 @@ fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
     }
 }
 
+fn map_wire(err: TransportError) -> EngineError {
+    EngineError::Backend(format!("qwen36 pipeline wire: {err}"))
+}
+
 pub struct Qwen36Engine {
-    emb: Runtime,
+    /// Rank 0 only in pipeline mode.
+    emb: Option<Runtime>,
     stages: Vec<Runtime>,
-    tokenizer: Tokenizer,
+    /// Rank 0 only in pipeline mode.
+    tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
     max_tokens_default: u32,
     last_logits_only: bool,
+    rank: u32,
+    total: u32,
+    upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
+    downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
+    runtime_handle: Option<tokio::runtime::Handle>,
+    /// Raw manifest.json for the startup handshake (full-text compare —
+    /// small file, stronger than a hash and needs no new dependency).
+    manifest_json: String,
+    /// Task epoch (spec §3.3). Rank 0 bumps per admission; frames carry
+    /// it; the downstream drops frames from older epochs.
+    epoch: u32,
+    /// Downstream side: epoch of the last RESET accepted.
+    peer_epoch: u32,
+    handshake_done: bool,
+    /// Set when the startup handshake found a config mismatch (spec
+    /// §3.4: refuse to serve). Admissions fail loud with this reason.
+    poisoned: Option<String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
 }
@@ -199,7 +355,10 @@ struct ActiveTask {
     prompt_ids: Vec<u32>,
     prefill_idx: usize,
     step: usize,
+    /// Single-box: last position's logits row. Unused in pipeline mode.
     logits: Vec<f32>,
+    /// Pipeline rank 0: next token returned by the downstream argmax.
+    next_token: Option<u32>,
     gen_ids: Vec<u32>,
     /// Byte length of the decoded prefix already emitted as chunks.
     emitted: usize,
@@ -223,22 +382,35 @@ fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::Output {
+    crate::dist_spec::run_async_pub(h, fut)
+}
+
+/// One inbound frame on the upstream session (downstream rank's view).
+enum InFrame {
+    Hello(Vec<u8>),
+    Reset(u32),
+    Forward { epoch: u32, pos: u32, hidden: Vec<f32>, n: usize },
+}
+
 impl Qwen36Engine {
     /// Embed a token span: [1, n] ids -> flattened [1, n, HIDDEN] f32.
     fn embed_seq(&mut self, toks: &[u32]) -> EngineResult<Vec<f32>> {
-        let name = self
+        let emb = self
             .emb
+            .as_mut()
+            .ok_or_else(|| EngineError::Backend("no embeddings on this rank".into()))?;
+        let name = emb
             .input_names()
             .map_err(map_ov)?
             .into_iter()
             .next()
             .ok_or_else(|| EngineError::Backend("embeddings IR has no inputs".into()))?;
         let ids: Vec<i64> = toks.iter().map(|&t| t as i64).collect();
-        self.emb
-            .set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
+        emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
-        self.emb.infer().map_err(map_ov)?;
-        let (dtype, _shape, bytes) = self.emb.output(0).map_err(map_ov)?;
+        emb.infer().map_err(map_ov)?;
+        let (dtype, _shape, bytes) = emb.output(0).map_err(map_ov)?;
         if !matches!(dtype, DType::F32) {
             return Err(EngineError::Backend(format!(
                 "embeddings output dtype {dtype:?}, expected f32"
@@ -247,9 +419,11 @@ impl Qwen36Engine {
         Ok(f32_from_le(&bytes))
     }
 
-    /// One pass through the stage chain covering absolute positions
-    /// [t0, t1) (T = t1-t0; the stage IRs are dynamic in T). Returns the
-    /// last stage's full first output, flattened [1, T, width].
+    /// One pass through the local stage chain covering absolute positions
+    /// [t0, t1) (T = t1-t0; the stage IRs are dynamic in T). `hidden` is
+    /// real embeddings on the global first stage, the upstream stage's
+    /// output otherwise. Returns the last stage's full first output,
+    /// flattened [1, T, width].
     fn chain_pass(&mut self, embeds: &[f32], t0: usize, t1: usize) -> EngineResult<Vec<f32>> {
         let n = t1 - t0;
         let mask = vec![1i64; t1];
@@ -257,6 +431,7 @@ impl Qwen36Engine {
             .flat_map(|_| (t0 as i64)..(t1 as i64))
             .collect();
         let zeros_embeds = vec![0f32; n * HIDDEN];
+        let first_global = self.rank == 0;
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
@@ -266,9 +441,9 @@ impl Qwen36Engine {
                         .set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(&hidden))
                         .map_err(map_ov)?,
                     s if s.contains("embed") => {
-                        // first stage: real embeds; mid stages: dummy
-                        // (upstream ShapeOf chains read shapes only)
-                        let data = if j == 0 { &hidden } else { &zeros_embeds };
+                        // global first stage: real embeds; later stages:
+                        // dummy (upstream ShapeOf chains read shapes only)
+                        let data = if j == 0 && first_global { &hidden } else { &zeros_embeds };
                         st.set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(data))
                             .map_err(map_ov)?;
                     }
@@ -301,7 +476,7 @@ impl Qwen36Engine {
     }
 
     /// Run a token span starting at absolute position `t0`; returns the
-    /// LAST position's logits row.
+    /// LAST position's logits row. Single-box only (needs the full chain).
     fn run_span(&mut self, toks: &[u32], t0: usize) -> EngineResult<Vec<f32>> {
         let n = toks.len();
         let e = self.embed_seq(toks)?;
@@ -348,36 +523,147 @@ impl Qwen36Engine {
             Chunk::final_marker(t.task_id, "").with_prompt_tokens(t.prompt_ids.len() as u32),
         )]
     }
-}
 
-impl Engine for Qwen36Engine {
-    fn warmup(&mut self) {
-        self.reset_all();
-        match self.run_span(&[1000], 0) {
-            Ok(_) => info!("qwen36-moe warmup ok"),
-            Err(e) => warn!(error = %e, "qwen36-moe warmup failed"),
-        }
-        self.reset_all();
+    // -------- pipeline mode (M4'-1) --------
+
+    fn handle(&self) -> EngineResult<tokio::runtime::Handle> {
+        self.runtime_handle
+            .clone()
+            .ok_or_else(|| EngineError::Backend("pipeline mode without runtime handle".into()))
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.iter().any(|t| t.task_id == task.task_id) {
-            return Ok(());
+    /// Handshake payload (spec §3.4): manifest full text, stage layout,
+    /// wire dtype, protocol version. The shim exposes no OV version
+    /// string; the manifest compare covers export-level skew.
+    fn hello_payload(&self) -> Vec<u8> {
+        serde_json::json!({
+            "proto": PROTO_VERSION,
+            "total": self.total,
+            "wire": "f32",
+            "manifest": self.manifest_json,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit (spec §3.4).
+    fn handshake_a(&mut self) -> EngineResult<()> {
+        let payload = self.hello_payload();
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
+        let h = self.handle()?;
+        let nak: Option<String> = run_async(&h, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
+            g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&payload).await?;
+            let hb = g.recv_raw(12).await?;
+            let (kind, _, _) = parse_header(&hb);
+            match kind {
+                FRAME_HELLO_ACK => Ok(None),
+                FRAME_HELLO_NAK => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    let rb = g.recv_raw(n).await?;
+                    Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
+                }
+                other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
+            }
+        })
+        .map_err(map_wire)?;
+        if let Some(reason) = nak {
+            self.poisoned = Some(reason.clone());
+            return Err(EngineError::Backend(format!(
+                "qwen36 pipeline handshake refused: {reason}"
+            )));
         }
-        self.pending.push(task);
+        self.handshake_done = true;
+        info!("qwen36 pipeline handshake ok");
         Ok(())
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
-        // Admit the next task: position-0 entry per task (linear state
-        // cannot be trimmed — spec §4.1).
+    /// Rank 0: RESET → RESET_ACK for the current epoch (spec §3.2).
+    /// Fail-loud, no retry — the API caller retries the task.
+    fn reset_exchange(&mut self) -> EngineResult<()> {
+        let epoch = self.epoch;
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
+        let h = self.handle()?;
+        run_async(&h, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+            let hb = g.recv_raw(12).await?;
+            let (kind, e, _) = parse_header(&hb);
+            if kind != FRAME_RESET_ACK || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
+    }
+
+    /// Rank 0: one lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) →
+    /// TOKEN exchange. Returns the downstream argmax token.
+    fn send_forward_recv_token(&mut self, hidden: Vec<f32>, n: usize, t0: usize) -> EngineResult<u32> {
+        let epoch = self.epoch;
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
+        let h = self.handle()?;
+        let tensor = WireTensor::new(
+            WireDType::F32,
+            [1, n as u32, HIDDEN as u32],
+            le_bytes_f32(&hidden),
+        );
+        let token = run_async(&h, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32)).await?;
+            g.send(&tensor).await?;
+            let hb = g.recv_raw(12).await?;
+            let (kind, e, _) = parse_header(&hb);
+            if kind != FRAME_TOKEN || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            let tb = g.recv_raw(4).await?;
+            Ok(i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]))
+        })
+        .map_err(map_wire)?;
+        Ok(token as u32)
+    }
+
+    /// Rank 0 driver step: same task lifecycle as the single-box step,
+    /// with the downstream stage + argmax behind the wire.
+    fn step_pipe_first(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.active.is_none() {
             if self.pending.is_empty() {
                 return Vec::new();
             }
             let task = self.pending.remove(0);
+            if let Some(reason) = &self.poisoned {
+                warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+            if !self.handshake_done {
+                if let Err(e) = self.handshake_a() {
+                    warn!(task = %task.task_id, error = %e, "qwen36: handshake failed");
+                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                }
+            }
+            // Admission (spec §3.2): reset local state, bump the epoch,
+            // RESET/RESET_ACK the downstream, then admit at position 0.
             self.reset_all();
-            let mut prompt_ids: Vec<u32> = match self.tokenizer.encode(task.prompt.as_str(), true) {
+            self.epoch = self.epoch.wrapping_add(1);
+            if let Err(e) = self.reset_exchange() {
+                warn!(task = %task.task_id, error = %e, "qwen36: admission reset failed");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+            let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
+            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
@@ -385,10 +671,7 @@ impl Engine for Qwen36Engine {
                 }
             };
             if !task.enable_thinking {
-                // Hybrid-reasoning off: prefill the empty think block the
-                // official chat template injects for enable_thinking=false,
-                // so decode starts at the answer instead of reasoning.
-                if let Ok(e) = self.tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
+                if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
                     prompt_ids.extend(e.get_ids());
                 }
             }
@@ -403,6 +686,283 @@ impl Engine for Qwen36Engine {
                 prefill_idx: 0,
                 step: 0,
                 logits: Vec::new(),
+                next_token: None,
+                gen_ids: Vec::new(),
+                emitted: 0,
+                max_tokens,
+                started: Instant::now(),
+            });
+        }
+        let t = self.active.as_ref().unwrap();
+        let task_id = t.task_id.clone();
+
+        if t.prefill_idx < t.prompt_ids.len() {
+            // Full prefill in one step() call, chunked: per chunk the
+            // local stage runs, the hidden span crosses the wire, and
+            // the downstream answers with its argmax (intermediate
+            // chunks' tokens are discarded; the last one is the first
+            // decode token). Lockstep keeps the session quiescent
+            // between steps, so cancel never races a frame in flight.
+            while self.active.as_ref().unwrap().prefill_idx
+                < self.active.as_ref().unwrap().prompt_ids.len()
+            {
+                let t = self.active.as_ref().unwrap();
+                let end = (t.prefill_idx + PREFILL_CHUNK).min(t.prompt_ids.len());
+                let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
+                let t0 = t.step;
+                let n = toks.len();
+                let res = self
+                    .embed_seq(&toks)
+                    .and_then(|e| self.chain_pass(&e, t0, t0 + n))
+                    .and_then(|h| self.send_forward_recv_token(h, n, t0));
+                match res {
+                    Ok(tok) => {
+                        let t = self.active.as_mut().unwrap();
+                        t.next_token = Some(tok);
+                        t.prefill_idx = end;
+                        t.step += n;
+                    }
+                    Err(e) => {
+                        warn!(task = %task_id, error = %e, "pipeline prefill failed");
+                        return self.finalize();
+                    }
+                }
+            }
+            Vec::new()
+        } else {
+            if t.gen_ids.len() >= t.max_tokens {
+                return self.finalize();
+            }
+            let next = t.next_token.expect("pipeline decode without pending token");
+            if Some(next) == self.eos {
+                return self.finalize();
+            }
+            let step = t.step;
+            let res = self
+                .embed_seq(&[next])
+                .and_then(|e| self.chain_pass(&e, step, step + 1))
+                .and_then(|h| self.send_forward_recv_token(h, 1, step));
+            match res {
+                Ok(tok) => {
+                    let t = self.active.as_mut().unwrap();
+                    t.next_token = Some(tok);
+                    t.gen_ids.push(next);
+                    t.step += 1;
+                    let full = self
+                        .tokenizer
+                        .as_ref()
+                        .expect("rank 0 has tokenizer")
+                        .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
+                        .unwrap_or_default();
+                    let t = self.active.as_mut().unwrap();
+                    let delta = if full.ends_with('\u{FFFD}') {
+                        String::new()
+                    } else {
+                        let d = full.get(t.emitted..).unwrap_or("").to_string();
+                        t.emitted = full.len();
+                        d
+                    };
+                    vec![(
+                        task_id.clone(),
+                        Chunk::token(task_id, next as i64, delta),
+                    )]
+                }
+                Err(e) => {
+                    warn!(task = %task_id, error = %e, "pipeline decode failed");
+                    self.finalize()
+                }
+            }
+        }
+    }
+
+    /// Last rank: serve one inbound frame per step (relay loop). Blocks
+    /// in recv up to the activation timeout; idle timeouts surface as
+    /// step errors (warned and ignored by the dispatch, like ov-runtime).
+    fn step_pipe_last(&mut self) -> EngineResult<()> {
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("last rank has no upstream".into()))?;
+        let h = self.handle()?;
+        let frame = run_async(&h, async move {
+            let mut g = upstream.lock().await;
+            let hb = g.recv_raw(12).await?;
+            let (kind, epoch, pos) = parse_header(&hb);
+            match kind {
+                FRAME_HELLO => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    Ok(InFrame::Hello(g.recv_raw(n).await?))
+                }
+                FRAME_RESET => Ok(InFrame::Reset(epoch)),
+                FRAME_FORWARD => {
+                    let (t, _) = g.recv().await?;
+                    if !matches!(t.dtype, WireDType::F32) {
+                        return Err(TransportError::SocketClosed);
+                    }
+                    let n = t.shape[1] as usize;
+                    Ok(InFrame::Forward {
+                        epoch,
+                        pos,
+                        hidden: f32_from_le(&t.data),
+                        n,
+                    })
+                }
+                _ => Err(TransportError::SocketClosed),
+            }
+        })
+        .map_err(map_wire)?;
+
+        match frame {
+            InFrame::Hello(payload) => {
+                let reason = self.validate_hello(&payload);
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                match reason {
+                    None => {
+                        run_async(&h, async move {
+                            let mut g = upstream.lock().await;
+                            g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, 0)).await
+                        })
+                        .map_err(map_wire)?;
+                        info!("qwen36 pipeline handshake ok");
+                    }
+                    Some(reason) => {
+                        warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
+                        self.poisoned = Some(reason.clone());
+                        let bytes = reason.into_bytes();
+                        run_async(&h, async move {
+                            let mut g = upstream.lock().await;
+                            g.send_raw(&frame_header(FRAME_HELLO_NAK, 0, 0)).await?;
+                            g.send_raw(&(bytes.len() as u32).to_be_bytes()).await?;
+                            g.send_raw(&bytes).await
+                        })
+                        .map_err(map_wire)?;
+                    }
+                }
+                Ok(())
+            }
+            InFrame::Reset(epoch) => {
+                self.reset_all();
+                self.peer_epoch = epoch;
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_RESET_ACK, epoch, 0)).await
+                })
+                .map_err(map_wire)
+            }
+            InFrame::Forward { epoch, pos, hidden, n } => {
+                if self.poisoned.is_some() {
+                    return Err(EngineError::Backend(
+                        "qwen36 pipeline poisoned by handshake mismatch".into(),
+                    ));
+                }
+                if epoch != self.peer_epoch {
+                    // Stale epoch (spec §3.3): drop silently; the driver's
+                    // recv times out and fails its task loud.
+                    warn!(epoch, current = self.peer_epoch, "qwen36: dropping stale frame");
+                    return Ok(());
+                }
+                if hidden.len() != n * HIDDEN {
+                    return Err(EngineError::Backend(format!(
+                        "forward frame size {} != n({n}) * HIDDEN",
+                        hidden.len()
+                    )));
+                }
+                let t0 = pos as usize;
+                let out = self.chain_pass(&hidden, t0, t0 + n)?;
+                let logits = if self.last_logits_only {
+                    out
+                } else {
+                    let row = out.len() / n;
+                    out[(n - 1) * row..].to_vec()
+                };
+                let next = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as i32)
+                    .unwrap_or(0);
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_TOKEN, epoch, pos)).await?;
+                    g.send_raw(&next.to_be_bytes()).await
+                })
+                .map_err(map_wire)
+            }
+        }
+    }
+
+    /// Downstream side of the §3.4 handshake: compare the peer's payload
+    /// against ours field by field.
+    fn validate_hello(&self, payload: &[u8]) -> Option<String> {
+        let theirs: serde_json::Value = match serde_json::from_slice(payload) {
+            Ok(v) => v,
+            Err(e) => return Some(format!("unparseable HELLO payload: {e}")),
+        };
+        if theirs["proto"] != serde_json::json!(PROTO_VERSION) {
+            return Some(format!(
+                "protocol version mismatch: theirs {} ours {PROTO_VERSION}",
+                theirs["proto"]
+            ));
+        }
+        if theirs["total"] != serde_json::json!(self.total) {
+            return Some(format!(
+                "stage count mismatch: theirs {} ours {}",
+                theirs["total"], self.total
+            ));
+        }
+        if theirs["wire"] != serde_json::json!("f32") {
+            return Some(format!("wire dtype mismatch: theirs {}", theirs["wire"]));
+        }
+        if theirs["manifest"].as_str() != Some(self.manifest_json.as_str()) {
+            return Some("manifest mismatch between ranks".into());
+        }
+        None
+    }
+
+    /// Single-box step (M3' path), unchanged.
+    fn step_local(&mut self) -> Vec<(TaskId, Chunk)> {
+        // Admit the next task: position-0 entry per task (linear state
+        // cannot be trimmed — spec §4.1).
+        if self.active.is_none() {
+            if self.pending.is_empty() {
+                return Vec::new();
+            }
+            let task = self.pending.remove(0);
+            self.reset_all();
+            let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
+            let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
+                Ok(e) => e.get_ids().to_vec(),
+                Err(e) => {
+                    warn!(task = %task.task_id, error = %e, "tokenize failed");
+                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                }
+            };
+            if !task.enable_thinking {
+                // Hybrid-reasoning off: prefill the empty think block the
+                // official chat template injects for enable_thinking=false,
+                // so decode starts at the answer instead of reasoning.
+                if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
+                    prompt_ids.extend(e.get_ids());
+                }
+            }
+            let max_tokens = if task.max_tokens > 0 {
+                task.max_tokens
+            } else {
+                self.max_tokens_default
+            } as usize;
+            self.active = Some(ActiveTask {
+                task_id: task.task_id,
+                prompt_ids,
+                prefill_idx: 0,
+                step: 0,
+                logits: Vec::new(),
+                next_token: None,
                 gen_ids: Vec::new(),
                 emitted: 0,
                 max_tokens,
@@ -466,8 +1026,11 @@ impl Engine for Qwen36Engine {
                     // the suffix back until the next token completes it.
                     let full = self
                         .tokenizer
-                        .decode(&t.gen_ids, true)
+                        .as_ref()
+                        .expect("single-box has tokenizer")
+                        .decode(self.active.as_ref().unwrap().gen_ids.as_slice(), true)
                         .unwrap_or_default();
+                    let t = self.active.as_mut().unwrap();
                     let delta = if full.ends_with('\u{FFFD}') {
                         String::new()
                     } else {
@@ -487,16 +1050,135 @@ impl Engine for Qwen36Engine {
             }
         }
     }
+}
+
+impl Engine for Qwen36Engine {
+    fn warmup(&mut self) {
+        if self.total > 1 && self.rank != 0 {
+            // Last rank warms via its first real frame; the relay loop
+            // owns the upstream session from here on.
+            info!("qwen36-moe rank {}: skipping warmup (relay)", self.rank);
+            return;
+        }
+        if self.total > 1 {
+            // Local stage pass only (no logits on rank 0), then the
+            // startup handshake — fail-loud at boot, not first request.
+            self.reset_all();
+            let r = self
+                .embed_seq(&[1000])
+                .and_then(|e| self.chain_pass(&e, 0, 1));
+            match r {
+                Ok(_) => info!("qwen36-moe warmup ok (stage0 local)"),
+                Err(e) => warn!(error = %e, "qwen36-moe warmup failed"),
+            }
+            self.reset_all();
+            if let Err(e) = self.handshake_a() {
+                warn!(error = %e, "qwen36-moe startup handshake failed");
+            }
+            return;
+        }
+        self.reset_all();
+        match self.run_span(&[1000], 0) {
+            Ok(_) => info!("qwen36-moe warmup ok"),
+            Err(e) => warn!(error = %e, "qwen36-moe warmup failed"),
+        }
+        self.reset_all();
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.pending.iter().any(|t| t.task_id == task.task_id) {
+            return Ok(());
+        }
+        self.pending.push(task);
+        Ok(())
+    }
+
+    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.total <= 1 {
+            return self.step_local();
+        }
+        if self.rank == 0 {
+            self.step_pipe_first()
+        } else {
+            match self.step_pipe_last() {
+                Ok(()) => Vec::new(),
+                Err(e) => {
+                    warn!(error = %e, "qwen36 pipeline step failed");
+                    Vec::new()
+                }
+            }
+        }
+    }
 
     fn cancel(&mut self, task_id: &TaskId) {
         // Immediate clear (PR #56 idiom): cancel and step never overlap
         // (both &mut self behind the runner's mutex), and the next
         // admission resets state, so dropping active directly is safe
         // and frees the engine slot without waiting for another poll.
+        // Pipeline mode: the session is quiescent between steps
+        // (lockstep frames), and the next admission's RESET + epoch
+        // bump clears the downstream.
         self.pending.retain(|t| &t.task_id != task_id);
         if self.active.as_ref().is_some_and(|t| &t.task_id == task_id) {
             info!(task = %task_id, "qwen36: cancelled; dropping active task");
             self.active = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_roundtrip() {
+        let h = frame_header(FRAME_FORWARD, 7, 4096);
+        assert_eq!(parse_header(&h), (FRAME_FORWARD, 7, 4096));
+    }
+
+    fn bare_engine(total: u32, manifest: &str) -> Qwen36Engine {
+        Qwen36Engine {
+            emb: None,
+            stages: Vec::new(),
+            tokenizer: None,
+            eos: None,
+            max_tokens_default: 256,
+            last_logits_only: false,
+            rank: 1,
+            total,
+            upstream: None,
+            downstream: None,
+            runtime_handle: None,
+            manifest_json: manifest.to_string(),
+            epoch: 0,
+            peer_epoch: 0,
+            handshake_done: false,
+            poisoned: None,
+            pending: Vec::new(),
+            active: None,
+        }
+    }
+
+    #[test]
+    fn hello_validates_matching_payload() {
+        let e = bare_engine(2, r#"{"arch":"qwen3_5_moe"}"#);
+        let payload = e.hello_payload();
+        assert_eq!(e.validate_hello(&payload), None);
+    }
+
+    #[test]
+    fn hello_rejects_manifest_skew() {
+        let a = bare_engine(2, r#"{"arch":"qwen3_5_moe","stages":1}"#);
+        let b = bare_engine(2, r#"{"arch":"qwen3_5_moe","stages":2}"#);
+        let reason = b.validate_hello(&a.hello_payload());
+        assert!(reason.is_some_and(|r| r.contains("manifest")));
+    }
+
+    #[test]
+    fn hello_rejects_total_mismatch() {
+        let a = bare_engine(2, "{}");
+        let b = bare_engine(3, "{}");
+        let reason = b.validate_hello(&a.hello_payload());
+        assert!(reason.is_some_and(|r| r.contains("stage count")));
     }
 }

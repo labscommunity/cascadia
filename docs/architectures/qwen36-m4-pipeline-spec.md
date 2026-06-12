@@ -198,7 +198,34 @@ as sole recovery, no ShardSpec changes). New:
 4. **pawan-04 hardware non-homogeneity** — retired by the one-run check
    in gate 1.
 
-## 8. Decisions closed (were §8 open questions in rev 1)
+## 8. Implementation notes (M4'-1 engine, qwen36.rs)
+
+Deviations/decisions made during the build; all functionally within the
+rev-2 design:
+
+- **Frame format:** 12-byte BE raw header `[kind][epoch][pos]` + body,
+  not §3.1's literal i64 position-prefix tensor. Same information,
+  matches the day-0 probe's validated framing; epoch folded into the
+  header per §3.3's "or folded into the position frame" option.
+- **Handshake (§3.4):** runs in rank-0 `warmup()` (fail-loud at boot;
+  retried at first admit if the transport hiccuped). Carries proto
+  version, total, wire dtype, and the FULL manifest.json text (compare
+  beats hash, no new dependency). OV version string is NOT exchanged —
+  the shim exposes no version API and adding FFI is out of M4'-1 scope;
+  the manifest compare covers export-level skew. Mismatch poisons both
+  sides (admissions fail with the reason).
+- **Lockstep prefill:** every FORWARD (including intermediate prefill
+  chunks) is answered with the downstream argmax TOKEN; rank 0 discards
+  all but the last. Costs one ~15 ms RTT per 256-chunk (noise vs the
+  2.95 s measured chunk wire time) and keeps the session quiescent
+  between `step()` calls, so cancel never races an in-flight frame.
+- **Wire dtype f32** per §3.1 (parity gate compares against the all-f32
+  single-box engine; f16 truncation is avoidable risk).
+- Stale-epoch FORWARD frames are dropped with no response; the driver's
+  60 s recv timeout fails the task loud (lockstep makes this reachable
+  only via epoch bugs — belt-and-braces per §3.3).
+
+## 9. Decisions closed (were §8 open questions in rev 1)
 
 - Control channel: same transport session, RESET/RESET_ACK frames.
 - M4'-1 visibility: internal scaffolding until its gate passes.
