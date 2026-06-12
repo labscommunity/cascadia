@@ -69,6 +69,14 @@ pub enum TransportError {
 
     #[error("not connected; call connect()/accept() first")]
     NotConnected,
+
+    /// Frame-start idle ceiling fired: the peer is connected but silent
+    /// (black-holed). Connection-fatal — the server/client wrappers drop
+    /// the socket so a frame the peer sends later can never be read into
+    /// a different request; subsequent calls fail fast with
+    /// [`Self::NotConnected`].
+    #[error("frame-start idle ceiling hit after {0:?}; connection dropped (black-holed peer?)")]
+    FrameIdleCeiling(Duration),
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -297,19 +305,16 @@ fn frame_idle_ceiling() -> Option<Duration> {
 /// is not a failure, and treating it as one made every idle chain kill its
 /// own sockets on a timer. A dead peer still fails fast here via EOF/reset;
 /// a silent black-hole peer (connected, no FIN/RST) is bounded only by the
-/// much larger [`frame_idle_ceiling`], which converts it into the same
-/// timed-out error class as the deadline'd recvs.
+/// much larger [`frame_idle_ceiling`], surfaced as the dedicated
+/// [`TransportError::FrameIdleCeiling`] — distinguishable from the
+/// per-frame deadline's `Io(TimedOut)` so the wrappers can treat it as
+/// connection-fatal.
 async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
     let first_read = sock.read(buf);
     let n = match frame_idle_ceiling() {
         Some(ceiling) => match tokio::time::timeout(ceiling, first_read).await {
             Ok(res) => res?,
-            Err(_) => {
-                return Err(TransportError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("frame-start idle ceiling hit after {ceiling:?} (black-holed peer?)"),
-                )))
-            }
+            Err(_) => return Err(TransportError::FrameIdleCeiling(ceiling)),
         },
         None => first_read.await?,
     };
@@ -401,7 +406,21 @@ impl ActivationServer {
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(sock).await
+        let res = recv_tensor(sock).await;
+        self.drop_connection_on_ceiling(res.as_ref().err());
+        res
+    }
+
+    /// Ceiling fire is connection-fatal: drop the socket here, at the
+    /// transport layer, so the abandoned frame the black-holed peer may
+    /// send later can never be read into a different request (token
+    /// frames carry no task id). Subsequent calls fail fast with
+    /// [`TransportError::NotConnected`].
+    fn drop_connection_on_ceiling(&mut self, err: Option<&TransportError>) {
+        if matches!(err, Some(TransportError::FrameIdleCeiling(_))) {
+            self.client = None; // drop closes the fd
+            self.accepted_addr = None;
+        }
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
@@ -428,7 +447,9 @@ impl ActivationServer {
         }
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact_frame_start(sock, &mut buf).await?;
+        let res = recv_exact_frame_start(sock, &mut buf).await;
+        self.drop_connection_on_ceiling(res.as_ref().err());
+        res?;
         Ok(buf)
     }
 
@@ -528,7 +549,17 @@ impl ActivationClient {
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(sock).await
+        let res = recv_tensor(sock).await;
+        self.drop_connection_on_ceiling(res.as_ref().err());
+        res
+    }
+
+    /// See [`ActivationServer::drop_connection_on_ceiling`]: ceiling fire
+    /// is connection-fatal at the transport layer.
+    fn drop_connection_on_ceiling(&mut self, err: Option<&TransportError>) {
+        if matches!(err, Some(TransportError::FrameIdleCeiling(_))) {
+            self.sock = None; // drop closes the fd
+        }
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
@@ -544,7 +575,9 @@ impl ActivationClient {
         }
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact_frame_start(sock, &mut buf).await?;
+        let res = recv_exact_frame_start(sock, &mut buf).await;
+        self.drop_connection_on_ceiling(res.as_ref().err());
+        res?;
         Ok(buf)
     }
 
@@ -733,13 +766,49 @@ mod tests {
         let got = h.await.unwrap();
         set_frame_idle_ceiling_secs(0);
         match got {
-            Err(TransportError::Io(e)) => assert_eq!(
-                e.kind(),
-                io::ErrorKind::TimedOut,
-                "ceiling must surface as the timed-out error class"
-            ),
-            other => panic!("expected timed-out io error, got {other:?}"),
+            Err(TransportError::FrameIdleCeiling(_)) => {}
+            other => panic!("expected FrameIdleCeiling, got {other:?}"),
         }
+    }
+
+    /// A ceiling fire must kill the connection: the next recv on the same
+    /// server fails fast with NotConnected, and a frame the black-holed
+    /// peer sends late must never be readable as a valid frame (it would
+    /// otherwise leak into the NEXT request — token frames carry no task
+    /// id).
+    #[tokio::test]
+    async fn ceiling_fire_is_connection_fatal() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_frame_idle_ceiling_secs(1);
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        // Connect, then go silent — never send a byte.
+        let mut peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        server.accept().await.unwrap();
+        let first = server.recv().await;
+        assert!(
+            matches!(first, Err(TransportError::FrameIdleCeiling(_))),
+            "expected FrameIdleCeiling, got {first:?}"
+        );
+        // The abandoned frame arrives LATE, after the ceiling fired.
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        let _ = send_tensor(&mut peer, &tensor).await; // peer may already see RST
+                                                       // Subsequent use must fail fast on a dead connection — the late
+                                                       // frame must NOT come back as a valid frame.
+        let start = Instant::now();
+        let second = server.recv().await;
+        set_frame_idle_ceiling_secs(0);
+        set_activation_timeout_secs(0);
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "recv after ceiling fire must fail NotConnected, got {second:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "recv after ceiling fire must fail fast"
+        );
     }
 
     /// The ceiling must not erode the idle-tolerance guarantee: an idle

@@ -1771,9 +1771,16 @@ impl Engine for OvDistSpecWorkerEngine {
             // Transport-closed errors signal the driver disconnected;
             // don't spam the log. Drop the upstream/downstream so the
             // next step exits the relay loop cleanly via NotConnected.
+            // "idle ceiling" = frame-start idle ceiling fired (black-holed
+            // peer); the transport layer has already dropped that socket —
+            // close the rest here too. Transport errors reach us flattened
+            // to strings (EngineError::Backend), hence the contains().
             let msg = e.to_string();
-            if msg.contains("socket closed") || msg.contains("not connected") {
-                warn!("ov-dist-spec worker: upstream closed, exiting");
+            if msg.contains("socket closed")
+                || msg.contains("not connected")
+                || msg.contains("idle ceiling")
+            {
+                warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links");
                 // Mark engine as drained by clearing connections.
                 let _ = self.runtime_handle.clone().block_on(async {
                     let mut g = self.upstream.lock().await;
