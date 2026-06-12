@@ -100,8 +100,19 @@ the engine's final chunk; `total = prompt + completion`. **Thinking-mode
 (2026-06-12)**: `enable_thinking: false` on the request prefills the
 template's empty think block (staged engine); default unchanged.
 
-Still pending: HF-parity prompt set; iGPU repeat of the tool-calling
-probe.
+**Fixed prompt set validated (2026-06-12)**: 6/6 factual-correctness
+PASS on BOTH paths (`tools/qwen36_surgery/promptset.json`; outputs in
+`tools/qwen36_surgery/golden/promptset_*.json`). Staged engine ran with
+`enable_thinking: false` and small budgets; the `ov-genai` path thinks
+unconditionally (the pipeline applies the chat template internally, so
+prompt-level think suppression doesn't reach the assistant position —
+attempted and reverted in 2fbdda6; GenAI-level template kwargs is the
+follow-up) and passed with 256-token budgets. True bf16 HF-reference
+parity is NOT claimable on this fleet (35B bf16 needs ~70 GB; nodes are
+31.6 GB) — the gate is factual correctness + cross-path consistency on
+the official int4 artifact, stated per the no-silent-caps rule.
+
+Still pending: iGPU repeat of the tool-calling probe and prompt set.
 
 ## Why `cascadia shard` rejects it
 
