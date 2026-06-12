@@ -242,13 +242,77 @@ pub fn recv_timeout() -> Duration {
     )
 }
 
-/// Wait for the first byte of a NEW frame without a deadline, then read the
-/// remainder under the strict recv timeout. A pipeline stage is idle between
-/// requests by design — "no next frame yet" is not a failure, and treating it
-/// as one made every idle chain kill its own sockets on a timer. A dead peer
-/// still fails fast here via EOF/reset; only a silent black-hole peer waits.
+/// Default frame-start idle ceiling. Generous enough for legitimate long
+/// gaps between frames (cold compiles between stages, idle chains between
+/// requests) which the strict per-frame recv timeout must not kill; small
+/// enough that a black-holed peer — connected but silent, no FIN/RST —
+/// eventually surfaces as an error instead of pinning the stage forever.
+pub const DEFAULT_FRAME_IDLE_CEILING: Duration = Duration::from_secs(900);
+
+/// Config override for the frame-start idle ceiling, stored as secs+1 so
+/// 0 can mean "unset" while a configured 0 ("no ceiling") stays expressible.
+static FRAME_IDLE_CEILING_SECS_PLUS_ONE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set the frame-start idle ceiling from node config (seconds); takes
+/// precedence over the env var. `0` disables the ceiling entirely (the
+/// historical unbounded idle wait).
+pub fn set_frame_idle_ceiling_secs(secs: u64) {
+    FRAME_IDLE_CEILING_SECS_PLUS_ONE
+        .store(secs.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Precedence: config override > env > default; 0 at any level = no ceiling.
+/// Pure, for testing.
+fn resolve_frame_idle_ceiling(stored_plus_one: u64, env_secs: Option<u64>) -> Option<Duration> {
+    let secs = if stored_plus_one > 0 {
+        stored_plus_one - 1
+    } else {
+        match env_secs {
+            Some(s) => s,
+            None => return Some(DEFAULT_FRAME_IDLE_CEILING),
+        }
+    };
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Frame-start idle ceiling: config > `CASCADIA_FRAME_IDLE_CEILING_SECS` > 900s.
+fn frame_idle_ceiling() -> Option<Duration> {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
+    let env = *ENV.get_or_init(|| {
+        std::env::var("CASCADIA_FRAME_IDLE_CEILING_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    resolve_frame_idle_ceiling(
+        FRAME_IDLE_CEILING_SECS_PLUS_ONE.load(std::sync::atomic::Ordering::Relaxed),
+        env,
+    )
+}
+
+/// Wait for the first byte of a NEW frame exempt from the per-frame recv
+/// timeout, then read the remainder under the strict recv timeout. A
+/// pipeline stage is idle between requests by design — "no next frame yet"
+/// is not a failure, and treating it as one made every idle chain kill its
+/// own sockets on a timer. A dead peer still fails fast here via EOF/reset;
+/// a silent black-hole peer (connected, no FIN/RST) is bounded only by the
+/// much larger [`frame_idle_ceiling`], which converts it into the same
+/// timed-out error class as the deadline'd recvs.
 async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
-    let n = sock.read(buf).await?;
+    let first_read = sock.read(buf);
+    let n = match frame_idle_ceiling() {
+        Some(ceiling) => match tokio::time::timeout(ceiling, first_read).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("frame-start idle ceiling hit after {ceiling:?} (black-holed peer?)"),
+                )))
+            }
+        },
+        None => first_read.await?,
+    };
     if n == 0 {
         return Err(TransportError::SocketClosed);
     }
@@ -628,5 +692,83 @@ mod tests {
         let got = h.await.unwrap();
         set_activation_timeout_secs(0);
         assert!(got.is_err(), "partial frame then stall must still time out");
+    }
+
+    #[test]
+    fn frame_idle_ceiling_precedence_config_over_env_over_default() {
+        // unset everywhere -> generous default
+        assert_eq!(
+            resolve_frame_idle_ceiling(0, None),
+            Some(DEFAULT_FRAME_IDLE_CEILING)
+        );
+        // no config -> env wins; env 0 = no ceiling
+        assert_eq!(
+            resolve_frame_idle_ceiling(0, Some(30)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(resolve_frame_idle_ceiling(0, Some(0)), None);
+        // config (stored as secs+1) wins over env; configured 0 = no ceiling
+        assert_eq!(
+            resolve_frame_idle_ceiling(6, Some(30)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(resolve_frame_idle_ceiling(1, Some(30)), None);
+    }
+
+    /// A black-holed peer (connected, silent, no FIN/RST) must hit the
+    /// frame-start idle ceiling instead of blocking recv forever.
+    #[tokio::test]
+    async fn frame_start_idle_ceiling_fires_on_silent_peer() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_frame_idle_ceiling_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        // Connect, then go silent — never send a byte.
+        let _sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let got = h.await.unwrap();
+        set_frame_idle_ceiling_secs(0);
+        match got {
+            Err(TransportError::Io(e)) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::TimedOut,
+                "ceiling must surface as the timed-out error class"
+            ),
+            other => panic!("expected timed-out io error, got {other:?}"),
+        }
+    }
+
+    /// The ceiling must not erode the idle-tolerance guarantee: an idle
+    /// gap longer than the strict recv timeout but under the (generous)
+    /// ceiling still delivers the next frame intact.
+    #[tokio::test]
+    async fn generous_idle_ceiling_does_not_fire_on_idle_gap() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        set_frame_idle_ceiling_secs(60);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await; // idle > timeout
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        set_frame_idle_ceiling_secs(0);
+        assert!(
+            got.is_ok(),
+            "idle gap under the ceiling must not time out: {:?}",
+            got.err()
+        );
     }
 }
