@@ -1,150 +1,204 @@
-# Qwen3.6-35B M4' — 2-node layer pipeline with per-node GPU-prefill handoff (rev 1)
+# Qwen3.6-35B M4' — cross-node stage pipeline (rev 2)
 
-Status: **DRAFT rev 1 — awaiting multi-angle review.** Successor
-milestone to M3' (`qwen36-moe-support.md`); every number below is
-measured, not estimated (spikes 1–3, 2026-06-12, pawan-01/04).
+Status: **DRAFT rev 2** — rewritten after the 4-angle rev-1 review
+(adversarial, feasibility-vs-code, scope, external/codex). Successor
+milestone to M3' (`qwen36-moe-support.md`). All numbers measured
+(spikes 1–3, 2026-06-12, pawan-01/04) unless marked *extrapolated*.
 
-## 1. Value proposition (the part review must attack hardest)
+## 0. Rev-1 → rev-2 changes (review disposition)
 
-A 2-node pipeline does NOT speed up single-stream decode — stages
-serialize, and the wire adds ~14.5 ms/token. What it buys, measured:
+The owner re-framed the goal, which resolves the review's top finding by
+changing the objective rather than defending it:
 
-1. **TTFT.** Single-box GPU prefill of the full model is impossible
-   beside CPU decode (2× ~18 GB weights vs 31.6 GB). Split per node,
-   each stage is ~9–10 GB — and **GPU+CPU dual residency per stage
-   fits** (spike 1). GPU prefill measured 6–10 s @1K whole-model vs
-   ~41 s CPU batched: target TTFT @1K ≤ 15 s, ~3× better than M3'.
-2. **Context headroom.** 262K-native model; KV + DeltaNet state plus
-   weights squeeze one 32 GB box at long context. Half the weights per
-   node ≈ double the state budget.
+- **Goal is CAPABILITY PARITY, not a perf win.** `ov-runtime` runs
+  per-stage shards cross-machine (`--rank/--total/--next`; the llama-8B
+  2-stage ran on these exact nodes); `gemma4` and `ov-dist-spec` are
+  multi-stage engines. Qwen3.6 is the only sharded model locked to one
+  box. M4' makes it a peer of the others. The ~7 % decode wire tax is
+  the accepted cost of the capability, as it was for llama.
+- GPU-prefill handoff (rev 1's headline) is demoted to an OPTIONAL
+  follow-on milestone with its own gate; its kill-question (single-box
+  sequential GPU prefill might be as good) no longer threatens the core.
+- Scope cuts applied wholesale from review: M4'-0 collapsed into a
+  day-0 probe; `--prefill-device` flag dropped; reset protocol is one
+  RESET/RESET_ACK exchange, fail-loud, no retry loop; control frames
+  piggyback the existing transport session (no second socket); M4'-1 is
+  internal scaffolding until its gate passes; GPU residency defaults to
+  recompile-first, resident variant only if measurement demands it.
+- Feasibility corrections adopted: position travels as the existing
+  i64 position-prefix frame (static-KV mechanism, `runtime.rs:262`), NOT
+  `[4,1,n]` mRoPE rows (derivable stage-locally); the stateful path's
+  implicit `seq>1` reset heuristic is EXPLICITLY not reusable (chunked
+  prefill would re-trigger it mid-task); shim FFI is ~3 Rust methods /
+  ~8 C ABI entry points in the existing getter style; the engine
+  per-stage refactor is named as the dominant cost.
 
-Anti-scenario honesty (carried from the M4' gate): 35B int4 FITS one
-box; if review judges TTFT+context insufficient to justify the build,
-the correct outcome is CUT, not build. The killer-demo framing
-("model too big for one box") is NOT available for this model.
+## 1. Goal
 
-## 2. Measured priors (all 2026-06-12 unless noted)
+`cascadia worker --rank R --total 2 --engine qwen36-moe` works exactly
+like it does for `ov-runtime`: stage0 node runs embeddings + layers
+0–19, stage1 node runs layers 20–39 + logits, hidden states cross the
+wire per chunk/token, greedy decode is token-faithful to the single-box
+engine, and the M3' robustness matrix holds across two processes on two
+machines.
 
-- **Spike 1 — state handoff:** all 40 per-stage VariableStates are
-  plain f32 tensors; GPU→export 34.1 MB @32-tok ctx in 46 ms, CPU→import
-  23 ms. Hidden-level drift rel 4.0e-2 (step 1) → ~1.9e-1 (step 8)
-  from mixed GPU/CPU f16 regimes; no-state control 4.3e+1.
-- **Spike 2 — wire:** 8 KB ([1,1,2048] f32) round-trip pawan-01↔04
-  median **14.55 ms**, p95 16.4 ms, over the tailscale DERP relay — the
-  only path (node subnets don't route to each other). Expert
-  parallelism (§4.3 of the M3' spec) is dead as-wired: ~40
-  round-trips/token ≈ 580 ms/token floor.
-- **Spike 3 — full-chain handoff:** GPU prefill both stages → state
-  import to CPU stages → 16 greedy tokens **token-identical** to the
-  CPU-pure golden. Drift does not flip greedy near-ties.
-- **M3' baselines:** CPU 2-stage decode 4.8 tok/s (chain) / 4.7–8.8
-  (engine, short ctx); CPU batched prefill ~13.8 tok/s engine-measured;
-  GPU whole-model prefill 6–10 s @1K; stage compile: CPU ~25 s,
-  GPU ~16 s.
+Non-goals (v1): GPU prefill (M4'-2, optional), batching, mid-task
+failover/state migration, enterprise integration (gossip EngineKind
+bump per ADR-001 only after M4'-1 passes), expert parallelism (dead
+as-wired: 14.5 ms relay RTT × ~40 hops/token ≈ 580 ms/token).
 
-## 3. Topology and dataflow
+## 2. Measured priors
 
-Two nodes, one stage each (stage0 = node A, stage1 = node B). Node A is
-the entry (gateway). Per task:
+- Wire: 8 KB round-trip pawan-01↔04 median 14.55 ms, p95 16.4 ms (DERP
+  relay — node subnets do not route directly). Decode budget impact:
+  ~7 % on ~210 ms/token → floor ≈ 4.4 tok/s vs 4.8 single-box.
+- 2 MB prefill-chunk frames: latency measured only at 8 KB; sustained
+  relay throughput UNMEASURED → M4'-1 day-0 probe records 2 MB
+  one-way p50/p95/p99 (review finding; bandwidth could serialize
+  prefill).
+- State is stage-local (M3' §3) — nothing but hidden states, positions
+  and token ids cross the wire.
+- Full-chain handoff/parity machinery proven by spikes 1–3 (16/16
+  token-parity vs the CPU-pure golden after cross-request state import).
+- Stage sizes ~9–10 GB; CPU stage compile ~25 s; transport frame
+  (`cascadia-transport`, 20-byte header, rank ≤3, 256 MiB cap) fits
+  every frame this design sends.
+
+## 3. Design
+
+### 3.1 Topology and frames
 
 ```
-prefill:  A: GPU stage0 prefill (chunked 256)  --hidden[1,T,2048]/chunk--> B: GPU stage1 prefill
-          A: state GPU->CPU import                                        B: state GPU->CPU import
-decode:   A: CPU stage0 step --hidden[1,1,2048]--> B: CPU stage1 step --token id--> A
+A (rank 0): embeddings + stage0          B (rank 1): stage1 + logits
+prefill:  per 256-chunk: [pos-prefix i64] + [1,n,2048] f32  ->  B
+decode:   per token:     [pos-prefix i64] + [1,1,2048] f32  ->  B
+                         B -> A: token id (existing token-return path)
+control:  RESET / RESET_ACK frames on the SAME transport session
 ```
 
-- State NEVER crosses the wire — DeltaNet/KV state is stage-local
-  (M3' spec §3); the handoff is intra-node (GPU request → CPU request).
-- Wire frames: prefill chunks `[1,256,2048]` f32 (2 MB/chunk, ~4
-  chunks @1K — bandwidth not latency bound); decode `[1,1,2048]` f32
-  (8 KB) forward + token id back. Decode budget: 14.5 ms wire on
-  ~210 ms compute ≈ 7% tax → floor ~4.4 tok/s vs 4.8 single-box.
-- Per-node GPU residency is TRANSIENT: GPU stage compiled for prefill,
-  state exported, GPU model FREED before decode begins (spike-3
-  sequencing) — steady-state memory = CPU stage only (~10 GB/node).
-  Alternative (GPU model kept resident for the next task's prefill)
-  costs ~10 GB/node but saves ~16 s recompile; decided at M4'-1 by
-  measuring task-to-task latency both ways. OV compile cache may make
-  recompile cheap; measure before choosing.
+- Position-prefix frame per activation frame (the static-KV path
+  mechanism). Downstream resets its OV state only at position 0 — the
+  stateful `seq>1` heuristic is disabled for qwen36 stages.
+- mRoPE rows are built stage-locally from the absolute position (all 4
+  rows identical to `t0..t1` in text-only mode, `qwen36.rs:256`).
+- Decode token return reuses the ov-runtime token-return path.
 
-## 4. Invariants (carried + new)
+### 3.2 Reset protocol (minimal, review-cut)
+
+Task admission on A: A resets local state, sends RESET, B resets and
+replies RESET_ACK, A admits. No ack → task fails loud; no retry loop
+inside the engine (an unstable wire is invariant-7 territory; the API
+caller retries). The admission wait must complete within one `step()`
+call or emit progress — the runner closes streams after 3 consecutive
+empty steps (`cascadia-runner/src/lib.rs:28`).
+
+### 3.3 Task epochs and stale frames (codex finding)
+
+Every frame carries the task epoch (one u32 prefix or folded into the
+position frame). A peer inside a synchronous OV call cannot be
+interrupted; when it returns, any frame from an older epoch is dropped.
+Cancel/disconnect on either side → epoch bump + RESET exchange before
+the next admit. This is the entire distributed-cancel story; nothing
+fancier is in scope.
+
+### 3.4 Startup handshake (codex finding)
+
+Before first admit, A→B exchange: manifest hash, stage range, OV
+version string, wire dtype. Mismatch = refuse to serve, log both sides.
+(State schema never crosses nodes, so state-shape skew is out of scope.)
+
+### 3.5 Failure semantics
+
+Connect-once like ov-runtime today: peer process death mid-task = task
+failure; recovery = restart both workers (documented operator action).
+Reconnect machinery is explicitly out of scope for M4'-1 — the gate
+tests "kill + restart both → next task clean", not live re-pairing
+(feasibility finding: no re-dial/re-accept exists anywhere today, and
+building it is not parity work).
+
+## 4. Invariants
 
 1–4 of M3' §4.1 carry verbatim (batch=1, greedy-only, position-0 reset
-as sole recovery, no ShardSpec changes beyond peers). New:
+as sole recovery, no ShardSpec changes). New:
 
-5. **Cross-node reset atomicity:** a task admits only when BOTH nodes
-   confirm position-0 (reset ack on the control channel). A node that
-   cannot confirm forces the pair into reset-retry; no partial-state
-   serving, fail-loud after N attempts.
-6. **Per-regime parity:** acceptance compares GPU-prefill+CPU-decode
-   runs against their own goldens, not against CPU-pure (spike 1 drift
-   is real even when greedy survives it; spike 3 shows survival on the
-   reference prompt, not a guarantee).
-7. **Wire is hidden-state + position + token only.** No state
-   migration, no mid-task failover: peer loss mid-task = task failure +
-   position-0 re-entry on a healthy pair (M3' rule extended).
+5. Task admits only after RESET/RESET_ACK; fail-loud on no-ack.
+6. Frames from a stale epoch are dropped silently; state-mutating work
+   happens only for the current epoch.
+7. Peer loss mid-task = task failure + position-0 re-entry after
+   operator restart. No partial-state serving.
 
-## 5. Deltas required (smallest honest list)
+## 5. Deltas (sized honestly per the feasibility review)
 
-- **shim FFI:** `state_names()/get_state()/set_state()` on Runtime
-  (spike used Python; the engine needs it in the C++ shim). New surface,
-  ~3 functions.
-- **engine:** `Qwen36Builder::connect` accepts upstream/downstream
-  peers (today: hard-reject); per-stage mode (run MY stage only);
-  prefill-chunk send/recv; decode-step send/recv; GPU-prefill handoff
-  path behind a flag (`--prefill-device GPU`).
-- **transport:** reuse the existing stage-frame transport
-  (`ov-runtime` multi-stage already ships hidden states cross-machine —
-  the llama 2-stage mesh ran on these nodes). Delta = qwen36 frame
-  carries mRoPE position rows; verify the existing frame fits or extend.
-- **runner/CLI:** `--rank/--total/--next` wiring for qwen36-moe
-  (exists for ov-runtime; mirror it).
-- **exporter:** no changes (stages already per-stage IRs).
-- Explicitly NOT in scope: enterprise integration (gossip EngineKind
-  bump per ADR-001 happens only after community M4' passes), expert
-  parallelism (dead as-wired), state migration/failover, batching.
+- **Engine (dominant cost — most of the milestone):** per-stage mode in
+  `Qwen36Engine`: stage-role dispatch (first/last for 2 stages),
+  rank-aware load (compile only MY stage; embeddings+tokenizer on rank
+  0 only), transport plumbing + async bridge (port the
+  `send_hidden_downstream`/`recv_hidden_from_upstream`/
+  `send_token_to_upstream` pattern from `runtime.rs:696-820`),
+  chunked-prefill send/recv with position prefixes, RESET/ACK + epoch
+  handling. Template exists and is proven; still days, not hours.
+- **CLI/runner (small):** `Qwen36Builder` gains rank/total (stage
+  selection) + a real `configure_listen` (today inherits the no-op
+  default); `cmd_worker` already passes everything needed
+  (`cli/src/lib.rs:793-845`).
+- **Transport (verify-only):** existing frames suffice; no crate
+  changes expected. Day-0 probe confirms.
+- **Shim FFI: NONE for M4'-1.** State get/set is only needed for the
+  optional GPU handoff (M4'-2). CPU-only pipeline keeps state inside
+  each stage's single infer request.
+- **Exporter: none.**
 
-## 6. Milestones, each gated by measurement
+## 6. Milestones
 
-- **M4'-0 (probe, ~day):** two-process SINGLE-BOX rehearsal — stage0
-  and stage1 in separate processes on pawan-01, localhost TCP, full
-  protocol (chunked prefill frames, decode frames, reset handshake).
-  Gate: 64-token greedy == single-process engine output; decode ≥
-  4.5 tok/s localhost.
-- **M4'-1 (cross-node, ~days):** real 2-node run pawan-01+04, CPU-only
-  first (no GPU handoff). Gate: 64-token greedy == M4'-0 output;
-  decode ≥ 4 tok/s; reset/cancel/disconnect matrix passes (engine kill
-  mid-decode on either node → next task clean).
-- **M4'-2 (GPU prefill handoff):** `--prefill-device GPU` on both
-  nodes. Gate: TTFT @1K ≤ 15 s; decode unchanged from M4'-1; 64-token
-  output coherent + stable vs its own golden (invariant 6); per-node
-  peak ≤ 24 GB.
-- **Exit:** all three gates green → M4' acceptance = the §1 value prop
-  delivered with numbers; any gate failing twice → write down why and
-  stop (the M3' single-box engine remains the shipped answer).
+- **Day-0 probe (hours, no engine code):** two Python processes on
+  pawan-01+04 speak the proposed frame sequence over TCP through the
+  real relay: position-prefix + 2 MB chunk frames ×4, then 64 decode
+  frames, RESET/ACK, epoch-stale drop. Records: 2 MB p50/p95/p99,
+  decode-frame p95, protocol soundness. Gate to start engine work:
+  prefill wire total < 5 s @1K-equivalent AND decode p95 < 25 ms.
+- **M4'-1 (cross-node CPU pipeline — THE milestone):**
+  Gate, all required:
+  1. 64-token greedy through the 2-node pipeline matches the single-box
+     engine per the M3' §5 token-agreement protocol on the parity
+     prompt set (not raw `==`; near-tie allowance per the established
+     criterion), after one hardware-homogeneity check run on pawan-04
+     (one CPU decode measurement — all priors are pawan-01).
+  2. Decode ≥ 4 tok/s short-ctx.
+  3. Robustness matrix, named rows: cancel mid-decode entered at A;
+     SSE disconnect at A; kill B mid-decode → A fails task loud; kill A
+     mid-decode → B drops stale frames on restart; restart both → next
+     task clean; 3 sequential tasks → no state bleed (golden repeat).
+  4. Wire histogram during the gate run; decode p95 > 40 ms → M4'
+     BLOCKED pending a direct-path ops fix (not a pass-with-caveat).
+- **M4'-2 (OPTIONAL, separately justified — GPU prefill handoff):**
+  enters only with its own spike first: chunked-256 GPU prefill state
+  correctness + rate AND single-box sequential GPU prefill TTFT with
+  warm compile cache. If single-box sequential gets within 1.5× of the
+  2-node projection, M4'-2 is cut and the single-box trick becomes an
+  M3' enhancement instead. Shim state FFI (~3 Rust / ~8 C entries)
+  belongs to this milestone only.
+- **Exit/stop rule:** any M4'-1 gate failing twice with the day-0 probe
+  green → stop, record why in this doc, M3' single-box remains the
+  shipped answer. (Probe failing = stop before engine code at all.)
 
-## 7. Risks (ranked, with the measurement that retires each)
+## 7. Risks (re-ranked per review)
 
-1. **Reset coordination correctness** under cancel/disconnect/timeouts
-   ×2 nodes — the M3' robustness matrix squared. Retired by the M4'-1
-   gate matrix. (Highest risk: this is distributed-state correctness,
-   not perf.)
-2. **mRoPE position frame mismatch** with the existing transport frame.
-   Retired at M4'-0 (localhost protocol rehearsal).
-3. **GPU prefill chunking semantics** — chunked GPU prefill state
-   accumulation has only been probed single-shot @32 tokens (spike 1)
-   and unchunked @8-token prompt (spike 3); chunked-at-256 GPU prefill
-   state correctness is unmeasured. Retire FIRST in M4'-2 with a
-   one-cell probe before any engine code depends on it.
-4. **Relay-path variance** — 14.5 ms median is one measurement window;
-   DERP under load may spike. M4'-1 records a latency histogram during
-   the gate run; p95 > 40 ms forces the direct-LAN ops conversation.
+1. **Distributed cancel/epoch correctness** — the M3' robustness matrix
+   squared. Retired by M4'-1 gate row set (the matrix is named, not a
+   label).
+2. **Relay bandwidth on 2 MB frames** — unmeasured; retired by the
+   day-0 probe BEFORE engine work (was rev-1's mispriced risk).
+3. **Protocol mismatch with the stateful reset heuristic** — designed
+   out (§3.1 position-prefix + heuristic disabled); day-0 probe
+   double-checks framing.
+4. **pawan-04 hardware non-homogeneity** — retired by the one-run check
+   in gate 1.
 
-## 8. Open questions for review
+## 8. Decisions closed (were §8 open questions in rev 1)
 
-- Is §1 enough to justify the build at all (the anti-scenario)?
-- Keep-GPU-resident vs recompile-per-task (§3) — right default?
-- Should M4'-1 CPU-only cross-node be PUBLIC (a shippable "2-node
-  qwen" without GPU handoff) or internal-only scaffolding?
-- Control channel: piggyback the existing transport session vs a
-  separate TCP control socket (reset acks, token return path).
+- Control channel: same transport session, RESET/RESET_ACK frames.
+- M4'-1 visibility: internal scaffolding until its gate passes.
+- GPU residency: recompile-first; resident variant only if M4'-2
+  happens and measurement demands it.
+- `--prefill-device`: does not exist; GPU handoff (if built) is
+  unconditional-when-available behind the M4'-2 gate.
