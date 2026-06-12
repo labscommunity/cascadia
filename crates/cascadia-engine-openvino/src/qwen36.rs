@@ -240,7 +240,9 @@ impl Builder for Qwen36Builder {
         // Embeddings + tokenizer + eos live with the decode driver only.
         if self.rank == 0 {
             let emb_xml = dir.join("openvino_text_embeddings_model.xml");
-            progress.push(LoadProgress::message("compiling text-embeddings IR".to_string()));
+            progress.push(LoadProgress::message(
+                "compiling text-embeddings IR".to_string(),
+            ));
             self.emb = Some(
                 Runtime::compile(emb_xml.to_str().unwrap_or_default(), &self.device, &plugin)
                     .map_err(map_ov)?,
@@ -304,9 +306,9 @@ impl Builder for Qwen36Builder {
 
 fn map_ov(err: cascadia_ov_genai_shim::Error) -> EngineError {
     match err {
-        cascadia_ov_genai_shim::Error::Stub => EngineError::Backend(
-            "qwen36-moe requires the `openvino` feature (stub build)".into(),
-        ),
+        cascadia_ov_genai_shim::Error::Stub => {
+            EngineError::Backend("qwen36-moe requires the `openvino` feature (stub build)".into())
+        }
         cascadia_ov_genai_shim::Error::Utf8(s) => EngineError::InvalidConfig(s),
         cascadia_ov_genai_shim::Error::Native(s) => EngineError::Backend(s),
     }
@@ -364,6 +366,9 @@ struct ActiveTask {
     emitted: usize,
     max_tokens: usize,
     started: Instant,
+    /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
+    /// decode frames (n=1), for the M4'-1 gate's wire histogram.
+    wire_ms: Vec<f64>,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -390,7 +395,12 @@ fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::O
 enum InFrame {
     Hello(Vec<u8>),
     Reset(u32),
-    Forward { epoch: u32, pos: u32, hidden: Vec<f32>, n: usize },
+    Forward {
+        epoch: u32,
+        pos: u32,
+        hidden: Vec<f32>,
+        n: usize,
+    },
 }
 
 impl Qwen36Engine {
@@ -443,7 +453,11 @@ impl Qwen36Engine {
                     s if s.contains("embed") => {
                         // global first stage: real embeds; later stages:
                         // dummy (upstream ShapeOf chains read shapes only)
-                        let data = if j == 0 && first_global { &hidden } else { &zeros_embeds };
+                        let data = if j == 0 && first_global {
+                            &hidden
+                        } else {
+                            &zeros_embeds
+                        };
                         st.set_input(name, DType::F32, &[1, n, HIDDEN], &le_bytes_f32(data))
                             .map_err(map_ov)?;
                     }
@@ -518,6 +532,20 @@ impl Qwen36Engine {
             tok_s,
             "qwen36 task done"
         );
+        if !t.wire_ms.is_empty() {
+            // M4'-1 gate 4: decode wire histogram (p95 > 40 ms blocks).
+            let mut w = t.wire_ms.clone();
+            w.sort_by(f64::total_cmp);
+            let pct = |p: f64| w[((w.len() - 1) as f64 * p) as usize];
+            info!(
+                task = %t.task_id,
+                frames = w.len(),
+                p50_ms = pct(0.50),
+                p95_ms = pct(0.95),
+                max_ms = w[w.len() - 1],
+                "qwen36 pipeline decode wire histogram"
+            );
+        }
         vec![(
             t.task_id.clone(),
             Chunk::final_marker(t.task_id, "").with_prompt_tokens(t.prompt_ids.len() as u32),
@@ -607,8 +635,15 @@ impl Qwen36Engine {
     }
 
     /// Rank 0: one lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) →
-    /// TOKEN exchange. Returns the downstream argmax token.
-    fn send_forward_recv_token(&mut self, hidden: Vec<f32>, n: usize, t0: usize) -> EngineResult<u32> {
+    /// TOKEN exchange. Returns the downstream argmax token and the
+    /// round-trip's wire share in ms (RTT minus the peer-reported infer
+    /// time) for the M4'-1 gate's wire histogram.
+    fn send_forward_recv_token(
+        &mut self,
+        hidden: Vec<f32>,
+        n: usize,
+        t0: usize,
+    ) -> EngineResult<(u32, f64)> {
         let epoch = self.epoch;
         let downstream = self
             .downstream
@@ -620,20 +655,27 @@ impl Qwen36Engine {
             [1, n as u32, HIDDEN as u32],
             le_bytes_f32(&hidden),
         );
-        let token = run_async(&h, async move {
+        let started = Instant::now();
+        let (token, infer_us) = run_async(&h, async move {
             let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32)).await?;
+            g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
+                .await?;
             g.send(&tensor).await?;
             let hb = g.recv_raw(12).await?;
             let (kind, e, _) = parse_header(&hb);
             if kind != FRAME_TOKEN || e != epoch {
                 return Err(TransportError::SocketClosed);
             }
-            let tb = g.recv_raw(4).await?;
-            Ok(i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]))
+            let tb = g.recv_raw(8).await?;
+            Ok((
+                i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
+                u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
+            ))
         })
         .map_err(map_wire)?;
-        Ok(token as u32)
+        let wire_ms =
+            (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
+        Ok((token as u32, wire_ms))
     }
 
     /// Rank 0 driver step: same task lifecycle as the single-box step,
@@ -691,6 +733,7 @@ impl Qwen36Engine {
                 emitted: 0,
                 max_tokens,
                 started: Instant::now(),
+                wire_ms: Vec::new(),
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -716,7 +759,7 @@ impl Qwen36Engine {
                     .and_then(|e| self.chain_pass(&e, t0, t0 + n))
                     .and_then(|h| self.send_forward_recv_token(h, n, t0));
                 match res {
-                    Ok(tok) => {
+                    Ok((tok, _wire_ms)) => {
                         let t = self.active.as_mut().unwrap();
                         t.next_token = Some(tok);
                         t.prefill_idx = end;
@@ -743,9 +786,10 @@ impl Qwen36Engine {
                 .and_then(|e| self.chain_pass(&e, step, step + 1))
                 .and_then(|h| self.send_forward_recv_token(h, 1, step));
             match res {
-                Ok(tok) => {
+                Ok((tok, wire_ms)) => {
                     let t = self.active.as_mut().unwrap();
                     t.next_token = Some(tok);
+                    t.wire_ms.push(wire_ms);
                     t.gen_ids.push(next);
                     t.step += 1;
                     let full = self
@@ -762,10 +806,7 @@ impl Qwen36Engine {
                         t.emitted = full.len();
                         d
                     };
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta),
-                    )]
+                    vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "pipeline decode failed");
@@ -853,7 +894,12 @@ impl Qwen36Engine {
                 })
                 .map_err(map_wire)
             }
-            InFrame::Forward { epoch, pos, hidden, n } => {
+            InFrame::Forward {
+                epoch,
+                pos,
+                hidden,
+                n,
+            } => {
                 if self.poisoned.is_some() {
                     return Err(EngineError::Backend(
                         "qwen36 pipeline poisoned by handshake mismatch".into(),
@@ -862,7 +908,11 @@ impl Qwen36Engine {
                 if epoch != self.peer_epoch {
                     // Stale epoch (spec §3.3): drop silently; the driver's
                     // recv times out and fails its task loud.
-                    warn!(epoch, current = self.peer_epoch, "qwen36: dropping stale frame");
+                    warn!(
+                        epoch,
+                        current = self.peer_epoch,
+                        "qwen36: dropping stale frame"
+                    );
                     return Ok(());
                 }
                 if hidden.len() != n * HIDDEN {
@@ -871,6 +921,7 @@ impl Qwen36Engine {
                         hidden.len()
                     )));
                 }
+                let infer_started = Instant::now();
                 let t0 = pos as usize;
                 let out = self.chain_pass(&hidden, t0, t0 + n)?;
                 let logits = if self.last_logits_only {
@@ -885,12 +936,14 @@ impl Qwen36Engine {
                     .max_by(|a, b| a.1.total_cmp(b.1))
                     .map(|(i, _)| i as i32)
                     .unwrap_or(0);
+                let infer_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 run_async(&h, async move {
                     let mut g = upstream.lock().await;
                     g.send_raw(&frame_header(FRAME_TOKEN, epoch, pos)).await?;
-                    g.send_raw(&next.to_be_bytes()).await
+                    g.send_raw(&next.to_be_bytes()).await?;
+                    g.send_raw(&infer_us.to_be_bytes()).await
                 })
                 .map_err(map_wire)
             }
@@ -967,6 +1020,7 @@ impl Qwen36Engine {
                 emitted: 0,
                 max_tokens,
                 started: Instant::now(),
+                wire_ms: Vec::new(),
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -1038,10 +1092,7 @@ impl Qwen36Engine {
                         t.emitted = full.len();
                         d
                     };
-                    vec![(
-                        task_id.clone(),
-                        Chunk::token(task_id, next as i64, delta),
-                    )]
+                    vec![(task_id.clone(), Chunk::token(task_id, next as i64, delta))]
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "decode failed");
