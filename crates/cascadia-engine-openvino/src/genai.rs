@@ -153,7 +153,11 @@ impl Builder for OvGenaiBuilder {
             let prompt_lookup = self.prompt_lookup_ngram > 0;
             progress.push(LoadProgress::message(format!(
                 "VLM-layout export detected; compiling VLMPipeline{} on {}",
-                if prompt_lookup { " + prompt_lookup" } else { "" },
+                if prompt_lookup {
+                    " + prompt_lookup"
+                } else {
+                    ""
+                },
                 self.device
             )));
             LlmPipeline::vlm(&self.model_path, &self.device, prompt_lookup, &plugin)

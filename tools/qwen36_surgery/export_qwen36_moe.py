@@ -248,7 +248,10 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
     for aux in ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
-                "tokenizer.json", "generation_config.json", "config.json"):
+                "tokenizer.json", "generation_config.json", "config.json",
+                # API renders /v1/chat/completions through this when present
+                # (legacy "role: content" formatting otherwise)
+                "chat_template.jinja"):
         src = os.path.join(model_dir, aux)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, aux))

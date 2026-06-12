@@ -51,7 +51,10 @@ async fn qwen36_greedy_parity() {
         .connect(PeerLayout::single_stage())
         .await
         .expect("connect");
-    let mut load = builder.load(ShardSpec::single_stage(&shards, "CPU")).await.expect("load");
+    let mut load = builder
+        .load(ShardSpec::single_stage(&shards, "CPU"))
+        .await
+        .expect("load");
     use futures::StreamExt;
     while load.next().await.is_some() {}
     let mut engine = Box::new(builder).build().expect("build");
@@ -89,20 +92,28 @@ async fn qwen36_greedy_parity() {
         };
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string_pretty(&g).unwrap()).unwrap();
-        eprintln!("golden written: {} ({} tokens)", path.display(), g.ids.len());
+        eprintln!(
+            "golden written: {} ({} tokens)",
+            path.display(),
+            g.ids.len()
+        );
         return;
     }
 
-    let g: Golden = serde_json::from_str(
-        &std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("golden missing ({e}); run once with QWEN36_WRITE_GOLDEN=1")),
-    )
-    .expect("golden parse");
-    assert_eq!(g.prompt, PROMPT, "golden was blessed for a different prompt");
+    let g: Golden =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("golden missing ({e}); run once with QWEN36_WRITE_GOLDEN=1")
+        }))
+        .expect("golden parse");
+    assert_eq!(
+        g.prompt, PROMPT,
+        "golden was blessed for a different prompt"
+    );
     assert_eq!(g.max_tokens, MAX_TOKENS);
     let match_len = ids.iter().zip(&g.ids).take_while(|(a, b)| a == b).count();
     assert_eq!(
-        ids, g.ids,
+        ids,
+        g.ids,
         "greedy divergence at token {match_len}/{} (engine text: {text:?})",
         g.ids.len()
     );

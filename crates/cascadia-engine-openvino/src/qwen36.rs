@@ -752,7 +752,10 @@ impl Qwen36Engine {
                     return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
                 }
             };
-            if !task.enable_thinking {
+            if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
+                // Legacy-rendered prompts only: a chat template injects
+                // the empty think block itself (API passes
+                // enable_thinking into the render).
                 if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
                     prompt_ids.extend(e.get_ids());
                 }
@@ -1066,10 +1069,12 @@ impl Qwen36Engine {
                     return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
                 }
             };
-            if !task.enable_thinking {
+            if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
                 // Hybrid-reasoning off: prefill the empty think block the
                 // official chat template injects for enable_thinking=false,
                 // so decode starts at the answer instead of reasoning.
+                // Legacy-rendered prompts only — a chat template injects
+                // it itself (API passes enable_thinking into the render).
                 if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
                     prompt_ids.extend(e.get_ids());
                 }

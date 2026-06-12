@@ -101,14 +101,23 @@ impl Default for Config {
 /// instruct models render through their real template rather than the
 /// legacy formatter (which degenerates instruct models).
 pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
-    let tok_dir = model_dir.join("tokenizer");
-    let p = tok_dir.join("tokenizer_config.json");
-    let Ok(bytes) = std::fs::read(&p) else {
-        return ChatTemplateConfig::default();
+    // Shard trees from `cascadia shard` keep tokenizer files in a
+    // `tokenizer/` subdir; official HF/OV export dirs (and the qwen36
+    // surgery tree) keep them at the model root. Use whichever has a
+    // tokenizer_config.json; a root chat_template.jinja alone (qwen36
+    // tree: no tokenizer_config at all) still counts.
+    let tok_dir = {
+        let sub = model_dir.join("tokenizer");
+        if sub.join("tokenizer_config.json").exists() {
+            sub
+        } else {
+            model_dir.to_path_buf()
+        }
     };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return ChatTemplateConfig::default();
-    };
+    let v = std::fs::read(tok_dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .unwrap_or_default();
     let template = v
         .get("chat_template")
         .and_then(|t| t.as_str())
@@ -342,6 +351,7 @@ fn render_with_chat_env(
     messages: &[ChatMessage],
     bos_token: &str,
     eos_token: &str,
+    enable_thinking: bool,
 ) -> Result<String, String> {
     use minijinja::context;
     use minijinja::value::Value;
@@ -363,6 +373,9 @@ fn render_with_chat_env(
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
+        // Hybrid-reasoning templates (Qwen3.x) read this and inject the
+        // empty think block themselves when false.
+        enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
     };
@@ -371,9 +384,15 @@ fn render_with_chat_env(
         .map_err(|e| format!("template render: {e}"))
 }
 
-fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
+fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool) -> String {
     if let Some(env) = &state.chat_env {
-        match render_with_chat_env(env, messages, &state.bos_token, &state.eos_token) {
+        match render_with_chat_env(
+            env,
+            messages,
+            &state.bos_token,
+            &state.eos_token,
+            enable_thinking,
+        ) {
             Ok(s) => return s,
             Err(e) => {
                 warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
@@ -417,7 +436,7 @@ impl ChatPromptRenderer {
     /// template is set or rendering fails.
     pub fn render(&self, messages: &[ChatMessage]) -> String {
         if let Some(env) = &self.env {
-            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token) {
+            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true) {
                 Ok(s) => return s,
                 Err(e) => {
                     warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
@@ -433,7 +452,7 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(&state, &req.messages);
+    let prompt = render_prompt(&state, &req.messages, req.enable_thinking);
     if prompt.len() > state.max_prompt_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -791,7 +810,7 @@ mod tests {
             content: "hi".into(),
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>")
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true)
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
