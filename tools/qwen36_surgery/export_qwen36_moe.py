@@ -94,12 +94,40 @@ def extract_stage(xml_path: str, a: int, b: int, first: bool, last: bool) -> ov.
         for tgt in list(b_in.get_target_inputs()):
             tgt.replace_source_output(param.output(0))
         params_new.append(param)
+        # Retire the v1 dummy-input wart: upstream mask/position ShapeOf
+        # chains read inputs_embeds for its SHAPE only, and stage_hidden
+        # has the identical [?,?,hidden] shape — redirect every consumer
+        # so the dummy Parameter drops out of the stage entirely.
+        emb_param = next(
+            (p for p in model.get_parameters()
+             if any("embed" in n for n in p.output(0).get_names())),
+            None,
+        )
+        if emb_param is not None:
+            n_rewired = 0
+            for tgt in list(emb_param.output(0).get_target_inputs()):
+                tgt.replace_source_output(param.output(0))
+                n_rewired += 1
+            print(f"  rewired {n_rewired} inputs_embeds consumers onto stage_hidden",
+                  flush=True)
 
     if last:
-        # natural logits Result stays
+        # Natural logits output, sliced to the LAST position: decode (T=1)
+        # is unchanged, batched prefill stops materializing [1, T, vocab]
+        # (~1 MB/token at the 248320 vocab). manifest sets
+        # last_logits_only so the engine skips its own row slicing.
         results = list(model.get_results())
         out_ports = [r.input_value(0) for r in results]
-        results = [ops.result(p) for p in out_ports]
+        results = []
+        for p in out_ports:
+            sl = ops.slice(
+                p,
+                ops.constant(np.array([-1], dtype=np.int64)),
+                ops.constant(np.array([np.iinfo(np.int64).max], dtype=np.int64)),
+                ops.constant(np.array([1], dtype=np.int64)),
+                ops.constant(np.array([1], dtype=np.int64)),
+            )
+            results.append(ops.result(sl.output(0)))
     else:
         results = [ops.result(b_out)]
         results[0].output(0).set_names({"stage_hidden_out"})
@@ -194,6 +222,7 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False):
     manifest = {
         "arch": "qwen3_5_moe", "hidden_size": HIDDEN, "num_layers": NUM_LAYERS,
         "source": os.path.basename(os.path.abspath(model_dir)),
+        "last_logits_only": True,
         "stages": [],
     }
 
@@ -282,10 +311,80 @@ def _validate(model_dir, output_dir, xml, ranges):
     print(f"CHAIN logits max_abs={d:.3e} rel={d/n:.3e} top1_match={top1} "
           f"top5_overlap={overlap}/{k}", flush=True)
     ok = top1 and overlap >= 4 and d / n < 0.5
+
+    # Multi-token greedy: 8 decode tokens from a synthetic prompt, chain
+    # vs full at T=1 steps (proto_m3_decode.py measured 64/64 in this
+    # regime). f16 fusion-order noise can flip a late near-tie, so accept
+    # >= 6/8; the full >=64-token criterion stays engine-level (the
+    # qwen36_parity golden test).
+    PROMPT_IDS = [9707, 11, 1246, 525, 498, 30]
+    N_DEC = 8
+    emb_req2 = core.compile_model(
+        core.read_model(os.path.join(model_dir, "openvino_text_embeddings_model.xml")),
+        "CPU",
+    )
+
+    def embed_tok(t):
+        a = np.array([[t]], dtype=np.int64)
+        r = emb_req2.create_infer_request().infer(
+            {emb_req2.inputs[0].get_any_name(): a})
+        return r[emb_req2.outputs[0]].astype(np.float32).reshape(1, 1, HIDDEN)
+
+    def step_feeds(comp, step, hidden=None, embeds=None):
+        f = {}
+        for inp in comp.inputs:
+            nm = inp.get_any_name()
+            et = inp.get_element_type().to_dtype()
+            if nm == "stage_hidden":
+                f[nm] = hidden.astype(et)
+            elif "embed" in nm:
+                f[nm] = (embeds if embeds is not None
+                         else np.zeros((1, 1, HIDDEN))).astype(et)
+            elif "attention_mask" in nm:
+                f[nm] = np.ones((1, step + 1), dtype=et)
+            elif "position" in nm:
+                ps = inp.get_partial_shape()
+                d0 = ps[0].get_length() if ps[0].is_static else 1
+                f[nm] = np.full((d0, 1, 1), step, dtype=et)
+            else:
+                f[nm] = np.zeros([1], dtype=et)
+        return f
+
+    def greedy(paths, label):
+        comps = [core.compile_model(core.read_model(p), "CPU") for p in paths]
+        reqs = [(c, c.create_infer_request()) for c in comps]
+        step, logits, gen = 0, None, []
+        for phase_toks in (PROMPT_IDS, None):
+            seq = phase_toks if phase_toks is not None else range(N_DEC)
+            for item in seq:
+                tok = item if phase_toks is not None else int(np.argmax(logits))
+                if phase_toks is None:
+                    gen.append(tok)
+                cur = embed_tok(tok)
+                for j, (c, r) in enumerate(reqs):
+                    f = step_feeds(c, step,
+                                   hidden=None if j == 0 else cur,
+                                   embeds=cur if j == 0 else None)
+                    cur = r.infer(f)[c.outputs[0]].astype(np.float32)
+                logits = cur.reshape(-1)
+                step += 1
+        del reqs, comps
+        print(f"{label} greedy: {gen}", flush=True)
+        return gen
+
+    chain_gen = greedy(
+        [os.path.join(output_dir, f"stage{i}", "stage.xml") for i in range(len(ranges))],
+        "chain")
+    full_gen = greedy([xml], "full")
+    m = sum(1 for x, y in zip(chain_gen, full_gen) if x == y)
+    print(f"MULTI_TOKEN_PARITY {m}/{N_DEC}", flush=True)
+    ok = ok and m >= 6
+
     print("EXPORT_VALIDATE_OK" if ok else "EXPORT_VALIDATE_FAIL", flush=True)
     if ok:
-        print("note: multi-token greedy parity (>=64 tokens) is the M3' "
-              "engine-level criterion; this validates one decode step.", flush=True)
+        print("note: >=64-token greedy parity is the M3' engine-level "
+              "criterion (qwen36_parity golden test); this validates one "
+              f"step token-level + {N_DEC}-token greedy.", flush=True)
 
 
 def main():

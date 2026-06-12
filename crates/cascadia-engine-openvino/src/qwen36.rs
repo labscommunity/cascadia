@@ -30,6 +30,11 @@ const MROPE_ROWS: usize = 4;
 #[derive(serde::Deserialize)]
 struct Manifest {
     arch: String,
+    /// Exporter sliced the last stage's logits to the final position
+    /// ([1,1,vocab]); the engine then skips its own row slicing. Absent
+    /// in pre-slice shard trees (default false).
+    #[serde(default)]
+    last_logits_only: bool,
     stages: Vec<StageInfo>,
 }
 
@@ -48,6 +53,7 @@ pub struct Qwen36Builder {
     stages: Option<Vec<Runtime>>,
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
+    last_logits_only: bool,
 }
 
 impl Qwen36Builder {
@@ -60,6 +66,7 @@ impl Qwen36Builder {
             stages: None,
             tokenizer: None,
             eos: None,
+            last_logits_only: false,
         }
     }
 }
@@ -140,6 +147,7 @@ impl Builder for Qwen36Builder {
             .map_err(|e| EngineError::InvalidConfig(format!("tokenizer.json: {e}")))?;
 
         self.eos = read_eos(&dir);
+        self.last_logits_only = manifest.last_logits_only;
         self.emb = Some(emb);
         self.stages = Some(stages);
         self.tokenizer = Some(tokenizer);
@@ -154,6 +162,7 @@ impl Builder for Qwen36Builder {
             tokenizer: self.tokenizer.ok_or(EngineError::NotLoaded)?,
             eos: self.eos,
             max_tokens_default: self.max_tokens_default,
+            last_logits_only: self.last_logits_only,
             pending: Vec::new(),
             active: None,
         }))
@@ -176,6 +185,7 @@ pub struct Qwen36Engine {
     tokenizer: Tokenizer,
     eos: Option<u32>,
     max_tokens_default: u32,
+    last_logits_only: bool,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
 }
@@ -296,6 +306,11 @@ impl Qwen36Engine {
         let n = toks.len();
         let e = self.embed_seq(toks)?;
         let out = self.chain_pass(&e, t0, t0 + n)?;
+        if self.last_logits_only {
+            // Exporter already sliced the last stage to the final
+            // position; the output IS the last row.
+            return Ok(out);
+        }
         let row = out.len() / n;
         Ok(out[(n - 1) * row..].to_vec())
     }
