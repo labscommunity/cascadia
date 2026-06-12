@@ -1327,6 +1327,27 @@ impl Engine for OvRuntimeEngine {
         }
         result
     }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        self.pending.retain(|t| t.task_id != *task_id);
+        // Abandoning the active task mirrors the step-failure recovery:
+        // clear it and reset generation state so the next pending task
+        // activates immediately instead of waiting for this one to
+        // drain max_tokens worth of inference on the device.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.task.task_id == *task_id)
+        {
+            info!(task = %task_id, "ov-runtime cancel: abandoning active task");
+            self.active = None;
+            let _ = self.runtime.reset_state();
+            if let Some(sk) = self.static_kv.as_mut() {
+                sk.reset();
+            }
+            self.position = 0;
+        }
+    }
 }
 
 // -------- Builder --------

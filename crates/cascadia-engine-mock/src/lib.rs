@@ -84,6 +84,10 @@ impl Engine for MockEngine {
         self.pending.push((task, emitted + 1));
         Ok(vec![(task_id, chunk)])
     }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        self.pending.retain(|(t, _)| t.task_id != *task_id);
+    }
 }
 
 #[derive(Default)]
@@ -189,6 +193,35 @@ mod tests {
         // We should still have exactly one task pending.
         let chunks = e.step().unwrap();
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn cancel_pending_task_removes_it() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "alpha bravo")).unwrap();
+        e.submit(GenerationTask::new("t2", "charlie delta"))
+            .unwrap();
+        e.cancel(&"t1".to_string());
+        // Only t2 ever emits; t1 is gone.
+        for _ in 0..8 {
+            for (tid, _) in e.step().unwrap() {
+                assert_eq!(tid, "t2");
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_active_task_lets_next_task_activate_immediately() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "alpha bravo charlie").with_max_tokens(8))
+            .unwrap();
+        // t1 is mid-generation (one token emitted).
+        assert_eq!(e.step().unwrap()[0].0, "t1");
+        e.cancel(&"t1".to_string());
+        e.submit(GenerationTask::new("t2", "delta echo").with_max_tokens(8))
+            .unwrap();
+        // The very next step serves t2 — no draining of the abandoned t1.
+        assert_eq!(e.step().unwrap()[0].0, "t2");
     }
 
     #[test]

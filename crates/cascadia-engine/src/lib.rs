@@ -77,8 +77,14 @@ pub trait Engine: Send {
     /// starts fresh, but callers must not retry the failed one.
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>>;
 
-    /// Best-effort cancellation of an in-flight task. Engines that do
-    /// not support mid-stream cancellation may treat this as a no-op.
+    /// Cancel a task. After `cancel` returns, `step()` emits no further
+    /// chunks for `task_id`: a queued task is dropped from the pending
+    /// queue; an active task is abandoned and the engine's generation
+    /// state reset so the next task starts fresh instead of waiting for
+    /// the abandoned one to drain to completion. Engines that cannot
+    /// cancel mid-stream may keep the default no-op — the runner still
+    /// suppresses the task's chunks, but the engine slot stays busy
+    /// until the task finishes on its own.
     fn cancel(&mut self, _task_id: &TaskId) {}
 
     /// Tear down the engine. Idempotent.
