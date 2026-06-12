@@ -225,6 +225,26 @@ rev-2 design:
   60 s recv timeout fails the task loud (lockstep makes this reachable
   only via epoch bugs — belt-and-braces per §3.3).
 
+Launch (rank 1 first — its listener must be up before rank 0 dials):
+
+```
+# pawan-04 (rank 1: stage1 + logits)
+cascadia worker --rank 1 --total 2 --engine qwen36-moe `
+  --model C:\cascadia\models\qwen36-shards-2stage --device CPU --listen :9100
+
+# pawan-01 (rank 0: embeddings + stage0 + tokenizer + API)
+cascadia worker --rank 0 --total 2 --engine qwen36-moe `
+  --model C:\cascadia\models\qwen36-shards-2stage --device CPU `
+  --next <p04-tailscale-ip>:9100 --api :8000
+```
+
+Gate harness: `tools/qwen36_surgery/m4_gate_serving.py` (gates 1–2 +
+prompt set; gate 4 read from the rank-0 wire-histogram log line) and
+`m4_gate_robustness.py` (gate 3 rows; kill rows operator-driven via its
+`longgen` mode). Rank 1 needs only manifest.json, generation_config.json
+and stage1/ from the shard tree (~10 GB); embeddings + tokenizer load on
+rank 0 only.
+
 ## 9. Decisions closed (were §8 open questions in rev 1)
 
 - Control channel: same transport session, RESET/RESET_ACK frames.
