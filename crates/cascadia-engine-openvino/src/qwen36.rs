@@ -377,13 +377,21 @@ impl Engine for Qwen36Engine {
             }
             let task = self.pending.remove(0);
             self.reset_all();
-            let prompt_ids: Vec<u32> = match self.tokenizer.encode(task.prompt.as_str(), true) {
+            let mut prompt_ids: Vec<u32> = match self.tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
                     return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
                 }
             };
+            if !task.enable_thinking {
+                // Hybrid-reasoning off: prefill the empty think block the
+                // official chat template injects for enable_thinking=false,
+                // so decode starts at the answer instead of reasoning.
+                if let Ok(e) = self.tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
+                    prompt_ids.extend(e.get_ids());
+                }
+            }
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {

@@ -230,6 +230,15 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    /// Hybrid-reasoning switch (Qwen3+ convention). Default true =
+    /// model-default behavior; false asks the engine to skip the
+    /// <think> block (engines that can't, ignore it).
+    #[serde(default = "default_true")]
+    pub enable_thinking: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_tokens() -> u32 {
@@ -444,7 +453,7 @@ async fn chat_completions(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: 0,
-        enable_thinking: false,
+        enable_thinking: req.enable_thinking,
         trust_remote_code: false,
     };
 
