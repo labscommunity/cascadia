@@ -1154,7 +1154,11 @@ impl Engine for Qwen36Engine {
             match self.step_pipe_last() {
                 Ok(()) => Vec::new(),
                 Err(e) => {
+                    // Backoff: a dead upstream session makes recv fail
+                    // instantly; without a pause the relay loop spins and
+                    // floods the log (peer loss = operator restart, §3.5).
                     warn!(error = %e, "qwen36 pipeline step failed");
+                    std::thread::sleep(Duration::from_millis(500));
                     Vec::new()
                 }
             }
