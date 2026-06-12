@@ -202,6 +202,11 @@ impl Runner {
     /// Step errors are logged and driving continues (engines own their
     /// recovery). Used by non-first pipeline stages.
     ///
+    /// Engines driven by this loop must self-throttle a persistently
+    /// fast-failing `step()` (e.g. sleep on a dead peer) — the loop never
+    /// exits on `Err` and only yields between rounds, so an instant-`Err`
+    /// engine would otherwise spin this thread hot.
+    ///
     /// Enters a `BlockingContextGuard` once per OS thread (since this
     /// loop runs on a single `spawn_blocking` thread) so that engines'
     /// `run_async` calls hit the naked-`block_on` path instead of

@@ -75,6 +75,18 @@ pub trait Engine: Send {
     /// transport failure) and is terminal for the in-flight task —
     /// engines recover their own state so the next submitted task
     /// starts fresh, but callers must not retry the failed one.
+    ///
+    /// Task attribution: `Err` affects at most the active task; queued
+    /// tasks survive. The error carries no [`TaskId`] today, so callers
+    /// driving multiple concurrent streams cannot attribute the failure —
+    /// the runner's `ChunkStream` ends whichever stream observes the
+    /// `Err`, which may not be the failed task's stream (known
+    /// limitation).
+    ///
+    /// Failure idiom: implementors should return `Err` for engine-level
+    /// failures (engine unusable / task aborted by the engine); emit a
+    /// final-marker chunk for per-task completion, including task-level
+    /// failure where the engine remains healthy.
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>>;
 
     /// Cancel a task. Implementors SHOULD guarantee that after `cancel`

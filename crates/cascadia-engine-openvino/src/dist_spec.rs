@@ -1769,8 +1769,10 @@ impl Engine for OvDistSpecWorkerEngine {
         let result = self.handle_one_frame();
         if let Err(ref e) = result {
             // Transport-closed errors signal the driver disconnected;
-            // don't spam the log. Drop the upstream/downstream so the
-            // next step exits the relay loop cleanly via NotConnected.
+            // don't spam the log. Drop the upstream/downstream so
+            // subsequent steps fail fast with NotConnected — the relay
+            // loop never exits on Err, so the sleep below is what keeps
+            // it from spinning hot until the runner tears us down.
             // "idle ceiling" = frame-start idle ceiling fired (black-holed
             // peer); the transport layer has already dropped that socket —
             // close the rest here too. Transport errors reach us flattened
