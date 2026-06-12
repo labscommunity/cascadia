@@ -270,18 +270,8 @@ impl Engine for OvGenaiEngine {
             task.temperature,
         );
 
-        // Hybrid-reasoning off: append the empty think block the chat
-        // template would inject for enable_thinking=false, so the model
-        // continues straight to the answer (same trick as the qwen36
-        // staged engine, at text level). No-op for non-thinking models.
-        let prompt = if task.enable_thinking {
-            task.prompt.clone()
-        } else {
-            format!("{}\n<think>\n\n</think>\n\n", task.prompt)
-        };
-
         let started = Instant::now();
-        let result = match self.pipe.generate(&prompt, &cfg) {
+        let result = match self.pipe.generate(&task.prompt, &cfg) {
             Ok(r) => r,
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
@@ -292,7 +282,7 @@ impl Engine for OvGenaiEngine {
         let elapsed = started.elapsed().as_secs_f64();
 
         let mut text = result.text;
-        if let Some(stripped) = text.strip_prefix(&prompt) {
+        if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
         }
         // Prefer tokenizer-based count; fall back to perf_metrics value.
