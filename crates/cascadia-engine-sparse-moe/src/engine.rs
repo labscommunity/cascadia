@@ -854,15 +854,18 @@ impl Engine for SparseMoEEngine {
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.total == 1 {
-            return self.step_single_stage();
+            return Ok(self.step_single_stage());
         }
-        if self.rank == 0 {
+        // step_first / step_worker handle their own errors terminally
+        // (final-marker chunk on the driver, latched backoff on the
+        // worker), so there is nothing to surface as Err here.
+        Ok(if self.rank == 0 {
             self.step_first()
         } else {
             self.step_worker()
-        }
+        })
     }
 
     fn close(&mut self) {

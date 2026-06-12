@@ -12,11 +12,17 @@ use futures::stream;
 #[derive(Default)]
 pub struct MockEngine {
     pending: Vec<(GenerationTask, usize)>,
+    fail_next_step: Option<String>,
 }
 
 impl MockEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test hook: make the next `step()` return `EngineError::Backend(msg)`.
+    pub fn fail_next_step(&mut self, msg: impl Into<String>) {
+        self.fail_next_step = Some(msg.into());
     }
 }
 
@@ -38,9 +44,12 @@ impl Engine for MockEngine {
         Ok(())
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if let Some(msg) = self.fail_next_step.take() {
+            return Err(EngineError::Backend(msg));
+        }
         if self.pending.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (task, emitted) = self.pending.remove(0);
         // Test sentinel: a prompt containing `__engine_error__` fails the
@@ -64,16 +73,16 @@ impl Engine for MockEngine {
             } else {
                 cascadia_types::FinishReason::Length
             };
-            return vec![(
+            return Ok(vec![(
                 task.task_id.clone(),
                 Chunk::final_marker(task.task_id, "").with_finish_reason(reason),
-            )];
+            )]);
         }
         let token = words[emitted].to_string();
         let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");
         let task_id = task.task_id.clone();
         self.pending.push((task, emitted + 1));
-        vec![(task_id, chunk)]
+        Ok(vec![(task_id, chunk)])
     }
 }
 
@@ -145,7 +154,7 @@ mod tests {
             .unwrap();
         let mut emitted = Vec::new();
         for _ in 0..6 {
-            for (_, chunk) in e.step() {
+            for (_, chunk) in e.step().unwrap() {
                 emitted.push(chunk);
             }
         }
@@ -178,7 +187,18 @@ mod tests {
         e.submit(GenerationTask::new("t1", "hi")).unwrap();
         e.submit(GenerationTask::new("t1", "hi")).unwrap();
         // We should still have exactly one task pending.
-        let chunks = e.step();
+        let chunks = e.step().unwrap();
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn injected_step_error_surfaces_as_err() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "hello world")).unwrap();
+        e.fail_next_step("boom");
+        let res = e.step();
+        assert!(matches!(res, Err(EngineError::Backend(ref m)) if m == "boom"));
+        // Error is one-shot; the engine resumes on the next step.
+        assert!(!e.step().unwrap().is_empty());
     }
 }

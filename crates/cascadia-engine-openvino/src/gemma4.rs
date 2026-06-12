@@ -1053,7 +1053,7 @@ impl Engine for Gemma4Engine {
         }
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
         } else if self.spec.is_last_stage {
@@ -1061,7 +1061,11 @@ impl Engine for Gemma4Engine {
         } else {
             self.step_middle().map(|_| Vec::new())
         };
-        match result {
+        // Keep main's rate-limited WARN (a persistently-failing step() must
+        // not flood logs), but surface the Err to the caller — step_first
+        // already cleared active + reset_state, so callers can now tell
+        // "engine failed" from "still prefilling" (both were empty vecs).
+        match &result {
             Ok(v) => {
                 // First-stage idle steps return Ok(empty) even mid-failure
                 // (a failed step_first clears `active`; the next poll
@@ -1072,7 +1076,6 @@ impl Engine for Gemma4Engine {
                         info!(suppressed, "gemma4 step recovered");
                     }
                 }
-                v
             }
             Err(e) => {
                 match self.step_warn.on_failure(std::time::Instant::now()) {
@@ -1082,9 +1085,9 @@ impl Engine for Gemma4Engine {
                     }
                     None => {}
                 }
-                Vec::new()
             }
         }
+        result
     }
 }
 

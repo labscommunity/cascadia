@@ -70,7 +70,12 @@ pub trait Engine: Send {
 
     /// Make progress on at most one pending task and return any chunks
     /// emitted. Returns an empty Vec when no work is in flight.
-    fn step(&mut self) -> Vec<(TaskId, Chunk)>;
+    ///
+    /// `Err` means the engine failed to make progress (backend or
+    /// transport failure) and is terminal for the in-flight task —
+    /// engines recover their own state so the next submitted task
+    /// starts fresh, but callers must not retry the failed one.
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>>;
 
     /// Best-effort cancellation of an in-flight task. Engines that do
     /// not support mid-stream cancellation may treat this as a no-op.

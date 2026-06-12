@@ -184,8 +184,9 @@ impl Runner {
     }
 
     /// Submit a task and return a stream of chunks. Stops on the final
-    /// chunk, on cancellation, or after MAX_CONSECUTIVE_EMPTY_STEPS empty
-    /// engine polls (engine appears stuck).
+    /// chunk, on cancellation, on an engine step error, or after
+    /// MAX_CONSECUTIVE_EMPTY_STEPS empty engine polls (engine appears
+    /// stuck).
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
         self.submit(task.clone())?;
         Ok(ChunkStream {
@@ -209,8 +210,13 @@ impl Runner {
         loop {
             let mut guard = self.engine.lock();
             let Some(engine) = guard.as_mut() else { break };
-            // Engine.step is sync; just drain.
-            let _produced = engine.step();
+            // Engine.step is sync; just drain. An Err is logged but the
+            // loop keeps driving — relay engines recover their own state
+            // (and self-throttle on dead peers), and a transient frame
+            // error must not take the whole stage down.
+            if let Err(e) = engine.step() {
+                warn!(error = %e, "relay step failed");
+            }
             // Don't hold the lock for long under the loop — yield to
             // other generate() callers between rounds.
             drop(guard);
@@ -269,14 +275,28 @@ impl Stream for ChunkStream {
                 }
             }
 
-            // 2) Drive the engine one step.
+            // 2) Drive the engine one step. An Err is terminal for this
+            //    task: the engine has already abandoned it and reset its
+            //    own state, so end the stream instead of spinning on
+            //    empty steps until MAX_CONSECUTIVE_EMPTY_STEPS.
             let produced = {
                 let mut guard = this.engine.lock();
                 let Some(engine) = guard.as_mut() else {
                     this.done = true;
                     return Poll::Ready(None);
                 };
-                engine.step()
+                match engine.step() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        this.done = true;
+                        warn!(
+                            task = %this.task_id,
+                            error = %e,
+                            "engine step failed; closing stream"
+                        );
+                        return Poll::Ready(None);
+                    }
+                }
             };
 
             if produced.is_empty() {
@@ -445,5 +465,54 @@ mod tests {
     async fn close_without_start_does_not_panic() {
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner.close();
+    }
+
+    /// An engine whose every step fails (e.g. dead transport).
+    struct FailingEngine;
+
+    impl Engine for FailingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Err(EngineError::Backend("transport down".into()))
+        }
+    }
+
+    struct FailingBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for FailingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(FailingEngine))
+        }
+    }
+
+    #[tokio::test]
+    async fn step_error_terminates_stream() {
+        let runner = Runner::new(Box::new(FailingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t1", "hello").with_max_tokens(8))
+            .unwrap();
+        // The first poll hits the step error and ends the stream — no
+        // empty-step spinning, no chunks.
+        assert!(stream.next().await.is_none());
     }
 }

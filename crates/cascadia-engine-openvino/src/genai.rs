@@ -289,9 +289,9 @@ impl Engine for OvGenaiEngine {
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.pending.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let task = self.pending.remove(0);
         let max_new = if task.max_tokens > 0 {
@@ -312,7 +312,7 @@ impl Engine for OvGenaiEngine {
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
                 let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
-                return vec![(task.task_id, final_chunk)];
+                return Ok(vec![(task.task_id, final_chunk)]);
             }
         };
         let elapsed = started.elapsed().as_secs_f64();
@@ -362,7 +362,7 @@ impl Engine for OvGenaiEngine {
         if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
-        vec![(task.task_id, chunk)]
+        Ok(vec![(task.task_id, chunk)])
     }
 }
 
