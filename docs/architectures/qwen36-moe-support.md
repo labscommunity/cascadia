@@ -332,6 +332,24 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   5/5), MULTI_TOKEN_PARITY 8/8, and the qwen36_parity golden test
   passes against the polished shards (engine integration, token-
   identical to the blessed golden).
+- **M4' spike 1 (2026-06-12): GPU→CPU state handoff — mechanics PASS,
+  numerics quantified** (`probe_state_handoff.py`, stage0 on pawan-01).
+  All 40 VariableStates (DeltaNet ssm/conv + KV) are plain f32 tensors:
+  export from a GPU request 34.1 MB @32-token ctx in 46 ms, import into
+  a CPU request 23 ms; dual residency (stage0 compiled CPU+GPU
+  simultaneously) fits a 31.6 GB node, GPU compile 16 s. Teacher-forced
+  hidden tracking: handoff decode tracks CPU-pure at rel 4.0e-2 on the
+  first step (no-state control: 4.3e+1 — three orders apart), drifting
+  to ~1.9e-1 by step 8 (mixed GPU/CPU f16 regimes compound). Verdict:
+  the heterogeneous design's state handoff is REAL; decode after GPU
+  prefill will be coherent but not token-parity with CPU-pure — the
+  same per-regime rule already documented for GPU serving. Lesson
+  encoded in the probe: a hidden-argmax pseudo-token comparator is an
+  attractor (passes its own negative control 7/8) — compare hidden
+  VECTORS with a no-state control instead. Remaining spikes before any
+  engine transport work: full 2-stage logits version of this probe;
+  per-token wire latency pawan-01↔04 (nodes currently relay via DERP
+  "sea", not direct).
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
