@@ -481,12 +481,16 @@ async fn chat_completions(
     };
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
+    let mut prompt_tokens: u32 = 0;
     while let Some(chunk) = chunk_stream.next().await {
         if !chunk.is_final {
             buf.push_str(&chunk.text);
-            completion_tokens += 1;
-        } else if !chunk.text.is_empty() {
-            buf.push_str(&chunk.text);
+            completion_tokens += chunk.n_tokens.unwrap_or(1);
+        } else {
+            if !chunk.text.is_empty() {
+                buf.push_str(&chunk.text);
+            }
+            prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
         }
     }
 
@@ -505,9 +509,11 @@ async fn chat_completions(
             logprobs: None,
         }],
         usage: Usage {
-            prompt_tokens: 0, // cascadia engines don't surface this today
+            // From the engine's final chunk; 0 when the engine can't tell
+            // (e.g. ov-genai tokenizes inside the pipeline).
+            prompt_tokens,
             completion_tokens,
-            total_tokens: completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     })
     .into_response()

@@ -345,7 +345,7 @@ impl Qwen36Engine {
         );
         vec![(
             t.task_id.clone(),
-            Chunk::final_marker(t.task_id, ""),
+            Chunk::final_marker(t.task_id, "").with_prompt_tokens(t.prompt_ids.len() as u32),
         )]
     }
 }

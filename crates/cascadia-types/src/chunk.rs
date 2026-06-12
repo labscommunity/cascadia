@@ -38,6 +38,10 @@ pub struct Chunk {
     /// don't undercount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_tokens: Option<u32>,
+    /// Prompt token count, set on the FINAL chunk by engines that know
+    /// it (the API's usage block reads it; None = engine can't tell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
 }
 
 impl Chunk {
@@ -49,6 +53,7 @@ impl Chunk {
             is_final: false,
             logprobs: None,
             n_tokens: None,
+            prompt_tokens: None,
         }
     }
 
@@ -60,6 +65,12 @@ impl Chunk {
             is_final: true,
             logprobs: None,
             n_tokens: None,
+            prompt_tokens: None,
         }
+    }
+
+    pub fn with_prompt_tokens(mut self, n: u32) -> Self {
+        self.prompt_tokens = Some(n);
+        self
     }
 }
