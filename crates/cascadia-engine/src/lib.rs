@@ -77,8 +77,9 @@ pub trait Engine: Send {
     /// starts fresh, but callers must not retry the failed one.
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>>;
 
-    /// Cancel a task. After `cancel` returns, `step()` emits no further
-    /// chunks for `task_id`: a queued task is dropped from the pending
+    /// Cancel a task. Implementors SHOULD guarantee that after `cancel`
+    /// returns, `step()` emits no further chunks for `task_id`: a queued
+    /// task is dropped from the pending
     /// queue; an active task is abandoned and the engine's generation
     /// state reset so the next task starts fresh instead of waiting for
     /// the abandoned one to drain to completion. Engines that cannot

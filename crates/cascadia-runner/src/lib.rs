@@ -198,8 +198,9 @@ impl Runner {
         })
     }
 
-    /// Step the engine forever; exits when the engine signals io error
-    /// (transport closed). Used by non-first pipeline stages.
+    /// Step the engine forever; exits only when the engine slot empties.
+    /// Step errors are logged and driving continues (engines own their
+    /// recovery). Used by non-first pipeline stages.
     ///
     /// Enters a `BlockingContextGuard` once per OS thread (since this
     /// loop runs on a single `spawn_blocking` thread) so that engines'
