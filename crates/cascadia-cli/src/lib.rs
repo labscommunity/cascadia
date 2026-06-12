@@ -871,14 +871,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // exact format the model was trained on. Falls back gracefully
         // to the legacy "role: content" join if the file or fields are
         // missing.
-        let chat_template = if matches!(args.engine, EngineKind::OvGenai) {
+        let chat_template = match args.engine {
             // ov-genai pipelines apply the model's chat template
             // internally (observed: a text suffix appended to the prompt
             // lands inside the user turn); API-side rendering would
             // double-wrap. Keep the raw legacy join for this engine.
-            cascadia_api::ChatTemplateConfig::default()
-        } else {
-            cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
+            EngineKind::OvGenai => cascadia_api::ChatTemplateConfig::default(),
+            // qwen36 surgery trees keep chat_template.jinja at the model
+            // root with no tokenizer_config.json.
+            EngineKind::Qwen36Moe => cascadia_api::load_chat_template_config_at(
+                std::path::Path::new(&args.model),
+            ),
+            _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
         };
         if chat_template.template.is_some() {
             info!(

@@ -101,19 +101,25 @@ impl Default for Config {
 /// instruct models render through their real template rather than the
 /// legacy formatter (which degenerates instruct models).
 pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
-    // Shard trees from `cascadia shard` keep tokenizer files in a
-    // `tokenizer/` subdir; official HF/OV export dirs (and the qwen36
-    // surgery tree) keep them at the model root. Use whichever has a
-    // tokenizer_config.json; a root chat_template.jinja alone (qwen36
-    // tree: no tokenizer_config at all) still counts.
-    let tok_dir = {
-        let sub = model_dir.join("tokenizer");
-        if sub.join("tokenizer_config.json").exists() {
-            sub
-        } else {
-            model_dir.to_path_buf()
-        }
+    // Strict, unchanged semantics: a present AND parsable
+    // tokenizer_config.json is required before anything (including the
+    // sibling jinja file) is considered.
+    let tok_dir = model_dir.join("tokenizer");
+    let Ok(bytes) = std::fs::read(tok_dir.join("tokenizer_config.json")) else {
+        return ChatTemplateConfig::default();
     };
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+        return ChatTemplateConfig::default();
+    }
+    load_chat_template_config_at(&tok_dir)
+}
+
+/// Like [`load_chat_template_config`] but reads `dir` itself instead of a
+/// `tokenizer/` subdir, and accepts a `chat_template.jinja` without any
+/// `tokenizer_config.json`. For model layouts that keep tokenizer files at
+/// the model root (the qwen36 surgery shard tree, which ships the jinja
+/// file but no tokenizer_config).
+pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateConfig {
     let v = std::fs::read(tok_dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
