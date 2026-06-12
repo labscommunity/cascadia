@@ -160,6 +160,40 @@ as sole recovery, no ShardSpec changes). New:
   decode p95 < 25 ms): PASS on run 2; run 1's tail shows the relay is
   BURSTY — the M4'-1 gate's wire histogram must use a long window and
   the p95>40 ms block-rule stands. Engine work is unblocked.
+- **M4'-1 GATES RUN 2026-06-12 — ALL PASS** (pawan-01 rank 0 ↔
+  pawan-04 rank 1, CPU both, engine a195fd6, identical exporter trees
+  manifest-matched 43066861):
+  1. **Token agreement: PARITY_EXACT** — 64-token greedy through the
+     2-node pipeline char-identical to the single-box engine on the
+     same tree. Reference re-blessed first: the m4 exporter tree
+     (logit-slice + inputs_embeds removal) diverges from the M3'-tree
+     golden at ~token 30 with an f16 near-tie flip (both coherent —
+     the documented §5-allowance case); single-box determinism
+     reconfirmed before the pipeline run. The parity run itself
+     exercises pawan-04 CPU decode (stage1), covering the
+     hardware-homogeneity check. Prompt set 6/6
+     (`golden/promptset_pipeline-2node.json`).
+  2. **Decode 4.1–4.8 tok/s** short-ctx (≥4 required; single-box
+     envelope 4.7–8.8 — wire tax visible but within budget).
+  3. **Robustness, all rows:** cancel mid-decode PASS (+follow-up
+     clean); SSE disconnect PASS; 3 sequential tasks identical (no
+     state bleed); kill B mid-decode → A fails task loud (os error
+     10054, final marker emitted, server healthy); kill A mid-decode →
+     B survives, warns at exactly 500 ms spacing (relay backoff fix
+     a195fd6, found when the first boot's dead-peer spin flooded the
+     rank-1 log); restart both → next task clean (verified twice).
+  4. **Wire histogram (decode, 64 frames): p50 21.2 ms / p95 23.6 ms /
+     max 37.9 ms** — under the 40 ms block rule. (RTT minus
+     peer-reported infer time; higher than the day-0 probe's 13.5 ms
+     p50 — includes serialize + session mutex.)
+
+  Ops notes from the run: pawan-04 enterprise cascadia-node service
+  uninstalled to free RAM (OVMS held ~19 GB; rank 1 OOM'd at stage
+  compile) — restore with `cascadia-node.exe service install`;
+  pipeline listens on :9200 (enterprise node owns :9100); the relay
+  worker pattern is `cmd /c C:\cascadia\m4_rank{0,1}.bat` held by a
+  long-lived ssh session.
+
 - **M4'-1 (cross-node CPU pipeline — THE milestone):**
   Gate, all required:
   1. 64-token greedy through the 2-node pipeline matches the single-box
