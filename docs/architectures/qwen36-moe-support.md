@@ -350,6 +350,20 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   engine transport work: full 2-stage logits version of this probe;
   per-token wire latency pawan-01↔04 (nodes currently relay via DERP
   "sea", not direct).
+- **M4' spike 2 (2026-06-12): cross-node wire latency pawan-01↔04** —
+  8 KB ([1,1,2048] f32 hidden state) TCP round-trip, TCP_NODELAY:
+  median **14.55 ms**, p95 16.4 ms — over the tailscale DERP relay,
+  which is the ONLY path (the nodes' local subnets 192.168.19.x /
+  192.168.3.x do not route to each other; verified with a live
+  listener). Implications: (a) 2-stage LAYER pipelining pays ~1
+  RTT/token ≈ 7% of the 200 ms decode budget — viable; (b) EXPERT
+  parallelism (§4.3) is DEAD on this fleet as-wired: ~40 layer
+  round-trips/token × 14.5 ms ≈ 580 ms/token network floor (<2 tok/s)
+  vs the §4.3 LAN assumption of 0.2–0.5 ms RTTs. Revisits only if the
+  nodes get a routable LAN or tailscale punches direct. Combined with
+  spike 1: the viable M4' shape is 2-node layer pipeline with per-node
+  GPU-prefill/CPU-decode handoff; remaining pre-engine spike is the
+  full 2-stage logits handoff probe.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
