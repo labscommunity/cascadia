@@ -46,7 +46,8 @@ ALIASES: dict[str, str] = {
     "qwen3-8b": "Qwen/Qwen3-8B",
 
     # Qwen 3.5 / 3.6 hybrid MoE (qwen3_5_moe) — single-stage `ov-genai`
-    # only (OV >= 2026.2); rejected by the multi-stage shard path (#77).
+    # (OV >= 2026.2), or staged via `cascadia shard` + `--engine
+    # qwen36-moe` (IR surgery on the official int4 IR, #77).
     "qwen3.5-35b": "Qwen/Qwen3.5-35B-A3B",
     "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B",
 
