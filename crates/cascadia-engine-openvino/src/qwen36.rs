@@ -1,7 +1,7 @@
 //! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
 //! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
-//! (M3', --total 1) or as a 2-node stage pipeline (M4'-1, --rank R
-//! --total 2). Greedy-only, batch=1; the decode loop is a port of
+//! (M3', --total 1) or as an N-node stage pipeline (M4'-1, --rank R
+//! --total N). Greedy-only, batch=1; the decode loop is a port of
 //! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
 //! greedy token parity vs the whole model.
 //!
@@ -12,12 +12,16 @@
 //! admission's reset restores the invariant.
 //!
 //! Pipeline mode (qwen36-m4-pipeline-spec.md): rank 0 holds embeddings
-//! + stage0 + tokenizer and drives decode; rank 1 holds stage1 + logits
-//! and answers each FORWARD with the argmax token. Frames are lockstep
-//! on one transport session: 12-byte BE header [kind][epoch][pos], then
-//! a kind-specific body. The stateful `seq>1` reset heuristic is NOT
-//! used — chunked prefill would re-trigger it mid-task; the downstream
-//! resets only on RESET frames (position-0 = new task).
+//! + stage 0 + tokenizer and drives decode; middle ranks relay (run
+//! their stage, pass the span downstream, return the token back); the
+//! last rank holds the logits head and answers each FORWARD with the
+//! argmax token. Control frames (HELLO, RESET) chain through middles —
+//! one ACK at rank 0 means the whole chain agreed. Frames are lockstep
+//! on one transport session per hop: 12-byte BE header
+//! [kind][epoch][pos], then a kind-specific body. The stateful `seq>1`
+//! reset heuristic is NOT used — chunked prefill would re-trigger it
+//! mid-task; downstream ranks reset only on RESET frames (position-0 =
+//! new task).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -201,11 +205,6 @@ impl Builder for Qwen36Builder {
         if !pipeline && !(shard.is_first_stage && shard.is_last_stage) {
             return Err(EngineError::ShardRejected(
                 "qwen36-moe --total 1 requires a single in-process stage chain".into(),
-            ));
-        }
-        if pipeline && self.total != 2 {
-            return Err(EngineError::ShardRejected(
-                "qwen36-moe pipeline supports exactly 2 stages (M4'-1; no middle ranks)".into(),
             ));
         }
         let dir = PathBuf::from(&self.shards_dir);
@@ -575,32 +574,11 @@ impl Qwen36Engine {
     }
 
     /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit (spec §3.4).
+    /// Middles chain the payload on, so one ACK means the whole chain
+    /// validated against this rank's manifest.
     fn handshake_a(&mut self) -> EngineResult<()> {
         let payload = self.hello_payload();
-        let downstream = self
-            .downstream
-            .clone()
-            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
-        let h = self.handle()?;
-        let nak: Option<String> = run_async(&h, async move {
-            let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
-            g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
-            g.send_raw(&payload).await?;
-            let hb = g.recv_raw(12).await?;
-            let (kind, _, _) = parse_header(&hb);
-            match kind {
-                FRAME_HELLO_ACK => Ok(None),
-                FRAME_HELLO_NAK => {
-                    let lb = g.recv_raw(4).await?;
-                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let rb = g.recv_raw(n).await?;
-                    Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
-                }
-                other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
-            }
-        })
-        .map_err(map_wire)?;
+        let nak = self.forward_hello_downstream(&payload)?;
         if let Some(reason) = nak {
             self.poisoned = Some(reason.clone());
             return Err(EngineError::Backend(format!(
@@ -634,29 +612,27 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
-    /// Rank 0: one lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) →
-    /// TOKEN exchange. Returns the downstream argmax token and the
-    /// round-trip's wire share in ms (RTT minus the peer-reported infer
-    /// time) for the M4'-1 gate's wire histogram.
-    fn send_forward_recv_token(
+    /// One lockstep FORWARD([1,n,HIDDEN] f32 at pos t0) → TOKEN exchange
+    /// with the downstream peer. Returns the chain-end argmax token and
+    /// the accumulated downstream infer time (µs) the TOKEN carried.
+    fn forward_downstream(
         &mut self,
-        hidden: Vec<f32>,
+        epoch: u32,
+        hidden: &[f32],
         n: usize,
         t0: usize,
-    ) -> EngineResult<(u32, f64)> {
-        let epoch = self.epoch;
+    ) -> EngineResult<(i32, u32)> {
         let downstream = self
             .downstream
             .clone()
-            .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
         let tensor = WireTensor::new(
             WireDType::F32,
             [1, n as u32, HIDDEN as u32],
-            le_bytes_f32(&hidden),
+            le_bytes_f32(hidden),
         );
-        let started = Instant::now();
-        let (token, infer_us) = run_async(&h, async move {
+        run_async(&h, async move {
             let mut g = downstream.lock().await;
             g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
                 .await?;
@@ -672,10 +648,74 @@ impl Qwen36Engine {
                 u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
             ))
         })
-        .map_err(map_wire)?;
+        .map_err(map_wire)
+    }
+
+    /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
+    /// minus the chain's accumulated infer time) for the M4'-1 gate's
+    /// wire histogram.
+    fn send_forward_recv_token(
+        &mut self,
+        hidden: Vec<f32>,
+        n: usize,
+        t0: usize,
+    ) -> EngineResult<(u32, f64)> {
+        let epoch = self.epoch;
+        let started = Instant::now();
+        let (token, infer_us) = self.forward_downstream(epoch, &hidden, n, t0)?;
         let wire_ms =
             (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
         Ok((token as u32, wire_ms))
+    }
+
+    /// Middle/last shared: forward the rank-0 HELLO payload downstream
+    /// and return the reply (None = ACK, Some(reason) = NAK).
+    fn forward_hello_downstream(&mut self, payload: &[u8]) -> EngineResult<Option<String>> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        let payload = payload.to_vec();
+        run_async(&h, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
+            g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&payload).await?;
+            let hb = g.recv_raw(12).await?;
+            let (kind, _, _) = parse_header(&hb);
+            match kind {
+                FRAME_HELLO_ACK => Ok(None),
+                FRAME_HELLO_NAK => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    let rb = g.recv_raw(n).await?;
+                    Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
+                }
+                other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
+            }
+        })
+        .map_err(map_wire)
+    }
+
+    /// Middle: forward RESET downstream, await its ack.
+    fn forward_reset_downstream(&mut self, epoch: u32) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        run_async(&h, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+            let hb = g.recv_raw(12).await?;
+            let (kind, e, _) = parse_header(&hb);
+            if kind != FRAME_RESET_ACK || e != epoch {
+                return Err(TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
     /// Rank 0 driver step: same task lifecycle as the single-box step,
@@ -816,10 +856,12 @@ impl Qwen36Engine {
         }
     }
 
-    /// Last rank: serve one inbound frame per step (relay loop). Blocks
+    /// Middle/last ranks: serve one inbound frame per step (relay
+    /// loop). Middles run their stage and pass the span downstream;
+    /// the chain-end token relays back through them. Blocks
     /// in recv up to the activation timeout; idle timeouts surface as
     /// step errors (warned and ignored by the dispatch, like ov-runtime).
-    fn step_pipe_last(&mut self) -> EngineResult<()> {
+    fn step_pipe_relay(&mut self) -> EngineResult<()> {
         let upstream = self
             .upstream
             .clone()
@@ -854,9 +896,19 @@ impl Qwen36Engine {
         })
         .map_err(map_wire)?;
 
+        let is_last = self.rank == self.total - 1;
         match frame {
             InFrame::Hello(payload) => {
-                let reason = self.validate_hello(&payload);
+                // Validate locally, then (middles) chain the ORIGINAL
+                // rank-0 payload downstream so every rank checks against
+                // the origin; reply upstream with the combined verdict.
+                let mut reason = self.validate_hello(&payload);
+                if reason.is_none() && !is_last {
+                    reason = match self.forward_hello_downstream(&payload) {
+                        Ok(r) => r.map(|r| format!("downstream: {r}")),
+                        Err(e) => Some(format!("downstream handshake forward failed: {e}")),
+                    };
+                }
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
@@ -884,8 +936,15 @@ impl Qwen36Engine {
                 Ok(())
             }
             InFrame::Reset(epoch) => {
+                // Chain the reset before acking upstream: the ack means
+                // "everything downstream of you is at position 0". A
+                // failed downstream reset = no ack = task fails loud at
+                // rank 0 (spec §3.2).
                 self.reset_all();
                 self.peer_epoch = epoch;
+                if !is_last {
+                    self.forward_reset_downstream(epoch)?;
+                }
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 run_async(&h, async move {
@@ -924,19 +983,30 @@ impl Qwen36Engine {
                 let infer_started = Instant::now();
                 let t0 = pos as usize;
                 let out = self.chain_pass(&hidden, t0, t0 + n)?;
-                let logits = if self.last_logits_only {
-                    out
+                // Own infer only — the downstream wait is wire + their
+                // infer; they report their own share, so rank 0's
+                // RTT-minus-infer stays the chain's true wire share.
+                let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let (next, downstream_us) = if is_last {
+                    let logits = if self.last_logits_only {
+                        out
+                    } else {
+                        let row = out.len() / n;
+                        out[(n - 1) * row..].to_vec()
+                    };
+                    let next = logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as i32)
+                        .unwrap_or(0);
+                    (next, 0u32)
                 } else {
-                    let row = out.len() / n;
-                    out[(n - 1) * row..].to_vec()
+                    // Middle: pass the hidden span on; the chain end's
+                    // token comes back through us.
+                    self.forward_downstream(epoch, &out, n, t0)?
                 };
-                let next = logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i as i32)
-                    .unwrap_or(0);
-                let infer_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let infer_us = own_us.saturating_add(downstream_us);
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 run_async(&h, async move {
@@ -1151,7 +1221,7 @@ impl Engine for Qwen36Engine {
         if self.rank == 0 {
             self.step_pipe_first()
         } else {
-            match self.step_pipe_last() {
+            match self.step_pipe_relay() {
                 Ok(()) => Vec::new(),
                 Err(e) => {
                     // Backoff: a dead upstream session makes recv fail

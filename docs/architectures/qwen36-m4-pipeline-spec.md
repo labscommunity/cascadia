@@ -259,7 +259,20 @@ rev-2 design:
   60 s recv timeout fails the task loud (lockstep makes this reachable
   only via epoch bugs — belt-and-braces per §3.3).
 
-Launch (rank 1 first — its listener must be up before rank 0 dials):
+**N-stage extension (post-gate, 2026-06-12):** the 2-stage cap was
+M4'-1 scope, not architecture; the engine now supports `--total N`.
+Middle ranks relay: FORWARD → own stage → forward downstream → TOKEN
+back upstream; HELLO and RESET chain through (rank 0's original payload
+is validated by every rank; a RESET_ACK means everything downstream is
+at position 0). TOKEN frames accumulate per-rank infer time so rank 0's
+histogram stays the chain's true wire share. Per-hop wire tax stacks
+(~21 ms/token/hop on this relay) and exporter `--total N` already
+slices arbitrarily. 2-node gates remain the validated configuration;
+an N≥3 run needs its own token-agreement check before being relied on.
+
+Launch (rank 1 first — its listener must be up before rank 0 dials;
+generally start the HIGHEST rank first, then descending — each rank's
+listener must be up before its upstream dials):
 
 ```
 # pawan-04 (rank 1: stage1 + logits)
