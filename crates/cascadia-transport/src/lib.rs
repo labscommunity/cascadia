@@ -284,7 +284,20 @@ fn resolve_frame_idle_ceiling(stored_plus_one: u64, env_secs: Option<u64>) -> Op
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// Frame-start idle ceiling: config > `CASCADIA_FRAME_IDLE_CEILING_SECS` > 900s.
+/// An enabled ceiling below the strict per-frame recv timeout would make
+/// frame-START stricter than mid-frame (design inversion) and silently
+/// re-create the premature idle-kill the ceiling exists to avoid — floor
+/// the effective value at the recv timeout. `None` (no ceiling) passes
+/// through. Pure, for testing.
+fn clamp_frame_idle_ceiling(
+    configured: Option<Duration>,
+    recv_timeout: Duration,
+) -> Option<Duration> {
+    configured.map(|c| c.max(recv_timeout))
+}
+
+/// Frame-start idle ceiling: config > `CASCADIA_FRAME_IDLE_CEILING_SECS` > 900s,
+/// floored at [`recv_timeout`] when enabled (warns once when the floor engages).
 fn frame_idle_ceiling() -> Option<Duration> {
     use std::sync::OnceLock;
     static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
@@ -293,10 +306,22 @@ fn frame_idle_ceiling() -> Option<Duration> {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
     });
-    resolve_frame_idle_ceiling(
+    let configured = resolve_frame_idle_ceiling(
         FRAME_IDLE_CEILING_SECS_PLUS_ONE.load(std::sync::atomic::Ordering::Relaxed),
         env,
-    )
+    );
+    let effective = clamp_frame_idle_ceiling(configured, recv_timeout());
+    if effective != configured {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(
+                configured = ?configured,
+                effective = ?effective,
+                "frame idle ceiling below the activation recv timeout; clamping up"
+            );
+        }
+    }
+    effective
 }
 
 /// Wait for the first byte of a NEW frame exempt from the per-frame recv
@@ -748,12 +773,38 @@ mod tests {
         assert_eq!(resolve_frame_idle_ceiling(1, Some(30)), None);
     }
 
+    #[test]
+    fn ceiling_clamped_to_recv_timeout_when_enabled() {
+        // ceiling below the recv timeout -> floored at the recv timeout
+        assert_eq!(
+            clamp_frame_idle_ceiling(Some(Duration::from_secs(5)), Duration::from_secs(60)),
+            Some(Duration::from_secs(60))
+        );
+        // ceiling above the recv timeout -> unchanged
+        assert_eq!(
+            clamp_frame_idle_ceiling(Some(Duration::from_secs(900)), Duration::from_secs(60)),
+            Some(Duration::from_secs(900))
+        );
+        // 0 = unbounded stays unbounded; the clamp never re-enables it
+        assert_eq!(
+            clamp_frame_idle_ceiling(None, Duration::from_secs(60)),
+            None
+        );
+        // raised activation timeout drags the default ceiling up with it
+        // (frame-start must never be stricter than mid-frame)
+        assert_eq!(
+            clamp_frame_idle_ceiling(Some(DEFAULT_FRAME_IDLE_CEILING), Duration::from_secs(1200)),
+            Some(Duration::from_secs(1200))
+        );
+    }
+
     /// A black-holed peer (connected, silent, no FIN/RST) must hit the
     /// frame-start idle ceiling instead of blocking recv forever.
     #[tokio::test]
     async fn frame_start_idle_ceiling_fires_on_silent_peer() {
         let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         set_frame_idle_ceiling_secs(1);
+        set_activation_timeout_secs(1); // keep the 1s ceiling under the clamp
         let mut server = ActivationServer::new("127.0.0.1", 0);
         server.start().await.unwrap();
         let port = server.port();
@@ -765,6 +816,7 @@ mod tests {
         let _sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let got = h.await.unwrap();
         set_frame_idle_ceiling_secs(0);
+        set_activation_timeout_secs(0);
         match got {
             Err(TransportError::FrameIdleCeiling(_)) => {}
             other => panic!("expected FrameIdleCeiling, got {other:?}"),
