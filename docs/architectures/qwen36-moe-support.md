@@ -364,6 +364,20 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   spike 1: the viable M4' shape is 2-node layer pipeline with per-node
   GPU-prefill/CPU-decode handoff; remaining pre-engine spike is the
   full 2-stage logits handoff probe.
+- **M4' spike 3 (2026-06-12): full-chain GPU-prefill handoff — 16/16
+  token-perfect** (`probe_handoff_full_chain.py`). Both stages prefilled
+  on GPU (sequentially compiled/freed to fit 31.6 GB), states exported
+  and imported into CPU-compiled stages, 16 greedy tokens decoded:
+  token-identical to the blessed CPU-pure golden on the parity prompt.
+  Spike 1's hidden-level drift does not flip greedy near-ties here.
+  **M4' pre-engine gates: ALL GREEN.** Go/no-go picture: the viable
+  M4' build is a 2-node layer pipeline (wire tax ~14.5 ms/token ≈ 7%
+  via the DERP relay) with per-node GPU-prefill→CPU-decode handoff
+  (state round-trip proven, token-faithful); expert parallelism stays
+  dead as-wired. What the engine needs: state get/set FFI in the shim,
+  upstream/downstream transport in the qwen36 engine (drop the
+  single-box invariant), cross-node position-0 reset coordination.
+  That build is a new milestone with its own spec round.
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
