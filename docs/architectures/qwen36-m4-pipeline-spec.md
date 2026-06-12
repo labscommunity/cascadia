@@ -295,9 +295,28 @@ back upstream; HELLO and RESET chain through (rank 0's original payload
 is validated by every rank; a RESET_ACK means everything downstream is
 at position 0). TOKEN frames accumulate per-rank infer time so rank 0's
 histogram stays the chain's true wire share. Per-hop wire tax stacks
-(~21 ms/token/hop on this relay) and exporter `--total N` already
-slices arbitrarily. 2-node gates remain the validated configuration;
-an N≥3 run needs its own token-agreement check before being relied on.
+and exporter `--total N` already slices arbitrarily.
+
+**3-node / middle-rank LIVE VALIDATION 2026-06-12 (commit 1c154bc):**
+ran a real cross-machine 3-stage chain — rank0 + rank2 co-resident on
+node A (separate processes, separate stages; node A had 25 GB free, no
+enterprise teardown), **rank1 the MIDDLE on node B**, so both wire hops
+are A↔B real network. (A true third physical node was attempted but
+the relay couldn't sustain the 7.6 GB stage copy — resets mid-transfer;
+co-residency exercises the identical middle-rank code over real
+cross-machine frames without the bulk copy.) 3-stage tree:
+layers 0–12 / 13–25 / 26–39, manifest 5ab2dad1 matched on both nodes.
+Results:
+- **Parity PARITY_EXACT** vs the single-box 3-stage golden (blessed on
+  node A `--total 1`) → the middle-rank relay is token-faithful.
+- **Promptset 6/6**, clean (chat template through 3 ranks).
+- **Robustness:** cancel mid-decode PASS (+follow-up clean); 3-task
+  no-bleed PASS.
+- **Wire (2 hops): p50 ~32 ms** ≈ 2× the single-hop ~17 ms — confirms
+  per-hop additivity; p95 36–62 ms (2 hops × bursty relay). Decode-only
+  ~3.9 tok/s (the per-hop wire tax stacks as designed).
+The middle-rank code (relay role, chained HELLO/RESET, per-rank infer
+accounting) is validated. 2-node remains the perf-reference config.
 
 Launch (rank 1 first — its listener must be up before rank 0 dials;
 generally start the HIGHEST rank first, then descending — each rank's
