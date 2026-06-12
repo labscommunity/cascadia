@@ -86,9 +86,22 @@ Same-day follow-ups (also validated 2026-06-11):
 - **OVMS 2026.2.0** installed via the repinned `install-ovms.ps1`
   (URL + SHA256 verified end-to-end).
 
-Still pending: tool-calling validation, HF-parity prompt set, `usage`
-token counts in API responses (currently 0), thinking-mode chat-template
-handling.
+**Tool-calling validated (2026-06-12)** on BOTH serving paths through
+`/v1/chat/completions` on pawan-01 (CPU): a hermes-format tool schema in
+the system message yields a well-formed
+`<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>`
+from the nonsharded `ov-genai` path (reasoned, then called) and from the
+staged `qwen36-moe` engine (empty think, then called). Prompt-level
+validation per #77 — an OpenAI `tools`/`tool_calls` API surface is a
+separate feature, not in #77 scope.
+
+**`usage` token counts fixed (2026-06-12)**: real `prompt_tokens` ride
+the engine's final chunk; `total = prompt + completion`. **Thinking-mode
+(2026-06-12)**: `enable_thinking: false` on the request prefills the
+template's empty think block (staged engine); default unchanged.
+
+Still pending: HF-parity prompt set; iGPU repeat of the tool-calling
+probe.
 
 ## Why `cascadia shard` rejects it
 
