@@ -194,6 +194,35 @@ as sole recovery, no ShardSpec changes). New:
   worker pattern is `cmd /c C:\cascadia\m4_rank{0,1}.bat` held by a
   long-lived ssh session.
 
+- **REGATE 2026-06-12 — N-stage engine + chat-template trees (commit
+  1c154bc):** re-ran after the N-stage refactor, chat-template wiring,
+  and cancel-tombstone landed; both nodes rebuilt + re-exported
+  (exporter now copies `chat_template.jinja`, manifests still
+  43066861). Results vs the first gate:
+  1. **Parity PARITY_EXACT** again (re-blessed on the new template
+     rendering — the API now applies the model chat template for
+     qwen36, so the prompt opens the think block and decode starts at
+     the reasoning content rather than emitting a literal `<think>`).
+  2. **tok/s 4.0–4.2** (≥4 holds).
+  3. **Robustness cancel/disconnect/bleed all PASS** (kill rows carried
+     from the first gate; backoff fix already in the build).
+  4. **Promptset 6/6 — and the legacy echo wart is GONE.** Before:
+     `"Parisuser: What is the capital…"`; now clean `"Paris"`, `"42"`,
+     `"Tokyo"`. The chat-template wiring is the fix
+     (`golden/promptset_pipeline-2node-template.json`).
+  - **Gate 4 wire: RELAY-BLOCKED this window.** Decode p50 *improved*
+     to ~17 ms (from 21.2), but the DERP-relay p95 tail is variable
+     across clean 64-frame runs: 36.7 / 43.2 / 42.5 / 20.0 ms —
+     frequently over the 40 ms hard rule (bursty windows with mixed
+     control frames hit p95 ~43, max 80+). The engine is not the
+     cause (p50 down, parity exact every run); this is the documented
+     direct-path limitation (node subnets don't route directly → relay
+     through "sea"). Per §6's "p95 > 40 ms → BLOCKED, not
+     pass-with-caveat", a reliable pass needs the LAN-route ops fix.
+     The first gate caught a good relay window (p95 23.6); this one
+     caught a marginal one. **Functional parity is proven; the wire
+     SLA is relay-bound, not code-bound.**
+
 - **M4'-1 (cross-node CPU pipeline — THE milestone):**
   Gate, all required:
   1. 64-token greedy through the 2-node pipeline matches the single-box
