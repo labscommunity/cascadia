@@ -317,6 +317,21 @@ protocol. T = 10 tok/s decode at 1K context (TODO(review): confirm).
   → one-token validation EXPORT_VALIDATE_OK with numbers identical to
   the hand export (rel 2.8e-2, top1 match, top5 5/5). Post-export
   hint is arch-aware (`cascadia run <dir> --engine qwen36-moe`).
+- **Exporter polish (2026-06-12): all three items SHIPPED.** (1) The v1
+  dummy-input wart is gone: mid stages rewire their mask/position
+  ShapeOf chains off `inputs_embeds` onto `stage_hidden` (4 consumers
+  on the 2-stage cut), so stage1's inputs are just
+  stage_hidden/attention_mask/position_ids/beam_idx. (2) The last
+  stage slices logits to the final position ([1,1,vocab]); manifest
+  sets `last_logits_only` and the engine skips its row slicing —
+  batched prefill stops materializing [1,T,vocab] (~1 MB/token).
+  Pre-slice shard trees still work (flag defaults false). (3)
+  `--validate` adds an 8-token greedy chain-vs-full check (accept
+  ≥6/8; measured 8/8). Re-validated E2E via `cascadia shard` on
+  pawan-01: single-step numbers identical (rel 2.8e-2, top1, top5
+  5/5), MULTI_TOKEN_PARITY 8/8, and the qwen36_parity golden test
+  passes against the polished shards (engine integration, token-
+  identical to the blessed golden).
 - **M3' engine build / M4' — remaining, proceed from the prototype.** Shapes (export probe, engine,
   mesh) return from `b593466` rewritten around the chosen strategy.
   Standing corrections whenever they return: M3' is the user-value
