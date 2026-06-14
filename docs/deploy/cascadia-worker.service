@@ -3,6 +3,11 @@ Description=Cascadia worker (rank %i)
 After=network-online.target
 Wants=network-online.target
 
+# Rate-limit restarts so a crash-loop on a config error doesn't churn.
+# systemd >=229 reads StartLimit* from [Unit], NOT [Service] (ignored there).
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
 [Service]
 Type=simple
 User=cascadia
@@ -32,10 +37,10 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 
 # Restart on crash, but back off so we don't churn on a config error.
+# (StartLimitIntervalSec / StartLimitBurst live in [Unit] above — systemd
+# ignores them under [Service].)
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
 
 # Resource isolation. Uncomment / tighten for production.
 # LimitNOFILE=65535
