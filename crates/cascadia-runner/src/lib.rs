@@ -34,6 +34,16 @@ const MAX_CONSECUTIVE_EMPTY_STEPS: usize = 3;
 /// situation (`WORKER_BACKOFF`).
 const RELAY_ERR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Why [`Runner::run_relay_loop`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayExit {
+    /// The engine slot emptied (clean teardown via [`Runner::close`]).
+    SlotEmpty,
+    /// A `step()` hit an unrecoverable peer-link failure; the caller should
+    /// exit non-zero so the supervisor rebuilds the stage.
+    ConnectionFatal,
+}
+
 // ---------------------------------------------------------------------------
 // Shared block_on dispatch + BlockingContextGuard.
 //
@@ -205,33 +215,46 @@ impl Runner {
         })
     }
 
-    /// Step the engine forever; exits only when the engine slot empties.
-    /// Step errors are logged and driving continues (engines own their
-    /// recovery). Used by non-first pipeline stages.
+    /// Step the engine forever; exits when the engine slot empties (clean
+    /// teardown) or the engine's peer link dies unrecoverably. Used by
+    /// non-first pipeline stages.
     ///
-    /// The loop throttles itself: a `step()` that returns `Err` sleeps
-    /// `RELAY_ERR_BACKOFF` before the next round so a persistently-failing
-    /// engine (dead peer, bad-frame flood, black-holed upstream) can't peg
-    /// a core regardless of whether the engine self-throttles. The backoff
-    /// resets on any non-empty `Ok` step. Engines MAY additionally
-    /// self-throttle (e.g. the workers sleep on a dead peer too); the two
-    /// are belt-and-suspenders.
+    /// A `step()` that returns a *connection-fatal* `Err` ([dead/dropped
+    /// socket, idle-ceiling fire](EngineError::is_connection_fatal)) ends
+    /// the loop with [`RelayExit::ConnectionFatal`]: the worker's upstream
+    /// socket can only be re-accepted by a rebuild, so the caller exits
+    /// non-zero and lets the supervisor (systemd `Restart=on-failure`)
+    /// rebuild the stage — rather than spin-and-flood at the backoff rate
+    /// forever. A *non-fatal* `Err` (bad frame kind, transient inference
+    /// failure) is logged and driving continues, throttled by
+    /// `RELAY_ERR_BACKOFF` so it can't peg a core; the backoff resets on
+    /// any non-empty `Ok` step. Engines MAY additionally self-throttle.
     ///
     /// Enters a `BlockingContextGuard` once per OS thread (since this
     /// loop runs on a single `spawn_blocking` thread) so that engines'
     /// `run_async` calls hit the naked-`block_on` path instead of
     /// `block_in_place` — ~60 ms/frame savings on Windows.
-    pub fn run_relay_loop(&self) {
+    pub fn run_relay_loop(&self) -> RelayExit {
         let _blocking = BlockingContextGuard::enter();
         loop {
             let mut guard = self.engine.lock();
-            let Some(engine) = guard.as_mut() else { break };
-            // Engine.step is sync; just drain. An Err is logged but the
-            // loop keeps driving — relay engines recover their own state
-            // (and self-throttle on dead peers), and a transient frame
-            // error must not take the whole stage down.
+            let Some(engine) = guard.as_mut() else {
+                drop(guard);
+                info!("relay loop exited: engine slot empty");
+                return RelayExit::SlotEmpty;
+            };
+            // Engine.step is sync; just drain. A non-fatal Err is logged
+            // but the loop keeps driving — relay engines recover their own
+            // state and a transient frame error must not take the stage
+            // down. A connection-fatal Err is unrecoverable in-process, so
+            // bail and let the supervisor rebuild us.
             let failed = match engine.step() {
                 Ok(_) => false,
+                Err(e) if e.is_connection_fatal() => {
+                    drop(guard);
+                    warn!(error = %e, "relay step hit a dead peer link; exiting for supervisor rebuild");
+                    return RelayExit::ConnectionFatal;
+                }
                 Err(e) => {
                     warn!(error = %e, "relay step failed");
                     true
@@ -249,7 +272,6 @@ impl Runner {
                 std::thread::yield_now();
             }
         }
-        info!("relay loop exited");
     }
 
     pub fn close(&self) {
@@ -579,7 +601,7 @@ mod tests {
         let handle = std::thread::spawn(move || driver.run_relay_loop());
         std::thread::sleep(RELAY_ERR_BACKOFF * 5);
         runner.close(); // engine slot -> None: loop breaks next round
-        handle.join().unwrap();
+        assert_eq!(handle.join().unwrap(), RelayExit::SlotEmpty);
 
         // With a 200 ms backoff per Err round, ~1 s of wall time admits a
         // handful of iterations, not the millions a hot-spin would do.
@@ -590,6 +612,57 @@ mod tests {
             "relay loop hot-spun on persistently-failing step(): {n} calls in ~1s"
         );
         assert!(n >= 1, "relay loop never stepped the engine");
+    }
+
+    /// A worker whose every step hits a dead peer link (flattened transport
+    /// error). The relay loop must exit ConnectionFatal so the supervisor
+    /// rebuilds the stage, instead of spinning at the backoff rate forever.
+    struct DeadLinkEngine(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Engine for DeadLinkEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Same shape the dist-spec worker produces once its socket is
+            // dropped: TransportError::NotConnected flattened to a string.
+            Err(EngineError::Backend(
+                "not connected; call connect()/accept() first".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn relay_loop_exits_on_connection_fatal_step() {
+        use std::sync::atomic::Ordering;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine: Box<dyn Engine> = Box::new(DeadLinkEngine(calls.clone()));
+        let runner = Arc::new(Runner {
+            builder: Mutex::new(None),
+            engine: Arc::new(Mutex::new(Some(engine))),
+            buffers: Arc::new(Mutex::new(Buffers::default())),
+        });
+
+        // No external stop: the loop must terminate on its own. A timed join
+        // guards against a regression that lets it spin forever.
+        let driver = runner.clone();
+        let handle = std::thread::spawn(move || driver.run_relay_loop());
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("relay loop did not exit on connection-fatal step()");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(handle.join().unwrap(), RelayExit::ConnectionFatal);
+        // It bails on the first fatal Err — no spin.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "relay loop should exit on the first connection-fatal step()"
+        );
     }
 
     #[tokio::test]

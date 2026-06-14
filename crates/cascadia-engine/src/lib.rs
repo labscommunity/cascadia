@@ -80,6 +80,33 @@ impl EngineError {
             },
         }
     }
+
+    /// Whether this error means the engine's peer link is dead and cannot
+    /// recover in-process — a worker stage whose upstream socket is dropped
+    /// can only get a fresh connection by being rebuilt (re-`accept()` only
+    /// happens at startup). The relay loop exits on this so the supervisor
+    /// (systemd `Restart=on-failure`) rebuilds the stage, rather than
+    /// spin-and-flood at the backoff rate forever.
+    ///
+    /// Transport errors reach the engine flattened to strings via
+    /// [`EngineError::Backend`] (the worker calls `e.to_string()`), so this
+    /// matches the same substrings the dist-spec worker uses to classify a
+    /// fatal link drop, plus the structural [`EngineError::NotConnected`].
+    /// A connected-but-misbehaving peer (bad frame kind, stray response) is
+    /// NOT fatal — that link can still deliver a good frame next.
+    pub fn is_connection_fatal(&self) -> bool {
+        match self {
+            EngineError::NotConnected => true,
+            EngineError::Task { source, .. } => source.is_connection_fatal(),
+            EngineError::Backend(msg) => {
+                let msg = msg.to_ascii_lowercase();
+                msg.contains("socket closed")
+                    || msg.contains("not connected")
+                    || msg.contains("idle ceiling")
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -161,4 +188,35 @@ pub trait Builder: Send {
 
     /// Tear down any partially-initialised resources (sockets, weights).
     fn close(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_fatal_classification() {
+        // Structural variant.
+        assert!(EngineError::NotConnected.is_connection_fatal());
+        // Flattened transport strings the dist-spec worker produces.
+        for msg in [
+            "socket closed during recv",
+            "not connected; call connect()/accept() first",
+            "frame-start idle ceiling hit after 900s; connection dropped",
+        ] {
+            assert!(
+                EngineError::Backend(msg.into()).is_connection_fatal(),
+                "expected fatal: {msg}"
+            );
+        }
+        // Recoverable / unrelated failures are NOT fatal.
+        assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
+        assert!(
+            !EngineError::Backend("worker received LOGITS_RESPONSE".into()).is_connection_fatal()
+        );
+        assert!(!EngineError::NotLoaded.is_connection_fatal());
+        // A task-attributed fatal error unwraps to its source.
+        let wrapped = EngineError::Backend("socket closed".into()).for_task(TaskId::from("t1"));
+        assert!(wrapped.is_connection_fatal());
+    }
 }
