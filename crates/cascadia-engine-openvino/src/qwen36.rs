@@ -441,6 +441,21 @@ impl Qwen36Engine {
             .collect();
         let zeros_embeds = vec![0f32; n * HIDDEN];
         let first_global = self.rank == 0;
+        // DEBUG(qwen36dbg): activation-parity trace. Checksums the hidden
+        // state in/out of each stage so a distributed run can be compared
+        // hop-by-hop against single-box. Remove once the multi-middle relay
+        // numerics are resolved.
+        let dbg_rank = self.rank;
+        let dbg_total = self.total;
+        let sig = |v: &[f32]| -> (f64, f64, f32) {
+            let sum: f64 = v.iter().map(|x| *x as f64).sum();
+            let sq: f64 = v.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+            (sum, sq, v.first().copied().unwrap_or(0.0))
+        };
+        {
+            let (s, q, f) = sig(embeds);
+            info!(target: "cascadia::qwen36dbg", rank = dbg_rank, total = dbg_total, n, t0, t1, sum = s, sumsq = q, first = f, "chain_pass INPUT");
+        }
         let mut hidden: Vec<f32> = embeds.to_vec();
         for (j, st) in self.stages.iter_mut().enumerate() {
             let names = st.input_names().map_err(map_ov)?;
@@ -484,6 +499,8 @@ impl Qwen36Engine {
                 )));
             }
             hidden = f32_from_le(&bytes);
+            let (s, q, f) = sig(&hidden);
+            info!(target: "cascadia::qwen36dbg", rank = dbg_rank, total = dbg_total, stage_j = j, len = hidden.len(), sum = s, sumsq = q, first = f, "chain_pass STAGE OUT");
         }
         Ok(hidden)
     }
