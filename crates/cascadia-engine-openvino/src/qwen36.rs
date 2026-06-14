@@ -390,6 +390,21 @@ fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::O
     crate::dist_spec::run_async_pub(h, fut)
 }
 
+/// Bound a driver-side reply exchange. The transport exempts a frame's FIRST
+/// byte from the recv timeout so an idle relay can park on the next request
+/// without killing its socket; a driver that just sent FORWARD/RESET/HELLO is
+/// owed a reply now, so a black-holed downstream must not pin this thread
+/// forever. Times out at the same configured activation timeout.
+async fn reply_bounded<T, F>(fut: F) -> Result<T, TransportError>
+where
+    F: std::future::Future<Output = Result<T, TransportError>>,
+{
+    match tokio::time::timeout(cascadia_transport::recv_timeout(), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(TransportError::SocketClosed),
+    }
+}
+
 /// One inbound frame on the upstream session (downstream rank's view).
 enum InFrame {
     Hello(Vec<u8>),
@@ -599,7 +614,7 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
         let h = self.handle()?;
-        run_async(&h, async move {
+        run_async(&h, reply_bounded(async move {
             let mut g = downstream.lock().await;
             g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
             let hb = g.recv_raw(12).await?;
@@ -608,7 +623,7 @@ impl Qwen36Engine {
                 return Err(TransportError::SocketClosed);
             }
             Ok(())
-        })
+        }))
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
@@ -632,7 +647,7 @@ impl Qwen36Engine {
             [1, n as u32, HIDDEN as u32],
             le_bytes_f32(hidden),
         );
-        run_async(&h, async move {
+        run_async(&h, reply_bounded(async move {
             let mut g = downstream.lock().await;
             g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
                 .await?;
@@ -647,7 +662,7 @@ impl Qwen36Engine {
                 i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
                 u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
             ))
-        })
+        }))
         .map_err(map_wire)
     }
 
@@ -677,7 +692,7 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
         let payload = payload.to_vec();
-        run_async(&h, async move {
+        run_async(&h, reply_bounded(async move {
             let mut g = downstream.lock().await;
             g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
             g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
@@ -694,7 +709,7 @@ impl Qwen36Engine {
                 }
                 other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
             }
-        })
+        }))
         .map_err(map_wire)
     }
 
@@ -705,7 +720,7 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
-        run_async(&h, async move {
+        run_async(&h, reply_bounded(async move {
             let mut g = downstream.lock().await;
             g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
             let hb = g.recv_raw(12).await?;
@@ -714,7 +729,7 @@ impl Qwen36Engine {
                 return Err(TransportError::SocketClosed);
             }
             Ok(())
-        })
+        }))
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
@@ -759,6 +774,12 @@ impl Qwen36Engine {
                 if let Ok(e) = tokenizer.encode("\n<think>\n\n</think>\n\n", false) {
                     prompt_ids.extend(e.get_ids());
                 }
+            }
+            // An empty prompt leaves next_token None through prefill and would
+            // panic the decode branch (`expect`); reject at admission.
+            if prompt_ids.is_empty() {
+                warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
             }
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
@@ -1079,6 +1100,12 @@ impl Qwen36Engine {
                     prompt_ids.extend(e.get_ids());
                 }
             }
+            // An empty prompt leaves logits empty and would fabricate token 0
+            // (garbage decode); reject at admission to match the pipeline path.
+            if prompt_ids.is_empty() {
+                warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1215,6 +1242,17 @@ impl Engine for Qwen36Engine {
         if self.pending.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
+        if self.pending.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            warn!(
+                queued = self.pending.len(),
+                cap = crate::dist_spec::MAX_PENDING_TASKS,
+                "qwen36: pending queue at cap; rejecting task"
+            );
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            });
+        }
         self.pending.push(task);
         Ok(())
     }
@@ -1310,5 +1348,23 @@ mod tests {
         let b = bare_engine(3, "{}");
         let reason = b.validate_hello(&a.hello_payload());
         assert!(reason.is_some_and(|r| r.contains("stage count")));
+    }
+
+    #[test]
+    fn submit_caps_pending_queue() {
+        use crate::dist_spec::MAX_PENDING_TASKS;
+        let mut e = bare_engine(1, "{}");
+        for i in 0..MAX_PENDING_TASKS {
+            assert!(e.submit(GenerationTask::new(format!("t{i}"), "hi")).is_ok());
+        }
+        // Re-submitting an existing id is a no-op Ok (dedup), not a new slot.
+        assert!(e.submit(GenerationTask::new("t0", "hi")).is_ok());
+        // A new id past the cap is rejected rather than growing unbounded.
+        let over = e.submit(GenerationTask::new("overflow", "hi"));
+        assert!(matches!(
+            over,
+            Err(EngineError::QueueFull { queued, cap })
+                if queued == MAX_PENDING_TASKS && cap == MAX_PENDING_TASKS
+        ));
     }
 }

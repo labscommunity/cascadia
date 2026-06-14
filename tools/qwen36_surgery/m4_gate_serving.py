@@ -19,6 +19,7 @@ Gate 4 (wire histogram) is read from the rank-0 log: the engine emits
 """
 import json
 import pathlib
+import re
 import sys
 import time
 import urllib.request
@@ -50,8 +51,10 @@ def chat(content, max_tokens, thinking):
 
 def parity():
     g = json.load(open(HERE / "golden" / "qwen36_parity_64.json"))
-    # golden prompt is the rendered "user: ..." form; send the raw user
-    # content — the engine renders the same legacy form.
+    # NOTE: this golden was blessed before the chat-template render landed, so
+    # the engine now applies the template (not the legacy "user: ..." form) and
+    # exact parity is expected to diverge until re-blessed against the template
+    # path. Treat divergence here as "re-bless needed", not a model regression.
     user = g["prompt"].removeprefix("user: ")
     text, usage, wall = chat(user, g["max_tokens"], True)
     ref = g["text"]
@@ -65,7 +68,7 @@ def parity():
     if full_match:
         print(f"PARITY_EXACT len={len(text)}", flush=True)
     else:
-        print(f"PARITY_DIVERGES at char {div} of {len(ref)} (S5 near-tie judgment needed):", flush=True)
+        print(f"PARITY_DIVERGES at char {div} of {len(ref)} (S5 near-tie judgment / golden re-bless needed):", flush=True)
         print("  golden  :", json.dumps(ref[max(0, div - 40):div + 80]), flush=True)
         print("  pipeline:", json.dumps(text[max(0, div - 40):div + 80]), flush=True)
     print("FULL_TEXT_JSON:", json.dumps(text), flush=True)
@@ -76,7 +79,9 @@ def promptset(label):
     results, passed = [], 0
     for p in ps["prompts"]:
         text, usage, wall = chat(p["content"], p["max_tokens"], p["thinking"])
-        ok = p["expect"].lower() in text.lower()
+        # Whole-token match (not substring-anywhere): "8" must not pass on
+        # "18", "def" must not pass on "default".
+        ok = re.search(rf"\b{re.escape(p['expect'].lower())}\b", text.lower()) is not None
         passed += ok
         results.append({"id": p["id"], "ok": ok, "content": text[:120], "usage": usage})
         print(f"{p['id']}: {'PASS' if ok else 'FAIL'} ({wall:.1f}s) {json.dumps(text[:80])}", flush=True)

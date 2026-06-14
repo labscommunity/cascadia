@@ -226,7 +226,9 @@ fn resolve_recv_timeout(explicit_secs: u64, env_secs: Option<u64>) -> Duration {
 }
 
 /// Per-hop activation recv timeout: config > `CASCADIA_ACTIVATION_TIMEOUT_SECS` > 60s.
-fn recv_timeout() -> Duration {
+/// Public so a driver awaiting an owed reply can bound the frame-start wait
+/// that [`recv_raw`] intentionally exempts for idle relays.
+pub fn recv_timeout() -> Duration {
     use std::sync::OnceLock;
     static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
     let env = *ENV.get_or_init(|| {
