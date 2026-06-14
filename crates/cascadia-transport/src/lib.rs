@@ -296,6 +296,28 @@ fn clamp_frame_idle_ceiling(
     configured.map(|c| c.max(recv_timeout))
 }
 
+/// Whether a recv error leaves the socket unusable for subsequent reads, so
+/// the owner must drop it. Two cases, both leaving frame alignment lost:
+///
+/// * frame-START idle ceiling ([`TransportError::FrameIdleCeiling`]) — the
+///   peer is connected but silent; a frame it sends later must never land in
+///   the next request (token frames carry no task id).
+/// * MID-frame deadline — a frame began but stalled past the strict
+///   [`recv_timeout`]; [`recv_exact`] surfaces this as `Io(TimedOut)`,
+///   leaving a half-consumed frame on the wire that the next recv would read
+///   as a corrupt header.
+///
+/// A clean EOF/reset is NOT fatal here: it surfaces as
+/// [`TransportError::SocketClosed`] (or a non-timeout `Io`), needs no drop,
+/// and the next call fails cleanly on its own. Pure, for testing.
+fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
+    match err {
+        TransportError::FrameIdleCeiling(_) => true,
+        TransportError::Io(e) => e.kind() == io::ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
 /// Frame-start idle ceiling: config > `CASCADIA_FRAME_IDLE_CEILING_SECS` > 900s,
 /// floored at [`recv_timeout`] when enabled (warns once when the floor engages).
 fn frame_idle_ceiling() -> Option<Duration> {
@@ -432,17 +454,18 @@ impl ActivationServer {
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor(sock).await;
-        self.drop_connection_on_ceiling(res.as_ref().err());
+        self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
 
-    /// Ceiling fire is connection-fatal: drop the socket here, at the
-    /// transport layer, so the abandoned frame the black-holed peer may
-    /// send later can never be read into a different request (token
-    /// frames carry no task id). Subsequent calls fail fast with
+    /// A recv timeout is connection-fatal: drop the socket here, at the
+    /// transport layer, so a half-consumed or abandoned frame can never be
+    /// read into a different request (token frames carry no task id). Covers
+    /// both the frame-start idle ceiling and a mid-frame stall — see
+    /// [`recv_error_is_connection_fatal`]. Subsequent calls fail fast with
     /// [`TransportError::NotConnected`].
-    fn drop_connection_on_ceiling(&mut self, err: Option<&TransportError>) {
-        if matches!(err, Some(TransportError::FrameIdleCeiling(_))) {
+    fn drop_connection_if_recv_fatal(&mut self, err: Option<&TransportError>) {
+        if err.is_some_and(recv_error_is_connection_fatal) {
             self.client = None; // drop closes the fd
             self.accepted_addr = None;
         }
@@ -473,7 +496,7 @@ impl ActivationServer {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         let res = recv_exact_frame_start(sock, &mut buf).await;
-        self.drop_connection_on_ceiling(res.as_ref().err());
+        self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
         Ok(buf)
     }
@@ -575,14 +598,15 @@ impl ActivationClient {
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor(sock).await;
-        self.drop_connection_on_ceiling(res.as_ref().err());
+        self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
 
-    /// See [`ActivationServer::drop_connection_on_ceiling`]: ceiling fire
-    /// is connection-fatal at the transport layer.
-    fn drop_connection_on_ceiling(&mut self, err: Option<&TransportError>) {
-        if matches!(err, Some(TransportError::FrameIdleCeiling(_))) {
+    /// See [`ActivationServer::drop_connection_if_recv_fatal`]: a recv
+    /// timeout (frame-start ceiling or mid-frame stall) is connection-fatal
+    /// at the transport layer.
+    fn drop_connection_if_recv_fatal(&mut self, err: Option<&TransportError>) {
+        if err.is_some_and(recv_error_is_connection_fatal) {
             self.sock = None; // drop closes the fd
         }
     }
@@ -601,7 +625,7 @@ impl ActivationClient {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
         let res = recv_exact_frame_start(sock, &mut buf).await;
-        self.drop_connection_on_ceiling(res.as_ref().err());
+        self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
         Ok(buf)
     }
@@ -860,6 +884,83 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "recv after ceiling fire must fail fast"
+        );
+    }
+
+    #[test]
+    fn recv_error_fatal_classification() {
+        // Frame-start ceiling: fatal (black-holed peer).
+        assert!(recv_error_is_connection_fatal(
+            &TransportError::FrameIdleCeiling(Duration::from_secs(1))
+        ));
+        // Mid-frame deadline surfaces as Io(TimedOut): fatal (half frame
+        // left on the wire would desync the next read).
+        assert!(recv_error_is_connection_fatal(&TransportError::Io(
+            io::Error::new(io::ErrorKind::TimedOut, "recv_exact timed out")
+        )));
+        // Clean EOF: NOT fatal — the next call fails cleanly on its own.
+        assert!(!recv_error_is_connection_fatal(
+            &TransportError::SocketClosed
+        ));
+        // A reset / other Io kind: NOT a timeout, NOT dropped here.
+        assert!(!recv_error_is_connection_fatal(&TransportError::Io(
+            io::Error::new(io::ErrorKind::ConnectionReset, "peer reset")
+        )));
+    }
+
+    /// A mid-frame stall (header arrives, payload never does, past the recv
+    /// timeout) must be connection-fatal: the half-consumed frame leaves the
+    /// wire desynced, so the next recv must fail fast with NotConnected, and
+    /// a late completion of that frame must never be read back as valid.
+    #[tokio::test]
+    async fn mid_frame_stall_is_connection_fatal() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        // Keep the frame-start ceiling well above the recv timeout so the
+        // first read (the header) is NOT what fires — we want the mid-frame
+        // deadline to be the trigger.
+        set_frame_idle_ceiling_secs(60);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let mut peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        server.accept().await.unwrap();
+
+        // Send a complete, valid header for an 8-byte f32 [1,1,2] payload,
+        // then stall — never send the payload. recv_exact_frame_start reads
+        // the header, recv_tensor then blocks in recv_exact for the body.
+        let mut header = [0u8; HEADER_SIZE];
+        header[0..4].copy_from_slice(&8u32.to_be_bytes()); // payload_len
+        header[4..8].copy_from_slice(&(DType::F32 as u32).to_be_bytes());
+        header[8..12].copy_from_slice(&1u32.to_be_bytes());
+        header[12..16].copy_from_slice(&1u32.to_be_bytes());
+        header[16..20].copy_from_slice(&2u32.to_be_bytes());
+        peer.write_all(&header).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let first = server.recv().await;
+        assert!(
+            matches!(&first, Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "expected mid-frame Io(TimedOut), got {first:?}"
+        );
+
+        // The peer finally sends the rest of the abandoned frame, late.
+        peer.write_all(&[0, 0, 128, 63, 0, 0, 0, 64]).await.ok();
+        peer.flush().await.ok();
+
+        // The socket must already be dead: the next recv fails fast with
+        // NotConnected, NOT a corrupt frame read from the late payload.
+        let start = Instant::now();
+        let second = server.recv().await;
+        set_activation_timeout_secs(0);
+        set_frame_idle_ceiling_secs(0);
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "recv after mid-frame stall must fail NotConnected, got {second:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "recv after mid-frame stall must fail fast (socket already dropped)"
         );
     }
 
