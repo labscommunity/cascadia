@@ -347,7 +347,8 @@ fn frame_idle_ceiling() -> Option<Duration> {
 }
 
 /// Wait for the first byte of a NEW frame exempt from the per-frame recv
-/// timeout, then read the remainder under the strict recv timeout. A
+/// timeout (but still bounded by the much larger [`frame_idle_ceiling`], not
+/// unbounded), then read the remainder under the strict recv timeout. A
 /// pipeline stage is idle between requests by design — "no next frame yet"
 /// is not a failure, and treating it as one made every idle chain kill its
 /// own sockets on a timer. A dead peer still fails fast here via EOF/reset;
