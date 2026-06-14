@@ -211,6 +211,8 @@ impl Runner {
             engine: self.engine.clone(),
             buffers: self.buffers.clone(),
             consecutive_empty: 0,
+            last_errored_task: None,
+            consecutive_foreign_err: 0,
             done: false,
         })
     }
@@ -290,6 +292,15 @@ pub struct ChunkStream {
     engine: Arc<Mutex<Option<Box<dyn Engine>>>>,
     buffers: Arc<Mutex<Buffers>>,
     consecutive_empty: usize,
+    /// Foreign-task hot-spin guard: the last foreign task-id an engine `step()`
+    /// failed, and how many times in a row it has failed *that same* id. A
+    /// contract-violating engine that re-emits the same foreign Err forever
+    /// (never clearing it) trips the bound; distinct foreign failures mean the
+    /// engine IS clearing each and progressing, so the run resets. Separate
+    /// from `consecutive_empty` so a healthy task isn't false-closed by a few
+    /// distinct foreign failures it observes while waiting its turn.
+    last_errored_task: Option<TaskId>,
+    consecutive_foreign_err: usize,
     done: bool,
 }
 
@@ -357,19 +368,26 @@ impl Stream for ChunkStream {
                         bufs.cancelled.insert(failed.clone());
                         bufs.chunks.remove(&failed);
                         drop(bufs);
-                        // This round made no progress for *us*. Count it
-                        // toward the no-progress guard so a contract-violating
-                        // engine that re-emits the same foreign-task Err every
-                        // step (never clearing it) can't busy-spin this stream
-                        // forever — it falls through to the MAX-empty close
-                        // below. A well-behaved engine clears the failed task
-                        // and serves us, resetting the counter.
-                        this.consecutive_empty += 1;
-                        if this.consecutive_empty >= MAX_CONSECUTIVE_EMPTY_STEPS {
+                        // Bound only a *non-clearing* engine: one that re-emits
+                        // the SAME foreign-task Err every step (never dropping
+                        // it) would busy-spin our `continue` forever, so count
+                        // repeats of the same id toward the guard. Distinct
+                        // foreign failures mean the engine IS clearing each and
+                        // making progress — don't penalize our healthy stream
+                        // for merely observing them, so reset the run on a new
+                        // id. (Tracked separately from `consecutive_empty` so a
+                        // burst of distinct foreign errors can't false-close us.)
+                        if this.last_errored_task.as_ref() == Some(&failed) {
+                            this.consecutive_foreign_err += 1;
+                        } else {
+                            this.last_errored_task = Some(failed);
+                            this.consecutive_foreign_err = 1;
+                        }
+                        if this.consecutive_foreign_err >= MAX_CONSECUTIVE_EMPTY_STEPS {
                             this.done = true;
                             warn!(
                                 task = %this.task_id,
-                                "engine made no progress for {} consecutive steps; closing stream",
+                                "engine re-failed the same foreign task for {} consecutive steps; closing stream",
                                 MAX_CONSECUTIVE_EMPTY_STEPS
                             );
                             return Poll::Ready(None);
@@ -401,7 +419,10 @@ impl Stream for ChunkStream {
                 }
                 continue;
             }
+            // Real progress this round: clear both hot-spin guards.
             this.consecutive_empty = 0;
+            this.last_errored_task = None;
+            this.consecutive_foreign_err = 0;
 
             // 3) Distribute produced chunks: ours go to caller; others to
             //    their owners' buffers. We may then loop to attempt the
@@ -921,5 +942,84 @@ mod tests {
             n <= MAX_CONSECUTIVE_EMPTY_STEPS,
             "stream busy-spun on a non-clearing foreign-task Err: {n} steps"
         );
+    }
+
+    /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
+    /// (clearing each — a correctly-behaving engine), then serves the polled
+    /// task a final chunk. Models concurrent serving where several other
+    /// requests die in a row while a healthy task waits its turn.
+    struct DistinctForeignFailEngine {
+        fails: std::collections::VecDeque<TaskId>,
+        serve: TaskId,
+    }
+
+    impl Engine for DistinctForeignFailEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            if let Some(f) = self.fails.pop_front() {
+                // Each foreign failure is distinct and cleared (popped) — the
+                // engine is making progress, not hot-spinning one task.
+                return Err(EngineError::Backend("transport down".into()).for_task(f));
+            }
+            Ok(vec![(
+                self.serve.clone(),
+                Chunk::final_marker(self.serve.clone(), "ok"),
+            )])
+        }
+    }
+
+    struct DistinctForeignFailBuilder {
+        fails: Vec<TaskId>,
+        serve: TaskId,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for DistinctForeignFailBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(DistinctForeignFailEngine {
+                fails: self.fails.into_iter().collect(),
+                serve: self.serve,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn distinct_foreign_task_errs_do_not_kill_healthy_stream() {
+        // Three DISTINCT foreign tasks fail in a row (>= MAX_CONSECUTIVE_EMPTY_
+        // STEPS) before our task is served. The old "any foreign err bumps the
+        // bound" logic false-closed us here; the same-task refinement must let
+        // our healthy stream survive and finish.
+        let runner = Runner::new(Box::new(DistinctForeignFailBuilder {
+            fails: vec!["f1".to_string(), "f2".to_string(), "f3".to_string()],
+            serve: "ours".to_string(),
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("ours", "x").with_max_tokens(4))
+            .unwrap();
+        let chunk = stream.next().await;
+        assert!(
+            chunk.as_ref().map(|c| c.is_final).unwrap_or(false),
+            "healthy stream was false-closed by distinct foreign-task errors: {chunk:?}"
+        );
+        assert!(stream.next().await.is_none(), "stream should be complete");
     }
 }
