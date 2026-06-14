@@ -1800,7 +1800,14 @@ impl Engine for OvDistSpecWorkerEngine {
                 // hot-loop until the runner notices.
                 std::thread::sleep(std::time::Duration::from_millis(200));
             } else {
+                // Non-connection-fatal error (bad frame kind, stray
+                // LOGITS_RESPONSE, reset/inference failure). recv_raw keeps
+                // succeeding on a connected-but-misbehaving peer, so without
+                // a cool-off a bad-frame flood hot-spins the worker loop and
+                // floods the log. Same 200 ms cadence as the fatal branch;
+                // the sleep also caps the warn rate to ~5/s.
                 warn!(error = %e, "ov-dist-spec worker step error");
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
         result.map(|_| Vec::new())

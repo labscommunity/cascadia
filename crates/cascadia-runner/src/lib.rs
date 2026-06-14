@@ -27,6 +27,13 @@ use tracing::{info, warn};
 /// misbehaving engine.
 const MAX_CONSECUTIVE_EMPTY_STEPS: usize = 3;
 
+/// Cool-off `run_relay_loop` applies after a `step()` returns `Err`, so a
+/// persistently-failing engine (dead peer, bad-frame flood, black-holed
+/// upstream) is throttled regardless of whether the engine self-throttles.
+/// Matches the cadence the sparse-moe / dist_spec workers use for the same
+/// situation (`WORKER_BACKOFF`).
+const RELAY_ERR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 // ---------------------------------------------------------------------------
 // Shared block_on dispatch + BlockingContextGuard.
 //
@@ -202,10 +209,13 @@ impl Runner {
     /// Step errors are logged and driving continues (engines own their
     /// recovery). Used by non-first pipeline stages.
     ///
-    /// Engines driven by this loop must self-throttle a persistently
-    /// fast-failing `step()` (e.g. sleep on a dead peer) — the loop never
-    /// exits on `Err` and only yields between rounds, so an instant-`Err`
-    /// engine would otherwise spin this thread hot.
+    /// The loop throttles itself: a `step()` that returns `Err` sleeps
+    /// `RELAY_ERR_BACKOFF` before the next round so a persistently-failing
+    /// engine (dead peer, bad-frame flood, black-holed upstream) can't peg
+    /// a core regardless of whether the engine self-throttles. The backoff
+    /// resets on any non-empty `Ok` step. Engines MAY additionally
+    /// self-throttle (e.g. the workers sleep on a dead peer too); the two
+    /// are belt-and-suspenders.
     ///
     /// Enters a `BlockingContextGuard` once per OS thread (since this
     /// loop runs on a single `spawn_blocking` thread) so that engines'
@@ -220,13 +230,24 @@ impl Runner {
             // loop keeps driving — relay engines recover their own state
             // (and self-throttle on dead peers), and a transient frame
             // error must not take the whole stage down.
-            if let Err(e) = engine.step() {
-                warn!(error = %e, "relay step failed");
-            }
+            let failed = match engine.step() {
+                Ok(_) => false,
+                Err(e) => {
+                    warn!(error = %e, "relay step failed");
+                    true
+                }
+            };
             // Don't hold the lock for long under the loop — yield to
             // other generate() callers between rounds.
             drop(guard);
-            std::thread::yield_now();
+            // Throttle a persistently-failing step() so it can't hot-spin
+            // this thread; a successful round (even an idle empty one)
+            // just yields, keeping relay latency low.
+            if failed {
+                std::thread::sleep(RELAY_ERR_BACKOFF);
+            } else {
+                std::thread::yield_now();
+            }
         }
         info!("relay loop exited");
     }
@@ -502,6 +523,51 @@ mod tests {
         fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
             Ok(Box::new(FailingEngine))
         }
+    }
+
+    /// A failing engine that counts `step()` calls, so a test can assert
+    /// the relay loop throttled instead of hot-spinning.
+    struct CountingFailingEngine(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Engine for CountingFailingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(EngineError::Backend("transport down".into()))
+        }
+    }
+
+    #[test]
+    fn relay_loop_throttles_persistently_failing_step() {
+        use std::sync::atomic::Ordering;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine: Box<dyn Engine> = Box::new(CountingFailingEngine(calls.clone()));
+        let runner = Arc::new(Runner {
+            builder: Mutex::new(None),
+            engine: Arc::new(Mutex::new(Some(engine))),
+            buffers: Arc::new(Mutex::new(Buffers::default())),
+        });
+
+        // Drive the relay loop on a worker thread, let it run for a window
+        // several backoffs wide, then empty the engine slot to stop it.
+        let driver = runner.clone();
+        let handle = std::thread::spawn(move || driver.run_relay_loop());
+        std::thread::sleep(RELAY_ERR_BACKOFF * 5);
+        runner.close(); // engine slot -> None: loop breaks next round
+        handle.join().unwrap();
+
+        // With a 200 ms backoff per Err round, ~1 s of wall time admits a
+        // handful of iterations, not the millions a hot-spin would do.
+        // Bound generously to stay non-flaky on a loaded CI box.
+        let n = calls.load(Ordering::SeqCst);
+        assert!(
+            n <= 20,
+            "relay loop hot-spun on persistently-failing step(): {n} calls in ~1s"
+        );
+        assert!(n >= 1, "relay loop never stepped the engine");
     }
 
     #[tokio::test]
