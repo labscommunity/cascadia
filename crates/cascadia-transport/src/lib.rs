@@ -396,6 +396,17 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     // multi-MB Llama hidden state over Thunderbolt, and small enough
     // that a wedged peer is detected within one or two heartbeats.
     // Waiting for a frame to BEGIN is exempt — see recv_exact_frame_start.
+    //
+    // NOTE: this is a single wall-clock bound over the WHOLE remaining
+    // buffer, not an idle/no-progress timeout. Assumption: inter-stage
+    // frames are small (hidden states, KB–MB), so 60 s wall-clock ≈ a
+    // genuine stall, not a slow-but-progressing transfer. A mid-frame
+    // timeout is now connection-fatal (the socket is dropped), so a
+    // slow-but-progressing LARGE transfer on a degraded link would be
+    // killed — acceptable at the current frame sizes. If large mid-frame
+    // transfers ever land (e.g. KV-cache blobs), switch to an idle/
+    // no-progress timeout (reset the deadline on each read that returns
+    // bytes) so progress, not total size, is what's bounded.
     let read_fut = async {
         let mut read = 0;
         while read < buf.len() {
