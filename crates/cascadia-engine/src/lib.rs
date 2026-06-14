@@ -46,6 +46,40 @@ pub enum EngineError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A `step()` failure attributed to a specific task. Engines wrap their
+    /// underlying error in this at the failure site when the active task is
+    /// known, so the runner can route the failure to that task's stream
+    /// instead of ending whichever stream happens to observe it.
+    #[error("task {task_id}: {source}")]
+    Task {
+        task_id: TaskId,
+        #[source]
+        source: Box<EngineError>,
+    },
+}
+
+impl EngineError {
+    /// The task this error is attributed to, if any. Returns `None` for
+    /// engine-level / task-less failures.
+    pub fn task_id(&self) -> Option<&TaskId> {
+        match self {
+            EngineError::Task { task_id, .. } => Some(task_id),
+            _ => None,
+        }
+    }
+
+    /// Attribute an error to `task_id`, wrapping it in [`EngineError::Task`]
+    /// unless it already carries an attribution.
+    pub fn for_task(self, task_id: TaskId) -> Self {
+        match self {
+            EngineError::Task { .. } => self,
+            source => EngineError::Task {
+                task_id,
+                source: Box::new(source),
+            },
+        }
+    }
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -77,11 +111,13 @@ pub trait Engine: Send {
     /// starts fresh, but callers must not retry the failed one.
     ///
     /// Task attribution: `Err` affects at most the active task; queued
-    /// tasks survive. The error carries no [`TaskId`] today, so callers
-    /// driving multiple concurrent streams cannot attribute the failure —
-    /// the runner's `ChunkStream` ends whichever stream observes the
-    /// `Err`, which may not be the failed task's stream (known
-    /// limitation).
+    /// tasks survive. Implementors that know the failed task SHOULD wrap
+    /// their error with [`EngineError::for_task`] (or return
+    /// [`EngineError::Task`]) so the runner can route the failure to that
+    /// task's stream. A task-less `Err` (no active task, or a genuinely
+    /// engine-level failure) ends whichever stream observes it — correct
+    /// for engine death, the documented behavior for worker stages that
+    /// own no user task.
     ///
     /// Failure idiom: implementors should return `Err` for engine-level
     /// failures (engine unusable / task aborted by the engine); emit a

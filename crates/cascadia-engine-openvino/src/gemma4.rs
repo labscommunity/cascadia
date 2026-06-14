@@ -794,8 +794,8 @@ impl Gemma4Engine {
         // but step_first's "if active.is_none()" gate is false, so the
         // new task is never picked up — runner.poll_next sees empty
         // steps and the API returns `data: [DONE]` with zero chunks.
-        let res = self.step_first_body();
-        if let Err(ref e) = res {
+        let mut res = self.step_first_body();
+        if let Err(e) = res {
             // DEBUG, not WARN: the outer step() emits the rate-limited WARN
             // for the same error (StepWarnLimiter); a second unconditional
             // WARN here would bypass the limiter and double-log every
@@ -805,9 +805,17 @@ impl Gemma4Engine {
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
             );
+            // Attribute to the failed task (if one was active) before we
+            // null it, so the runner routes the failure to that task's
+            // stream instead of ending whichever stream observes the Err.
+            let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
             let _ = self.runtime.reset_state();
             self.position = 0;
+            res = Err(match failed {
+                Some(id) => e.for_task(id),
+                None => e,
+            });
         }
         res
     }

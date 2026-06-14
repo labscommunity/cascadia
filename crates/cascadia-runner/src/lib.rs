@@ -302,19 +302,41 @@ impl Stream for ChunkStream {
                 }
             }
 
-            // 2) Drive the engine one step. An Err is terminal for this
-            //    task: the engine has already abandoned it and reset its
-            //    own state, so end the stream instead of spinning on
-            //    empty steps until MAX_CONSECUTIVE_EMPTY_STEPS.
-            let produced = {
+            // 2) Drive the engine one step. An Err is terminal for the
+            //    failed task: the engine has already abandoned it and reset
+            //    its own state. If the error names a *different* task than
+            //    ours (concurrent serving), route the failure to that task
+            //    and keep polling — ending our healthy stream would kill the
+            //    wrong request. An error for our task, or a task-less /
+            //    engine-level error, ends this stream.
+            let step_result = {
                 let mut guard = this.engine.lock();
                 let Some(engine) = guard.as_mut() else {
                     this.done = true;
                     return Poll::Ready(None);
                 };
-                match engine.step() {
-                    Ok(v) => v,
-                    Err(e) => {
+                engine.step()
+            };
+            let produced = match step_result {
+                Ok(v) => v,
+                Err(e) => match e.task_id() {
+                    Some(failed) if failed != &this.task_id => {
+                        // Misattribution guard: fail the named task's stream,
+                        // not ours. Cancelling it makes its own poll_next
+                        // observe termination on its next turn.
+                        let failed = failed.clone();
+                        warn!(
+                            failed_task = %failed,
+                            polled_task = %this.task_id,
+                            error = %e,
+                            "engine step failed for another task; routing failure to it"
+                        );
+                        let mut bufs = this.buffers.lock();
+                        bufs.cancelled.insert(failed.clone());
+                        bufs.chunks.remove(&failed);
+                        continue;
+                    }
+                    _ => {
                         this.done = true;
                         warn!(
                             task = %this.task_id,
@@ -323,7 +345,7 @@ impl Stream for ChunkStream {
                         );
                         return Poll::Ready(None);
                     }
-                }
+                },
             };
 
             if produced.is_empty() {
@@ -586,5 +608,104 @@ mod tests {
         // The first poll hits the step error and ends the stream — no
         // empty-step spinning, no chunks.
         assert!(stream.next().await.is_none());
+    }
+
+    /// Engine that fails one named task with a task-attributed error on its
+    /// first step, then serves every other task one token + a final marker.
+    /// Models concurrent serving where task A's transport dies while B is
+    /// healthy.
+    struct SelectiveFailEngine {
+        fail: TaskId,
+        tasks: Vec<TaskId>,
+        served: std::collections::HashSet<TaskId>,
+    }
+
+    impl Engine for SelectiveFailEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.tasks.push(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            if self.tasks.iter().any(|t| t == &self.fail) {
+                // Abandon the doomed task and report it by id.
+                self.tasks.retain(|t| t != &self.fail);
+                return Err(
+                    EngineError::Backend("transport down".into()).for_task(self.fail.clone())
+                );
+            }
+            // Serve the first not-yet-served task a single final chunk.
+            let next = self
+                .tasks
+                .iter()
+                .find(|t| !self.served.contains(*t))
+                .cloned();
+            match next {
+                Some(tid) => {
+                    self.served.insert(tid.clone());
+                    Ok(vec![(tid.clone(), Chunk::final_marker(tid, "ok"))])
+                }
+                None => Ok(Vec::new()),
+            }
+        }
+    }
+
+    struct SelectiveFailBuilder(TaskId);
+
+    #[async_trait::async_trait]
+    impl Builder for SelectiveFailBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(SelectiveFailEngine {
+                fail: self.0,
+                tasks: Vec::new(),
+                served: std::collections::HashSet::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn step_err_for_other_task_does_not_kill_healthy_stream() {
+        // Two concurrent streams share one engine. Task "a" fails with a
+        // task-attributed error; task "b" must survive and finish, and only
+        // "a" ends.
+        let runner = Runner::new(Box::new(SelectiveFailBuilder("a".to_string())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream_a = runner
+            .generate(GenerationTask::new("a", "x").with_max_tokens(4))
+            .unwrap();
+        let mut stream_b = runner
+            .generate(GenerationTask::new("b", "y").with_max_tokens(4))
+            .unwrap();
+
+        // Drive B first: it polls the engine, observes the err attributed to
+        // "a", routes the failure to "a", and keeps going to serve itself.
+        let b_chunk = stream_b.next().await;
+        assert!(
+            b_chunk.as_ref().map(|c| c.is_final).unwrap_or(false),
+            "healthy task b's stream was killed by task a's failure: {b_chunk:?}"
+        );
+
+        // A's stream ends (None) — it was the failed task.
+        assert!(
+            stream_a.next().await.is_none(),
+            "failed task a's stream should have ended"
+        );
+        // B's stream is now complete too.
+        assert!(stream_b.next().await.is_none());
     }
 }
