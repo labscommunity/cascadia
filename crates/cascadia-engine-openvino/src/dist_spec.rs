@@ -1775,12 +1775,20 @@ impl Engine for OvDistSpecWorkerEngine {
             // it from spinning hot until the runner tears us down.
             // "idle ceiling" = frame-start idle ceiling fired (black-holed
             // peer); the transport layer has already dropped that socket —
-            // close the rest here too. Transport errors reach us flattened
-            // to strings (EngineError::Backend), hence the contains().
-            let msg = e.to_string();
+            // close the rest here too. "connection reset"/"broken pipe"/
+            // "connection aborted" = peer crash (TCP RST, the dominant
+            // dead-peer case); "recv_exact timed out" = mid-frame stall.
+            // Transport errors reach us flattened to strings
+            // (EngineError::Backend), hence the contains(). Kept in sync with
+            // EngineError::is_connection_fatal.
+            let msg = e.to_string().to_ascii_lowercase();
             if msg.contains("socket closed")
                 || msg.contains("not connected")
                 || msg.contains("idle ceiling")
+                || msg.contains("connection reset")
+                || msg.contains("broken pipe")
+                || msg.contains("connection aborted")
+                || msg.contains("recv_exact timed out")
             {
                 warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links");
                 // Mark engine as drained by clearing connections.

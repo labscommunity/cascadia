@@ -92,7 +92,11 @@ impl EngineError {
     /// [`EngineError::Backend`] (the worker calls `e.to_string()`), so this
     /// matches the same substrings the dist-spec worker uses to classify a
     /// fatal link drop, plus the structural [`EngineError::NotConnected`].
-    /// A connected-but-misbehaving peer (bad frame kind, stray response) is
+    /// Covered: clean teardown ("socket closed"/"not connected"), a
+    /// black-holed peer ("idle ceiling"), a peer crash ("connection
+    /// reset"/"broken pipe"/"connection aborted" — TCP RST is the dominant
+    /// dead-peer case), and a mid-frame stall ("recv_exact timed out"). A
+    /// connected-but-misbehaving peer (bad frame kind, stray response) is
     /// NOT fatal — that link can still deliver a good frame next.
     pub fn is_connection_fatal(&self) -> bool {
         match self {
@@ -100,9 +104,16 @@ impl EngineError {
             EngineError::Task { source, .. } => source.is_connection_fatal(),
             EngineError::Backend(msg) => {
                 let msg = msg.to_ascii_lowercase();
+                // Clean teardown / black-holed peer.
                 msg.contains("socket closed")
                     || msg.contains("not connected")
                     || msg.contains("idle ceiling")
+                    // Peer crash: TCP RST / broken pipe / aborted.
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("connection aborted")
+                    // Mid-frame deadline (recv_exact wall-clock bound).
+                    || msg.contains("recv_exact timed out")
             }
             _ => false,
         }
@@ -203,6 +214,12 @@ mod tests {
             "socket closed during recv",
             "not connected; call connect()/accept() first",
             "frame-start idle ceiling hit after 900s; connection dropped",
+            // Peer crash (TCP RST and its send/half-close variants).
+            "io error: connection reset by peer",
+            "io error: broken pipe",
+            "io error: connection aborted",
+            // Mid-frame stall surfaced by recv_exact's wall-clock bound.
+            "io error: recv_exact timed out after 60s",
         ] {
             assert!(
                 EngineError::Backend(msg.into()).is_connection_fatal(),

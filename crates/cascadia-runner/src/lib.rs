@@ -683,6 +683,49 @@ mod tests {
         );
     }
 
+    /// A worker step whose flattened transport error is a peer crash (TCP
+    /// RST) must also exit ConnectionFatal — the dominant dead-peer case,
+    /// not just a clean FIN. Mirrors the test above with the RST string.
+    struct RstStepEngine(EngineError);
+
+    impl Engine for RstStepEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Err(EngineError::Backend(self.0.to_string()))
+        }
+    }
+
+    #[test]
+    fn relay_loop_exits_on_peer_rst_and_mid_frame_step() {
+        // Both the peer-crash string and the mid-frame stall string must be
+        // treated as connection-fatal by the relay loop.
+        for msg in ["connection reset by peer", "recv_exact timed out after 60s"] {
+            let engine: Box<dyn Engine> = Box::new(RstStepEngine(EngineError::Backend(msg.into())));
+            let runner = Arc::new(Runner {
+                builder: Mutex::new(None),
+                engine: Arc::new(Mutex::new(Some(engine))),
+                buffers: Arc::new(Mutex::new(Buffers::default())),
+            });
+            let driver = runner.clone();
+            let handle = std::thread::spawn(move || driver.run_relay_loop());
+            let start = std::time::Instant::now();
+            while !handle.is_finished() {
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    panic!("relay loop did not exit on connection-fatal step() for {msg:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                handle.join().unwrap(),
+                RelayExit::ConnectionFatal,
+                "expected ConnectionFatal exit for {msg:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn step_error_terminates_stream() {
         let runner = Runner::new(Box::new(FailingBuilder));

@@ -297,7 +297,8 @@ fn clamp_frame_idle_ceiling(
 }
 
 /// Whether a recv error leaves the socket unusable for subsequent reads, so
-/// the owner must drop it. Two cases, both leaving frame alignment lost:
+/// the owner must drop it. Cases, all leaving the link dead or frame
+/// alignment lost:
 ///
 /// * frame-START idle ceiling ([`TransportError::FrameIdleCeiling`]) — the
 ///   peer is connected but silent; a frame it sends later must never land in
@@ -306,14 +307,26 @@ fn clamp_frame_idle_ceiling(
 ///   [`recv_timeout`]; [`recv_exact`] surfaces this as `Io(TimedOut)`,
 ///   leaving a half-consumed frame on the wire that the next recv would read
 ///   as a corrupt header.
+/// * peer crash — a process dying hard sends TCP RST (and a send/half-close
+///   races as BrokenPipe/ConnectionAborted/UnexpectedEof). These surface as
+///   `Io(ConnectionReset | BrokenPipe | ConnectionAborted | UnexpectedEof)`;
+///   the socket is dead, so drop it now and let the next call fail fast with
+///   [`TransportError::NotConnected`] (the dominant dead-peer case).
 ///
-/// A clean EOF/reset is NOT fatal here: it surfaces as
-/// [`TransportError::SocketClosed`] (or a non-timeout `Io`), needs no drop,
-/// and the next call fails cleanly on its own. Pure, for testing.
+/// A clean EOF is NOT fatal here: it surfaces as
+/// [`TransportError::SocketClosed`], needs no drop, and the next call fails
+/// cleanly on its own. Pure, for testing.
 fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
     match err {
         TransportError::FrameIdleCeiling(_) => true,
-        TransportError::Io(e) => e.kind() == io::ErrorKind::TimedOut,
+        TransportError::Io(e) => matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::UnexpectedEof
+        ),
         _ => false,
     }
 }
@@ -903,9 +916,23 @@ mod tests {
         assert!(!recv_error_is_connection_fatal(
             &TransportError::SocketClosed
         ));
-        // A reset / other Io kind: NOT a timeout, NOT dropped here.
+        // Peer crash: RST / broken pipe / aborted / unexpected EOF all leave
+        // the socket dead — fatal so the owner drops it (the dominant
+        // dead-peer case).
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                recv_error_is_connection_fatal(&TransportError::Io(io::Error::new(kind, "peer"))),
+                "expected fatal: {kind:?}"
+            );
+        }
+        // An unrelated Io kind (e.g. would-block) is NOT fatal here.
         assert!(!recv_error_is_connection_fatal(&TransportError::Io(
-            io::Error::new(io::ErrorKind::ConnectionReset, "peer reset")
+            io::Error::new(io::ErrorKind::WouldBlock, "retryable")
         )));
     }
 
@@ -962,6 +989,46 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "recv after mid-frame stall must fail fast (socket already dropped)"
+        );
+    }
+
+    /// A peer process dying hard sends TCP RST, surfaced on the recv side as
+    /// `Io(ConnectionReset)` (the dominant dead-peer case). The owner must
+    /// treat that as connection-fatal and drop the socket, so the next recv
+    /// fails fast with NotConnected instead of retrying a dead link. Drives
+    /// the owner's drop path with the synthesized error a real RST produces
+    /// (forcing a true RST portably needs the unstable `set_linger` or an
+    /// extra socket crate). The kind→fatal mapping itself is proven by
+    /// `recv_error_fatal_classification`.
+    #[tokio::test]
+    async fn peer_rst_drops_socket_fast_fail() {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let _peer = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        server.accept().await.unwrap();
+        assert!(server.client.is_some(), "precondition: connection accepted");
+
+        // The recv read returned ConnectionReset (peer RST). The owner drops
+        // the socket on this.
+        server.drop_connection_if_recv_fatal(Some(&TransportError::Io(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ))));
+        assert!(
+            server.client.is_none(),
+            "peer RST must drop the socket so the next call fails fast"
+        );
+
+        let start = Instant::now();
+        let next = server.recv().await;
+        assert!(
+            matches!(next, Err(TransportError::NotConnected)),
+            "recv after peer RST must fail NotConnected, got {next:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "recv after peer RST must fail fast"
         );
     }
 
