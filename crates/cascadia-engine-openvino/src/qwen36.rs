@@ -234,17 +234,14 @@ impl Builder for Qwen36Builder {
             self.rank,
             self.total
         ))];
-        // Force f32 inference precision. The MoE router picks top-8 of 256
-        // experts by tiny logit margins; OV's default fp16 GPU compute lets the
-        // cross-stage f32 boundary variance flip near-tie expert selections,
-        // which compounds over a multi-stage chain into degenerate long
-        // generation. f32 widens the margins well past the perturbation so the
-        // router is stable (int4 weights are unaffected; a single stage is ~1/4
-        // the model, so f32 compute fits the per-node GPU). ACCURACY also
-        // disables accuracy-reducing graph optimizations.
-        let plugin = PluginConfig::new()
-            .with("INFERENCE_PRECISION_HINT", "f32")
-            .with("EXECUTION_MODE_HINT", "ACCURACY");
+        // NOTE: the router runs f16. Raising precision to stabilize near-tie
+        // expert selection is NOT possible on the Intel Arc GPU — the fused MoE
+        // gemm (`MOE3GemmFusedCompressed`) has an f16-only kernel, so both
+        // INFERENCE_PRECISION_HINT=f32 and EXECUTION_MODE_HINT=ACCURACY fail at
+        // compile ("No layout format available ... data_type: f32"). The
+        // multi-stage long-generation drift is therefore mitigated by config
+        // (single-box / 2-stage, aligned GPU drivers), not a precision hint.
+        let plugin = PluginConfig::new();
 
         // Embeddings + tokenizer + eos live with the decode driver only.
         if self.rank == 0 {
