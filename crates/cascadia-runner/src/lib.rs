@@ -356,6 +356,24 @@ impl Stream for ChunkStream {
                         let mut bufs = this.buffers.lock();
                         bufs.cancelled.insert(failed.clone());
                         bufs.chunks.remove(&failed);
+                        drop(bufs);
+                        // This round made no progress for *us*. Count it
+                        // toward the no-progress guard so a contract-violating
+                        // engine that re-emits the same foreign-task Err every
+                        // step (never clearing it) can't busy-spin this stream
+                        // forever — it falls through to the MAX-empty close
+                        // below. A well-behaved engine clears the failed task
+                        // and serves us, resetting the counter.
+                        this.consecutive_empty += 1;
+                        if this.consecutive_empty >= MAX_CONSECUTIVE_EMPTY_STEPS {
+                            this.done = true;
+                            warn!(
+                                task = %this.task_id,
+                                "engine made no progress for {} consecutive steps; closing stream",
+                                MAX_CONSECUTIVE_EMPTY_STEPS
+                            );
+                            return Poll::Ready(None);
+                        }
                         continue;
                     }
                     _ => {
@@ -780,5 +798,85 @@ mod tests {
         );
         // B's stream is now complete too.
         assert!(stream_b.next().await.is_none());
+    }
+
+    /// Contract-violating engine: every step re-emits the SAME foreign-task
+    /// Err and never clears it (real engines drop the failed task). Models a
+    /// pathological non-clearing engine that would otherwise busy-spin the
+    /// observing stream's `continue`.
+    struct ForeignErrSpinEngine {
+        fail: TaskId,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Engine for ForeignErrSpinEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(EngineError::Backend("transport down".into()).for_task(self.fail.clone()))
+        }
+    }
+
+    struct ForeignErrSpinBuilder {
+        fail: TaskId,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for ForeignErrSpinBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(ForeignErrSpinEngine {
+                fail: self.fail,
+                steps: self.steps,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_foreign_task_err_bounds_observing_stream() {
+        use std::sync::atomic::Ordering;
+        // The engine fails task "other" on every step and never clears it.
+        // Our stream ("ours") never gets served, but the cross-task error arm
+        // must count toward the no-progress guard so we terminate rather than
+        // spin a tokio worker forever.
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = Runner::new(Box::new(ForeignErrSpinBuilder {
+            fail: "other".to_string(),
+            steps: steps.clone(),
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("ours", "x").with_max_tokens(64))
+            .unwrap();
+
+        // Must terminate (None), not hang. Bounded by the no-progress guard.
+        assert!(
+            stream.next().await.is_none(),
+            "stream should terminate on a non-clearing foreign-task Err, not spin"
+        );
+        // One step per no-progress round; capped by the guard, not unbounded.
+        let n = steps.load(Ordering::SeqCst);
+        assert!(
+            n <= MAX_CONSECUTIVE_EMPTY_STEPS,
+            "stream busy-spun on a non-clearing foreign-task Err: {n} steps"
+        );
     }
 }
