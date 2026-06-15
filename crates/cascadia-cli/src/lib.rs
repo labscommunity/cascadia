@@ -915,6 +915,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
+        // ov-genai owns native templating: render the template API-side only for
+        // the thinking-OFF path (engine sets apply_chat_template=false then);
+        // thinking-ON stays on ov-genai's native template, untouched.
+        cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         let app = cascadia_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
         info!(host = %api_host, port = api_port, "API serving");

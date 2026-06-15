@@ -59,6 +59,11 @@ pub struct AppState {
     pub chat_env: Option<Arc<minijinja::Environment<'static>>>,
     pub bos_token: Arc<str>,
     pub eos_token: Arc<str>,
+    /// Engines that own their native chat templating (ov-genai): defer to the
+    /// engine for the thinking-ON path and only render here when thinking is
+    /// OFF (to inject the empty `<think></think>`). Keeps the working
+    /// thinking-on path byte-identical to the engine's native render.
+    pub defer_template_on_thinking: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,6 +79,8 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
+    /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
+    pub defer_template_on_thinking: bool,
 }
 
 impl Default for Config {
@@ -83,6 +90,7 @@ impl Default for Config {
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
+            defer_template_on_thinking: false,
         }
     }
 }
@@ -181,6 +189,7 @@ pub fn make_router_with_config(
             }),
         bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
+        defer_template_on_thinking: cfg.defer_template_on_thinking,
     };
     Router::new()
         .route("/health", get(health))
@@ -391,7 +400,13 @@ fn render_with_chat_env(
 }
 
 fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool) -> String {
-    if let Some(env) = &state.chat_env {
+    // Hybrid: for engines that own native templating (ov-genai), only render
+    // here when thinking is OFF (to inject the empty-think block). With thinking
+    // ON, emit the legacy join so the engine applies its own template natively —
+    // leaving the already-working path byte-identical.
+    let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
+    if !defer_to_engine {
+        if let Some(env) = &state.chat_env {
         match render_with_chat_env(
             env,
             messages,
@@ -403,6 +418,7 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bo
             Err(e) => {
                 warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
             }
+        }
         }
     }
     render_prompt_legacy(messages)

@@ -242,7 +242,7 @@ pub struct OvGenaiEngine {
 
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
-        let cfg = self.gen_config(/*max_tokens*/ 4, /*temperature*/ 0.0);
+        let cfg = self.gen_config(/*max_tokens*/ 4, /*temperature*/ 0.0, /*enable_thinking*/ false);
         match self.pipe.generate("Hi", &cfg) {
             Ok(_) => info!(
                 spec_k = self.speculative_k,
@@ -284,6 +284,7 @@ impl Engine for OvGenaiEngine {
                 self.max_tokens_default
             },
             task.temperature,
+            task.enable_thinking,
         );
 
         let started = Instant::now();
@@ -325,7 +326,7 @@ impl Engine for OvGenaiEngine {
 }
 
 impl OvGenaiEngine {
-    fn gen_config(&self, max_tokens: u32, temperature: f32) -> GenConfig {
+    fn gen_config(&self, max_tokens: u32, temperature: f32, enable_thinking: bool) -> GenConfig {
         let do_sample = temperature > 0.0;
         let mut cfg = GenConfig {
             max_new_tokens: max_tokens,
@@ -333,9 +334,11 @@ impl OvGenaiEngine {
             temperature: if do_sample { temperature } else { 0.0 },
             num_assistant_tokens: 0,
             max_ngram_size: 0,
-            // API pre-rendered the template (with enable_thinking) → tell
-            // ov-genai not to re-apply it; else let ov-genai template as before.
-            skip_chat_template: self.prompt_pretemplated,
+            // Hybrid: only when the API rendered the template for us — i.e. a
+            // template loaded AND this request is thinking-OFF — do we tell
+            // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
+            // native templating (the legacy join the API emitted), untouched.
+            skip_chat_template: self.prompt_pretemplated && !enable_thinking,
         };
         if self.speculative_k > 0 {
             cfg.num_assistant_tokens = self.speculative_k;
