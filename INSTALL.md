@@ -36,7 +36,7 @@ The FFI shim (`cascadia-ov-genai-shim`) compiles C++ against the OpenVINO GenAI 
 
 ### 2. OpenVINO GenAI SDK
 
-Download the **OpenVINO GenAI 2026.1+** archive for your platform from Intel:
+Download the **OpenVINO GenAI 2026.2+** archive for your platform from Intel:
 
 - Archives: <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>
 - Or the Intel download center: <https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html>

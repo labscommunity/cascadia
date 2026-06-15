@@ -77,10 +77,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 
-# OpenVINO
-openvino = "0.10"
-openvino-genai = "0.10"
-openvino-genai-sys = "0.10"
+# OpenVINO binding is the C++ FFI shim (cascadia-ov-genai-shim), not the
+# crates.io `openvino*` crates — former workspace pins for them were dead
+# (absent from Cargo.lock) and removed in #77 Part A.
 
 # Discovery + downloads
 mdns-sd = "0.13"
