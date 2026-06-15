@@ -1,14 +1,11 @@
-# Qwen3.6-35B M4' — cross-node stage pipeline (rev 2)
+# Qwen3.6-35B — cross-node stage pipeline (M4')
 
-Status: **DRAFT rev 2** — rewritten after the 4-angle rev-1 review
-(adversarial, feasibility-vs-code, scope, external/codex). Successor
-milestone to M3' (`qwen36-moe-support.md`). All numbers measured
-(spikes 1–3, 2026-06-12, fleet nodes A/B) unless marked *extrapolated*.
+Design for running the sharded `qwen36-moe` engine across nodes (peer of
+`ov-runtime` / `gemma4`). Successor to M3' (`qwen36-moe-support.md`).
+Numbers measured on fleet nodes A/B (spikes 1–3, 2026-06-12) unless
+marked *extrapolated*.
 
-## 0. Rev-1 → rev-2 changes (review disposition)
-
-The owner re-framed the goal, which resolves the review's top finding by
-changing the objective rather than defending it:
+## 0. Key decisions
 
 - **Goal is CAPABILITY PARITY, not a perf win.** `ov-runtime` runs
   per-stage shards cross-machine (`--rank/--total/--next`; the llama-8B
@@ -83,7 +80,7 @@ control:  RESET / RESET_ACK frames on the SAME transport session
   rows identical to `t0..t1` in text-only mode, `qwen36.rs:256`).
 - Decode token return reuses the ov-runtime token-return path.
 
-### 3.2 Reset protocol (minimal, review-cut)
+### 3.2 Reset protocol (minimal)
 
 Task admission on A: A resets local state, sends RESET, B resets and
 replies RESET_ACK, A admits. No ack → task fails loud; no retry loop
@@ -92,7 +89,7 @@ caller retries). The admission wait must complete within one `step()`
 call or emit progress — the runner closes streams after 3 consecutive
 empty steps (`cascadia-runner/src/lib.rs:28`).
 
-### 3.3 Task epochs and stale frames (codex finding)
+### 3.3 Task epochs and stale frames
 
 Every frame carries the task epoch (one u32 prefix or folded into the
 position frame). A peer inside a synchronous OV call cannot be
@@ -101,7 +98,7 @@ Cancel/disconnect on either side → epoch bump + RESET exchange before
 the next admit. This is the entire distributed-cancel story; nothing
 fancier is in scope.
 
-### 3.4 Startup handshake (codex finding)
+### 3.4 Startup handshake
 
 Before first admit, A→B exchange: manifest hash, stage range, OV
 version string, wire dtype. Mismatch = refuse to serve, log both sides.
@@ -127,7 +124,7 @@ as sole recovery, no ShardSpec changes). New:
 7. Peer loss mid-task = task failure + position-0 re-entry after
    operator restart. No partial-state serving.
 
-## 5. Deltas (sized honestly per the feasibility review)
+## 5. Deltas
 
 - **Engine (dominant cost — most of the milestone):** per-stage mode in
   `Qwen36Engine`: stage-role dispatch (first/last for 2 stages),
@@ -248,7 +245,7 @@ as sole recovery, no ShardSpec changes). New:
   green → stop, record why in this doc, M3' single-box remains the
   shipped answer. (Probe failing = stop before engine code at all.)
 
-## 7. Risks (re-ranked per review)
+## 7. Risks
 
 1. **Distributed cancel/epoch correctness** — the M3' robustness matrix
    squared. Retired by M4'-1 gate row set (the matrix is named, not a
@@ -340,7 +337,7 @@ prompt set; gate 4 read from the rank-0 wire-histogram log line) and
 and stage1/ from the shard tree (~10 GB); embeddings + tokenizer load on
 rank 0 only.
 
-## 9. Decisions closed (were §8 open questions in rev 1)
+## 9. Decisions closed
 
 - Control channel: same transport session, RESET/RESET_ACK frames.
 - M4'-1 visibility: internal scaffolding until its gate passes.

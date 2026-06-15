@@ -1,20 +1,9 @@
-# Qwen3.6-35B-A3B sharded support — design spec (rev 6)
+# Qwen3.6-35B-A3B sharded support
 
-Status: **M2'-0 PASSED (2026-06-11) — strategy chosen: all-CPU OV-IR
-experts.** Measured full-layer-loop envelope ~17 tok/s on Lunar Lake
-(≥ T=10); the sharded design proceeds to M2'. Details in §5. Single-stage (nonsharded) serving already works
-and is documented separately (`qwen3.6.md`).
-
-Review lineage: rev 1 draft → rev 2 (adversarial+feasibility review:
-dense-MoE cost re-gated, exporter corrected, preconditions pinned) →
-rev 3 (issue #77 alignment) → rev 4 (M1 measured dense-MoE dead; pivot
-to sparse routed dispatch) → rev 5 (review: ISA precondition, corrected
-bandwidth, single-stream honesty) → **rev 6** (4-angle review incl.
-external: "port" framing replaced with new-engine reality, ov_ir
-call-overhead prior added, alternatives section added, benchmark
-protocol defined, stale §2 fixed, M4' cut to conditional). Rev 5's
-detailed exporter/runtime sections live in git history (`b593466`) and
-return only if M2'-0 passes.
+Single-stage (nonsharded) serving works and is hardware-validated
+(`qwen3.6.md`). The cross-node sharded design is below: strategy is
+all-CPU OV-IR experts, measured full-layer-loop envelope ~17 tok/s on
+Lunar Lake.
 
 ## 1. Model facts (verified against config.json + the official IR)
 
@@ -34,12 +23,12 @@ return only if M2'-0 passes.
   MoE op. VLM-layout; vision tower out of scope (text-only).
 - MTP head present; ignored (spec-decode is fenced off — §4.1).
 
-## 2. Where the repo stands today (rev 6: corrected)
+## 2. Where the repo stands today
 
 - `is_moe_config()` **now** rejects this model correctly config-first —
   nested `text_config` unwrap + `qwen3_5_moe` model_type landed on this
   branch (`e01faf4`, TDD'd) with a rejection message pointing at the
-  single-stage path. (Earlier revs described the pre-fix gap; stale.)
+  single-stage path.
 - Single-stage serving works end-to-end via VLMPipeline in the
   `ov-genai` engine (validated 2026-06-11, `qwen3.6.md`).
 - The generic shard exporter and the staged engines have no notion of
@@ -52,7 +41,7 @@ return only if M2'-0 passes.
   dense whole-model int4 via Intel GenAI: 1.27 tok/s greedy, 2.46
   prompt-lookup. Dense-MoE staged execution is dead (stages of this
   graph are strictly slower).
-- **Active-set bandwidth model** (corrected rev 5): ~1.7–1.8 GB/token
+- **Active-set bandwidth model**: ~1.7–1.8 GB/token
   (routed 566 MB + shared 63 MB + attention/DeltaNet/router ~800 MB +
   lm_head 254 MB + int4 scales ~12.5% + state R/W ~60 MB + KV(ctx)).
   Ideal ceiling at 60–90 GB/s: 33–50 tok/s; realistic 15–35. ~10× over
@@ -85,7 +74,7 @@ return only if M2'-0 passes.
 hardware, and is any multi-node arrangement worth it for this model?**
 Nothing below is decided; M2'-0 (§5) decides.
 
-### 4.1 Invariants any candidate must hold (carried from rev 2, still valid)
+### 4.1 Invariants any candidate must hold
 
 1. Batch = 1, one live task per stage (OV stateful vars are
    per-infer-request; DeltaNet state has no position mask to bound
@@ -123,7 +112,7 @@ transitions/token; at 0.25–1 ms each that alone caps 12–50 tok/s.
 All-CPU contends with the (lower) CPU-cluster bandwidth. Placement is a
 measured M2'-0 axis, not a default.
 
-### 4.3 Alternatives to layer-pipeline sharding (rev 6: decision-grade, previously unexamined)
+### 4.3 Alternatives to layer-pipeline sharding
 
 - **Expert parallelism** — shard by EXPERT OWNERSHIP, not layers: every
   node holds the shells + a subset of experts; per layer, the 2048-dim
@@ -166,14 +155,14 @@ costed against convert-with-extensions when the exporter returns.
 
 ### 4.5 Enterprise
 
-Unchanged from rev 2/5: any embedded-engine variant = gossip
+Any embedded-engine variant = gossip
 `/cascadia/gossip/N+1` bump + wire-pin update (ADR-001); enterprise has
 no staged-pipeline precedent; enterprise v1 story for this model stays
 the OVMS whole-model backend. All enterprise sharded work is v1.1+.
 
-## 5. Milestones (rev 6)
+## 5. Milestones
 
-**Benchmark protocol (applies to every gate; rev 6, external review):**
+**Benchmark protocol (applies to every gate):**
 fixed prompt set + context lengths, ≥3 warmup + ≥5 measured runs,
 report median + p10/p90, end-to-end tok/s (not per-stage), kernel/ISA
 path logged AND asserted (new instrumentation — the current fallback is
