@@ -530,6 +530,19 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// Load a whole-model chat template for ov-genai, tolerating both layouts:
+/// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
+/// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
+fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
+    let p = std::path::Path::new(model);
+    let sub = cascadia_api::load_chat_template_config(p);
+    if sub.template.is_some() {
+        sub
+    } else {
+        cascadia_api::load_chat_template_config_at(p)
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -564,11 +577,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             // If the model ships a chat template, the API renders it (honoring
             // enable_thinking) and the engine tells ov-genai to skip its own
             // internal apply. No template → leave ov-genai's apply on.
-            let pretemplated =
-                cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
-                    .template
-                    .is_some();
-            b = b.with_prompt_pretemplated(pretemplated);
+            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
@@ -883,9 +892,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             // ov-genai: render the template API-side so enable_thinking is
             // honored; the engine sets apply_chat_template=false so ov-genai
             // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
-            EngineKind::OvGenai => {
-                cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
-            }
+            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
             // qwen36 surgery trees keep chat_template.jinja at the model
             // root with no tokenizer_config.json.
             EngineKind::Qwen36Moe => cascadia_api::load_chat_template_config_at(
