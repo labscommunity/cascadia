@@ -108,6 +108,10 @@ mod sys {
         pub fn cascadia_genconfig_set_do_sample(cfg: *mut cascadia_genconfig_t, enabled: i32);
         pub fn cascadia_genconfig_set_num_assistant_tokens(cfg: *mut cascadia_genconfig_t, v: u32);
         pub fn cascadia_genconfig_set_max_ngram_size(cfg: *mut cascadia_genconfig_t, v: u32);
+        pub fn cascadia_genconfig_set_apply_chat_template(
+            cfg: *mut cascadia_genconfig_t,
+            enabled: i32,
+        );
 
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
@@ -267,6 +271,10 @@ pub struct GenConfig {
     pub temperature: f32,
     pub num_assistant_tokens: u32,
     pub max_ngram_size: u32,
+    /// When true, the GenAI pipeline skips its internal chat-template apply —
+    /// the caller pre-rendered the template (e.g. to honor enable_thinking).
+    /// Default false = apply (matches OV's `apply_chat_template = true`).
+    pub skip_chat_template: bool,
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).
@@ -447,6 +455,10 @@ impl LlmPipeline {
             if cfg.max_ngram_size > 0 {
                 sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
             }
+            sys::cascadia_genconfig_set_apply_chat_template(
+                raw_cfg,
+                if cfg.skip_chat_template { 0 } else { 1 },
+            );
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(

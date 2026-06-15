@@ -33,6 +33,9 @@ pub struct OvGenaiBuilder {
     pub draft_device: Option<String>,
     pub speculative_k: u32,
     pub prompt_lookup_ngram: u32,
+    /// True when the API pre-renders the model's chat template (so the engine
+    /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
+    pub prompt_pretemplated: bool,
     pipe: Option<LlmPipeline>,
 }
 
@@ -48,8 +51,15 @@ impl OvGenaiBuilder {
             draft_device: None,
             speculative_k: 0,
             prompt_lookup_ngram: 0,
+            prompt_pretemplated: false,
             pipe: None,
         }
+    }
+
+    /// Set when the API renders the chat template itself (template loaded).
+    pub fn with_prompt_pretemplated(mut self, v: bool) -> Self {
+        self.prompt_pretemplated = v;
+        self
     }
 
     pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
@@ -204,6 +214,7 @@ impl Builder for OvGenaiBuilder {
             pipe,
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
+            prompt_pretemplated: self.prompt_pretemplated,
             pending: Vec::new(),
             max_tokens_default: 256,
         }))
@@ -224,6 +235,7 @@ pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
+    prompt_pretemplated: bool,
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
 }
@@ -321,6 +333,9 @@ impl OvGenaiEngine {
             temperature: if do_sample { temperature } else { 0.0 },
             num_assistant_tokens: 0,
             max_ngram_size: 0,
+            // API pre-rendered the template (with enable_thinking) → tell
+            // ov-genai not to re-apply it; else let ov-genai template as before.
+            skip_chat_template: self.prompt_pretemplated,
         };
         if self.speculative_k > 0 {
             cfg.num_assistant_tokens = self.speculative_k;

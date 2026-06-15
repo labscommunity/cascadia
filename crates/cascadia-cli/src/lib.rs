@@ -561,6 +561,14 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
+            // If the model ships a chat template, the API renders it (honoring
+            // enable_thinking) and the engine tells ov-genai to skip its own
+            // internal apply. No template → leave ov-genai's apply on.
+            let pretemplated =
+                cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
+                    .template
+                    .is_some();
+            b = b.with_prompt_pretemplated(pretemplated);
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
@@ -872,11 +880,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // to the legacy "role: content" join if the file or fields are
         // missing.
         let chat_template = match args.engine {
-            // ov-genai pipelines apply the model's chat template
-            // internally (observed: a text suffix appended to the prompt
-            // lands inside the user turn); API-side rendering would
-            // double-wrap. Keep the raw legacy join for this engine.
-            EngineKind::OvGenai => cascadia_api::ChatTemplateConfig::default(),
+            // ov-genai: render the template API-side so enable_thinking is
+            // honored; the engine sets apply_chat_template=false so ov-genai
+            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
+            EngineKind::OvGenai => {
+                cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
+            }
             // qwen36 surgery trees keep chat_template.jinja at the model
             // root with no tokenizer_config.json.
             EngineKind::Qwen36Moe => cascadia_api::load_chat_template_config_at(

@@ -267,6 +267,9 @@ void cascadia_genconfig_set_num_assistant_tokens(cascadia_genconfig_t* cfg, uint
 void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v) {
     if (cfg) cfg->cfg.max_ngram_size = v;
 }
+void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled) {
+    if (cfg) cfg->cfg.apply_chat_template = enabled != 0;
+}
 
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
