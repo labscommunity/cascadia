@@ -16,6 +16,7 @@ pub mod genai;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;
+mod warn_limit;
 
 pub use dist_spec::{
     DistributedMaskedReq, FrameKind, MaskedReq, OvDistSpecBuilder, OvDistSpecEngine,
