@@ -303,9 +303,10 @@ pub struct ActivationServer {
     bind_host: String,
     bind_port: u16,
     listener: Option<TcpListener>,
-    client: Option<TcpStream>,
+    client: Option<ByteStream>,
     accepted_addr: Option<SocketAddr>,
     actual_port: u16,
+    peer_label: String,
 }
 
 impl ActivationServer {
@@ -317,6 +318,22 @@ impl ActivationServer {
             client: None,
             accepted_addr: None,
             actual_port: port,
+            peer_label: String::new(),
+        }
+    }
+
+    /// Build a server around an already-connected injected stream (no
+    /// listener / accept). `peer_label` is logged in place of the peer
+    /// `SocketAddr` the TCP path would have.
+    pub fn from_stream(stream: ByteStream, peer_label: impl std::fmt::Display) -> Self {
+        Self {
+            bind_host: String::new(),
+            bind_port: 0,
+            listener: None,
+            client: Some(stream),
+            accepted_addr: None,
+            actual_port: 0,
+            peer_label: peer_label.to_string(),
         }
     }
 
@@ -341,19 +358,20 @@ impl ActivationServer {
         let (sock, addr) = listener.accept().await?;
         sock.set_nodelay(true).ok();
         info!(peer = %addr, "ActivationServer accepted connection");
-        self.client = Some(sock);
+        self.client = Some(Box::new(sock));
         self.accepted_addr = Some(addr);
+        self.peer_label = addr.to_string();
         Ok(())
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(sock).await
+        recv_tensor(&mut **sock).await
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        send_tensor(&mut **sock, tensor).await
     }
 
     /// Send raw bytes over the established connection. Used by the
@@ -375,7 +393,7 @@ impl ActivationServer {
         }
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact_frame_start(sock, &mut buf).await?;
+        recv_exact_frame_start(&mut **sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -392,7 +410,8 @@ impl ActivationServer {
 pub struct ActivationClient {
     host: String,
     port: u16,
-    sock: Option<TcpStream>,
+    sock: Option<ByteStream>,
+    peer_label: String,
 }
 
 impl ActivationClient {
@@ -401,6 +420,17 @@ impl ActivationClient {
             host: host.into(),
             port,
             sock: None,
+            peer_label: String::new(),
+        }
+    }
+
+    /// Build a client around an already-connected injected stream (no dial).
+    pub fn from_stream(stream: ByteStream, peer_label: impl std::fmt::Display) -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            sock: Some(stream),
+            peer_label: peer_label.to_string(),
         }
     }
 
@@ -427,7 +457,7 @@ impl ActivationClient {
                 Ok(sock) => {
                     sock.set_nodelay(true).ok();
                     info!(host = %self.host, port = self.port, "ActivationClient connected");
-                    self.sock = Some(sock);
+                    self.sock = Some(Box::new(sock));
                     return Ok(());
                 }
                 Err(err) => {
@@ -470,12 +500,12 @@ impl ActivationClient {
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        send_tensor(&mut **sock, tensor).await
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(sock).await
+        recv_tensor(&mut **sock).await
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
@@ -491,7 +521,7 @@ impl ActivationClient {
         }
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact_frame_start(sock, &mut buf).await?;
+        recv_exact_frame_start(&mut **sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -652,5 +682,20 @@ mod tests {
         let got = h.await.unwrap();
         set_activation_timeout_secs(0);
         assert!(got.is_err(), "partial frame then stall must still time out");
+    }
+
+    #[tokio::test]
+    async fn from_stream_pairs_round_trip() {
+        // Server/Client built from injected duplex halves frame a tensor.
+        let (s, c) = tokio::io::duplex(64 * 1024);
+        let mut server = ActivationServer::from_stream(Box::new(s), "peer-A");
+        let mut client = ActivationClient::from_stream(Box::new(c), "peer-B");
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        let h = tokio::spawn(async move { client.send(&tensor).await.unwrap() });
+        let (got, _) = server.recv().await.unwrap();
+        h.await.unwrap();
+        assert_eq!(got.shape, [1, 1, 2]);
+        assert_eq!(got.dtype, DType::F32);
+        assert_eq!(got.data, vec![0, 0, 128, 63, 0, 0, 0, 64]); // byte-exact, not just shape
     }
 }
