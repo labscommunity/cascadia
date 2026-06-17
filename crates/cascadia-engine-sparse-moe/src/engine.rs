@@ -336,6 +336,24 @@ impl Builder for SparseMoEBuilder {
         Ok(())
     }
 
+    async fn connect_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.transport.upstream = Some(Arc::new(TokioMutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"),
+            )));
+        }
+        if let Some(s) = down {
+            self.transport.downstream = Some(Arc::new(TokioMutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"),
+            )));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream> {
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.config.cache_dir {
@@ -768,6 +786,25 @@ impl Engine for SparseMoEEngine {
             });
         }
         self.peer_disconnected = true;
+    }
+
+    fn reattach_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.transport.upstream = Some(Arc::new(TokioMutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"),
+            )));
+            self.peer_disconnected = false; // fresh upstream: un-latch the idle-on-disconnect flag
+        }
+        if let Some(s) = down {
+            self.transport.downstream = Some(Arc::new(TokioMutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"),
+            )));
+        }
+        Ok(())
     }
 }
 
