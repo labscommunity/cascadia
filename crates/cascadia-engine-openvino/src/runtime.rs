@@ -1019,6 +1019,7 @@ impl OvRuntimeEngine {
                 logprobs: None,
                 n_tokens: None,
                 prompt_tokens: None,
+                error: None,
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)

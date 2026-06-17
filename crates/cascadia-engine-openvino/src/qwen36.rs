@@ -750,12 +750,16 @@ impl Qwen36Engine {
             let task = self.pending.remove(0);
             if let Some(reason) = &self.poisoned {
                 warn!(task = %task.task_id, reason = %reason, "qwen36: refusing task (handshake mismatch)");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                let reason = format!("qwen36 pipeline poisoned by handshake mismatch: {reason}");
+                return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
             }
             if !self.handshake_done {
                 if let Err(e) = self.handshake_a() {
                     warn!(task = %task.task_id, error = %e, "qwen36: handshake failed");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
                 }
             }
             // Admission (spec §3.2): reset local state, bump the epoch,
@@ -764,14 +768,18 @@ impl Qwen36Engine {
             self.epoch = self.epoch.wrapping_add(1);
             if let Err(e) = self.reset_exchange() {
                 warn!(task = %task.task_id, error = %e, "qwen36: admission reset failed");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, e.to_string()),
+                )];
             }
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
             let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    let reason = format!("tokenize failed: {e}");
+                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
             if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
@@ -1094,7 +1102,8 @@ impl Qwen36Engine {
                 Ok(e) => e.get_ids().to_vec(),
                 Err(e) => {
                     warn!(task = %task.task_id, error = %e, "tokenize failed");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    let reason = format!("tokenize failed: {e}");
+                    return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
                 }
             };
             if !task.enable_thinking && !task.prompt.trim_end().ends_with("</think>") {
@@ -1355,6 +1364,27 @@ mod tests {
         let b = bare_engine(3, "{}");
         let reason = b.validate_hello(&a.hello_payload());
         assert!(reason.is_some_and(|r| r.contains("stage count")));
+    }
+
+    #[test]
+    fn poisoned_head_emits_error_chunk_not_empty_success() {
+        // C1: a NAK'd handshake poisons the head; the next admitted task
+        // must fail LOUD (carry an error) instead of returning an empty
+        // final_marker that reads as a successful empty completion.
+        let mut e = bare_engine(2, "{}");
+        e.rank = 0;
+        e.poisoned = Some("manifest mismatch between ranks".into());
+        e.pending.push(GenerationTask::new("t0", "hello"));
+
+        let out = e.step_pipe_first();
+        assert_eq!(out.len(), 1);
+        let (_, chunk) = &out[0];
+        assert!(chunk.is_final, "error chunk must still terminate the task");
+        assert!(
+            chunk.error.is_some(),
+            "poisoned head must emit an error chunk, got a silent empty success"
+        );
+        assert!(chunk.error.as_deref().unwrap().contains("manifest"));
     }
 
     #[test]

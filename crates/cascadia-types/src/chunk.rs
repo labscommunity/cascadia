@@ -42,6 +42,16 @@ pub struct Chunk {
     /// it (the API's usage block reads it; None = engine can't tell).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u32>,
+    /// Set when a task terminates by FAILURE rather than completion. The
+    /// `step()` API returns `Vec<(TaskId, Chunk)>` — not a `Result` — so a
+    /// final chunk is the only "task is done" signal an engine can emit.
+    /// Without this, a failed task is indistinguishable from a successful
+    /// empty completion: consumers see `is_final && text == ""` and answer
+    /// HTTP 200. An error chunk still sets `is_final` (old consumers end the
+    /// stream as before, no regression); new consumers check this and fail
+    /// loud (5xx). `None` on every normal token/final chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl Chunk {
@@ -54,6 +64,7 @@ impl Chunk {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            error: None,
         }
     }
 
@@ -66,6 +77,23 @@ impl Chunk {
             logprobs: None,
             n_tokens: None,
             prompt_tokens: None,
+            error: None,
+        }
+    }
+
+    /// A final chunk that marks the task FAILED (not completed). Carries the
+    /// failure reason so the API layer can return a 5xx instead of a 200 with
+    /// empty content. `is_final` is set so legacy consumers still terminate.
+    pub fn error(task_id: impl Into<TaskId>, reason: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            token_id: 0,
+            text: String::new(),
+            is_final: true,
+            logprobs: None,
+            n_tokens: None,
+            prompt_tokens: None,
+            error: Some(reason.into()),
         }
     }
 

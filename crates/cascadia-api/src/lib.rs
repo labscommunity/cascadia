@@ -533,6 +533,19 @@ async fn chat_completions(
     let mut completion_tokens: u32 = 0;
     let mut prompt_tokens: u32 = 0;
     while let Some(chunk) = chunk_stream.next().await {
+        // A failed task carries `error` on its final chunk. Without this
+        // branch the empty text below would build a normal 200 with empty
+        // content — indistinguishable from "the model said nothing". Fail
+        // loud with a 5xx instead (e.g. a sharded chain poisoned by a
+        // handshake/manifest mismatch).
+        if let Some(reason) = &chunk.error {
+            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
         if !chunk.is_final {
             buf.push_str(&chunk.text);
             completion_tokens += chunk.n_tokens.unwrap_or(1);
@@ -610,6 +623,21 @@ async fn stream_completion(
             let model = model.clone();
             let task_id = task_id.clone();
             async move {
+                // A failed task carries `error` on its final chunk. The 200
+                // headers are already on the wire by the time the body
+                // streams, so unlike the non-streaming path we cannot
+                // downgrade to a 5xx here. Surface the failure as an explicit
+                // SSE error event instead of a silent empty delta + [DONE].
+                if let Some(reason) = &chunk.error {
+                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                    let payload = serde_json::json!({
+                        "id": task_id,
+                        "object": "error",
+                        "error": { "message": reason, "type": "engine_error" },
+                    });
+                    tokio::task::yield_now().await;
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                }
                 // Custom (non-OpenAI) `n_tokens` field: how many model
                 // tokens this chunk carries. Spec-decode emits 1..=K+1
                 // tokens per chunk; downstream tok/s would be wrong if
@@ -786,6 +814,37 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[tokio::test]
+    async fn failed_task_returns_5xx_not_empty_200() {
+        // C1 regression: a task the engine FAILS (here via the mock's
+        // `__engine_error__` sentinel, standing in for a qwen36 handshake
+        // NAK) must surface as a 5xx, not a 200 with empty content.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "__engine_error__"}],
+            "stream": false,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("mock injected"),
+            "5xx body should carry the engine's failure reason, got {v}"
+        );
     }
 
     #[test]

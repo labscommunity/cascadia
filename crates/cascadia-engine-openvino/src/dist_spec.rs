@@ -1300,6 +1300,7 @@ impl Engine for OvDistSpecEngine {
                         logprobs: None,
                         n_tokens: Some(1),
                         prompt_tokens: None,
+                        error: None,
                     },
                 )]
             }
@@ -1330,6 +1331,7 @@ impl Engine for OvDistSpecEngine {
                                 logprobs: None,
                                 n_tokens: Some(n_tokens),
                                 prompt_tokens: None,
+                                error: None,
                             },
                         )]
                     }
@@ -1502,6 +1504,7 @@ impl OvDistSpecEngine {
                 logprobs: None,
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
                 prompt_tokens: None,
+                error: None,
             },
         )]
     }
