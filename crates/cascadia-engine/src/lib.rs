@@ -14,6 +14,7 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use cascadia_transport::ByteStream;
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use thiserror::Error;
@@ -62,6 +63,28 @@ mod error_tests {
         let e = EngineError::StreamInjectionUnsupported;
         assert_eq!(e.to_string(), "stream injection unsupported by this engine");
     }
+
+    struct OptOut;
+    impl Engine for OptOut {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _t: GenerationTask) -> EngineResult<()> {
+            Ok(())
+        }
+        fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn reattach_default_none_none_is_ok_but_some_is_unsupported() {
+        let mut e = OptOut;
+        assert!(e.reattach_streams(None, None).is_ok());
+        let s: cascadia_transport::ByteStream = Box::new(tokio::io::duplex(8).0);
+        assert!(matches!(
+            e.reattach_streams(Some(s), None),
+            Err(EngineError::StreamInjectionUnsupported)
+        ));
+    }
 }
 
 /// Stream of load-progress events yielded by [`Builder::load`].
@@ -92,6 +115,23 @@ pub trait Engine: Send {
 
     /// Tear down the engine. Idempotent.
     fn close(&mut self) {}
+
+    /// Re-attach a fresh stream pair to a LIVE engine after one died, without
+    /// reloading weights. `Some` replaces that side (old dropped); `None`
+    /// leaves it. `(None, None)` is an Ok no-op on every engine. Sync + no
+    /// `block_on`: it only swaps stored handles. Default: opt out — `Ok` for
+    /// `(None, None)`, else `StreamInjectionUnsupported`.
+    fn reattach_streams(
+        &mut self,
+        up: Option<ByteStream>,
+        down: Option<ByteStream>,
+    ) -> EngineResult<()> {
+        if up.is_none() && down.is_none() {
+            Ok(())
+        } else {
+            Err(EngineError::StreamInjectionUnsupported)
+        }
+    }
 }
 
 /// Builder-side: lifecycle of an [`Engine`] from CLI args → configured
@@ -109,6 +149,21 @@ pub trait Builder: Send {
 
     /// Load model weights. Streams progress events.
     async fn load(&mut self, shard: ShardSpec) -> EngineResult<LoadStream>;
+
+    /// Initial inject: wire up to peers via embedder-supplied streams instead
+    /// of dialing/binding TCP. `None` = no peer on that side. Default: opt out
+    /// — `Ok` for `(None, None)`, else `StreamInjectionUnsupported`.
+    async fn connect_streams(
+        &mut self,
+        up: Option<ByteStream>,
+        down: Option<ByteStream>,
+    ) -> EngineResult<()> {
+        if up.is_none() && down.is_none() {
+            Ok(())
+        } else {
+            Err(EngineError::StreamInjectionUnsupported)
+        }
+    }
 
     /// Construct the live engine. Must be called *after* `connect` + `load`.
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>>;

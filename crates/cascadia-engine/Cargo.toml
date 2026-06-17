@@ -8,6 +8,10 @@ description = "Engine + Builder traits — the plugin interface every inference 
 
 [dependencies]
 cascadia-types = { workspace = true }
+cascadia-transport = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies] # reattach_streams test uses tokio::io::duplex
+tokio = { workspace = true }
