@@ -684,11 +684,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
-        EngineKind::Qwen36Moe => {
-            Ok(Box::new(
-                Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
-            ))
-        }
+        EngineKind::Qwen36Moe => Ok(Box::new(
+            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+        )),
     }
 }
 
@@ -895,9 +893,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::OvGenai => ovgenai_chat_template(&args.model),
             // qwen36 surgery trees keep chat_template.jinja at the model
             // root with no tokenizer_config.json.
-            EngineKind::Qwen36Moe => cascadia_api::load_chat_template_config_at(
-                std::path::Path::new(&args.model),
-            ),
+            EngineKind::Qwen36Moe => {
+                cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
+            }
             _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
         };
         if chat_template.template.is_some() {
@@ -1168,13 +1166,12 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
     }
     // qwen3_5_moe shards run the in-process stage chain, not the
     // per-stage worker mesh; give the right invocation per manifest arch.
-    let arch = std::fs::read_to_string(
-        std::path::Path::new(&args.output_dir).join("manifest.json"),
-    )
-    .ok()
-    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    .and_then(|v| v["arch"].as_str().map(String::from))
-    .unwrap_or_default();
+    let arch =
+        std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["arch"].as_str().map(String::from))
+            .unwrap_or_default();
     if arch == "qwen3_5_moe" {
         eprintln!(
             "\nShard tree written to {}. Run with:\n  cascadia run {} \

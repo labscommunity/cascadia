@@ -635,16 +635,19 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("rank 0 has no downstream".into()))?;
         let h = self.handle()?;
-        run_async(&h, reply_bounded(async move {
-            let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
-            let hb = g.recv_raw(12).await?;
-            let (kind, e, _) = parse_header(&hb);
-            if kind != FRAME_RESET_ACK || e != epoch {
-                return Err(TransportError::SocketClosed);
-            }
-            Ok(())
-        }))
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_RESET_ACK || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(())
+            }),
+        )
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
@@ -668,22 +671,25 @@ impl Qwen36Engine {
             [1, n as u32, HIDDEN as u32],
             le_bytes_f32(hidden),
         );
-        run_async(&h, reply_bounded(async move {
-            let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
-                .await?;
-            g.send(&tensor).await?;
-            let hb = g.recv_raw(12).await?;
-            let (kind, e, _) = parse_header(&hb);
-            if kind != FRAME_TOKEN || e != epoch {
-                return Err(TransportError::SocketClosed);
-            }
-            let tb = g.recv_raw(8).await?;
-            Ok((
-                i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
-                u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
-            ))
-        }))
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
+                    .await?;
+                g.send(&tensor).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_TOKEN || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                let tb = g.recv_raw(8).await?;
+                Ok((
+                    i32::from_be_bytes([tb[0], tb[1], tb[2], tb[3]]),
+                    u32::from_be_bytes([tb[4], tb[5], tb[6], tb[7]]),
+                ))
+            }),
+        )
         .map_err(map_wire)
     }
 
@@ -713,24 +719,27 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
         let payload = payload.to_vec();
-        run_async(&h, reply_bounded(async move {
-            let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
-            g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
-            g.send_raw(&payload).await?;
-            let hb = g.recv_raw(12).await?;
-            let (kind, _, _) = parse_header(&hb);
-            match kind {
-                FRAME_HELLO_ACK => Ok(None),
-                FRAME_HELLO_NAK => {
-                    let lb = g.recv_raw(4).await?;
-                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
-                    let rb = g.recv_raw(n).await?;
-                    Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_HELLO, 0, 0)).await?;
+                g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
+                g.send_raw(&payload).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, _, _) = parse_header(&hb);
+                match kind {
+                    FRAME_HELLO_ACK => Ok(None),
+                    FRAME_HELLO_NAK => {
+                        let lb = g.recv_raw(4).await?;
+                        let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                        let rb = g.recv_raw(n).await?;
+                        Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
+                    }
+                    other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
                 }
-                other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
-            }
-        }))
+            }),
+        )
         .map_err(map_wire)
     }
 
@@ -741,16 +750,19 @@ impl Qwen36Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
-        run_async(&h, reply_bounded(async move {
-            let mut g = downstream.lock().await;
-            g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
-            let hb = g.recv_raw(12).await?;
-            let (kind, e, _) = parse_header(&hb);
-            if kind != FRAME_RESET_ACK || e != epoch {
-                return Err(TransportError::SocketClosed);
-            }
-            Ok(())
-        }))
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_RESET, epoch, 0)).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, e, _) = parse_header(&hb);
+                if kind != FRAME_RESET_ACK || e != epoch {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(())
+            }),
+        )
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 

@@ -46,7 +46,11 @@ async fn soak_frames_with_idle_gaps_survive_and_stay_in_sync() {
     let got = h.await.unwrap();
     set_activation_timeout_secs(0);
     let got = got.expect("all frames must survive idle gaps");
-    assert_eq!(got, (0..30u8).collect::<Vec<_>>(), "frames lost or desynced");
+    assert_eq!(
+        got,
+        (0..30u8).collect::<Vec<_>>(),
+        "frames lost or desynced"
+    );
 }
 
 /// Full header + partial body then stall: mid-frame timeout must still fire.

@@ -407,18 +407,18 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bo
     let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
     if !defer_to_engine {
         if let Some(env) = &state.chat_env {
-        match render_with_chat_env(
-            env,
-            messages,
-            &state.bos_token,
-            &state.eos_token,
-            enable_thinking,
-        ) {
-            Ok(s) => return s,
-            Err(e) => {
-                warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+            match render_with_chat_env(
+                env,
+                messages,
+                &state.bos_token,
+                &state.eos_token,
+                enable_thinking,
+            ) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                }
             }
-        }
         }
     }
     render_prompt_legacy(messages)

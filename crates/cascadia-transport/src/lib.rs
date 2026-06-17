@@ -498,7 +498,10 @@ mod tests {
     #[test]
     fn recv_timeout_precedence_config_over_env_over_default() {
         // explicit config override (node.toml) wins over env + default
-        assert_eq!(resolve_recv_timeout(120, Some(30)), Duration::from_secs(120));
+        assert_eq!(
+            resolve_recv_timeout(120, Some(30)),
+            Duration::from_secs(120)
+        );
         // no config -> env wins over default
         assert_eq!(resolve_recv_timeout(0, Some(90)), Duration::from_secs(90));
         // neither -> 60s default

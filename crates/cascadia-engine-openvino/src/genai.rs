@@ -242,7 +242,9 @@ pub struct OvGenaiEngine {
 
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
-        let cfg = self.gen_config(/*max_tokens*/ 4, /*temperature*/ 0.0, /*enable_thinking*/ false);
+        let cfg = self.gen_config(
+            /*max_tokens*/ 4, /*temperature*/ 0.0, /*enable_thinking*/ false,
+        );
         match self.pipe.generate("Hi", &cfg) {
             Ok(_) => info!(
                 spec_k = self.speculative_k,
