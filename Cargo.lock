@@ -315,9 +315,11 @@ name = "cascadia-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cascadia-transport",
  "cascadia-types",
  "futures",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -326,6 +328,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cascadia-engine",
+ "cascadia-transport",
  "cascadia-types",
  "futures",
  "tokio",
