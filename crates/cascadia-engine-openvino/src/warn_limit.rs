@@ -2,8 +2,11 @@
 //!
 //! A persistently-failing `Engine::step()` driven by the relay loop logs
 //! one WARN per call (~90k/s when the upstream connection drops and recv
-//! fast-errors), which grew a node's chain.log to 770 GB. Used by every
-//! OpenVINO engine's `step()` so the flood is bounded identically.
+//! fast-errors), which grew a node's chain.log to 770 GB. Used by the
+//! relay-loop engines that fast-error without their own backoff —
+//! `OvRuntimeEngine` and `Gemma4Engine` — so both bound the flood
+//! identically. (`qwen36` already self-throttles with a sleep; `dist_spec`
+//! is the speculative-decode engine.)
 
 /// Rate-limits the per-call "step failed" WARN. First failure of a streak
 /// logs in full; later ones are counted and surfaced as a periodic "still
