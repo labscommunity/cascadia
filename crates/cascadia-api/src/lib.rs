@@ -475,6 +475,19 @@ async fn chat_completions(
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let prompt = render_prompt(&state, &req.messages, req.enable_thinking);
+    // Degenerate input (no messages, or a render that collapses to nothing)
+    // is a client error. Reject here with 400 rather than admitting an empty
+    // prompt to the engine, which would generate nothing and return a 200
+    // with empty content — indistinguishable from a real failure.
+    if prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no prompt content: `messages` is empty or rendered to an empty prompt"
+            })),
+        )
+            .into_response();
+    }
     if prompt.len() > state.max_prompt_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -814,6 +827,31 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    #[tokio::test]
+    async fn empty_messages_returns_400_not_empty_200() {
+        // Degenerate input (no messages → empty rendered prompt) is a client
+        // error: reject with 400 at the API rather than admitting it to the
+        // engine and returning a 200 with empty content.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [],
+            "stream": false,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
