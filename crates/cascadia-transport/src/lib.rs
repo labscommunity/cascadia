@@ -326,6 +326,7 @@ impl ActivationServer {
     /// listener / accept). `peer_label` is logged in place of the peer
     /// `SocketAddr` the TCP path would have.
     pub fn from_stream(stream: ByteStream, peer_label: impl std::fmt::Display) -> Self {
+        info!(peer = %peer_label, "activation stream injected");
         Self {
             bind_host: String::new(),
             bind_port: 0,
@@ -365,8 +366,12 @@ impl ActivationServer {
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let label = self.peer_label.clone();
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(&mut **sock).await
+        recv_tensor(&mut **sock).await.map_err(|e| {
+            warn!(peer = %label, error = %e, "activation recv failed");
+            e
+        })
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
@@ -426,6 +431,7 @@ impl ActivationClient {
 
     /// Build a client around an already-connected injected stream (no dial).
     pub fn from_stream(stream: ByteStream, peer_label: impl std::fmt::Display) -> Self {
+        info!(peer = %peer_label, "activation stream injected");
         Self {
             host: String::new(),
             port: 0,
@@ -504,8 +510,12 @@ impl ActivationClient {
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        let label = self.peer_label.clone();
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        recv_tensor(&mut **sock).await
+        recv_tensor(&mut **sock).await.map_err(|e| {
+            warn!(peer = %label, error = %e, "activation recv failed");
+            e
+        })
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
