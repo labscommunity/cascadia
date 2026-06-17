@@ -573,6 +573,20 @@ impl Qwen36Engine {
         )]
     }
 
+    /// Terminate the active task as FAILED rather than completed: clear
+    /// engine state (as `finalize` does) but emit an error chunk so the
+    /// API returns a 5xx instead of a 200 with whatever partial text was
+    /// streamed. For mid-generation backend/wire errors that previously
+    /// fell through to `finalize` and read as a clean (empty/partial)
+    /// success.
+    fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
+        let Some(t) = self.active.take() else {
+            return Vec::new();
+        };
+        self.reset_all();
+        vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
+    }
+
     // -------- pipeline mode (M4'-1) --------
 
     fn handle(&self) -> EngineResult<tokio::runtime::Handle> {
@@ -846,7 +860,7 @@ impl Qwen36Engine {
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "pipeline prefill failed");
-                        return self.finalize();
+                        return self.finalize_error(format!("pipeline prefill failed: {e}"));
                     }
                 }
             }
@@ -889,7 +903,7 @@ impl Qwen36Engine {
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "pipeline decode failed");
-                    self.finalize()
+                    self.finalize_error(format!("pipeline decode failed: {e}"))
                 }
             }
         }
@@ -1166,7 +1180,7 @@ impl Qwen36Engine {
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "prefill failed");
-                        return self.finalize();
+                        return self.finalize_error(format!("prefill failed: {e}"));
                     }
                 }
             }
@@ -1214,7 +1228,7 @@ impl Qwen36Engine {
                 }
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "decode failed");
-                    self.finalize()
+                    self.finalize_error(format!("decode failed: {e}"))
                 }
             }
         }
@@ -1385,6 +1399,37 @@ mod tests {
             "poisoned head must emit an error chunk, got a silent empty success"
         );
         assert!(chunk.error.as_deref().unwrap().contains("manifest"));
+    }
+
+    #[test]
+    fn finalize_error_emits_error_chunk_and_clears_active() {
+        // A mid-generation backend/wire failure must terminate the task as
+        // FAILED (error chunk + state cleared), not fall through to a clean
+        // `finalize` that reads as an empty/partial success.
+        let mut e = bare_engine(2, "{}");
+        e.active = Some(ActiveTask {
+            task_id: "t0".into(),
+            prompt_ids: vec![1, 2, 3],
+            prefill_idx: 3,
+            step: 4,
+            logits: Vec::new(),
+            next_token: Some(5),
+            gen_ids: vec![5],
+            emitted: 0,
+            max_tokens: 16,
+            started: Instant::now(),
+            wire_ms: Vec::new(),
+        });
+
+        let out = e.finalize_error("pipeline decode failed: wire closed".into());
+        assert_eq!(out.len(), 1);
+        let (_, chunk) = &out[0];
+        assert!(chunk.is_final);
+        assert_eq!(
+            chunk.error.as_deref(),
+            Some("pipeline decode failed: wire closed")
+        );
+        assert!(e.active.is_none(), "failed task must clear active state");
     }
 
     #[test]
