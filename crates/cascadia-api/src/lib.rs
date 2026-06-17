@@ -632,6 +632,8 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
         EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
         EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        EngineError::StreamInjectionUnsupported => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }

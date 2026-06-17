@@ -19,6 +19,7 @@ use futures::Stream;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
@@ -46,9 +47,22 @@ pub enum EngineError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("stream injection unsupported by this engine")]
+    StreamInjectionUnsupported,
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    #[test]
+    fn stream_injection_unsupported_displays() {
+        let e = EngineError::StreamInjectionUnsupported;
+        assert_eq!(e.to_string(), "stream injection unsupported by this engine");
+    }
+}
 
 /// Stream of load-progress events yielded by [`Builder::load`].
 pub type LoadStream = Pin<Box<dyn Stream<Item = LoadProgress> + Send>>;
