@@ -45,7 +45,10 @@ impl MockEngine {
         let up = self.upstream.clone().ok_or(EngineError::NotConnected)?;
         handle.block_on(async move {
             let mut g = up.lock().await;
-            let (t, _) = g.recv().await.map_err(|e| EngineError::Backend(e.to_string()))?;
+            let (t, _) = g
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
             Ok(t.data.len())
         })
     }
@@ -79,12 +82,21 @@ impl Engine for MockEngine {
         vec![(task_id, chunk)]
     }
 
-    fn reattach_streams(&mut self, up: Option<ByteStream>, down: Option<ByteStream>) -> EngineResult<()> {
+    fn reattach_streams(
+        &mut self,
+        up: Option<ByteStream>,
+        down: Option<ByteStream>,
+    ) -> EngineResult<()> {
         if let Some(s) = up {
-            self.upstream = Some(Arc::new(Mutex::new(ActivationServer::from_stream(s, "mock-up"))));
+            self.upstream = Some(Arc::new(Mutex::new(ActivationServer::from_stream(
+                s, "mock-up",
+            ))));
         }
         if let Some(s) = down {
-            self.downstream = Some(Arc::new(Mutex::new(ActivationClient::from_stream(s, "mock-down"))));
+            self.downstream = Some(Arc::new(Mutex::new(ActivationClient::from_stream(
+                s,
+                "mock-down",
+            ))));
         }
         Ok(())
     }
@@ -128,12 +140,21 @@ impl Builder for MockBuilder {
         Ok(Box::pin(stream::iter(progress)))
     }
 
-    async fn connect_streams(&mut self, up: Option<ByteStream>, down: Option<ByteStream>) -> EngineResult<()> {
+    async fn connect_streams(
+        &mut self,
+        up: Option<ByteStream>,
+        down: Option<ByteStream>,
+    ) -> EngineResult<()> {
         if let Some(s) = up {
-            self.upstream = Some(Arc::new(Mutex::new(ActivationServer::from_stream(s, "mock-up"))));
+            self.upstream = Some(Arc::new(Mutex::new(ActivationServer::from_stream(
+                s, "mock-up",
+            ))));
         }
         if let Some(s) = down {
-            self.downstream = Some(Arc::new(Mutex::new(ActivationClient::from_stream(s, "mock-down"))));
+            self.downstream = Some(Arc::new(Mutex::new(ActivationClient::from_stream(
+                s,
+                "mock-down",
+            ))));
         }
         self.connected = true;
         Ok(())
@@ -206,21 +227,34 @@ mod tests {
         let mut e = MockEngine::new();
         e.submit(GenerationTask::new("t1", "hello world")).unwrap(); // state that must survive
         let (peer1, es1) = tokio::io::duplex(64 * 1024);
-        e.reattach_streams(Some(Box::new(es1) as ByteStream), None).unwrap();
+        e.reattach_streams(Some(Box::new(es1) as ByteStream), None)
+            .unwrap();
         drop(peer1); // kill stream #1
         let (peer2, es2) = tokio::io::duplex(64 * 1024);
-        e.reattach_streams(Some(Box::new(es2) as ByteStream), None).unwrap();
-        assert!(e.has_upstream() && !e.has_downstream(), "per-direction: downstream untouched");
+        e.reattach_streams(Some(Box::new(es2) as ByteStream), None)
+            .unwrap();
+        assert!(
+            e.has_upstream() && !e.has_downstream(),
+            "per-direction: downstream untouched"
+        );
         assert_eq!(e.pending_len(), 1, "engine state survives the re-pair");
         let mut peer2_client = ActivationClient::from_stream(Box::new(peer2), "test-peer");
         let send = tokio::spawn(async move {
-            peer2_client.send(&Tensor::from_2d(DType::F32, 1, 1, vec![0, 0, 128, 63])).await.unwrap();
+            peer2_client
+                .send(&Tensor::from_2d(DType::F32, 1, 1, vec![0, 0, 128, 63]))
+                .await
+                .unwrap();
         });
         let handle = tokio::runtime::Handle::current();
         let n = tokio::task::spawn_blocking(move || e.recv_once_upstream(&handle))
-            .await.unwrap().expect("recv on the re-attached upstream must succeed");
+            .await
+            .unwrap()
+            .expect("recv on the re-attached upstream must succeed");
         send.await.unwrap();
-        assert_eq!(n, 4, "received the 4-byte f32 payload over the fresh stream");
+        assert_eq!(
+            n, 4,
+            "received the 4-byte f32 payload over the fresh stream"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -228,14 +262,18 @@ mod tests {
         use cascadia_transport::ByteStream;
         let (peer, engine_side) = tokio::io::duplex(64 * 1024);
         let mut e = MockEngine::new();
-        e.reattach_streams(Some(Box::new(engine_side) as ByteStream), None).unwrap();
+        e.reattach_streams(Some(Box::new(engine_side) as ByteStream), None)
+            .unwrap();
         assert!(e.has_upstream(), "precondition: upstream actually attached");
         drop(peer); // peer dies -> EOF on the engine read half
         let handle = tokio::runtime::Handle::current();
         let res = tokio::task::spawn_blocking(move || e.recv_once_upstream(&handle))
-            .await.unwrap();
-        assert!(matches!(res, Err(EngineError::Backend(_))),
-            "dead upstream must surface a recv error, got {res:?}");
+            .await
+            .unwrap();
+        assert!(
+            matches!(res, Err(EngineError::Backend(_))),
+            "dead upstream must surface a recv error, got {res:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,16 +281,26 @@ mod tests {
         use cascadia_transport::{ActivationClient, ByteStream, DType, Tensor};
         let (peer, engine_side) = tokio::io::duplex(64 * 1024);
         let mut b = MockBuilder::new();
-        b.connect_streams(Some(Box::new(engine_side) as ByteStream), None).await.unwrap();
+        b.connect_streams(Some(Box::new(engine_side) as ByteStream), None)
+            .await
+            .unwrap();
         let mut e = b.into_engine(); // the exact move build() performs
-        assert!(e.has_upstream() && !e.has_downstream(), "connect_streams installed only upstream");
+        assert!(
+            e.has_upstream() && !e.has_downstream(),
+            "connect_streams installed only upstream"
+        );
         let mut peer_client = ActivationClient::from_stream(Box::new(peer), "test-peer");
         let send = tokio::spawn(async move {
-            peer_client.send(&Tensor::from_2d(DType::F32, 1, 1, vec![0, 0, 128, 63])).await.unwrap();
+            peer_client
+                .send(&Tensor::from_2d(DType::F32, 1, 1, vec![0, 0, 128, 63]))
+                .await
+                .unwrap();
         });
         let handle = tokio::runtime::Handle::current();
         let n = tokio::task::spawn_blocking(move || e.recv_once_upstream(&handle))
-            .await.unwrap().expect("engine built via connect_streams must recv over the injected stream");
+            .await
+            .unwrap()
+            .expect("engine built via connect_streams must recv over the injected stream");
         send.await.unwrap();
         assert_eq!(n, 4);
     }
