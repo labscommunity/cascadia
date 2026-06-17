@@ -154,8 +154,8 @@ Two profiles:
 # Stub mode (no OV link). Engines that need OV return a clean runtime error.
 cargo build --release -p cascadia
 
-# Real OV (Intel hardware). Requires the OpenVINO GenAI 2026.1 SDK download.
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0_x86_64 \
+# Real OV (Intel hardware). Requires the OpenVINO GenAI 2026.2 SDK download.
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0_x86_64 \
   cargo build --release -p cascadia --features openvino
 ```
 

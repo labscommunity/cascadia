@@ -42,7 +42,7 @@ First get OpenVINO set up — see **[INSTALL.md](INSTALL.md)** (C++ toolchain,
 the GenAI SDK, and on Linux the GPU runtime stack). Then:
 
 ```bash
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_2026.1.0.0 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 
 # Confirm OpenVINO can see your GPU (not just CPU):

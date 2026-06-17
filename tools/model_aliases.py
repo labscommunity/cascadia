@@ -45,6 +45,12 @@ ALIASES: dict[str, str] = {
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-8b": "Qwen/Qwen3-8B",
 
+    # Qwen 3.5 / 3.6 hybrid MoE (qwen3_5_moe) — single-stage `ov-genai`
+    # (OV >= 2026.2), or staged via `cascadia shard` + `--engine
+    # qwen36-moe` (IR surgery on the official int4 IR, #77).
+    "qwen3.5-35b": "Qwen/Qwen3.5-35B-A3B",
+    "qwen3.6-35b": "Qwen/Qwen3.6-35B-A3B",
+
     # Phi-3 / Phi-4 — partial rotary handled by export_shards.py (#69).
     "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
     "phi-4": "microsoft/phi-4",

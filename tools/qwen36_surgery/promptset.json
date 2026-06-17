@@ -1,0 +1,11 @@
+{
+  "comment": "Fixed prompt set for Qwen3.6-35B serving validation (#77 Path-1). Greedy, enable_thinking=false for assertable outputs except the last. 'expect' = substring that must appear in content (case-insensitive). True HF bf16 reference parity is NOT possible on this fleet (35B bf16 needs ~70GB+); this set gates coherence + factual correctness + cross-path (ov-genai vs qwen36-moe staged) consistency instead.",
+  "prompts": [
+    {"id": "capital", "content": "What is the capital of France? Answer with one word.", "max_tokens": 16, "thinking": false, "expect": "paris"},
+    {"id": "math", "content": "What is 17 + 25? Answer with just the number.", "max_tokens": 16, "thinking": false, "expect": "42"},
+    {"id": "code", "content": "Write a Python function that returns the square of a number. Code only.", "max_tokens": 64, "thinking": false, "expect": "def"},
+    {"id": "instruct", "content": "Say exactly: HELLO CASCADIA", "max_tokens": 16, "thinking": false, "expect": "hello cascadia"},
+    {"id": "science", "content": "What gas do plants absorb from the atmosphere during photosynthesis? One short answer.", "max_tokens": 24, "thinking": false, "expect": "carbon dioxide"},
+    {"id": "thinking", "content": "Is 97 a prime number? Explain briefly.", "max_tokens": 200, "thinking": true, "expect": "prime"}
+  ]
+}

@@ -25,9 +25,9 @@ Cascadia is a Cargo workspace at the repo root. Two build modes:
 # Engines that need OV will return a clean runtime error.
 cargo build --release -p cascadia
 
-# Real OV mode — links against openvino-genai 2026.1.0+. Required to run
+# Real OV mode — links against openvino-genai 2026.2.0+. Required to run
 # the OV engines on real Intel hardware.
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 ```
 
@@ -38,7 +38,7 @@ The resulting binary lands at `target/release/cascadia` (`cascadia.exe` on Windo
 Build prerequisites:
 
 - Rust 1.85+ (`rustup default stable`)
-- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK ([INSTALL.md](INSTALL.md) has the download links and the Linux GPU runtime steps)
+- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.2+ SDK ([INSTALL.md](INSTALL.md) has the download links and the Linux GPU runtime steps)
 
 > After building, run **`cascadia doctor`**. It checks your toolchain and — crucially — tells you whether OpenVINO can actually see your GPU. On Intel AI PCs the GPU can be invisible to OpenVINO even with a working driver, and that failure is otherwise silent (you just get slow CPU inference). `doctor` makes it loud and tells you how to fix it.
 
