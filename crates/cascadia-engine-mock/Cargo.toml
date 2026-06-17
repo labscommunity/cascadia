@@ -9,8 +9,7 @@ description = "Mock engine for tests — deterministic per-token output without 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-transport = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true }   # recv_once_upstream/reattach_streams use tokio::sync::Mutex + runtime::Handle in non-test code
