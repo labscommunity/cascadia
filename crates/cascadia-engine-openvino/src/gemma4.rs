@@ -1000,6 +1000,22 @@ impl Engine for Gemma4Engine {
         }
     }
 
+    fn reattach_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"))));
+        }
+        if let Some(s) = down {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"))));
+        }
+        Ok(())
+    }
+
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if !self.spec.is_first_stage {
             warn!("gemma4 submit() ignored on non-first stage");
@@ -1157,6 +1173,22 @@ impl Builder for Gemma4Builder {
                 .accept()
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn connect_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"))));
+        }
+        if let Some(s) = down {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"))));
         }
         Ok(())
     }
