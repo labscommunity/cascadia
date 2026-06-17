@@ -46,6 +46,7 @@ use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
+use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
 // -------- pipeline / stage config --------
 
@@ -418,8 +419,6 @@ struct ActiveTask {
     /// `recv_token_from_downstream` — i.e. wire send + charlie wait + recv.
     t_wire: std::time::Duration,
 }
-
-use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
 pub struct OvRuntimeEngine {
     spec: ShardSpec,
