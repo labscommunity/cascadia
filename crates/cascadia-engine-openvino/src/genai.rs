@@ -33,6 +33,9 @@ pub struct OvGenaiBuilder {
     pub draft_device: Option<String>,
     pub speculative_k: u32,
     pub prompt_lookup_ngram: u32,
+    /// True when the API pre-renders the model's chat template (so the engine
+    /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
+    pub prompt_pretemplated: bool,
     pipe: Option<LlmPipeline>,
 }
 
@@ -48,8 +51,15 @@ impl OvGenaiBuilder {
             draft_device: None,
             speculative_k: 0,
             prompt_lookup_ngram: 0,
+            prompt_pretemplated: false,
             pipe: None,
         }
+    }
+
+    /// Set when the API renders the chat template itself (template loaded).
+    pub fn with_prompt_pretemplated(mut self, v: bool) -> Self {
+        self.prompt_pretemplated = v;
+        self
     }
 
     pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
@@ -135,7 +145,34 @@ impl Builder for OvGenaiBuilder {
         ))];
 
         let plugin = self.build_plugin_config();
-        let pipe = if let Some(dpath) = &self.draft_model_path {
+        // VLM-layout export (Qwen3.5/3.6 etc.): language model + separate
+        // embeddings IRs, no `openvino_model.xml`. Needs VLMPipeline —
+        // LLMPipeline fails on it with "Port for tensor name input_ids
+        // was not found". Served text-only.
+        let model_dir = PathBuf::from(&self.model_path);
+        let is_vlm_layout = model_dir.join("openvino_language_model.xml").exists()
+            && !model_dir.join("openvino_model.xml").exists();
+        let pipe = if is_vlm_layout {
+            if self.draft_model_path.is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "--draft-model is not supported on VLM-layout exports; \
+                     use --prompt-lookup instead"
+                        .into(),
+                ));
+            }
+            let prompt_lookup = self.prompt_lookup_ngram > 0;
+            progress.push(LoadProgress::message(format!(
+                "VLM-layout export detected; compiling VLMPipeline{} on {}",
+                if prompt_lookup {
+                    " + prompt_lookup"
+                } else {
+                    ""
+                },
+                self.device
+            )));
+            LlmPipeline::vlm(&self.model_path, &self.device, prompt_lookup, &plugin)
+                .map_err(map_ov_err)?
+        } else if let Some(dpath) = &self.draft_model_path {
             progress.push(LoadProgress::message(format!(
                 "loading draft model {dpath}"
             )));
@@ -177,6 +214,7 @@ impl Builder for OvGenaiBuilder {
             pipe,
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
+            prompt_pretemplated: self.prompt_pretemplated,
             pending: Vec::new(),
             max_tokens_default: 256,
         }))
@@ -197,13 +235,16 @@ pub struct OvGenaiEngine {
     pipe: LlmPipeline,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
+    prompt_pretemplated: bool,
     pending: Vec<GenerationTask>,
     max_tokens_default: u32,
 }
 
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
-        let cfg = self.gen_config(/*max_tokens*/ 4, /*temperature*/ 0.0);
+        let cfg = self.gen_config(
+            /*max_tokens*/ 4, /*temperature*/ 0.0, /*enable_thinking*/ false,
+        );
         match self.pipe.generate("Hi", &cfg) {
             Ok(_) => info!(
                 spec_k = self.speculative_k,
@@ -245,6 +286,7 @@ impl Engine for OvGenaiEngine {
                 self.max_tokens_default
             },
             task.temperature,
+            task.enable_thinking,
         );
 
         let started = Instant::now();
@@ -286,7 +328,7 @@ impl Engine for OvGenaiEngine {
 }
 
 impl OvGenaiEngine {
-    fn gen_config(&self, max_tokens: u32, temperature: f32) -> GenConfig {
+    fn gen_config(&self, max_tokens: u32, temperature: f32, enable_thinking: bool) -> GenConfig {
         let do_sample = temperature > 0.0;
         let mut cfg = GenConfig {
             max_new_tokens: max_tokens,
@@ -294,6 +336,11 @@ impl OvGenaiEngine {
             temperature: if do_sample { temperature } else { 0.0 },
             num_assistant_tokens: 0,
             max_ngram_size: 0,
+            // Hybrid: only when the API rendered the template for us — i.e. a
+            // template loaded AND this request is thinking-OFF — do we tell
+            // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
+            // native templating (the legacy join the API emitted), untouched.
+            skip_chat_template: self.prompt_pretemplated && !enable_thinking,
         };
         if self.speculative_k > 0 {
             cfg.num_assistant_tokens = self.speculative_k;

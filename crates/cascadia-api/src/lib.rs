@@ -59,6 +59,11 @@ pub struct AppState {
     pub chat_env: Option<Arc<minijinja::Environment<'static>>>,
     pub bos_token: Arc<str>,
     pub eos_token: Arc<str>,
+    /// Engines that own their native chat templating (ov-genai): defer to the
+    /// engine for the thinking-ON path and only render here when thinking is
+    /// OFF (to inject the empty `<think></think>`). Keeps the working
+    /// thinking-on path byte-identical to the engine's native render.
+    pub defer_template_on_thinking: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -74,6 +79,8 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
+    /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
+    pub defer_template_on_thinking: bool,
 }
 
 impl Default for Config {
@@ -83,6 +90,7 @@ impl Default for Config {
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
+            defer_template_on_thinking: false,
         }
     }
 }
@@ -101,14 +109,29 @@ impl Default for Config {
 /// instruct models render through their real template rather than the
 /// legacy formatter (which degenerates instruct models).
 pub fn load_chat_template_config(model_dir: &std::path::Path) -> ChatTemplateConfig {
+    // Strict, unchanged semantics: a present AND parsable
+    // tokenizer_config.json is required before anything (including the
+    // sibling jinja file) is considered.
     let tok_dir = model_dir.join("tokenizer");
-    let p = tok_dir.join("tokenizer_config.json");
-    let Ok(bytes) = std::fs::read(&p) else {
+    let Ok(bytes) = std::fs::read(tok_dir.join("tokenizer_config.json")) else {
         return ChatTemplateConfig::default();
     };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
         return ChatTemplateConfig::default();
-    };
+    }
+    load_chat_template_config_at(&tok_dir)
+}
+
+/// Like [`load_chat_template_config`] but reads `dir` itself instead of a
+/// `tokenizer/` subdir, and accepts a `chat_template.jinja` without any
+/// `tokenizer_config.json`. For model layouts that keep tokenizer files at
+/// the model root (the qwen36 surgery shard tree, which ships the jinja
+/// file but no tokenizer_config).
+pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateConfig {
+    let v = std::fs::read(tok_dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .unwrap_or_default();
     let template = v
         .get("chat_template")
         .and_then(|t| t.as_str())
@@ -166,6 +189,7 @@ pub fn make_router_with_config(
             }),
         bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
+        defer_template_on_thinking: cfg.defer_template_on_thinking,
     };
     Router::new()
         .route("/health", get(health))
@@ -230,6 +254,15 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+    /// Hybrid-reasoning switch (Qwen3+ convention). Default true =
+    /// model-default behavior; false asks the engine to skip the
+    /// <think> block (engines that can't, ignore it).
+    #[serde(default = "default_true")]
+    pub enable_thinking: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_tokens() -> u32 {
@@ -333,6 +366,7 @@ fn render_with_chat_env(
     messages: &[ChatMessage],
     bos_token: &str,
     eos_token: &str,
+    enable_thinking: bool,
 ) -> Result<String, String> {
     use minijinja::context;
     use minijinja::value::Value;
@@ -354,6 +388,9 @@ fn render_with_chat_env(
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
+        // Hybrid-reasoning templates (Qwen3.x) read this and inject the
+        // empty think block themselves when false.
+        enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
     };
@@ -362,16 +399,74 @@ fn render_with_chat_env(
         .map_err(|e| format!("template render: {e}"))
 }
 
-fn render_prompt(state: &AppState, messages: &[ChatMessage]) -> String {
-    if let Some(env) = &state.chat_env {
-        match render_with_chat_env(env, messages, &state.bos_token, &state.eos_token) {
-            Ok(s) => return s,
-            Err(e) => {
-                warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool) -> String {
+    // Hybrid: for engines that own native templating (ov-genai), only render
+    // here when thinking is OFF (to inject the empty-think block). With thinking
+    // ON, emit the legacy join so the engine applies its own template natively —
+    // leaving the already-working path byte-identical.
+    let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
+    if !defer_to_engine {
+        if let Some(env) = &state.chat_env {
+            match render_with_chat_env(
+                env,
+                messages,
+                &state.bos_token,
+                &state.eos_token,
+                enable_thinking,
+            ) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                }
             }
         }
     }
     render_prompt_legacy(messages)
+}
+
+/// `AppState`-free chat-prompt renderer for in-process callers. Parses the
+/// chat template once in [`new`](Self::new); reuse across requests.
+#[derive(Clone)]
+pub struct ChatPromptRenderer {
+    env: Option<Arc<minijinja::Environment<'static>>>,
+    bos_token: String,
+    eos_token: String,
+}
+
+impl ChatPromptRenderer {
+    /// Compile the chat template once. An unparseable template is treated as
+    /// absent so [`render`](Self::render) falls back to the legacy formatter.
+    pub fn new(cfg: &ChatTemplateConfig) -> Self {
+        let env = cfg
+            .template
+            .as_deref()
+            .and_then(|src| match build_chat_env(src) {
+                Ok(env) => Some(Arc::new(env)),
+                Err(e) => {
+                    warn!(error = %e, "chat_template failed to parse; using legacy formatter");
+                    None
+                }
+            });
+        Self {
+            env,
+            bos_token: cfg.bos_token.clone().unwrap_or_default(),
+            eos_token: cfg.eos_token.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
+    /// template is set or rendering fails.
+    pub fn render(&self, messages: &[ChatMessage]) -> String {
+        if let Some(env) = &self.env {
+            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true) {
+                Ok(s) => return s,
+                Err(e) => {
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                }
+            }
+        }
+        render_prompt_legacy(messages)
+    }
 }
 
 async fn chat_completions(
@@ -379,7 +474,20 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(&state, &req.messages);
+    let prompt = render_prompt(&state, &req.messages, req.enable_thinking);
+    // Degenerate input (no messages, or a render that collapses to nothing)
+    // is a client error. Reject here with 400 rather than admitting an empty
+    // prompt to the engine, which would generate nothing and return a 200
+    // with empty content — indistinguishable from a real failure.
+    if prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no prompt content: `messages` is empty or rendered to an empty prompt"
+            })),
+        )
+            .into_response();
+    }
     if prompt.len() > state.max_prompt_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -399,7 +507,7 @@ async fn chat_completions(
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         logprobs: 0,
-        enable_thinking: false,
+        enable_thinking: req.enable_thinking,
         trust_remote_code: false,
     };
 
@@ -436,12 +544,29 @@ async fn chat_completions(
     };
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
+    let mut prompt_tokens: u32 = 0;
     while let Some(chunk) = chunk_stream.next().await {
+        // A failed task carries `error` on its final chunk. Without this
+        // branch the empty text below would build a normal 200 with empty
+        // content — indistinguishable from "the model said nothing". Fail
+        // loud with a 5xx instead (e.g. a sharded chain poisoned by a
+        // handshake/manifest mismatch).
+        if let Some(reason) = &chunk.error {
+            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
         if !chunk.is_final {
             buf.push_str(&chunk.text);
-            completion_tokens += 1;
-        } else if !chunk.text.is_empty() {
-            buf.push_str(&chunk.text);
+            completion_tokens += chunk.n_tokens.unwrap_or(1);
+        } else {
+            if !chunk.text.is_empty() {
+                buf.push_str(&chunk.text);
+            }
+            prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
         }
     }
 
@@ -460,9 +585,11 @@ async fn chat_completions(
             logprobs: None,
         }],
         usage: Usage {
-            prompt_tokens: 0, // cascadia engines don't surface this today
+            // From the engine's final chunk; 0 when the engine can't tell
+            // (e.g. ov-genai tokenizes inside the pipeline).
+            prompt_tokens,
             completion_tokens,
-            total_tokens: completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     })
     .into_response()
@@ -509,6 +636,21 @@ async fn stream_completion(
             let model = model.clone();
             let task_id = task_id.clone();
             async move {
+                // A failed task carries `error` on its final chunk. The 200
+                // headers are already on the wire by the time the body
+                // streams, so unlike the non-streaming path we cannot
+                // downgrade to a 5xx here. Surface the failure as an explicit
+                // SSE error event instead of a silent empty delta + [DONE].
+                if let Some(reason) = &chunk.error {
+                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                    let payload = serde_json::json!({
+                        "id": task_id,
+                        "object": "error",
+                        "error": { "message": reason, "type": "engine_error" },
+                    });
+                    tokio::task::yield_now().await;
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                }
                 // Custom (non-OpenAI) `n_tokens` field: how many model
                 // tokens this chunk carries. Spec-decode emits 1..=K+1
                 // tokens per chunk; downstream tok/s would be wrong if
@@ -687,6 +829,62 @@ mod tests {
         assert!(!content.is_empty(), "completion content was empty");
     }
 
+    #[tokio::test]
+    async fn empty_messages_returns_400_not_empty_200() {
+        // Degenerate input (no messages → empty rendered prompt) is a client
+        // error: reject with 400 at the API rather than admitting it to the
+        // engine and returning a 200 with empty content.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [],
+            "stream": false,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn failed_task_returns_5xx_not_empty_200() {
+        // C1 regression: a task the engine FAILS (here via the mock's
+        // `__engine_error__` sentinel, standing in for a qwen36 handshake
+        // NAK) must surface as a 5xx, not a 200 with empty content.
+        let app = make_app().await;
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "__engine_error__"}],
+            "stream": false,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("mock injected"),
+            "5xx body should carry the engine's failure reason, got {v}"
+        );
+    }
+
     #[test]
     fn load_chat_template_falls_back_to_jinja_sibling() {
         // Gemma 3/4 (and recent Llama) ship the template as a sibling
@@ -716,27 +914,57 @@ mod tests {
         assert_eq!(cfg.eos_token.as_deref(), Some("<eos>"));
     }
 
-    #[test]
-    fn render_prompt_with_template_supports_macros() {
-        // Guards the minijinja `macros` feature: Gemma-style instruct templates
-        // define `{% macro %}` helpers for role formatting. Without the feature
-        // the template fails to parse and chat silently degrades to the legacy
-        // formatter (which produces incoherent output on instruct models).
-        let tmpl = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
+    /// Gemma-style chat template for the macro/renderer tests.
+    const MACRO_TEMPLATE: &str = "{%- macro turn(role, text) -%}<start_of_turn>{{ role }}\n\
                     {{ text }}<end_of_turn>\n{% endmacro -%}\
                     {{ bos_token }}{% for m in messages %}{{ turn(m.role, m.content) }}{% endfor %}\
                     {% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
+
+    #[test]
+    fn chat_env_supports_macro_templates() {
+        // Guards the minijinja `macros` feature; without it Gemma-style
+        // instruct templates fail to parse and silently fall back to legacy.
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
         }];
-        let env = build_chat_env(tmpl).expect("macro-based template must parse");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>")
+        let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true)
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
         assert!(out.contains("hi"), "out={out}");
         assert!(out.contains("<start_of_turn>model"), "out={out}");
+    }
+
+    #[test]
+    fn chat_prompt_renderer_renders_then_falls_back() {
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+
+        // Template present: renders through the parsed env (parsed once in `new`).
+        let r = ChatPromptRenderer::new(&ChatTemplateConfig {
+            template: Some(MACRO_TEMPLATE.into()),
+            bos_token: Some("<bos>".into()),
+            eos_token: Some("<eos>".into()),
+        });
+        let out = r.render(&msgs);
+        assert!(out.contains("<bos>"), "out={out}");
+        assert!(out.contains("<start_of_turn>user"), "out={out}");
+
+        // No template: falls back to the legacy formatter.
+        let none = ChatPromptRenderer::new(&ChatTemplateConfig::default());
+        assert_eq!(none.render(&msgs), render_prompt_legacy(&msgs));
+
+        // Unparseable template is treated as absent → legacy fallback, not a panic.
+        let broken = ChatPromptRenderer::new(&ChatTemplateConfig {
+            template: Some("{% for %}".into()),
+            bos_token: None,
+            eos_token: None,
+        });
+        assert_eq!(broken.render(&msgs), render_prompt_legacy(&msgs));
     }
 
     #[test]

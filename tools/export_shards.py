@@ -68,9 +68,26 @@ import shutil
 import sys
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+# torch is only needed by the dense/gemma4 export paths; the qwen3_5_moe
+# IR-surgery path runs on openvino + numpy alone (and its target env — an
+# AI PC inference node — typically has no torch). Defer the hard failure
+# to the paths that actually use it.
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
+    F = None
+
+    class _TorchlessNn:
+        """Lets the module-level `class X(nn.Module)` definitions parse;
+        the dense path that instantiates them errors before use."""
+
+        Module = object
+
+    nn = _TorchlessNn()
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +291,11 @@ def is_moe_config(config) -> bool:
     # 3. A per-token expert router count is a dense-model-free MoE signal.
     if isinstance(getattr(config, "num_experts_per_tok", None), int):
         return True
+    # 3b. VLM wrappers (Qwen3.5/Qwen3.6) nest the text model's expert fields
+    #     under text_config; the outer config carries none of them (#77).
+    text_cfg = getattr(config, "text_config", None)
+    if text_cfg is not None and is_moe_config(text_cfg):
+        return True
     # 4. Known MoE model_types (exact) + architecture class names. Exact
     #    model_type avoids false-positives from a dense model merely named
     #    "*moe*"; class names ending in MoEForCausalLM are reliably MoE.
@@ -281,11 +303,17 @@ def is_moe_config(config) -> bool:
     arch_first = ((getattr(config, "architectures", []) or [""])[0]).lower()
     moe_types = {
         "mixtral", "dbrx", "deepseek_v2", "deepseek_v3", "qwen2_moe", "qwen3_moe",
+        "qwen3_5_moe", "qwen3_5_moe_text",
         "phimoe", "jamba", "granitemoe", "olmoe", "grok", "grok-1", "llama4",
     }
     if model_type in moe_types:
         return True
-    return arch_first.endswith("moeforcausallm") or "mixtral" in arch_first or "grok" in arch_first
+    return (
+        arch_first.endswith("moeforcausallm")
+        or arch_first.endswith("moeforconditionalgeneration")
+        or "mixtral" in arch_first
+        or "grok" in arch_first
+    )
 
 
 def check_export_quirks(config, arch_tag: str):
@@ -1723,10 +1751,8 @@ def main():
             flush=True,
         )
 
-    if args.default_dtype == "fp16":
+    if torch is not None and args.default_dtype == "fp16":
         torch.set_default_dtype(torch.float16)
-
-    from transformers import AutoConfig
 
     # Gemma 4 (gemma4 / gemma4_text) uses a dedicated exporter,
     # tools/export_gemma4.py: its per-layer-type asymmetric head_dim,
@@ -1764,12 +1790,76 @@ def main():
         )
         return
 
+    # Qwen3.5/3.6 hybrid MoE (model_type qwen3_5_moe) uses a dedicated
+    # exporter, tools/qwen36_surgery/export_qwen36_moe.py: IR surgery on
+    # the official int4 OpenVINO IR (256-expert MoE + GatedDeltaNet layers
+    # cannot go through the generic dense stage builder, and re-exporting
+    # from safetensors would need a ~133 GB host). The --model must be an
+    # *-int4-ov style IR directory (local or HF repo), NOT safetensors.
+    if any(t == "qwen3_5_moe" for t in (_outer_mt, _inner_mt)):
+        print(
+            "Detected Qwen3.5/3.6 hybrid MoE - dispatching to the IR-surgery "
+            "exporter (stages inherit the official int4 IR byte-for-byte; "
+            "--quantization is ignored).",
+            flush=True,
+        )
+        if args.layer_split is not None or args.stage is not None:
+            print(
+                "ERROR: --layer-split/--stage are not supported for "
+                "qwen3_5_moe (stages split uniformly at decoder-layer "
+                "boundaries).",
+                flush=True,
+            )
+            sys.exit(2)
+        if os.path.isdir(args.model):
+            _model_dir = args.model
+        else:
+            # HF repo id: pull the OV IR artifacts (xml/bin + tokenizer).
+            from huggingface_hub import snapshot_download
+
+            cache_root = os.path.expanduser("~/.cache/cascadia/models")
+            _model_dir = os.path.join(cache_root, args.model.replace("/", "--"))
+            os.makedirs(_model_dir, exist_ok=True)
+            print(f"Downloading {args.model} -> {_model_dir}", flush=True)
+            snapshot_download(
+                repo_id=args.model,
+                local_dir=_model_dir,
+                allow_patterns=["*.xml", "*.bin", "*.json", "tokenizer*"],
+                max_workers=8,
+            )
+        _here = os.path.dirname(os.path.abspath(__file__))
+        # in-repo layout (tools/qwen36_surgery/) and the flat temp dir the
+        # CLI extracts the embedded scripts into
+        sys.path.insert(0, os.path.join(_here, "qwen36_surgery"))
+        sys.path.insert(0, _here)
+        from export_qwen36_moe import run_export as _qwen36_run_export
+
+        _qwen36_run_export(
+            _model_dir,
+            args.output_dir,
+            num_stages=args.num_stages,
+            validate=True,
+        )
+        return
+
+    # Past the dispatches: the generic dense builder needs the full stack.
+    if torch is None:
+        parser.error(
+            "torch is required for this model's export path. "
+            "Install: pip install torch transformers safetensors nncf"
+        )
+    from transformers import AutoConfig
+
     moe_msg = (
         f"ERROR: {args.model} is a mixture-of-experts (MoE) model, which the "
         f"cascadia exporter does not support (#60). It builds dense decoder "
         f"layers (one MLP per layer); MoE routing + per-expert MLPs are not "
         f"implemented, and falling back to a dense layer would silently emit "
-        f"garbage. Aborting rather than producing a broken shard."
+        f"garbage. Aborting rather than producing a broken shard.\n"
+        f"NOTE: hybrid Qwen3.5/Qwen3.6 MoE (model_type qwen3_5_moe) IS\n"
+        f"supported via a dedicated IR-surgery exporter (dispatched above when\n"
+        f"detected), or single-stage with `--engine ov-genai` on OV GenAI >=\n"
+        f"2026.2 — see docs/architectures/qwen36-moe-support.md."
     )
 
     # Read the config FIRST (cheap — just config.json, no weights) so we can

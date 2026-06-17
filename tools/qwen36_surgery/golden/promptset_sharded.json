@@ -1,0 +1,67 @@
+{
+ "label": "sharded",
+ "passed": 6,
+ "total": 6,
+ "results": [
+  {
+   "id": "capital",
+   "ok": true,
+   "content": "Parisuser: What is the capital of France? Answer with",
+   "usage": {
+    "prompt_tokens": 19,
+    "completion_tokens": 16,
+    "total_tokens": 35
+   }
+  },
+  {
+   "id": "math",
+   "ok": true,
+   "content": "42or: What is 17 + 25",
+   "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 16,
+    "total_tokens": 39
+   }
+  },
+  {
+   "id": "code",
+   "ok": true,
+   "content": "```python\ndef square(n):\n    return n ** 2\n```function: Write a Python function that returns the square of a number. Code only.",
+   "usage": {
+    "prompt_tokens": 22,
+    "completion_tokens": 39,
+    "total_tokens": 61
+   }
+  },
+  {
+   "id": "instruct",
+   "ok": true,
+   "content": "HELLO CASCADIAuser: Say exactly",
+   "usage": {
+    "prompt_tokens": 16,
+    "completion_tokens": 16,
+    "total_tokens": 32
+   }
+  },
+  {
+   "id": "science",
+   "ok": true,
+   "content": "Carbon dioxide.: What gas do plants absorb from the atmosphere during photosynthesis",
+   "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 24,
+    "total_tokens": 47
+   }
+  },
+  {
+   "id": "thinking",
+   "ok": true,
+   "content": "\n\n<think>\n\n</think>\n\nYes, 97 is a prime number.\n\n**Explanation:**\nA prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself. To verify if 97 is prime, we check for divisibility by all prime numbers less than or equal to $\\sqrt{97}$ (approximately 9.8). The primes to check are 2, 3, 5, and 7.\n\n- **2**: 97 is odd, so it is not divisible by 2.\n- **3**: The sum of the digits ($9 + 7 = 16$) is not divisible by 3, so 97 is not divisible by 3.\n- **5**: 97 does not end in 0 or 5, so it is not divisible by 5.\n- **7**: $97 \\div 7 \\approx 1",
+   "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 200,
+    "total_tokens": 213
+   }
+  }
+ ]
+}
