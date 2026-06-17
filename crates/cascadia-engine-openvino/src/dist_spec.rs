@@ -1218,6 +1218,22 @@ impl Engine for OvDistSpecEngine {
         }
     }
 
+    fn reattach_streams(
+        &mut self,
+        _up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = down {
+            let client = cascadia_transport::ActivationClient::from_stream(s, "injected-down");
+            self.target.downstream = Arc::new(tokio::sync::Mutex::new(client));
+            // Fresh peer KV starts at 0; agree on logical_pos_start. NOT reset()
+            // (that emits a Reset frame on the now-replaced stream).
+            self.target.cache_len = 0;
+            self.target.logical_pos = 0;
+        }
+        Ok(())
+    }
+
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
@@ -1618,6 +1634,18 @@ impl Builder for OvDistSpecBuilder {
         Ok(())
     }
 
+    async fn connect_streams(
+        &mut self,
+        _up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = down {
+            let client = cascadia_transport::ActivationClient::from_stream(s, "injected-down");
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        }
+        Ok(())
+    }
+
     async fn load(&mut self, _shard: ShardSpec) -> EngineResult<LoadStream> {
         let mut events = Vec::new();
         let pipeline_cfg = read_pipeline_config(&self.pipeline_dir)?;
@@ -1726,6 +1754,24 @@ pub struct OvDistSpecWorkerEngine {
 impl Engine for OvDistSpecWorkerEngine {
     fn warmup(&mut self) {
         info!("ov-dist-spec worker warmup skipped");
+    }
+
+    fn reattach_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.upstream = Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"),
+            ));
+        }
+        if let Some(s) = down {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"),
+            )));
+        }
+        Ok(())
     }
 
     fn submit(&mut self, _task: GenerationTask) -> EngineResult<()> {
@@ -2110,6 +2156,24 @@ impl Builder for OvDistSpecWorkerBuilder {
                 .accept()
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn connect_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationServer::from_stream(s, "injected-up"),
+            )));
+        }
+        if let Some(s) = down {
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(
+                cascadia_transport::ActivationClient::from_stream(s, "injected-down"),
+            )));
         }
         Ok(())
     }
