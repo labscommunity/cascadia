@@ -24,6 +24,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+/// Any reliable, ordered, byte-oriented async stream the activation
+/// transport can frame over. Injected streams MUST additionally provide:
+/// cancel-safe `poll_read` (`recv_exact` wraps reads in a timeout that may
+/// drop the read future mid-frame); reliable in-order delivery (the wire
+/// protocol has no retransmit/reorder/dedup); and a meaningful `flush`
+/// (every send flushes — a no-op on TCP, load-bearing on buffered streams).
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// Boxed activation stream handed in by an embedder (or a boxed `TcpStream`
+/// on the built-in TCP path).
+pub type ByteStream = Box<dyn AsyncStream>;
+
 pub const HEADER_SIZE: usize = 20;
 pub const MAX_RANK: usize = 3;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -140,7 +153,7 @@ pub struct TransferStats {
 }
 
 /// Send a tensor over a connected stream.
-pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResult<TransferStats> {
+pub async fn send_tensor(sock: &mut dyn AsyncStream, tensor: &Tensor) -> TransportResult<TransferStats> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&(tensor.data.len() as u32).to_be_bytes());
@@ -166,7 +179,7 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 /// Also cross-checks the per-element count against the declared
 /// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
 /// trigger overflow downstream.
-pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+pub async fn recv_tensor(sock: &mut dyn AsyncStream) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
     recv_exact_frame_start(sock, &mut header).await?;
@@ -245,7 +258,7 @@ fn recv_timeout() -> Duration {
 /// requests by design — "no next frame yet" is not a failure, and treating it
 /// as one made every idle chain kill its own sockets on a timer. A dead peer
 /// still fails fast here via EOF/reset; only a silent black-hole peer waits.
-async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact_frame_start(sock: &mut dyn AsyncStream, buf: &mut [u8]) -> TransportResult<()> {
     let n = sock.read(buf).await?;
     if n == 0 {
         return Err(TransportError::SocketClosed);
@@ -256,7 +269,7 @@ async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> Transpo
     Ok(())
 }
 
-async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact(sock: &mut dyn AsyncStream, buf: &mut [u8]) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
     // sends one byte per second — must not be able to pin a worker
@@ -602,6 +615,22 @@ mod tests {
             "idle wait for the next frame must not time out: {:?}",
             got.err()
         );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_over_duplex_is_wire_identical() {
+        // A non-TCP AsyncStream must round-trip a tensor byte-identically.
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut a: ByteStream = Box::new(a);
+        let mut b: ByteStream = Box::new(b);
+        let payload = vec![0u8, 0, 128, 63, 0, 0, 0, 64]; // f32: 1.0, 2.0
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, payload.clone());
+        let send = tokio::spawn(async move { send_tensor(&mut *a, &tensor).await.unwrap() });
+        let (got, _) = recv_tensor(&mut *b).await.unwrap();
+        send.await.unwrap();
+        assert_eq!(got.dtype, DType::F32);
+        assert_eq!(got.shape, [1, 1, 2]);
+        assert_eq!(got.data, payload);
     }
 
     /// Once a frame has started, a stalled peer must still hit the timeout
