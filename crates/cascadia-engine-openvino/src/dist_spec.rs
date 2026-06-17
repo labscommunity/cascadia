@@ -1768,29 +1768,15 @@ impl Engine for OvDistSpecWorkerEngine {
         let _guard = BlockingContextGuard::enter();
         let result = self.handle_one_frame();
         if let Err(ref e) = result {
-            // Transport-closed errors signal the driver disconnected;
-            // don't spam the log. Drop the upstream/downstream so
-            // subsequent steps fail fast with NotConnected; the relay loop
-            // exits ConnectionFatal on this Err (clean supervisor rebuild),
-            // and the sleep below only throttles the single round before the
-            // loop observes the drop.
-            // "idle ceiling" = frame-start idle ceiling fired (black-holed
-            // peer); the transport layer has already dropped that socket —
-            // close the rest here too. "connection reset"/"broken pipe"/
-            // "connection aborted" = peer crash (TCP RST, the dominant
-            // dead-peer case); "recv_exact timed out" = mid-frame stall.
-            // Transport errors reach us flattened to strings
-            // (EngineError::Backend), hence the contains(). Kept in sync with
-            // EngineError::is_connection_fatal.
-            let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("socket closed")
-                || msg.contains("not connected")
-                || msg.contains("idle ceiling")
-                || msg.contains("connection reset")
-                || msg.contains("broken pipe")
-                || msg.contains("connection aborted")
-                || msg.contains("recv_exact timed out")
-            {
+            // Transport-closed errors signal the driver disconnected; don't
+            // spam the log. Drop the upstream/downstream so subsequent steps
+            // fail fast with NotConnected; the relay loop exits ConnectionFatal
+            // on this Err (clean supervisor rebuild), and the sleep below only
+            // throttles the single round before the loop observes the drop.
+            // Fatal-classification is delegated to EngineError::is_connection_fatal
+            // (single source of truth) — clean teardown, black-holed peer (idle
+            // ceiling), peer crash (RST/broken pipe/aborted), mid-frame stall.
+            if e.is_connection_fatal() {
                 warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links");
                 // Mark engine as drained by clearing connections.
                 let _ = self.runtime_handle.clone().block_on(async {

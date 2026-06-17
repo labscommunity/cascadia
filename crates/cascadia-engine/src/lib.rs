@@ -115,6 +115,21 @@ impl EngineError {
                     // Mid-frame deadline (recv_exact wall-clock bound).
                     || msg.contains("recv_exact timed out")
             }
+            // A structurally-typed io error — should a future `?`-on-io path
+            // ever produce one instead of the flattened `Backend` string —
+            // is fatal for the same kinds the transport layer treats as fatal
+            // (see `recv_error_is_connection_fatal`). Belt-and-suspenders: the
+            // dist-spec worker flattens recv errors to `Backend` today, so this
+            // arm is unreachable now, but it keeps the classifier correct if
+            // that ever changes.
+            EngineError::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
             _ => false,
         }
     }
@@ -226,6 +241,22 @@ mod tests {
                 "expected fatal: {msg}"
             );
         }
+        // Structurally-typed io errors classify by kind (mirrors the
+        // transport recv-fatal set), independent of the Backend-string path.
+        use std::io::{Error as IoError, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                EngineError::Io(IoError::from(kind)).is_connection_fatal(),
+                "expected fatal io kind: {kind:?}"
+            );
+        }
+        assert!(!EngineError::Io(IoError::from(ErrorKind::NotFound)).is_connection_fatal());
         // Recoverable / unrelated failures are NOT fatal.
         assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
         assert!(
