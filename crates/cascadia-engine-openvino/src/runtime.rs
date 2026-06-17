@@ -1199,6 +1199,26 @@ impl OvRuntimeEngine {
 }
 
 impl Engine for OvRuntimeEngine {
+    // One struct serves first/middle/last and single-stage (is_first && is_last).
+    // A single-stage shard's `step` never reads injected streams, so accepting and
+    // storing them here is a benign no-op in practice — no embedder hands streams to
+    // a single-stage shard in PR1. Hence accept-and-store rather than guard-and-reject.
+    fn reattach_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            let server = cascadia_transport::ActivationServer::from_stream(s, "injected-up");
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        }
+        if let Some(s) = down {
+            let client = cascadia_transport::ActivationClient::from_stream(s, "injected-down");
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        }
+        Ok(())
+    }
+
     fn warmup(&mut self) {
         if !(self.spec.is_first_stage) {
             info!("ov-runtime warmup skipped on non-first stage");
@@ -1393,6 +1413,22 @@ impl Builder for OvRuntimeBuilder {
                 .accept()
                 .await
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn connect_streams(
+        &mut self,
+        up: Option<cascadia_transport::ByteStream>,
+        down: Option<cascadia_transport::ByteStream>,
+    ) -> EngineResult<()> {
+        if let Some(s) = up {
+            let server = cascadia_transport::ActivationServer::from_stream(s, "injected-up");
+            self.upstream = Some(Arc::new(tokio::sync::Mutex::new(server)));
+        }
+        if let Some(s) = down {
+            let client = cascadia_transport::ActivationClient::from_stream(s, "injected-down");
+            self.downstream = Some(Arc::new(tokio::sync::Mutex::new(client)));
         }
         Ok(())
     }
