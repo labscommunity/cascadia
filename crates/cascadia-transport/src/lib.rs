@@ -169,7 +169,7 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
-    recv_exact(sock, &mut header).await?;
+    recv_exact_frame_start(sock, &mut header).await?;
 
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
     let dtype_code = u32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -208,6 +208,56 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
     Ok((tensor, stats))
 }
 
+/// Config override (seconds) for the activation recv timeout; 0 = unset.
+static ACTIVATION_TIMEOUT_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the activation recv timeout from node config; takes precedence over the env var.
+pub fn set_activation_timeout_secs(secs: u64) {
+    ACTIVATION_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Precedence: config override > env > default. Pure, for testing.
+fn resolve_recv_timeout(explicit_secs: u64, env_secs: Option<u64>) -> Duration {
+    if explicit_secs > 0 {
+        Duration::from_secs(explicit_secs)
+    } else {
+        env_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TIMEOUT)
+    }
+}
+
+/// Per-hop activation recv timeout: config > `CASCADIA_ACTIVATION_TIMEOUT_SECS` > 60s.
+/// Public so a driver awaiting an owed reply can bound the frame-start wait
+/// that [`recv_raw`] intentionally exempts for idle relays.
+pub fn recv_timeout() -> Duration {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
+    let env = *ENV.get_or_init(|| {
+        std::env::var("CASCADIA_ACTIVATION_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    resolve_recv_timeout(
+        ACTIVATION_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed),
+        env,
+    )
+}
+
+/// Wait for the first byte of a NEW frame without a deadline, then read the
+/// remainder under the strict recv timeout. A pipeline stage is idle between
+/// requests by design — "no next frame yet" is not a failure, and treating it
+/// as one made every idle chain kill its own sockets on a timer. A dead peer
+/// still fails fast here via EOF/reset; only a silent black-hole peer waits.
+async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+    let n = sock.read(buf).await?;
+    if n == 0 {
+        return Err(TransportError::SocketClosed);
+    }
+    if n < buf.len() {
+        recv_exact(sock, &mut buf[n..]).await?;
+    }
+    Ok(())
+}
+
 async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
@@ -215,6 +265,7 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     // thread forever. 60 s is generous for a single tensor frame on a
     // multi-MB Llama hidden state over Thunderbolt, and small enough
     // that a wedged peer is detected within one or two heartbeats.
+    // Waiting for a frame to BEGIN is exempt — see recv_exact_frame_start.
     let read_fut = async {
         let mut read = 0;
         while read < buf.len() {
@@ -226,11 +277,12 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
         }
         Ok(())
     };
-    match tokio::time::timeout(DEFAULT_TIMEOUT, read_fut).await {
+    let to = recv_timeout();
+    match tokio::time::timeout(to, read_fut).await {
         Ok(res) => res,
         Err(_) => Err(TransportError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("recv_exact timed out after {DEFAULT_TIMEOUT:?}"),
+            format!("recv_exact timed out after {to:?}"),
         ))),
     }
 }
@@ -312,7 +364,7 @@ impl ActivationServer {
         }
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact(sock, &mut buf).await?;
+        recv_exact_frame_start(sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -428,7 +480,7 @@ impl ActivationClient {
         }
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let mut buf = vec![0u8; n];
-        recv_exact(sock, &mut buf).await?;
+        recv_exact_frame_start(sock, &mut buf).await?;
         Ok(buf)
     }
 
@@ -442,6 +494,19 @@ impl ActivationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_timeout_precedence_config_over_env_over_default() {
+        // explicit config override (node.toml) wins over env + default
+        assert_eq!(
+            resolve_recv_timeout(120, Some(30)),
+            Duration::from_secs(120)
+        );
+        // no config -> env wins over default
+        assert_eq!(resolve_recv_timeout(0, Some(90)), Duration::from_secs(90));
+        // neither -> 60s default
+        assert_eq!(resolve_recv_timeout(0, None), DEFAULT_TIMEOUT);
+    }
 
     #[tokio::test]
     async fn roundtrip_f32_2d() {
@@ -512,5 +577,56 @@ mod tests {
         assert_eq!(DType::I8.bytes_per_element(), 1);
         assert_eq!(DType::I32.bytes_per_element(), 4);
         assert_eq!(DType::I64.bytes_per_element(), 8);
+    }
+
+    /// Serializes tests that mutate the global activation timeout.
+    static TIMEOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A pipeline tail is idle between requests by design; waiting for the
+    /// NEXT frame longer than the recv timeout must not kill the socket.
+    #[tokio::test]
+    async fn idle_gap_longer_than_timeout_does_not_kill_recv() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await; // idle > timeout
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_ok(),
+            "idle wait for the next frame must not time out: {:?}",
+            got.err()
+        );
+    }
+
+    /// Once a frame has started, a stalled peer must still hit the timeout
+    /// (slow-loris / wedged-peer bound is preserved).
+    #[tokio::test]
+    async fn mid_frame_stall_still_times_out() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock.write_all(&[0u8; 4]).await.unwrap(); // partial header, then stall
+        sock.flush().await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(got.is_err(), "partial frame then stall must still time out");
     }
 }

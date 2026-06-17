@@ -1,0 +1,16 @@
+# Exporter toolchain pins (#77 Part A).
+#
+# Floor rationale:
+# - transformers >= 5.2 — first release carrying `qwen3_5_moe` modeling code
+#   (Qwen3.5/Qwen3.6); < 5.5 per export_gemma4.py's documented quirks.
+# - openvino >= 2026.2 — first release with the fused GatedDeltaNet op +
+#   qwen3_5_moe support; matches the SDK floor in INSTALL.md.
+# - optimum-intel: qwen3_5_moe export path requires a 2026.2-era release.
+#
+# TODO(#77): exact == pins recorded after the first verified Qwen3.6 export
+# on the 2026.2 toolchain (Part B Path 1 task).
+transformers>=5.2,<5.5
+openvino>=2026.2
+optimum-intel>=1.27
+nncf>=2.18
+torch>=2.6

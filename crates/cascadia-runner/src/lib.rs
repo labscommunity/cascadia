@@ -336,7 +336,15 @@ impl Drop for ChunkStream {
         }
         let mut bufs = self.buffers.lock();
         bufs.chunks.remove(&self.task_id);
-        bufs.cancelled.remove(&self.task_id);
+        // Tombstone rather than remove: an engine that defers its final
+        // chunk past cancel would re-buffer it for this dead stream via
+        // another caller's distribution pass, leaking the map entry until
+        // close(). Bounded: task ids are UUIDs (no reuse), so the rare
+        // wholesale clear only risks re-buffering one late chunk.
+        if bufs.cancelled.len() >= 4096 {
+            bufs.cancelled.clear();
+        }
+        bufs.cancelled.insert(self.task_id.clone());
     }
 }
 

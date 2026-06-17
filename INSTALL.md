@@ -36,15 +36,15 @@ The FFI shim (`cascadia-ov-genai-shim`) compiles C++ against the OpenVINO GenAI 
 
 ### 2. OpenVINO GenAI SDK
 
-Download the **OpenVINO GenAI 2026.1+** archive for your platform from Intel:
+Download the **OpenVINO GenAI 2026.2+** archive for your platform from Intel:
 
 - Archives: <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>
 - Or the Intel download center: <https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html>
 
-Pick the build matching your OS (e.g. `openvino_genai_ubuntu24_2026.1.0.0_x86_64.tar.gz`). Extract it and point `INTEL_OPENVINO_DIR` at the **extracted SDK root** — the directory that contains `runtime/`, `setupvars.sh`, etc.:
+Pick the build matching your OS (e.g. `openvino_genai_ubuntu24_2026.2.0.0_x86_64.tar.gz`). Extract it and point `INTEL_OPENVINO_DIR` at the **extracted SDK root** — the directory that contains `runtime/`, `setupvars.sh`, etc.:
 
 ```bash
-export INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.1.0.0
+export INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0
 ```
 
 > If you build with `--features openvino` and this isn't set (or points at the wrong place), the build now fails fast with an explanatory message instead of an opaque compile/link error.
@@ -73,7 +73,7 @@ On **macOS** there is no Intel GPU runtime — use stub mode for dev only.
 ### Build and verify
 
 ```bash
-INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.1.0.0 \
+INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 
 ./target/release/cascadia doctor   # should list a GPU device, not just CPU

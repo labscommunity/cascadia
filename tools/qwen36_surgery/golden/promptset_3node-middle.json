@@ -1,0 +1,67 @@
+{
+ "label": "3node-middle",
+ "passed": 6,
+ "total": 6,
+ "results": [
+  {
+   "id": "capital",
+   "ok": true,
+   "content": "Paris",
+   "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 1,
+    "total_tokens": 25
+   }
+  },
+  {
+   "id": "math",
+   "ok": true,
+   "content": "42",
+   "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 2,
+    "total_tokens": 30
+   }
+  },
+  {
+   "id": "code",
+   "ok": true,
+   "content": "```python\ndef square(n):\n    return n ** 2\n```",
+   "usage": {
+    "prompt_tokens": 27,
+    "completion_tokens": 16,
+    "total_tokens": 43
+   }
+  },
+  {
+   "id": "instruct",
+   "ok": true,
+   "content": "HELLO CASCADIA",
+   "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 6,
+    "total_tokens": 27
+   }
+  },
+  {
+   "id": "science",
+   "ok": true,
+   "content": "Carbon dioxide",
+   "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 2,
+    "total_tokens": 30
+   }
+  },
+  {
+   "id": "thinking",
+   "ok": true,
+   "content": "Here's a thinking process:\n\n1.  **Understand the User's Question**: The user asks \"Is 97 a prime number? Explain briefly",
+   "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 200,
+    "total_tokens": 221
+   }
+  }
+ ]
+}

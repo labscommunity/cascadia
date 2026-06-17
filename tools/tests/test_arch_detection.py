@@ -514,3 +514,28 @@ def test_traced_rotary_rejects_odd_rotary_dim():
         export_shards.TracedRotaryEmbedding(
             head_dim=10, rope_theta=10_000.0, partial_rotary_factor=0.5  # int(5)=5 odd
         )
+
+
+def test_is_moe_config_rejects_qwen35_moe_model_type():
+    """Qwen3.5/Qwen3.6 (qwen3_5_moe) is MoE even though its architecture
+    class ends in ForConditionalGeneration, not MoeForCausalLM (#77)."""
+    cfg = _FakeConfig(
+        model_type="qwen3_5_moe",
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+    )
+    assert export_shards.is_moe_config(cfg) is True
+
+
+def test_is_moe_config_rejects_nested_text_config_experts():
+    """Qwen3.6-35B-A3B is a VLM whose expert fields live under text_config;
+    the outer config carries no expert counts (#77). The gate must unwrap."""
+    cfg = _FakeConfig(
+        model_type="some_future_vlm",
+        architectures=["FutureVlmForConditionalGeneration"],
+        text_config=_FakeConfig(
+            model_type="some_future_vlm_text",
+            num_experts=256,
+            num_experts_per_tok=8,
+        ),
+    )
+    assert export_shards.is_moe_config(cfg) is True

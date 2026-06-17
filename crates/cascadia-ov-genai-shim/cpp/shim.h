@@ -60,6 +60,20 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     size_t properties_count,
     cascadia_pipeline_t** out_handle);
 
+/// VLMPipeline-backed pipeline for VLM-layout exports (e.g. Qwen3.5/3.6:
+/// `openvino_language_model.xml` + separate embeddings/vision IRs), used
+/// text-only. `enable_prompt_lookup` non-zero turns on prompt-lookup
+/// decoding (OV GenAI >= 2026.2 extends it to VLM pipelines). The handle
+/// is interchangeable with LLMPipeline handles for generate / tokenizer /
+/// destroy.
+int32_t cascadia_pipeline_create_vlm(
+    const char* model_path,
+    const char* device,
+    int32_t enable_prompt_lookup,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_pipeline_t** out_handle);
+
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle);
 
 // ---- GenerationConfig -----------------------------------------------------
@@ -71,6 +85,9 @@ void cascadia_genconfig_set_temperature(cascadia_genconfig_t* cfg, float v);
 void cascadia_genconfig_set_do_sample(cascadia_genconfig_t* cfg, int32_t enabled);
 void cascadia_genconfig_set_num_assistant_tokens(cascadia_genconfig_t* cfg, uint32_t v);
 void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v);
+// When enabled==0 the pipeline skips its internal chat-template apply (caller
+// pre-rendered the template, e.g. to honor enable_thinking). Default: apply.
+void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled);
 
 // ---- Generation -----------------------------------------------------------
 

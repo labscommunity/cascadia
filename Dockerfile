@@ -11,7 +11,7 @@
 #   docker build --target stub -t cascadia:stub .
 # Build (real OpenVINO):
 #   docker build --target openvino \
-#     --build-arg OPENVINO_URL=https://storage.openvinotoolkit.org/.../openvino_genai_ubuntu24_2026.1.0.0_x86_64.tar.gz \
+#     --build-arg OPENVINO_URL=https://storage.openvinotoolkit.org/.../openvino_genai_ubuntu24_2026.2.0.0_x86_64.tar.gz \
 #     -t cascadia:ov .
 # Run (GPU):
 #   docker run --rm --device /dev/dri -p 8000:8000 cascadia:ov \

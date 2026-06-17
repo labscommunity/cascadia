@@ -12,6 +12,7 @@ use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
     Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+    Qwen36Builder,
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
@@ -110,6 +111,11 @@ pub enum EngineKind {
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
+    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
+    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
+    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    Qwen36Moe,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -480,6 +486,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
+    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
     Ok(())
 }
 
@@ -523,6 +530,19 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// Load a whole-model chat template for ov-genai, tolerating both layouts:
+/// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
+/// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
+fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
+    let p = std::path::Path::new(model);
+    let sub = cascadia_api::load_chat_template_config(p);
+    if sub.template.is_some() {
+        sub
+    } else {
+        cascadia_api::load_chat_template_config_at(p)
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -554,6 +574,10 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
+            // If the model ships a chat template, the API renders it (honoring
+            // enable_thinking) and the engine tells ov-genai to skip its own
+            // internal apply. No template → leave ov-genai's apply on.
+            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
@@ -660,6 +684,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
+        EngineKind::Qwen36Moe => Ok(Box::new(
+            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+        )),
     }
 }
 
@@ -859,8 +886,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // exact format the model was trained on. Falls back gracefully
         // to the legacy "role: content" join if the file or fields are
         // missing.
-        let chat_template =
-            cascadia_api::load_chat_template_config(std::path::Path::new(&args.model));
+        let chat_template = match args.engine {
+            // ov-genai: render the template API-side so enable_thinking is
+            // honored; the engine sets apply_chat_template=false so ov-genai
+            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
+            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
+            // qwen36 surgery trees keep chat_template.jinja at the model
+            // root with no tokenizer_config.json.
+            EngineKind::Qwen36Moe => {
+                cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
+            }
+            _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
+        };
         if chat_template.template.is_some() {
             info!(
                 model = %args.model,
@@ -876,6 +913,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
+        // ov-genai owns native templating: render the template API-side only for
+        // the thinking-OFF path (engine sets apply_chat_template=false then);
+        // thinking-ON stays on ov-genai's native template, untouched.
+        cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         let app = cascadia_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
         info!(host = %api_host, port = api_port, "API serving");
@@ -992,6 +1033,12 @@ const ALIASES_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/model_aliases.py"
 ));
+/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe.
+const QWEN36_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/qwen36_surgery/export_qwen36_moe.py"
+));
 
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
     use std::process::{Command, Stdio};
@@ -1077,6 +1124,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         ("export_shards.py", EXPORT_SCRIPT),
         ("export_gemma4.py", GEMMA4_SCRIPT),
         ("model_aliases.py", ALIASES_SCRIPT),
+        ("export_qwen36_moe.py", QWEN36_SCRIPT),
     ] {
         std::fs::write(_tmpdir.path().join(name), body)
             .with_context(|| format!("writing embedded {name} to temp dir"))?;
@@ -1116,11 +1164,27 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    eprintln!(
-        "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
-         --engine ov-runtime --device GPU --model {} \
-         --next <next-host>:9100 --api :8000",
-        args.output_dir, args.num_stages, args.output_dir
-    );
+    // qwen3_5_moe shards run the in-process stage chain, not the
+    // per-stage worker mesh; give the right invocation per manifest arch.
+    let arch =
+        std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["arch"].as_str().map(String::from))
+            .unwrap_or_default();
+    if arch == "qwen3_5_moe" {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia run {} \
+             --engine qwen36-moe --device CPU --api :8000",
+            args.output_dir, args.output_dir
+        );
+    } else {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
+             --engine ov-runtime --device GPU --model {} \
+             --next <next-host>:9100 --api :8000",
+            args.output_dir, args.num_stages, args.output_dir
+        );
+    }
     Ok(())
 }
