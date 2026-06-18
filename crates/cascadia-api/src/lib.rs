@@ -456,6 +456,18 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bo
     render_prompt_legacy(messages)
 }
 
+/// Decide the response message + finish_reason from accumulated text.
+/// `tool_choice == Some("none")` skips parsing (always "stop").
+fn build_choice(buf: String, tool_choice: &Option<serde_json::Value>) -> (ChatChoiceMessage, &'static str) {
+    let parse_enabled = tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
+    if parse_enabled {
+        if let Some(calls) = parse_tool_calls(&buf) {
+            return (ChatChoiceMessage { role: "assistant", content: None, tool_calls: Some(calls) }, "tool_calls");
+        }
+    }
+    (ChatChoiceMessage { role: "assistant", content: Some(buf), tool_calls: None }, "stop")
+}
+
 /// Parse model tool-call output into structured calls; None when none found.
 /// Shape-based + engine-agnostic; never panics (each block parsed independently,
 /// malformed blocks skipped).
@@ -663,6 +675,7 @@ async fn chat_completions(
         }
     }
 
+    let (message, finish_reason) = build_choice(buf, &req.tool_choice);
     Json(ChatCompletionResponse {
         id: task_id,
         object: "chat.completion",
@@ -670,12 +683,8 @@ async fn chat_completions(
         model: req.model,
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatChoiceMessage {
-                role: "assistant",
-                content: Some(buf),
-                tool_calls: None,
-            },
-            finish_reason: "stop",
+            message,
+            finish_reason,
             logprobs: None,
         }],
         usage: Usage {
@@ -1221,5 +1230,48 @@ mod tests {
         let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
         assert!(out.contains("[CALLS:get_weather]"), "assistant tool_calls not rendered: {out}");
         assert!(out.contains("[TCID:call_1]"), "tool_call_id not rendered: {out}");
+    }
+
+    #[test]
+    fn build_choice_emits_tool_calls_when_parsed() {
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>".into(),
+            &Some(serde_json::json!("auto")));
+        assert_eq!(fr, "tool_calls");
+        assert!(m.content.is_none(), "tool-call message content must be null");
+        assert_eq!(m.tool_calls.unwrap()[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn build_choice_none_skips_parse() {
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
+            &Some(serde_json::json!("none")));
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert!(m.content.is_some(), "non-parsed content preserved");
+    }
+
+    #[test]
+    fn build_choice_plain_is_stop() {
+        let (m, fr) = build_choice("hello".into(), &None);
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert_eq!(m.content.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn tool_request_returns_tool_calls_finish_e2e() {
+        let app = make_app().await;
+        let tc = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather"}}],"stream":false});
+        let resp = app.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert!(v["choices"][0]["message"]["content"].is_null());
+        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
     }
 }
