@@ -711,8 +711,10 @@ fn render_prompt(
 fn build_choice(
     buf: String,
     tool_choice: &Option<serde_json::Value>,
+    tools_present: bool,
 ) -> (ChatChoiceMessage, &'static str) {
-    let parse_enabled = tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
+    let parse_enabled =
+        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if parse_enabled {
         if let Some(calls) = parse_tool_calls(&buf) {
             return (
@@ -1021,7 +1023,11 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) = build_choice(buf, &req.tool_choice);
+    let (message, choice_finish) = build_choice(
+        buf,
+        &req.tool_choice,
+        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+    );
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
     if choice_finish == "tool_calls" {
@@ -2392,12 +2398,10 @@ mod tests {
             "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"
                 .into(),
             &Some(serde_json::json!("auto")),
+            true,
         );
         assert_eq!(fr, "tool_calls");
-        assert!(
-            m.content.is_none(),
-            "tool-call message content must be null"
-        );
+        assert!(m.content.is_none());
         assert_eq!(m.tool_calls.unwrap()[0].function.name, "get_weather");
     }
 
@@ -2406,15 +2410,29 @@ mod tests {
         let (m, fr) = build_choice(
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
             &Some(serde_json::json!("none")),
+            true,
         );
         assert_eq!(fr, "stop");
         assert!(m.tool_calls.is_none());
-        assert!(m.content.is_some(), "non-parsed content preserved");
+        assert!(m.content.is_some());
+    }
+
+    #[test]
+    fn build_choice_no_tools_skips_parse() {
+        // tools absent -> never parse, even if output looks like a tool call.
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
+            &Some(serde_json::json!("auto")),
+            false,
+        );
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert!(m.content.is_some());
     }
 
     #[test]
     fn build_choice_plain_is_stop() {
-        let (m, fr) = build_choice("hello".into(), &None);
+        let (m, fr) = build_choice("hello".into(), &None, true);
         assert_eq!(fr, "stop");
         assert!(m.tool_calls.is_none());
         assert_eq!(m.content.as_deref(), Some("hello"));
