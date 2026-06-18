@@ -635,7 +635,9 @@ async fn chat_completions(
     };
 
     if req.stream {
-        return stream_completion(state, req.model, task, permit)
+        let tool_choice = req.tool_choice.clone();
+        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        return stream_completion(state, req.model, task, permit, tool_choice, tools_present)
             .await
             .into_response();
     }
@@ -703,6 +705,8 @@ async fn stream_completion(
     model: String,
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
+    tool_choice: Option<serde_json::Value>,
+    tools_present: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
@@ -714,6 +718,56 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
+    // Buffer + emit one tool delta only when tools are present and not disabled.
+    let tools_active =
+        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
+    if tools_active {
+        let _permit = permit; // hold the slot until generation completes
+        let mut buf = String::new();
+        let mut err: Option<String> = None;
+        let mut stream = chunk_stream;
+        while let Some(chunk) = stream.next().await {
+            if let Some(reason) = &chunk.error {
+                err = Some(reason.clone());
+                break;
+            }
+            buf.push_str(&chunk.text);
+        }
+        let frames: Vec<Bytes> = if let Some(reason) = err {
+            warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
+            vec![Bytes::from(format!("data: {}\n\n", serde_json::json!({
+                "id": task_id.clone(), "object": "error",
+                "error": { "message": reason, "type": "engine_error" },
+            })))]
+        } else if let Some(calls) = parse_tool_calls(&buf) {
+            let tool_calls: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| {
+                serde_json::json!({ "index": i, "id": c.id.clone(), "type": c.r#type.clone(),
+                    "function": { "name": c.function.name.clone(), "arguments": c.function.arguments.clone() } })
+            }).collect();
+            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": { "role": "assistant", "tool_calls": tool_calls }, "finish_reason": serde_json::Value::Null }] });
+            let finish = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": {}, "finish_reason": "tool_calls" }] });
+            vec![Bytes::from(format!("data: {delta}\n\n")), Bytes::from(format!("data: {finish}\n\n"))]
+        } else {
+            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": { "role": "assistant", "content": buf }, "finish_reason": "stop" }] });
+            vec![Bytes::from(format!("data: {delta}\n\n"))]
+        };
+        let body = stream::iter(frames.into_iter().map(Ok::<Bytes, std::convert::Infallible>))
+            .chain(stream::once(async { Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n")) }));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(body))
+            .unwrap()
+            .into_response();
+    }
     // Move the permit into the stream so it's released only when the
     // body is dropped (client disconnect or final chunk).
     let permit_carrier = StreamWithPermit {
@@ -1273,5 +1327,56 @@ mod tests {
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
         assert!(v["choices"][0]["message"]["content"].is_null());
         assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_request_emits_indexed_tool_delta() {
+        let app = make_app().await;
+        let tc = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather"}}],"stream":true});
+        let resp = app.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let (mut saw_tool, mut saw_finish) = (false, false);
+        for line in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if line.trim() == "[DONE]" { continue; }
+            let v: Value = serde_json::from_str(line).unwrap();
+            let d = &v["choices"][0]["delta"];
+            if d.get("tool_calls").is_some() {
+                saw_tool = true;
+                assert_eq!(d["tool_calls"][0]["index"], 0);
+                assert_eq!(d["tool_calls"][0]["function"]["name"], "get_weather");
+                assert_eq!(d["role"], "assistant");
+            }
+            if v["choices"][0]["finish_reason"] == "tool_calls" { saw_finish = true; }
+        }
+        assert!(saw_tool, "no tool_calls delta: {body}");
+        assert!(saw_finish, "no tool_calls finish: {body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_non_tool_is_per_token_with_stop() {
+        let app = make_app().await;
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"alpha bravo charlie"}],"stream":true});
+        let resp = app.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+        assert!(!body.contains("tool_calls"), "non-tool stream must not mention tool_calls: {body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_engine_error_emits_error_event() {
+        let app = make_app().await;
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"__engine_error__"}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"x"}}],"stream":true});
+        let resp = app.oneshot(Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("content-type","application/json").body(Body::from(payload.to_string())).unwrap()).await.unwrap();
+        let body = String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"object\":\"error\""), "expected SSE error event: {body}");
+        assert!(!body.contains("tool_calls"), "{body}");
     }
 }
