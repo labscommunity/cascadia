@@ -754,6 +754,9 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 if let Some(c) = call_from_value(&v) {
                     calls.push(c);
                 }
+            } else if let Some(c) = call_from_xml_function(&after[..end]) {
+                // Qwen3/MoE <function=…><parameter=…> XML dialect (non-JSON).
+                calls.push(c);
             }
             rest = &after[end + "</tool_call>".len()..];
         }
@@ -796,6 +799,46 @@ fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
         id: format!("call_{}", Uuid::new_v4().simple()),
         r#type: "function".to_string(),
         function: FunctionCall { name, arguments },
+    })
+}
+
+/// Parse the Qwen3 `<function=NAME>…<parameter=K>V</parameter>…</function>` XML
+/// tool-call dialect emitted inside a `<tool_call>` block by some Qwen3/MoE
+/// templates (instead of the JSON Hermes form). Parameter values are kept as
+/// strings (the model emits text); arguments is serialised to a JSON object.
+fn call_from_xml_function(block: &str) -> Option<ToolCall> {
+    let fstart = block.find("<function=")?;
+    let after = &block[fstart + "<function=".len()..];
+    let nend = after.find('>')?;
+    let name = after[..nend].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &after[nend + 1..];
+    while let Some(ps) = rest.find("<parameter=") {
+        let pa = &rest[ps + "<parameter=".len()..];
+        let Some(ke) = pa.find('>') else { break };
+        let key = pa[..ke].trim().to_string();
+        let val_rest = &pa[ke + 1..];
+        let Some(ve) = val_rest.find("</parameter>") else {
+            break;
+        };
+        if !key.is_empty() {
+            args.insert(
+                key,
+                serde_json::Value::String(val_rest[..ve].trim().to_string()),
+            );
+        }
+        rest = &val_rest[ve + "</parameter>".len()..];
+    }
+    Some(ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name,
+            arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
+        },
     })
 }
 
@@ -2281,6 +2324,36 @@ mod tests {
                 ["city"],
             "Paris"
         );
+    }
+
+    #[test]
+    fn parse_qwen3_xml_function_dialect() {
+        // Qwen3.6-MoE emits the <function=NAME><parameter=K>V</parameter></function>
+        // XML dialect inside <tool_call> (not the JSON Hermes form). Live rig: the MoE
+        // produced exactly this, finish=stop because the parser didn't recognise it.
+        let calls = parse_tool_calls(
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+        )
+        .expect("one tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()["city"],
+            "Paris"
+        );
+        assert!(calls[0].id.starts_with("call_"));
+        assert_eq!(calls[0].r#type, "function");
+    }
+
+    #[test]
+    fn parse_qwen3_xml_multi_param() {
+        let calls = parse_tool_calls(
+            "<tool_call><function=f><parameter=a>1</parameter><parameter=b>two</parameter></function></tool_call>",
+        )
+        .expect("one");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["a"], "1");
+        assert_eq!(args["b"], "two");
     }
 
     #[test]
