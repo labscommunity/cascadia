@@ -642,57 +642,47 @@ fn render_with_chat_env(
     bos_token: &str,
     eos_token: &str,
     enable_thinking: bool,
+    tools: Option<&[Tool]>,
 ) -> Result<String, String> {
     use minijinja::context;
     use minijinja::value::Value;
-
-    let tmpl = env
-        .get_template("chat")
-        .map_err(|e| format!("template lookup: {e}"))?;
-
+    let tmpl = env.get_template("chat").map_err(|e| format!("template lookup: {e}"))?;
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
-            Value::from_serialize(serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            }))
+            let mut obj = serde_json::json!({ "role": m.role, "content": m.content });
+            if let Some(tc) = &m.tool_calls {
+                obj["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+            }
+            if let Some(id) = &m.tool_call_id {
+                obj["tool_call_id"] = serde_json::json!(id);
+            }
+            if let Some(name) = &m.name {
+                obj["name"] = serde_json::json!(name);
+            }
+            Value::from_serialize(obj)
         })
         .collect();
-
+    let tools_value: Option<Vec<Value>> =
+        tools.map(|ts| ts.iter().map(Value::from_serialize).collect());
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
-        // Hybrid-reasoning templates (Qwen3.x) read this and inject the
-        // empty think block themselves when false.
         enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
+        tools => tools_value,
     };
-
-    tmpl.render(ctx)
-        .map_err(|e| format!("template render: {e}"))
+    tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
 }
 
-fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool) -> String {
-    // Hybrid: for engines that own native templating (ov-genai), only render
-    // here when thinking is OFF (to inject the empty-think block). With thinking
-    // ON, emit the legacy join so the engine applies its own template natively —
-    // leaving the already-working path byte-identical.
+fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool, tools: Option<&[Tool]>) -> String {
     let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
     if !defer_to_engine {
         if let Some(env) = &state.chat_env {
-            match render_with_chat_env(
-                env,
-                messages,
-                &state.bos_token,
-                &state.eos_token,
-                enable_thinking,
-            ) {
+            match render_with_chat_env(env, messages, &state.bos_token, &state.eos_token, enable_thinking, tools) {
                 Ok(s) => return s,
-                Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
-                }
+                Err(e) => warn!(error = %e, "chat_template render failed; falling back to legacy formatter"),
             }
         }
     }
@@ -786,18 +776,22 @@ impl ChatPromptRenderer {
         }
     }
 
-    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
-    /// template is set or rendering fails.
-    pub fn render(&self, messages: &[ChatMessage]) -> String {
+    /// Render `messages` with optional `tools`, falling back to
+    /// [`render_prompt_legacy`] when no template is set or rendering fails.
+    pub fn render_with_tools(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         if let Some(env) = &self.env {
-            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true) {
+            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true, tools) {
                 Ok(s) => return s,
-                Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
-                }
+                Err(e) => warn!(error = %e, "chat_template render failed; falling back to legacy formatter"),
             }
         }
         render_prompt_legacy(messages)
+    }
+
+    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
+    /// template is set or rendering fails.
+    pub fn render(&self, messages: &[ChatMessage]) -> String {
+        self.render_with_tools(messages, None)
     }
 }
 
@@ -815,7 +809,7 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(&state, &req.messages, req.enable_thinking);
+    let prompt = render_prompt(&state, &req.messages, req.enable_thinking, req.tools.as_deref());
     // Degenerate input (no messages, or a render that collapses to nothing)
     // is a client error. Reject here with 400 rather than admitting an empty
     // prompt to the engine, which would generate nothing and return a 200
@@ -1996,7 +1990,7 @@ mod tests {
             tool_call_id: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true)
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
@@ -2160,5 +2154,36 @@ mod tests {
     fn parse_arguments_already_string_passthrough() {
         let calls = parse_tool_calls("<tool_call>{\"name\":\"f\",\"arguments\":\"{\\\"k\\\":1}\"}</tool_call>").expect("one");
         assert_eq!(calls[0].function.arguments, "{\"k\":1}");
+    }
+
+    const TOOL_TEMPLATE: &str = "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\
+        {% if m.tool_calls %}[CALLS:{% for c in m.tool_calls %}{{ c.function.name }}{% endfor %}]{% endif %}\
+        {% if m.tool_call_id %}[TCID:{{ m.tool_call_id }}]{% endif %}\n{% endfor %}\
+        {% if tools %}[TOOLS:{% for t in tools %}{{ t.function.name }}{% endfor %}]{% endif %}";
+
+    #[test]
+    fn renderer_forwards_tools_into_template() {
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let msgs = [ChatMessage { role: "user".into(), content: "hi".into(),
+            name: None, tool_calls: None, tool_call_id: None }];
+        let tools = vec![Tool { r#type: "function".into(), function: serde_json::json!({"name":"get_weather"}) }];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools)).unwrap();
+        assert!(out.contains("[TOOLS:get_weather]"), "tools not forwarded: {out}");
+    }
+
+    #[test]
+    fn renderer_forwards_assistant_tool_calls_and_tool_result() {
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let msgs = [
+            ChatMessage { role: "assistant".into(), content: "".into(), name: None,
+                tool_calls: Some(vec![ToolCall { id: "call_1".into(), r#type: "function".into(),
+                    function: FunctionCall { name: "get_weather".into(), arguments: "{}".into() } }]),
+                tool_call_id: None },
+            ChatMessage { role: "tool".into(), content: "18C".into(), name: Some("get_weather".into()),
+                tool_calls: None, tool_call_id: Some("call_1".into()) },
+        ];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
+        assert!(out.contains("[CALLS:get_weather]"), "assistant tool_calls not rendered: {out}");
+        assert!(out.contains("[TCID:call_1]"), "tool_call_id not rendered: {out}");
     }
 }
