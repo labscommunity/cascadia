@@ -2356,6 +2356,34 @@ mod tests {
     }
 
     #[test]
+    fn chat_env_supports_tojson_filter() {
+        // Guards the minijinja `json` feature. Real Llama-3.1/Qwen instruct
+        // templates serialize the tool schema via `{{ tool | tojson }}`; without
+        // `json` the filter is unknown, render_with_chat_env errors, and
+        // render_with_tools silently falls back to the legacy formatter —
+        // dropping tools from the prompt so the model never sees them.
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name":"get_weather"}),
+        }];
+        let env = build_chat_env("{% if tools %}{{ tools | tojson }}{% endif %}")
+            .expect("tojson template must parse");
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools))
+            .expect("tojson template must render (needs minijinja `json` feature)");
+        assert!(
+            out.contains("get_weather"),
+            "tojson did not serialize tools: {out}"
+        );
+    }
+
+    #[test]
     fn renderer_forwards_assistant_tool_calls_and_tool_result() {
         let env = build_chat_env(TOOL_TEMPLATE).unwrap();
         let msgs = [
