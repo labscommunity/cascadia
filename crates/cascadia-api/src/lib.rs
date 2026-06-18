@@ -291,10 +291,45 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     })
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default, deserialize_with = "de_null_content")]
     pub content: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI tool spec (request input). `function` is opaque JSON (name,
+/// description, parameters schema) forwarded verbatim to the chat template.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: serde_json::Value,
+}
+
+/// A structured tool call (response output + round-trip input).
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded argument object (OpenAI ships this as a string).
+    pub arguments: String,
+}
+
+/// null/missing content -> "" (assistant tool-call turns send content: null).
+fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -348,6 +383,10 @@ pub struct ChatCompletionRequest {
     /// <think> block (engines that can't, ignore it).
     #[serde(default = "default_true")]
     pub enable_thinking: bool,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl ChatCompletionRequest {
@@ -392,7 +431,10 @@ fn default_max_tokens() -> u32 {
 #[derive(Serialize)]
 struct ChatChoiceMessage {
     role: &'static str,
-    content: String,
+    /// `Option` so a tool-call turn emits `content: null` (OpenAI shape).
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// OpenAI chat `logprobs` object: one entry per generated token under
@@ -867,7 +909,8 @@ async fn chat_completions(
             index: 0,
             message: ChatChoiceMessage {
                 role: "assistant",
-                content: buf,
+                content: Some(buf),
+                tool_calls: None,
             },
             finish_reason,
             logprobs: if logprobs_content.is_empty() {
@@ -1891,6 +1934,9 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true)
@@ -1906,6 +1952,9 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -1955,5 +2004,50 @@ mod tests {
             "empty/whitespace chat_template.jinja must yield template=None, got {:?}",
             cfg.template
         );
+    }
+
+    #[test]
+    fn request_accepts_tools_and_tool_choice() {
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather",
+            "description":"Get weather","parameters":{"type":"object",
+            "properties":{"city":{"type":"string"}}}}}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let tools = req.tools.expect("tools parse");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].r#type, "function");
+        assert_eq!(tools[0].function["name"], "get_weather");
+        assert_eq!(req.tool_choice.unwrap(), serde_json::json!("auto"));
+    }
+
+    #[test]
+    fn message_accepts_null_content_and_tool_calls() {
+        let raw = r#"{"role":"assistant","content":null,
+            "tool_calls":[{"id":"call_abc","type":"function",
+            "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert!(m.content.is_empty(), "null content -> empty string");
+        let calls = m.tool_calls.expect("tool_calls parse");
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"Paris\"}");
+    }
+
+    #[test]
+    fn message_accepts_tool_role_with_tool_call_id() {
+        let raw = r#"{"role":"tool","content":"{\"temp_c\":18}",
+            "tool_call_id":"call_abc","name":"get_weather"}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(m.name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
+    fn non_tool_choice_message_serializes_content_as_string() {
+        let msg = ChatChoiceMessage { role: "assistant", content: Some("hi".into()), tool_calls: None };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["content"], "hi");
+        assert!(v.get("tool_calls").is_none(), "no tool_calls key on non-tool message");
     }
 }
