@@ -56,10 +56,10 @@ impl Engine for MockEngine {
         // task loud (emits an error chunk) so consumers' failure paths —
         // e.g. the API's 5xx mapping — can be exercised deterministically.
         if task.prompt.contains("__engine_error__") {
-            return vec![(
+            return Ok(vec![(
                 task.task_id.clone(),
                 Chunk::error(task.task_id, "mock injected engine failure"),
-            )];
+            )]);
         }
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
