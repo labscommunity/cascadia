@@ -466,6 +466,63 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bo
     render_prompt_legacy(messages)
 }
 
+/// Parse model tool-call output into structured calls; None when none found.
+/// Shape-based + engine-agnostic; never panics (each block parsed independently,
+/// malformed blocks skipped).
+pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    if text.contains("<tool_call>") {
+        // Qwen/Hermes: each <tool_call>…</tool_call> block.
+        let mut rest = text;
+        while let Some(start) = rest.find("<tool_call>") {
+            let after = &rest[start + "<tool_call>".len()..];
+            let Some(end) = after.find("</tool_call>") else { break };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(after[..end].trim()) {
+                if let Some(c) = call_from_value(&v) {
+                    calls.push(c);
+                }
+            }
+            rest = &after[end + "</tool_call>".len()..];
+        }
+    } else {
+        // Llama-3.1: require <|python_tag|> prefix OR whole-output JSON.
+        let trimmed = text.trim();
+        let candidate = trimmed.strip_prefix("<|python_tag|>").map(str::trim).unwrap_or(trimmed);
+        let looks_json = candidate.starts_with('{') || candidate.starts_with('[');
+        if trimmed.starts_with("<|python_tag|>") || looks_json {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(candidate) {
+                for v in &arr {
+                    if let Some(c) = call_from_value(v) {
+                        calls.push(c);
+                    }
+                }
+            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if let Some(c) = call_from_value(&v) {
+                    calls.push(c);
+                }
+            }
+        }
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// One `ToolCall` from a parsed JSON value. `name` required (else None → skip).
+/// `arguments` (preferred) or `parameters` (Llama alias); default "{}"; an
+/// already-string arguments value passes through.
+fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
+    let name = v.get("name")?.as_str()?.to_string();
+    let arguments = match v.get("arguments").or_else(|| v.get("parameters")) {
+        None => "{}".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string(other).ok()?,
+    };
+    Some(ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall { name, arguments },
+    })
+}
+
 /// `AppState`-free chat-prompt renderer for in-process callers. Parses the
 /// chat template once in [`new`](Self::new); reuse across requests.
 #[derive(Clone)]
@@ -1085,5 +1142,59 @@ mod tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["content"], "hi");
         assert!(v.get("tool_calls").is_none(), "no tool_calls key on non-tool message");
+    }
+
+    #[test]
+    fn parse_llama_python_tag_single() {
+        let calls = parse_tool_calls("<|python_tag|>{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}").expect("one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()["city"], "Paris");
+        assert!(calls[0].id.starts_with("call_"));
+        assert_eq!(calls[0].r#type, "function");
+    }
+
+    #[test]
+    fn parse_qwen_hermes_single() {
+        let calls = parse_tool_calls("<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>").expect("one");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()["city"], "Paris");
+    }
+
+    #[test]
+    fn parse_qwen_multiple_distinct_ids() {
+        let calls = parse_tool_calls("<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\
+            <tool_call>{\"name\":\"b\",\"arguments\":{\"x\":1}}</tool_call>").expect("two");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "a");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[1].function.name, "b");
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn parse_skips_malformed_first_block_keeps_valid() {
+        let calls = parse_tool_calls("<tool_call>{bad</tool_call><tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>").expect("one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "b");
+    }
+
+    #[test]
+    fn parse_plain_prose_is_none() {
+        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
+        assert!(parse_tool_calls("you could call <tool_call> here").is_none());
+    }
+
+    #[test]
+    fn parse_missing_name_and_truncated_no_panic() {
+        assert!(parse_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>").is_none());
+        assert!(parse_tool_calls("<tool_call>{\"name\":\"x\",\"argum").is_none());
+        assert!(parse_tool_calls("<|python_tag|>{\"name\":\"x\"").is_none());
+    }
+
+    #[test]
+    fn parse_arguments_already_string_passthrough() {
+        let calls = parse_tool_calls("<tool_call>{\"name\":\"f\",\"arguments\":\"{\\\"k\\\":1}\"}</tool_call>").expect("one");
+        assert_eq!(calls[0].function.arguments, "{\"k\":1}");
     }
 }
