@@ -2,7 +2,7 @@ import { NavLink } from "react-router-dom";
 
 export function Nav() {
   return (
-    <header className="sticky top-0 z-10 bg-paper/85 backdrop-blur border-b border-rule">
+    <header className="sticky top-0 z-10 bg-white/85 backdrop-blur border-b border-rule">
       <div className="max-w-container mx-auto px-6 h-14 flex items-center gap-8">
         <NavLink
           to="/"
@@ -30,8 +30,8 @@ function NavItem({ to, label, end }: { to: string; label: string; end?: boolean 
       to={to}
       end={end}
       className={({ isActive }) =>
-        `px-3 py-1.5 rounded-sm label-mono transition-colors ${
-          isActive ? "text-ink bg-mint-wash" : "hover:text-ink"
+        `px-3.5 py-1.5 rounded-full label-mono transition-colors ${
+          isActive ? "text-pine bg-mint-wash" : "hover:text-persian"
         }`
       }
     >

@@ -34,10 +34,10 @@
   }
 
   body {
-    /* Inter ships several stylistic alternates; opt into the disambiguated
-     * '1' / 'l' / 'I' set (cv11) and the alternate four / six (ss01). Keeps
-     * latency numbers and node IDs legible at small sizes. */
-    font-feature-settings: "cv11", "ss01";
+    /* cascadia.to base typography: Lato, 16px / 1.6. tabular-nums keeps
+     * latency numbers and node IDs aligned in tables. */
+    font-size: 16px;
+    line-height: 1.6;
     font-variant-numeric: tabular-nums;
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
@@ -51,10 +51,11 @@
     @apply text-[11px] font-mono tracking-[0.08em] uppercase text-ink-low;
   }
 
-  /* Default card surface — node cards, stat panels, table rows. Subtle
-   * border + shadow, slight elevation on hover. */
+  /* Default card surface — node cards, stat panels, table rows. Warm paper
+   * panel on the white page (the cascadia.to --panel: var(--paper) mapping),
+   * with a subtle border + shadow and slight elevation on hover. */
   .surface {
-    @apply bg-white border border-rule rounded-md shadow-card;
+    @apply bg-paper border border-rule rounded-md shadow-card;
   }
 
   /* Live pulse dot. Used in the nav and on node cards to communicate
