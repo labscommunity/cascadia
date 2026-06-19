@@ -4,7 +4,8 @@
 //!
 //! * `GET /api/topology` — current nodes + measured edges (JSON)
 //! * `GET /api/stats` — coarse runtime counters (in-flight requests,
-//!   tokens generated). Filled in by the host process via [`DashboardStats`].
+//!   tokens generated). Read from the shared [`cascadia_types::ApiStats`]
+//!   the OpenAI server bumps on the chat hot path.
 //! * `GET /api/events` — server-sent events for live updates (added in a
 //!   follow-up; the placeholder route returns a one-shot welcome event).
 //! * `embed-spa` feature — when on, serves the built Vite SPA from
@@ -23,8 +24,8 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use cascadia_api::ApiStats;
 use cascadia_topology::{NodeInfo, Topology};
+use cascadia_types::ApiStats;
 use serde::Serialize;
 
 #[cfg(feature = "embed-spa")]

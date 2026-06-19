@@ -298,8 +298,8 @@ name = "cascadia-dashboard"
 version = "0.1.0"
 dependencies = [
  "axum",
- "cascadia-api",
  "cascadia-topology",
+ "cascadia-types",
  "mime_guess",
  "rust-embed",
  "serde",
@@ -316,6 +316,7 @@ version = "0.1.0"
 dependencies = [
  "cascadia-topology",
  "cascadia-types",
+ "if-addrs",
  "mdns-sd",
  "parking_lot",
  "thiserror 1.0.69",

@@ -33,23 +33,62 @@ impl From<mdns_sd::Error> for Error {
     }
 }
 
-/// Best-effort local LAN IP: the address this host uses to reach the
-/// gateway. Falls back to `127.0.0.1` if no route can be probed.
+/// Best-effort local LAN IP — the address peers should use to reach this
+/// host for the activation relay + latency probes.
+///
+/// 1. Default-route egress probe (no packets sent; just selects the
+///    outbound interface). Picks the real default interface over docker/VPN
+///    ones and works on any routable network.
+/// 2. If that yields nothing usable (an **air-gapped / isolated LAN with no
+///    default route** — the project's primary deployment), fall back to the
+///    first private, non-loopback IPv4 from the interface list. Without this
+///    the node would advertise `127.0.0.1` and every peer would probe its
+///    own loopback, filling the latency matrix with bogus self-loops.
+/// 3. Loopback as a last resort.
 pub fn local_ip() -> IpAddr {
-    let socket = match UdpSocket::bind("0.0.0.0:0") {
-        Ok(s) => s,
-        Err(_) => return IpAddr::from([127, 0, 0, 1]),
-    };
+    if let Some(ip) = egress_route_ip() {
+        if !ip.is_loopback() {
+            return ip;
+        }
+    }
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        if let Some(ip) = ifaces
+            .iter()
+            .map(|i| i.ip())
+            .find(|ip| matches!(ip, IpAddr::V4(v4) if v4.is_private()))
+        {
+            return ip;
+        }
+    }
+    IpAddr::from([127, 0, 0, 1])
+}
+
+/// Select the source IP of the default route via a connected (but never
+/// sent-on) UDP socket. `None` when there is no route (air-gapped).
+fn egress_route_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket
         .set_read_timeout(Some(Duration::from_millis(500)))
         .ok();
-    if socket.connect("8.8.8.8:80").is_err() {
-        return IpAddr::from([127, 0, 0, 1]);
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|sa| sa.ip())
+}
+
+/// Cap a free-form spec string before it goes into the mDNS TXT record.
+/// TXT records have a tight size budget (each entry ≤255 bytes, and some
+/// responders enforce a small single-packet total), so an unexpectedly
+/// long CPU brand / OS string can't push the record past the limit and
+/// get the whole advertisement dropped.
+fn txt_trunc(s: &str) -> String {
+    const MAX: usize = 64;
+    if s.len() <= MAX {
+        s.to_owned()
+    } else {
+        s.char_indices()
+            .take_while(|(i, _)| *i < MAX)
+            .map(|(_, c)| c)
+            .collect()
     }
-    socket
-        .local_addr()
-        .map(|sa| sa.ip())
-        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]))
 }
 
 fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
@@ -58,10 +97,13 @@ fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
     p.insert("namespace".into(), info.namespace.clone());
     p.insert("device".into(), info.device.clone());
     p.insert("memory_mb".into(), info.memory_mb.to_string());
-    p.insert("cpu_model".into(), info.cpu_model.clone());
+    p.insert("cpu_model".into(), txt_trunc(&info.cpu_model));
     p.insert("cpu_cores".into(), info.cpu_cores.to_string());
-    p.insert("os".into(), info.os.clone());
+    p.insert("os".into(), txt_trunc(&info.os));
     p.insert("engines".into(), info.engines.join(","));
+    if let Some(api_port) = info.api_port {
+        p.insert("api_port".into(), api_port.to_string());
+    }
     p
 }
 
@@ -88,6 +130,7 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u32);
     let os = get("os").unwrap_or_default();
+    let api_port = get("api_port").and_then(|s| s.parse().ok());
     let engines = get("engines")
         .map(|s| {
             s.split(',')
@@ -109,6 +152,7 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         node_id,
         host,
         port,
+        api_port,
         namespace,
         device,
         memory_mb,
@@ -176,10 +220,18 @@ impl DiscoveryService {
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        if let Some(node_id) = fullname.split('.').next() {
-                            debug!(%node_id, "peer removed");
-                            topology.remove_node(node_id);
-                        }
+                        // The mDNS fullname is `<node_id>.<SERVICE_TYPE>`.
+                        // Strip the service-type suffix rather than splitting
+                        // on the first '.', so a node_id containing a dot
+                        // (e.g. an FQDN-ish hostname) isn't truncated to the
+                        // wrong id (which would leave the dead peer in the
+                        // topology forever).
+                        let node_id = fullname
+                            .strip_suffix(SERVICE_TYPE)
+                            .and_then(|s| s.strip_suffix('.'))
+                            .unwrap_or(&fullname);
+                        debug!(%node_id, "peer removed");
+                        topology.remove_node(node_id);
                     }
                     other => debug!(?other, "discovery event"),
                 }
@@ -234,5 +286,54 @@ mod tests {
         let p = props_from_node(&info);
         assert_eq!(p.get("node_id"), Some(&"n1".to_string()));
         assert_eq!(p.get("engines"), Some(&"ov-genai,mock".to_string()));
+    }
+
+    // Exercises the DECODE half (node_from_service) — previously untested —
+    // so the encode/decode pair can't silently drift when a NodeInfo field
+    // is added to one side only.
+    #[test]
+    fn props_round_trip_through_service_info() {
+        let mut node = NodeInfo::new("host.lan-r0", "192.168.0.5", 9100);
+        node.api_port = Some(8000);
+        node.device = "GPU".into();
+        node.memory_mb = 32000;
+        node.cpu_model = "Intel(R) Core(TM) Ultra 7 258V".into();
+        node.cpu_cores = 16;
+        node.os = "Windows 11".into();
+        node.engines = vec!["ov-runtime".into(), "mock".into()];
+
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+
+        let decoded = node_from_service(&info, "default").expect("decode");
+        assert_eq!(decoded.node_id, "host.lan-r0");
+        assert_eq!(decoded.api_port, Some(8000));
+        assert_eq!(decoded.device, "GPU");
+        assert_eq!(decoded.memory_mb, 32000);
+        assert_eq!(decoded.cpu_model, "Intel(R) Core(TM) Ultra 7 258V");
+        assert_eq!(decoded.cpu_cores, 16);
+        assert_eq!(decoded.os, "Windows 11");
+        assert_eq!(decoded.engines, vec!["ov-runtime", "mock"]);
+    }
+
+    // A node_id containing a '.' must round-trip through the mDNS fullname
+    // suffix-strip used by ServiceRemoved (regression: split('.').next()
+    // truncated it).
+    #[test]
+    fn removed_fullname_strips_service_type_not_first_dot() {
+        let node_id = "host.lan-r0";
+        let fullname = format!("{node_id}.{SERVICE_TYPE}");
+        let stripped = fullname
+            .strip_suffix(SERVICE_TYPE)
+            .and_then(|s| s.strip_suffix('.'))
+            .unwrap_or(&fullname);
+        assert_eq!(stripped, "host.lan-r0");
     }
 }

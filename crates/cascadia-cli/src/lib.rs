@@ -65,26 +65,43 @@ async fn probe_peer(host: &str, port: u16) -> Option<f64> {
     }
 }
 
-/// Best-effort hostname for the local node. Used as the human-readable
-/// prefix of `node_id`. Falls back to "node" if the `hostname` command is
-/// unavailable or returns something empty.
-fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "node".to_owned())
+/// Local node identity + hardware specs for the dashboard node card.
+/// Gathered once at worker startup. Read off the main async path via
+/// `spawn_blocking` (see `cmd_worker`) because `sysinfo` does blocking
+/// syscalls. Falls back to empty/0/"node" for anything undeterminable.
+struct NodeSpecs {
+    hostname: String,
+    memory_mb: u64,
+    cpu_model: String,
+    cpu_cores: u32,
+    os: String,
 }
 
-/// Best-effort local system specs for the dashboard node card:
-/// `(total_RAM_MB, cpu_brand, logical_cores, os_label)`. Read once at
-/// worker startup via `sysinfo` and advertised in the node's mDNS record.
-/// Any field that can't be determined falls back to empty/0.
-fn system_specs() -> (u64, String, u32, String) {
-    use sysinfo::System;
-    let sys = System::new_all();
+impl Default for NodeSpecs {
+    fn default() -> Self {
+        Self {
+            hostname: "node".to_owned(),
+            memory_mb: 0,
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            os: String::new(),
+        }
+    }
+}
+
+/// Blocking: probe RAM + CPU + OS + hostname via `sysinfo` in one pass.
+/// Uses a narrow `RefreshKind` (RAM + CPU only) rather than `new_all()`,
+/// which would also enumerate every process/disk/network just to read
+/// three fields. `hostname` comes from `sysinfo` too (no `hostname`
+/// subprocess that would yield "node" — and a node_id collision — when
+/// the binary isn't on PATH).
+fn gather_node_specs() -> NodeSpecs {
+    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+    let sys = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_memory(MemoryRefreshKind::nothing().with_ram())
+            .with_cpu(CpuRefreshKind::nothing()),
+    );
     // sysinfo reports total_memory() in bytes (0.30+).
     let memory_mb = sys.total_memory() / 1024 / 1024;
     let cpu_model = sys
@@ -99,7 +116,17 @@ fn system_specs() -> (u64, String, u32, String) {
         (Some(n), _) => n,
         _ => System::long_os_version().unwrap_or_default(),
     };
-    (memory_mb, cpu_model, cpu_cores, os)
+    let hostname = System::host_name()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".to_owned());
+    NodeSpecs {
+        hostname,
+        memory_mb,
+        cpu_model,
+        cpu_cores,
+        os,
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -1006,17 +1033,30 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         .advertise_device
         .clone()
         .unwrap_or_else(|| args.device.clone());
-    let (memory_mb, cpu_model, cpu_cores, os) = system_specs();
+    // sysinfo + hostname do blocking syscalls; gather them off the async
+    // runtime thread so they don't stall worker startup.
+    let specs = tokio::task::spawn_blocking(gather_node_specs)
+        .await
+        .unwrap_or_default();
+    // Advertise the API/dashboard port separately from the relay port so
+    // the dashboard can show a node's reachable address (the relay `port`
+    // isn't an HTTP endpoint). None for relay-only stages.
+    let api_port = args
+        .api
+        .as_deref()
+        .and_then(|a| parse_addr(a, "0.0.0.0").ok())
+        .map(|(_, p)| p);
     let self_node = cascadia_topology::NodeInfo {
-        node_id: format!("{}-r{}", hostname(), args.rank),
+        node_id: format!("{}-r{}", specs.hostname, args.rank),
         host: cascadia_discovery::local_ip().to_string(),
         port: listen_port,
+        api_port,
         namespace: "default".to_owned(),
         device,
-        memory_mb,
-        cpu_model,
-        cpu_cores,
-        os,
+        memory_mb: specs.memory_mb,
+        cpu_model: specs.cpu_model,
+        cpu_cores: specs.cpu_cores,
+        os: specs.os,
         engines,
         last_seen: 0.0,
     };
@@ -1035,13 +1075,15 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // the daemon (TTL-driven, slower); a generous freshness window on
     // the frontend covers the gap.
     let topology_for_heartbeat = topology.clone();
-    let self_node_for_heartbeat = self_node.clone();
+    let self_id_for_heartbeat = self_node.node_id.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         tick.tick().await; // skip the immediate first tick — we already added the node above.
         loop {
             tick.tick().await;
-            topology_for_heartbeat.add_node(self_node_for_heartbeat.clone());
+            // Only the timestamp changes — touch() updates last_seen in
+            // place instead of re-cloning + re-inserting the whole NodeInfo.
+            topology_for_heartbeat.touch(&self_id_for_heartbeat);
         }
     });
 
@@ -1061,20 +1103,30 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tick.tick().await;
-            let nodes = topology_for_probe.nodes();
-            let probes: Vec<_> = nodes
+            // Snapshot just (id, host, port) — no full NodeInfo clone — and
+            // probe all peers concurrently with join_all rather than an
+            // unbounded tokio::spawn per peer per tick.
+            let peers: Vec<(String, String, u16)> = topology_for_probe
+                .nodes()
                 .into_iter()
                 .filter(|n| n.node_id != self_id_for_probe)
-                .map(|n| {
-                    let host = n.host.clone();
-                    let port = n.port;
-                    let id = n.node_id.clone();
-                    tokio::spawn(async move { (id, probe_peer(&host, port).await) })
-                })
+                .map(|n| (n.node_id, n.host, n.port))
                 .collect();
-            for jh in probes {
-                if let Ok((dst_id, Some(latency_ms))) = jh.await {
-                    topology_for_probe.measure(self_id_for_probe.clone(), dst_id, latency_ms, 0.0);
+            let results = futures::future::join_all(
+                peers
+                    .into_iter()
+                    .map(|(id, host, port)| async move { (id, probe_peer(&host, port).await) }),
+            )
+            .await;
+            for (dst_id, latency) in results {
+                if let Some(latency_ms) = latency {
+                    // record_latency, not measure(.., 0.0), so a future
+                    // bandwidth probe on the same edge isn't clobbered.
+                    topology_for_probe.record_latency(
+                        self_id_for_probe.clone(),
+                        dst_id,
+                        latency_ms,
+                    );
                 }
             }
         }

@@ -5,7 +5,7 @@
 //! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -46,19 +46,24 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 16;
 /// Mirrors the Llama-3.1 default 128 K context window minus headroom.
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 
-/// Live request/token counters bumped on the chat hot path. Shared
-/// (via `Arc`) with the dashboard's `/api/stats` so the cluster view
-/// reflects activity in real time. All `Relaxed` — these are coarse
-/// monotonic gauges, not synchronization points.
-#[derive(Default)]
-pub struct ApiStats {
-    /// Cumulative chat-completion requests admitted (past the permit gate).
-    pub requests_total: AtomicU64,
-    /// Requests currently executing (incremented on admit, decremented when
-    /// the response/stream is fully drained or dropped).
-    pub requests_in_flight: AtomicU64,
-    /// Cumulative model tokens emitted across all requests.
-    pub tokens_total: AtomicU64,
+/// Live request/token counters bumped on the chat hot path. Shared (via
+/// `Arc`) with the dashboard's `/api/stats`. Defined in `cascadia-types`
+/// (re-exported here) so the dashboard can read it without depending on
+/// this whole HTTP-server crate.
+pub use cascadia_types::ApiStats;
+
+/// Tokens a chunk contributes to the cumulative counter. The engine's
+/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1);
+/// otherwise the per-chunk convention is "one token per non-empty chunk"
+/// (see `Chunk::n_tokens` docs). An empty chunk — the no-text final
+/// marker mock/runtime engines emit — contributes 0 so it isn't counted
+/// as a phantom token. (ov-genai delivers its whole response on a single
+/// final chunk with no `n_tokens`, so it counts as 1 here — approximate,
+/// since that engine tokenizes internally and reports no token count.)
+fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
+    chunk
+        .n_tokens
+        .unwrap_or(if chunk.text.is_empty() { 0 } else { 1 })
 }
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
@@ -365,11 +370,17 @@ fn now_unix() -> i64 {
 /// That gives one-shot prompting (no multi-turn memory) but doesn't
 /// produce confusing duplicated output. Multi-turn coherence requires
 /// a real tokenizer_config.json with `chat_template` populated.
+///
+/// When there's no `user` turn at all (e.g. a system-only request), fall
+/// back to the last message of any role rather than rendering empty — an
+/// empty render trips the 400 "no prompt content" guard and would reject
+/// a request the old all-turns formatter admitted.
 fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
     messages
         .iter()
         .rev()
         .find(|m| m.role == "user")
+        .or_else(|| messages.last())
         .map(|m| m.content.clone())
         .unwrap_or_default()
 }
@@ -619,13 +630,15 @@ async fn chat_completions(
             )
                 .into_response();
         }
-        if !chunk.is_final {
-            buf.push_str(&chunk.text);
-            completion_tokens += chunk.n_tokens.unwrap_or(1);
-        } else {
-            if !chunk.text.is_empty() {
-                buf.push_str(&chunk.text);
-            }
+        // Count tokens for EVERY chunk including the final one — engines
+        // like ov-genai deliver their whole output on a single final
+        // chunk, and spec-decode carries its last round there too; gating
+        // on `!is_final` dropped them (tokens_total stuck at 0 for
+        // ov-genai). chunk_token_count contributes 0 for the empty final
+        // markers other engines emit, so there's no phantom over-count.
+        buf.push_str(&chunk.text);
+        completion_tokens += chunk_token_count(&chunk);
+        if chunk.is_final {
             prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
         }
     }
@@ -708,10 +721,13 @@ async fn stream_completion(
             async move {
                 // Count model tokens as they stream so the dashboard's
                 // tokens_total advances live (not just at request end).
-                if chunk.error.is_none() && !chunk.is_final {
+                // Counts the final chunk too (ov-genai emits its whole
+                // output there); chunk_token_count yields 0 for empty
+                // markers, so no phantom token.
+                if chunk.error.is_none() {
                     stats
                         .tokens_total
-                        .fetch_add(chunk.n_tokens.unwrap_or(1) as u64, Ordering::Relaxed);
+                        .fetch_add(chunk_token_count(&chunk) as u64, Ordering::Relaxed);
                 }
                 // A failed task carries `error` on its final chunk. The 200
                 // headers are already on the wire by the time the body
