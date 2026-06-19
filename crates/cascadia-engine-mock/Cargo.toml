@@ -1,0 +1,16 @@
+[package]
+name = "cascadia-engine-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mock engine for tests — deterministic per-token output without real model weights."
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-engine = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

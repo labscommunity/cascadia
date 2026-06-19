@@ -4,7 +4,12 @@ target/
 *.pdb
 # Cargo.lock IS tracked (binary project — pinned for reproducibility)
 
-# Tahoma scratch dirs (bench logs, ad-hoc experiments)
+# Python (tools/ exporter + its tests)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Cascadia scratch dirs (bench logs, ad-hoc experiments)
 tmp/
 experiments/
 

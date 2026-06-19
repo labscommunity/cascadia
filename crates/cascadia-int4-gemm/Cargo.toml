@@ -1,0 +1,39 @@
+[package]
+name = "cascadia-int4-gemm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hand-rolled int4 GEMM for the K2.6 expert path — group-32 symmetric quantization with bf16 scales, matching compressed-tensors' on-disk format."
+
+[dependencies]
+half = "2"
+memmap2 = "0.9"
+parking_lot = { workspace = true }
+rayon = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# autolab iter 038 (C1 Windows port): PrefetchVirtualMemory + friends
+# for the Windows arm of advise_willneed. Bundled in `windows-sys` so
+# we only pull the Win32 import lib, no proc-macros or extra crates.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# (canonical reference decompression for cross-validation lives in
+# rainier/scripts/k26_export_per_expert_v2.py — we cross-validate the
+# Rust kernel against bytes-on-disk only).
+tempfile = { workspace = true }
+
+[[bench]]
+name = "expert_gemm"
+harness = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+

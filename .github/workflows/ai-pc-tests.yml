@@ -1,0 +1,79 @@
+# AI-PC tests: the hardware (OpenVINO / Intel iGPU / NPU) tier, run on the
+# self-hosted AI-PC runner pool. The stub-mode unit/lint/build stays in ci.yml
+# on GitHub-hosted ubuntu-latest; only the OpenVINO path runs here.
+#
+# Prereqs:
+#   - self-hosted runners online with labels [self-hosted, ai-pc, windows]
+#     (provisioned via cascadia-fleet — see that repo's docs/RUNNERS.md)
+#   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
+#     root on the runners.
+
+name: AI-PC tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/cascadia-engine-openvino/**'
+      - 'crates/cascadia-ov-genai-shim/**'
+      - 'crates/cascadia-engine-sparse-moe/**'
+      - 'crates/cascadia-engine/**'
+      - 'crates/cascadia-cli/**'
+      - 'crates/cascadia/**'
+      - 'tests-e2e/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ai-pc-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: this workflow only needs to read the repo to run tests.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  ai-pc-openvino:
+    name: build + test (openvino feature, ai-pc)
+    # SECURITY: never run a fork PR's code on the self-hosted AI-PC hardware.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, ai-pc, windows]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ai-pc-openvino
+          cache-on-failure: true
+
+      # Real OpenVINO build (mirrors `just build-ov`).
+      - name: Build cascadia with the openvino feature
+        env:
+          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
+        run: cargo build --release -p cascadia --features openvino
+
+      # OV-gated tests (skipped on the ubuntu stub CI because they need the real
+      # runtime + an Intel device).
+      - name: Run OpenVINO-feature tests
+        env:
+          INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
+        run: cargo test -p cascadia-engine-openvino --features openvino --no-fail-fast
+
+      # Optional end-to-end smoke once a small model is staged on the runners:
+      # bring up the cascadia binary against the real engine and hit
+      # /v1/chat/completions. Left commented until the model fixture path is
+      # decided (avoids a guessed CLI invocation).
+      #
+      # - name: e2e smoke against the real engine
+      #   env:
+      #     INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
+      #   run: cargo test -p cascadia-tests-e2e --release -- --test-threads=1

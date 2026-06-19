@@ -1,0 +1,22 @@
+[package]
+name = "cascadia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "cascadia binary — distributed LLM inference for Intel hardware (Rust port)."
+
+[features]
+default = []
+openvino = ["cascadia-cli/openvino"]
+dashboard-embed = ["cascadia-cli/dashboard-embed"]
+
+[[bin]]
+name = "cascadia"
+path = "src/main.rs"
+
+[dependencies]
+cascadia-cli = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

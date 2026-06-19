@@ -32,6 +32,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -220,6 +226,257 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cascadia"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cascadia-cli",
+ "clap",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-runner",
+ "cascadia-types",
+ "chrono",
+ "futures",
+ "minijinja",
+ "minijinja-contrib",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cascadia-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cascadia-api",
+ "cascadia-dashboard",
+ "cascadia-discovery",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-engine-openvino",
+ "cascadia-engine-sparse-moe",
+ "cascadia-ov-genai-shim",
+ "cascadia-runner",
+ "cascadia-topology",
+ "cascadia-types",
+ "clap",
+ "clap_complete",
+ "dirs 5.0.1",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cascadia-dashboard"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "cascadia-topology",
+ "mime_guess",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-discovery"
+version = "0.1.0"
+dependencies = [
+ "cascadia-topology",
+ "cascadia-types",
+ "mdns-sd",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-download"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hf-hub",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-types",
+ "futures",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cascadia-engine-mock"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-types",
+ "futures",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-engine-openvino"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-ov-genai-shim",
+ "cascadia-runner",
+ "cascadia-transport",
+ "cascadia-types",
+ "futures",
+ "half",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-engine-sparse-moe"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-int4-gemm",
+ "cascadia-ov-genai-shim",
+ "cascadia-runner",
+ "cascadia-transport",
+ "cascadia-types",
+ "futures",
+ "half",
+ "lru",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-int4-gemm"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "memmap2",
+ "parking_lot",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cascadia-ov-genai-shim"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cascadia-runner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cascadia-engine",
+ "cascadia-engine-mock",
+ "cascadia-types",
+ "futures",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-tests-e2e"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "cascadia-topology"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "serde",
+]
+
+[[package]]
+name = "cascadia-transport"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cascadia-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -284,6 +541,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -510,11 +776,32 @@ dependencies = [
 
 [[package]]
 name = "dirs"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
+dependencies = [
+ "dirs-sys 0.4.1",
+]
+
+[[package]]
+name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys",
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.4.6",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -525,7 +812,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users",
+ "redox_users 0.5.2",
  "windows-sys 0.61.2",
 ]
 
@@ -826,6 +1113,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash",
 ]
 
@@ -853,7 +1142,7 @@ version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "629d8f3bbeda9d148036d6b0de0a3ab947abd08ce90626327fc3547a49d59d97"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
  "futures",
  "http",
  "indicatif",
@@ -1271,6 +1560,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"
@@ -1812,6 +2110,17 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
+dependencies = [
+ "getrandom 0.2.17",
+ "libredox",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
@@ -2314,250 +2623,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tahoma"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "tahoma-cli",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "chrono",
- "futures",
- "minijinja",
- "minijinja-contrib",
- "parking_lot",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-runner",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tahoma-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "futures",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "tahoma-api",
- "tahoma-dashboard",
- "tahoma-discovery",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-engine-openvino",
- "tahoma-engine-sparse-moe",
- "tahoma-runner",
- "tahoma-topology",
- "tahoma-types",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tahoma-dashboard"
-version = "0.1.0"
-dependencies = [
- "axum",
- "mime_guess",
- "rust-embed",
- "serde",
- "serde_json",
- "tahoma-topology",
- "tokio",
- "tower",
- "tower-http 0.5.2",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-discovery"
-version = "0.1.0"
-dependencies = [
- "mdns-sd",
- "parking_lot",
- "tahoma-topology",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-download"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hf-hub",
- "parking_lot",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-engine"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "tahoma-types",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tahoma-engine-mock"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "tahoma-engine",
- "tahoma-types",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-engine-openvino"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "half",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-ov-genai-shim",
- "tahoma-runner",
- "tahoma-transport",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokenizers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-engine-sparse-moe"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "half",
- "serde",
- "serde_json",
- "tahoma-engine",
- "tahoma-int4-gemm",
- "tahoma-ov-genai-shim",
- "tahoma-runner",
- "tahoma-transport",
- "tahoma-types",
- "tempfile",
- "thiserror 1.0.69",
- "tokenizers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-int4-gemm"
-version = "0.1.0"
-dependencies = [
- "half",
- "memmap2",
- "parking_lot",
- "rayon",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tahoma-ov-genai-shim"
-version = "0.1.0"
-dependencies = [
- "cc",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "tahoma-runner"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "parking_lot",
- "tahoma-engine",
- "tahoma-engine-mock",
- "tahoma-types",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-tests-e2e"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "tahoma-topology"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "parking_lot",
- "serde",
-]
-
-[[package]]
-name = "tahoma-transport"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tahoma-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2884,9 +2949,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typenum"
-version = "1.20.0"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicase"
@@ -3299,6 +3364,15 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
+version = "0.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677d2418bec65e3338edb076e806bc1ec15693c5d0104683f2efe857f61056a9"
+dependencies = [
+ "windows-targets 0.48.5",
+]
+
+[[package]]
+name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
@@ -3331,6 +3405,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-targets"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a2fa6e2155d7247be68c096456083145c183cbbbc2764150dda45a87197940c"
+dependencies = [
+ "windows_aarch64_gnullvm 0.48.5",
+ "windows_aarch64_msvc 0.48.5",
+ "windows_i686_gnu 0.48.5",
+ "windows_i686_msvc 0.48.5",
+ "windows_x86_64_gnu 0.48.5",
+ "windows_x86_64_gnullvm 0.48.5",
+ "windows_x86_64_msvc 0.48.5",
 ]
 
 [[package]]
@@ -3368,6 +3457,12 @@ dependencies = [
 
 [[package]]
 name = "windows_aarch64_gnullvm"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b38e32f0abccf9987a4e3079dfb67dcd799fb61361e53e2882c3cbaf0d905d8"
+
+[[package]]
+name = "windows_aarch64_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
@@ -3380,6 +3475,12 @@ checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
 
 [[package]]
 name = "windows_aarch64_msvc"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc35310971f3b2dbbf3f0690a219f40e2d9afcf64f9ab7cc1be722937c26b4bc"
+
+[[package]]
+name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
@@ -3389,6 +3490,12 @@ name = "windows_aarch64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
+
+[[package]]
+name = "windows_i686_gnu"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a75915e7def60c94dcef72200b9a8e58e5091744960da64ec734a6c6e9b3743e"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -3416,6 +3523,12 @@ checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f55c233f70c4b27f66c523580f78f1004e8b5a8b659e05a4eb49d4166cca406"
+
+[[package]]
+name = "windows_i686_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
@@ -3425,6 +3538,12 @@ name = "windows_i686_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
+
+[[package]]
+name = "windows_x86_64_gnu"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53d40abd2583d23e4718fddf1ebec84dbff8381c07cae67ff7768bbf19c6718e"
 
 [[package]]
 name = "windows_x86_64_gnu"
@@ -3440,6 +3559,12 @@ checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
 
 [[package]]
 name = "windows_x86_64_gnullvm"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b7b52767868a23d5bab768e390dc5f5c55825b6d30b86c844ff2dc7414044cc"
+
+[[package]]
+name = "windows_x86_64_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
@@ -3449,6 +3574,12 @@ name = "windows_x86_64_gnullvm"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
+
+[[package]]
+name = "windows_x86_64_msvc"
+version = "0.48.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed94fce61571a4006852b7389a063ab983c02eb1bb37b47f8272ce92d06d9538"
 
 [[package]]
 name = "windows_x86_64_msvc"

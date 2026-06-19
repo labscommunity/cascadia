@@ -1,27 +1,27 @@
-# Deploying tahoma workers
+# Deploying cascadia workers
 
-Tahoma is a long-running CLI process; it does not daemonize itself. Run it under whatever supervisor your platform already uses — systemd on Linux, NSSM or Task Scheduler on Windows, launchd on macOS.
+Cascadia is a long-running CLI process; it does not daemonize itself. Run it under whatever supervisor your platform already uses — systemd on Linux, NSSM or Task Scheduler on Windows, launchd on macOS.
 
 ## Linux (systemd)
 
-A template unit lives at [`tahoma-worker.service`](tahoma-worker.service). It expects a `tahoma` user, a checkout/install at `/opt/tahoma`, and shards under `/opt/tahoma/shards/`.
+A template unit lives at [`cascadia-worker.service`](cascadia-worker.service). It expects a `cascadia` user, a checkout/install at `/opt/cascadia`, and shards under `/opt/cascadia/shards/`.
 
 ```bash
 # Adjust the Environment= lines in the unit file, then:
-sudo cp docs/deploy/tahoma-worker.service /etc/systemd/system/tahoma-worker@.service
-sudo mkdir -p /run/tahoma && sudo chown tahoma:tahoma /run/tahoma
+sudo cp docs/deploy/cascadia-worker.service /etc/systemd/system/cascadia-worker@.service
+sudo mkdir -p /run/cascadia && sudo chown cascadia:cascadia /run/cascadia
 sudo systemctl daemon-reload
 
 # Start the worker for stage 0 and stage 1:
-sudo systemctl enable --now tahoma-worker@0.service
-sudo systemctl enable --now tahoma-worker@1.service
+sudo systemctl enable --now cascadia-worker@0.service
+sudo systemctl enable --now cascadia-worker@1.service
 
 # Inspect:
-sudo systemctl status tahoma-worker@0.service
-sudo journalctl -u tahoma-worker@0.service -f
+sudo systemctl status cascadia-worker@0.service
+sudo journalctl -u cascadia-worker@0.service -f
 ```
 
-The unit is `Type=simple` and uses `--pid-file /run/tahoma/tahoma-worker-%i.pid`. Tahoma writes its PID on start and removes it via `atexit` on clean exit. systemd also restarts the worker on failure (`Restart=on-failure`, capped at 3 starts/min).
+The unit is `Type=simple` and uses `--pid-file /run/cascadia/cascadia-worker-%i.pid`. Cascadia writes its PID on start and removes it via `atexit` on clean exit. systemd also restarts the worker on failure (`Restart=on-failure`, capped at 3 starts/min).
 
 `KillSignal=SIGTERM` works with the SIGTERM handler in `cli.cmd_worker` — the worker calls `runner.close()` (drops sockets, releases GPU contexts) before exiting.
 
@@ -29,14 +29,14 @@ The unit is `Type=simple` and uses `--pid-file /run/tahoma/tahoma-worker-%i.pid`
 
 ```powershell
 # Install nssm (https://nssm.cc), then:
-nssm install tahoma-worker-0 "C:\Python311\python.exe" `
-    "-m tahoma worker --rank 0 --total 2 --engine ov-runtime --device GPU " `
-    "--model C:\tahoma\shards --next 10.0.0.2:9100 --listen :9100 " `
-    "--pid-file C:\ProgramData\tahoma\worker-0.pid --log-level INFO"
-nssm set tahoma-worker-0 AppStdout C:\ProgramData\tahoma\worker-0.log
-nssm set tahoma-worker-0 AppStderr C:\ProgramData\tahoma\worker-0.log
-nssm set tahoma-worker-0 AppExit Default Restart
-nssm start tahoma-worker-0
+nssm install cascadia-worker-0 "C:\Python311\python.exe" `
+    "-m cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU " `
+    "--model C:\cascadia\shards --next 10.0.0.2:9100 --listen :9100 " `
+    "--pid-file C:\ProgramData\cascadia\worker-0.pid --log-level INFO"
+nssm set cascadia-worker-0 AppStdout C:\ProgramData\cascadia\worker-0.log
+nssm set cascadia-worker-0 AppStderr C:\ProgramData\cascadia\worker-0.log
+nssm set cascadia-worker-0 AppExit Default Restart
+nssm start cascadia-worker-0
 ```
 
 NSSM sends `SIGTERM`-equivalent on stop (`Process` graceful shutdown then `WM_CLOSE` then `TerminateProcess`) which our handler picks up.
@@ -45,7 +45,7 @@ NSSM sends `SIGTERM`-equivalent on stop (`Process` graceful shutdown then `WM_CL
 
 ## macOS (launchd)
 
-For dev only — Tahoma is Intel-Linux-target. A minimal `~/Library/LaunchAgents/com.tahoma.worker.plist`:
+For dev only — Cascadia is Intel-Linux-target. A minimal `~/Library/LaunchAgents/com.cascadia.worker.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,26 +53,26 @@ For dev only — Tahoma is Intel-Linux-target. A minimal `~/Library/LaunchAgents
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.tahoma.worker</string>
+  <key>Label</key><string>com.cascadia.worker</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/tahoma</string>
+    <string>/usr/local/bin/cascadia</string>
     <string>worker</string>
     <string>--rank</string><string>0</string>
     <string>--total</string><string>1</string>
     <string>--engine</string><string>ov-optimum</string>
     <string>--model</string><string>unsloth/Meta-Llama-3.1-8B-Instruct</string>
     <string>--api</string><string>:8000</string>
-    <string>--pid-file</string><string>/tmp/tahoma-worker.pid</string>
+    <string>--pid-file</string><string>/tmp/cascadia-worker.pid</string>
   </array>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/tahoma-worker.out</string>
-  <key>StandardErrorPath</key><string>/tmp/tahoma-worker.err</string>
+  <key>StandardOutPath</key><string>/tmp/cascadia-worker.out</string>
+  <key>StandardErrorPath</key><string>/tmp/cascadia-worker.err</string>
 </dict>
 </plist>
 ```
 
-Load with `launchctl load ~/Library/LaunchAgents/com.tahoma.worker.plist`.
+Load with `launchctl load ~/Library/LaunchAgents/com.cascadia.worker.plist`.
 
 ## Health checks
 
@@ -85,10 +85,10 @@ For supervisors that probe via TCP or HTTP, point them at the API port. For pipe
 
 ## Logs
 
-Tahoma logs to stdout/stderr in plain text:
+Cascadia logs to stdout/stderr in plain text:
 
 ```
-2026-05-01 20:41:23,189 INFO tahoma.worker.runner | runner ready
+2026-05-01 20:41:23,189 INFO cascadia.worker.runner | runner ready
 ```
 
-For structured log shipping (Loki, CloudWatch), wrap the `tahoma worker` command with whatever envelope your shipper expects — Tahoma intentionally does not bundle a JSON formatter.
+For structured log shipping (Loki, CloudWatch), wrap the `cascadia worker` command with whatever envelope your shipper expects — Cascadia intentionally does not bundle a JSON formatter.

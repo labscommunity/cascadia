@@ -10,7 +10,7 @@ The minimum that demonstrates the killer story: serve a model that does not fit 
 - `master/placement.py` — simple: even split across discovered nodes
 - `discovery/` — mDNS / libp2p, zero-config peer find
 - `api/` — OpenAI `/v1/chat/completions` (non-streaming first, then streaming)
-- CLI — `tahoma run <model>` and `tahoma serve`
+- CLI — `cascadia run <model>` and `cascadia serve`
 
 **Acceptance test:** Two Intel laptops on the same LAN. One command per machine. `curl localhost:8000/v1/chat/completions` and get a response from a model that exceeds one machine's RAM.
 

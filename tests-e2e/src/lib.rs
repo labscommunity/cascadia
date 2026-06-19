@@ -1,12 +1,12 @@
-//! End-to-end binary integration tests for the tahoma Rust port.
+//! End-to-end binary integration tests for the cascadia Rust port.
 //!
-//! Spawns the built `tahoma` binary, waits for /health, exercises the
+//! Spawns the built `cascadia` binary, waits for /health, exercises the
 //! OpenAI-compatible API, then tears down. Validates the full chain:
 //! CLI parsing -> Runner.start() -> Engine -> API handlers -> wire JSON.
 //!
 //! Run via:
-//!     cargo build -p tahoma
-//!     cargo test -p tahoma-tests-e2e -- --test-threads=1
+//!     cargo build -p cascadia
+//!     cargo test -p cascadia-tests-e2e -- --test-threads=1
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -34,21 +34,21 @@ pub fn binary_path() -> PathBuf {
         } else {
             "release"
         })
-        .join("tahoma")
+        .join("cascadia")
 }
 
-pub struct TahomaProc {
+pub struct CascadiaProc {
     pub port: u16,
     pub child: Child,
 }
 
-impl TahomaProc {
+impl CascadiaProc {
     pub async fn spawn_mock_with_api() -> Self {
         let port = pick_free_port();
         let bin = binary_path();
         assert!(
             bin.exists(),
-            "tahoma binary not built — run `cargo build -p tahoma` first ({:?})",
+            "cascadia binary not built — run `cargo build -p cascadia` first ({:?})",
             bin
         );
         let child = Command::new(&bin)
@@ -71,7 +71,7 @@ impl TahomaProc {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .expect("spawn tahoma binary");
+            .expect("spawn cascadia binary");
         Self { port, child }
     }
 
@@ -95,7 +95,7 @@ impl TahomaProc {
     }
 }
 
-impl Drop for TahomaProc {
+impl Drop for CascadiaProc {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
@@ -107,7 +107,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_serves_health_then_models_then_chat() {
-        let proc = TahomaProc::spawn_mock_with_api().await;
+        let proc = CascadiaProc::spawn_mock_with_api().await;
         assert!(
             proc.wait_for_health(Duration::from_secs(10)).await,
             "binary did not become healthy in 10s"
@@ -151,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_supports_concurrent_requests() {
-        let proc = TahomaProc::spawn_mock_with_api().await;
+        let proc = CascadiaProc::spawn_mock_with_api().await;
         assert!(proc.wait_for_health(Duration::from_secs(10)).await);
 
         let client = reqwest::Client::new();

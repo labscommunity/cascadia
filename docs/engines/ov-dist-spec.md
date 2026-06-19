@@ -34,7 +34,7 @@ Workers can hold just their own stage as a flat dir:
 
 ## Wire protocol
 
-`crates/tahoma-engine-openvino/src/dist_spec.rs` defines three frames:
+`crates/cascadia-engine-openvino/src/dist_spec.rs` defines three frames:
 
 - **FORWARD** (driver → worker → next worker): `[kind=1][logical_pos_start]` + `attention_mask` (int64 `[1, total_seq_len]`) + `hidden_states` (float16 `[1, new_tokens, hidden_size]`)
 - **RESET** (driver → workers, propagated): `[kind=3]`
@@ -55,12 +55,12 @@ worker (rank 1, has stage_1)
 
 ```bash
 # Worker (last stage, listens on TB/LAN port):
-tahoma worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
+cascadia worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
               --model /shards/shards_2stage_v5_beam_stage_1 \
               --listen 10.10.10.2:9100
 
 # Driver (rank 0, holds draft, serves the API or stdin):
-tahoma worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
+cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
               --model /shards/shards_2stage_v5_beam \
               --next 10.10.10.2:9100 --api :8000 \
               --draft-model unsloth/Llama-3.2-1B-Instruct \
@@ -86,4 +86,4 @@ Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, alpha+charlie vi
 
 - Mask-based rewind (v5) is ~free vs the ~40 ms-per-call physical rewind that v3 shards forced. The win shows up most on long generations and low-accept prompts.
 - Per-FORWARD network cost dominates on slow links. Thunderbolt 4/5 between hosts on AC power gives a 25% throughput bump over LAN; on battery the link drops under load.
-- `--device GPU` resolves to whatever Intel iGPU/dGPU OpenVINO sees; `tahoma engines` does not currently list devices.
+- `--device GPU` resolves to whatever Intel iGPU/dGPU OpenVINO sees; `cascadia engines` does not currently list devices.

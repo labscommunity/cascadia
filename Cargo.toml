@@ -1,22 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tahoma-types",
-    "crates/tahoma-topology",
-    "crates/tahoma-transport",
-    "crates/tahoma-engine",
-    "crates/tahoma-engine-mock",
-    "crates/tahoma-ov-genai-shim",
-    "crates/tahoma-engine-openvino",
-    "crates/tahoma-engine-sparse-moe",
-    "crates/tahoma-int4-gemm",
-    "crates/tahoma-runner",
-    "crates/tahoma-discovery",
-    "crates/tahoma-download",
-    "crates/tahoma-api",
-    "crates/tahoma-dashboard",
-    "crates/tahoma-cli",
-    "crates/tahoma",
+    "crates/cascadia-types",
+    "crates/cascadia-topology",
+    "crates/cascadia-transport",
+    "crates/cascadia-engine",
+    "crates/cascadia-engine-mock",
+    "crates/cascadia-ov-genai-shim",
+    "crates/cascadia-engine-openvino",
+    "crates/cascadia-engine-sparse-moe",
+    "crates/cascadia-int4-gemm",
+    "crates/cascadia-runner",
+    "crates/cascadia-discovery",
+    "crates/cascadia-download",
+    "crates/cascadia-api",
+    "crates/cascadia-dashboard",
+    "crates/cascadia-cli",
+    "crates/cascadia",
     "tests-e2e",
 ]
 
@@ -25,25 +25,25 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/labscommunity/tahoma"
+repository = "https://github.com/labscommunity/cascadia"
 
 [workspace.dependencies]
 # Internal crates
-tahoma-types = { path = "crates/tahoma-types" }
-tahoma-topology = { path = "crates/tahoma-topology" }
-tahoma-transport = { path = "crates/tahoma-transport" }
-tahoma-engine = { path = "crates/tahoma-engine" }
-tahoma-engine-mock = { path = "crates/tahoma-engine-mock" }
-tahoma-ov-genai-shim = { path = "crates/tahoma-ov-genai-shim" }
-tahoma-engine-openvino = { path = "crates/tahoma-engine-openvino" }
-tahoma-engine-sparse-moe = { path = "crates/tahoma-engine-sparse-moe" }
-tahoma-int4-gemm = { path = "crates/tahoma-int4-gemm" }
-tahoma-runner = { path = "crates/tahoma-runner" }
-tahoma-discovery = { path = "crates/tahoma-discovery" }
-tahoma-download = { path = "crates/tahoma-download" }
-tahoma-api = { path = "crates/tahoma-api" }
-tahoma-dashboard = { path = "crates/tahoma-dashboard" }
-tahoma-cli = { path = "crates/tahoma-cli" }
+cascadia-types = { path = "crates/cascadia-types" }
+cascadia-topology = { path = "crates/cascadia-topology" }
+cascadia-transport = { path = "crates/cascadia-transport" }
+cascadia-engine = { path = "crates/cascadia-engine" }
+cascadia-engine-mock = { path = "crates/cascadia-engine-mock" }
+cascadia-ov-genai-shim = { path = "crates/cascadia-ov-genai-shim" }
+cascadia-engine-openvino = { path = "crates/cascadia-engine-openvino" }
+cascadia-engine-sparse-moe = { path = "crates/cascadia-engine-sparse-moe" }
+cascadia-int4-gemm = { path = "crates/cascadia-int4-gemm" }
+cascadia-runner = { path = "crates/cascadia-runner" }
+cascadia-discovery = { path = "crates/cascadia-discovery" }
+cascadia-download = { path = "crates/cascadia-download" }
+cascadia-api = { path = "crates/cascadia-api" }
+cascadia-dashboard = { path = "crates/cascadia-dashboard" }
+cascadia-cli = { path = "crates/cascadia-cli" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -79,10 +79,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 
-# OpenVINO
-openvino = "0.10"
-openvino-genai = "0.10"
-openvino-genai-sys = "0.10"
+# OpenVINO binding is the C++ FFI shim (cascadia-ov-genai-shim), not the
+# crates.io `openvino*` crates — former workspace pins for them were dead
+# (absent from Cargo.lock) and removed in #77 Part A.
 
 # Discovery + downloads
 mdns-sd = "0.13"

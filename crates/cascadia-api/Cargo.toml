@@ -1,0 +1,35 @@
+[package]
+name = "cascadia-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions."
+
+[dependencies]
+cascadia-types = { workspace = true }
+cascadia-engine = { workspace = true }
+cascadia-runner = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+# `macros` is required by modern instruct chat templates (Gemma 3/4 define
+# `{% macro %}` helpers for tool/role formatting); without it the template
+# fails to parse and rendering silently falls back to the legacy formatter,
+# which degenerates instruct models. `multi_template` covers `{% include %}`.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+cascadia-engine-mock = { workspace = true }
