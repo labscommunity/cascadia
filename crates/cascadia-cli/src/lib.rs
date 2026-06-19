@@ -36,6 +36,99 @@ use profile::{cmd_profile_devices, ProfileDevicesArgs};
 use profile_stage::{cmd_profile_per_stage, PerStageArgs};
 use run_placement::{cmd_run_placement, RunPlacementArgs};
 
+/// String form of an engine kind, used in NodeInfo.engines for discovery
+/// and in the dashboard's "Engines" pill list. Stable wire format —
+/// matches the strings `cascadia engines` already prints.
+fn engine_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Mock => "mock",
+        EngineKind::OvGenai => "ov-genai",
+        EngineKind::OvRuntime => "ov-runtime",
+        EngineKind::OvDistSpec => "ov-dist-spec",
+        EngineKind::Gemma4 => "gemma4",
+        EngineKind::SparseMoe => "sparse-moe",
+        EngineKind::Qwen36Moe => "qwen36-moe",
+    }
+}
+
+/// Measure round-trip time to a peer via a 1 s-timeout TCP connect.
+/// Returns `None` if the peer is unreachable or the connect timed out.
+/// The connect handshake gives the best low-overhead RTT signal we can
+/// take without speaking the activation-relay protocol.
+async fn probe_peer(host: &str, port: u16) -> Option<f64> {
+    let start = std::time::Instant::now();
+    let addr = format!("{host}:{port}");
+    let connect = tokio::net::TcpStream::connect(&addr);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), connect).await {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
+}
+
+/// Local node identity + hardware specs for the dashboard node card.
+/// Gathered once at worker startup. Read off the main async path via
+/// `spawn_blocking` (see `cmd_worker`) because `sysinfo` does blocking
+/// syscalls. Falls back to empty/0/"node" for anything undeterminable.
+struct NodeSpecs {
+    hostname: String,
+    memory_mb: u64,
+    cpu_model: String,
+    cpu_cores: u32,
+    os: String,
+}
+
+impl Default for NodeSpecs {
+    fn default() -> Self {
+        Self {
+            hostname: "node".to_owned(),
+            memory_mb: 0,
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            os: String::new(),
+        }
+    }
+}
+
+/// Blocking: probe RAM + CPU + OS + hostname via `sysinfo` in one pass.
+/// Uses a narrow `RefreshKind` (RAM + CPU only) rather than `new_all()`,
+/// which would also enumerate every process/disk/network just to read
+/// three fields. `hostname` comes from `sysinfo` too (no `hostname`
+/// subprocess that would yield "node" — and a node_id collision — when
+/// the binary isn't on PATH).
+fn gather_node_specs() -> NodeSpecs {
+    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+    let sys = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_memory(MemoryRefreshKind::nothing().with_ram())
+            .with_cpu(CpuRefreshKind::nothing()),
+    );
+    // sysinfo reports total_memory() in bytes (0.30+).
+    let memory_mb = sys.total_memory() / 1024 / 1024;
+    let cpu_model = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let cpu_cores = sys.cpus().len() as u32;
+    let os = match (System::name(), System::os_version()) {
+        (Some(n), Some(v)) if !v.is_empty() => format!("{n} {v}"),
+        (Some(n), _) => n,
+        _ => System::long_os_version().unwrap_or_default(),
+    };
+    let hostname = System::host_name()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".to_owned());
+    NodeSpecs {
+        hostname,
+        memory_mb,
+        cpu_model,
+        cpu_cores,
+        os,
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -194,6 +287,20 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Override the engines list advertised in the mDNS NodeInfo (comma-
+    /// separated, e.g. "ov-genai,ov-runtime"). Decouples what shows in the
+    /// dashboard from the actually-loaded engine — useful when running a
+    /// mock worker for discovery testing but you want the card to look
+    /// real. Default: derived from --engine.
+    #[arg(long, value_delimiter = ',')]
+    pub advertise_engines: Vec<String>,
+
+    /// Override the device label advertised in mDNS NodeInfo. Distinct
+    /// from --device, which selects the OpenVINO target device; this is
+    /// purely a dashboard cosmetic. Default: copies --device.
+    #[arg(long)]
+    pub advertise_device: Option<String>,
 
     /// Override the MoE top-K dispatch (sparse-moe engine only).
     /// If set and < manifest top_k, dispatch only the first K' experts
@@ -364,6 +471,8 @@ impl WorkerArgs {
             spec_k: 5,
             prompt_lookup: 0,
             max_tokens: 64,
+            advertise_engines: Vec::new(),
+            advertise_device: None,
             top_k_override: None,
             routing_threshold: None,
             kv_prefix_cache_size: 0,
@@ -870,6 +979,159 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
     runner.start_with_listen(peers, shard, listen).await?;
 
+    // Probe listener: bind a TCP socket on listen_port so the
+    // coordinator's latency probe loop has something to handshake
+    // against. Real engines bind this port themselves (for activation
+    // relay) via Engine::configure_listen, but the mock engine's impl
+    // is a no-op — without this, latency probes against mock-engine
+    // workers find a closed port and the matrix stays empty in the
+    // dashboard demo. If the engine already bound the port, `bind`
+    // fails with AddrInUse and we silently step aside (the engine's
+    // listener handles probes identically at the TCP layer).
+    let probe_addr = format!("0.0.0.0:{listen_port}");
+    match tokio::net::TcpListener::bind(&probe_addr).await {
+        Ok(listener) => {
+            info!(addr = %probe_addr, "probe listener bound");
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok(_) => {
+                            // Drop the connection immediately — the
+                            // probe only needs the connect handshake.
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "probe accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                addr = %probe_addr,
+                "probe listener could not bind; engine likely owns the port"
+            );
+        }
+    }
+
+    // Every worker advertises itself via mDNS — not just rank 0 — so the
+    // coordinator's dashboard /api/topology can render the full cluster
+    // and not just self. Best-effort: a host without a working multicast
+    // path (CI sandbox, restricted LAN) still serves; the dashboard just
+    // shows fewer nodes. We bind `_discovery` for the rest of this
+    // function so its Drop unregisters the mDNS record cleanly on
+    // shutdown (relay loop or `serve_with_nodelay`).
+    let topology = cascadia_topology::Topology::new();
+    let engines = if !args.advertise_engines.is_empty() {
+        args.advertise_engines.clone()
+    } else {
+        vec![engine_name(args.engine).to_owned()]
+    };
+    let device = args
+        .advertise_device
+        .clone()
+        .unwrap_or_else(|| args.device.clone());
+    // sysinfo + hostname do blocking syscalls; gather them off the async
+    // runtime thread so they don't stall worker startup.
+    let specs = tokio::task::spawn_blocking(gather_node_specs)
+        .await
+        .unwrap_or_default();
+    // Advertise the API/dashboard port separately from the relay port so
+    // the dashboard can show a node's reachable address (the relay `port`
+    // isn't an HTTP endpoint). None for relay-only stages.
+    let api_port = args
+        .api
+        .as_deref()
+        .and_then(|a| parse_addr(a, "0.0.0.0").ok())
+        .map(|(_, p)| p);
+    let self_node = cascadia_topology::NodeInfo {
+        node_id: format!("{}-r{}", specs.hostname, args.rank),
+        host: cascadia_discovery::local_ip().to_string(),
+        port: listen_port,
+        api_port,
+        namespace: "default".to_owned(),
+        device,
+        memory_mb: specs.memory_mb,
+        cpu_model: specs.cpu_model,
+        cpu_cores: specs.cpu_cores,
+        os: specs.os,
+        engines,
+        last_seen: 0.0,
+    };
+    topology.add_node(self_node.clone());
+    let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), "default");
+    if let Err(e) = discovery.start(self_node.clone()) {
+        tracing::warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
+    }
+    let _discovery = discovery;
+
+    // Self-heartbeat: re-insert our own NodeInfo every 2 s so last_seen
+    // stays current in the local topology even when no mDNS event has
+    // fired. Without this the dashboard's "live" indicator goes cold
+    // after FRESH_THRESHOLD_S because add_node only sets last_seen once.
+    // mDNS-discovered peers refresh on each ServiceResolved event from
+    // the daemon (TTL-driven, slower); a generous freshness window on
+    // the frontend covers the gap.
+    let topology_for_heartbeat = topology.clone();
+    let self_id_for_heartbeat = self_node.node_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.tick().await; // skip the immediate first tick — we already added the node above.
+        loop {
+            tick.tick().await;
+            // Only the timestamp changes — touch() updates last_seen in
+            // place instead of re-cloning + re-inserting the whole NodeInfo.
+            topology_for_heartbeat.touch(&self_id_for_heartbeat);
+        }
+    });
+
+    // Latency probe loop: every 5 s open a TCP connect to each peer's
+    // advertised port and measure round-trip time. Populates the
+    // dashboard's edge matrix with the cluster's actual measured
+    // latencies (which is the whole topology pitch — we store edges
+    // exo doesn't even have).
+    //
+    // Only outgoing edges from self are populated here, so the matrix
+    // has one row filled per coordinator. A symmetric N×N view would
+    // require cross-host measurement sharing (gossip or query-by-id);
+    // out of scope for the MVP.
+    let topology_for_probe = topology.clone();
+    let self_id_for_probe = self_node.node_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            // Snapshot just (id, host, port) — no full NodeInfo clone — and
+            // probe all peers concurrently with join_all rather than an
+            // unbounded tokio::spawn per peer per tick.
+            let peers: Vec<(String, String, u16)> = topology_for_probe
+                .nodes()
+                .into_iter()
+                .filter(|n| n.node_id != self_id_for_probe)
+                .map(|n| (n.node_id, n.host, n.port))
+                .collect();
+            let results = futures::future::join_all(
+                peers
+                    .into_iter()
+                    .map(|(id, host, port)| async move { (id, probe_peer(&host, port).await) }),
+            )
+            .await;
+            for (dst_id, latency) in results {
+                if let Some(latency_ms) = latency {
+                    // record_latency, not measure(.., 0.0), so a future
+                    // bandwidth probe on the same edge isn't clobbered.
+                    topology_for_probe.record_latency(
+                        self_id_for_probe.clone(),
+                        dst_id,
+                        latency_ms,
+                    );
+                }
+            }
+        }
+    });
+
     if !is_first {
         info!("entering relay loop");
         let r = runner.clone();
@@ -917,9 +1179,34 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
-        let app = cascadia_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
+        let max_concurrent = cfg.max_concurrent_requests as u64;
+        // Shared live counters: the API bumps them on the chat hot path,
+        // the dashboard's /api/stats reads them — same Arc, so the cluster
+        // view updates as prompts run.
+        let api_stats = Arc::new(cascadia_api::ApiStats::default());
+        let api_router = cascadia_api::make_router_with_stats(
+            runner.clone(),
+            args.model.clone(),
+            cfg,
+            api_stats.clone(),
+        );
+
+        // `topology` was populated above (every worker advertises +
+        // browses) so by the time the dashboard binds, mDNS may already
+        // have discovered other ranks on the LAN.
+        let dash_state = cascadia_dashboard::DashboardState {
+            topology,
+            stats: api_stats,
+            max_concurrent,
+        };
+        // Compose: OpenAI-compat routes (/v1/*, /health) stay at root for
+        // backward compatibility with existing clients; dashboard-internal
+        // routes live at /api/* plus the SPA (when the `dashboard-embed`
+        // feature is on) at /. The dashboard router carries the SPA
+        // fallback, so it must be merged second.
+        let app = api_router.merge(cascadia_dashboard::make_router(dash_state));
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
-        info!(host = %api_host, port = api_port, "API serving");
+        info!(host = %api_host, port = api_port, "API + dashboard serving");
         // NODELAY-on-accept wrapper. tokio's TcpStream defaults to
         // NODELAY=false (Nagle on); for SSE streaming small per-token
         // chunks, Nagle aggregates them into ~3500 B bursts every

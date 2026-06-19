@@ -13,6 +13,11 @@ openvino = [
     "cascadia-engine-sparse-moe/openvino",
     "cascadia-ov-genai-shim/openvino",
 ]
+# Embed the built SPA (crates/cascadia-dashboard/web/dist) into the binary.
+# Off by default so a fresh `cargo build` doesn't require `npm run build`
+# to have been run first. With this on, `cascadia worker --api` serves the
+# UI at `/`.
+dashboard-embed = ["cascadia-dashboard/embed-spa"]
 
 [dependencies]
 cascadia-types = { workspace = true }
@@ -23,6 +28,7 @@ cascadia-engine-sparse-moe = { workspace = true }
 cascadia-ov-genai-shim = { workspace = true }
 cascadia-runner = { workspace = true }
 cascadia-api = { workspace = true }
+cascadia-dashboard = { workspace = true }
 cascadia-discovery = { workspace = true }
 cascadia-topology = { workspace = true }
 tokio = { workspace = true }
@@ -40,3 +46,4 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
 dirs = "5"
+sysinfo = "0.33"

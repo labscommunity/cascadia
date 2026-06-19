@@ -5,6 +5,7 @@
 //! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -45,11 +46,51 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 16;
 /// Mirrors the Llama-3.1 default 128 K context window minus headroom.
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 
+/// Live request/token counters bumped on the chat hot path. Shared (via
+/// `Arc`) with the dashboard's `/api/stats`. Defined in `cascadia-types`
+/// (re-exported here) so the dashboard can read it without depending on
+/// this whole HTTP-server crate.
+pub use cascadia_types::ApiStats;
+
+/// Tokens a chunk contributes to the cumulative counter. The engine's
+/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1);
+/// otherwise the per-chunk convention is "one token per non-empty chunk"
+/// (see `Chunk::n_tokens` docs). An empty chunk — the no-text final
+/// marker mock/runtime engines emit — contributes 0 so it isn't counted
+/// as a phantom token. (ov-genai delivers its whole response on a single
+/// final chunk with no `n_tokens`, so it counts as 1 here — approximate,
+/// since that engine tokenizes internally and reports no token count.)
+fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
+    chunk
+        .n_tokens
+        .unwrap_or(if chunk.text.is_empty() { 0 } else { 1 })
+}
+
+/// RAII guard: bumps `requests_in_flight` on construction and decrements it
+/// on drop, so the gauge is correct even on early return, client disconnect,
+/// or a mid-stream engine error.
+struct InFlightGuard(Arc<ApiStats>);
+
+impl InFlightGuard {
+    fn new(stats: Arc<ApiStats>) -> Self {
+        stats.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard(stats)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub runner: Arc<Runner>,
     pub model_id: String,
     pub permits: Arc<Semaphore>,
+    /// Live counters, shared with the dashboard. See [`ApiStats`].
+    pub stats: Arc<ApiStats>,
     pub max_prompt_bytes: usize,
     /// Pre-built minijinja environment for the model's HF chat template (from
     /// tokenizer_config.json's `chat_template` field or a sibling
@@ -169,10 +210,22 @@ pub fn make_router_with_config(
     model_id: impl Into<String>,
     cfg: Config,
 ) -> Router {
+    make_router_with_stats(runner, model_id, cfg, Arc::new(ApiStats::default()))
+}
+
+/// Like [`make_router_with_config`] but takes a caller-owned [`ApiStats`] so
+/// the same counter set can be shared with the dashboard's `/api/stats`.
+pub fn make_router_with_stats(
+    runner: Arc<Runner>,
+    model_id: impl Into<String>,
+    cfg: Config,
+    stats: Arc<ApiStats>,
+) -> Router {
     let state = AppState {
         runner,
         model_id: model_id.into(),
         permits: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+        stats,
         max_prompt_bytes: cfg.max_prompt_bytes,
         // Parse the chat template once here (not per request). A parse error
         // downgrades to the legacy formatter rather than failing every request.
@@ -304,21 +357,32 @@ fn now_unix() -> i64 {
     Utc::now().timestamp()
 }
 
-/// Last-resort formatting when no chat template is available. Matches
-/// the Python "no chat template" engines and what cascadia shipped pre-
-/// minijinja. Coherent on permissive base models, brittle on instruct
-/// models that expect their own prompt format.
+/// Last-resort formatting when no chat template is available.
+///
+/// The previous behaviour joined every turn as `role: content\n…`,
+/// which works on permissive base models but produces visibly broken
+/// transcripts on instruct models and on the mock engine — the engine
+/// sees the assistant's prior turn re-inserted as input, and on the
+/// next request the response includes that prior content verbatim.
+///
+/// Without a real chat template we can't reconstruct the model's
+/// multi-turn format honestly, so render only the latest user message.
+/// That gives one-shot prompting (no multi-turn memory) but doesn't
+/// produce confusing duplicated output. Multi-turn coherence requires
+/// a real tokenizer_config.json with `chat_template` populated.
+///
+/// When there's no `user` turn at all (e.g. a system-only request), fall
+/// back to the last message of any role rather than rendering empty — an
+/// empty render trips the 400 "no prompt content" guard and would reject
+/// a request the old all-turns formatter admitted.
 fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
-    let mut buf = String::new();
-    for m in messages {
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(&m.role);
-        buf.push_str(": ");
-        buf.push_str(&m.content);
-    }
-    buf
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .or_else(|| messages.last())
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Build the minijinja environment for a model's HF chat template ONCE, with
@@ -529,15 +593,22 @@ async fn chat_completions(
         }
     };
 
+    // Past the gate = an admitted request. Bump the cumulative counter and
+    // hold an in-flight guard for the request's lifetime (the guard's Drop
+    // decrements the gauge on any exit path).
+    state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+    let inflight = InFlightGuard::new(state.stats.clone());
+
     if req.stream {
-        return stream_completion(state, req.model, task, permit)
+        return stream_completion(state, req.model, task, permit, inflight)
             .await
             .into_response();
     }
 
-    // Non-streaming: collect full output. Hold the permit until the
-    // task completes; drop frees the slot.
+    // Non-streaming: collect full output. Hold the permit + in-flight guard
+    // until the task completes; drop frees the slot.
     let _permit = permit;
+    let _inflight = inflight;
     let mut chunk_stream = match state.runner.generate(task.clone()) {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
@@ -559,16 +630,22 @@ async fn chat_completions(
             )
                 .into_response();
         }
-        if !chunk.is_final {
-            buf.push_str(&chunk.text);
-            completion_tokens += chunk.n_tokens.unwrap_or(1);
-        } else {
-            if !chunk.text.is_empty() {
-                buf.push_str(&chunk.text);
-            }
+        // Count tokens for EVERY chunk including the final one — engines
+        // like ov-genai deliver their whole output on a single final
+        // chunk, and spec-decode carries its last round there too; gating
+        // on `!is_final` dropped them (tokens_total stuck at 0 for
+        // ov-genai). chunk_token_count contributes 0 for the empty final
+        // markers other engines emit, so there's no phantom over-count.
+        buf.push_str(&chunk.text);
+        completion_tokens += chunk_token_count(&chunk);
+        if chunk.is_final {
             prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
         }
     }
+    state
+        .stats
+        .tokens_total
+        .fetch_add(completion_tokens as u64, Ordering::Relaxed);
 
     Json(ChatCompletionResponse {
         id: task_id,
@@ -600,6 +677,7 @@ async fn stream_completion(
     model: String,
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
+    inflight: InFlightGuard,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
@@ -611,11 +689,15 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
-    // Move the permit into the stream so it's released only when the
-    // body is dropped (client disconnect or final chunk).
+    // Clone the counter handle for per-chunk token accounting in the
+    // formatter closure below.
+    let stats = state.stats.clone();
+    // Move the permit + in-flight guard into the stream so they're released
+    // only when the body is dropped (client disconnect or final chunk).
     let permit_carrier = StreamWithPermit {
         inner: chunk_stream,
         _permit: permit,
+        _inflight: inflight,
     };
     // Format each chunk as a raw SSE frame `data: <json>\n\n` and send
     // it as a one-byte-shy-of-MTU frame via `Body::from_stream`.
@@ -635,7 +717,18 @@ async fn stream_completion(
         .then(move |chunk| {
             let model = model.clone();
             let task_id = task_id.clone();
+            let stats = stats.clone();
             async move {
+                // Count model tokens as they stream so the dashboard's
+                // tokens_total advances live (not just at request end).
+                // Counts the final chunk too (ov-genai emits its whole
+                // output there); chunk_token_count yields 0 for empty
+                // markers, so no phantom token.
+                if chunk.error.is_none() {
+                    stats
+                        .tokens_total
+                        .fetch_add(chunk_token_count(&chunk) as u64, Ordering::Relaxed);
+                }
                 // A failed task carries `error` on its final chunk. The 200
                 // headers are already on the wire by the time the body
                 // streams, so unlike the non-streaming path we cannot
@@ -707,6 +800,8 @@ async fn stream_completion(
 struct StreamWithPermit {
     inner: cascadia_runner::ChunkStream,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    /// Decrements `requests_in_flight` when the stream body is dropped.
+    _inflight: InFlightGuard,
 }
 
 impl Stream for StreamWithPermit {

@@ -9,6 +9,7 @@ description = "cascadia binary — distributed LLM inference for Intel hardware 
 [features]
 default = []
 openvino = ["cascadia-cli/openvino"]
+dashboard-embed = ["cascadia-cli/dashboard-embed"]
 
 [[bin]]
 name = "cascadia"

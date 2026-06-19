@@ -1,0 +1,32 @@
+[package]
+name = "cascadia-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dashboard HTTP routes (topology, stats, SSE events) and embedded SPA for visualizing a Cascadia cluster."
+
+[dependencies]
+cascadia-topology = { workspace = true }
+cascadia-types = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+mime_guess = { version = "2", optional = true }
+rust-embed = { version = "8", optional = true }
+
+[features]
+default = []
+# Embed the built SPA (web/dist) into the binary so a single static binary
+# ships with the UI. Requires `npm run build` to have been run in `web/`
+# before `cargo build --features embed-spa`. Without the feature, the
+# crate exposes only the JSON + SSE endpoints; an external SPA host (e.g.
+# `vite dev` during local development) supplies the UI.
+embed-spa = ["dep:rust-embed", "dep:mime_guess"]
+
+[dev-dependencies]
+tower = { workspace = true }
