@@ -6,11 +6,13 @@
 //! `docs/superpowers/specs/2026-06-19-cascadia-issue-34-option-c-kv-plane-impl-design.md` §6/§7.
 mod codec;
 mod envelope;
+mod frame;
 mod manifest;
 mod reslice;
 
 pub use codec::{KvSnapshotCodec, ValidateError};
 pub use envelope::{Get, KvMessage, Negotiate, Offer};
+pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use manifest::{
     CacheKey, LayerMeta, Manifest, PartnerId, DTYPE_SIZE, KV_LAYOUT_VERSION, SCHEMA_VERSION,
     SEQ_AXIS,
