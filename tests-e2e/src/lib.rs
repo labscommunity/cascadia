@@ -310,6 +310,10 @@ mod tests {
     ///   CASCADIA_FLEET_TOKEN    shared fleet token
     ///   CASCADIA_FLEET_NODES    ordered node_ids, comma-separated (rank 0 first)
     ///   CASCADIA_REMOTE_BIN     path to the cascadia binary on the nodes
+    /// Optional (defaults to a mock run; set for a real sharded model):
+    ///   CASCADIA_ENGINE  engine, default "mock" (e.g. "ov-runtime")
+    ///   CASCADIA_MODEL   model id / shard dir on the nodes, default "mock-model"
+    ///   CASCADIA_DEVICE  device for OV engines, e.g. "GPU" (omitted for mock)
     #[tokio::test]
     async fn multi_node_pipeline_via_fleet() {
         if std::env::var("CASCADIA_MULTINODE").ok().as_deref() != Some("1") {
@@ -326,9 +330,17 @@ mod tests {
             .collect();
         let remote_bin =
             std::env::var("CASCADIA_REMOTE_BIN").unwrap_or_else(|_| "C:/cascadia/cascadia.exe".into());
+        // Defaults give a mock run; set CASCADIA_ENGINE/MODEL/DEVICE for a real
+        // sharded model (e.g. ov-runtime + a shard dir + GPU).
+        let engine = std::env::var("CASCADIA_ENGINE").unwrap_or_else(|_| "mock".into());
+        let model = std::env::var("CASCADIA_MODEL").unwrap_or_else(|_| "mock-model".into());
+        let device_flag = match std::env::var("CASCADIA_DEVICE") {
+            Ok(d) if !d.is_empty() => format!("--device {d}"),
+            _ => String::new(),
+        };
         let name = "e2e-multinode";
         let command = format!(
-            "{remote_bin} worker --engine mock --model mock-model --log-level warn \
+            "{remote_bin} worker --engine {engine} --model {model} {device_flag} --log-level warn \
              --rank {{rank}} --total {{total}} {{listen_flag}} {{next_flag}} {{api_flag}}"
         );
         let client = reqwest::Client::new();
