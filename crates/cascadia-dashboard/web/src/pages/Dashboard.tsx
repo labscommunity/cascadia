@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import { LatencyMatrix } from "@/components/LatencyMatrix";
 import { NodeCard } from "@/components/NodeCard";
@@ -9,10 +9,6 @@ import { useTopology } from "@/hooks/useTopology";
 export function Dashboard() {
   const topology = useTopology();
   const stats = useStats();
-
-  // Refresh the "freshness clock" once per second so stale-node detection
-  // and "last seen Xs ago" decay smoothly between topology fetches.
-  const now = useNow(1000);
 
   const { nodes, edges } = useMemo(() => {
     if (topology.kind !== "ready") return { nodes: [], edges: [] };
@@ -56,7 +52,7 @@ export function Dashboard() {
             {[...nodes]
               .sort((a, b) => a.node_id.localeCompare(b.node_id))
               .map((n) => (
-                <NodeCard key={n.node_id} node={n} now={now} />
+                <NodeCard key={n.node_id} node={n} />
               ))}
           </div>
         )}
@@ -95,13 +91,4 @@ function SurfaceMessage({
   return (
     <div className={`surface p-8 font-mono text-[13px] ${toneClass}`}>{children}</div>
   );
-}
-
-function useNow(intervalMs: number) {
-  const [now, setNow] = useState(() => Date.now() / 1000);
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now() / 1000), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
-  return now;
 }

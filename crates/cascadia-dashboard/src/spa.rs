@@ -18,9 +18,13 @@ use rust_embed::Embed;
 struct SpaAssets;
 
 pub fn router() -> Router<crate::DashboardState> {
-    Router::new()
-        .route("/", get(index))
-        .route("/*path", get(serve))
+    // The SPA is a `fallback`, not a `GET /*path` catch-all. A catch-all
+    // route is GET-only and method-blind, so a method-mismatched request
+    // (e.g. `GET /v1/chat/completions`, a POST endpoint) or any unknown
+    // path returned 200 + index.html instead of 405/404. As the fallback,
+    // axum still returns 405 for a wrong method on a known route and only
+    // hands genuinely-unmatched requests to the SPA.
+    Router::new().route("/", get(index)).fallback(serve)
 }
 
 async fn index() -> Response {
@@ -28,8 +32,14 @@ async fn index() -> Response {
 }
 
 async fn serve(uri: Uri) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    serve_path(path)
+    let path = uri.path();
+    // Reserved API namespaces: a miss here is a real 404, not a client-side
+    // SPA route — otherwise a typo'd `/v1/*` or `/api/*` GET would be masked
+    // as 200 + the SPA shell.
+    if path.starts_with("/v1/") || path.starts_with("/api/") || path == "/health" {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    serve_path(path.trim_start_matches('/'))
 }
 
 fn serve_path(path: &str) -> Response {

@@ -1,15 +1,18 @@
+import { memo, useEffect, useState } from "react";
+
 import type { NodeInfo } from "@/lib/api";
 import { humanizeMemory, relativeAge } from "@/lib/format";
 
 import { DeviceChip } from "./DeviceChip";
 
-export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
-  // Presence in topology is the liveness signal — the mDNS daemon
-  // removes peers from this list when TTL expires, so anything we render
-  // is by definition currently being heard from. The `last_seen` field
-  // is now decorative ("when we last got a fresh resolution event")
-  // because mdns-sd suppresses ServiceResolved for already-known peers,
-  // making it unreliable as a freshness proxy.
+// Memoized: the card body only re-renders when its `node` changes. The
+// once-per-second "last seen" decay is isolated to the <LastSeen> leaf
+// (which owns its own clock) so it doesn't re-render the whole grid of
+// cards every second.
+export const NodeCard = memo(function NodeCard({ node }: { node: NodeInfo }) {
+  // Show the API/dashboard port when the node serves one — that's its
+  // reachable address; the relay `port` isn't an HTTP endpoint.
+  const address = `${node.host}:${node.api_port ?? node.port}`;
   return (
     <article className="surface p-5 flex flex-col gap-4 hover:shadow-elev transition-shadow">
       <header className="flex items-start justify-between gap-3">
@@ -17,8 +20,8 @@ export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
           <h3 className="font-mono text-[15px] text-ink truncate" title={node.node_id}>
             {node.node_id}
           </h3>
-          <p className="font-mono text-[12px] text-ink-low truncate" title={`${node.host}:${node.port}`}>
-            {node.host}:{node.port}
+          <p className="font-mono text-[12px] text-ink-low truncate" title={address}>
+            {address}
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -71,8 +74,19 @@ export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
 
       <footer className="border-t border-rule-2 pt-2 -mx-1 px-1 flex items-center justify-between label-mono">
         <span>last seen</span>
-        <span className="text-ink-dim">{relativeAge(node.last_seen, now)}</span>
+        <LastSeen lastSeen={node.last_seen} />
       </footer>
     </article>
   );
+});
+
+/** Self-clocking "Xs ago" leaf — owns its own 1 s tick so the per-second
+ *  decay re-renders only this span, not the enclosing (memoized) card. */
+function LastSeen({ lastSeen }: { lastSeen: number }) {
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  return <span className="text-ink-dim">{relativeAge(lastSeen, now)}</span>;
 }

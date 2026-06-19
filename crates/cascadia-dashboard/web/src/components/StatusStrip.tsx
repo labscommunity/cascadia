@@ -1,4 +1,5 @@
 import type { Edge, NodeInfo, Stats } from "@/lib/api";
+import { formatLatency } from "@/lib/format";
 
 type Props = {
   nodes: NodeInfo[];
@@ -35,12 +36,7 @@ export function StatusStrip({ nodes, edges, stats }: Props) {
     { label: "Devices", value: deviceLabel },
     {
       label: "Median RTT",
-      value:
-        medianLatency != null
-          ? medianLatency < 10
-            ? `${medianLatency.toFixed(2)} ms`
-            : `${medianLatency.toFixed(1)} ms`
-          : "—",
+      value: medianLatency != null ? formatLatency(medianLatency) : "—",
     },
     {
       label: "In flight",

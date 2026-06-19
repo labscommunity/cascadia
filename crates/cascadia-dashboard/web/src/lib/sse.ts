@@ -13,7 +13,7 @@ export type ChatMessage = {
   content: string;
 };
 
-export type ChatStreamChunk = {
+export type ChatCompletionChunk = {
   id: string;
   object: "chat.completion.chunk";
   /** Cascadia extension: tokens condensed into this chunk (spec-decode emits 1..K+1). */
@@ -24,6 +24,15 @@ export type ChatStreamChunk = {
     finish_reason: "stop" | null;
   }[];
 };
+
+/** Emitted by the server when a task fails mid-stream — note: NO `choices`. */
+export type ChatErrorChunk = {
+  id: string;
+  object: "error";
+  error: { message: string; type?: string };
+};
+
+export type ChatStreamChunk = ChatCompletionChunk | ChatErrorChunk;
 
 export type ChatStreamArgs = {
   model: string;

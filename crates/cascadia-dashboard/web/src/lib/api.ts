@@ -6,7 +6,10 @@
 export type NodeInfo = {
   node_id: string;
   host: string;
+  /** Activation-relay / latency-probe port. */
   port: number;
+  /** OpenAI-API / dashboard port (coordinator nodes serving --api). Absent on relay-only stages. */
+  api_port?: number;
   namespace: string;
   device: string;
   memory_mb: number;

@@ -49,6 +49,12 @@ export function ChatSurface() {
 
     try {
       for await (const chunk of chatStream({ model, messages: history }, controller.signal)) {
+        // A mid-stream engine failure arrives as {object:"error", error:{…}}
+        // with NO `choices`. Surface the engine's real reason (the catch
+        // below renders it) instead of dereferencing a missing `choices`.
+        if (chunk.object === "error") {
+          throw new Error(chunk.error.message);
+        }
         if (firstChunkAt === null) firstChunkAt = performance.now();
         totalTokens += chunk.n_tokens ?? 1;
         const delta = chunk.choices[0]?.delta.content ?? "";
@@ -63,14 +69,21 @@ export function ChatSurface() {
         const now = performance.now();
         const elapsed = (now - startedAt) / 1000;
         const ttft = firstChunkAt != null ? (firstChunkAt - startedAt) / 1000 : null;
-        // Decode tok/s — excludes TTFT so the number reflects steady-state
-        // throughput, not "model load + first-token-latency averaged in".
-        const decodeWindow = ttft != null ? Math.max(elapsed - ttft, 1e-3) : null;
+        // Decode tok/s — tokens AFTER the first (the first token's time is
+        // TTFT, not decode) over the post-TTFT window. Hold off until >1
+        // token AND >50 ms have elapsed so a tiny initial window can't
+        // divide into an absurd thousands-of-tok/s reading.
+        const decodeWindow = ttft != null ? elapsed - ttft : null;
+        const decodeTokens = totalTokens - 1;
+        const tokensPerSecond =
+          decodeWindow != null && decodeWindow > 0.05 && decodeTokens > 0
+            ? decodeTokens / decodeWindow
+            : null;
         setStats({
           tokens: totalTokens,
           ttftSeconds: ttft,
           elapsedSeconds: elapsed,
-          tokensPerSecond: decodeWindow != null ? totalTokens / decodeWindow : null,
+          tokensPerSecond,
         });
       }
     } catch (err) {
