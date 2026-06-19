@@ -58,6 +58,9 @@ fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
     p.insert("namespace".into(), info.namespace.clone());
     p.insert("device".into(), info.device.clone());
     p.insert("memory_mb".into(), info.memory_mb.to_string());
+    p.insert("cpu_model".into(), info.cpu_model.clone());
+    p.insert("cpu_cores".into(), info.cpu_cores.to_string());
+    p.insert("os".into(), info.os.clone());
     p.insert("engines".into(), info.engines.join(","));
     p
 }
@@ -80,6 +83,11 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
     let memory_mb = get("memory_mb")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0u64);
+    let cpu_model = get("cpu_model").unwrap_or_default();
+    let cpu_cores = get("cpu_cores")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0u32);
+    let os = get("os").unwrap_or_default();
     let engines = get("engines")
         .map(|s| {
             s.split(',')
@@ -104,6 +112,9 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         namespace,
         device,
         memory_mb,
+        cpu_model,
+        cpu_cores,
+        os,
         engines,
         last_seen: 0.0,
     })

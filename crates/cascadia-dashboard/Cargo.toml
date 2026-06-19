@@ -8,6 +8,7 @@ description = "Dashboard HTTP routes (topology, stats, SSE events) and embedded 
 
 [dependencies]
 cascadia-topology = { workspace = true }
+cascadia-api = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

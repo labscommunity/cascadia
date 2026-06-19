@@ -17,12 +17,13 @@
 //! the dashboard separable also leaves room for shipping or hiding it
 //! independently of the OpenAI API.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use cascadia_api::ApiStats;
 use cascadia_topology::{NodeInfo, Topology};
 use serde::Serialize;
 
@@ -32,38 +33,16 @@ mod spa;
 /// Shared state for the dashboard routes.
 ///
 /// `topology` is the same `Topology` handle the discovery loop writes
-/// to (cheap to clone — it's `Arc`-backed inside). `stats` is a small
-/// shared counter bag the host process bumps as requests flow through
-/// the runner; see [`DashboardStats`].
+/// to (cheap to clone — it's `Arc`-backed inside). `stats` is the SAME
+/// [`ApiStats`] handle the OpenAI-compat server bumps on the chat hot
+/// path, so `/api/stats` reflects live request/token activity rather
+/// than the placeholder zeros it returned before. `max_concurrent` is a
+/// static config value (the admission ceiling), so a plain `u64`.
 #[derive(Clone)]
 pub struct DashboardState {
     pub topology: Topology,
-    pub stats: Arc<DashboardStats>,
-}
-
-/// Coarse runtime counters surfaced by `GET /api/stats`.
-///
-/// All fields are atomic so the host can update them from request
-/// handlers without a lock. The dashboard is best-effort: a stale read
-/// or a small drift between counters is acceptable.
-#[derive(Default)]
-pub struct DashboardStats {
-    /// Cumulative chat-completion requests admitted (including failed).
-    pub requests_total: AtomicU64,
-    /// Currently executing chat-completion requests.
-    pub requests_in_flight: AtomicU64,
-    /// Cumulative tokens emitted by the engine.
-    pub tokens_total: AtomicU64,
-    /// Configured concurrency ceiling (from `cascadia-api`'s semaphore).
-    pub max_concurrent: AtomicU64,
-}
-
-impl DashboardStats {
-    pub fn new(max_concurrent: u64) -> Arc<Self> {
-        let s = Self::default();
-        s.max_concurrent.store(max_concurrent, Ordering::Relaxed);
-        Arc::new(s)
-    }
+    pub stats: Arc<ApiStats>,
+    pub max_concurrent: u64,
 }
 
 /// Build the dashboard router. Combine with `cascadia-api`'s router in the
@@ -128,7 +107,7 @@ async fn get_stats(State(state): State<DashboardState>) -> Json<StatsResponse> {
         requests_total: state.stats.requests_total.load(Ordering::Relaxed),
         requests_in_flight: state.stats.requests_in_flight.load(Ordering::Relaxed),
         tokens_total: state.stats.tokens_total.load(Ordering::Relaxed),
-        max_concurrent: state.stats.max_concurrent.load(Ordering::Relaxed),
+        max_concurrent: state.max_concurrent,
     })
 }
 
@@ -148,7 +127,8 @@ mod tests {
         topology.measure("alpha", "beta", 1.5, 900.0);
         DashboardState {
             topology,
-            stats: DashboardStats::new(16),
+            stats: Arc::new(ApiStats::default()),
+            max_concurrent: 16,
         }
     }
 

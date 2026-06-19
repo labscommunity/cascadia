@@ -32,6 +32,17 @@ pub struct NodeInfo {
     pub device: String,
     #[serde(default)]
     pub memory_mb: u64,
+    /// CPU brand string (e.g. "Intel(R) Core(TM) Ultra 7 258V"). Empty if
+    /// unknown. Advertised so the dashboard can show per-node system specs.
+    #[serde(default)]
+    pub cpu_model: String,
+    /// Logical CPU count. 0 if unknown.
+    #[serde(default)]
+    pub cpu_cores: u32,
+    /// Operating system label (e.g. "Windows 11", "macOS 15.5"). Empty if
+    /// unknown.
+    #[serde(default)]
+    pub os: String,
     #[serde(default)]
     pub engines: Vec<String>,
     #[serde(default = "now_ts")]
@@ -54,6 +65,9 @@ impl NodeInfo {
             namespace: default_namespace(),
             device: default_device(),
             memory_mb: 0,
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            os: String::new(),
             engines: Vec::new(),
             last_seen: now_ts(),
         }

@@ -10,6 +10,12 @@ export type NodeInfo = {
   namespace: string;
   device: string;
   memory_mb: number;
+  /** CPU brand string, e.g. "Intel(R) Core(TM) Ultra 7 258V". "" if unknown. */
+  cpu_model: string;
+  /** Logical CPU count. 0 if unknown. */
+  cpu_cores: number;
+  /** OS label, e.g. "Windows 11" / "Darwin 25.5". "" if unknown. */
+  os: string;
   engines: string[];
   /** Unix seconds, fractional. Compared against Date.now()/1000 for freshness. */
   last_seen: number;

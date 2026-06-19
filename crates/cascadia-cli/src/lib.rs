@@ -78,6 +78,30 @@ fn hostname() -> String {
         .unwrap_or_else(|| "node".to_owned())
 }
 
+/// Best-effort local system specs for the dashboard node card:
+/// `(total_RAM_MB, cpu_brand, logical_cores, os_label)`. Read once at
+/// worker startup via `sysinfo` and advertised in the node's mDNS record.
+/// Any field that can't be determined falls back to empty/0.
+fn system_specs() -> (u64, String, u32, String) {
+    use sysinfo::System;
+    let sys = System::new_all();
+    // sysinfo reports total_memory() in bytes (0.30+).
+    let memory_mb = sys.total_memory() / 1024 / 1024;
+    let cpu_model = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let cpu_cores = sys.cpus().len() as u32;
+    let os = match (System::name(), System::os_version()) {
+        (Some(n), Some(v)) if !v.is_empty() => format!("{n} {v}"),
+        (Some(n), _) => n,
+        _ => System::long_os_version().unwrap_or_default(),
+    };
+    (memory_mb, cpu_model, cpu_cores, os)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -982,13 +1006,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         .advertise_device
         .clone()
         .unwrap_or_else(|| args.device.clone());
+    let (memory_mb, cpu_model, cpu_cores, os) = system_specs();
     let self_node = cascadia_topology::NodeInfo {
         node_id: format!("{}-r{}", hostname(), args.rank),
         host: cascadia_discovery::local_ip().to_string(),
         port: listen_port,
         namespace: "default".to_owned(),
         device,
-        memory_mb: 0,
+        memory_mb,
+        cpu_model,
+        cpu_cores,
+        os,
         engines,
         last_seen: 0.0,
     };
@@ -1100,15 +1128,24 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         let max_concurrent = cfg.max_concurrent_requests as u64;
-        let api_router =
-            cascadia_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
+        // Shared live counters: the API bumps them on the chat hot path,
+        // the dashboard's /api/stats reads them — same Arc, so the cluster
+        // view updates as prompts run.
+        let api_stats = Arc::new(cascadia_api::ApiStats::default());
+        let api_router = cascadia_api::make_router_with_stats(
+            runner.clone(),
+            args.model.clone(),
+            cfg,
+            api_stats.clone(),
+        );
 
         // `topology` was populated above (every worker advertises +
         // browses) so by the time the dashboard binds, mDNS may already
         // have discovered other ranks on the LAN.
         let dash_state = cascadia_dashboard::DashboardState {
             topology,
-            stats: cascadia_dashboard::DashboardStats::new(max_concurrent),
+            stats: api_stats,
+            max_concurrent,
         };
         // Compose: OpenAI-compat routes (/v1/*, /health) stay at root for
         // backward compatibility with existing clients; dashboard-internal

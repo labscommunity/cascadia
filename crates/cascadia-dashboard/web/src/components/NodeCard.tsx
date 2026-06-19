@@ -28,11 +28,24 @@ export function NodeCard({ node, now }: { node: NodeInfo; now: number }) {
       </header>
 
       <dl className="grid grid-cols-2 gap-x-4 gap-y-2">
+        <div className="col-span-2 min-w-0">
+          <dt className="label-mono">CPU</dt>
+          <dd className="font-mono text-[13px] text-ink mt-0.5 truncate" title={node.cpu_model || undefined}>
+            {node.cpu_model || "—"}
+            {node.cpu_cores ? <span className="text-ink-low"> · {node.cpu_cores} cores</span> : null}
+          </dd>
+        </div>
         <div>
           <dt className="label-mono">Memory</dt>
           <dd className="font-mono text-[13px] text-ink mt-0.5">{humanizeMemory(node.memory_mb)}</dd>
         </div>
-        <div>
+        <div className="min-w-0">
+          <dt className="label-mono">OS</dt>
+          <dd className="font-mono text-[13px] text-ink mt-0.5 truncate" title={node.os || undefined}>
+            {node.os || "—"}
+          </dd>
+        </div>
+        <div className="col-span-2">
           <dt className="label-mono">Namespace</dt>
           <dd className="font-mono text-[13px] text-ink mt-0.5">{node.namespace}</dd>
         </div>
