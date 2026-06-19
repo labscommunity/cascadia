@@ -545,23 +545,35 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             rest = &after[end + "</tool_call>".len()..];
         }
     } else {
-        // Llama-3.1: require <|python_tag|> prefix OR whole-output JSON.
+        // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
+        // whole-output JSON (no marker) is only treated as a call if it carries
+        // `arguments`/`parameters` — a real Llama call always does (`parameters`,
+        // even `{}`), so a plain JSON DATA answer with a stray `name` key (e.g.
+        // {"name":"Alice","age":30}) isn't misread as a tool call.
         let trimmed = text.trim();
+        let explicit = trimmed.starts_with("<|python_tag|>");
         let candidate = trimmed
             .strip_prefix("<|python_tag|>")
             .map(str::trim)
             .unwrap_or(trimmed);
         let looks_json = candidate.starts_with('{') || candidate.starts_with('[');
-        if trimmed.starts_with("<|python_tag|>") || looks_json {
+        if explicit || looks_json {
+            let tool_shaped = |v: &serde_json::Value| {
+                explicit || v.get("arguments").is_some() || v.get("parameters").is_some()
+            };
             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(candidate) {
                 for v in &arr {
-                    if let Some(c) = call_from_value(v) {
-                        calls.push(c);
+                    if tool_shaped(v) {
+                        if let Some(c) = call_from_value(v) {
+                            calls.push(c);
+                        }
                     }
                 }
             } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
-                if let Some(c) = call_from_value(&v) {
-                    calls.push(c);
+                if tool_shaped(&v) {
+                    if let Some(c) = call_from_value(&v) {
+                        calls.push(c);
+                    }
                 }
             }
         }
@@ -1384,6 +1396,23 @@ mod tests {
         );
         assert!(calls[0].id.starts_with("call_"));
         assert_eq!(calls[0].r#type, "function");
+    }
+
+    #[test]
+    fn parse_bare_json_requires_tool_shape() {
+        // M3(b): a plain JSON DATA answer with a stray `name` key (no marker, no
+        // args/params) must NOT be misread as a tool call.
+        assert!(parse_tool_calls(r#"{"name":"Alice","age":30}"#).is_none());
+        assert!(parse_tool_calls(r#"[{"name":"Bob"}]"#).is_none());
+        // A real bare Llama call (carries `parameters`, even `{}`) still parses.
+        let calls = parse_tool_calls(r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#)
+            .expect("bare call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let calls = parse_tool_calls(r#"{"name":"ping","arguments":{}}"#).expect("bare empty-args");
+        assert_eq!(calls[0].function.name, "ping");
+        // The explicit <|python_tag|> marker stays lenient (no params needed).
+        let calls = parse_tool_calls(r#"<|python_tag|>{"name":"now"}"#).expect("explicit no-arg");
+        assert_eq!(calls[0].function.name, "now");
     }
 
     #[test]
