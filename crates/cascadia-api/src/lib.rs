@@ -2424,6 +2424,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_calls_brace_balance_stress() {
+        // 1) nested object/array args + a '}' and a '{' inside a string value +
+        //    an escaped quote — exact JSON must survive the balanced scan.
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"f","arguments":{"o":{"k":1},"a":[1,2],"s":"a{b}c \" }"}}</tool_call>"#,
+        )
+        .expect("nested");
+        assert_eq!(calls.len(), 1);
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["o"]["k"], 1);
+        assert_eq!(args["a"][1], 2);
+        assert_eq!(args["s"], "a{b}c \" }");
+
+        // 2) two blocks; the FIRST carries '</tool_call>' AND '}' inside a value.
+        //    Both calls must survive (no truncation, no bleed into the next).
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"a","arguments":{"t":"</tool_call> } x"}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+        )
+        .expect("two");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "a");
+        assert_eq!(calls[1].function.name, "b");
+        assert_ne!(calls[0].id, calls[1].id);
+
+        // 3) XML dialect still parses through the fallback (regression).
+        let calls =
+            parse_tool_calls("<tool_call><function=g><parameter=x>v</parameter></function></tool_call>")
+                .expect("xml");
+        assert_eq!(calls[0].function.name, "g");
+
+        // 4) truncated/unbalanced JSON block => skipped, no panic; a later valid
+        //    block still parses.
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"bad","arguments":{"x":1</tool_call><tool_call>{"name":"ok","arguments":{}}</tool_call>"#,
+        )
+        .expect("recovers");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ok");
+
+        // 5) a lone unbalanced block never panics and yields nothing.
+        assert!(parse_tool_calls(r#"<tool_call>{"name":"x","arguments":{"a":"#).is_none());
+    }
+
+    #[test]
     fn parse_qwen_multiple_distinct_ids() {
         let calls = parse_tool_calls(
             "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\
