@@ -514,14 +514,31 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         let mut rest = text;
         while let Some(start) = rest.find("<tool_call>") {
             let after = &rest[start + "<tool_call>".len()..];
+            let inner = after.trim_start();
+            // JSON Hermes: scan a brace-balanced (string/escape-aware) object so a
+            // literal "</tool_call>" inside an argument value can't truncate the
+            // block. Fall back to the close-tag delimiter for the XML dialect.
+            if inner.starts_with('{') || inner.starts_with('[') {
+                let off = after.len() - inner.len();
+                if let Some(len) = balanced_json_end(&after[off..]) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
+                    {
+                        if let Some(c) = call_from_value(&v) {
+                            calls.push(c);
+                        }
+                    }
+                    let tail = &after[off + len..];
+                    rest = match tail.find("</tool_call>") {
+                        Some(e) => &tail[e + "</tool_call>".len()..],
+                        None => tail,
+                    };
+                    continue;
+                }
+            }
             let Some(end) = after.find("</tool_call>") else {
                 break;
             };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(after[..end].trim()) {
-                if let Some(c) = call_from_value(&v) {
-                    calls.push(c);
-                }
-            } else if let Some(c) = call_from_xml_function(&after[..end]) {
+            if let Some(c) = call_from_xml_function(&after[..end]) {
                 // Qwen3/MoE <function=…><parameter=…> XML dialect (non-JSON).
                 calls.push(c);
             }
@@ -550,6 +567,42 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         }
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// Byte length of the balanced JSON value starting at `s[0]` (`{` or `[`),
+/// string-/escape-aware so brackets inside string values don't miscount.
+/// `None` if `s` doesn't start with a bracket or never balances.
+fn balanced_json_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let (open, close) = match bytes.first()? {
+        b'{' => (b'{', b'}'),
+        b'[' => (b'[', b']'),
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
 }
 
 /// One `ToolCall` from a parsed JSON value. `name` required (else None → skip).
@@ -1372,6 +1425,20 @@ mod tests {
         let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
         assert_eq!(args["a"], "1");
         assert_eq!(args["b"], "two");
+    }
+
+    #[test]
+    fn parse_tool_call_arg_containing_close_tag() {
+        // An argument value that literally contains "</tool_call>" must not
+        // truncate the block (brace-balanced scan, not first-close-tag).
+        let calls = parse_tool_calls(
+            "<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"</tool_call> bye\"}}</tool_call>",
+        )
+        .expect("one call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "echo");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["text"], "</tool_call> bye");
     }
 
     #[test]
