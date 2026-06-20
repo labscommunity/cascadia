@@ -807,9 +807,24 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    // issue-49: validate response_format (400 on malformed; chat_completions returns a
+    // Response, NOT a Result — use an explicit early-return, mirroring the empty-prompt 400).
+    let response_format = match validate_response_format(req.response_format.as_ref()) {
+        Ok(rf) => rf,
+        Err(msg) => {
+            return (axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}})))
+                .into_response();
+        }
+    };
+    // issue-49: inject the required/forced directive into a render-local messages copy
+    // (receipt-safe; never mutate req.messages).
+    let (forced_name, is_required) = normalize_tool_choice_value(req.tool_choice.as_ref());
+    let mut msgs = req.messages.clone();
+    apply_tool_directive(&mut msgs, forced_name.as_deref(), is_required);
     let prompt = render_prompt(
         &state,
-        &req.messages,
+        &msgs,
         req.enable_thinking,
         req.tools.as_deref(),
     );
@@ -847,7 +862,7 @@ async fn chat_completions(
         logprobs: 0,
         enable_thinking: req.enable_thinking,
         trust_remote_code: false,
-        grammar: None,
+        grammar: grammar_from_response_format(response_format.as_ref()),
     };
 
     // Acquire a request slot before touching the engine. Without this

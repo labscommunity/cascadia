@@ -998,6 +998,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             logprobs: 0,
             enable_thinking: false,
             trust_remote_code: false,
+            grammar: None,
         };
         let mut stream = runner.generate(task)?;
         while let Some(chunk) = stream.next().await {
