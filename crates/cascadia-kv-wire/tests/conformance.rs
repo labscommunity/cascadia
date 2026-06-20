@@ -86,6 +86,14 @@ fn envelope_variants_match_golden() {
         ("env_notfound", KvMessage::NotFound),
         ("env_error", KvMessage::Error("e".into())),
         ("env_found", KvMessage::Found(fixed_manifest())),
+        (
+            "env_hint",
+            KvMessage::Hint(WarmHint {
+                request_id: [3u8; 16],
+                prev_chain_id: [9u8; 32],
+                partner: "c".into(),
+            }),
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();

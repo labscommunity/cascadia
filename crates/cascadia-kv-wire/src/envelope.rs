@@ -26,11 +26,24 @@ pub struct Get {
     pub expected_len: u32,
 }
 
+/// Entry→head warm-pull hint (issue-34 side-channel, §7). Carries only primitives so this crate
+/// stays enterprise-/engine-dep-free; the enterprise maps it to/from its `KvWarmHint`
+/// (`request_id` = the 16-byte UUID, `prev_chain_id` = the 32-byte `ChainId`). Sent on the existing
+/// `/cascadia/state/kv/v1` stream (no second protocol) — the head peeks the first frame and routes a
+/// `Hint` to its correlation stash instead of the holder serve path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmHint {
+    pub request_id: [u8; 16],
+    pub prev_chain_id: [u8; 32],
+    pub partner: String,
+}
+
 /// Control envelope on `/cascadia/state/kv/v1`.
 ///
 /// Commit is **in-band** (the warm/cold decision rides the pipeline dispatch, §7) — there is no
 /// `COMMIT`/`Ack` message. `Found` is followed on the stream by per-layer length-prefixed K then V
-/// payloads (framed by the transport, not this enum).
+/// payloads (framed by the transport, not this enum). `Hint` is **appended last** so existing variant
+/// indices (and the wire-conformance goldens) are unchanged — an additive bump.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvMessage {
     Negotiate(Negotiate),
@@ -39,6 +52,7 @@ pub enum KvMessage {
     Found(Manifest),
     NotFound,
     Error(String),
+    Hint(WarmHint),
 }
 
 #[cfg(test)]
@@ -66,6 +80,11 @@ mod tests {
             }),
             KvMessage::NotFound,
             KvMessage::Error("x".into()),
+            KvMessage::Hint(WarmHint {
+                request_id: [3u8; 16],
+                prev_chain_id: [9u8; 32],
+                partner: "acme".into(),
+            }),
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
