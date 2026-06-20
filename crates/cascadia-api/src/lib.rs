@@ -298,6 +298,8 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -1891,6 +1893,14 @@ mod tests {
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    #[test]
+    fn chat_completion_request_carries_response_format() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(body).unwrap();
+        assert!(validate_response_format(req.response_format.as_ref()).unwrap().is_some());
     }
 
     #[test]
