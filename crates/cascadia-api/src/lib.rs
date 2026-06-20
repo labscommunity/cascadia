@@ -238,7 +238,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     })
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default, deserialize_with = "de_null_content")]
@@ -306,6 +306,80 @@ fn default_true() -> bool {
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+/// Request-surface structured-output spec. Upstream twin of enterprise
+/// `cascadia_protocol::ResponseFormat`; bridged like `Tool`. Only `JsonSchema` in slice 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponseFormat {
+    JsonSchema { name: String, schema: String, strict: bool },
+}
+
+/// Parse+validate a partner `response_format` Value. `Ok(None)` for absent/null/text;
+/// `Err` on a malformed json_schema (stronger contract than tool_choice). Shared by the
+/// standalone server and the enterprise gateway.
+pub fn validate_response_format(v: Option<&serde_json::Value>) -> Result<Option<ResponseFormat>, String> {
+    let v = match v {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "text" => Ok(None),
+        "json_schema" => {
+            let js = v.get("json_schema").and_then(|j| j.as_object())
+                .ok_or("response_format.json_schema must be an object")?;
+            let name = js.get("name").and_then(|n| n.as_str())
+                .ok_or("response_format.json_schema.name is required")?.to_string();
+            let schema = js.get("schema").filter(|s| s.is_object())
+                .ok_or("response_format.json_schema.schema must be an object")?;
+            let strict = js.get("strict").and_then(|s| s.as_bool()).unwrap_or(false);
+            Ok(Some(ResponseFormat::JsonSchema {
+                name,
+                schema: serde_json::to_string(schema).map_err(|e| e.to_string())?,
+                strict,
+            }))
+        }
+        other => Err(format!("unsupported response_format.type: {other}")),
+    }
+}
+
+/// Derive the backend-neutral engine grammar (slice 1: response_format-only).
+pub fn grammar_from_response_format(rf: Option<&ResponseFormat>) -> Option<cascadia_types::GrammarSpec> {
+    match rf {
+        Some(ResponseFormat::JsonSchema { schema, .. }) => Some(cascadia_types::GrammarSpec {
+            kind: cascadia_types::GrammarKind::JsonSchema,
+            body: schema.clone(),
+        }),
+        None => None,
+    }
+}
+
+/// Best-effort required/forced nudge text. `None` ⇒ no directive (auto/none).
+pub fn tool_call_directive(forced_name: Option<&str>, is_required: bool) -> Option<String> {
+    match forced_name {
+        Some(name) => Some(format!("You must call the `{name}` tool.")),
+        None if is_required => Some("You must call one of the provided tools.".to_string()),
+        None => None,
+    }
+}
+
+/// Normalize a partner `tool_choice` Value → (forced_name, is_required).
+pub fn normalize_tool_choice_value(tc: Option<&serde_json::Value>) -> (Option<String>, bool) {
+    match tc {
+        Some(serde_json::Value::String(s)) if s == "required" => (None, true),
+        Some(serde_json::Value::Object(o)) => (
+            o.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).map(str::to_string),
+            true,
+        ),
+        _ => (None, false),
+    }
+}
+
+/// Receipt-safe: append the required/forced directive to a render-local messages copy.
+pub fn apply_tool_directive(msgs: &mut Vec<ChatMessage>, forced_name: Option<&str>, is_required: bool) {
+    if let Some(d) = tool_call_directive(forced_name, is_required) {
+        msgs.push(ChatMessage { role: "system".to_string(), content: d, name: None, tool_calls: None, tool_call_id: None });
+    }
 }
 
 #[derive(Serialize)]
@@ -771,6 +845,7 @@ async fn chat_completions(
         logprobs: 0,
         enable_thinking: req.enable_thinking,
         trust_remote_code: false,
+        grammar: None,
     };
 
     // Acquire a request slot before touching the engine. Without this
@@ -1816,5 +1891,60 @@ mod tests {
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    #[test]
+    fn validate_response_format_accept_reject_none() {
+        let ok = serde_json::json!({"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object"},"strict":true}});
+        let rf = validate_response_format(Some(&ok)).unwrap().unwrap();
+        let ResponseFormat::JsonSchema { name, schema, strict } = rf;
+        assert_eq!(name, "a");
+        assert!(strict);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&schema).unwrap()["type"], "object");
+
+        assert!(validate_response_format(None).unwrap().is_none());
+        assert!(validate_response_format(Some(&serde_json::json!({"type":"text"}))).unwrap().is_none());
+        assert!(validate_response_format(Some(&serde_json::json!({"type":"json_schema"}))).is_err());
+        assert!(validate_response_format(Some(&serde_json::json!({"type":"json_schema","json_schema":{"schema":{"type":"object"}}}))).is_err());
+        assert!(validate_response_format(Some(&serde_json::json!({"type":"json_schema","json_schema":{"name":"x","schema":"nope"}}))).is_err());
+        assert!(validate_response_format(Some(&serde_json::json!({"type":"json_obj"}))).is_err());
+    }
+
+    #[test]
+    fn grammar_from_response_format_maps_json_schema() {
+        let rf = ResponseFormat::JsonSchema { name: "x".into(), schema: r#"{"type":"object"}"#.into(), strict: true };
+        let g = grammar_from_response_format(Some(&rf)).unwrap();
+        assert!(matches!(g.kind, cascadia_types::GrammarKind::JsonSchema));
+        assert_eq!(g.body, r#"{"type":"object"}"#);
+        assert!(grammar_from_response_format(None).is_none());
+    }
+
+    #[test]
+    fn tool_directive_helpers() {
+        assert_eq!(tool_call_directive(None, false), None);
+        assert_eq!(tool_call_directive(None, true).as_deref(), Some("You must call one of the provided tools."));
+        assert_eq!(tool_call_directive(Some("get_weather"), true).as_deref(), Some("You must call the `get_weather` tool."));
+        // normalize from the partner Value
+        assert_eq!(normalize_tool_choice_value(Some(&serde_json::json!("required"))), (None, true));
+        assert_eq!(
+            normalize_tool_choice_value(Some(&serde_json::json!({"type":"function","function":{"name":"f"}}))),
+            (Some("f".to_string()), true)
+        );
+        assert_eq!(normalize_tool_choice_value(Some(&serde_json::json!("auto"))), (None, false));
+        assert_eq!(normalize_tool_choice_value(None), (None, false));
+    }
+
+    #[test]
+    fn apply_tool_directive_appends_only_when_required() {
+        let base = vec![ChatMessage { role: "user".into(), content: "hi".into(), name: None, tool_calls: None, tool_call_id: None }];
+        let mut m = base.clone();
+        apply_tool_directive(&mut m, None, false);
+        assert_eq!(m, base); // auto/none: byte-identical, no injection
+        let mut m2 = base.clone();
+        apply_tool_directive(&mut m2, None, true);
+        assert_eq!(m2.len(), 2);
+        assert_eq!(m2[1].role, "system");
+        assert_eq!(m2[1].content, "You must call one of the provided tools.");
+        assert_eq!(m2[0], base[0]); // original user message preserved
     }
 }
