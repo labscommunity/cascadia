@@ -17,4 +17,4 @@ pub use error::Error;
 pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
 pub use shard::{ShardPlan, ShardSpec};
-pub use task::{GenerationTask, TaskId};
+pub use task::{GenerationTask, GrammarKind, GrammarSpec, TaskId};

@@ -30,6 +30,22 @@ fn generation_task_serde_roundtrip() {
 }
 
 #[test]
+fn generation_task_grammar_bincode_and_json_roundtrip() {
+    use cascadia_types::{GenerationTask, GrammarKind, GrammarSpec};
+    let task = GenerationTask::new("t-1", "hello").with_grammar(GrammarSpec {
+        kind: GrammarKind::JsonSchema,
+        body: r#"{"type":"object"}"#.to_string(),
+    });
+    let json = serde_json::to_string(&task).unwrap();
+    assert_eq!(serde_json::from_str::<GenerationTask>(&json).unwrap(), task);
+    let bytes = bincode::serde::encode_to_vec(&task, bincode::config::standard()).unwrap();
+    let (decoded, _): (GenerationTask, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    assert_eq!(task, decoded);
+    assert!(GenerationTask::new("t-2", "hi").grammar.is_none());
+}
+
+#[test]
 fn chunk_token_constructor() {
     let c = Chunk::token("t1", 42, "hello");
     assert_eq!(c.token_id, 42);

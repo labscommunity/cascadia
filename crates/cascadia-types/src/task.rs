@@ -27,6 +27,24 @@ pub struct GenerationTask {
     /// Treat as a security boundary — opt in only.
     #[serde(default)]
     pub trust_remote_code: bool,
+    /// Guided-decoding constraint; enforced by engines that support it, else ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<GrammarSpec>,
+}
+
+/// Backend-neutral guided-decoding constraint. `None` = unconstrained; engines
+/// that don't enforce it ignore it (like `logprobs`). `body` is a String (never
+/// serde_json::Value — ADR-001 bincode).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GrammarSpec {
+    pub kind: GrammarKind,
+    pub body: String,
+}
+
+/// Only `JsonSchema` in slice 1; `Regex`/`Lark` are additive future variants.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GrammarKind {
+    JsonSchema,
 }
 
 fn default_max_tokens() -> u32 {
@@ -43,6 +61,7 @@ impl GenerationTask {
             logprobs: 0,
             enable_thinking: false,
             trust_remote_code: false,
+            grammar: None,
         }
     }
 
@@ -53,6 +72,11 @@ impl GenerationTask {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    pub fn with_grammar(mut self, grammar: GrammarSpec) -> Self {
+        self.grammar = Some(grammar);
         self
     }
 }
