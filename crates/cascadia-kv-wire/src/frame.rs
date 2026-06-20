@@ -50,8 +50,13 @@ pub fn decode_frame(buf: &[u8]) -> Result<(KvMessage, usize), FrameError> {
     if buf.len() < end {
         return Err(FrameError::Incomplete);
     }
-    let (msg, _) = bincode::serde::decode_from_slice(&buf[4..end], standard())
+    let (msg, consumed) = bincode::serde::decode_from_slice(&buf[4..end], standard())
         .map_err(|_| FrameError::Decode)?;
+    // The declared length must match the bincode encoding exactly — trailing junk inside a frame is a
+    // structural anomaly; reject rather than silently swallow it.
+    if consumed != len as usize {
+        return Err(FrameError::Decode);
+    }
     Ok((msg, end))
 }
 
@@ -114,6 +119,18 @@ mod tests {
         let mut buf = (MAX_FRAME_LEN + 1).to_be_bytes().to_vec();
         buf.extend_from_slice(&[0u8; 8]);
         assert_eq!(decode_frame(&buf), Err(FrameError::TooLarge));
+    }
+
+    #[test]
+    fn trailing_junk_inside_frame_is_rejected() {
+        // A length prefix larger than the actual bincode body (extra trailing bytes inside the
+        // declared frame) must reject, not silently swallow the junk.
+        let body = bincode::serde::encode_to_vec(sample(), standard()).unwrap();
+        let inflated = body.len() as u32 + 3;
+        let mut buf = inflated.to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // junk counted inside the frame length
+        assert_eq!(decode_frame(&buf), Err(FrameError::Decode));
     }
 
     #[test]

@@ -18,6 +18,20 @@ pub enum ValidateError {
     TokenLen,
 }
 
+/// Expected payload bytes for a tensor shape, with **checked** arithmetic. An adversarial shape whose
+/// element product overflows `u64` must reject: a silently-wrapped small expectation would let an
+/// undersized payload validate against a huge declared tensor → consumer OOB read at reslice time.
+/// Empty shape rejects (a KV tensor has at least the seq axis).
+fn expected_bytes(shape: &[u32]) -> Option<u64> {
+    if shape.is_empty() {
+        return None;
+    }
+    shape
+        .iter()
+        .try_fold(1u64, |acc, &d| acc.checked_mul(u64::from(d)))?
+        .checked_mul(DTYPE_SIZE as u64)
+}
+
 pub struct KvSnapshotCodec;
 
 impl KvSnapshotCodec {
@@ -71,10 +85,13 @@ impl KvSnapshotCodec {
                 return Err(ValidateError::ShapeSeq);
             }
             // K and V validated independently (distinct qk_head_dim / v_head_dim, plan C3).
-            let k_expect: u64 =
-                lm.k_shape.iter().map(|&d| d as u64).product::<u64>() * DTYPE_SIZE as u64;
-            let v_expect: u64 =
-                lm.v_shape.iter().map(|&d| d as u64).product::<u64>() * DTYPE_SIZE as u64;
+            // Checked product (see `expected_bytes`): an overflowing/empty shape rejects rather than
+            // wrapping to a small expectation an undersized payload could match.
+            let (Some(k_expect), Some(v_expect)) =
+                (expected_bytes(&lm.k_shape), expected_bytes(&lm.v_shape))
+            else {
+                return Err(ValidateError::ByteLenShape);
+            };
             if lm.k_byte_len != k_expect || lm.v_byte_len != v_expect {
                 return Err(ValidateError::ByteLenShape);
             }
@@ -231,10 +248,24 @@ mod tests {
         assert_eq!(ok(&m, &k, &v, &[11, 22, 33]), Err(ValidateError::Crc));
     }
     #[test]
+    fn rejects_shape_product_overflow() {
+        // Adversarial shape whose element product overflows u64 must reject (not wrap to a small
+        // expectation that an undersized payload could match → consumer OOB). seq axis (index 1)
+        // still equals prefix_token_len so the shape-seq check passes and byte-len is reached.
+        let (mut m, k, v) = good();
+        m.layers[0].k_shape = vec![1, 2, u32::MAX, u32::MAX];
+        m.layers[0].k_byte_len = 4; // attacker-chosen small len matching a tiny payload
+        assert_eq!(
+            ok(&m, &k, &v, &[11, 22, 33]),
+            Err(ValidateError::ByteLenShape)
+        );
+    }
+
+    #[test]
     fn validates_asymmetric_k_v_dims() {
         // qk_head_dim=3, v_head_dim=1 → distinct K/V byte lengths (plan C3 regression).
-        let k = vec![0u8; 2 * 3 * 2]; // [1,2,3] u16
-        let v = vec![0u8; 2 * 1 * 2]; // [1,2,1] u16
+        let k = vec![0u8; 2 * 3 * 2]; // [1,2,3] u16 = 12 bytes
+        let v = vec![0u8; 4]; // [1,2,1] u16 = 4 bytes
         let mut m = good().0;
         m.layers[0].k_shape = vec![1, 2, 3];
         m.layers[0].v_shape = vec![1, 2, 1];
