@@ -594,7 +594,7 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
-    println!("  sparse-moe     Kimi K2.6 sparse top-8 dispatch; AVX-512 int4 GEMM + Rust shells");
+    println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
     println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
     Ok(())
 }
