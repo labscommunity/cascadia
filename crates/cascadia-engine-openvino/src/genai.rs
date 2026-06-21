@@ -279,7 +279,7 @@ impl Engine for OvGenaiEngine {
             return Vec::new();
         }
         let task = self.pending.remove(0);
-        let cfg = self.gen_config(
+        let mut cfg = self.gen_config(
             if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -288,6 +288,7 @@ impl Engine for OvGenaiEngine {
             task.temperature,
             task.enable_thinking,
         );
+        cfg.json_schema = grammar_to_json_schema(task.grammar.as_ref());
 
         let started = Instant::now();
         let result = match self.pipe.generate(&task.prompt, &cfg) {
@@ -325,6 +326,15 @@ impl Engine for OvGenaiEngine {
         let chunk = Chunk::final_marker(task.task_id.clone(), text);
         vec![(task.task_id, chunk)]
     }
+}
+
+/// Engine-wire grammar → ov-genai json_schema. Only `JsonSchema` today; a new
+/// `GrammarKind` variant is a deliberate compile-stop (forces handling here,
+/// not a silent drop).
+fn grammar_to_json_schema(grammar: Option<&cascadia_types::GrammarSpec>) -> Option<String> {
+    grammar.map(|g| match g.kind {
+        cascadia_types::GrammarKind::JsonSchema => g.body.clone(),
+    })
 }
 
 impl OvGenaiEngine {
@@ -409,5 +419,18 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::grammar_to_json_schema;
+    use cascadia_types::{GrammarKind, GrammarSpec};
+
+    #[test]
+    fn maps_json_schema_body_else_none() {
+        let g = GrammarSpec { kind: GrammarKind::JsonSchema, body: r#"{"type":"object"}"#.into() };
+        assert_eq!(grammar_to_json_schema(Some(&g)).as_deref(), Some(r#"{"type":"object"}"#));
+        assert_eq!(grammar_to_json_schema(None), None);
     }
 }
