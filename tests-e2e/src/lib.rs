@@ -6,7 +6,10 @@
 //!
 //! Run via:
 //!     cargo build -p cascadia
-//!     cargo test -p cascadia-tests-e2e -- --test-threads=1
+//!     cargo test -p cascadia-tests-e2e
+//!
+//! Every test binds ephemeral ports (see [`pick_free_port`]), so they run
+//! in parallel safely — `--test-threads=1` is not required.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -15,6 +18,11 @@ use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
 /// Find a free TCP port to avoid collisions when tests run in parallel.
+///
+/// There is an unavoidable TOCTOU window: the port is free when we drop the
+/// listener but could be claimed by another process before the caller binds
+/// it. The pick→spawn gap is small and the ephemeral range is large, so
+/// collisions are vanishingly rare — this is the standard bind-to-`:0` trick.
 pub fn pick_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let port = listener.local_addr().unwrap().port();
@@ -161,8 +169,10 @@ impl MockPipeline {
                 .spawn()
                 .expect("spawn pipeline stage");
             procs.push(child);
-            // Give the stage a moment to bind before its upstream connects.
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // No inter-stage sleep needed: stages are spawned downstream-first
+            // and the activation transport retries its connect (every 500ms up
+            // to DEFAULT_CONNECT_TIMEOUT = 30s), so an upstream simply waits out
+            // the gap until its downstream is bound and accepting.
         }
         Self {
             api_port,
@@ -390,7 +400,7 @@ mod tests {
             let r = client
                 .post(format!("{entry}/v1/chat/completions"))
                 .json(&serde_json::json!({
-                    "model": "mock-model",
+                    "model": model,
                     "messages": [{"role": "user", "content": "hello world"}],
                     "max_tokens": 2,
                 }))
