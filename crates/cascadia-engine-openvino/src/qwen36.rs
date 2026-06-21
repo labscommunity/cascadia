@@ -1300,30 +1300,26 @@ impl Engine for Qwen36Engine {
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
-        // EngineResult migration (matches the other engines on this branch).
-        // step_local/step_pipe_first already absorb their own errors into the
-        // emitted Vec, so they Ok-wrap directly. The relay arm keeps qwen36's
-        // existing swallow+backoff policy (peer loss = operator restart, §3.5)
-        // rather than propagating Err — that policy is intentional and out of
-        // scope for the type migration.
+        // EngineResult migration. step_local/step_pipe_first already absorb their
+        // own task-level errors into the emitted Vec (final error chunks), so
+        // they Ok-wrap directly.
         if self.total <= 1 {
             return Ok(self.step_local());
         }
         if self.rank == 0 {
-            Ok(self.step_pipe_first())
-        } else {
-            match self.step_pipe_relay() {
-                Ok(()) => Ok(Vec::new()),
-                Err(e) => {
-                    // Backoff: a dead upstream session makes recv fail
-                    // instantly; without a pause the relay loop spins and
-                    // floods the log (peer loss = operator restart, §3.5).
-                    warn!(error = %e, "qwen36 pipeline step failed");
-                    std::thread::sleep(Duration::from_millis(500));
-                    Ok(Vec::new())
-                }
-            }
+            return Ok(self.step_pipe_first());
         }
+        // Relay stage: PROPAGATE the error (like runtime/gemma4/sparse-moe). A
+        // dead upstream is connection-fatal, and `run_relay_loop` only restarts
+        // the stage when step() returns that Err (§3.5: peer loss = operator
+        // restart). Swallowing it into Ok(Vec::new()) would leave a silent
+        // zombie that never rebuilds. The runner throttles non-fatal errors via
+        // RELAY_ERR_BACKOFF, so no in-engine backoff is needed.
+        let result = self.step_pipe_relay().map(|_| Vec::new());
+        if let Err(e) = &result {
+            warn!(error = %e, "qwen36 pipeline step failed");
+        }
+        result
     }
 
     fn cancel(&mut self, task_id: &TaskId) {

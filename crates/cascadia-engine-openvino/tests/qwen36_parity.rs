@@ -65,7 +65,7 @@ async fn qwen36_greedy_parity() {
     let mut ids = Vec::new();
     let mut text = String::new();
     loop {
-        let chunks = engine.step();
+        let chunks = engine.step().expect("step");
         let mut done = false;
         for (_, c) in chunks {
             if c.is_final {
