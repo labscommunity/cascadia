@@ -112,6 +112,7 @@ mod sys {
             cfg: *mut cascadia_genconfig_t,
             enabled: i32,
         );
+        pub fn cascadia_genconfig_set_json_schema(cfg: *mut cascadia_genconfig_t, schema: *const c_char);
 
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
@@ -462,6 +463,10 @@ impl LlmPipeline {
                 raw_cfg,
                 if cfg.skip_chat_template { 0 } else { 1 },
             );
+            if let Some(schema) = cfg.json_schema.as_deref() {
+                let schema_c = cstr(schema)?;
+                sys::cascadia_genconfig_set_json_schema(raw_cfg, schema_c.as_ptr());
+            }
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(

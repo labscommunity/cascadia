@@ -88,6 +88,7 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 // When enabled==0 the pipeline skips its internal chat-template apply (caller
 // pre-rendered the template, e.g. to honor enable_thinking). Default: apply.
 void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled);
+void cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char* schema);
 
 // ---- Generation -----------------------------------------------------------
 

@@ -270,6 +270,14 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled) {
     if (cfg) cfg->cfg.apply_chat_template = enabled != 0;
 }
+void cascadia_genconfig_set_json_schema(cascadia_genconfig_t* cfg, const char* schema) {
+    if (!cfg || !schema) return;
+    try {   // building std::string / StructuredOutputConfig can throw — never let it cross the C ABI
+        ov::genai::StructuredOutputConfig soc;
+        soc.json_schema = std::string(schema);   // backend defaults to "xgrammar"
+        cfg->cfg.structured_output_config = soc;
+    } catch (...) { set_last_error("set_json_schema failed"); }
+}
 
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,
