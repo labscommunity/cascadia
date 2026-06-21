@@ -99,6 +99,10 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--quant", choices=["none", "int8", "int4", "nf4"], default="none",
                     help="simulate expert weight quantization (none=fp32/FP8-precision)")
+    ap.add_argument("--ov-experts", action="store_true",
+                    help="dispatch the export's compiled OV expert IRs (like the Rust engine) "
+                         "instead of numpy SwiGLU from the FP8 source — isolates OV-expert-IR "
+                         "execution from the numpy reference")
     ap.add_argument("--device", default="CPU")
     args = ap.parse_args()
 
@@ -132,9 +136,23 @@ def main():
             w = (quant_dequant(reader.weight(b + ".w1").numpy(), args.quant),   # gate
                  quant_dequant(reader.weight(b + ".w3").numpy(), args.quant),   # up
                  quant_dequant(reader.weight(b + ".w2").numpy(), args.quant))   # down
-            if len(expert_cache) < 64:               # tiny cache; recompute keeps RSS low
+            if len(expert_cache) < 600:              # ~34G cap; speeds up short runs
                 expert_cache[key] = w
         return w
+
+    expert_ov_cache = {}
+
+    def expert_ov(li, ei, apn):
+        c = expert_ov_cache.get((li, ei))
+        if c is None:
+            c = core.compile_model(
+                str(md / "experts" / f"layer_{li:02d}" / f"expert_{ei:03d}" / "openvino_model.xml"),
+                args.device)
+            if len(expert_ov_cache) < 4000:
+                expert_ov_cache[(li, ei)] = c
+        r = c.create_infer_request()
+        r.infer({"x": apn.reshape(1, 1, H).astype(np.float32)})
+        return np.array(r.get_tensor("y").data).reshape(-1)
 
     past_k = {li: np.zeros((1, KV, 0, D), np.float32) for li in layers}
     past_v = {li: np.zeros((1, KV, 0, D), np.float32) for li in layers}
@@ -156,9 +174,13 @@ def main():
             past_v[li] = np.concatenate([past_v[li], pv], axis=2)
             moe = np.zeros_like(residual)
             for k in range(K):
-                gate, up, down = expert_f32(li, int(ids_r[k]))
-                inter = silu(gate @ apn) * (up @ apn)   # [inter]
-                y = (down @ inter).reshape(residual.shape)
+                ei = int(ids_r[k])
+                if args.ov_experts:
+                    y = expert_ov(li, ei, apn).reshape(residual.shape)
+                else:
+                    gate, up, down = expert_f32(li, ei)
+                    inter = silu(gate @ apn) * (up @ apn)   # [inter]
+                    y = (down @ inter).reshape(residual.shape)
                 moe = moe + float(w_r[k]) * y
             h = residual + moe
         logits = head(h.astype(np.float32))[head.output("logits")].reshape(-1)
