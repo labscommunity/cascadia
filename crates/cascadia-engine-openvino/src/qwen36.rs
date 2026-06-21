@@ -1299,22 +1299,28 @@ impl Engine for Qwen36Engine {
         Ok(())
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // EngineResult migration (matches the other engines on this branch).
+        // step_local/step_pipe_first already absorb their own errors into the
+        // emitted Vec, so they Ok-wrap directly. The relay arm keeps qwen36's
+        // existing swallow+backoff policy (peer loss = operator restart, §3.5)
+        // rather than propagating Err — that policy is intentional and out of
+        // scope for the type migration.
         if self.total <= 1 {
-            return self.step_local();
+            return Ok(self.step_local());
         }
         if self.rank == 0 {
-            self.step_pipe_first()
+            Ok(self.step_pipe_first())
         } else {
             match self.step_pipe_relay() {
-                Ok(()) => Vec::new(),
+                Ok(()) => Ok(Vec::new()),
                 Err(e) => {
                     // Backoff: a dead upstream session makes recv fail
                     // instantly; without a pause the relay loop spins and
                     // floods the log (peer loss = operator restart, §3.5).
                     warn!(error = %e, "qwen36 pipeline step failed");
                     std::thread::sleep(Duration::from_millis(500));
-                    Vec::new()
+                    Ok(Vec::new())
                 }
             }
         }
