@@ -104,6 +104,25 @@ impl Manifest {
             .join("openvino_model.xml")
     }
 
+    /// Path to the GPU-friendly shell-core IR for layer `lid` (attention +
+    /// KV, no router) — produced by `tools/split_m2_shells.py`. Present only
+    /// when the shells have been split for non-CPU (iGPU/NPU) execution.
+    pub fn shell_core_xml(&self, model_dir: &Path, lid: u32) -> PathBuf {
+        model_dir
+            .join("shells")
+            .join(format!("layer_{:02}", lid))
+            .join("shell_core.xml")
+    }
+
+    /// Path to the CPU router IR for layer `lid` (`apn_in` -> routing
+    /// ids/weights), the sibling of [`Self::shell_core_xml`].
+    pub fn router_xml(&self, model_dir: &Path, lid: u32) -> PathBuf {
+        model_dir
+            .join("shells")
+            .join(format!("layer_{:02}", lid))
+            .join("router.xml")
+    }
+
     /// Path to one per-(layer, expert) IR.
     pub fn expert_xml(&self, model_dir: &Path, lid: u32, eid: u32) -> PathBuf {
         model_dir
