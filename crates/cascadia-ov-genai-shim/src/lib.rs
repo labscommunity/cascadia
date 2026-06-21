@@ -275,6 +275,9 @@ pub struct GenConfig {
     /// the caller pre-rendered the template (e.g. to honor enable_thinking).
     /// Default false = apply (matches OV's `apply_chat_template = true`).
     pub skip_chat_template: bool,
+    /// Engine-wire JSON-schema for guided decoding (issue-49). `None` = unconstrained.
+    /// Forwarded to OpenVINO GenAI's StructuredOutputConfig only under `--features openvino`.
+    pub json_schema: Option<String>,
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).

@@ -341,6 +341,7 @@ impl OvGenaiEngine {
             // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
             // native templating (the legacy join the API emitted), untouched.
             skip_chat_template: self.prompt_pretemplated && !enable_thinking,
+            json_schema: None,
         };
         if self.speculative_k > 0 {
             cfg.num_assistant_tokens = self.speculative_k;
