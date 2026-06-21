@@ -14,6 +14,7 @@ members = [
     "crates/cascadia-discovery",
     "crates/cascadia-download",
     "crates/cascadia-api",
+    "crates/cascadia-dashboard",
     "crates/cascadia-cli",
     "crates/cascadia",
     "tests-e2e",
@@ -41,6 +42,7 @@ cascadia-runner = { path = "crates/cascadia-runner" }
 cascadia-discovery = { path = "crates/cascadia-discovery" }
 cascadia-download = { path = "crates/cascadia-download" }
 cascadia-api = { path = "crates/cascadia-api" }
+cascadia-dashboard = { path = "crates/cascadia-dashboard" }
 cascadia-cli = { path = "crates/cascadia-cli" }
 
 # Async runtime
@@ -77,10 +79,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
 
-# OpenVINO
-openvino = "0.10"
-openvino-genai = "0.10"
-openvino-genai-sys = "0.10"
+# OpenVINO binding is the C++ FFI shim (cascadia-ov-genai-shim), not the
+# crates.io `openvino*` crates — former workspace pins for them were dead
+# (absent from Cargo.lock) and removed in #77 Part A.
 
 # Discovery + downloads
 mdns-sd = "0.13"

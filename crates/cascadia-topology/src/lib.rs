@@ -25,13 +25,31 @@ fn now_ts() -> f64 {
 pub struct NodeInfo {
     pub node_id: String,
     pub host: String,
+    /// Activation-relay / latency-probe port (the port peers connect to for
+    /// the pipeline transport and RTT probes).
     pub port: u16,
+    /// OpenAI-compatible API / dashboard port, set on coordinator nodes that
+    /// serve `--api`. `None` for relay-only stages. The dashboard shows this
+    /// as the node's reachable address rather than the relay `port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_port: Option<u16>,
     #[serde(default = "default_namespace")]
     pub namespace: String,
     #[serde(default = "default_device")]
     pub device: String,
     #[serde(default)]
     pub memory_mb: u64,
+    /// CPU brand string (e.g. "Intel(R) Core(TM) Ultra 7 258V"). Empty if
+    /// unknown. Advertised so the dashboard can show per-node system specs.
+    #[serde(default)]
+    pub cpu_model: String,
+    /// Logical CPU count. 0 if unknown.
+    #[serde(default)]
+    pub cpu_cores: u32,
+    /// Operating system label (e.g. "Windows 11", "macOS 15.5"). Empty if
+    /// unknown.
+    #[serde(default)]
+    pub os: String,
     #[serde(default)]
     pub engines: Vec<String>,
     #[serde(default = "now_ts")]
@@ -51,9 +69,13 @@ impl NodeInfo {
             node_id: node_id.into(),
             host: host.into(),
             port,
+            api_port: None,
             namespace: default_namespace(),
             device: default_device(),
             memory_mb: 0,
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            os: String::new(),
             engines: Vec::new(),
             last_seen: now_ts(),
         }
@@ -96,6 +118,16 @@ impl Topology {
         inner.nodes.insert(info.node_id.clone(), info);
     }
 
+    /// Refresh an existing node's `last_seen` without re-cloning the whole
+    /// `NodeInfo`. Used by the self-heartbeat loop. No-op if the node isn't
+    /// present (a peer we haven't discovered yet).
+    pub fn touch(&self, node_id: &str) {
+        let mut inner = self.inner.write();
+        if let Some(n) = inner.nodes.get_mut(node_id) {
+            n.last_seen = now_ts();
+        }
+    }
+
     pub fn remove_node(&self, node_id: &str) {
         let mut inner = self.inner.write();
         inner.nodes.remove(node_id);
@@ -112,6 +144,25 @@ impl Topology {
         let mut inner = self.inner.write();
         inner.edges.insert(
             (src.into(), dst.into()),
+            EdgeMetrics {
+                latency_ms,
+                bandwidth_mbps,
+                last_measured: now_ts(),
+            },
+        );
+    }
+
+    /// Record a latency measurement WITHOUT clobbering a previously-measured
+    /// `bandwidth_mbps` on the same edge. The latency-probe loop measures
+    /// only RTT; using `measure(.., 0.0)` would reset bandwidth to 0 on
+    /// every tick. Preserves the existing edge's bandwidth (0.0 for a new
+    /// edge until a bandwidth probe sets it).
+    pub fn record_latency(&self, src: impl Into<String>, dst: impl Into<String>, latency_ms: f64) {
+        let key = (src.into(), dst.into());
+        let mut inner = self.inner.write();
+        let bandwidth_mbps = inner.edges.get(&key).map_or(0.0, |e| e.bandwidth_mbps);
+        inner.edges.insert(
+            key,
             EdgeMetrics {
                 latency_ms,
                 bandwidth_mbps,

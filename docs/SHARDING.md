@@ -56,23 +56,81 @@ network).
 Cascadia's exporter uses HuggingFace's standard decoder-layer classes,
 so anything whose layer exposes the conventional names
 (`self_attn.{q_proj,k_proj,v_proj,o_proj}`, `mlp`, `input_layernorm`,
-`post_attention_layernorm`) and uses RoPE rotary embeddings works:
+`post_attention_layernorm`) and uses RoPE rotary embeddings works.
+
+This table tracks what `tools/export_shards.py` accepts today. For each
+family, **Status** is one of:
+
+- ✅ **tested** — exercised on hardware in CI or by hand; produces tokens that
+  match HF reference closely (single-token-level agreement on greedy decode
+  for short prompts).
+- ⚠️ **best-effort** — loads and traces, but either has no automated quality
+  check, or a SOFT quirk (long-context RoPE / sliding window) means it is exact
+  only within the original context window.
+- 🚧 **rejected** — a recognised `model_type` (or config feature) the exporter
+  cannot honour; rejected config-first, before download (#60/#69), with a clear
+  error and a pointer to the right tool. No shards produced unless
+  `CASCADIA_ALLOW_LOSSY_EXPORT=1`.
+- ❌ **unknown** — not in any accept/reject list; `detect_architecture` falls
+  back to the Llama path with a stderr warning. May work (most post-Llama-2
+  dense decoder-only LMs do) or produce garbage — benchmark before trusting.
 
 | Family | Status | Notes |
 |--------|--------|-------|
-| **Llama** (1, 2, 3, 3.1, 3.2) | ✅ tested | Reference path. Llama 3.2 1B/3B have tied embeddings — handled. |
-| **Mistral** (7B v0.1+) | ✅ tested | Sliding-window attention is disabled in the export (uses standard SDPA). |
+| **Llama** (1, 2, 3, 3.1, 3.2, 3.3) | ✅ tested | Reference path. Llama 3.2 1B/3B + 3.3 have tied embeddings — handled. Llama-3 RoPE scaling (`rope_type: "llama3"`) is recomputed in the Rust runtime. |
+| **Mistral** (7B v0.1+, NeMo 12B) | ✅ tested | Sliding-window attention is disabled in the export (uses standard SDPA across the full KV cache). NeMo and Small 3 (`model_type: "mistral"`) work out of the box; Pixtral / Mistral Small 3.1 (`model_type: "mistral3"`) are wrapper configs — see "Multimodal text-only path" below. |
 | **Qwen2 / Qwen2.5** | ✅ tested | Uses Qwen2-specific decoder layer with bias on q/k/v projections. |
-| **Phi-3** (Mini, Medium) | ⚠️ best-effort | Standard Phi-3 layouts work; LongRope variants may need `rope_theta` override. |
-| **Gemma 2** | ⚠️ best-effort | Gemma2DecoderLayer is used; logit softcapping is NOT applied (the export skips it for performance) — quality may regress by ~1% on benchmarks. |
-| **Mixtral / MoE** | ❌ not supported | The exporter assumes one MLP per layer; MoE routing requires a different export path. |
-| **Multimodal (Llava, etc.)** | ❌ not supported | Vision encoder is not exported; text-only path may work but isn't tested. |
+| **Qwen3 dense** | ✅ tested | Dispatches to `Qwen3DecoderLayer`; `q_norm` / `k_norm` (RMSNorm on Q/K before RoPE) are detected and applied automatically. `head_dim` is read from `config.head_dim` (Qwen3 decouples it from `hidden_size / num_heads`). |
+| **DeepSeek R1 Distills** (Qwen / Llama 7B–70B) | ✅ supported | Distills inherit their base config (`model_type: "qwen2"` or `"llama"`), so they ride the existing paths with no special handling. Short aliases (`r1-distill-qwen-7b`, …) resolve via `tools/model_aliases.py` (#49). |
+| **DeepSeek-V2-Lite** | ⚠️ best-effort / MoE | Standard attention + RoPE on the Llama path, BUT V2-Lite is itself MoE (`n_routed_experts`), so `is_moe_config` now rejects it (#60). Use the dense R1-Distills instead. |
+| **Phi-3** (Mini 4B, Medium 14B, Small 3.8B) | ✅ supported | `Phi3DecoderLayer` loads; fused `qkv_proj` is split (#58). **Partial rotary** (`partial_rotary_factor < 1.0`) is honoured (#69) — only the leading `factor·head_dim` dims rotate, the rest pass through. |
+| **Phi-4** (14B, Phi-4-mini, Phi-4-reasoning) | ✅ supported (short context) | Reports `model_type: "phi3"`. **Phi-4-mini** has `partial_rotary_factor=0.75` (honoured, #69) and **LongRoPE** scaling (not modeled — soft-warned). Exact within the original context window; long-context degrades. |
+| **Gemma 1 / Gemma 2** | ✅ supported (short context) | Gemma 1 (2-norm) and Gemma 2 (4-norm + attention/final **logit softcapping** + sqrt(hidden) embed scaling) are applied (#61). Sliding-window attention (Gemma 2) is treated as full-causal — exact within the window. |
+| **Gemma 3** (1B / 4B / 12B / 27B) | 🚧 rejected | Interleaved local/global sliding-window, QK-norm, and per-layer-type RoPE bases are not modeled; `detect_architecture` rejects it up front (#69) rather than mis-exporting through the `gemma` path. |
+| **Gemma 4** (E2B / E4B / 31B, April 2026) | ✅ via dedicated exporter | `cascadia shard` auto-dispatches Gemma 4 to `tools/export_gemma4.py` (#48), which handles per-layer-type asymmetric `head_dim` (256/512), per-layer-type/proportional RoPE, KV-sharing, per-layer embeddings, and `final_logit_softcapping=30.0`. **Exporter-only today**: the shards run via OpenVINO Core; multi-stage on the Rust `ov-runtime` engine is a tracked follow-up (see `docs/architectures/gemma4-support.md`, Phase B). The 26B-A4B MoE variant is rejected. |
+| **Llama 4** (Scout / Maverick, April 2025) | 🚧 rejected | MoE with iRoPE (NoPE every 4 layers), QK-norm, chunked attention. Rejected by `is_moe_config` (#60); would need MoE infra + custom rotary. |
+| **Qwen3 MoE** (30B-A3B, 235B-A22B) | 🚧 rejected | `model_type: "qwen3_moe"`. 128 experts, top-8 routing, no shared expert. Rejected by `is_moe_config` (#60). Note: `cascadia-engine-sparse-moe` (Kimi K2.6) demonstrates the routing pattern but is not wired into the generic `cascadia shard` path. |
+| **Qwen3.5 / Qwen3.6** (35B-A3B, hybrid Gated-DeltaNet MoE) | ✅ single-stage via `ov-genai` (OV ≥ 2026.2); ✅ staged via `cascadia shard` + `--engine qwen36-moe` | `model_type: "qwen3_5_moe"` (expert fields nested under `text_config`). 256 experts top-8 + 1 shared expert, 3:1 linear:full hybrid attention, mRoPE. OV 2026.2 compiles it natively: `--engine ov-genai --model <optimum-int4-ir>` serves it whole-model, and `cascadia shard --model <int4-ov dir>` cuts the official IR into stage shards for the in-process `qwen36-moe` staged engine (IR surgery, no re-quantization — #77, `docs/architectures/qwen3.6.md`, `docs/architectures/qwen36-moe-support.md`). |
+| **gpt-oss** (20b, 120b, August 2025) | 🚧 rejected | OpenAI's open-weight MoE. Alternating sliding/full per-layer, YARN RoPE, sigmoid-routed top-k, MXFP4 native quant. Rejected by `is_moe_config` (#60). |
+| **Mixtral 8x7B / 8x22B** | 🚧 rejected | `is_moe_config` rejects it up front (#60) rather than silently miswiring `block_sparse_moe` as a dense MLP. For a one-off MoE demo, see `cascadia-engine-sparse-moe` (Kimi K2.6). |
+| **DeepSeek-V3 / R1** (full 671B) | 🚧 rejected | MoE + Multi-head Latent Attention (`q_lora_rank`, `kv_lora_rank`, split `qk_nope_head_dim` / `qk_rope_head_dim`) — a full attention rewrite. Rejected by `is_moe_config` (#60); use R1-Distill-Qwen/Llama instead. |
+| **Jamba / Falcon-Mamba / Granite 4 / Nemotron-H** | 🚧 rejected | Hybrid Transformer-Mamba (SSM) architectures need a Mamba kernel; `detect_architecture` rejects them up front (#69). Out of scope for OpenVINO IR export. |
+| **Multimodal (Llava, Llama 4 multimodal, Gemma 3/4 multimodal)** | ❌ not supported | Vision / audio encoders are not exported. For multimodal configs with a `text_config` sub-config (Gemma 3, Llama 4, Mistral 3.x), the Rust runtime's RoPE loader unwraps `text_config` so a text-only IR may load — but `cascadia shard` does not yet auto-extract just the text tower; you have to slice the model yourself first. |
 
 For unknown architectures the script falls back to `LlamaDecoderLayer`
 and warns on stderr. If the resulting shard's outputs match the HF
 reference (you can spot-check with `cascadia worker --engine ov-genai`
 single-stage on the same model), it's good. If they diverge, file an
 issue with the model's `model_type` and `architectures` from `config.json`.
+
+### Architecture quirks — handled, dropped, or rejected
+
+The exporter recomputes RoPE locally in the OV IR using a `theta` baked
+from `config.rope_theta` (or `config.rope_parameters.rope_theta` on
+transformers ≥ 5). How it treats the per-family extras, as of #69 (+ #48
+for Gemma 4):
+
+| Feature | Affected families | Status |
+|---------|-------------------|--------|
+| **Partial rotary** (`partial_rotary_factor < 1.0`) | Phi-1/2, Phi-3/4 Mini, StableLM-2, Persimmon | ✅ **handled** (#69) — only the leading `factor·head_dim` dims rotate; the rest pass through (byte-parity with HF Phi/Phi3). |
+| **Logit softcapping** (`final_logit_softcapping`, `attn_logit_softcapping`) | Gemma 2, Gemma 4 | ✅ **handled** — Gemma 2 via the gemma2 path (#61), Gemma 4 via `export_gemma4.py` (#48). On any other family `check_export_quirks` treats it as a HARD quirk. |
+| **Embed scaling by sqrt(hidden_size)** | Gemma 1, 2, 4 | ✅ **handled** (#61) — the embed stage applies `arch.embed_scale`. |
+| **Tied embeddings** | Llama 3.2 small, Granite, Cohere2, SmolLM3, Gemma | ✅ **handled** via `tie_word_embeddings`. |
+| **QK-Norm** (RMSNorm on Q/K before RoPE) | Qwen3 (✅), OLMo 2, Llama 4 | ✅ on the qwen3 path; on any other family `check_export_quirks` flags it HARD (rejected) — without it output collapses to repetition. |
+| **Asymmetric per-layer-type `head_dim`**, **per-layer-type RoPE**, **KV-sharing**, **per-layer embeddings** | Gemma 4 | ✅ **handled** by the dedicated `tools/export_gemma4.py` (#48). The generic builder assumes one `head_dim`, so a *non*-Gemma-4 model with these is rejected by `check_export_quirks`. |
+| **LongRoPE** (`rope_type: "longrope"`) | Phi-3 Mini 128k, Phi-4 Mini long-context | ⚠️ **dropped (soft)** — plain RoPE baked; exact within the original context window, degrades beyond it (warn-and-proceed). |
+| **YARN** (`rope_type: "yarn"`) | Qwen2.5 long-context, gpt-oss, DeepSeek-V3 | ⚠️ **dropped (soft)** — same as LongRoPE. |
+| **NTK-by-parts / "dynamic"** scaling | Older Llama-2 long-context derivatives | ⚠️ dropped (soft). |
+| **Per-layer-type sliding window** (`layer_types`) | Gemma 2/3, gpt-oss, Cohere2 | ⚠️ **dropped (soft)** — treated as full-causal; exact within the window, over-attends beyond it. |
+| **MLA** (Multi-head Latent Attention) | DeepSeek-V2/V3/R1 (full) | 🚧 **rejected** — full attention-block rewrite. |
+| **NoPE layers** (no rotary every N) | Llama 4, SmolLM3 | 🚧 rejected (Llama 4 is MoE; SmolLM3 unsupported). |
+| **MoE routing** | Mixtral, Qwen3-MoE, Llama 4, gpt-oss, GraniteMoE, DeepSeek-V2/V3, Gemma 4 26B-A4B | 🚧 **rejected** by `is_moe_config` (#60) — the generic builder cannot route experts. |
+
+HARD quirks (those that corrupt output even on short prompts, or won't
+load) abort the export with a clear error; SOFT quirks (correct within the
+original context window) warn and proceed. To force an export past a HARD
+quirk anyway, set `CASCADIA_ALLOW_LOSSY_EXPORT=1` (output WILL diverge from
+the HF reference).
 
 ## Picking `--num-stages`
 

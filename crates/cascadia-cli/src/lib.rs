@@ -11,7 +11,8 @@ use anyhow::{anyhow, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
-    OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+    Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
+    Qwen36Builder,
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
@@ -24,10 +25,109 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod placement;
 pub mod profile;
+pub mod profile_stage;
+pub mod run_placement;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
+use placement::{cmd_place, PlaceArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
+use profile_stage::{cmd_profile_per_stage, PerStageArgs};
+use run_placement::{cmd_run_placement, RunPlacementArgs};
+
+/// String form of an engine kind, used in NodeInfo.engines for discovery
+/// and in the dashboard's "Engines" pill list. Stable wire format —
+/// matches the strings `cascadia engines` already prints.
+fn engine_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Mock => "mock",
+        EngineKind::OvGenai => "ov-genai",
+        EngineKind::OvRuntime => "ov-runtime",
+        EngineKind::OvDistSpec => "ov-dist-spec",
+        EngineKind::Gemma4 => "gemma4",
+        EngineKind::SparseMoe => "sparse-moe",
+        EngineKind::Qwen36Moe => "qwen36-moe",
+    }
+}
+
+/// Measure round-trip time to a peer via a 1 s-timeout TCP connect.
+/// Returns `None` if the peer is unreachable or the connect timed out.
+/// The connect handshake gives the best low-overhead RTT signal we can
+/// take without speaking the activation-relay protocol.
+async fn probe_peer(host: &str, port: u16) -> Option<f64> {
+    let start = std::time::Instant::now();
+    let addr = format!("{host}:{port}");
+    let connect = tokio::net::TcpStream::connect(&addr);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), connect).await {
+        Ok(Ok(_stream)) => Some(start.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
+}
+
+/// Local node identity + hardware specs for the dashboard node card.
+/// Gathered once at worker startup. Read off the main async path via
+/// `spawn_blocking` (see `cmd_worker`) because `sysinfo` does blocking
+/// syscalls. Falls back to empty/0/"node" for anything undeterminable.
+struct NodeSpecs {
+    hostname: String,
+    memory_mb: u64,
+    cpu_model: String,
+    cpu_cores: u32,
+    os: String,
+}
+
+impl Default for NodeSpecs {
+    fn default() -> Self {
+        Self {
+            hostname: "node".to_owned(),
+            memory_mb: 0,
+            cpu_model: String::new(),
+            cpu_cores: 0,
+            os: String::new(),
+        }
+    }
+}
+
+/// Blocking: probe RAM + CPU + OS + hostname via `sysinfo` in one pass.
+/// Uses a narrow `RefreshKind` (RAM + CPU only) rather than `new_all()`,
+/// which would also enumerate every process/disk/network just to read
+/// three fields. `hostname` comes from `sysinfo` too (no `hostname`
+/// subprocess that would yield "node" — and a node_id collision — when
+/// the binary isn't on PATH).
+fn gather_node_specs() -> NodeSpecs {
+    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+    let sys = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_memory(MemoryRefreshKind::nothing().with_ram())
+            .with_cpu(CpuRefreshKind::nothing()),
+    );
+    // sysinfo reports total_memory() in bytes (0.30+).
+    let memory_mb = sys.total_memory() / 1024 / 1024;
+    let cpu_model = sys
+        .cpus()
+        .first()
+        .map(|c| c.brand().trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let cpu_cores = sys.cpus().len() as u32;
+    let os = match (System::name(), System::os_version()) {
+        (Some(n), Some(v)) if !v.is_empty() => format!("{n} {v}"),
+        (Some(n), _) => n,
+        _ => System::long_os_version().unwrap_or_default(),
+    };
+    let hostname = System::host_name()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".to_owned());
+    NodeSpecs {
+        hostname,
+        memory_mb,
+        cpu_model,
+        cpu_cores,
+        os,
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +174,17 @@ pub enum Command {
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
     /// {iGPU, NPU, CPU} ILP placement).
     ProfileDevices(ProfileDevicesArgs),
+    /// Profile each stage of a multi-stage shard on each device (latency +
+    /// memory + op-support) and write `placement_profile.json` — the cost
+    /// table for `cascadia place`. Step 1.5 of issue #41.
+    ProfileStages(PerStageArgs),
+    /// Solve three-tier {iGPU, NPU, CPU} placement from a per-stage cost
+    /// profile and write `placement.json`. Step 2 of issue #41 — the ILP
+    /// over `profile-stages` output.
+    Place(PlaceArgs),
+    /// Launch a heterogeneous pipeline from a `placement.json`: one worker
+    /// per stage, each pinned to its assigned device. Step 3 of issue #41.
+    RunPlacement(RunPlacementArgs),
     /// Generate a shell completion script (bash, zsh, fish, …). See
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
@@ -85,10 +196,19 @@ pub enum EngineKind {
     OvGenai,
     OvRuntime,
     OvDistSpec,
+    /// Gemma 4 multi-stage engine. Drives `gemma4_cached_v1` shards
+    /// (per-layer-type asymmetric attention, KV-sharing, per-layer
+    /// embeddings, baked softcap) produced by `tools/export_gemma4.py`.
+    Gemma4,
     /// Kimi K2.6-style sparse-MoE engine. Routes only the top-k experts
     /// per token (not all 384) and runs the expert matmuls through the
     /// hand-rolled AVX-512 int4 GEMM kernel. Single-stage, CPU-targeted.
     SparseMoe,
+    /// Qwen3.6-35B-A3B staged engine. Runs the IR-surgery shard chain
+    /// (`tools/qwen36_surgery/export_qwen36_moe.py` output dir with
+    /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
+    /// for decode (see docs/architectures/qwen36-moe-support.md).
+    Qwen36Moe,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -167,6 +287,20 @@ pub struct WorkerArgs {
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
+
+    /// Override the engines list advertised in the mDNS NodeInfo (comma-
+    /// separated, e.g. "ov-genai,ov-runtime"). Decouples what shows in the
+    /// dashboard from the actually-loaded engine — useful when running a
+    /// mock worker for discovery testing but you want the card to look
+    /// real. Default: derived from --engine.
+    #[arg(long, value_delimiter = ',')]
+    pub advertise_engines: Vec<String>,
+
+    /// Override the device label advertised in mDNS NodeInfo. Distinct
+    /// from --device, which selects the OpenVINO target device; this is
+    /// purely a dashboard cosmetic. Default: copies --device.
+    #[arg(long)]
+    pub advertise_device: Option<String>,
 
     /// Override the MoE top-K dispatch (sparse-moe engine only).
     /// If set and < manifest top_k, dispatch only the first K' experts
@@ -337,6 +471,8 @@ impl WorkerArgs {
             spec_k: 5,
             prompt_lookup: 0,
             max_tokens: 64,
+            advertise_engines: Vec::new(),
+            advertise_device: None,
             top_k_override: None,
             routing_threshold: None,
             kv_prefix_cache_size: 0,
@@ -424,6 +560,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
         Command::ProfileDevices(args) => cmd_profile_devices(args),
+        Command::ProfileStages(args) => cmd_profile_per_stage(args),
+        Command::Place(args) => cmd_place(args),
+        Command::RunPlacement(args) => cmd_run_placement(args).await,
         Command::Completions(args) => cmd_completions(args),
     }
 }
@@ -454,7 +593,9 @@ fn cmd_engines() -> Result<()> {
     println!("  ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup");
     println!("  ov-runtime     multi-stage stateful KV cache; pre-exported per-stage v3+ shards");
     println!("  ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards");
+    println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI); gemma4_cached_v1 shards");
     println!("  sparse-moe     Kimi K2.6 (AVX-512 int4 GEMM + Rust MLA shells) or MiniMax-M2 (OV-IR shells); single-stage top-k expert dispatch");
+    println!("  qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards");
     Ok(())
 }
 
@@ -498,6 +639,19 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// Load a whole-model chat template for ov-genai, tolerating both layouts:
+/// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
+/// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
+fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
+    let p = std::path::Path::new(model);
+    let sub = cascadia_api::load_chat_template_config(p);
+    if sub.template.is_some() {
+        sub
+    } else {
+        cascadia_api::load_chat_template_config_at(p)
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
@@ -529,10 +683,27 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
+            // If the model ships a chat template, the API renders it (honoring
+            // enable_thinking) and the engine tells ov-genai to skip its own
+            // internal apply. No template → leave ov-genai's apply on.
+            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
             let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
+            }
+            if let Some(prec) = &args.ov_kv_precision {
+                b = b.with_kv_cache_precision(prec);
+            }
+            if let Some(group) = &args.ov_dyn_quant_group {
+                b = b.with_dyn_quant_group(group);
+            }
+            Ok(Box::new(b))
+        }
+        EngineKind::Gemma4 => {
+            let mut b = Gemma4Builder::new(&args.model, args.rank, args.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -622,6 +793,9 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
+        EngineKind::Qwen36Moe => Ok(Box::new(
+            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+        )),
     }
 }
 
@@ -805,6 +979,159 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
     runner.start_with_listen(peers, shard, listen).await?;
 
+    // Probe listener: bind a TCP socket on listen_port so the
+    // coordinator's latency probe loop has something to handshake
+    // against. Real engines bind this port themselves (for activation
+    // relay) via Engine::configure_listen, but the mock engine's impl
+    // is a no-op — without this, latency probes against mock-engine
+    // workers find a closed port and the matrix stays empty in the
+    // dashboard demo. If the engine already bound the port, `bind`
+    // fails with AddrInUse and we silently step aside (the engine's
+    // listener handles probes identically at the TCP layer).
+    let probe_addr = format!("0.0.0.0:{listen_port}");
+    match tokio::net::TcpListener::bind(&probe_addr).await {
+        Ok(listener) => {
+            info!(addr = %probe_addr, "probe listener bound");
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok(_) => {
+                            // Drop the connection immediately — the
+                            // probe only needs the connect handshake.
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "probe accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                addr = %probe_addr,
+                "probe listener could not bind; engine likely owns the port"
+            );
+        }
+    }
+
+    // Every worker advertises itself via mDNS — not just rank 0 — so the
+    // coordinator's dashboard /api/topology can render the full cluster
+    // and not just self. Best-effort: a host without a working multicast
+    // path (CI sandbox, restricted LAN) still serves; the dashboard just
+    // shows fewer nodes. We bind `_discovery` for the rest of this
+    // function so its Drop unregisters the mDNS record cleanly on
+    // shutdown (relay loop or `serve_with_nodelay`).
+    let topology = cascadia_topology::Topology::new();
+    let engines = if !args.advertise_engines.is_empty() {
+        args.advertise_engines.clone()
+    } else {
+        vec![engine_name(args.engine).to_owned()]
+    };
+    let device = args
+        .advertise_device
+        .clone()
+        .unwrap_or_else(|| args.device.clone());
+    // sysinfo + hostname do blocking syscalls; gather them off the async
+    // runtime thread so they don't stall worker startup.
+    let specs = tokio::task::spawn_blocking(gather_node_specs)
+        .await
+        .unwrap_or_default();
+    // Advertise the API/dashboard port separately from the relay port so
+    // the dashboard can show a node's reachable address (the relay `port`
+    // isn't an HTTP endpoint). None for relay-only stages.
+    let api_port = args
+        .api
+        .as_deref()
+        .and_then(|a| parse_addr(a, "0.0.0.0").ok())
+        .map(|(_, p)| p);
+    let self_node = cascadia_topology::NodeInfo {
+        node_id: format!("{}-r{}", specs.hostname, args.rank),
+        host: cascadia_discovery::local_ip().to_string(),
+        port: listen_port,
+        api_port,
+        namespace: "default".to_owned(),
+        device,
+        memory_mb: specs.memory_mb,
+        cpu_model: specs.cpu_model,
+        cpu_cores: specs.cpu_cores,
+        os: specs.os,
+        engines,
+        last_seen: 0.0,
+    };
+    topology.add_node(self_node.clone());
+    let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), "default");
+    if let Err(e) = discovery.start(self_node.clone()) {
+        tracing::warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
+    }
+    let _discovery = discovery;
+
+    // Self-heartbeat: re-insert our own NodeInfo every 2 s so last_seen
+    // stays current in the local topology even when no mDNS event has
+    // fired. Without this the dashboard's "live" indicator goes cold
+    // after FRESH_THRESHOLD_S because add_node only sets last_seen once.
+    // mDNS-discovered peers refresh on each ServiceResolved event from
+    // the daemon (TTL-driven, slower); a generous freshness window on
+    // the frontend covers the gap.
+    let topology_for_heartbeat = topology.clone();
+    let self_id_for_heartbeat = self_node.node_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.tick().await; // skip the immediate first tick — we already added the node above.
+        loop {
+            tick.tick().await;
+            // Only the timestamp changes — touch() updates last_seen in
+            // place instead of re-cloning + re-inserting the whole NodeInfo.
+            topology_for_heartbeat.touch(&self_id_for_heartbeat);
+        }
+    });
+
+    // Latency probe loop: every 5 s open a TCP connect to each peer's
+    // advertised port and measure round-trip time. Populates the
+    // dashboard's edge matrix with the cluster's actual measured
+    // latencies (which is the whole topology pitch — we store edges
+    // exo doesn't even have).
+    //
+    // Only outgoing edges from self are populated here, so the matrix
+    // has one row filled per coordinator. A symmetric N×N view would
+    // require cross-host measurement sharing (gossip or query-by-id);
+    // out of scope for the MVP.
+    let topology_for_probe = topology.clone();
+    let self_id_for_probe = self_node.node_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            // Snapshot just (id, host, port) — no full NodeInfo clone — and
+            // probe all peers concurrently with join_all rather than an
+            // unbounded tokio::spawn per peer per tick.
+            let peers: Vec<(String, String, u16)> = topology_for_probe
+                .nodes()
+                .into_iter()
+                .filter(|n| n.node_id != self_id_for_probe)
+                .map(|n| (n.node_id, n.host, n.port))
+                .collect();
+            let results = futures::future::join_all(
+                peers
+                    .into_iter()
+                    .map(|(id, host, port)| async move { (id, probe_peer(&host, port).await) }),
+            )
+            .await;
+            for (dst_id, latency) in results {
+                if let Some(latency_ms) = latency {
+                    // record_latency, not measure(.., 0.0), so a future
+                    // bandwidth probe on the same edge isn't clobbered.
+                    topology_for_probe.record_latency(
+                        self_id_for_probe.clone(),
+                        dst_id,
+                        latency_ms,
+                    );
+                }
+            }
+        }
+    });
+
     if !is_first {
         info!("entering relay loop");
         let r = runner.clone();
@@ -821,8 +1148,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // exact format the model was trained on. Falls back gracefully
         // to the legacy "role: content" join if the file or fields are
         // missing.
-        let chat_template =
-            cascadia_api::load_chat_template_config(std::path::Path::new(&args.model));
+        let chat_template = match args.engine {
+            // ov-genai: render the template API-side so enable_thinking is
+            // honored; the engine sets apply_chat_template=false so ov-genai
+            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
+            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
+            // qwen36 surgery trees keep chat_template.jinja at the model
+            // root with no tokenizer_config.json.
+            EngineKind::Qwen36Moe => {
+                cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
+            }
+            _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
+        };
         if chat_template.template.is_some() {
             info!(
                 model = %args.model,
@@ -838,9 +1175,38 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         }
         let mut cfg = cascadia_api::Config::default();
         cfg.chat_template = chat_template;
-        let app = cascadia_api::make_router_with_config(runner.clone(), args.model.clone(), cfg);
+        // ov-genai owns native templating: render the template API-side only for
+        // the thinking-OFF path (engine sets apply_chat_template=false then);
+        // thinking-ON stays on ov-genai's native template, untouched.
+        cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        let max_concurrent = cfg.max_concurrent_requests as u64;
+        // Shared live counters: the API bumps them on the chat hot path,
+        // the dashboard's /api/stats reads them — same Arc, so the cluster
+        // view updates as prompts run.
+        let api_stats = Arc::new(cascadia_api::ApiStats::default());
+        let api_router = cascadia_api::make_router_with_stats(
+            runner.clone(),
+            args.model.clone(),
+            cfg,
+            api_stats.clone(),
+        );
+
+        // `topology` was populated above (every worker advertises +
+        // browses) so by the time the dashboard binds, mDNS may already
+        // have discovered other ranks on the LAN.
+        let dash_state = cascadia_dashboard::DashboardState {
+            topology,
+            stats: api_stats,
+            max_concurrent,
+        };
+        // Compose: OpenAI-compat routes (/v1/*, /health) stay at root for
+        // backward compatibility with existing clients; dashboard-internal
+        // routes live at /api/* plus the SPA (when the `dashboard-embed`
+        // feature is on) at /. The dashboard router carries the SPA
+        // fallback, so it must be merged second.
+        let app = api_router.merge(cascadia_dashboard::make_router(dash_state));
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
-        info!(host = %api_host, port = api_port, "API serving");
+        info!(host = %api_host, port = api_port, "API + dashboard serving");
         // NODELAY-on-accept wrapper. tokio's TcpStream defaults to
         // NODELAY=false (Nagle on); for SSE streaming small per-token
         // chunks, Nagle aggregates them into ~3500 B bursts every
@@ -942,8 +1308,26 @@ const EXPORT_SCRIPT: &str = include_str!(concat!(
     "/../../tools/export_shards.py"
 ));
 
+/// Sibling modules the exporter imports at runtime: the dedicated Gemma-4
+/// exporter (dispatched for gemma4 models) and the short-alias registry.
+/// They must be written next to export_shards.py in the temp dir so its
+/// `from export_gemma4 import ...` / `from model_aliases import ...` resolve.
+const GEMMA4_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/export_gemma4.py"
+));
+const ALIASES_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/model_aliases.py"
+));
+/// Qwen3.5/3.6 hybrid-MoE exporter (IR surgery on the official int4 IR),
+/// dispatched by export_shards.py for model_type qwen3_5_moe.
+const QWEN36_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/qwen36_surgery/export_qwen36_moe.py"
+));
+
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
-    use std::io::Write;
     use std::process::{Command, Stdio};
 
     let python = if let Some(p) = args.python.as_deref() {
@@ -1014,16 +1398,24 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         }
     }
 
-    // Write the embedded script to a temp file so we have a real path.
-    let mut tmp = tempfile::Builder::new()
+    // Write the embedded exporter + its sibling modules into a temp dir so
+    // export_shards.py's `from export_gemma4 import ...` / `from model_aliases
+    // import ...` (run from that dir) resolve. `_tmpdir` is held until the end
+    // of this function so the dir survives until the exporter exits.
+    let _tmpdir = tempfile::Builder::new()
         .prefix("cascadia-export-")
-        .suffix(".py")
-        .tempfile()
-        .context("creating temp file for embedded exporter")?;
-    tmp.write_all(EXPORT_SCRIPT.as_bytes())
-        .context("writing embedded exporter to temp file")?;
-    tmp.flush().ok();
-    let script_path = tmp.path().to_owned();
+        .tempdir()
+        .context("creating temp dir for embedded exporter")?;
+    let script_path = _tmpdir.path().join("export_shards.py");
+    for (name, body) in [
+        ("export_shards.py", EXPORT_SCRIPT),
+        ("export_gemma4.py", GEMMA4_SCRIPT),
+        ("model_aliases.py", ALIASES_SCRIPT),
+        ("export_qwen36_moe.py", QWEN36_SCRIPT),
+    ] {
+        std::fs::write(_tmpdir.path().join(name), body)
+            .with_context(|| format!("writing embedded {name} to temp dir"))?;
+    }
 
     // Build python argv.
     let mut cmd = Command::new(&python);
@@ -1059,11 +1451,27 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             status
         ));
     }
-    eprintln!(
-        "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
-         --engine ov-runtime --device GPU --model {} \
-         --next <next-host>:9100 --api :8000",
-        args.output_dir, args.num_stages, args.output_dir
-    );
+    // qwen3_5_moe shards run the in-process stage chain, not the
+    // per-stage worker mesh; give the right invocation per manifest arch.
+    let arch =
+        std::fs::read_to_string(std::path::Path::new(&args.output_dir).join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["arch"].as_str().map(String::from))
+            .unwrap_or_default();
+    if arch == "qwen3_5_moe" {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia run {} \
+             --engine qwen36-moe --device CPU --api :8000",
+            args.output_dir, args.output_dir
+        );
+    } else {
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
+             --engine ov-runtime --device GPU --model {} \
+             --next <next-host>:9100 --api :8000",
+            args.output_dir, args.num_stages, args.output_dir
+        );
+    }
     Ok(())
 }

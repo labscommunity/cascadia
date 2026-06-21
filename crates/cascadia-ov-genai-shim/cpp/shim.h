@@ -60,6 +60,20 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     size_t properties_count,
     cascadia_pipeline_t** out_handle);
 
+/// VLMPipeline-backed pipeline for VLM-layout exports (e.g. Qwen3.5/3.6:
+/// `openvino_language_model.xml` + separate embeddings/vision IRs), used
+/// text-only. `enable_prompt_lookup` non-zero turns on prompt-lookup
+/// decoding (OV GenAI >= 2026.2 extends it to VLM pipelines). The handle
+/// is interchangeable with LLMPipeline handles for generate / tokenizer /
+/// destroy.
+int32_t cascadia_pipeline_create_vlm(
+    const char* model_path,
+    const char* device,
+    int32_t enable_prompt_lookup,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_pipeline_t** out_handle);
+
 void cascadia_pipeline_destroy(cascadia_pipeline_t* handle);
 
 // ---- GenerationConfig -----------------------------------------------------
@@ -71,6 +85,9 @@ void cascadia_genconfig_set_temperature(cascadia_genconfig_t* cfg, float v);
 void cascadia_genconfig_set_do_sample(cascadia_genconfig_t* cfg, int32_t enabled);
 void cascadia_genconfig_set_num_assistant_tokens(cascadia_genconfig_t* cfg, uint32_t v);
 void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v);
+// When enabled==0 the pipeline skips its internal chat-template apply (caller
+// pre-rendered the template, e.g. to honor enable_thinking). Default: apply.
+void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled);
 
 // ---- Generation -----------------------------------------------------------
 
@@ -179,6 +196,21 @@ int32_t cascadia_runtime_output_shape(
 
 int32_t cascadia_runtime_output_dtype(
     cascadia_runtime_t* handle, size_t output_idx, uint32_t* out_dtype);
+
+/// Input-tensor introspection (rank / shape / dtype), mirroring the output
+/// getters. Reports the compiled model's concrete input dims — used by
+/// `profile-devices --per-stage` to size the zeroed inputs it feeds when
+/// timing a stage. Expects a static model; on a dynamic-shape port get_shape()
+/// errors (returns non-zero), which the caller surfaces as an error.
+int32_t cascadia_runtime_input_rank(
+    cascadia_runtime_t* handle, size_t input_idx, size_t* out_rank);
+
+int32_t cascadia_runtime_input_shape(
+    cascadia_runtime_t* handle, size_t input_idx,
+    size_t* out_shape, size_t shape_cap);
+
+int32_t cascadia_runtime_input_dtype(
+    cascadia_runtime_t* handle, size_t input_idx, uint32_t* out_dtype);
 
 /// Copy the output tensor's raw bytes into `out_buf`. `out_buf_size` must
 /// equal byte_size of the output tensor (call output_byte_size first).

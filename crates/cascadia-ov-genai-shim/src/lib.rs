@@ -90,6 +90,15 @@ mod sys {
             out_handle: *mut *mut cascadia_pipeline_t,
         ) -> c_int;
 
+        pub fn cascadia_pipeline_create_vlm(
+            model_path: *const c_char,
+            device: *const c_char,
+            enable_prompt_lookup: i32,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_pipeline_t,
+        ) -> c_int;
+
         pub fn cascadia_pipeline_destroy(handle: *mut cascadia_pipeline_t);
 
         pub fn cascadia_genconfig_new() -> *mut cascadia_genconfig_t;
@@ -99,6 +108,10 @@ mod sys {
         pub fn cascadia_genconfig_set_do_sample(cfg: *mut cascadia_genconfig_t, enabled: i32);
         pub fn cascadia_genconfig_set_num_assistant_tokens(cfg: *mut cascadia_genconfig_t, v: u32);
         pub fn cascadia_genconfig_set_max_ngram_size(cfg: *mut cascadia_genconfig_t, v: u32);
+        pub fn cascadia_genconfig_set_apply_chat_template(
+            cfg: *mut cascadia_genconfig_t,
+            enabled: i32,
+        );
 
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
@@ -194,6 +207,22 @@ mod sys {
             output_idx: usize,
             out_dtype: *mut u32,
         ) -> c_int;
+        pub fn cascadia_runtime_input_rank(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_rank: *mut usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_input_shape(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_shape: *mut usize,
+            shape_cap: usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_input_dtype(
+            handle: *mut cascadia_runtime_t,
+            input_idx: usize,
+            out_dtype: *mut u32,
+        ) -> c_int;
         pub fn cascadia_runtime_output_byte_size(
             handle: *mut cascadia_runtime_t,
             output_idx: usize,
@@ -242,6 +271,10 @@ pub struct GenConfig {
     pub temperature: f32,
     pub num_assistant_tokens: u32,
     pub max_ngram_size: u32,
+    /// When true, the GenAI pipeline skips its internal chat-template apply —
+    /// the caller pre-rendered the template (e.g. to honor enable_thinking).
+    /// Default false = apply (matches OV's `apply_chat_template = true`).
+    pub skip_chat_template: bool,
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).
@@ -308,13 +341,26 @@ impl LlmPipeline {
         Self::do_new(model_path, device, plugin, None, None, true)
     }
 
+    /// VLM-layout export (e.g. Qwen3.5/3.6: `openvino_language_model.xml`
+    /// + separate embeddings IRs), served text-only via `VLMPipeline`.
+    /// `prompt_lookup` enables prompt-lookup decoding (OV GenAI >= 2026.2
+    /// supports it on VLM pipelines).
+    pub fn vlm(
+        model_path: &str,
+        device: &str,
+        prompt_lookup: bool,
+        plugin: &PluginConfig,
+    ) -> Result<Self> {
+        Self::do_new(model_path, device, plugin, None, Some(prompt_lookup), false)
+    }
+
     #[cfg(not(feature = "openvino"))]
     fn do_new(
         _model_path: &str,
         _device: &str,
         _plugin: &PluginConfig,
         _draft: Option<(&str, &str)>,
-        _: Option<()>,
+        _vlm_prompt_lookup: Option<bool>,
         _prompt_lookup: bool,
     ) -> Result<Self> {
         Err(Error::Stub)
@@ -326,7 +372,7 @@ impl LlmPipeline {
         device: &str,
         plugin: &PluginConfig,
         draft: Option<(&str, &str)>,
-        _: Option<()>,
+        vlm_prompt_lookup: Option<bool>,
         prompt_lookup: bool,
     ) -> Result<Self> {
         let model_c = cstr(model_path)?;
@@ -342,7 +388,16 @@ impl LlmPipeline {
 
         let mut handle: *mut sys::cascadia_pipeline_t = ptr::null_mut();
         let rc = unsafe {
-            if let Some((dpath, ddev)) = draft {
+            if let Some(pl) = vlm_prompt_lookup {
+                sys::cascadia_pipeline_create_vlm(
+                    model_c.as_ptr(),
+                    device_c.as_ptr(),
+                    if pl { 1 } else { 0 },
+                    ptrs.as_ptr(),
+                    plugin.entries.len(),
+                    &mut handle,
+                )
+            } else if let Some((dpath, ddev)) = draft {
                 let dpath_c = cstr(dpath)?;
                 let ddev_c = cstr(ddev)?;
                 sys::cascadia_pipeline_create_with_draft(
@@ -400,6 +455,10 @@ impl LlmPipeline {
             if cfg.max_ngram_size > 0 {
                 sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
             }
+            sys::cascadia_genconfig_set_apply_chat_template(
+                raw_cfg,
+                if cfg.skip_chat_template { 0 } else { 1 },
+            );
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
@@ -737,6 +796,46 @@ impl Runtime {
                 return Err(Error::Native(last_native_error()));
             }
             Ok((DType::from_code(dtype_code), shape, buf))
+        }
+    }
+
+    /// Input tensor `idx`'s shape — concrete dims for a static (NPU-export)
+    /// model. Used by `profile-devices --per-stage` to size the zeroed
+    /// inputs it feeds when timing a stage.
+    pub fn input_shape(&self, idx: usize) -> Result<Vec<usize>> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = idx;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut rank: usize = 0;
+            if sys::cascadia_runtime_input_rank(self.handle, idx, &mut rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut shape = vec![0usize; rank];
+            if sys::cascadia_runtime_input_shape(self.handle, idx, shape.as_mut_ptr(), rank) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(shape)
+        }
+    }
+
+    /// Input tensor `idx`'s element type.
+    pub fn input_dtype(&self, idx: usize) -> Result<DType> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = idx;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut code: u32 = 0;
+            if sys::cascadia_runtime_input_dtype(self.handle, idx, &mut code) != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(DType::from_code(code))
         }
     }
 }

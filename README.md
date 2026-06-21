@@ -25,9 +25,9 @@ Cascadia is a Cargo workspace at the repo root. Two build modes:
 # Engines that need OV will return a clean runtime error.
 cargo build --release -p cascadia
 
-# Real OV mode — links against openvino-genai 2026.1.0+. Required to run
+# Real OV mode — links against openvino-genai 2026.2.0+. Required to run
 # the OV engines on real Intel hardware.
-INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.1.0.0 \
+INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 ```
 
@@ -38,7 +38,7 @@ The resulting binary lands at `target/release/cascadia` (`cascadia.exe` on Windo
 Build prerequisites:
 
 - Rust 1.85+ (`rustup default stable`)
-- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.1+ SDK ([INSTALL.md](INSTALL.md) has the download links and the Linux GPU runtime steps)
+- For `--features openvino`: a Visual Studio 2022 Build Tools install (Windows) or `g++` ≥ 12 (Linux), plus the OpenVINO GenAI 2026.2+ SDK ([INSTALL.md](INSTALL.md) has the download links and the Linux GPU runtime steps)
 
 > After building, run **`cascadia doctor`**. It checks your toolchain and — crucially — tells you whether OpenVINO can actually see your GPU. On Intel AI PCs the GPU can be invisible to OpenVINO even with a working driver, and that failure is otherwise silent (you just get slow CPU inference). `doctor` makes it loud and tells you how to fix it.
 
@@ -116,7 +116,24 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 Not sure of a node's address? Run `cascadia discover` on either box to
 list Cascadia peers on the LAN and the `host:port` to pass to `--next`.
 
-Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding (see [docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)). See [docs/SHARDING.md](docs/SHARDING.md) for supported architectures and tuning.
+Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding (see [docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
+
+### Supported model families
+
+`cascadia shard` works today with Llama (1–3.3), Mistral (7B, NeMo,
+Small 3.x text), Qwen2 / Qwen2.5, Qwen3 dense, DeepSeek R1 Distills (Qwen
+and Llama variants), Phi-3, Phi-4 / Phi-4-mini (partial rotary), and
+Gemma 1 / Gemma 2 (Gemma 2 with logit softcapping + the 4-norm structure;
+sliding-window attention is treated as full-causal, so output is exact
+within the window). Gemma 4 (E2B / E4B / 31B) exports through a dedicated
+path (`tools/export_gemma4.py`, auto-dispatched by `cascadia shard`).
+
+Mixture-of-experts and other architecturally-incompatible families —
+Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the
+Gemma 4 26B-A4B MoE variant, and Mamba / hybrids — are detected and
+rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md)
+and [docs/architectures/](docs/architectures/) for the full per-family
+status table and per-family deep-dives.
 
 ### List engines
 

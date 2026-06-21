@@ -1,0 +1,89 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design system — adapted from cascadia-website + tahoma-demo. Light mode
+ * only by intent: the audience is Intel hardware operators showing this on
+ * AI PC screens (not at 3am from a dark room), and the cascadia visual
+ * language is editorial-on-paper, not command-center-on-black. Both inputs
+ * the visual identity is built on lean light; reproducing that faithfully
+ * was the brief.
+ *
+ * Note we deliberately do NOT match exo's dark "command center" theme.
+ */
+
+@layer base {
+  :root {
+    /* Mirror of Tailwind tokens, exposed for places where utilities aren't
+     * enough — keyframes that need rgb(... / alpha), pseudo-elements, etc. */
+    --paper: 249 250 247;
+    --ink: 19 35 58;
+    --ink-dim: 74 85 104;
+    --ink-low: 138 148 163;
+    --persian: 35 163 146;
+    --rule: 217 220 212;
+
+    color-scheme: light;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    /* cascadia.to base typography: Lato, 16px / 1.6. tabular-nums keeps
+     * latency numbers and node IDs aligned in tables. */
+    font-size: 16px;
+    line-height: 1.6;
+    font-variant-numeric: tabular-nums;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer components {
+  /* Tracked uppercase mono label — used for section headers, stat labels,
+   * and nav items. Carries most of the "technical / editorial" tone. */
+  .label-mono {
+    @apply text-[11px] font-mono tracking-[0.08em] uppercase text-ink-low;
+  }
+
+  /* Default card surface — node cards, stat panels, table rows. Warm paper
+   * panel on the white page (the cascadia.to --panel: var(--paper) mapping),
+   * with a subtle border + shadow and slight elevation on hover. */
+  .surface {
+    @apply bg-paper border border-rule rounded-md shadow-card;
+  }
+
+  /* Live pulse dot. Used in the nav and on node cards to communicate
+   * a live data source without being noisy. */
+  .pulse-dot {
+    position: relative;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: rgb(var(--persian));
+  }
+  .pulse-dot::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    background: rgb(var(--persian) / 0.45);
+    animation: pulse 2s ease-out infinite;
+  }
+
+  @keyframes pulse {
+    0% {
+      transform: scale(0.6);
+      opacity: 0.7;
+    }
+    100% {
+      transform: scale(1.6);
+      opacity: 0;
+    }
+  }
+}

@@ -31,7 +31,7 @@ Deterministic word-echo engine — splits the prompt and emits one word per `ste
 
 ## `cascadia-ov-genai-shim`
 
-C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.1+ SDK.
+C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.2+ SDK.
 
 ## `cascadia-transport`
 
