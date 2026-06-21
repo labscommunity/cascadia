@@ -271,7 +271,17 @@ impl OvMoeRunner {
         // exporter/Python reference sets SNIPPETS_MODE=DISABLE; the engine
         // must too. This was THE cause of the int4/int8/NF4 "degrades after
         // the first sentence" — not expert quantization.
-        let plugin = plugin.with("SNIPPETS_MODE", "DISABLE");
+        //
+        // SNIPPETS_MODE is a CPU-plugin option; the GPU plugin rejects it
+        // ("Option not found: SNIPPETS_MODE") and the snippets bug is
+        // CPU-specific anyway, so only set it when targeting CPU. This lets
+        // a pipeline rank run on an Intel iGPU (e.g. a NUC stage) while the
+        // CPU ranks keep the workaround.
+        let plugin = if device.eq_ignore_ascii_case("CPU") {
+            plugin.with("SNIPPETS_MODE", "DISABLE")
+        } else {
+            plugin
+        };
         let utf8 = |p: &PathBuf| -> Result<String, OvMoeError> {
             p.to_str()
                 .map(str::to_owned)
