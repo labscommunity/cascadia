@@ -130,11 +130,16 @@ impl MockPipeline {
             let is_last = rank == stages - 1;
             let mut args: Vec<String> = vec![
                 "worker".into(),
-                "--rank".into(), rank.to_string(),
-                "--total".into(), stages.to_string(),
-                "--engine".into(), "mock".into(),
-                "--model".into(), "mock-model".into(),
-                "--log-level".into(), "warn".into(),
+                "--rank".into(),
+                rank.to_string(),
+                "--total".into(),
+                stages.to_string(),
+                "--engine".into(),
+                "mock".into(),
+                "--model".into(),
+                "mock-model".into(),
+                "--log-level".into(),
+                "warn".into(),
             ];
             if !is_first {
                 args.push("--listen".into());
@@ -159,7 +164,10 @@ impl MockPipeline {
             // Give the stage a moment to bind before its upstream connects.
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        Self { api_port, stages: procs }
+        Self {
+            api_port,
+            stages: procs,
+        }
     }
 
     pub async fn wait_for_health(&self, timeout: Duration) -> bool {
@@ -294,7 +302,11 @@ mod tests {
             .send()
             .await
             .expect("post chat to pipeline entry");
-        assert!(r.status().is_success(), "pipeline chat status: {}", r.status());
+        assert!(
+            r.status().is_success(),
+            "pipeline chat status: {}",
+            r.status()
+        );
         let v: serde_json::Value = r.json().await.unwrap();
         assert_eq!(v["choices"][0]["message"]["role"], "assistant");
         let content = v["choices"][0]["message"]["content"]
@@ -328,8 +340,8 @@ mod tests {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let remote_bin =
-            std::env::var("CASCADIA_REMOTE_BIN").unwrap_or_else(|_| "C:/cascadia/cascadia.exe".into());
+        let remote_bin = std::env::var("CASCADIA_REMOTE_BIN")
+            .unwrap_or_else(|_| "C:/cascadia/cascadia.exe".into());
         // Defaults give a mock run; set CASCADIA_ENGINE/MODEL/DEVICE for a real
         // sharded model (e.g. ov-runtime + a shard dir + GPU).
         let engine = std::env::var("CASCADIA_ENGINE").unwrap_or_else(|_| "mock".into());
@@ -354,7 +366,10 @@ mod tests {
             .expect("topology up");
         assert!(up.status().is_success(), "topology up: {}", up.status());
         let up: serde_json::Value = up.json().await.unwrap();
-        let entry = up["entry_url"].as_str().expect("entry_url in response").to_string();
+        let entry = up["entry_url"]
+            .as_str()
+            .expect("entry_url in response")
+            .to_string();
 
         // Run the request, capturing the outcome so teardown always happens.
         let outcome: Result<(), String> = async {
