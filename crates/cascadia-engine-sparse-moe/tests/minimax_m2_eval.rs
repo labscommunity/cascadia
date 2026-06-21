@@ -74,6 +74,119 @@ fn minimax_m2_tiny_matches_hf_reference() {
     );
 }
 
+/// Pipeline-parallel correctness gate: the SAME tiny model split across two
+/// ranks (rank 0 = embed + first half of the layers, rank 1 = second half +
+/// head) must reproduce the canonical HF greedy stream — i.e. slicing the
+/// model and threading the hidden state rank→rank is numerically identical
+/// to running it whole. Drives the runner slices directly (no sockets) so it
+/// isolates the layer-slice math; the wire format is covered by
+/// `dist_wire.rs` and the CLI loopback run. Gated on `M2_MODEL_DIR`.
+#[test]
+fn minimax_m2_two_rank_pipeline_matches_hf_reference() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping MiniMax-M2 pipeline test");
+        return;
+    };
+
+    let reference: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(model_dir.join("reference.json")).expect("read reference.json"),
+    )
+    .expect("parse reference.json");
+    let prompt: Vec<u32> = reference["prompt_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let greedy: Vec<u32> = reference["greedy_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    let device = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
+    let mut r0 =
+        OvMoeRunner::load_staged(model_dir.clone(), &device, PluginConfig::new(), None, 0, 2)
+            .expect("load rank 0 slice");
+    let mut r1 =
+        OvMoeRunner::load_staged(model_dir.clone(), &device, PluginConfig::new(), None, 1, 2)
+            .expect("load rank 1 slice");
+    assert!(
+        r0.is_first() && !r0.is_last(),
+        "rank 0 should own the embedding but not the head"
+    );
+    assert!(
+        r1.is_last() && !r1.is_first(),
+        "rank 1 should own the head but not the embedding"
+    );
+
+    let n_new = greedy.len() - prompt.len();
+    let generated = drive_two_rank_greedy(&mut r0, &mut r1, &prompt, n_new);
+
+    let mut full = prompt.clone();
+    full.extend_from_slice(&generated);
+    eprintln!("reference greedy : {greedy:?}");
+    eprintln!("2-rank   greedy  : {full:?}");
+    assert_eq!(
+        full, greedy,
+        "2-rank pipeline greedy stream must match the HF reference"
+    );
+}
+
+/// Greedy-drive two pipeline slices in-process: rank 0 embeds + runs its
+/// layers, hands the hidden state to rank 1, which runs its layers + head;
+/// the argmax of rank 1's logits is the next token. Mirrors
+/// [`OvMoeRunner::generate_argmax`] (default/greedy sampling), just with the
+/// layers split across two runners and the hidden state passed by value the
+/// way `cascadia-transport` carries it on the wire.
+fn drive_two_rank_greedy(
+    r0: &mut OvMoeRunner,
+    r1: &mut OvMoeRunner,
+    prompt: &[u32],
+    max_new: usize,
+) -> Vec<u32> {
+    // First-max-wins, matching crate::sampling::argmax used by the runner.
+    fn argmax(xs: &[f32]) -> u32 {
+        let mut best = 0u32;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in xs.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i as u32;
+            }
+        }
+        best
+    }
+    fn fwd(r0: &mut OvMoeRunner, r1: &mut OvMoeRunner, tok: u32, pos: usize) -> Vec<f32> {
+        let h = r0.embed_token(tok).expect("embed");
+        let h = r0.forward_layers(h, pos).expect("rank 0 layers");
+        let h = r1.forward_layers(h, pos).expect("rank 1 layers");
+        r1.head_logits(&h).expect("head")
+    }
+
+    r0.reset();
+    r1.reset();
+    let eos = r0.eos_token_ids().to_vec();
+    let mut pos = 0usize;
+    let mut logits = Vec::new();
+    for &t in prompt {
+        logits = fwd(r0, r1, t, pos);
+        pos += 1;
+    }
+    let mut out = Vec::with_capacity(max_new);
+    loop {
+        let next = argmax(&logits);
+        out.push(next);
+        if out.len() >= max_new || eos.contains(&next) {
+            break;
+        }
+        logits = fwd(r0, r1, next, pos);
+        pos += 1;
+    }
+    out
+}
+
 /// Real-model generation smoke test. Gated on `M2_GEN_DIR` pointing at a
 /// full MiniMax-M2 export (with tokenizer.json). There's no exact HF
 /// reference at 230B (won't fit in RAM), so this just confirms the Rust

@@ -21,7 +21,11 @@
 //!
 //! Because the graphs carry their own shapes, this path is fully
 //! dimension-agnostic — the same code runs the tiny synthetic M2 used by
-//! the correctness test and the full 230B model. Single-stage only.
+//! the correctness test and the full 230B model. Single-stage (whole model)
+//! and pipeline-parallel (a contiguous layer slice per rank, via
+//! [`OvMoeRunner::load_staged`] + [`OvMoeRunner::embed_token`] /
+//! [`OvMoeRunner::forward_layers`] / [`OvMoeRunner::head_logits`]) share
+//! this same per-layer math.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -200,8 +204,14 @@ pub struct OvMoeRunner {
     device: String,
     plugin: PluginConfig,
 
-    embed: Runtime,
-    head: Runtime,
+    /// Embedding (`layer0`) IR — present only on the first rank
+    /// (`is_first`); `None` on downstream ranks, which receive the
+    /// already-embedded hidden state over the wire.
+    embed: Option<Runtime>,
+    /// Final norm + lm_head IR — present only on the last rank
+    /// (`is_last`); `None` on upstream ranks, which forward the hidden
+    /// state downstream instead of producing logits.
+    head: Option<Runtime>,
     shells: Vec<Runtime>,
     shell_ports: ShellPorts,
     layer_ids: Vec<u32>,
@@ -209,6 +219,9 @@ pub struct OvMoeRunner {
     experts: ExpertCache,
 
     kv: Vec<LayerKv>,
+    // pipeline-parallel role
+    is_first: bool,
+    is_last: bool,
     // cached dims
     hidden: usize,
     kv_heads: usize,
@@ -218,11 +231,30 @@ pub struct OvMoeRunner {
 }
 
 impl OvMoeRunner {
+    /// Load the whole model on one node (single-stage). Equivalent to
+    /// [`Self::load_staged`] with `rank=0, total=1`.
     pub fn load(
         model_dir: PathBuf,
         device: &str,
         plugin: PluginConfig,
         max_cached_experts: Option<NonZeroUsize>,
+    ) -> Result<Self, OvMoeError> {
+        Self::load_staged(model_dir, device, plugin, max_cached_experts, 0, 1)
+    }
+
+    /// Load this rank's contiguous slice of the model for pipeline-parallel
+    /// inference. Rank 0 owns the embedding (`layer0` IR); the last rank
+    /// owns the head; every rank owns an even slice of the transformer
+    /// shells (+ their experts). `total == 1` loads the whole model — the
+    /// path [`Self::load`] uses. The hidden state flows rank→rank as F32
+    /// over `cascadia-transport`; each rank keeps only its own layers' KV.
+    pub fn load_staged(
+        model_dir: PathBuf,
+        device: &str,
+        plugin: PluginConfig,
+        max_cached_experts: Option<NonZeroUsize>,
+        rank: u32,
+        total: u32,
     ) -> Result<Self, OvMoeError> {
         let manifest = Manifest::load(&model_dir)?;
         if !manifest.is_ov_shell() {
@@ -252,24 +284,60 @@ impl OvMoeRunner {
             Ok(Runtime::compile(&utf8(&p)?, device, &plugin)?)
         };
 
+        // Split the transformer shells into one contiguous slice per
+        // rank. Rank 0 also carries the embedding; the last rank also
+        // carries the head. The middle ranks are shells-only relays.
+        let total = total.max(1);
+        let rank = rank.min(total - 1);
+        let is_first = rank == 0;
+        let is_last = rank == total - 1;
+        let all_ids = manifest.ov_layer_ids();
+        let n = all_ids.len();
+        let per = n / total as usize;
+        let rem = n % total as usize;
+        let r = rank as usize;
+        let start = r * per + r.min(rem);
+        let cnt = per + if r < rem { 1 } else { 0 };
+        if cnt == 0 {
+            return Err(OvMoeError::Internal(format!(
+                "rank {rank}/{total} would hold zero of {n} layers; reduce total"
+            )));
+        }
+        let layer_ids: Vec<u32> = all_ids[start..start + cnt].to_vec();
+
         info!(
             arch = %manifest.arch,
             num_layers = manifest.num_layers,
             num_experts = manifest.num_experts,
             top_k = manifest.top_k,
-            "loading OV-IR sparse-MoE model (single-stage)"
+            rank,
+            total,
+            layers = format!("{}..{}", layer_ids.first().copied().unwrap_or(0), layer_ids.last().copied().unwrap_or(0)),
+            "loading OV-IR sparse-MoE model"
         );
 
-        let embed = compile(manifest.layer0_xml(&model_dir))?;
-        let head = compile(manifest.head_xml(&model_dir))?;
+        let embed = if is_first {
+            Some(compile(manifest.layer0_xml(&model_dir))?)
+        } else {
+            None
+        };
+        let head = if is_last {
+            Some(compile(manifest.head_xml(&model_dir))?)
+        } else {
+            None
+        };
 
-        let layer_ids = manifest.ov_layer_ids();
         let mut shells = Vec::with_capacity(layer_ids.len());
         for &lid in &layer_ids {
             shells.push(compile(manifest.shell_xml(&model_dir, lid))?);
         }
         let shell_ports = ShellPorts::resolve(&shells[0])?;
-        info!("compiled {} shells + embed + head", shells.len());
+        info!(
+            "compiled {} shells (embed={}, head={})",
+            shells.len(),
+            is_first,
+            is_last
+        );
 
         let expert_intermediate = manifest.expert_intermediate as usize;
         let experts = match manifest.experts_format.as_str() {
@@ -312,7 +380,25 @@ impl OvMoeRunner {
             layer_ids,
             experts,
             kv,
+            is_first,
+            is_last,
         })
+    }
+
+    /// True on the first rank (owns the embedding).
+    pub fn is_first(&self) -> bool {
+        self.is_first
+    }
+
+    /// True on the last rank (owns the head / produces logits).
+    pub fn is_last(&self) -> bool {
+        self.is_last
+    }
+
+    /// Hidden-state width (`hidden_size`) — the length of the F32 vector
+    /// exchanged between pipeline ranks.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden
     }
 
     pub fn reset(&mut self) {
@@ -392,21 +478,30 @@ impl OvMoeRunner {
         Ok(bytes)
     }
 
-    /// One decode step: returns the raw logits for `token` at absolute
-    /// position `pos`, updating every layer's KV cache. The caller picks
-    /// the next token (argmax / sampling).
-    fn step_logits(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, OvMoeError> {
+    /// Embed one token into a hidden state `[H]` (rank-0 / `is_first`
+    /// only). The downstream ranks receive this over the wire instead.
+    pub fn embed_token(&mut self, token: u32) -> Result<Vec<f32>, OvMoeError> {
+        let embed = self.embed.as_mut().ok_or_else(|| {
+            OvMoeError::Internal("embed_token on a rank without the embedding (not rank 0)".into())
+        })?;
+        let ids = [token as i64];
+        embed.set_input("input_ids", DType::I64, &[1, 1], i64_as_bytes(&ids))?;
+        embed.infer()?;
+        let (_, _, hb) = embed.output(0)?;
+        Ok(bytes_to_f32(&hb)) // [1,1,H]
+    }
+
+    /// Run this rank's shell+expert layers on the incoming hidden state at
+    /// absolute position `pos`, updating this rank's per-layer KV cache and
+    /// returning the outgoing hidden state `[H]`. Architecture-agnostic:
+    /// the same call drives single-stage (all layers) and each pipeline
+    /// rank (its slice). `pos` is the wire `past_seq_len`; the local KV
+    /// `seq` tracks it in lockstep across ranks.
+    pub fn forward_layers(&mut self, hidden: Vec<f32>, pos: usize) -> Result<Vec<f32>, OvMoeError> {
         let h = self.hidden;
         let kv = self.kv_heads;
         let d = self.head_dim;
-
-        // embed
-        let ids = [token as i64];
-        self.embed
-            .set_input("input_ids", DType::I64, &[1, 1], i64_as_bytes(&ids))?;
-        self.embed.infer()?;
-        let (_, _, hb) = self.embed.output(0)?;
-        let mut hidden = bytes_to_f32(&hb); // [1,1,H]
+        let mut hidden = hidden;
 
         for (idx, &lid) in self.layer_ids.clone().iter().enumerate() {
             let p = self.kv[idx].seq;
@@ -453,12 +548,31 @@ impl OvMoeRunner {
                 hidden[j] = residual[j] + shared[j] + moe[j];
             }
         }
+        Ok(hidden)
+    }
 
-        // head
-        self.head
-            .set_input("x", DType::F32, &[1, 1, h], f32_as_bytes(&hidden))?;
-        self.head.infer()?;
-        Ok(bytes_to_f32(&self.head.output(0)?.2))
+    /// Run the head (final norm + lm_head) on the hidden state, returning
+    /// the raw logits (last rank / `is_last` only). The caller samples.
+    pub fn head_logits(&mut self, hidden: &[f32]) -> Result<Vec<f32>, OvMoeError> {
+        let h = self.hidden;
+        let head = self.head.as_mut().ok_or_else(|| {
+            OvMoeError::Internal(
+                "head_logits on a rank without the head (not the last rank)".into(),
+            )
+        })?;
+        head.set_input("x", DType::F32, &[1, 1, h], f32_as_bytes(hidden))?;
+        head.infer()?;
+        Ok(bytes_to_f32(&head.output(0)?.2))
+    }
+
+    /// One single-stage decode step: returns the raw logits for `token` at
+    /// absolute position `pos`, updating every layer's KV cache. Composes
+    /// embed → layers → head, so the pipeline path and the single-stage
+    /// path run identical math. The caller picks the next token.
+    fn step_logits(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, OvMoeError> {
+        let hidden = self.embed_token(token)?;
+        let hidden = self.forward_layers(hidden, pos)?;
+        self.head_logits(&hidden)
     }
 
     /// Generate with a sampling config (repetition penalty / temperature /
