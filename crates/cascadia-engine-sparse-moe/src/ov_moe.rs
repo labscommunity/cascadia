@@ -334,17 +334,43 @@ impl OvMoeRunner {
         let is_last = rank == total - 1;
         let all_ids = manifest.ov_layer_ids();
         let n = all_ids.len();
-        let per = n / total as usize;
-        let rem = n % total as usize;
-        let r = rank as usize;
-        let start = r * per + r.min(rem);
-        let cnt = per + if r < rem { 1 } else { 0 };
-        if cnt == 0 {
+        // Layer slice. Default: an even split across ranks. Override:
+        // `CASCADIA_M2_LAYER_RANGE=start:end` (global, half-open) pins this
+        // rank's layers explicitly, so an asymmetric ring is possible — e.g.
+        // a high-RAM CPU node holding most layers while a small iGPU node
+        // holds a few. The ranges must partition `0..num_layers` contiguously
+        // in rank order (the driver streams hidden states down the chain).
+        let layer_ids: Vec<u32> = match std::env::var("CASCADIA_M2_LAYER_RANGE").ok() {
+            Some(spec) => {
+                let parse = || -> Option<(u32, u32)> {
+                    let (a, b) = spec.split_once(':')?;
+                    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                };
+                let (s, e) = parse().ok_or_else(|| {
+                    OvMoeError::Internal(format!(
+                        "CASCADIA_M2_LAYER_RANGE={spec:?} must be 'start:end' (half-open)"
+                    ))
+                })?;
+                all_ids
+                    .iter()
+                    .copied()
+                    .filter(|&l| l >= s && l < e)
+                    .collect()
+            }
+            None => {
+                let per = n / total as usize;
+                let rem = n % total as usize;
+                let r = rank as usize;
+                let start = r * per + r.min(rem);
+                let cnt = per + if r < rem { 1 } else { 0 };
+                all_ids[start..start + cnt].to_vec()
+            }
+        };
+        if layer_ids.is_empty() {
             return Err(OvMoeError::Internal(format!(
-                "rank {rank}/{total} would hold zero of {n} layers; reduce total"
+                "rank {rank}/{total} holds zero of {n} layers (check CASCADIA_M2_LAYER_RANGE / total)"
             )));
         }
-        let layer_ids: Vec<u32> = all_ids[start..start + cnt].to_vec();
 
         info!(
             arch = %manifest.arch,
