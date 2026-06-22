@@ -45,7 +45,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-use crate::constrained::{ApplyOutcome, GrammarFactory, GrammarMask};
+use crate::constrained::{apply_mask_bytes, sentinel_mask, ApplyOutcome, GrammarFactory, GrammarMask};
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
@@ -705,6 +705,7 @@ impl OvRuntimeEngine {
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
+        mask: &[i8],
     ) -> EngineResult<()> {
         let downstream = self
             .downstream
@@ -715,6 +716,14 @@ impl OvRuntimeEngine {
             wire_shape[i] = *d as u32;
         }
         let hid = WireTensor::new(WireDType::F16, wire_shape, f32_to_f16_bytes(hidden));
+        // Design A (spec §5.3): the per-step token bitmask rides the activation
+        // wire as an always-present I8 frame after hidden — a real bitset or the
+        // 1-byte sentinel — so the frame count stays deterministic.
+        let mask_tensor = WireTensor::new(
+            WireDType::I8,
+            [1u32, 1u32, mask.len() as u32],
+            mask.iter().map(|&b| b as u8).collect(),
+        );
         // Static (NPU) shards need the absolute position downstream so each
         // stage can reset its ring at position 0 and align the visible-past
         // count. The wire shape has only MAX_RANK=3 dims (all used by
@@ -731,7 +740,8 @@ impl OvRuntimeEngine {
             if let Some(p) = pos {
                 guard.send(&p).await?;
             }
-            guard.send(&hid).await
+            guard.send(&hid).await?;
+            guard.send(&mask_tensor).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
         Ok(())
@@ -763,7 +773,9 @@ impl OvRuntimeEngine {
         Ok(token)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
+    fn recv_hidden_from_upstream(
+        &mut self,
+    ) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>, Vec<i8>)> {
         let upstream = self
             .upstream
             .clone()
@@ -771,8 +783,9 @@ impl OvRuntimeEngine {
         // Static (NPU) shards send a leading I64 position tensor before the
         // hidden activation (see send_hidden_downstream). Each frame's payload
         // must match its shape*dtype, so we recv two separate tensors here.
+        // The I8 mask frame (Design A, spec §5.3) always trails hidden.
         let want_pos = self.static_kv.is_some();
-        let (pos_tensor, tensor) = self
+        let (pos_tensor, tensor, mask_tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
                 let pos_tensor = if want_pos {
@@ -781,9 +794,11 @@ impl OvRuntimeEngine {
                     None
                 };
                 let (t, _) = guard.recv().await?;
-                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
+                let (m, _) = guard.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t, m))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mask: Vec<i8> = mask_tensor.data.iter().map(|&b| b as i8).collect();
         // Decode + strictly validate the position frame outside the transport
         // closure (so a bad frame yields a clear EngineError, not a desync).
         let position = match pos_tensor {
@@ -808,7 +823,7 @@ impl OvRuntimeEngine {
                 )))
             }
         };
-        Ok((floats, shape, position))
+        Ok((floats, shape, position, mask))
     }
 
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
@@ -1016,7 +1031,13 @@ impl OvRuntimeEngine {
         } else {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
-            self.send_hidden_downstream(out, s3, position)?;
+            // Design A: the head owns the grammar matcher and ships the per-step
+            // bitmask (or sentinel) down the wire for the tail to apply.
+            let mask = match (mask_step, self.active.as_mut().and_then(|a| a.grammar_mask.as_mut())) {
+                (true, Some(m)) => m.next_mask_bytes()?,
+                _ => sentinel_mask(),
+            };
+            self.send_hidden_downstream(out, s3, position, &mask)?;
             let token = self.recv_token_from_downstream()?;
             Ok((token, ts.elapsed()))
         }
@@ -1208,7 +1229,7 @@ impl OvRuntimeEngine {
     }
 
     fn step_last(&mut self) -> EngineResult<()> {
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
         let (out, out_shape) = match pos_opt {
             // Static (NPU): the carried absolute position drives the ring
             // (reset at 0); seq is always 1.
@@ -1223,13 +1244,27 @@ impl OvRuntimeEngine {
                 r
             }
         };
-        let next = argmax_logits(&out, &out_shape)?;
+        let vocab = *out_shape.last().ok_or_else(|| EngineError::Backend("no vocab dim".into()))?;
+        if vocab > out.len() {
+            return Err(EngineError::Backend("logits shorter than vocab".into()));
+        }
+        let mut row = out[out.len() - vocab..].to_vec();
+        // Width invariant (spec §5.3): a non-sentinel mask must cover exactly `vocab` bits.
+        if mask.len() * 8 >= vocab && mask.len() != vocab.div_ceil(8) {
+            return Err(EngineError::Backend(format!(
+                "mask width {} bytes != vocab {vocab} ({} bytes)",
+                mask.len(),
+                vocab.div_ceil(8)
+            )));
+        }
+        apply_mask_bytes(&mut row, &mask);
+        let next = argmax_last_row(&row, vocab);
         self.send_token_to_upstream(next)?;
         Ok(())
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
-        let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let (hidden, shape, pos_opt, mask) = self.recv_hidden_from_upstream()?;
         let (out, out_shape, fwd_pos) = match pos_opt {
             Some(pos) => {
                 let (o, s) = self.run_relay(&hidden, shape, pos)?;
@@ -1246,7 +1281,7 @@ impl OvRuntimeEngine {
             }
         };
         let s3 = to_shape3(&out_shape);
-        self.send_hidden_downstream(&out, s3, fwd_pos)?;
+        self.send_hidden_downstream(&out, s3, fwd_pos, &mask)?;
         let token = self.recv_token_from_downstream()?;
         self.send_token_to_upstream(token)?;
         Ok(())
