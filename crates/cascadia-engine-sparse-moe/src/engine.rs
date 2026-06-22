@@ -349,19 +349,19 @@ impl Builder for SparseMoEBuilder {
         }
 
         // OV-IR shell backend (MiniMax-M2): the whole architecture lives in
-        // the traced graphs, so we run a dedicated single-stage runner
-        // instead of the K2.6 MLA kernel. Pipeline-parallel isn't wired for
-        // this backend yet (the K2.6 transport path assumes the Rust shell).
+        // the traced graphs, so we run a dedicated runner instead of the
+        // K2.6 MLA kernel. Single-stage loads the whole model; multi-stage
+        // (total > 1) loads a contiguous layer slice per rank and exchanges
+        // F32 hidden states over the same engine-agnostic dist wire protocol
+        // the K2.6 path uses (rank 0 embeds + drives, the last rank runs the
+        // head + sampler).
         let is_ov = Manifest::load(&self.config.model_dir)
             .map(|m| m.is_ov_shell())
             .unwrap_or(false);
         if is_ov {
-            if self.config.total > 1 {
-                return Err(EngineError::InvalidConfig(
-                    "ov_ir shell backend (MiniMax-M2) is single-stage only; total must be 1".into(),
-                ));
-            }
             let cfg = self.config.clone();
+            let total = cfg.total.max(1);
+            let rank = cfg.rank.min(total - 1);
             let opts = resolve_runner_options(&cfg);
             let cap = opts.max_cached_experts;
             let plugin_for_worker = plugin.clone();
@@ -372,24 +372,35 @@ impl Builder for SparseMoEBuilder {
                         "loading MiniMax-M2 (OV-IR sparse-MoE)",
                     ))
                     .ok();
-                    OvMoeRunner::load(cfg.model_dir.clone(), &cfg.device, plugin_for_worker, cap)
+                    OvMoeRunner::load_staged(
+                        cfg.model_dir.clone(),
+                        &cfg.device,
+                        plugin_for_worker,
+                        cap,
+                        rank,
+                        total,
+                    )
                 });
             let ov_runner = match join.join() {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => return Err(EngineError::Backend(format!("ov-moe load: {e}"))),
                 Err(_) => return Err(EngineError::Backend("ov-moe load worker panicked".into())),
             };
-            let tok_path = self.config.model_dir.join("tokenizer.json");
-            if tok_path.exists() {
-                self.tokenizer = Some(
-                    Tokenizer::from_file(&tok_path)
-                        .map_err(|e| EngineError::Backend(format!("load tokenizer.json: {e}")))?,
-                );
-            } else {
-                warn!(
-                    "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
-                    tok_path.display()
-                );
+            // The tokenizer is only needed on rank 0 (the API rank); worker
+            // ranks drive themselves from the hidden states on the wire.
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
             }
             self.ov_runner = Some(ov_runner);
             let drained: Vec<LoadProgress> = rx.try_iter().collect();
@@ -502,13 +513,33 @@ impl Builder for SparseMoEBuilder {
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
         if let Some(ov) = self.ov_runner {
-            if self.tokenizer.is_none() {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            // Only rank 0 (the API rank) needs a tokenizer; worker ranks
+            // drive themselves from the hidden states on the wire.
+            if rank == 0 && self.tokenizer.is_none() {
                 return Err(EngineError::Backend(
-                    "tokenizer.json missing (required for the MiniMax-M2 engine)".into(),
+                    "tokenizer.json missing (required for the MiniMax-M2 API rank)".into(),
                 ));
             }
-            info!("built MiniMax-M2 OV-IR engine (single-stage)");
-            return Ok(Box::new(OvMoeEngine::new(ov, self.tokenizer)));
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            if total > 1 {
+                info!(
+                    rank,
+                    total, "built MiniMax-M2 OV-IR engine (pipeline-parallel)"
+                );
+            } else {
+                info!("built MiniMax-M2 OV-IR engine (single-stage)");
+            }
+            return Ok(Box::new(OvMoeEngine::new(
+                ov,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+            )));
         }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
         let total = self.config.total.max(1);
@@ -1742,52 +1773,76 @@ impl SparseMoEEngine {
 
 const OV_MAX_PENDING: usize = 64;
 
-/// Single-stage engine for the OV-IR shell backend (MiniMax-M2).
+/// Engine for the OV-IR shell backend (MiniMax-M2).
 ///
-/// Greedy-only for v1: `OvMoeRunner` argmaxes each step, so sampling
-/// config (temperature / penalties) is ignored. The whole architecture is
-/// baked into the exported OV graphs, so this engine just tokenizes, drives
-/// [`OvMoeRunner::generate_argmax`], and decodes — no pipeline transport.
+/// - **Single-stage** (`total == 1`): one engine holds the whole model and
+///   drives [`OvMoeRunner::generate`] end-to-end (the path the tiny
+///   correctness test and the 230B smoke exercise).
+/// - **Pipeline-parallel** (`total > 1`): each rank holds a contiguous
+///   layer slice. Rank 0 embeds the token, runs its shells, and ships the
+///   F32 hidden state downstream over `cascadia-transport`; middle ranks
+///   relay; the last rank runs the head + sampler and returns the token
+///   upstream. The wire protocol is the engine-agnostic [`crate::dist`]
+///   one the K2.6 path uses (Forward / Reset / Token frames). No
+///   spec-decode (M2 sends only per-token Forward frames).
 pub struct OvMoeEngine {
     runner: OvMoeRunner,
     tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
+    transport: StageTransport,
+    runtime_handle: tokio::runtime::Handle,
+    rank: u32,
+    total: u32,
+    /// Set on a worker rank when the upstream socket closes cleanly, so
+    /// `step_worker` doesn't hot-spin on `recv_kind_server` → `Ok(None)`.
+    peer_disconnected: bool,
+    /// Last-rank only: tokens this rank has sampled since the last `Reset`,
+    /// used as the repetition-penalty `history`. Like the K2.6 path, prompt
+    /// tokens are not mirrored here (they flow only as hidden states), so
+    /// the rep-penalty window covers generated tokens only. Greedy
+    /// (`repetition_penalty == 1.0`) is unaffected, so a greedy pipeline
+    /// run matches the single-stage greedy output exactly.
+    last_rank_history: Vec<i64>,
+    last_rank_rng: u64,
+    last_rank_rng_seeded: bool,
 }
 
 impl OvMoeEngine {
-    fn new(runner: OvMoeRunner, tokenizer: Option<Tokenizer>) -> Self {
+    fn new(
+        runner: OvMoeRunner,
+        tokenizer: Option<Tokenizer>,
+        transport: StageTransport,
+        runtime_handle: tokio::runtime::Handle,
+        rank: u32,
+        total: u32,
+    ) -> Self {
         Self {
             runner,
             tokenizer,
             pending: VecDeque::new(),
-        }
-    }
-}
-
-impl Engine for OvMoeEngine {
-    fn warmup(&mut self) {
-        if let Some(tok) = self.tokenizer.as_ref() {
-            let ids: Vec<u32> = tok
-                .encode("Hello", false)
-                .map(|e| e.get_ids().to_vec())
-                .unwrap_or_else(|_| vec![1]);
-            let _ = self.runner.generate_argmax(&ids, 1);
-            info!("warmup: generated 1 token (MiniMax-M2)");
+            transport,
+            runtime_handle,
+            rank,
+            total,
+            peer_disconnected: false,
+            last_rank_history: Vec::new(),
+            last_rank_rng: 0,
+            last_rank_rng_seeded: false,
         }
     }
 
-    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
-        if self.pending.len() >= OV_MAX_PENDING {
-            return Err(EngineError::QueueFull {
-                queued: self.pending.len(),
-                cap: OV_MAX_PENDING,
-            });
-        }
-        self.pending.push_back(task);
-        Ok(())
+    /// Bridge sync `Engine::step` code to an async transport future (same
+    /// thread-local fast path the K2.6 engine uses on worker ranks).
+    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        cascadia_runner::run_async(&self.runtime_handle, fut)
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn is_last(&self) -> bool {
+        self.transport.is_last()
+    }
+
+    /// Single-stage path: tokenize, run the whole model, decode.
+    fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
@@ -1826,6 +1881,292 @@ impl Engine for OvMoeEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         vec![(task.task_id.clone(), chunk)]
+    }
+
+    /// Rank-0 driver: embed + run my shells, ship hidden downstream, await
+    /// the sampled token back. Returns the token the last rank sampled.
+    fn forward_one_token_first(
+        &mut self,
+        token: u32,
+        pos: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<i64, String> {
+        let hidden = self
+            .runner
+            .embed_token(token)
+            .map_err(|e| format!("embed: {e}"))?;
+        let hidden = self
+            .runner
+            .forward_layers(hidden, pos)
+            .map_err(|e| format!("forward: {e}"))?;
+        let h = self.runner.hidden_size() as u32;
+        self.block_on(async {
+            send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                .await
+                .map_err(|e| format!("send_forward: {e}"))?;
+            match recv_kind_client(downstream).await {
+                Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
+                    .await
+                    .map_err(|e| format!("recv_token: {e}")),
+                Ok(Some(other)) => Err(format!("rank 0 expected Token, got {other:?}")),
+                Ok(None) => Err("downstream closed before Token".into()),
+                Err(e) => Err(format!("recv_kind: {e}")),
+            }
+        })
+    }
+
+    /// Rank-0 pipeline driver: tokenize, reset the ring, drive prefill +
+    /// decode one token per wire round-trip, decode, emit one final chunk.
+    fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
+        let task = match self.pending.pop_front() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let id = task.task_id.clone();
+        let Some(downstream) = self.transport.downstream.clone() else {
+            warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
+            return vec![(id.clone(), Chunk::error(id, "rank 0 missing downstream"))];
+        };
+        if self.tokenizer.is_none() {
+            warn!(task = %id, "MiniMax-M2 rank 0 has no tokenizer");
+            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+        }
+        let started = Instant::now();
+        let prompt_ids: Vec<u32> = match self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .encode(task.prompt.as_str(), true)
+        {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                warn!(task = %id, "tokenizer encode failed: {e}");
+                return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            }
+        };
+        if prompt_ids.is_empty() {
+            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+        }
+        let max_new = task.max_tokens.max(1) as usize;
+        let cfg = sampling_from_task(&task);
+        let eos = self.runner.eos_token_ids().to_vec();
+
+        // Reset KV across the whole pipeline before the new generation.
+        self.runner.reset();
+        if let Err(e) = self.block_on(send_reset(&downstream)) {
+            warn!(task = %id, "send_reset failed: {e}");
+            return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
+        }
+
+        // Prefill: feed every prompt token. The sample produced after the
+        // LAST prompt token is the first generated token — matching
+        // `OvMoeRunner::generate_timed`.
+        let mut pos = 0usize;
+        let mut next: i64 = -1;
+        for &t in &prompt_ids {
+            match self.forward_one_token_first(t, pos, &cfg, &downstream) {
+                Ok(tok_back) => next = tok_back,
+                Err(e) => {
+                    warn!(task = %id, "prefill forward failed: {e}");
+                    return vec![(id.clone(), Chunk::error(id, e))];
+                }
+            }
+            pos += 1;
+        }
+
+        // Decode: like generate_timed, push the token then stop on max_new
+        // or EOS (the EOS token is included in the output).
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new);
+        loop {
+            let next_u = next as u32;
+            generated.push(next_u);
+            if generated.len() >= max_new || eos.contains(&next_u) {
+                break;
+            }
+            match self.forward_one_token_first(next_u, pos, &cfg, &downstream) {
+                Ok(tok_back) => next = tok_back,
+                Err(e) => {
+                    warn!(task = %id, "decode forward failed; emitting partial output: {e}");
+                    break;
+                }
+            }
+            pos += 1;
+        }
+
+        let n_tokens = generated.len() as u32;
+        let text = self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .decode(&generated, true)
+            .unwrap_or_default();
+        let elapsed = started.elapsed().as_secs_f64();
+        info!(
+            task = %id,
+            tokens = n_tokens,
+            total = self.total,
+            elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            "task done (MiniMax-M2 pipeline-parallel)"
+        );
+        let mut chunk = Chunk::final_marker(id.clone(), text);
+        chunk.n_tokens = Some(n_tokens);
+        vec![(id, chunk)]
+    }
+
+    /// Worker rank (rank > 0): service one frame from upstream per call.
+    fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.peer_disconnected {
+            std::thread::sleep(WORKER_BACKOFF);
+            return Vec::new();
+        }
+        let Some(upstream) = self.transport.upstream.clone() else {
+            warn!("worker rank has no upstream socket");
+            std::thread::sleep(WORKER_BACKOFF);
+            return Vec::new();
+        };
+        let downstream = self.transport.downstream.clone();
+        let kind = match self.block_on(recv_kind_server(&upstream)) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+            Err(e) => {
+                warn!("worker recv_kind failed: {e}");
+                std::thread::sleep(WORKER_BACKOFF);
+                return Vec::new();
+            }
+        };
+        let res = match kind {
+            FrameKind::Reset => {
+                self.runner.reset();
+                self.last_rank_history.clear();
+                self.last_rank_rng_seeded = false;
+                match downstream.as_ref() {
+                    Some(down) => self
+                        .block_on(forward_reset(down))
+                        .map_err(|e| format!("forward_reset: {e}")),
+                    None => Ok(()),
+                }
+            }
+            FrameKind::Forward => self.handle_forward(&upstream, downstream.as_ref()),
+            other => Err(format!(
+                "worker received unsupported frame {other:?} (MiniMax-M2 has no spec-decode batching)"
+            )),
+        };
+        if let Err(e) = res {
+            warn!("worker frame failed: {e}");
+            std::thread::sleep(WORKER_BACKOFF);
+        }
+        Vec::new()
+    }
+
+    /// Handle one Forward frame on a worker rank: run my shells, then
+    /// either (last rank) head + sample + Token upstream, or (middle rank)
+    /// relay the hidden downstream and pass the returned Token back up.
+    fn handle_forward(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+            .block_on(recv_forward_body_server(upstream))
+            .map_err(|e| format!("recv_forward_body: {e}"))?;
+        let pos = past_seq_len as usize;
+        let hidden = self
+            .runner
+            .forward_layers(hidden_f32, pos)
+            .map_err(|e| format!("forward: {e}"))?;
+        if self.is_last() {
+            let logits = self
+                .runner
+                .head_logits(&hidden)
+                .map_err(|e| format!("head: {e}"))?;
+            if !self.last_rank_rng_seeded {
+                self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+                self.last_rank_rng_seeded = true;
+            }
+            let token = crate::sampling::sample(
+                &logits,
+                &self.last_rank_history,
+                &sampling_cfg,
+                &mut self.last_rank_rng,
+            );
+            self.last_rank_history.push(token);
+            self.block_on(send_token_upstream(upstream, token))
+                .map_err(|e| format!("send_token: {e}"))?;
+            Ok(())
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let h = self.runner.hidden_size() as u32;
+            self.block_on(async {
+                send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::Token)) => {
+                        let t = recv_token_body_client(down)
+                            .await
+                            .map_err(|e| format!("recv_token: {e}"))?;
+                        send_token_upstream(upstream, t)
+                            .await
+                            .map_err(|e| format!("relay token: {e}"))?;
+                        Ok(())
+                    }
+                    Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
+                    Ok(None) => Err("downstream closed before Token".into()),
+                    Err(e) => Err(format!("recv_kind: {e}")),
+                }
+            })
+        }
+    }
+}
+
+impl Engine for OvMoeEngine {
+    fn warmup(&mut self) {
+        // Only rank 0 (single-stage or the API rank) self-warms; worker
+        // ranks are warmed by the first real generation's prefill, which
+        // drives the whole ring in lockstep.
+        if self.total == 1 {
+            if let Some(tok) = self.tokenizer.as_ref() {
+                let ids: Vec<u32> = tok
+                    .encode("Hello", false)
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_else(|_| vec![1]);
+                let _ = self.runner.generate_argmax(&ids, 1);
+                info!("warmup: generated 1 token (MiniMax-M2)");
+            }
+        }
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.rank != 0 {
+            return Err(EngineError::InvalidConfig(
+                "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
+                    .into(),
+            ));
+        }
+        if self.pending.len() >= OV_MAX_PENDING {
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: OV_MAX_PENDING,
+            });
+        }
+        self.pending.push_back(task);
+        Ok(())
+    }
+
+    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.total <= 1 {
+            return self.step_single_stage();
+        }
+        if self.rank == 0 {
+            self.step_first()
+        } else {
+            self.step_worker()
+        }
     }
 }
 
