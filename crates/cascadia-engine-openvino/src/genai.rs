@@ -288,7 +288,13 @@ impl Engine for OvGenaiEngine {
             task.temperature,
             task.enable_thinking,
         );
-        cfg.json_schema = grammar_to_json_schema(task.grammar.as_ref());
+        // OV GenAI 2026.2 StructuredOutputConfig segfaults (slice-3 spec §0); default OFF.
+        // Opt back in via the env var if a fixed OV build is ever deployed.
+        cfg.json_schema = if std::env::var("CASCADIA_OVGENAI_STRUCTURED_OUTPUT").is_ok() {
+            grammar_to_json_schema(task.grammar.as_ref())
+        } else {
+            None
+        };
 
         let started = Instant::now();
         let result = match self.pipe.generate(&task.prompt, &cfg) {
