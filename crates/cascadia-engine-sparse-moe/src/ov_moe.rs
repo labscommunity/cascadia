@@ -19,6 +19,14 @@
 //! per-expert OpenVINO IR (`ov_ir`) or flat int4 binaries fed to the
 //! cascadia-int4-gemm AVX-512 kernel (`int4_bin`, no per-call OV overhead).
 //!
+//! **Intel iGPU note:** the MoE router subgraph (sigmoid + TopK + Gather)
+//! makes the OpenVINO GPU plugin emit a kernel that fails at runtime with
+//! `CL_OUT_OF_RESOURCES` (it can wedge the OpenCL context); the attention/KV
+//! core runs on the iGPU fine. So when targeting a non-CPU device and the
+//! shells have been split by `tools/split_m2_shells.py`, this runner loads
+//! the GPU-friendly `shell_core` on the device and the carved `router` on
+//! the CPU plugin (the router is trivial compute). See [`OvMoeRunner`].
+//!
 //! Because the graphs carry their own shapes, this path is fully
 //! dimension-agnostic — the same code runs the tiny synthetic M2 used by
 //! the correctness test and the full 230B model. Single-stage (whole model)
@@ -106,28 +114,43 @@ fn out_idx(rt: &Runtime, name: &str) -> Result<usize, OvMoeError> {
     Err(OvMoeError::MissingOutput(name.to_string(), have))
 }
 
-/// Resolved output-port indices for a shell graph (same layout every layer).
+/// Output-port indices for the attention/KV part of a shell — present in
+/// both the monolithic shell and the GPU-friendly `shell_core` split.
 #[derive(Clone, Copy)]
-struct ShellPorts {
+struct CorePorts {
     apn: usize,
     residual: usize,
     shared: usize,
-    ids: usize,
-    weights: usize,
     present_k: usize,
     present_v: usize,
 }
 
-impl ShellPorts {
+impl CorePorts {
     fn resolve(rt: &Runtime) -> Result<Self, OvMoeError> {
         Ok(Self {
             apn: out_idx(rt, "attn_out_post_norm")?,
             residual: out_idx(rt, "attn_residual")?,
             shared: out_idx(rt, "shared_expert_out")?,
-            ids: out_idx(rt, "routing_ids")?,
-            weights: out_idx(rt, "routing_weights")?,
             present_k: out_idx(rt, "present_k")?,
             present_v: out_idx(rt, "present_v")?,
+        })
+    }
+}
+
+/// Output-port indices for the MoE router (top-k ids + weights). Resolved
+/// from the monolithic shell (CPU path) or the carved `router` graph (the
+/// non-CPU split, where the router runs on the CPU plugin).
+#[derive(Clone, Copy)]
+struct RouterPorts {
+    ids: usize,
+    weights: usize,
+}
+
+impl RouterPorts {
+    fn resolve(rt: &Runtime) -> Result<Self, OvMoeError> {
+        Ok(Self {
+            ids: out_idx(rt, "routing_ids")?,
+            weights: out_idx(rt, "routing_weights")?,
         })
     }
 }
@@ -212,8 +235,16 @@ pub struct OvMoeRunner {
     /// (`is_last`); `None` on upstream ranks, which forward the hidden
     /// state downstream instead of producing logits.
     head: Option<Runtime>,
+    /// Per-layer shells. Either the monolithic shell (CPU / no split) or the
+    /// GPU-friendly `shell_core` (attention + KV, no router) when running on
+    /// a non-CPU device with split graphs present.
     shells: Vec<Runtime>,
-    shell_ports: ShellPorts,
+    /// Per-layer router graphs compiled on the CPU plugin, used only in the
+    /// split path (the MoE router wedges the Intel GPU plugin). `None` in the
+    /// monolithic path, where the router outputs come from `shells`.
+    routers: Option<Vec<Runtime>>,
+    core_ports: CorePorts,
+    router_ports: RouterPorts,
     layer_ids: Vec<u32>,
 
     experts: ExpertCache,
@@ -239,15 +270,28 @@ impl OvMoeRunner {
         plugin: PluginConfig,
         max_cached_experts: Option<NonZeroUsize>,
     ) -> Result<Self, OvMoeError> {
-        Self::load_staged(model_dir, device, plugin, max_cached_experts, 0, 1)
+        Self::load_staged(
+            model_dir,
+            device,
+            plugin,
+            max_cached_experts,
+            0,
+            1,
+            0,
+            0,
+            false,
+        )
     }
 
     /// Load this rank's contiguous slice of the model for pipeline-parallel
     /// inference. Rank 0 owns the embedding (`layer0` IR); the last rank
-    /// owns the head; every rank owns an even slice of the transformer
-    /// shells (+ their experts). `total == 1` loads the whole model — the
-    /// path [`Self::load`] uses. The hidden state flows rank→rank as F32
-    /// over `cascadia-transport`; each rank keeps only its own layers' KV.
+    /// owns the head. The layer slice is `[layer_start, layer_end)` (global,
+    /// half-open) when `layer_end > layer_start` — an explicit, possibly
+    /// asymmetric split — otherwise an even split across ranks. `total == 1`
+    /// loads the whole model (the path [`Self::load`] uses). The hidden
+    /// state flows rank→rank as F32 over `cascadia-transport`; each rank
+    /// keeps only its own layers' KV.
+    #[allow(clippy::too_many_arguments)]
     pub fn load_staged(
         model_dir: PathBuf,
         device: &str,
@@ -255,6 +299,9 @@ impl OvMoeRunner {
         max_cached_experts: Option<NonZeroUsize>,
         rank: u32,
         total: u32,
+        layer_start: u32,
+        layer_end: u32,
+        force_split: bool,
     ) -> Result<Self, OvMoeError> {
         let manifest = Manifest::load(&model_dir)?;
         if !manifest.is_ov_shell() {
@@ -303,17 +350,32 @@ impl OvMoeRunner {
         let is_last = rank == total - 1;
         let all_ids = manifest.ov_layer_ids();
         let n = all_ids.len();
-        let per = n / total as usize;
-        let rem = n % total as usize;
-        let r = rank as usize;
-        let start = r * per + r.min(rem);
-        let cnt = per + if r < rem { 1 } else { 0 };
-        if cnt == 0 {
+        // Layer slice. With an explicit `[layer_start, layer_end)` (global,
+        // half-open; from the CLI --layer-start/--layer-end) we pin this
+        // rank's layers — enabling an asymmetric ring (e.g. a high-RAM CPU
+        // node holding most layers, small iGPU nodes a few each). The ranges
+        // must partition `0..num_layers` contiguously in rank order (the
+        // driver streams hidden states down the chain). Otherwise (both 0)
+        // an even split by rank/total.
+        let layer_ids: Vec<u32> = if layer_end > layer_start {
+            all_ids
+                .iter()
+                .copied()
+                .filter(|&l| l >= layer_start && l < layer_end)
+                .collect()
+        } else {
+            let per = n / total as usize;
+            let rem = n % total as usize;
+            let r = rank as usize;
+            let start = r * per + r.min(rem);
+            let cnt = per + if r < rem { 1 } else { 0 };
+            all_ids[start..start + cnt].to_vec()
+        };
+        if layer_ids.is_empty() {
             return Err(OvMoeError::Internal(format!(
-                "rank {rank}/{total} would hold zero of {n} layers; reduce total"
+                "rank {rank}/{total} holds zero of {n} layers (check --layer-start/--layer-end / total)"
             )));
         }
-        let layer_ids: Vec<u32> = all_ids[start..start + cnt].to_vec();
 
         info!(
             arch = %manifest.arch,
@@ -337,14 +399,51 @@ impl OvMoeRunner {
             None
         };
 
+        // iGPU/NPU path: the MoE router subgraph wedges the Intel GPU plugin
+        // (CL_OUT_OF_RESOURCES — it can even brick the OpenCL context), but
+        // the attention/KV core runs there fine. When targeting a non-CPU
+        // device and the split graphs exist (`tools/split_m2_shells.py`),
+        // load the GPU-friendly `shell_core` on the device and the carved
+        // `router` on the CPU plugin. On CPU the monolithic shell is used.
+        // Split the shell into shell_core (device) + router (CPU) for non-CPU
+        // execution. `force_split` also forces it on CPU — used by the
+        // split-path test to validate the carve is numerically identical to
+        // the monolithic shell without needing a GPU.
+        let split = manifest.shell_core_xml(&model_dir, layer_ids[0]).exists()
+            && (force_split || !device.eq_ignore_ascii_case("CPU"));
+
         let mut shells = Vec::with_capacity(layer_ids.len());
-        for &lid in &layer_ids {
-            shells.push(compile(manifest.shell_xml(&model_dir, lid))?);
-        }
-        let shell_ports = ShellPorts::resolve(&shells[0])?;
+        let routers = if split {
+            // The router is tiny + static (no growing past_k), so it needs no
+            // SNIPPETS workaround on the CPU plugin.
+            let cpu_plugin = PluginConfig::new();
+            let mut routers = Vec::with_capacity(layer_ids.len());
+            for &lid in &layer_ids {
+                let core_xml = manifest.shell_core_xml(&model_dir, lid);
+                let router_xml = manifest.router_xml(&model_dir, lid);
+                if !router_xml.exists() {
+                    return Err(OvMoeError::MissingFile(router_xml));
+                }
+                shells.push(compile(core_xml)?);
+                routers.push(Runtime::compile(&utf8(&router_xml)?, "CPU", &cpu_plugin)?);
+            }
+            Some(routers)
+        } else {
+            for &lid in &layer_ids {
+                shells.push(compile(manifest.shell_xml(&model_dir, lid))?);
+            }
+            None
+        };
+        let core_ports = CorePorts::resolve(&shells[0])?;
+        let router_ports = match &routers {
+            Some(rs) => RouterPorts::resolve(&rs[0])?,
+            None => RouterPorts::resolve(&shells[0])?,
+        };
         info!(
-            "compiled {} shells (embed={}, head={})",
+            "compiled {} shells on {} (router_split={}, embed={}, head={})",
             shells.len(),
+            device,
+            split,
             is_first,
             is_last
         );
@@ -386,7 +485,9 @@ impl OvMoeRunner {
             embed,
             head,
             shells,
-            shell_ports,
+            routers,
+            core_ports,
+            router_ports,
             layer_ids,
             experts,
             kv,
@@ -534,16 +635,37 @@ impl OvMoeRunner {
                 sh.set_input("past_seq_len", DType::I64, &[], i64_as_bytes(&pos_i))?;
                 sh.infer()?;
             }
-            let ports = self.shell_ports;
-            let sh = &self.shells[idx];
-            let apn = bytes_to_f32(&sh.output(ports.apn)?.2);
-            let residual = bytes_to_f32(&sh.output(ports.residual)?.2);
-            let shared = bytes_to_f32(&sh.output(ports.shared)?.2);
-            let ids_out = bytes_to_i64(&sh.output(ports.ids)?.2);
-            let weights = bytes_to_f32(&sh.output(ports.weights)?.2);
-            let present_k = bytes_to_f32(&sh.output(ports.present_k)?.2);
-            let present_v = bytes_to_f32(&sh.output(ports.present_v)?.2);
+            let cp = self.core_ports;
+            let rp = self.router_ports;
+            let (apn, residual, shared, present_k, present_v) = {
+                let sh = &self.shells[idx];
+                (
+                    bytes_to_f32(&sh.output(cp.apn)?.2),
+                    bytes_to_f32(&sh.output(cp.residual)?.2),
+                    bytes_to_f32(&sh.output(cp.shared)?.2),
+                    bytes_to_f32(&sh.output(cp.present_k)?.2),
+                    bytes_to_f32(&sh.output(cp.present_v)?.2),
+                )
+            };
             self.kv[idx].append(&present_k, &present_v, kv, d);
+
+            // Routing ids/weights: from the carved CPU router graph when the
+            // shells are split for non-CPU execution, else from the shell.
+            let (ids_out, weights) = if let Some(routers) = self.routers.as_mut() {
+                let rt = &mut routers[idx];
+                rt.set_input("apn_in", DType::F32, &[1, 1, h], f32_as_bytes(&apn))?;
+                rt.infer()?;
+                (
+                    bytes_to_i64(&rt.output(rp.ids)?.2),
+                    bytes_to_f32(&rt.output(rp.weights)?.2),
+                )
+            } else {
+                let sh = &self.shells[idx];
+                (
+                    bytes_to_i64(&sh.output(rp.ids)?.2),
+                    bytes_to_f32(&sh.output(rp.weights)?.2),
+                )
+            };
 
             let mut moe = vec![0.0f32; h];
             for k in 0..self.top_k.min(ids_out.len()) {

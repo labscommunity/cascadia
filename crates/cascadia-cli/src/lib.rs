@@ -221,6 +221,19 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub total: u32,
 
+    /// First transformer layer this stage holds (global, 0-based, inclusive).
+    /// Together with --layer-end, pins an explicit asymmetric layer split
+    /// instead of the default even split across ranks — e.g. a high-RAM CPU
+    /// node holding most layers while small iGPU nodes hold a few each.
+    /// `0/0` (both default) = even split. MiniMax-M2 sparse-moe only.
+    #[arg(long, default_value_t = 0)]
+    pub layer_start: u32,
+
+    /// One-past-the-last transformer layer this stage holds (global,
+    /// exclusive). `0` = unset (even split). See --layer-start.
+    #[arg(long, default_value_t = 0)]
+    pub layer_end: u32,
+
     /// HF model id or local model directory.
     #[arg(long)]
     pub model: String,
@@ -457,6 +470,8 @@ impl WorkerArgs {
         WorkerArgs {
             rank: 0,
             total: 1,
+            layer_start: 0,
+            layer_end: 0,
             model,
             listen: ":9100".into(),
             next: None,
@@ -960,8 +975,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
 
     let shard = ShardSpec {
         model_id: args.model.clone(),
-        layer_start: 0,
-        layer_end: 0,
+        layer_start: args.layer_start,
+        layer_end: args.layer_end,
         total_layers: 0,
         device: args.device.clone(),
         is_first_stage: is_first,

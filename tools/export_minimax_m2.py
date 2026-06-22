@@ -351,6 +351,11 @@ def convert_and_save(wrapper, example_inputs, out_xml: Path, dyn_axes,
 # --------------------------------------------------------------------------
 # Model loading
 # --------------------------------------------------------------------------
+# Number of layers for the --tiny synthetic model; overridden by --tiny-layers
+# in main(). Module global so tiny_config() stays arg-free.
+_TINY_LAYERS = 2
+
+
 def tiny_config():
     """Small but architecturally-faithful M2 config for the correctness test."""
     from transformers import MiniMaxM2Config
@@ -358,7 +363,7 @@ def tiny_config():
         vocab_size=256,
         hidden_size=128,
         intermediate_size=64,          # expert FFN dim
-        num_hidden_layers=2,
+        num_hidden_layers=_TINY_LAYERS,
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=32,
@@ -747,6 +752,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="path/hub id of MiniMax-M2 (FP8)")
     ap.add_argument("--tiny", action="store_true", help="export a synthetic small M2")
+    ap.add_argument("--tiny-layers", type=int, default=2,
+                    help="number of layers for --tiny (default 2; use more to test "
+                         "pipeline-parallel splits with one rank per node)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="subset e.g. 0-3 (debug); default all")
     ap.add_argument("--no-quant", action="store_true", help="skip INT4 (fp32 weights)")
@@ -776,6 +784,8 @@ def main():
 
     if not args.tiny and not args.model:
         ap.error("need --model or --tiny")
+    global _TINY_LAYERS
+    _TINY_LAYERS = args.tiny_layers
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
