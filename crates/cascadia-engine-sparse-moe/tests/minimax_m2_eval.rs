@@ -74,6 +74,79 @@ fn minimax_m2_tiny_matches_hf_reference() {
     );
 }
 
+/// iGPU router-split correctness gate (runs on CPU). When the shells have
+/// been split by `tools/split_m2_shells.py`, running shell_core + the carved
+/// CPU router must be byte-identical to the monolithic shell — the property
+/// the iGPU path relies on (only the device differs in production). Forces
+/// the split on CPU (`force_split = true`) so it needs no GPU and runs in CI.
+/// Gated on `M2_MODEL_DIR`; skips if the split files aren't present.
+#[test]
+fn minimax_m2_split_path_matches_monolithic() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping split-path test");
+        return;
+    };
+    let core0 = model_dir
+        .join("shells")
+        .join("layer_00")
+        .join("shell_core.xml");
+    if !core0.exists() {
+        eprintln!("shell_core.xml absent (run tools/split_m2_shells.py); skipping split-path test");
+        return;
+    }
+    let reference: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(model_dir.join("reference.json")).expect("read reference.json"),
+    )
+    .expect("parse reference.json");
+    let prompt: Vec<u32> = reference["prompt_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let greedy: Vec<u32> = reference["greedy_tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let n_new = greedy.len() - prompt.len();
+
+    // Monolithic shell (CPU).
+    let mut mono = OvMoeRunner::load(model_dir.clone(), "CPU", PluginConfig::new(), None)
+        .expect("load monolithic");
+    let mono_gen = mono
+        .generate_argmax(&prompt, n_new)
+        .expect("monolithic generate");
+
+    // shell_core + carved CPU router, forced on CPU.
+    let mut split = OvMoeRunner::load_staged(
+        model_dir.clone(),
+        "CPU",
+        PluginConfig::new(),
+        None,
+        0,
+        1,
+        0,
+        0,
+        true,
+    )
+    .expect("load split");
+    let split_gen = split
+        .generate_argmax(&prompt, n_new)
+        .expect("split generate");
+
+    eprintln!("monolithic: {mono_gen:?}");
+    eprintln!("split     : {split_gen:?}");
+    assert_eq!(
+        split_gen, mono_gen,
+        "shell_core + CPU router must match the monolithic shell byte-for-byte"
+    );
+    let mut full = prompt.clone();
+    full.extend_from_slice(&split_gen);
+    assert_eq!(full, greedy, "split path must match the HF reference");
+}
+
 /// Pipeline-parallel correctness gate: the SAME tiny model split across two
 /// ranks (rank 0 = embed + first half of the layers, rank 1 = second half +
 /// head) must reproduce the canonical HF greedy stream — i.e. slicing the
@@ -106,12 +179,30 @@ fn minimax_m2_two_rank_pipeline_matches_hf_reference() {
         .collect();
 
     let device = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
-    let mut r0 =
-        OvMoeRunner::load_staged(model_dir.clone(), &device, PluginConfig::new(), None, 0, 2)
-            .expect("load rank 0 slice");
-    let mut r1 =
-        OvMoeRunner::load_staged(model_dir.clone(), &device, PluginConfig::new(), None, 1, 2)
-            .expect("load rank 1 slice");
+    let mut r0 = OvMoeRunner::load_staged(
+        model_dir.clone(),
+        &device,
+        PluginConfig::new(),
+        None,
+        0,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank 0 slice");
+    let mut r1 = OvMoeRunner::load_staged(
+        model_dir.clone(),
+        &device,
+        PluginConfig::new(),
+        None,
+        1,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank 1 slice");
     assert!(
         r0.is_first() && !r0.is_last(),
         "rank 0 should own the embedding but not the head"

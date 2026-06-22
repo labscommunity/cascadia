@@ -270,15 +270,28 @@ impl OvMoeRunner {
         plugin: PluginConfig,
         max_cached_experts: Option<NonZeroUsize>,
     ) -> Result<Self, OvMoeError> {
-        Self::load_staged(model_dir, device, plugin, max_cached_experts, 0, 1)
+        Self::load_staged(
+            model_dir,
+            device,
+            plugin,
+            max_cached_experts,
+            0,
+            1,
+            0,
+            0,
+            false,
+        )
     }
 
     /// Load this rank's contiguous slice of the model for pipeline-parallel
     /// inference. Rank 0 owns the embedding (`layer0` IR); the last rank
-    /// owns the head; every rank owns an even slice of the transformer
-    /// shells (+ their experts). `total == 1` loads the whole model — the
-    /// path [`Self::load`] uses. The hidden state flows rank→rank as F32
-    /// over `cascadia-transport`; each rank keeps only its own layers' KV.
+    /// owns the head. The layer slice is `[layer_start, layer_end)` (global,
+    /// half-open) when `layer_end > layer_start` — an explicit, possibly
+    /// asymmetric split — otherwise an even split across ranks. `total == 1`
+    /// loads the whole model (the path [`Self::load`] uses). The hidden
+    /// state flows rank→rank as F32 over `cascadia-transport`; each rank
+    /// keeps only its own layers' KV.
+    #[allow(clippy::too_many_arguments)]
     pub fn load_staged(
         model_dir: PathBuf,
         device: &str,
@@ -286,6 +299,9 @@ impl OvMoeRunner {
         max_cached_experts: Option<NonZeroUsize>,
         rank: u32,
         total: u32,
+        layer_start: u32,
+        layer_end: u32,
+        force_split: bool,
     ) -> Result<Self, OvMoeError> {
         let manifest = Manifest::load(&model_dir)?;
         if !manifest.is_ov_shell() {
@@ -334,41 +350,30 @@ impl OvMoeRunner {
         let is_last = rank == total - 1;
         let all_ids = manifest.ov_layer_ids();
         let n = all_ids.len();
-        // Layer slice. Default: an even split across ranks. Override:
-        // `CASCADIA_M2_LAYER_RANGE=start:end` (global, half-open) pins this
-        // rank's layers explicitly, so an asymmetric ring is possible — e.g.
-        // a high-RAM CPU node holding most layers while a small iGPU node
-        // holds a few. The ranges must partition `0..num_layers` contiguously
-        // in rank order (the driver streams hidden states down the chain).
-        let layer_ids: Vec<u32> = match std::env::var("CASCADIA_M2_LAYER_RANGE").ok() {
-            Some(spec) => {
-                let parse = || -> Option<(u32, u32)> {
-                    let (a, b) = spec.split_once(':')?;
-                    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-                };
-                let (s, e) = parse().ok_or_else(|| {
-                    OvMoeError::Internal(format!(
-                        "CASCADIA_M2_LAYER_RANGE={spec:?} must be 'start:end' (half-open)"
-                    ))
-                })?;
-                all_ids
-                    .iter()
-                    .copied()
-                    .filter(|&l| l >= s && l < e)
-                    .collect()
-            }
-            None => {
-                let per = n / total as usize;
-                let rem = n % total as usize;
-                let r = rank as usize;
-                let start = r * per + r.min(rem);
-                let cnt = per + if r < rem { 1 } else { 0 };
-                all_ids[start..start + cnt].to_vec()
-            }
+        // Layer slice. With an explicit `[layer_start, layer_end)` (global,
+        // half-open; from the CLI --layer-start/--layer-end) we pin this
+        // rank's layers — enabling an asymmetric ring (e.g. a high-RAM CPU
+        // node holding most layers, small iGPU nodes a few each). The ranges
+        // must partition `0..num_layers` contiguously in rank order (the
+        // driver streams hidden states down the chain). Otherwise (both 0)
+        // an even split by rank/total.
+        let layer_ids: Vec<u32> = if layer_end > layer_start {
+            all_ids
+                .iter()
+                .copied()
+                .filter(|&l| l >= layer_start && l < layer_end)
+                .collect()
+        } else {
+            let per = n / total as usize;
+            let rem = n % total as usize;
+            let r = rank as usize;
+            let start = r * per + r.min(rem);
+            let cnt = per + if r < rem { 1 } else { 0 };
+            all_ids[start..start + cnt].to_vec()
         };
         if layer_ids.is_empty() {
             return Err(OvMoeError::Internal(format!(
-                "rank {rank}/{total} holds zero of {n} layers (check CASCADIA_M2_LAYER_RANGE / total)"
+                "rank {rank}/{total} holds zero of {n} layers (check --layer-start/--layer-end / total)"
             )));
         }
 
@@ -400,8 +405,12 @@ impl OvMoeRunner {
         // device and the split graphs exist (`tools/split_m2_shells.py`),
         // load the GPU-friendly `shell_core` on the device and the carved
         // `router` on the CPU plugin. On CPU the monolithic shell is used.
-        let split = !device.eq_ignore_ascii_case("CPU")
-            && manifest.shell_core_xml(&model_dir, layer_ids[0]).exists();
+        // Split the shell into shell_core (device) + router (CPU) for non-CPU
+        // execution. `force_split` also forces it on CPU — used by the
+        // split-path test to validate the carve is numerically identical to
+        // the monolithic shell without needing a GPU.
+        let split = manifest.shell_core_xml(&model_dir, layer_ids[0]).exists()
+            && (force_split || !device.eq_ignore_ascii_case("CPU"));
 
         let mut shells = Vec::with_capacity(layer_ids.len());
         let routers = if split {

@@ -362,6 +362,10 @@ impl Builder for SparseMoEBuilder {
             let cfg = self.config.clone();
             let total = cfg.total.max(1);
             let rank = cfg.rank.min(total - 1);
+            // Explicit per-rank layer range from the ShardSpec (CLI
+            // --layer-start/--layer-end). `layer_end == 0` means "unset" →
+            // load_staged falls back to the even split.
+            let (layer_start, layer_end) = (shard.layer_start, shard.layer_end);
             let opts = resolve_runner_options(&cfg);
             let cap = opts.max_cached_experts;
             let plugin_for_worker = plugin.clone();
@@ -379,6 +383,9 @@ impl Builder for SparseMoEBuilder {
                         cap,
                         rank,
                         total,
+                        layer_start,
+                        layer_end,
+                        false, // force_split: production splits by device, not forced
                     )
                 });
             let ov_runner = match join.join() {
