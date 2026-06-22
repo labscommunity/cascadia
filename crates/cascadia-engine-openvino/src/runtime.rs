@@ -846,6 +846,19 @@ impl OvRuntimeEngine {
                 prompt_tokens = prompt_ids.len(),
                 "task active (ov-runtime)"
             );
+            let grammar_mask = match task.grammar.as_ref() {
+                Some(spec) => self
+                    .grammar_factory
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Backend(
+                            "grammar requested but no tokenizer/factory".into(),
+                        )
+                    })?
+                    .create(spec)
+                    .map(Some)?,
+                None => None,
+            };
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
@@ -853,7 +866,7 @@ impl OvRuntimeEngine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
-                grammar_mask: None,
+                grammar_mask,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
