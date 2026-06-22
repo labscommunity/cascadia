@@ -45,7 +45,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-use crate::constrained::{GrammarFactory, GrammarMask};
+use crate::constrained::{ApplyOutcome, GrammarFactory, GrammarMask};
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
@@ -944,14 +944,19 @@ impl OvRuntimeEngine {
                 }
             }
             let mut nt = 0i32;
-            for &t in &tokens {
+            for (i, &t) in tokens.iter().enumerate() {
                 let position = self.position;
                 let ts = std::time::Instant::now();
                 let (out, shape) = self.run_first(&[t], position)?;
                 let alpha = ts.elapsed();
                 self.position += 1;
-                let (token, wire) =
-                    self.resolve_next_token(&out, &shape, single_stage, position)?;
+                let (token, wire) = self.resolve_next_token(
+                    &out,
+                    &shape,
+                    single_stage,
+                    position,
+                    i == tokens.len() - 1,
+                )?;
                 nt = token;
                 if let Some(a) = self.active.as_mut() {
                     a.t_alpha_compute += alpha;
@@ -967,7 +972,7 @@ impl OvRuntimeEngine {
             let (out, shape) = self.run_first(&tokens, position)?;
             let alpha = ts.elapsed();
             self.position += tokens.len() as i64;
-            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position, true)?;
             if let Some(a) = self.active.as_mut() {
                 a.t_alpha_compute += alpha;
                 a.t_wire += wire;
@@ -988,9 +993,21 @@ impl OvRuntimeEngine {
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        mask_step: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+            let vocab = *shape.last().ok_or_else(|| EngineError::Backend("no vocab dim".into()))?;
+            let tok = match (mask_step, self.active.as_mut().and_then(|a| a.grammar_mask.as_mut())) {
+                (true, Some(mask)) => {
+                    let mut row = out[out.len() - vocab..].to_vec();
+                    match mask.apply(&mut row)? {
+                        ApplyOutcome::Masked => argmax_last_row(&row, vocab),
+                        ApplyOutcome::Complete => self.eos_token_ids.first().copied().unwrap_or(128_001) as i32,
+                    }
+                }
+                _ => argmax_logits(out, shape)?,
+            };
+            Ok((tok, std::time::Duration::ZERO))
         } else {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
@@ -1010,6 +1027,12 @@ impl OvRuntimeEngine {
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
         active.last_token = next_token;
         active.generated.push(next_token);
+
+        if let Some(mask) = active.grammar_mask.as_mut() {
+            if !mask.is_stopped() {
+                mask.accept(next_token as u32)?;
+            }
+        }
 
         let tok = self
             .tokenizer
