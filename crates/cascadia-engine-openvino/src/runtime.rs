@@ -997,6 +997,11 @@ impl OvRuntimeEngine {
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
             let vocab = *shape.last().ok_or_else(|| EngineError::Backend("no vocab dim".into()))?;
+            if vocab == 0 || vocab > out.len() {
+                return Err(EngineError::Backend(format!(
+                    "logits len {} < vocab {vocab}", out.len()
+                )));
+            }
             let tok = match (mask_step, self.active.as_mut().and_then(|a| a.grammar_mask.as_mut())) {
                 (true, Some(mask)) => {
                     let mut row = out[out.len() - vocab..].to_vec();
