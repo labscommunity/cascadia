@@ -45,6 +45,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
+use crate::constrained::{GrammarFactory, GrammarMask};
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
@@ -410,6 +411,7 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    grammar_mask: Option<GrammarMask>,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -444,6 +446,9 @@ pub struct OvRuntimeEngine {
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
+    /// Built once at engine construction when a tokenizer is present; `None` for
+    /// tokenizer-less stages. Drives constrained decoding (see constrained.rs).
+    grammar_factory: Option<GrammarFactory>,
     step_warn: StepWarnLimiter,
 }
 
@@ -848,6 +853,7 @@ impl OvRuntimeEngine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
+                grammar_mask: None,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -1724,6 +1730,11 @@ impl Builder for OvRuntimeBuilder {
             None
         };
 
+        let grammar_factory = match self.tokenizer.as_ref() {
+            Some(tok) => Some(GrammarFactory::new(tok, &self.eos_token_ids)?),
+            None => None,
+        };
+
         Ok(Box::new(OvRuntimeEngine {
             spec,
             runtime,
@@ -1740,6 +1751,7 @@ impl Builder for OvRuntimeBuilder {
             pending: Vec::new(),
             active: None,
             static_kv,
+            grammar_factory,
             step_warn: StepWarnLimiter::default(),
         }))
     }
