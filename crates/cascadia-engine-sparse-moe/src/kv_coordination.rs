@@ -175,6 +175,13 @@ impl KvCoordination for SparseMoEEngine {
         KV_ENGINE_REV
     }
 
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        // add_special_tokens=true mirrors the prefill path (engine.rs single-stage encode), so the
+        // head's NEGOTIATE tokens equal what keys the prefix cache.
+        let enc = self.tokenizer.as_ref()?.encode(text, true).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+
     fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         if !self.kv_prefix_cache.enabled() {
             return None; // capacity-0 (e.g. total>1, sharded) — nothing to offer
