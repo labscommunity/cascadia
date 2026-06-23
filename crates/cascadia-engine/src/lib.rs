@@ -195,6 +195,9 @@ pub trait KvCoordination {
     fn layout_version(&self) -> u16;
     /// Engine build revision (codec rejects a mismatch).
     fn engine_rev(&self) -> u64;
+    /// Tokenize a rendered prompt with the engine's own tokenizer, so the head's NEGOTIATE uses the
+    /// exact token sequence the prefill will key the prefix cache on. `None` if no tokenizer.
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>>;
     /// NEGOTIATE: longest-common-prefix of `token_ids` against this holder's cache for `partner`.
     /// Returns the stamped `(snapshot_epoch, prefix_token_len)`, or `None` ⇒ NotFound.
     fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)>;

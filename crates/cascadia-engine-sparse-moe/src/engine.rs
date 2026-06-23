@@ -1022,7 +1022,7 @@ const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 
 pub struct SparseMoEEngine {
     pub(crate) runner: Runner,
-    tokenizer: Option<Tokenizer>,
+    pub(crate) tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
     runtime_handle: tokio::runtime::Handle,
