@@ -187,6 +187,7 @@ pub type LoadStream = Pin<Box<dyn Stream<Item = LoadProgress> + Send>>;
 /// boundary). An engine that holds a prefix KV cache returns `Some` from [`Engine::kv_coordination`];
 /// engines without one (mock / openvino) keep the default `None`. Wire-typed (`cascadia_kv_wire`) so
 /// the enterprise plane needs no engine-internal types. All host-side buffer ops — no device FFI.
+#[cfg(feature = "kv_coord")]
 pub trait KvCoordination {
     /// This rank's model fingerprint — cache key + cross-rev guard.
     fn model_fingerprint(&self) -> u64;
@@ -261,7 +262,8 @@ pub trait Engine: Send {
 
     /// Issue-34 Option C: the engine's KV export/import surface, if it holds a prefix cache. Default
     /// `None` — engines without KV coordination opt out. `&mut` because lookup/export/insert mutate
-    /// the cache (LRU touch, restore).
+    /// the cache (LRU touch, restore). Gated so the wire crate stays out of default trees.
+    #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn KvCoordination> {
         None
     }

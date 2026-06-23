@@ -10,7 +10,12 @@ description = "Engine + Builder traits — the plugin interface every inference 
 
 [dependencies]
 cascadia-types = { workspace = true }
-cascadia-kv-wire = { path = "../cascadia-kv-wire" }
+cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+
+[features]
+# Issue-34 Option C: the KV coordination surface (KvCoordination trait + Engine accessor). Off by
+# default so the wire crate never enters a default consumer's tree.
+kv_coord = ["dep:cascadia-kv-wire"]
