@@ -183,6 +183,38 @@ pub type LoadStream = Pin<Box<dyn Stream<Item = LoadProgress> + Send>>;
 ///
 /// Implementations are not required to be `Send` themselves but the
 /// runner holds them behind a `Mutex`, so they MUST be `Send`.
+/// Issue-34 Option C: the engine's host-side KV export/import contract (the plane's `KvCoordination`
+/// boundary). An engine that holds a prefix KV cache returns `Some` from [`Engine::kv_coordination`];
+/// engines without one (mock / openvino) keep the default `None`. Wire-typed (`cascadia_kv_wire`) so
+/// the enterprise plane needs no engine-internal types. All host-side buffer ops — no device FFI.
+pub trait KvCoordination {
+    /// This rank's model fingerprint — cache key + cross-rev guard.
+    fn model_fingerprint(&self) -> u64;
+    /// KV buffer layout version (codec rejects a mismatch).
+    fn layout_version(&self) -> u16;
+    /// Engine build revision (codec rejects a mismatch).
+    fn engine_rev(&self) -> u64;
+    /// NEGOTIATE: longest-common-prefix of `token_ids` against this holder's cache for `partner`.
+    /// Returns the stamped `(snapshot_epoch, prefix_token_len)`, or `None` ⇒ NotFound.
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)>;
+    /// GET: export the snapshot asserted by `(epoch, len)` → wire `Manifest` + per-layer `(k, v)`
+    /// byte payloads. `None` if the holder's `(epoch, len)` ≠ asserted (evicted / drifted).
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
+    /// Consumer INSERT: materialize a pulled, validated snapshot into the cache so the next prefill
+    /// auto-hits. `Err(())` ⇒ rejected / OOM (the rank votes fail).
+    #[allow(clippy::result_unit_err)]
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()>;
+}
+
 pub trait Engine: Send {
     /// One short forward to compile kernels and warm device caches.
     fn warmup(&mut self);
@@ -226,6 +258,13 @@ pub trait Engine: Send {
     /// suppresses the task's chunks, but the engine slot stays busy
     /// until the task finishes on its own.
     fn cancel(&mut self, _task_id: &TaskId) {}
+
+    /// Issue-34 Option C: the engine's KV export/import surface, if it holds a prefix cache. Default
+    /// `None` — engines without KV coordination opt out. `&mut` because lookup/export/insert mutate
+    /// the cache (LRU touch, restore).
+    fn kv_coordination(&mut self) -> Option<&mut dyn KvCoordination> {
+        None
+    }
 
     /// Tear down the engine. Idempotent.
     fn close(&mut self) {}

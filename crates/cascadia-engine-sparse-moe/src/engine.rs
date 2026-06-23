@@ -867,6 +867,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng_seeded: false,
             spec_decode_k,
             kv_prefix_cache,
+            kv_offers: std::collections::HashMap::new(),
         }))
     }
 }
@@ -1019,7 +1020,7 @@ const MAX_PENDING_TASKS: usize = 8;
 const WORKER_BACKOFF: Duration = Duration::from_millis(200);
 
 pub struct SparseMoEEngine {
-    runner: Runner,
+    pub(crate) runner: Runner,
     tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
@@ -1058,7 +1059,12 @@ pub struct SparseMoEEngine {
     /// the longest matching prefix's snapshot into the runner so the
     /// generate path skips that portion of prefill. See
     /// [`crate::kv_prefix_cache`] for the cache semantics.
-    kv_prefix_cache: KvPrefixCache,
+    pub(crate) kv_prefix_cache: KvPrefixCache,
+    /// Issue-34 Option C: NEGOTIATE→GET correlation. A `lookup` stashes the offered `(prefix_tokens,
+    /// snapshot)` keyed by its content-derived `snapshot_epoch`; the paired `export` retrieves it by
+    /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS`.
+    pub(crate) kv_offers:
+        std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
 }
 
 impl SparseMoEEngine {
@@ -1181,6 +1187,11 @@ impl Engine for SparseMoEEngine {
             return Err(EngineError::NotConnected);
         }
         Ok(produced)
+    }
+
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        // Issue-34 Option C: the sparse-MoE engine holds a `KvPrefixCache`, so it participates.
+        Some(self)
     }
 
     fn close(&mut self) {
