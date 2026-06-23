@@ -366,6 +366,7 @@ name = "cascadia-engine"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "cascadia-kv-wire",
  "cascadia-types",
  "futures",
  "thiserror 1.0.69",
@@ -410,10 +411,12 @@ dependencies = [
  "async-trait",
  "cascadia-engine",
  "cascadia-int4-gemm",
+ "cascadia-kv-wire",
  "cascadia-ov-genai-shim",
  "cascadia-runner",
  "cascadia-transport",
  "cascadia-types",
+ "crc32fast",
  "futures",
  "half",
  "lru",

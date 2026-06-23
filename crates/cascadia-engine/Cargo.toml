@@ -10,6 +10,7 @@ description = "Engine + Builder traits — the plugin interface every inference 
 
 [dependencies]
 cascadia-types = { workspace = true }
+cascadia-kv-wire = { path = "../cascadia-kv-wire" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
