@@ -867,6 +867,7 @@ impl Builder for SparseMoEBuilder {
             last_rank_rng_seeded: false,
             spec_decode_k,
             kv_prefix_cache,
+            #[cfg(feature = "kv_coord")]
             kv_offers: std::collections::HashMap::new(),
         }))
     }
@@ -1063,6 +1064,7 @@ pub struct SparseMoEEngine {
     /// Issue-34 Option C: NEGOTIATE→GET correlation. A `lookup` stashes the offered `(prefix_tokens,
     /// snapshot)` keyed by its content-derived `snapshot_epoch`; the paired `export` retrieves it by
     /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS`.
+    #[cfg(feature = "kv_coord")]
     pub(crate) kv_offers:
         std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
 }
@@ -1189,6 +1191,7 @@ impl Engine for SparseMoEEngine {
         Ok(produced)
     }
 
+    #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         // Issue-34 Option C: the sparse-MoE engine holds a `KvPrefixCache`, so it participates.
         Some(self)

@@ -40,6 +40,7 @@ pub mod dist;
 pub mod dsv4;
 pub mod engine;
 pub mod glm;
+#[cfg(feature = "kv_coord")]
 pub mod kv_coordination;
 pub mod kv_prefix_cache;
 pub mod manifest;
