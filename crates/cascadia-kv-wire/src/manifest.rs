@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u16 = 1;
 /// KV bit-layout / int4 shell ABI version — owned here, bumped on any KV layout change (§6).
 pub const KV_LAYOUT_VERSION: u16 = 1;
+/// Sentinel `kv_layout_version` for an **opaque, self-describing** snapshot (e.g. an OpenVINO
+/// `VariableState` blob) carried as one payload. The codec relaxes the per-layer shape rules for
+/// this layout — only length + crc are enforced — because the producer alone interprets the bytes,
+/// restoring via `set_state` on the same model (matched by `model_fingerprint`). Reserved sentinel:
+/// no structured engine may report it. Bump to `0xFFFE`, … if the blob *envelope* format changes.
+pub const OPAQUE_KV_LAYOUT: u16 = 0xFFFF;
 /// KV element size in bytes (the sparse-MoE engine stores bf16 as `u16`).
 pub const DTYPE_SIZE: usize = 2;
 /// Index of the sequence axis in a per-layer shape `[num_heads, n_slots(seq), head_dim]`.

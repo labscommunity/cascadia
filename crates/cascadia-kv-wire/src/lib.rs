@@ -14,7 +14,7 @@ pub use codec::{KvSnapshotCodec, ValidateError};
 pub use envelope::{Get, KvMessage, Negotiate, Offer, WarmHint};
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use manifest::{
-    CacheKey, LayerMeta, Manifest, PartnerId, DTYPE_SIZE, KV_LAYOUT_VERSION, SCHEMA_VERSION,
-    SEQ_AXIS,
+    CacheKey, LayerMeta, Manifest, PartnerId, DTYPE_SIZE, KV_LAYOUT_VERSION, OPAQUE_KV_LAYOUT,
+    SCHEMA_VERSION, SEQ_AXIS,
 };
 pub use reslice::longest_common_prefix_len;
