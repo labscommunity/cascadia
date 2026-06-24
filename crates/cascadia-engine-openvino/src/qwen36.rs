@@ -308,6 +308,8 @@ impl Builder for Qwen36Builder {
             poisoned: None,
             pending: Vec::new(),
             active: None,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
         }))
     }
 }
@@ -354,6 +356,9 @@ pub struct Qwen36Engine {
     poisoned: Option<String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
+    /// Issue-34 Option C: opaque multi-stage KV blob cache for the coordination plane.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -540,6 +545,18 @@ impl Qwen36Engine {
         let Some(t) = self.active.take() else {
             return Vec::new();
         };
+        // Issue-34: capture this rank's local KV under (prompt + generated) BEFORE reset_all wipes
+        // it. Keyed by the full sequence (session-resume). Gated + best-effort (stub ⇒ no-op).
+        #[cfg(feature = "kv_coord")]
+        {
+            let tokens: Vec<i32> = t
+                .prompt_ids
+                .iter()
+                .chain(t.gen_ids.iter())
+                .map(|&u| u as i32)
+                .collect();
+            self.kv_capture_local(tokens);
+        }
         self.reset_all();
         let elapsed = t.started.elapsed().as_secs_f64();
         let tok_s = if elapsed > 0.0 {
@@ -1347,6 +1364,117 @@ impl Engine for Qwen36Engine {
             self.active = None;
         }
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        // Only ranks that hold KV (a loaded stage) participate; emb-only rank-0 with no stage can't.
+        if self.stages.is_empty() {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl Qwen36Engine {
+    /// Snapshot every local stage's OV KV state into one framed opaque blob (emb is stateless).
+    /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill.
+    fn blob_local_stages(&mut self) -> Option<Vec<u8>> {
+        let mut blobs = Vec::with_capacity(self.stages.len());
+        for st in self.stages.iter_mut() {
+            match st.get_state_blob() {
+                Ok(b) => blobs.push(b),
+                Err(e) => {
+                    tracing::debug!(error = %e, "qwen36: get_state_blob skipped (no KV capture)");
+                    return None;
+                }
+            }
+        }
+        (!blobs.is_empty()).then(|| crate::kv_coordination::frame_blobs(&blobs))
+    }
+
+    /// Restore each local stage from a framed blob (inverse of [`Self::blob_local_stages`]).
+    fn restore_local_stages(&mut self, blob: &[u8]) -> bool {
+        let Some(parts) = crate::kv_coordination::unframe_blobs(blob) else {
+            return false;
+        };
+        if parts.len() != self.stages.len() {
+            return false;
+        }
+        for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
+            if let Err(e) = st.set_state_blob(part) {
+                warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stable model+rank fingerprint: a rank only matches the identical rank on a peer chain (its
+    /// blob is its stage-span's KV, not the whole model's).
+    fn kv_fingerprint(&self) -> u64 {
+        let mut buf = self.manifest_json.clone().into_bytes();
+        buf.extend_from_slice(&self.rank.to_le_bytes());
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
+    }
+
+    /// Capture this rank's local KV under `tokens` (head/single-box token-keyed path). Called at the
+    /// top of `finalize`, before `reset_all` wipes the state. Best-effort.
+    fn kv_capture_local(&mut self, tokens: Vec<i32>) {
+        if tokens.is_empty() {
+            return;
+        }
+        if let Some(blob) = self.blob_local_stages() {
+            self.kv.capture(tokens, blob);
+        }
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for Qwen36Engine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        // add_special_tokens=true mirrors the prefill encode (step_pipe_first / step_local).
+        let enc = self.tokenizer.as_ref()?.encode(text, true).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(token_ids)
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_fingerprint();
+        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        self.kv.capture(tokens, blob);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1379,6 +1507,8 @@ mod tests {
             poisoned: None,
             pending: Vec::new(),
             active: None,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
         }
     }
 
