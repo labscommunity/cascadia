@@ -37,8 +37,10 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Content-derived epoch over the negotiated prefix tokens.
-fn synth_epoch(prefix: &[i32]) -> u64 {
+/// Content-derived epoch over the negotiated prefix tokens. `pub(crate)` so the multi-stage capture
+/// path (engine.rs `step_first`) mints the SAME epoch the head broadcasts to its workers (§8: the
+/// head assigns E; ranks adopt it via the `CAPTURE` frame, never deriving it locally).
+pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     let mut buf = Vec::with_capacity(prefix.len() * 4);
     for &t in prefix {
         buf.extend_from_slice(&t.to_le_bytes());
@@ -209,7 +211,17 @@ impl KvCoordination for SparseMoEEngine {
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let model_fp = self.runner.fingerprint().digest();
-        let (prefix, snap) = self.kv_offers.remove(&expected_epoch)?; // single-use per GET
+        // Two sources, checked in order:
+        //  - `kv_offers`: the head/single-stage NEGOTIATE→GET correlation (short-lived, single-use).
+        //  - `kv_capture`: Task 1.3 multi-stage per-rank store (persistent; a worker has no NEGOTIATE,
+        //    so its slice is stashed at CAPTURE time and may serve repeat/later GETs — clone, no remove).
+        let (prefix, snap) = if let Some(off) = self.kv_offers.remove(&expected_epoch) {
+            off
+        } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+            (tokens.clone(), snap.clone())
+        } else {
+            return None;
+        };
         if snap.past_seq_len as u32 != expected_len {
             return None; // drifted from what was negotiated
         }
