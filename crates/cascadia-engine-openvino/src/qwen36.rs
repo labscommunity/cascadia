@@ -66,6 +66,13 @@ const FRAME_TOKEN: u32 = 7;
 const FRAME_CAPTURE: u32 = 8;
 #[cfg(feature = "kv_coord")]
 const FRAME_CAPTURE_ACK: u32 = 9;
+/// Issue-34 consume: head broadcasts RESTORE at admission so every rank `set_state`s its
+/// pulled+inserted slice. The ACK's `pos` field carries an all-or-nothing verdict (1 = the whole
+/// downstream chain restored; 0 = some rank couldn't ⇒ head falls back to a cold RESET).
+#[cfg(feature = "kv_coord")]
+const FRAME_RESTORE: u32 = 10;
+#[cfg(feature = "kv_coord")]
+const FRAME_RESTORE_ACK: u32 = 11;
 /// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
 
@@ -440,6 +447,13 @@ enum InFrame {
     Capture {
         kv_epoch: u64,
         tokens: Vec<i32>,
+    },
+    /// Issue-34 consume RESTORE: `set_state` the pulled slice stashed under `kv_epoch`. `task_epoch`
+    /// (frame header) advances `peer_epoch` exactly like RESET.
+    #[cfg(feature = "kv_coord")]
+    Restore {
+        task_epoch: u32,
+        kv_epoch: u64,
     },
 }
 
@@ -838,6 +852,34 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 CAPTURE not acked: {e}")))
     }
 
+    /// Issue-34 consume: send `RESTORE(kv_epoch)` downstream and return the chain's all-or-nothing
+    /// verdict (ACK `pos` == 1 ⇒ every downstream rank restored). Used by the head (admission) and
+    /// chained by each middle. `Ok(false)` ⇒ the head must fall back to a cold RESET.
+    #[cfg(feature = "kv_coord")]
+    fn forward_restore_downstream(&mut self, task_epoch: u32, kv_epoch: u64) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
+                    .await?;
+                g.send_raw(&kv_epoch.to_le_bytes()).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, _, verdict) = parse_header(&hb);
+                if kind != FRAME_RESTORE_ACK {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(verdict == 1)
+            }),
+        )
+        .map_err(|e| EngineError::Backend(format!("qwen36 RESTORE not acked: {e}")))
+    }
+
     /// Rank 0 driver step: same task lifecycle as the single-box step,
     /// with the downstream stage + argmax behind the wire.
     fn step_pipe_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -860,17 +902,9 @@ impl Qwen36Engine {
                     )];
                 }
             }
-            // Admission: reset local state, bump the epoch,
-            // RESET/RESET_ACK the downstream, then admit at position 0.
-            self.reset_all();
+            // Admission (spec §3.2): bump the epoch (frames carry it), tokenize, then either
+            // warm-resume (chain-wide RESTORE of the pulled KV) or cold-reset to position 0.
             self.epoch = self.epoch.wrapping_add(1);
-            if let Err(e) = self.reset_exchange() {
-                warn!(task = %task.task_id, error = %e, "qwen36: admission reset failed");
-                return vec![(
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id, e.to_string()),
-                )];
-            }
             let tokenizer = self.tokenizer.as_ref().expect("rank 0 has tokenizer");
             let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
@@ -903,11 +937,59 @@ impl Qwen36Engine {
             } else {
                 self.max_tokens_default
             } as usize;
+            // Cold admission: RESET local + downstream to position 0. Early-returns the task's error
+            // chunk on a downstream RESET failure. Used by every non-warm path.
+            macro_rules! cold_admit {
+                () => {{
+                    self.reset_all();
+                    if let Err(e) = self.reset_exchange() {
+                        warn!(task = %task.task_id, error = %e, "qwen36: admission reset failed");
+                        return vec![(
+                            task.task_id.clone(),
+                            Chunk::error(task.task_id, e.to_string()),
+                        )];
+                    }
+                }};
+            }
+            // Issue-34 warm-resume: a cached strict-prefix blob ⇒ RESTORE this rank + the whole
+            // downstream chain (all-or-nothing); any rank short ⇒ cold. 0 ⇒ full prefill (default).
+            let warm_prefix: usize = {
+                #[cfg(feature = "kv_coord")]
+                {
+                    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
+                    match self.kv.take_warm(&prompt_i32) {
+                        Some((blob, len)) => {
+                            let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            let chain_ok = self.restore_local_stages(&blob)
+                                && self
+                                    .forward_restore_downstream(self.epoch, kv_epoch)
+                                    .unwrap_or(false);
+                            if chain_ok {
+                                info!(task = %task.task_id, warm_prefix = len, "qwen36 pipeline warm-resumed");
+                                len
+                            } else {
+                                warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
+                                cold_admit!();
+                                0
+                            }
+                        }
+                        None => {
+                            cold_admit!();
+                            0
+                        }
+                    }
+                }
+                #[cfg(not(feature = "kv_coord"))]
+                {
+                    cold_admit!();
+                    0
+                }
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 prompt_ids,
-                prefill_idx: 0,
-                step: 0,
+                prefill_idx: warm_prefix,
+                step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: Vec::new(),
@@ -1028,6 +1110,19 @@ impl Qwen36Engine {
                         .ok_or(TransportError::SocketClosed)?;
                     Ok(InFrame::Capture { kv_epoch, tokens })
                 }
+                #[cfg(feature = "kv_coord")]
+                FRAME_RESTORE => {
+                    let eb = g.recv_raw(8).await?;
+                    let kv_epoch = u64::from_le_bytes(
+                        eb.as_slice()
+                            .try_into()
+                            .map_err(|_| TransportError::SocketClosed)?,
+                    );
+                    Ok(InFrame::Restore {
+                        task_epoch: epoch,
+                        kv_epoch,
+                    })
+                }
                 FRAME_FORWARD => {
                     let (t, _) = g.recv().await?;
                     if !matches!(t.dtype, WireDType::F32) {
@@ -1121,6 +1216,35 @@ impl Qwen36Engine {
                 run_async(&h, async move {
                     let mut g = upstream.lock().await;
                     g.send_raw(&frame_header(FRAME_CAPTURE_ACK, 0, 0)).await
+                })
+                .map_err(map_wire)
+            }
+            #[cfg(feature = "kv_coord")]
+            InFrame::Restore {
+                task_epoch,
+                kv_epoch,
+            } => {
+                // Consume warm-resume: set_state this rank's pulled slice, chain RESTORE downstream,
+                // ack with the all-or-nothing verdict (local && downstream restored). A miss anywhere
+                // ⇒ verdict 0 ⇒ the head re-RESETs the chain cold (never a partial/corrupt restore).
+                self.peer_epoch = task_epoch;
+                let local_ok = match self.kv.take_capture(kv_epoch) {
+                    Some((_, blob)) => self.restore_local_stages(&blob),
+                    None => false,
+                };
+                let down_ok = if is_last {
+                    true
+                } else {
+                    self.forward_restore_downstream(task_epoch, kv_epoch)
+                        .unwrap_or(false)
+                };
+                let verdict = u32::from(local_ok && down_ok);
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_RESTORE_ACK, task_epoch, verdict))
+                        .await
                 })
                 .map_err(map_wire)
             }
@@ -1580,7 +1704,7 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.capture(tokens, blob);
+        self.kv.insert_both(tokens, blob);
         Ok(())
     }
 }
