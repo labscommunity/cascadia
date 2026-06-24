@@ -140,6 +140,16 @@ fn sampling_wire_round_trips_defaults_and_explicit_values() {
     assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
 }
 
+#[test]
+fn decode_sanitizes_corrupt_zero_repetition_penalty() {
+    // An all-zero (or otherwise corrupt) sampling block from an out-of-version
+    // peer must not yield repetition_penalty == 0, which the sampler would use
+    // as a divisor (logit / 0 = +inf). It clamps back to the 1.0 no-op.
+    let bytes = [0u8; SAMPLING_WIRE_BYTES];
+    let cfg = decode_sampling(&bytes);
+    assert_eq!(cfg.repetition_penalty, 1.0);
+}
+
 #[tokio::test]
 async fn reset_frame_round_trips() {
     let (server, client) = make_pair().await;

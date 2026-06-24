@@ -70,7 +70,10 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
     }
 
     // OpenAI frequency / presence penalties (subtractive, on logits). Applied
-    // over the full running history. Gated so there's zero cost when unused.
+    // over the full running `history` — which includes the prompt tokens, like
+    // the repetition penalty above. OpenAI scopes these to the completion only;
+    // including the prompt is a deliberate, common local-sampler choice (it also
+    // discourages parroting the prompt). Gated so there's zero cost when unused.
     if cfg.frequency_penalty != 0.0 || cfg.presence_penalty != 0.0 {
         let mut seen = std::collections::HashSet::new();
         for &tok in history.iter() {

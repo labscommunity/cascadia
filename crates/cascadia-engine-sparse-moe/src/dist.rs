@@ -204,10 +204,14 @@ pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
         0.0,
     )
     .min(1.0);
+    // repetition_penalty is a divisor in the sampler (`logit / α`), so a wire
+    // value of 0 from a corrupt/out-of-version peer would map a positive logit
+    // to +inf. Clamp anything <= 0 (and NaN) back to 1.0 (no-op) — the min is
+    // MIN_POSITIVE, not 0.0, so exactly-zero falls back too.
     let repetition_penalty = sanitize_f32(
         f32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         1.0,
-        0.0,
+        f32::MIN_POSITIVE,
     );
     let rep_window = u64::from_be_bytes([
         bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
