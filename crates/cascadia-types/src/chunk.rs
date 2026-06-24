@@ -101,4 +101,13 @@ impl Chunk {
         self.prompt_tokens = Some(n);
         self
     }
+
+    /// Record how many model tokens this chunk's `text` condenses. Engines
+    /// that deliver a whole response on one chunk (ov-genai) set this so the
+    /// API's `usage.completion_tokens` reflects the real count instead of
+    /// the "one token per chunk" fallback. See `Chunk::n_tokens` docs.
+    pub fn with_n_tokens(mut self, n: u32) -> Self {
+        self.n_tokens = Some(n);
+        self
+    }
 }

@@ -53,13 +53,12 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 pub use cascadia_types::ApiStats;
 
 /// Tokens a chunk contributes to the cumulative counter. The engine's
-/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1);
-/// otherwise the per-chunk convention is "one token per non-empty chunk"
-/// (see `Chunk::n_tokens` docs). An empty chunk — the no-text final
-/// marker mock/runtime engines emit — contributes 0 so it isn't counted
-/// as a phantom token. (ov-genai delivers its whole response on a single
-/// final chunk with no `n_tokens`, so it counts as 1 here — approximate,
-/// since that engine tokenizes internally and reports no token count.)
+/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1;
+/// ov-genai sets it on its single final chunk so `usage` reflects the
+/// real generated count — issue #55); otherwise the per-chunk convention
+/// is "one token per non-empty chunk" (see `Chunk::n_tokens` docs). An
+/// empty chunk — the no-text final marker mock/runtime engines emit —
+/// contributes 0 so it isn't counted as a phantom token.
 fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
     chunk
         .n_tokens
@@ -672,7 +671,7 @@ async fn chat_completions(
         }],
         usage: Usage {
             // From the engine's final chunk; 0 when the engine can't tell
-            // (e.g. ov-genai tokenizes inside the pipeline).
+            // (e.g. an engine that reports no prompt-token count).
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
@@ -852,9 +851,33 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use cascadia_engine_mock::MockBuilder;
-    use cascadia_types::{PeerLayout, ShardSpec};
+    use cascadia_types::{Chunk, PeerLayout, ShardSpec};
     use serde_json::Value;
     use tower::ServiceExt;
+
+    // Guards the contract the ov-genai usage fix (#55) depends on: when an
+    // engine sets `n_tokens` on a single text-bearing final chunk, that count
+    // is authoritative (not the "1 per chunk" fallback), so `usage` reflects
+    // the real generated-token count rather than 0/1.
+    #[test]
+    fn chunk_token_count_honors_engine_count() {
+        // ov-genai's shape: whole response on one final chunk, n_tokens set.
+        let c = Chunk::final_marker("t", "The capital of France is Paris.").with_n_tokens(8);
+        assert_eq!(chunk_token_count(&c), 8);
+
+        // Same shape WITHOUT n_tokens falls back to 1 (the pre-#55 behavior
+        // that under-counted ov-genai) — documents why the engine must set it.
+        let c = Chunk::final_marker("t", "The capital of France is Paris.");
+        assert_eq!(chunk_token_count(&c), 1);
+
+        // Empty final marker (mock/runtime) contributes 0 — no phantom token.
+        let c = Chunk::final_marker("t", "");
+        assert_eq!(chunk_token_count(&c), 0);
+
+        // A normal per-token chunk counts as 1.
+        let c = Chunk::token("t", 123, "Paris");
+        assert_eq!(chunk_token_count(&c), 1);
+    }
 
     async fn make_app() -> Router {
         let mut runner = Runner::new(Box::new(MockBuilder::new()));

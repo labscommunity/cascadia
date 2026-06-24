@@ -322,7 +322,18 @@ impl Engine for OvGenaiEngine {
             "task done"
         );
 
-        let chunk = Chunk::final_marker(task.task_id.clone(), text);
+        // Carry the real token counts on the final chunk so the API's
+        // `usage` block is populated (issue #55 — previously always 0 for
+        // this engine because the whole response lands on one chunk with no
+        // per-token count). `prompt_tokens` is the rendered-prompt token
+        // count; it is exact when the API pre-templated the prompt
+        // (`skip_chat_template`) and a slight undercount when ov-genai
+        // applies its own template internally (the template wrapping isn't
+        // counted). None when the tokenizer is unavailable.
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), text).with_n_tokens(tokens);
+        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+            chunk = chunk.with_prompt_tokens(prompt_tokens);
+        }
         vec![(task.task_id, chunk)]
     }
 }
