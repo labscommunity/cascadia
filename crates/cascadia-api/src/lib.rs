@@ -533,6 +533,15 @@ impl ChatPromptRenderer {
     }
 }
 
+/// One-shot chat-prompt render for standalone / embedded callers that hold a
+/// [`ChatTemplateConfig`] directly (e.g. an embedded shard backend) and render
+/// outside the router's `AppState`. Builds a [`ChatPromptRenderer`] per call;
+/// callers that render repeatedly should construct one [`ChatPromptRenderer`]
+/// and reuse it. Falls back to [`render_prompt_legacy`] on parse/render failure.
+pub fn render_chat_prompt(cfg: &ChatTemplateConfig, messages: &[ChatMessage]) -> String {
+    ChatPromptRenderer::new(cfg).render(messages)
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
