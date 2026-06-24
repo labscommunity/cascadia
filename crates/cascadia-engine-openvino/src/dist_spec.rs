@@ -389,6 +389,18 @@ impl MaskedReq {
     pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
         self.runtime.set_state_blob(b).is_ok()
     }
+    /// After a warm `set_state_blob`, align the host-side cursors to the restored prefix length so
+    /// the next `feed` appends the suffix at the right position (mirrors `reset`, but to `len`).
+    pub(crate) fn kv_set_pos(&mut self, len: usize) {
+        if len + 1 > self.valid_mask.len() {
+            self.valid_mask.resize((len + 1) * 2, 1);
+        }
+        for m in self.valid_mask.iter_mut() {
+            *m = 1;
+        }
+        self.cache_len = len;
+        self.logical_pos = len;
+    }
 }
 
 impl MaskedReq {
@@ -590,6 +602,17 @@ impl DistributedMaskedReq {
     }
     pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
         self.stage0.set_state_blob(b).is_ok()
+    }
+    /// Align host-side cursors to a restored prefix (see `MaskedReq::kv_set_pos`).
+    pub(crate) fn kv_set_pos(&mut self, len: usize) {
+        if len + 1 > self.valid_mask.len() {
+            self.valid_mask.resize((len + 1) * 2, 1);
+        }
+        for m in self.valid_mask.iter_mut() {
+            *m = 1;
+        }
+        self.cache_len = len;
+        self.logical_pos = len;
     }
 
     /// §8 CAPTURE: broadcast `(epoch, tokens)` down the target chain; await the aggregate ACK.
@@ -1453,15 +1476,24 @@ impl OvDistSpecEngine {
         task: GenerationTask,
         prompt_ids: &[i64],
     ) -> Result<ActiveSpec, EngineError> {
-        self.target.reset()?;
+        // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
+        // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
+        #[cfg(feature = "kv_coord")]
+        let warm_len = self.kv_try_warm_resume(prompt_ids);
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_len = 0usize;
+        if warm_len == 0 {
+            self.target.reset()?;
+            self.draft.reset()?;
+        }
         self.target.t_alpha_setup = std::time::Duration::ZERO;
         self.target.t_alpha_infer = std::time::Duration::ZERO;
         self.target.t_alpha_output = std::time::Duration::ZERO;
         self.target.t_wire = std::time::Duration::ZERO;
-        self.draft.reset()?;
 
-        let (t_logits, t_shape) = self.target.feed(prompt_ids)?;
-        self.draft.feed(prompt_ids)?;
+        let feed_ids = &prompt_ids[warm_len..];
+        let (t_logits, t_shape) = self.target.feed(feed_ids)?;
+        self.draft.feed(feed_ids)?;
         let vocab = t_shape[2];
         let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
 
@@ -2442,6 +2474,36 @@ impl OvDistSpecEngine {
             warn!(error = %e, "ov-dist-spec: CAPTURE broadcast failed (best-effort)");
         }
         self.kv.capture(tokens, blob);
+    }
+
+    /// Try to warm-resume: restore draft + target-stage0 + the whole target chain (all-or-nothing)
+    /// for a cached strict prefix. Returns the warm prefix length (0 ⇒ cold). On partial restore,
+    /// resets everything cold (a partial restore would corrupt spec-decode).
+    fn kv_try_warm_resume(&mut self, prompt_ids: &[i64]) -> usize {
+        let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+        let Some((blob, len)) = self.kv.take_warm(&prompt_i32) else {
+            return 0;
+        };
+        let Some(parts) = crate::kv_coordination::unframe_blobs(&blob) else {
+            return 0;
+        };
+        if parts.len() != 2 {
+            return 0;
+        }
+        let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+        let ok = self.draft.kv_restore(&parts[0])
+            && self.target.stage0_restore(&parts[1])
+            && self.target.restore_downstream(epoch).unwrap_or(false);
+        if ok {
+            self.draft.kv_set_pos(len);
+            self.target.kv_set_pos(len);
+            info!(warm_prefix = len, "ov-dist-spec pipeline warm-resumed");
+            len
+        } else {
+            let _ = self.target.reset();
+            let _ = self.draft.reset();
+            0
+        }
     }
 }
 
