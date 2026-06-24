@@ -88,6 +88,45 @@ beat pipeline on their own. The persistent megakernel is the load-bearing next s
 (this is the `cascadia-megakernel` effort), with speedeth's fast wire attacking the residual
 all-reduce.
 
+### Decode-only profile, measured 2-node (alpha rank0 + charlie rank1, int4)
+
+The instrumentation now resets after prefill and splits the *steady-state decode*
+forward into four buckets (`SE_TP_TUNE`, `decode profile` log line). Measured over 4–8
+reps of 64–96-token greedy decode, per token:
+
+| Bucket | µs/token | share | what it is |
+|---|---|---|---|
+| **GPU segment infers** | **~37,000** | **81%** | 34 OV `InferRequest`s × ~1.05 ms each |
+| All-reduce | ~7,200 | 16% | 32 TCP round-trips × ~225 µs (192.168.0.x LAN) |
+| Host setup | ~1,080 | 2.4% | `set_input` + f32↔bytes conversions |
+| Other | ~97 | 0.2% | residual adds, argmax, control broadcast |
+
+This is the hard confirmation of the loopback estimate: **the wall is GPU dispatch (81%)**,
+and the host path is negligible (2.4%) — so set_input/tensor-reuse micro-optimization buys
+nothing and was not pursued. The only OV-level bucket with real headroom is the all-reduce
+(16%), which is exactly speedeth's small-message-RTT regime.
+
+### What OV-level tuning recovers (`SE_TP_TUNE` A/B)
+
+Pinning the GPU plugin to the single-stream low-latency schedule
+(`PERFORMANCE_HINT=LATENCY` + `NUM_STREAMS=1`, default-on; `SE_TP_TUNE=0` reverts) is the
+cheapest possible lever — pure plugin config, no re-export, no kernel work. Measured A/B,
+same nodes/client/model:
+
+| Config | decode tok/s (median) | GPU bucket |
+|---|---|---|
+| baseline (`SE_TP_TUNE=0`) | 22.2 | ~37.0 ms/tok |
+| tuned (`SE_TP_TUNE=1`) | **23.4** | ~34.0 ms/tok |
+
+**~+5–8%, and that is the ceiling for OV-config tuning.** The LATENCY hint shaves only ~8%
+off the GPU bucket because the per-infer cost is the irreducible OV-plugin/Level-Zero
+*per-invocation* floor — a half-width attn segment costs about as much as a full monolithic
+layer. No config knob touches that; only **fewer dispatches** (impossible in standard
+2-all-reduce-per-layer Megatron — the MLP's column-parallel gate/up needs the full post-attn
+hidden, so neither all-reduce can be skipped or merged) or a **lighter dispatch path**
+(the megakernel) can. Confirmed empirically: the cheap lever is worth single digits, the
+structural fix is the megakernel.
+
 ## Run
 
 ```
