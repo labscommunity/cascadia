@@ -965,8 +965,7 @@ impl Qwen36Engine {
                                     .forward_restore_downstream(self.epoch, kv_epoch)
                                     .unwrap_or(false);
                             if chain_ok {
-                                // Position from real KV depth, not token count (off-by-one: the turn's
-                                // last sampled token was never fed ⇒ KV = len-1). Same fix as ov-runtime.
+                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                                 let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
@@ -1400,7 +1399,7 @@ impl Qwen36Engine {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&prompt_i32) {
                         Some((blob, len)) if self.restore_local_stages(&blob) => {
-                            // Real KV depth, not token count (off-by-one — see ov-runtime).
+                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
                                 .map(|s| s.min(len))
                                 .unwrap_or(len);

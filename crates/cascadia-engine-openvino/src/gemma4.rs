@@ -832,9 +832,7 @@ impl Gemma4Engine {
                             }
                         };
                         if chain_ok {
-                            // Position/mask track the REAL restored KV depth, not the matched token
-                            // count (the turn's last sampled token was never fed ⇒ KV = len-1).
-                            // See kv_seq_from_blob — same off-by-one fix as ov-runtime.
+                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
                                 .map(|s| s.min(len))
                                 .unwrap_or(len);

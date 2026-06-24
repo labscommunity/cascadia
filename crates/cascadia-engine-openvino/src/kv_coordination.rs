@@ -52,15 +52,12 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     fnv1a64(&buf)
 }
 
-/// Restored KV depth (max `shape[2]` over rank>=3 states) read straight from a `get_state_blob`
-/// blob. The blob is self-describing — `[u32 count]` then per state
-/// `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nbytes][data]` (LE).
+/// Restored KV depth (max `shape[2]` over rank≥3 states) from a `get_state_blob` blob — `[u32 count]`
+/// then per state `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nb][data]` (LE).
 ///
-/// Why this exists: the cached token list is `prompt + all generated`, but the KV only holds tokens
-/// that were *fed* — the last sampled token of a turn is never fed back, so KV depth = matched_len-1.
-/// Warm-resume must drive `position`/`attention_mask` from the real KV depth, else the suffix decode
-/// feeds `mask_len = kv+2` against `kv+1` keys and the attention `Add` fails on shape. Engine-agnostic
-/// (reads the actual depth instead of assuming the off-by-one). `None` if the blob is unparseable.
+/// Warm-resume drives position/mask off this, not the matched token count: a turn's last sampled token
+/// is never fed back, so KV depth = matched_len-1; using the token count overshoots the mask by one and
+/// the attention `Add` fails on shape. `None` if unparseable (caller falls back to the token count).
 pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     fn u32_at(b: &[u8], p: usize) -> Option<u32> {
         Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
@@ -95,10 +92,9 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     (seq > 0).then_some(seq)
 }
 
-/// KV depth from a multi-stage FRAMED blob (`frame_blobs` of N per-stage `get_state_blob`s) — the max
-/// `kv_seq_from_blob` over its parts. Stages share the sequence length, so any part gives the depth;
-/// `max` is a safe tie-break. Use for engines whose warm blob is framed (qwen36 stages, dist-spec
-/// draft+target); raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
+/// [`kv_seq_from_blob`] for a framed multi-stage blob (`frame_blobs`): max depth over its parts (stages
+/// share the sequence length, `max` is a safe tie-break). For qwen36 stages / dist-spec draft+target;
+/// raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
 pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
     let parts = unframe_blobs(blob)?;
     parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
