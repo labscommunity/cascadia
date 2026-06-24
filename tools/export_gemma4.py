@@ -614,9 +614,11 @@ def build_cached_wrapper(model, text_config, stage_plan):
     # (global) layers have fewer KV heads (num_global_key_value_heads) than
     # sliding_attention (local) layers, alongside the asymmetric head_dim. E2B/E4B
     # lack the global field, so this falls back to num_key_value_heads (unchanged).
+    # The trailing `or` also covers configs that carry the field but leave it
+    # None/0, which getattr would otherwise pass through as a bad head count.
     num_kv_heads_global = getattr(
         text_config, "num_global_key_value_heads", num_kv_heads_local
-    )
+    ) or num_kv_heads_local
     num_kv_heads_per_layer = [
         (num_kv_heads_global if lt == "full_attention" else num_kv_heads_local)
         for lt in stage_layer_types
@@ -905,9 +907,11 @@ def export_single_stage(model, text_config, stage_plan, output_dir, quantization
     hidden_dim = text_config.hidden_size
     pli_dim = text_config.hidden_size_per_layer_input or 0
     num_kv_heads = text_config.num_key_value_heads
+    # `or num_kv_heads` guards a present-but-None/0 global field (see
+    # build_cached_wrapper); absent → getattr default already handles E2B/E4B.
     num_kv_heads_global = getattr(
         text_config, "num_global_key_value_heads", num_kv_heads
-    )
+    ) or num_kv_heads
     downstream_pli_count = num_total - le if not has_head else 0
 
     log(f"\n{'=' * 60}")
