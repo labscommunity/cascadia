@@ -1479,6 +1479,10 @@ pub struct OvRuntimeEngine {
     /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 consume: set by a `RESTORE` control frame; suppresses the next prefill's implicit
+    /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
+    #[cfg(feature = "kv_coord")]
+    kv_warm_pending: bool,
 }
 
 impl OvRuntimeEngine {
@@ -2073,8 +2077,26 @@ impl OvRuntimeEngine {
                 if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
-                            warm_prefix = len;
-                            info!(warm_prefix = len, "ov-runtime warm-resumed from KV blob");
+                            // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
+                            // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
+                            let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                            let chain_ok = !multi || {
+                                let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                                match self.send_restore_downstream(epoch) {
+                                    Ok(true) => true,
+                                    _ => {
+                                        let _ = self.send_abort_downstream();
+                                        false
+                                    }
+                                }
+                            };
+                            if chain_ok {
+                                warm_prefix = len;
+                                info!(warm_prefix = len, "ov-runtime warm-resumed from KV blob");
+                            } else {
+                                let _ = self.runtime.reset_state();
+                                warn!("ov-runtime: pipeline restore incomplete; cold reprefill");
+                            }
                         }
                         Err(e) => {
                             warn!(error = %e, "set_state_blob failed; cold reprefill");
@@ -3338,6 +3360,19 @@ impl OvRuntimeEngine {
         }
     }
 
+    /// Issue-34: consume the one-shot warm-resume flag. `true` ⇒ this prefill continues a RESTOREd
+    /// state, so the worker must NOT reset. Always `false` in the default build (no-op).
+    fn kv_consume_warm_pending(&mut self) -> bool {
+        #[cfg(feature = "kv_coord")]
+        {
+            std::mem::take(&mut self.kv_warm_pending)
+        }
+        #[cfg(not(feature = "kv_coord"))]
+        {
+            false
+        }
+    }
+
     fn step_last(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
@@ -3370,7 +3405,10 @@ impl OvRuntimeEngine {
             // (reset at 0); seq is always 1.
             Some(pos) => self.run_relay(&hidden, shape, pos)?,
             None => {
-                if shape[1] > 1 {
+                // Reset on a fresh prefill UNLESS a RESTORE warm-resumed this rank (keep that state +
+                // its position). The flag is consumed every prefill so it never leaks across turns.
+                let warm = self.kv_consume_warm_pending();
+                if shape[1] > 1 && !warm {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                     self.position = 0;
                 }
@@ -3466,7 +3504,8 @@ impl OvRuntimeEngine {
                 (o, s, pos)
             }
             None => {
-                if shape[1] > 1 {
+                let warm = self.kv_consume_warm_pending();
+                if shape[1] > 1 && !warm {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                     self.position = 0;
                 }
@@ -3894,6 +3933,17 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
 const OPCODE_CAPTURE: u8 = 1;
 #[cfg(feature = "kv_coord")]
 const OPCODE_CAPTURE_ACK: u8 = 2;
+/// Consume: `RESTORE(epoch)` set_states a rank's pulled slice; the ACK's data[1] is an all-or-nothing
+/// verdict. On a fail verdict the head `ABORT`s — every rank resets cold (a partial restore corrupts
+/// output). `ABORT` also clears a stray `kv_warm_pending` so a cold turn re-prefills clean.
+#[cfg(feature = "kv_coord")]
+const OPCODE_RESTORE: u8 = 3;
+#[cfg(feature = "kv_coord")]
+const OPCODE_RESTORE_ACK: u8 = 4;
+#[cfg(feature = "kv_coord")]
+const OPCODE_ABORT: u8 = 5;
+#[cfg(feature = "kv_coord")]
+const OPCODE_ABORT_ACK: u8 = 6;
 
 #[cfg(feature = "kv_coord")]
 impl OvRuntimeEngine {
@@ -3926,13 +3976,15 @@ impl OvRuntimeEngine {
         }
     }
 
-    /// Worker → upstream: ACK a CAPTURE.
-    fn send_capture_ack_upstream(&mut self) -> EngineResult<()> {
+    /// Worker → upstream: ACK a control frame (`payload` carries e.g. the RESTORE verdict).
+    fn send_control_ack_upstream(&mut self, ack_opcode: u8, payload: &[u8]) -> EngineResult<()> {
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE_ACK]);
+        let mut data = vec![ack_opcode];
+        data.extend_from_slice(payload);
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
         self.block_on(async move {
             let mut g = upstream.lock().await;
             g.send(&t).await
@@ -3941,10 +3993,51 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
+    /// Head/middle → downstream: `RESTORE(epoch)`; returns the chain's all-or-nothing verdict
+    /// (ACK data[1] == 1 ⇒ every downstream rank restored). `Ok(false)` ⇒ caller must `ABORT` + cold.
+    fn send_restore_downstream(&mut self, epoch: u64) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![OPCODE_RESTORE];
+        data.extend_from_slice(&epoch.to_le_bytes());
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                let (ack, _) = g.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_RESTORE_ACK) {
+            Ok(ack.data.get(1) == Some(&1))
+        } else {
+            Err(EngineError::Backend("ov-runtime: bad RESTORE ack".into()))
+        }
+    }
+
+    /// Head/middle → downstream: `ABORT` (reset cold + clear warm); await ACK. Best-effort.
+    fn send_abort_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_ABORT]);
+        self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t).await?;
+            let _ = g.recv().await?;
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
     /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
-    /// CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream (middles), ack up.
     fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
         match t.data.first().copied() {
+            // CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream, ack up.
             Some(OPCODE_CAPTURE) => {
                 let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
                     .ok_or_else(|| EngineError::Backend("ov-runtime: bad CAPTURE body".into()))?;
@@ -3956,7 +4049,47 @@ impl OvRuntimeEngine {
                         warn!(error = %e, "ov-runtime: CAPTURE chain downstream failed (best-effort)");
                     }
                 }
-                self.send_capture_ack_upstream()
+                self.send_control_ack_upstream(OPCODE_CAPTURE_ACK, &[])
+            }
+            // RESTORE: set_state this rank's pulled slice + arm warm_pending; chain downstream; ack
+            // the all-or-nothing verdict. A miss anywhere ⇒ verdict 0 ⇒ head ABORTs the chain.
+            Some(OPCODE_RESTORE) => {
+                let epoch = t
+                    .data
+                    .get(1..9)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(|| EngineError::Backend("ov-runtime: bad RESTORE body".into()))?;
+                let local_ok = match self.kv.take_capture(epoch) {
+                    Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
+                        Ok(()) => {
+                            self.position = tokens.len() as i64;
+                            self.kv_warm_pending = true;
+                            true
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                let down_ok = if self.spec.is_last_stage {
+                    true
+                } else {
+                    self.send_restore_downstream(epoch).unwrap_or(false)
+                };
+                self.send_control_ack_upstream(OPCODE_RESTORE_ACK, &[u8::from(local_ok && down_ok)])
+            }
+            // ABORT: reset cold + clear warm_pending; chain downstream; ack.
+            Some(OPCODE_ABORT) => {
+                let _ = self.runtime.reset_state();
+                self.kv_warm_pending = false;
+                self.position = 0;
+                if !self.spec.is_last_stage {
+                    let _ = self.send_abort_downstream();
+                }
+                self.send_control_ack_upstream(OPCODE_ABORT_ACK, &[])
             }
             other => Err(EngineError::Backend(format!(
                 "ov-runtime: unknown control opcode {other:?}"
@@ -4819,6 +4952,8 @@ impl Builder for OvRuntimeBuilder {
             consecutive_token_timeouts: 0,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_warm_pending: false,
         }))
     }
 }
