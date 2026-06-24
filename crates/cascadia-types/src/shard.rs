@@ -14,7 +14,10 @@ pub struct ShardSpec {
     pub layer_start: u32,
     pub layer_end: u32,
     pub total_layers: u32,
-    /// OV device hint: `"CPU"`, `"GPU"`, `"NPU"`.
+    /// OV device hint. Forwarded verbatim to `ov::Core::compile_model`.
+    /// Valid forms: `"CPU"`, `"GPU"`, `"GPU.N"`, `"NPU"`, `"NPU.N"`,
+    /// `"AUTO"`, `"MULTI:dev1,dev2,..."`, `"HETERO:dev1,dev2,..."`,
+    /// `"BATCH:dev"`. See `cascadia doctor` for available devices.
     pub device: String,
     pub is_first_stage: bool,
     pub is_last_stage: bool,
