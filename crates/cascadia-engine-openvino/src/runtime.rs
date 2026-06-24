@@ -1956,45 +1956,73 @@ impl OvRuntimeEngine {
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
-        let upstream = self
-            .upstream
-            .clone()
-            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
         // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
         // [seq] or [seq, position]. The LEAD frame's wait is lenient
         // (idle-between-requests); the hidden that must follow it is deadlined,
         // and the bounded token deadline lives on the active wait downstream.
+        //
+        // A stateful KV worker may also receive a bare I8 control frame (CAPTURE)
+        // between turns. It carries no seq and no hidden follows it, so the lead
+        // is recv'd on its own here rather than through `recv_hidden_frames`:
+        // I8 => handle the control and loop to the next activation.
         let want_pos = self.static_kv.is_some();
-        debug!(want_pos, "upstream recv: waiting");
-        let (lead, tensor) = self
-            .block_on(recv_hidden_frames(&upstream))
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        debug!("upstream recv: frames arrived");
-        // Record the seq this stage must echo back on the token it sends
-        // upstream; decode/validate outside the transport closure so a bad
-        // frame yields a clear EngineError, not a desync.
-        let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
-        self.inbound_seq = Some(inbound_seq);
-        let shape = [
-            tensor.shape[0] as usize,
-            tensor.shape[1] as usize,
-            tensor.shape[2] as usize,
-        ];
-        let floats = match tensor.dtype {
-            WireDType::F32 => tensor
-                .data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-            WireDType::F16 => f16_bytes_to_f32(&tensor.data),
-            other => {
-                return Err(EngineError::Backend(format!(
-                    "unexpected upstream dtype {other:?}"
-                )))
+        loop {
+            let upstream = self
+                .upstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+            debug!(want_pos, "upstream recv: waiting");
+            let lead = self
+                .block_on(async move {
+                    let mut guard = upstream.lock().await;
+                    Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            #[cfg(feature = "kv_coord")]
+            if !want_pos && lead.dtype == WireDType::I8 {
+                self.handle_inbound_control(&lead)?;
+                continue;
             }
-        };
-        Ok((floats, shape, position))
+            // `lead` is an activation lead frame: the hidden it promises is a
+            // mid-group frame the peer owes promptly, so it is deadlined.
+            let upstream = self
+                .upstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+            let tensor = self
+                .block_on(async move {
+                    let mut guard = upstream.lock().await;
+                    Ok::<_, cascadia_transport::TransportError>(guard.recv_reply().await?.0)
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            debug!("upstream recv: frames arrived");
+            // Record the seq this stage must echo back on the token it sends
+            // upstream; decode/validate outside the transport closure so a bad
+            // frame yields a clear EngineError, not a desync.
+            let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+            self.inbound_seq = Some(inbound_seq);
+            let shape = [
+                tensor.shape[0] as usize,
+                tensor.shape[1] as usize,
+                tensor.shape[2] as usize,
+            ];
+            let floats = match tensor.dtype {
+                WireDType::F32 => tensor
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                WireDType::F16 => f16_bytes_to_f32(&tensor.data),
+                other => {
+                    return Err(EngineError::Backend(format!(
+                        "unexpected upstream dtype {other:?}"
+                    )))
+                }
+            };
+            return Ok((floats, shape, position));
+        }
     }
+
 
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
         let upstream = self
@@ -2951,7 +2979,21 @@ impl OvRuntimeEngine {
                 let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
                 full.extend_from_slice(&active.generated);
                 match self.runtime.get_state_blob() {
-                    Ok(blob) => self.kv.capture(full, blob),
+                    Ok(blob) => {
+                        // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
+                        // slice under this turn's content epoch. Best-effort. Single-stage (no
+                        // downstream) skips straight to the local stash.
+                        if self.kv_stateful()
+                            && self.downstream.is_some()
+                            && !self.spec.is_last_stage
+                        {
+                            let epoch = crate::kv_coordination::synth_epoch(&full);
+                            if let Err(e) = self.send_capture_downstream(epoch, &full) {
+                                warn!(error = %e, "ov-runtime: CAPTURE broadcast failed (best-effort)");
+                            }
+                        }
+                        self.kv.capture(full, blob);
+                    }
                     Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
                 }
             }
@@ -3840,6 +3882,87 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
         )));
     }
     Ok(layers)
+}
+
+// -------- Issue-34 §8 multi-stage CAPTURE over ov-runtime's frameless transport --------
+//
+// ov-runtime's wire has no frame-kind header — it's a bare positional WireTensor exchange (F16
+// hidden, I64 position, I32 token). A control frame is an **I8** tensor (a dtype no real frame
+// uses ⇒ collision-free): `[opcode | capture_body_bytes]`. Stateful shards only (static/NPU shards
+// drive a host-side KV ring, not OV state, so they don't participate). All `kv_coord`-gated.
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE: u8 = 1;
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE_ACK: u8 = 2;
+
+#[cfg(feature = "kv_coord")]
+impl OvRuntimeEngine {
+    /// True once this rank holds OV state worth coordinating (stateful, post-load).
+    fn kv_stateful(&self) -> bool {
+        self.static_kv.is_none()
+    }
+
+    /// Head/middle → downstream: send `CAPTURE(epoch, tokens)` as an I8 control tensor, await the ACK.
+    fn send_capture_downstream(&mut self, epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![OPCODE_CAPTURE];
+        data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                let (ack, _) = g.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_CAPTURE_ACK) {
+            Ok(())
+        } else {
+            Err(EngineError::Backend("ov-runtime: bad CAPTURE ack".into()))
+        }
+    }
+
+    /// Worker → upstream: ACK a CAPTURE.
+    fn send_capture_ack_upstream(&mut self) -> EngineResult<()> {
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE_ACK]);
+        self.block_on(async move {
+            let mut g = upstream.lock().await;
+            g.send(&t).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
+    /// CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream (middles), ack up.
+    fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
+        match t.data.first().copied() {
+            Some(OPCODE_CAPTURE) => {
+                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                    .ok_or_else(|| EngineError::Backend("ov-runtime: bad CAPTURE body".into()))?;
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                }
+                if !self.spec.is_last_stage {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens) {
+                        warn!(error = %e, "ov-runtime: CAPTURE chain downstream failed (best-effort)");
+                    }
+                }
+                self.send_capture_ack_upstream()
+            }
+            other => Err(EngineError::Backend(format!(
+                "ov-runtime: unknown control opcode {other:?}"
+            ))),
+        }
+    }
 }
 
 // -------- Builder --------
