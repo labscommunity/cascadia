@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
+use crate::constrained::{ApplyOutcome, GrammarFactory, GrammarMask};
 use cascadia_ov_genai_shim::{
     DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
@@ -127,6 +128,65 @@ fn argmax(slice: &[f32]) -> usize {
         );
     }
     best_i
+}
+
+/// Target-only constrained accept loop (spec §3.3). The draft model proposes
+/// K tokens UNMASKED; this folds the K+1 target verify rows through the
+/// grammar matcher so every EMITTED token is grammar-valid. The matcher
+/// advances in lockstep with `out` (one `accept` per pushed token, never per
+/// draft). Returns `(emitted, accepted)` where `accepted` is the count of
+/// draft tokens that matched the masked argmax — the KV rewind is then
+/// `drafts.len() - accepted`, identical to the unmasked path.
+///
+/// `target_rows` is K+1 rows; row `j` is the target distribution verifying
+/// `drafts[j]`, and row K is the bonus row. `remaining` caps how many tokens
+/// may still be emitted this round.
+fn masked_accept(
+    mask: &mut GrammarMask,
+    target_rows: &[&[f32]],
+    drafts: &[i64],
+    eos: &[u32],
+    remaining: usize,
+) -> EngineResult<(Vec<i64>, usize)> {
+    let k = drafts.len();
+    let mut out: Vec<i64> = Vec::new();
+    let mut accepted = 0usize;
+    let mut done = false; // grammar-complete / EOS / budget
+    for j in 0..k {
+        if mask.is_stopped() {
+            done = true;
+            break;
+        }
+        let mut row = target_rows[j].to_vec();
+        if matches!(mask.apply(&mut row)?, ApplyOutcome::Complete) {
+            done = true;
+            break;
+        }
+        let m = argmax(&row) as i64;
+        out.push(m);
+        mask.accept(m as u32)?;
+        if eos.contains(&(m as u32)) || out.len() >= remaining {
+            done = true;
+            break;
+        }
+        if drafts[j] == m {
+            accepted += 1; // matched draft → keep going
+        } else {
+            break; // mismatch: `m` was the correction, stop the window
+        }
+    }
+    // Bonus token only when every draft matched and nothing stopped us.
+    if accepted == k && !done && !mask.is_stopped() {
+        let mut row = target_rows[k].to_vec();
+        if !matches!(mask.apply(&mut row)?, ApplyOutcome::Complete) {
+            let m = argmax(&row) as i64;
+            if out.len() < remaining {
+                out.push(m);
+                mask.accept(m as u32)?;
+            }
+        }
+    }
+    Ok((out, accepted))
 }
 
 fn map_ov_err(err: OvError) -> EngineError {
@@ -1173,6 +1233,9 @@ struct ActiveSpec {
     stats: SpecDecodeStats,
     /// Whether we already emitted the first sampled token's chunk.
     initialized: bool,
+    /// Per-task grammar matcher (driver only). `Some` when `task.grammar`
+    /// is set; constrains the emitted tokens in the target accept loop.
+    grammar_mask: Option<GrammarMask>,
 }
 
 pub struct OvDistSpecEngine {
@@ -1182,6 +1245,9 @@ pub struct OvDistSpecEngine {
     /// All EOS token ids configured for the model. Generation truncates
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
+    /// llguidance matcher factory (driver holds the tokenizer). Drives
+    /// constrained decoding; `None` only when no tokenizer is available.
+    grammar_factory: Option<GrammarFactory>,
     k: usize,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
@@ -1369,7 +1435,33 @@ impl OvDistSpecEngine {
         let (t_logits, t_shape) = self.target.feed(prompt_ids)?;
         self.draft.feed(prompt_ids)?;
         let vocab = t_shape[2];
-        let first = argmax(&t_logits[t_logits.len() - vocab..]) as i64;
+
+        // Build the per-task grammar matcher (driver only) and mask the very
+        // first sampled token before it primes the draft / becomes out[0].
+        let mut grammar_mask = match task.grammar.as_ref() {
+            Some(spec) => Some(
+                self.grammar_factory
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Backend("grammar requested but no tokenizer/factory".into())
+                    })?
+                    .create(spec)?,
+            ),
+            None => None,
+        };
+        let first = if let Some(mask) = grammar_mask.as_mut() {
+            let mut row = t_logits[t_logits.len() - vocab..].to_vec();
+            let tok = match mask.apply(&mut row)? {
+                ApplyOutcome::Masked => argmax(&row) as i64,
+                ApplyOutcome::Complete => self.eos_token_ids.first().copied().unwrap_or(0) as i64,
+            };
+            if !mask.is_stopped() {
+                mask.accept(tok as u32)?;
+            }
+            tok
+        } else {
+            argmax(&t_logits[t_logits.len() - vocab..]) as i64
+        };
 
         let (d_logits, d_shape) = self.draft.feed(&[first])?;
         let dv = d_shape[2];
@@ -1383,6 +1475,7 @@ impl OvDistSpecEngine {
             d_last_logit,
             stats: SpecDecodeStats::default(),
             initialized: false,
+            grammar_mask,
         })
     }
 
@@ -1412,46 +1505,80 @@ impl OvDistSpecEngine {
         verify.extend_from_slice(&drafts);
         let (t_logits, t_shape) = self.target.feed(&verify)?;
         let v = t_shape[2];
-        let mut t_greedy = Vec::with_capacity(verify.len());
-        for i in 0..verify.len() {
-            t_greedy.push(argmax(&t_logits[i * v..(i + 1) * v]) as i64);
-        }
 
-        // Greedy acceptance: accept consecutive matches.
-        let mut accepted = 0usize;
-        for i in 0..drafts.len() {
-            if t_greedy[i] == drafts[i] {
-                accepted += 1;
-            } else {
-                break;
-            }
-        }
-        active.stats.total_accepted += accepted as u32;
-
-        let correction = if accepted < drafts.len() {
-            t_greedy[accepted]
-        } else {
-            t_greedy[drafts.len()]
-        };
-
-        // Append [drafts[..accepted], correction] to out, but truncate at first EOS.
         let out_len_before = active.out.len();
         let mut hit_eos = false;
         let mut hit_max = false;
-        for &t in drafts[..accepted]
-            .iter()
-            .chain(std::iter::once(&correction))
-        {
-            if active.out.len() >= max_tokens {
-                hit_max = true;
-                break;
+
+        let (accepted, correction) = if let Some(mask) = active.grammar_mask.as_mut() {
+            // Constrained path: fold the K+1 target rows through the grammar
+            // matcher (target-only; drafts stay unmasked). The matcher already
+            // advanced in lockstep with the emitted tokens inside the helper.
+            // verify = [prev_correction, drafts...]; row j verifies drafts[j]
+            // (matching the unmasked `t_greedy[i] == drafts[i]`), and the last
+            // row (index K) is the bonus — i.e. all verify.len() rows.
+            let rows: Vec<&[f32]> = (0..verify.len())
+                .map(|i| &t_logits[i * v..(i + 1) * v])
+                .collect();
+            let remaining = max_tokens.saturating_sub(active.out.len());
+            let (emitted, accepted) =
+                masked_accept(mask, &rows, &drafts, &self.eos_token_ids, remaining)?;
+            // Grammar completion (matcher stopped) finalizes the task; capture
+            // it before the mask borrow ends.
+            let stopped = mask.is_stopped();
+            active.stats.total_accepted += accepted as u32;
+
+            // The last emitted token re-primes the draft (the "correction"),
+            // mirroring the unmasked path. Empty ⇒ grammar already complete.
+            let correction = emitted.last().copied().unwrap_or(active.prev_correction);
+            hit_eos = stopped
+                || emitted
+                    .last()
+                    .is_some_and(|&t| self.eos_token_ids.contains(&(t as u32)));
+            active.out.extend_from_slice(&emitted);
+            hit_max = active.out.len() >= max_tokens;
+            (accepted, correction)
+        } else {
+            // Unmasked greedy verify (byte-identical to the original path).
+            let mut t_greedy = Vec::with_capacity(verify.len());
+            for i in 0..verify.len() {
+                t_greedy.push(argmax(&t_logits[i * v..(i + 1) * v]) as i64);
             }
-            if self.eos_token_ids.contains(&(t as u32)) {
-                hit_eos = true;
-                break;
+
+            // Greedy acceptance: accept consecutive matches.
+            let mut accepted = 0usize;
+            for i in 0..drafts.len() {
+                if t_greedy[i] == drafts[i] {
+                    accepted += 1;
+                } else {
+                    break;
+                }
             }
-            active.out.push(t);
-        }
+            active.stats.total_accepted += accepted as u32;
+
+            let correction = if accepted < drafts.len() {
+                t_greedy[accepted]
+            } else {
+                t_greedy[drafts.len()]
+            };
+
+            // Append [drafts[..accepted], correction] to out, but truncate at first EOS.
+            for &t in drafts[..accepted]
+                .iter()
+                .chain(std::iter::once(&correction))
+            {
+                if active.out.len() >= max_tokens {
+                    hit_max = true;
+                    break;
+                }
+                if self.eos_token_ids.contains(&(t as u32)) {
+                    hit_eos = true;
+                    break;
+                }
+                active.out.push(t);
+            }
+            (accepted, correction)
+        };
         let n_tokens_added = (active.out.len() - out_len_before) as u32;
 
         // Rewind any rejected drafts from the target's KV cache.
@@ -1706,11 +1833,13 @@ impl Builder for OvDistSpecBuilder {
         let target =
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
+        let grammar_factory = Some(GrammarFactory::new(&tokenizer, &self.eos_token_ids)?);
         Ok(Box::new(OvDistSpecEngine {
             target,
             draft: masked_draft,
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
+            grammar_factory,
             k: self.k as usize,
             pending: Vec::new(),
             active: None,
@@ -2263,6 +2392,118 @@ mod tests {
     fn argmax_picks_first_on_ties() {
         let v = vec![0.5, 0.5, 0.5];
         assert_eq!(argmax(&v), 0);
+    }
+
+    // ---- constrained-decoding accept loop --------------------------------
+    use crate::constrained::GrammarFactory;
+    use cascadia_types::{GrammarKind, GrammarSpec};
+
+    /// Enum-of-one schema: the only valid JSON string is `"ok"`, so under the
+    /// single-byte tok env the grammar walks bytes `"` `o` `k` `"`.
+    fn ok_schema() -> GrammarSpec {
+        GrammarSpec {
+            kind: GrammarKind::JsonSchema,
+            body: r#"{"type":"string","enum":["ok"]}"#.to_string(),
+        }
+    }
+
+    /// A `mask_width`-wide logits row that peaks at `byte` (all others 0.0).
+    fn row_peaking_at(width: usize, byte: u8) -> Vec<f32> {
+        let mut r = vec![0.0f32; width];
+        r[byte as usize] = 10.0;
+        r
+    }
+
+    #[test]
+    fn masked_accept_corrects_disallowed_draft_and_advances_lockstep() {
+        let gf = GrammarFactory::single_byte();
+        let w = gf.mask_width();
+        let mut mask = gf.create(&ok_schema()).unwrap();
+
+        // Grammar requires `"` then `o`. Draft 0 = `"` (correct, peaks `"`),
+        // draft 1 = `X` (disallowed; row peaks at `X` but the mask forces the
+        // argmax to `o` — the correction — and the mismatch stops the round).
+        let r0 = row_peaking_at(w, b'"');
+        let r1 = row_peaking_at(w, b'X');
+        let r2 = row_peaking_at(w, b'k'); // bonus row (unused: round stops at mismatch)
+        let rows: Vec<&[f32]> = vec![&r0, &r1, &r2];
+        let drafts = [b'"' as i64, b'X' as i64];
+
+        let (out, accepted) =
+            masked_accept(&mut mask, &rows, &drafts, &[], 16).unwrap();
+
+        // (a) every emitted token is grammar-allowed at its position: replay
+        //     through a FRESH mask and confirm each survives the mask.
+        let mut replay = gf.create(&ok_schema()).unwrap();
+        for &t in &out {
+            let mut row = vec![0.0f32; w];
+            match replay.apply(&mut row).unwrap() {
+                ApplyOutcome::Masked => assert!(
+                    row[t as usize].is_finite(),
+                    "emitted token {t} was masked to -inf at its position"
+                ),
+                ApplyOutcome::Complete => panic!("grammar completed before consuming {t}"),
+            }
+            replay.accept(t as u32).unwrap();
+        }
+
+        // (b) the disallowed draft `X` is corrected to the masked argmax `o`,
+        //     never emitted raw; the round stops at that mismatch.
+        assert_eq!(out, vec![b'"' as i64, b'o' as i64]);
+        assert!(!out.contains(&(b'X' as i64)), "raw disallowed draft leaked");
+        assert_eq!(accepted, 1, "only draft 0 matched before the correction");
+
+        // (c) matcher advanced exactly once per emitted token (lockstep): the
+        //     post-call state equals feeding `out` one-by-one into a fresh mask.
+        //     `replay` above did exactly that and never diverged, so the live
+        //     `mask` and `replay` are in the same state — both now expect `k`.
+        let mut live_row = vec![0.0f32; w];
+        let mut replay_row = vec![0.0f32; w];
+        mask.apply(&mut live_row).unwrap();
+        replay.apply(&mut replay_row).unwrap();
+        assert_eq!(live_row, replay_row, "matcher state drifted from lockstep replay");
+    }
+
+    #[test]
+    fn masked_accept_all_match_emits_bonus() {
+        let gf = GrammarFactory::single_byte();
+        let w = gf.mask_width();
+        let mut mask = gf.create(&ok_schema()).unwrap();
+
+        // Both drafts match the masked argmax (`"` then `o`); bonus row peaks
+        // at `k` (the next grammar-required byte) → +1 token emitted.
+        let r0 = row_peaking_at(w, b'"');
+        let r1 = row_peaking_at(w, b'o');
+        let r2 = row_peaking_at(w, b'k');
+        let rows: Vec<&[f32]> = vec![&r0, &r1, &r2];
+        let drafts = [b'"' as i64, b'o' as i64];
+
+        let (out, accepted) =
+            masked_accept(&mut mask, &rows, &drafts, &[], 16).unwrap();
+
+        assert_eq!(accepted, 2, "both drafts matched");
+        assert_eq!(out, vec![b'"' as i64, b'o' as i64, b'k' as i64], "bonus token emitted");
+    }
+
+    #[test]
+    fn masked_accept_respects_remaining_budget() {
+        let gf = GrammarFactory::single_byte();
+        let w = gf.mask_width();
+        let mut mask = gf.create(&ok_schema()).unwrap();
+        let r0 = row_peaking_at(w, b'"');
+        let r1 = row_peaking_at(w, b'o');
+        let r2 = row_peaking_at(w, b'k');
+        let rows: Vec<&[f32]> = vec![&r0, &r1, &r2];
+        let drafts = [b'"' as i64, b'o' as i64];
+
+        // remaining = 1: only the first token may be emitted. Per the spec
+        // §3.3 fold order, the budget break fires *before* the draft-match
+        // increment, so `accepted` stays 0 (the matched draft is not credited
+        // toward the rewind — that position is re-driven next round).
+        let (out, accepted) =
+            masked_accept(&mut mask, &rows, &drafts, &[], 1).unwrap();
+        assert_eq!(out, vec![b'"' as i64]);
+        assert_eq!(accepted, 0, "budget stop precedes the accept increment");
     }
 
     #[test]

@@ -59,7 +59,7 @@ impl GrammarFactory {
     }
 
     #[cfg(test)]
-    fn single_byte() -> Self {
+    pub(crate) fn single_byte() -> Self {
         let tok_env = llguidance::toktrie::ApproximateTokEnv::single_byte_env();
         let w = tok_env.tok_trie().vocab_size();
         Self::from_tok_env(tok_env, w).unwrap()
