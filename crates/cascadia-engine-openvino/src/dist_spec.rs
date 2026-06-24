@@ -2495,10 +2495,28 @@ impl OvDistSpecEngine {
             && self.target.stage0_restore(&parts[1])
             && self.target.restore_downstream(epoch).unwrap_or(false);
         if ok {
-            self.draft.kv_set_pos(len);
-            self.target.kv_set_pos(len);
-            info!(warm_prefix = len, "ov-dist-spec pipeline warm-resumed");
-            len
+            // Cursors track each model's REAL restored KV depth, not the token count (off-by-one:
+            // the turn's last sampled token was never fed ⇒ KV = len-1; same fix as ov-runtime).
+            // draft + target are synced at a turn boundary so their depths match; a single suffix
+            // can only align both when they agree — otherwise fall back to cold rather than feed a
+            // desynced spec-decode state (a wrong cursor reproduces the very Add-shape crash).
+            let d_pos = crate::kv_coordination::kv_seq_from_blob(&parts[0])
+                .map(|s| s.min(len))
+                .unwrap_or(len);
+            let t_pos = crate::kv_coordination::kv_seq_from_blob(&parts[1])
+                .map(|s| s.min(len))
+                .unwrap_or(len);
+            if d_pos == t_pos {
+                self.draft.kv_set_pos(d_pos);
+                self.target.kv_set_pos(t_pos);
+                info!(warm_prefix = t_pos, matched = len, "ov-dist-spec pipeline warm-resumed");
+                t_pos
+            } else {
+                warn!(d_pos, t_pos, "ov-dist-spec: draft/target KV depth mismatch; cold reprefill");
+                let _ = self.target.reset();
+                let _ = self.draft.reset();
+                0
+            }
         } else {
             let _ = self.target.reset();
             let _ = self.draft.reset();

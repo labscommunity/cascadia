@@ -965,8 +965,13 @@ impl Qwen36Engine {
                                     .forward_restore_downstream(self.epoch, kv_epoch)
                                     .unwrap_or(false);
                             if chain_ok {
-                                info!(task = %task.task_id, warm_prefix = len, "qwen36 pipeline warm-resumed");
-                                len
+                                // Position from real KV depth, not token count (off-by-one: the turn's
+                                // last sampled token was never fed ⇒ KV = len-1). Same fix as ov-runtime.
+                                let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
+                                    .map(|s| s.min(len))
+                                    .unwrap_or(len);
+                                info!(task = %task.task_id, warm_prefix = warm, matched = len, "qwen36 pipeline warm-resumed");
+                                warm
                             } else {
                                 warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
                                 cold_admit!();
@@ -1395,11 +1400,16 @@ impl Qwen36Engine {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&prompt_i32) {
                         Some((blob, len)) if self.restore_local_stages(&blob) => {
+                            // Real KV depth, not token count (off-by-one — see ov-runtime).
+                            let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
+                                .map(|s| s.min(len))
+                                .unwrap_or(len);
                             info!(
-                                warm_prefix = len,
+                                warm_prefix = warm,
+                                matched = len,
                                 "qwen36 single-box warm-resumed from KV blob"
                             );
-                            len
+                            warm
                         }
                         _ => {
                             self.reset_all();
