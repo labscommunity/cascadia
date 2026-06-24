@@ -501,6 +501,13 @@ struct CompletionChoice {
     text: String,
     index: u32,
     finish_reason: &'static str,
+    // NOTE: the real OpenAI *legacy* completions `logprobs` object has a
+    // different shape than chat's (`{tokens, token_logprobs, top_logprobs,
+    // text_offset}` vs chat's `{content: [...]}`). We reuse the chat-style
+    // `ChatLogprobs` here for now; it's moot until an engine actually emits
+    // per-token logprobs (none do yet — same deferral as #14), at which point
+    // converting to the legacy schema is the follow-up. The field is omitted
+    // entirely when empty, so a legacy client sees no malformed object today.
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<ChatLogprobs>,
 }
@@ -1747,6 +1754,40 @@ mod tests {
         let text = v["choices"][0]["text"].as_str().unwrap();
         assert_eq!(text.trim(), "alpha bravo");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn completions_finish_reason_length_when_capped() {
+        // 5 prompt words, max_tokens 2 → hits the cap → "length" (the forked
+        // finish_reason path must preserve length just like the chat path).
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie delta echo",
+                "max_tokens": 2,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn completions_engine_error_returns_503() {
+        // The mock fails a task whose prompt contains `__engine_error__`. The
+        // forked non-streaming error branch must surface that as a 5xx, not a
+        // 200 with empty text.
+        let (status, _v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "__engine_error__",
+                "max_tokens": 8,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
