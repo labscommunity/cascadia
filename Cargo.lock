@@ -389,10 +389,12 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "cascadia-engine",
+ "cascadia-kv-wire",
  "cascadia-ov-genai-shim",
  "cascadia-runner",
  "cascadia-transport",
  "cascadia-types",
+ "crc32fast",
  "futures",
  "half",
  "serde",
