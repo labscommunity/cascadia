@@ -2094,8 +2094,18 @@ impl OvRuntimeEngine {
                                 }
                             };
                             if chain_ok {
-                                warm_prefix = len;
-                                info!(warm_prefix = len, "ov-runtime warm-resumed from KV blob");
+                                // The restored KV holds only tokens that were FED — the cached turn's
+                                // last sampled token was never fed back, so KV depth = matched_len - 1.
+                                // Drive position/mask off the REAL KV depth (read from the blob), else
+                                // the suffix decode feeds mask_len = kv+2 against kv+1 keys → Add crash.
+                                warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                    .map(|s| s.min(len))
+                                    .unwrap_or(len);
+                                info!(
+                                    warm_prefix,
+                                    matched = len,
+                                    "ov-runtime warm-resumed from KV blob"
+                                );
                             } else {
                                 let _ = self.runtime.reset_state();
                                 warn!("ov-runtime: pipeline restore incomplete; cold reprefill");
@@ -2828,61 +2838,38 @@ impl OvRuntimeEngine {
             }
             nt
         } else {
-            // Stateful: the IR keeps KV internally. Cold prefill (warm_prefix==0) feeds the whole
-            // prompt in ONE multi-token inference (input_len == mask_len at position 0 — fast). But
-            // Issue-34 WARM-resume prefills a suffix at a NON-zero position over a restored KV, where
-            // input_len < mask_len; the exported model's prefill graph assumes input_len==mask_len
-            // and throws a shape mismatch. So when resumed, feed the suffix token-by-token (the
-            // decode shapes — input_len==1, mask_len>1 — the model already supports). One forward for
-            // a plain decode step (tokens.len()==1) either way.
-            #[cfg(feature = "kv_coord")]
-            let resumed = prefill && self.active.as_ref().is_some_and(|a| a.warm_prefix > 0);
-            #[cfg(not(feature = "kv_coord"))]
-            let resumed = false;
-            if resumed {
-                let mut nt = 0i32;
-                for &t in &tokens {
-                    let position = self.position;
-                    let ts = std::time::Instant::now();
-                    let (out, shape) = self.run_first(&[t], position)?;
-                    let alpha = ts.elapsed();
-                    self.position += 1;
-                    // Per-token suffix feed: each is a single-token forward
-                    // (input_len==1), like a decode step — never a prefill-budget wait.
-                    let (n, wire) =
-                        self.resolve_next_token(&out, &shape, single_stage, position, false)?;
-                    nt = n;
-                    if let Some(a) = self.active.as_mut() {
-                        a.t_alpha_compute += alpha;
-                        a.t_wire += wire;
-                    }
+            // Stateful: the IR keeps KV internally and every shape dim is dynamic. Cold prefill
+            // (warm_prefix==0) feeds the whole prompt in ONE inference at position 0. Issue-34
+            // WARM-resume feeds the SUFFIX in ONE inference at position == the restored KV depth:
+            // build_feed sets mask_len = position + input_len = kv_depth + input_len, which is exactly
+            // present_K (restored kv + new), so the attention shapes line up — the same identity the
+            // cold path relies on at position 0. (The earlier per-token suffix feed was a workaround
+            // for a position/mask off-by-one, not a real prefill-shape limit; with position driven by
+            // the true KV depth a single batched forward is correct AND avoids stalling the suffix
+            // prefill past the gateway's inter-token deadline.)
+            let position = self.position;
+            let ts = std::time::Instant::now();
+            let (out, shape) = self.run_first(&tokens, position)?;
+            let alpha = ts.elapsed();
+            self.position += tokens.len() as i64;
+            // 1-token prompt prefill costs the same downstream as a decode
+            // step — keep the strict deadline (mirrors step_middle's
+            // shape[1] > 1) so wedge eviction stays fast.
+            let (nt, wire) = self.resolve_next_token(
+                &out,
+                &shape,
+                single_stage,
+                position,
+                prefill && tokens.len() > 1,
+            )?;
+            if let Some(a) = self.active.as_mut() {
+                a.t_alpha_compute += alpha;
+                a.t_wire += wire;
+                if prefill {
+                    a.t_prefill = a.started.elapsed();
                 }
-                nt
-            } else {
-                let position = self.position;
-                let ts = std::time::Instant::now();
-                let (out, shape) = self.run_first(&tokens, position)?;
-                let alpha = ts.elapsed();
-                self.position += tokens.len() as i64;
-                // 1-token prompt prefill costs the same downstream as a decode
-                // step — keep the strict deadline (mirrors step_middle's
-                // shape[1] > 1) so wedge eviction stays fast.
-                let (nt, wire) = self.resolve_next_token(
-                    &out,
-                    &shape,
-                    single_stage,
-                    position,
-                    prefill && tokens.len() > 1,
-                )?;
-                if let Some(a) = self.active.as_mut() {
-                    a.t_alpha_compute += alpha;
-                    a.t_wire += wire;
-                    if prefill {
-                        a.t_prefill = a.started.elapsed();
-                    }
-                }
-                nt
             }
+            nt
         };
 
         self.emit_token(next_token)
@@ -4096,7 +4083,13 @@ impl OvRuntimeEngine {
                 let local_ok = match self.kv.take_capture(epoch) {
                     Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
-                            self.position = tokens.len() as i64;
+                            // Track the REAL restored KV depth, not the token count (last sampled
+                            // token of the turn was never fed ⇒ KV = tokens - 1). Same off-by-one
+                            // fix as the head: position must match the keys the suffix decodes against.
+                            self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                .map(|s| s.min(tokens.len()))
+                                .unwrap_or(tokens.len())
+                                as i64;
                             self.kv_warm_pending = true;
                             true
                         }
