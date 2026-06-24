@@ -280,6 +280,15 @@ impl Engine for OvGenaiEngine {
         Ok(())
     }
 
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Monolithic step(): a generation already running holds the engine
+        // mutex for its whole duration, so cancel() (also &mut self) can only
+        // run between tasks — it drops queued tasks before they start.
+        // Interrupting an in-flight ov-genai generation needs a StreamerBase
+        // callback returning CANCEL (C++ shim work) — tracked as a follow-up.
+        self.pending.retain(|t| &t.task_id != task_id);
+    }
+
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.pending.is_empty() {
             return Vec::new();

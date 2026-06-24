@@ -1242,6 +1242,20 @@ impl Engine for OvDistSpecEngine {
         Ok(())
     }
 
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Step-wise driver (rank 0): drop the queued task and clear the active
+        // speculation so step() stops verifying rounds for it. The next
+        // admission's reset re-syncs the worker downstream.
+        self.pending.retain(|t| &t.task_id != task_id);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| &a.task.task_id == task_id)
+        {
+            self.active = None;
+        }
+    }
+
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
         // ---- Activate next pending task (one-time prompt feed + first sample).
         if self.active.is_none() {

@@ -23,6 +23,13 @@ impl MockEngine {
 impl Engine for MockEngine {
     fn warmup(&mut self) {}
 
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Step-wise engine: drop the task from the queue so step() stops
+        // emitting its words. cancel() and step() never overlap (both
+        // &mut self behind the runner mutex), so this is race-free.
+        self.pending.retain(|(t, _)| &t.task_id != task_id);
+    }
+
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
@@ -147,6 +154,22 @@ mod tests {
         assert!(emitted[0].text.starts_with("the"));
         assert!(emitted[1].text.starts_with("quick"));
         assert!(emitted[2].is_final);
+    }
+
+    #[test]
+    fn cancel_drops_pending_task_and_stops_emission() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "the quick brown fox jumps").with_max_tokens(64))
+            .unwrap();
+        // One token out, then cancel mid-generation.
+        let first = e.step();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].1.text.starts_with("the"));
+        e.cancel(&"t1".to_string());
+        // Task is gone — no further compute / emission.
+        assert!(e.step().is_empty());
+        // Cancelling an unknown id is a harmless no-op.
+        e.cancel(&"nope".to_string());
     }
 
     #[test]

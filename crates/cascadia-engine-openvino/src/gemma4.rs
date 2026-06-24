@@ -1033,6 +1033,19 @@ impl Engine for Gemma4Engine {
         Ok(())
     }
 
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Step-wise engine: drop the queued task and clear the active one so
+        // step() stops decoding it. cancel/step never overlap (runner mutex).
+        self.pending.retain(|t| &t.task_id != task_id);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| &a.task.task_id == task_id)
+        {
+            self.active = None;
+        }
+    }
+
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
