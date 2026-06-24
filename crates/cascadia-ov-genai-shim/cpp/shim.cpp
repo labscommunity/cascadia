@@ -8,8 +8,6 @@
 #include "gemv_offload.hpp"
 
 #include <cstring>
-#include <cstdio>
-#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -1011,15 +1009,6 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
         }
         *len_out = total;
         if (!buf || cap < total) return 0; // size query
-        if (std::getenv("CASCADIA_KV_DEBUG")) {
-            std::fprintf(stderr, "[KVDBG] get_state_blob: %zu states, %zu bytes\n", snaps.size(), total);
-            for (auto& kv : snaps) {
-                std::string sh; for (size_t d : kv.second.get_shape()) { sh += std::to_string(d); sh += ','; }
-                std::fprintf(stderr, "[KVDBG]   state '%s' shape=[%s] bytes=%zu\n",
-                             kv.first.c_str(), sh.c_str(), kv.second.get_byte_size());
-            }
-            std::fflush(stderr);
-        }
         uint8_t* p = buf;
         auto put32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
         auto put64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
@@ -1054,10 +1043,7 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         auto need = [&](size_t n) { if (static_cast<size_t>(end - p) < n) throw std::runtime_error("set_state_blob: truncated"); };
         auto get32 = [&]() { need(4); uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
         auto get64 = [&]() { need(8); uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
-        bool dbg = std::getenv("CASCADIA_KV_DEBUG") != nullptr;
         uint32_t count = get32();
-        if (dbg) std::fprintf(stderr, "[KVDBG] set_state_blob: %u states in blob, %zu states on model\n",
-                              count, by_name.size());
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nl = get32(); need(nl);
             std::string name(reinterpret_cast<const char*>(p), nl); p += nl;
@@ -1069,23 +1055,13 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
             auto it = by_name.find(name);
             if (it != by_name.end()) {
                 ov::Tensor t(code_to_ov_type(dcode), shape);
-                bool match = t.get_byte_size() == nb;
-                if (match) {
+                if (t.get_byte_size() == nb) {
                     std::memcpy(t.data(), p, nb);
                     it->second->set_state(t);
                 }
-                if (dbg) {
-                    std::string sh; for (size_t d : shape) { sh += std::to_string(d); sh += ','; }
-                    std::string cur; for (size_t d : it->second->get_state().get_shape()) { cur += std::to_string(d); cur += ','; }
-                    std::fprintf(stderr, "[KVDBG]   restore '%s' blob=[%s] nb=%llu newbytes=%zu match=%d modelwas=[%s]\n",
-                                 name.c_str(), sh.c_str(), (unsigned long long)nb, t.get_byte_size(), match ? 1 : 0, cur.c_str());
-                }
-            } else if (dbg) {
-                std::fprintf(stderr, "[KVDBG]   restore '%s' NOT FOUND on model (skipped)\n", name.c_str());
             }
             p += nb;
         }
-        if (dbg) std::fflush(stderr);
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) { set_last_error("unknown C++ exception in set_state_blob"); return 1; }
