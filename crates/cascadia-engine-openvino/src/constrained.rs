@@ -18,16 +18,19 @@ pub(crate) fn valid_eos(eos: &[u32], vocab: usize) -> Vec<u32> {
     eos.iter().copied().filter(|&t| (t as usize) < vocab).collect()
 }
 
-/// Tail-side: set every grammar-disallowed logit to -inf from a packed bitset.
-/// A sentinel (len < vocab/8) means "unconstrained" -> no-op. Bit i = byte i/8, bit i%8.
+/// Tail-side: apply a flag-prefixed grammar bitmask to the logits row.
+/// `mask[0] == 0` (or empty) = sentinel (unconstrained) → no-op. Otherwise
+/// `mask[1..]` is the allowed-token bitset (bit i = byte i/8, bit i%8); any
+/// index with bit 0, OR beyond the bitset (model-vocab padding past the
+/// tokenizer vocab), is set to -inf.
 pub fn apply_mask_bytes(logits_row: &mut [f32], mask: &[i8]) {
-    let vocab = logits_row.len();
-    if mask.len() * 8 < vocab {
-        return; // sentinel / no constraint
+    if mask.is_empty() || mask[0] == 0 {
+        return; // sentinel / unconstrained
     }
+    let bits = &mask[1..];
     for (i, l) in logits_row.iter_mut().enumerate() {
-        let byte = mask[i / 8] as u8;
-        if (byte >> (i % 8)) & 1 == 0 {
+        let allowed = (i / 8) < bits.len() && ((bits[i / 8] as u8 >> (i % 8)) & 1 == 1);
+        if !allowed {
             *l = f32::NEG_INFINITY;
         }
     }
@@ -106,10 +109,11 @@ impl GrammarMask {
 
     pub fn next_mask_bytes(&mut self) -> EngineResult<Vec<i8>> {
         let mask = self.matcher.compute_mask_or_eos().map_err(backend)?;
-        let mut bytes = vec![0i8; self.mask_width.div_ceil(8)];
+        let mut bytes = vec![0i8; 1 + self.mask_width.div_ceil(8)];
+        bytes[0] = 1; // flag: constrained
         for i in 0..self.mask_width {
             if mask.is_allowed(i as u32) {
-                bytes[i / 8] |= (1u8 << (i % 8)) as i8;
+                bytes[1 + i / 8] |= (1u8 << (i % 8)) as i8;
             }
         }
         Ok(bytes)
@@ -126,6 +130,7 @@ impl GrammarMask {
 }
 
 /// 1-byte sentinel meaning "no constraint this step" (frame-count-stable wire).
+/// The first byte is the flag; 0 = unconstrained.
 pub fn sentinel_mask() -> Vec<i8> {
     vec![0i8]
 }
@@ -202,5 +207,24 @@ mod tests {
         let mut row_sentinel = vec![0.0f32; gf.mask_width()];
         apply_mask_bytes(&mut row_sentinel, &[0i8]);
         assert!(row_sentinel.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn wire_mask_disallows_logits_beyond_tokenizer_vocab() {
+        // Simulate a model LM head padded past the tokenizer vocab: a logits row
+        // LARGER than mask_width. Indices >= mask_width must be -inf (not real tokens),
+        // and the sentinel must leave everything finite.
+        let gf = GrammarFactory::single_byte();
+        let mut head = gf.create(&hard_schema()).unwrap();
+        let bytes = head.next_mask_bytes().unwrap();
+        let padded = gf.mask_width() + 40;
+        let mut row = vec![0.0f32; padded];
+        apply_mask_bytes(&mut row, &bytes);
+        // a padding index beyond mask_width is disallowed
+        assert_eq!(row[gf.mask_width() + 10], f32::NEG_INFINITY);
+        // sentinel leaves the padded row untouched
+        let mut row2 = vec![0.0f32; padded];
+        apply_mask_bytes(&mut row2, &super::sentinel_mask());
+        assert!(row2.iter().all(|v| v.is_finite()));
     }
 }

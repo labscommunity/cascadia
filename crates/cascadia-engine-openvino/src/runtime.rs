@@ -1249,14 +1249,6 @@ impl OvRuntimeEngine {
             return Err(EngineError::Backend("logits shorter than vocab".into()));
         }
         let mut row = out[out.len() - vocab..].to_vec();
-        // Width invariant (spec §5.3): a non-sentinel mask must cover exactly `vocab` bits.
-        if mask.len() * 8 >= vocab && mask.len() != vocab.div_ceil(8) {
-            return Err(EngineError::Backend(format!(
-                "mask width {} bytes != vocab {vocab} ({} bytes)",
-                mask.len(),
-                vocab.div_ceil(8)
-            )));
-        }
         apply_mask_bytes(&mut row, &mask);
         let next = argmax_last_row(&row, vocab);
         self.send_token_to_upstream(next)?;
