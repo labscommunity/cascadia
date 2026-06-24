@@ -247,6 +247,7 @@ pub fn make_router_with_stats(
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
         // Cap the JSON body so an attacker can't OOM the server with
@@ -425,6 +426,92 @@ struct ChatCompletionResponse {
     created: i64,
     model: String,
     choices: Vec<ChatChoice>,
+    usage: Usage,
+}
+
+// --- Legacy /v1/completions (OpenAI-compatible) -------------------------
+
+/// OpenAI `prompt` is a single string or an array of strings.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum PromptSpec {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CompletionRequest {
+    pub model: String,
+    pub prompt: PromptSpec,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub logprobs: Option<u32>,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    /// Prepend the prompt to the returned text (OpenAI `echo`).
+    #[serde(default)]
+    pub echo: bool,
+}
+
+impl CompletionRequest {
+    fn sampling_params(&self) -> cascadia_types::SamplingParams {
+        cascadia_types::SamplingParams {
+            top_p: self.top_p.unwrap_or(1.0),
+            top_k: self.top_k.unwrap_or(0),
+            seed: self.seed,
+            frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: self.presence_penalty.unwrap_or(0.0),
+            stop: self
+                .stop
+                .as_ref()
+                .map(|s| match s {
+                    StopSpec::Single(x) => vec![x.clone()],
+                    StopSpec::Multiple(v) => v.clone(),
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Legacy `logprobs` is an integer count (number of top logprobs), unlike
+    /// the chat endpoint's bool. 0 / None disables.
+    fn logprobs_count(&self) -> u32 {
+        self.logprobs.unwrap_or(0).min(20)
+    }
+}
+
+#[derive(Serialize)]
+struct CompletionChoice {
+    text: String,
+    index: u32,
+    finish_reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<ChatLogprobs>,
+}
+
+#[derive(Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: &'static str,
+    created: i64,
+    model: String,
+    choices: Vec<CompletionChoice>,
     usage: Usage,
 }
 
@@ -793,6 +880,299 @@ async fn chat_completions(
         },
     })
     .into_response()
+}
+
+/// OpenAI-compatible legacy `/v1/completions`. A raw-`prompt` sibling of
+/// `/v1/chat/completions` — no chat-template render, returns `text` instead
+/// of a `message`. Reuses the same sampling/finish_reason/usage path.
+async fn completions(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> axum::response::Response {
+    // Multi-prompt batching needs cross-task batching infra the engines don't
+    // have yet (one task per step). Reject the array form with a clean 400.
+    let prompt = match &req.prompt {
+        PromptSpec::Single(s) => s.clone(),
+        PromptSpec::Multiple(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "multi-prompt batching not yet supported; submit one prompt per request"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
+    if prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no prompt content: `prompt` is empty" })),
+        )
+            .into_response();
+    }
+    if prompt.len() > state.max_prompt_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                    prompt.len(),
+                    state.max_prompt_bytes,
+                )
+            })),
+        )
+            .into_response();
+    }
+    let task = GenerationTask {
+        task_id: task_id.clone(),
+        // Raw prompt — the legacy endpoint does NOT apply a chat template.
+        prompt: prompt.clone(),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        logprobs: req.logprobs_count(),
+        sampling: req.sampling_params(),
+        enable_thinking: false,
+        trust_remote_code: false,
+    };
+
+    let permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "engine at capacity; retry after current requests complete"
+                })),
+            )
+                .into_response();
+        }
+    };
+    state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+    let inflight = InFlightGuard::new(state.stats.clone());
+
+    if req.stream {
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .map(|o| o.include_usage)
+            .unwrap_or(false);
+        let echo_prefix = if req.echo { Some(prompt) } else { None };
+        return stream_text_completion(
+            state,
+            req.model,
+            task,
+            echo_prefix,
+            permit,
+            inflight,
+            include_usage,
+        )
+        .await
+        .into_response();
+    }
+
+    let _permit = permit;
+    let _inflight = inflight;
+    let mut chunk_stream = match state.runner.generate(task) {
+        Ok(s) => s,
+        Err(err) => return engine_error_response(err),
+    };
+    let mut buf = String::new();
+    let mut completion_tokens: u32 = 0;
+    let mut prompt_tokens: u32 = 0;
+    let mut finish_reason: &'static str = "stop";
+    let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    while let Some(chunk) = chunk_stream.next().await {
+        if let Some(reason) = &chunk.error {
+            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
+        buf.push_str(&chunk.text);
+        completion_tokens += chunk_token_count(&chunk);
+        if let Some(lp) = &chunk.logprobs {
+            logprobs_content.push(lp.clone());
+        }
+        if chunk.is_final {
+            prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+            if let Some(fr) = chunk.finish_reason {
+                finish_reason = fr.as_openai_str();
+            }
+        }
+    }
+    state
+        .stats
+        .tokens_total
+        .fetch_add(completion_tokens as u64, Ordering::Relaxed);
+
+    // Stop-sequence truncation (same as the chat path).
+    let stops = req.sampling_params().stop;
+    if !stops.is_empty() {
+        if let Some(cut) = stops
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| buf.find(s.as_str()))
+            .min()
+        {
+            buf.truncate(cut);
+            finish_reason = "stop";
+        }
+    }
+
+    // `echo`: prepend the (raw) prompt to the returned text.
+    let text = if req.echo {
+        format!("{prompt}{buf}")
+    } else {
+        buf
+    };
+
+    Json(CompletionResponse {
+        id: task_id,
+        object: "text_completion",
+        created: now_unix(),
+        model: req.model,
+        choices: vec![CompletionChoice {
+            text,
+            index: 0,
+            finish_reason,
+            logprobs: if logprobs_content.is_empty() {
+                None
+            } else {
+                Some(ChatLogprobs {
+                    content: logprobs_content,
+                })
+            },
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    })
+    .into_response()
+}
+
+/// SSE variant of `/v1/completions`: emits `text_completion` chunks with
+/// `choices[].text` deltas. `echo_prefix`, when set, is prepended to the very
+/// first content frame.
+async fn stream_text_completion(
+    state: AppState,
+    model: String,
+    task: GenerationTask,
+    echo_prefix: Option<String>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    inflight: InFlightGuard,
+    include_usage: bool,
+) -> axum::response::Response {
+    let task_id = task.task_id.clone();
+    let chunk_stream = match state.runner.generate(task) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(error = %err, "completions-stream: generate failed");
+            return engine_error_response(err);
+        }
+    };
+    let stats = state.stats.clone();
+    let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let final_completion = usage_completion.clone();
+    let final_prompt = usage_prompt.clone();
+    let usage_model = model.clone();
+    let usage_task_id = task_id.clone();
+    // First-frame flag for `echo` (prepend the prompt once).
+    let echo_pending = Arc::new(std::sync::Mutex::new(echo_prefix));
+    let permit_carrier = StreamWithPermit {
+        inner: chunk_stream,
+        _permit: permit,
+        _inflight: inflight,
+    };
+    let body_stream = permit_carrier
+        .then(move |chunk| {
+            let model = model.clone();
+            let task_id = task_id.clone();
+            let stats = stats.clone();
+            let usage_completion = usage_completion.clone();
+            let usage_prompt = usage_prompt.clone();
+            let echo_pending = echo_pending.clone();
+            async move {
+                if chunk.error.is_none() {
+                    let n = chunk_token_count(&chunk);
+                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
+                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    if chunk.is_final {
+                        usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                    }
+                }
+                if let Some(reason) = &chunk.error {
+                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                    let payload = serde_json::json!({
+                        "id": task_id,
+                        "object": "error",
+                        "error": { "message": reason, "type": "engine_error" },
+                    });
+                    tokio::task::yield_now().await;
+                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                }
+                // Prepend the echo prefix to the first content frame, once.
+                let mut text = chunk.text.clone();
+                if let Some(prefix) = echo_pending.lock().unwrap().take() {
+                    text = format!("{prefix}{text}");
+                }
+                let payload = serde_json::json!({
+                    "id": task_id,
+                    "object": "text_completion",
+                    "created": now_unix(),
+                    "model": model,
+                    "n_tokens": chunk.n_tokens.unwrap_or(1),
+                    "choices": [{
+                        "index": 0,
+                        "text": text,
+                        "finish_reason": if chunk.is_final {
+                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
+                        } else {
+                            None
+                        },
+                    }],
+                });
+                let line = format!("data: {payload}\n\n");
+                tokio::task::yield_now().await;
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from(line))
+            }
+        })
+        .chain(stream::once(async move {
+            let mut out = String::new();
+            if include_usage {
+                let prompt = final_prompt.load(Ordering::Relaxed);
+                let completion = final_completion.load(Ordering::Relaxed);
+                let usage = serde_json::json!({
+                    "id": usage_task_id,
+                    "object": "text_completion",
+                    "created": now_unix(),
+                    "model": usage_model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion,
+                    },
+                });
+                out.push_str(&format!("data: {usage}\n\n"));
+            }
+            out.push_str("data: [DONE]\n\n");
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(out))
+        }));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(body_stream))
+        .unwrap()
+        .into_response()
 }
 
 async fn stream_completion(
@@ -1247,6 +1627,126 @@ mod tests {
         );
         assert!(text.contains("\"completion_tokens\""));
         assert!(text.trim_end().ends_with("data: [DONE]"));
+    }
+
+    async fn post_completions(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn completions_returns_text_completion() {
+        // Mock echoes prompt words verbatim (no chat template applied).
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie",
+                "max_tokens": 64,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["object"], "text_completion");
+        let text = v["choices"][0]["text"].as_str().unwrap();
+        assert_eq!(text.trim(), "alpha bravo charlie");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn completions_echo_prepends_prompt() {
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo",
+                "max_tokens": 64,
+                "echo": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // echo prepends the raw prompt to the (prompt-stripped) continuation.
+        let text = v["choices"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("alpha bravo"), "echo missing: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn completions_streaming_emits_text_completion_and_done() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "prompt": "alpha bravo charlie",
+                            "max_tokens": 8,
+                            "stream": true,
+                            "stream_options": {"include_usage": true},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("\"text_completion\""), "wrong object: {text}");
+        assert!(text.contains("\"text\""), "no text delta: {text}");
+        assert!(text.contains("\"usage\""));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn completions_multi_prompt_array_is_400() {
+        let (status, _v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": ["one", "two"],
+                "max_tokens": 4,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn completions_honor_stop_and_finish_reason() {
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "prompt": "alpha bravo charlie delta",
+                "max_tokens": 64,
+                "stop": ["charlie"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = v["choices"][0]["text"].as_str().unwrap();
+        assert_eq!(text.trim(), "alpha bravo");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
     }
 
     #[tokio::test]
