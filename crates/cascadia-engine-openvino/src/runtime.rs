@@ -2888,6 +2888,7 @@ impl OvRuntimeEngine {
                     a.t_prefill = a.started.elapsed();
                 }
             }
+            nt
         };
 
         self.emit_token(next_token)
