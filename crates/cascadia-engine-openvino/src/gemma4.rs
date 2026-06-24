@@ -668,23 +668,25 @@ impl Gemma4Engine {
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
+        // Wire order per step: position frame, hidden frame, cross-KV header, then `count` cross-KV
+        // frames. The position read transparently absorbs any I8 control frame (CAPTURE/RESTORE)
+        // that arrives between turns (stateful workers only).
+        let pos_t = self.recv_position_or_control()?;
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Wire order per step: position frame, hidden frame, cross-KV header,
-        // then `count` cross-KV frames (count from the header). Read the first
-        // three, decode the header to learn `count`, then read that many.
-        let (pos_t, hid_t, header_t) = self
-            .block_on(async {
+        let (hid_t, header_t) = self
+            .block_on(async move {
                 let mut guard = upstream.lock().await;
-                // First frame of the step is the IDLE wait; the frames that
-                // must follow it are mid-sequence replies — deadlined so a
-                // half-sent step can't wedge the stage (Item 5).
-                let pos = guard.recv().await?.0;
+                // pos was already read via recv_position_or_control (the IDLE
+                // wait that also absorbs a CAPTURE/RESTORE control frame between
+                // turns); the hid + cross-KV header that FOLLOW are mid-step
+                // replies — deadline them so a half-sent step can't wedge the
+                // stage (Item 5).
                 let hid = guard.recv_reply().await?.0;
                 let hdr = guard.recv_reply().await?.0;
-                Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
+                Ok::<_, cascadia_transport::TransportError>((hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         // Decode + strictly validate the position + header outside the transport
@@ -758,6 +760,29 @@ impl Gemma4Engine {
         Ok((floats, shape, position))
     }
 
+    /// Read one frame from upstream, transparently handling any I8 control frame (CAPTURE/RESTORE/
+    /// ABORT) and looping until a real (non-control) frame — the position tensor — arrives.
+    fn recv_position_or_control(&mut self) -> EngineResult<WireTensor> {
+        loop {
+            let upstream = self
+                .upstream
+                .clone()
+                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+            let t = self
+                .block_on(async move {
+                    let mut guard = upstream.lock().await;
+                    Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            #[cfg(feature = "kv_coord")]
+            if t.dtype == WireDType::I8 {
+                self.handle_inbound_control(&t)?;
+                continue;
+            }
+            return Ok(t);
+        }
+    }
+
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
         let upstream = self
             .upstream
@@ -789,12 +814,30 @@ impl Gemma4Engine {
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
             #[cfg(feature = "kv_coord")]
-            if self.downstream.is_none() {
+            {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                 if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
                     if self.runtime.set_state_blob(&blob).is_ok() {
-                        warm_prefix = len;
-                        info!(warm_prefix = len, "gemma4 warm-resumed from KV blob");
+                        // Multi-stage: RESTORE the whole downstream chain (all-or-nothing); any rank
+                        // short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
+                        let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                        let chain_ok = !multi || {
+                            let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            match self.send_restore_downstream(epoch) {
+                                Ok(true) => true,
+                                _ => {
+                                    let _ = self.send_abort_downstream();
+                                    false
+                                }
+                            }
+                        };
+                        if chain_ok {
+                            warm_prefix = len;
+                            info!(warm_prefix = len, "gemma4 warm-resumed from KV blob");
+                        } else {
+                            let _ = self.runtime.reset_state();
+                            warn!("gemma4: pipeline restore incomplete; cold reprefill");
+                        }
                     }
                 }
             }
@@ -1007,7 +1050,17 @@ impl Gemma4Engine {
                     .chain(active.generated.iter().copied())
                     .collect();
                 match self.runtime.get_state_blob() {
-                    Ok(blob) => self.kv.capture(full, blob),
+                    Ok(blob) => {
+                        // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
+                        // slice under this turn's content epoch. Best-effort.
+                        if self.downstream.is_some() && !self.spec.is_last_stage {
+                            let epoch = crate::kv_coordination::synth_epoch(&full);
+                            if let Err(e) = self.send_capture_downstream(epoch, &full) {
+                                warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
+                            }
+                        }
+                        self.kv.capture(full, blob);
+                    }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
                 }
             }
@@ -1163,6 +1216,157 @@ impl Engine for Gemma4Engine {
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
+    }
+}
+
+// -------- Issue-34 §8 multi-stage CAPTURE/RESTORE over gemma4's frameless transport --------
+// Same I8-control-tensor scheme as ov-runtime (real frames are F16/I64/F32, never I8 ⇒ collision
+// -free). Stateful shards only; `kv_coord`-gated. gemma4's recv reads pos+hidden+cross-KV, so the
+// demux peeks the FIRST frame's dtype before the multi-frame read.
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_CAPTURE: u8 = 1;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_CAPTURE_ACK: u8 = 2;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_RESTORE: u8 = 3;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_RESTORE_ACK: u8 = 4;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_ABORT: u8 = 5;
+#[cfg(feature = "kv_coord")]
+const G_OPCODE_ABORT_ACK: u8 = 6;
+
+#[cfg(feature = "kv_coord")]
+impl Gemma4Engine {
+    fn send_capture_downstream(&mut self, epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![G_OPCODE_CAPTURE];
+        data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                let (ack, _) = g.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_CAPTURE_ACK) {
+            Ok(())
+        } else {
+            Err(EngineError::Backend("gemma4: bad CAPTURE ack".into()))
+        }
+    }
+
+    fn send_restore_downstream(&mut self, epoch: u64) -> EngineResult<bool> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let mut data = vec![G_OPCODE_RESTORE];
+        data.extend_from_slice(&epoch.to_le_bytes());
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let ack = self
+            .block_on(async move {
+                let mut g = downstream.lock().await;
+                g.send(&t).await?;
+                let (ack, _) = g.recv().await?;
+                Ok::<_, cascadia_transport::TransportError>(ack)
+            })
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        if ack.dtype == WireDType::I8 && ack.data.first() == Some(&G_OPCODE_RESTORE_ACK) {
+            Ok(ack.data.get(1) == Some(&1))
+        } else {
+            Err(EngineError::Backend("gemma4: bad RESTORE ack".into()))
+        }
+    }
+
+    fn send_abort_downstream(&mut self) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![G_OPCODE_ABORT]);
+        self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t).await?;
+            let _ = g.recv().await?;
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    fn send_control_ack_upstream(&mut self, ack_opcode: u8, payload: &[u8]) -> EngineResult<()> {
+        let upstream = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
+        let mut data = vec![ack_opcode];
+        data.extend_from_slice(payload);
+        let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        self.block_on(async move {
+            let mut g = upstream.lock().await;
+            g.send(&t).await
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
+    fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
+        match t.data.first().copied() {
+            Some(G_OPCODE_CAPTURE) => {
+                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                    .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                }
+                if !self.spec.is_last_stage {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens) {
+                        warn!(error = %e, "gemma4: CAPTURE chain downstream failed (best-effort)");
+                    }
+                }
+                self.send_control_ack_upstream(G_OPCODE_CAPTURE_ACK, &[])
+            }
+            Some(G_OPCODE_RESTORE) => {
+                let epoch = t
+                    .data
+                    .get(1..9)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .ok_or_else(|| EngineError::Backend("gemma4: bad RESTORE body".into()))?;
+                // No warm flag needed: gemma4 workers reset on the carried frame position, so the
+                // head's warm prefill (position = warm_len > 0) skips reset, and a cold turn
+                // (position 0) resets everyone — restored or not.
+                let local_ok = match self.kv.take_capture(epoch) {
+                    Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+                    None => false,
+                };
+                let down_ok = if self.spec.is_last_stage {
+                    true
+                } else {
+                    self.send_restore_downstream(epoch).unwrap_or(false)
+                };
+                self.send_control_ack_upstream(
+                    G_OPCODE_RESTORE_ACK,
+                    &[u8::from(local_ok && down_ok)],
+                )
+            }
+            Some(G_OPCODE_ABORT) => {
+                let _ = self.runtime.reset_state();
+                self.position = 0;
+                if !self.spec.is_last_stage {
+                    let _ = self.send_abort_downstream();
+                }
+                self.send_control_ack_upstream(G_OPCODE_ABORT_ACK, &[])
+            }
+            other => Err(EngineError::Backend(format!(
+                "gemma4: unknown control opcode {other:?}"
+            ))),
+        }
     }
 }
 
