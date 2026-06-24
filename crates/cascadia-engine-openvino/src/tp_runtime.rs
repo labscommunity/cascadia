@@ -185,6 +185,9 @@ pub struct TpRuntimeEngine {
     position: i64,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
+    // instrumentation (per task, decode-phase): GPU segment-infer time vs all-reduce time
+    t_gpu_us: u128,
+    t_ar_us: u128,
 }
 
 impl TpRuntimeEngine {
@@ -253,16 +256,24 @@ impl TpRuntimeEngine {
                     s.set("beam_idx", ShimDType::I32, &[1], &0i32.to_le_bytes())?;
                 }
             }
+            let t = Instant::now();
             let (pa, _) = self.attn[i].run()?;
+            self.t_gpu_us += t.elapsed().as_micros();
+            let t = Instant::now();
             let ra = self.all_reduce(&pa, shape3)?;
+            self.t_ar_us += t.elapsed().as_micros();
             for (h, r) in hidden.iter_mut().zip(ra) {
                 *h += r;
             }
             // ----- mlp segment -----
             let hf16 = f32_to_bytes(&hidden);
             self.mlp[i].set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
+            let t = Instant::now();
             let (pm, _) = self.mlp[i].run()?;
+            self.t_gpu_us += t.elapsed().as_micros();
+            let t = Instant::now();
             let rm = self.all_reduce(&pm, shape3)?;
+            self.t_ar_us += t.elapsed().as_micros();
             for (h, r) in hidden.iter_mut().zip(rm) {
                 *h += r;
             }
@@ -271,7 +282,10 @@ impl TpRuntimeEngine {
         if let Some(head) = &mut self.head {
             let hf16 = f32_to_bytes(&hidden);
             head.set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
-            head.run()
+            let t = Instant::now();
+            let r = head.run();
+            self.t_gpu_us += t.elapsed().as_micros();
+            r
         } else {
             Ok((Vec::new(), vec![1, seq, 0]))
         }
@@ -365,7 +379,10 @@ impl TpRuntimeEngine {
             let elapsed = a.started.elapsed();
             let n = a.generated.len();
             info!(task = %tid, tokens = n, elapsed_s = elapsed.as_secs_f64(),
-                  tok_s = n as f64 / elapsed.as_secs_f64(), "tp-runtime task done");
+                  tok_s = n as f64 / elapsed.as_secs_f64(),
+                  gpu_ms = self.t_gpu_us as f64 / 1000.0,
+                  allreduce_ms = self.t_ar_us as f64 / 1000.0,
+                  "tp-runtime task done");
             // tell rank 1 the request is over
             let _ = self.broadcast(CTRL_STOP, &[]);
             self.active = None;
@@ -429,6 +446,8 @@ impl TpRuntimeEngine {
                 return Vec::new();
             }
             self.position = 0;
+            self.t_gpu_us = 0;
+            self.t_ar_us = 0;
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
@@ -670,6 +689,8 @@ impl Builder for TpRuntimeBuilder {
             position: 0,
             pending: Vec::new(),
             active: None,
+            t_gpu_us: 0,
+            t_ar_us: 0,
         }))
     }
 }

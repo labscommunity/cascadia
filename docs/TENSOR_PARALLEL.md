@@ -60,6 +60,34 @@ In other words: tensor parallelism is the right structure for lowering single-st
 latency on a memory-forced multi-node model, but on the current OpenVINO runtime it
 is dispatch-bound; the dispatch-amortization work is the prerequisite for it to pay off.
 
+### Profiling the bottleneck (`gpu_ms`/`allreduce_ms` instrumentation + per-segment probes)
+
+The engine logs `gpu_ms` (sum of segment infers) and `allreduce_ms` per task. A 2-rank
+loopback run (both ranks on one node, so the all-reduce is free) totals the *same*
+~44 ms/token as the 2-node run, split **gpu ~87% / all-reduce ~9%** — the work is in
+the segment infers, not the wire. Per-segment GPU probe (alpha Arc Xe2, int4):
+
+| segment | per-infer wall | GPU-busy | host/dispatch overhead |
+|---|---|---|---|
+| mlp_i (stateless) | 278 µs | 226 µs | ~52 µs |
+| attn_i (stateful KV + dynamic shape + beam_idx Gather) | 817 µs | **150 µs** | **~667 µs** |
+
+The attention segments are ~5× their own compute — almost all OV per-infer overhead
+(stateful-KV management + dynamic-shape re-inference). **Root cause:** pipeline parallelism
+runs 8 layers in *one* stateful graph (overhead paid 2× per token); TP runs *one layer per
+attn segment* (overhead paid 16×). So TP pays the stateful per-infer overhead ~8× more, and
+the 34 infers can't be merged (a network all-reduce sits between every pair).
+
+**Quantified target:** raw segment compute is only ~16·150 µs (attn) + 16·226 µs (mlp) +
+embed/head ≈ **~7 ms/token**, vs the ~39 ms with per-infer overhead. Collapsing the 34 infers
+into a single persistent GPU dispatch (the megakernel: one launch for the whole forward,
+signaling the host at all-reduce points) would put TP at ~7 ms + all-reduce → **~2–3× faster
+than pipeline**. Lesser tweaks (leaner all-reduce, static-shape attn, dropping the beam_idx
+Gather) trim the secondary costs but cannot overcome the 34-infer dispatch wall — they do not
+beat pipeline on their own. The persistent megakernel is the load-bearing next step
+(this is the `cascadia-megakernel` effort), with speedeth's fast wire attacking the residual
+all-reduce.
+
 ## Run
 
 ```
