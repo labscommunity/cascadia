@@ -52,6 +52,49 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     fnv1a64(&buf)
 }
 
+/// Restored KV depth (max `shape[2]` over rank>=3 states) read straight from a `get_state_blob`
+/// blob. The blob is self-describing — `[u32 count]` then per state
+/// `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nbytes][data]` (LE).
+///
+/// Why this exists: the cached token list is `prompt + all generated`, but the KV only holds tokens
+/// that were *fed* — the last sampled token of a turn is never fed back, so KV depth = matched_len-1.
+/// Warm-resume must drive `position`/`attention_mask` from the real KV depth, else the suffix decode
+/// feeds `mask_len = kv+2` against `kv+1` keys and the attention `Add` fails on shape. Engine-agnostic
+/// (reads the actual depth instead of assuming the off-by-one). `None` if the blob is unparseable.
+pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
+    }
+    let mut p = 0usize;
+    let count = u32_at(blob, p)?;
+    p += 4;
+    let mut seq = 0usize;
+    for _ in 0..count {
+        let name_len = u32_at(blob, p)? as usize;
+        p = p.checked_add(4)?.checked_add(name_len)?; // skip name_len + name
+        let _dtype = *blob.get(p)?;
+        let rank = *blob.get(p.checked_add(1)?)? as usize;
+        p = p.checked_add(2)?;
+        let mut seq_dim = 0usize;
+        for i in 0..rank {
+            let d = u64_at(blob, p)? as usize;
+            p = p.checked_add(8)?;
+            if i == 2 {
+                seq_dim = d;
+            }
+        }
+        if rank >= 3 {
+            seq = seq.max(seq_dim);
+        }
+        let nb = u64_at(blob, p)? as usize;
+        p = p.checked_add(8)?.checked_add(nb)?; // skip nbytes + data
+    }
+    (seq > 0).then_some(seq)
+}
+
 /// Max tokens in a CAPTURE frame body — DoS bound so a forged frame can't allocate unbounded.
 pub(crate) const MAX_CAPTURE_TOKENS: usize = 1 << 20;
 
