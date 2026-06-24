@@ -832,8 +832,13 @@ impl Gemma4Engine {
                             }
                         };
                         if chain_ok {
-                            warm_prefix = len;
-                            info!(warm_prefix = len, "gemma4 warm-resumed from KV blob");
+                            // Position/mask track the REAL restored KV depth, not the matched token
+                            // count (the turn's last sampled token was never fed ⇒ KV = len-1).
+                            // See kv_seq_from_blob — same off-by-one fix as ov-runtime.
+                            warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                .map(|s| s.min(len))
+                                .unwrap_or(len);
+                            info!(warm_prefix, matched = len, "gemma4 warm-resumed from KV blob");
                         } else {
                             let _ = self.runtime.reset_state();
                             warn!("gemma4: pipeline restore incomplete; cold reprefill");

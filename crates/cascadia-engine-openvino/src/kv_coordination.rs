@@ -95,6 +95,15 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     (seq > 0).then_some(seq)
 }
 
+/// KV depth from a multi-stage FRAMED blob (`frame_blobs` of N per-stage `get_state_blob`s) — the max
+/// `kv_seq_from_blob` over its parts. Stages share the sequence length, so any part gives the depth;
+/// `max` is a safe tie-break. Use for engines whose warm blob is framed (qwen36 stages, dist-spec
+/// draft+target); raw single-stage blobs use [`kv_seq_from_blob`] directly. `None` if unparseable.
+pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
+    let parts = unframe_blobs(blob)?;
+    parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
+}
+
 /// Max tokens in a CAPTURE frame body — DoS bound so a forged frame can't allocate unbounded.
 pub(crate) const MAX_CAPTURE_TOKENS: usize = 1 << 20;
 
@@ -497,6 +506,33 @@ mod tests {
         );
         // empty bundle (no stages)
         assert_eq!(unframe_blobs(&frame_blobs(&[])), Some(vec![]));
+    }
+    #[test]
+    fn kv_seq_from_blob_reads_depth() {
+        // Mirror the C++ get_state_blob layout: [u32 count] then per state
+        // [u32 name_len][name][u8 dtype][u8 rank][u64*rank shape][u64 nbytes][data].
+        fn state(name: &str, shape: &[u64], data_len: usize) -> Vec<u8> {
+            let mut b = (name.len() as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(name.as_bytes());
+            b.push(1); // dtype code
+            b.push(shape.len() as u8);
+            for &d in shape {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&(data_len as u64).to_le_bytes());
+            b.extend(std::iter::repeat(0u8).take(data_len));
+            b
+        }
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        blob.extend(state("past_key_values.0.key", &[1, 8, 85, 128], 16));
+        blob.extend(state("past_key_values.0.value", &[1, 8, 85, 128], 16));
+        assert_eq!(kv_seq_from_blob(&blob), Some(85)); // dim[2]
+        // Framed (qwen36 stages / dist-spec draft+target): max over parts, equal here.
+        let framed = frame_blobs(&[blob.clone(), blob.clone()]);
+        assert_eq!(kv_seq_from_framed_blob(&framed), Some(85));
+        // Garbage/truncated ⇒ None so the caller falls back to the matched token count.
+        assert_eq!(kv_seq_from_blob(&[0u8; 3]), None);
+        assert_eq!(kv_seq_from_blob(&1u32.to_le_bytes()), None); // count=1, no state body
     }
     #[test]
     fn unframe_blobs_rejects_malformed() {
