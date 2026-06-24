@@ -229,6 +229,18 @@ mod sys {
             buf_cap: usize,
             out_len: *mut usize,
         ) -> c_int;
+        // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
+        pub fn cascadia_runtime_get_state_blob(
+            handle: *mut cascadia_runtime_t,
+            buf: *mut u8,
+            cap: usize,
+            len_out: *mut usize,
+        ) -> c_int;
+        pub fn cascadia_runtime_set_state_blob(
+            handle: *mut cascadia_runtime_t,
+            buf: *const u8,
+            len: usize,
+        ) -> c_int;
 
         pub fn cascadia_runtime_input_count(handle: *mut cascadia_runtime_t) -> usize;
         pub fn cascadia_runtime_output_count(handle: *mut cascadia_runtime_t) -> usize;
@@ -1300,6 +1312,53 @@ impl Runtime {
         #[cfg(feature = "openvino")]
         unsafe {
             let rc = sys::cascadia_runtime_reset_state(self.handle);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
+    /// Issue-34: capture all KV variable-states into one opaque blob (two-call: size then fill).
+    /// The bytes are self-describing; restore on a peer engine via [`Runtime::set_state_blob`].
+    pub fn get_state_blob(&mut self) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let mut needed: usize = 0;
+            let rc =
+                sys::cascadia_runtime_get_state_blob(self.handle, ptr::null_mut(), 0, &mut needed);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut buf = vec![0u8; needed];
+            let rc = sys::cascadia_runtime_get_state_blob(
+                self.handle,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut needed,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            buf.truncate(needed);
+            Ok(buf)
+        }
+    }
+
+    /// Issue-34: restore KV variable-states from a blob produced by [`Runtime::get_state_blob`] on the
+    /// same model. States are matched by name; a missing/mismatched state is skipped (defence in depth).
+    pub fn set_state_blob(&mut self, blob: &[u8]) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = blob;
+            return Err(Error::Stub);
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let rc =
+                sys::cascadia_runtime_set_state_blob(self.handle, blob.as_ptr(), blob.len());
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
             }

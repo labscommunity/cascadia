@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -953,6 +954,117 @@ int32_t cascadia_runtime_profiling(
     } catch (...) {
         set_last_error("unknown C++ exception in runtime_profiling"); return 1;
     }
+}
+
+// ───── Issue-34: KV state export/import for warm-pull (cascadia_engine::KvCoordination on OV) ─────
+//
+// A stateful OV LLM keeps its KV cache as `VariableState`s on the InferRequest. We serialize them all
+// into ONE self-describing, opaque blob (the consumer restores via set_state, never interprets the
+// tensors — fingerprint + layout_version upstream guarantee same model). Blob layout (little-endian):
+//   u32 count
+//   per state: u32 name_len, name[name_len], u8 dtype_code, u8 rank, u64 dims[rank], u64 nbytes, data[nbytes]
+
+static uint8_t ov_type_to_code(const ov::element::Type& t) {
+    if (t == ov::element::f32)  return 0;
+    if (t == ov::element::f16)  return 1;
+    if (t == ov::element::bf16) return 2;
+    if (t == ov::element::i64)  return 3;
+    if (t == ov::element::i32)  return 4;
+    if (t == ov::element::u8)   return 5;
+    if (t == ov::element::i8)   return 6;
+    if (t == ov::element::f64)  return 7;
+    return 255;
+}
+static ov::element::Type code_to_ov_type(uint8_t c) {
+    switch (c) {
+        case 0: return ov::element::f32;
+        case 1: return ov::element::f16;
+        case 2: return ov::element::bf16;
+        case 3: return ov::element::i64;
+        case 4: return ov::element::i32;
+        case 5: return ov::element::u8;
+        case 6: return ov::element::i8;
+        case 7: return ov::element::f64;
+        default: return ov::element::dynamic;
+    }
+}
+
+// Two-call: pass buf=nullptr/cap=0 to learn the size in *len_out, then call again with a buffer of
+// that size. Returns 0 on success (incl. the size-query); 1 on error. `*len_out` is always set.
+int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf, size_t cap,
+                                        size_t* len_out) {
+    if (!handle || !handle->request || !len_out) {
+        set_last_error("null runtime handle / len_out"); return 1;
+    }
+    try {
+        auto states = handle->request->query_state();
+        std::vector<std::pair<std::string, ov::Tensor>> snaps;
+        snaps.reserve(states.size());
+        size_t total = 4;
+        for (auto& s : states) {
+            std::string name = s.get_name();
+            ov::Tensor t = s.get_state();
+            total += 4 + name.size() + 1 + 1 + 8 * t.get_shape().size() + 8 + t.get_byte_size();
+            snaps.emplace_back(std::move(name), t);
+        }
+        *len_out = total;
+        if (!buf || cap < total) return 0; // size query
+        uint8_t* p = buf;
+        auto put32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+        auto put64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+        put32(static_cast<uint32_t>(snaps.size()));
+        for (auto& kv : snaps) {
+            const std::string& name = kv.first;
+            ov::Tensor& t = kv.second;
+            put32(static_cast<uint32_t>(name.size()));
+            std::memcpy(p, name.data(), name.size()); p += name.size();
+            *p++ = ov_type_to_code(t.get_element_type());
+            auto shape = t.get_shape();
+            *p++ = static_cast<uint8_t>(shape.size());
+            for (size_t d : shape) put64(static_cast<uint64_t>(d));
+            size_t nb = t.get_byte_size();
+            put64(static_cast<uint64_t>(nb));
+            std::memcpy(p, t.data(), nb); p += nb;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown C++ exception in get_state_blob"); return 1; }
+}
+
+int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
+    if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
+    if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
+    try {
+        auto states = handle->request->query_state();
+        std::map<std::string, ov::VariableState*> by_name;
+        for (auto& s : states) by_name[s.get_name()] = &s;
+        const uint8_t* p = buf;
+        const uint8_t* end = buf + len;
+        auto need = [&](size_t n) { if (static_cast<size_t>(end - p) < n) throw std::runtime_error("set_state_blob: truncated"); };
+        auto get32 = [&]() { need(4); uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
+        auto get64 = [&]() { need(8); uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
+        uint32_t count = get32();
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t nl = get32(); need(nl);
+            std::string name(reinterpret_cast<const char*>(p), nl); p += nl;
+            need(1); uint8_t dcode = *p++;
+            need(1); uint8_t rank = *p++;
+            ov::Shape shape; shape.reserve(rank);
+            for (uint8_t r = 0; r < rank; ++r) shape.push_back(static_cast<size_t>(get64()));
+            uint64_t nb = get64(); need(nb);
+            auto it = by_name.find(name);
+            if (it != by_name.end()) {
+                ov::Tensor t(code_to_ov_type(dcode), shape);
+                if (t.get_byte_size() == nb) {
+                    std::memcpy(t.data(), p, nb);
+                    it->second->set_state(t);
+                }
+            }
+            p += nb;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown C++ exception in set_state_blob"); return 1; }
 }
 
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle) {
