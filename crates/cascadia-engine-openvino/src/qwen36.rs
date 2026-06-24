@@ -1146,7 +1146,7 @@ impl Qwen36Engine {
                 return Vec::new();
             }
             let task = self.pending.remove(0);
-            self.reset_all();
+            // reset moved below — Issue-34 warm-resume may restore a cached prefix blob instead.
             let tokenizer = self.tokenizer.as_ref().expect("single-box has tokenizer");
             let mut prompt_ids: Vec<u32> = match tokenizer.encode(task.prompt.as_str(), true) {
                 Ok(e) => e.get_ids().to_vec(),
@@ -1181,11 +1181,37 @@ impl Qwen36Engine {
             } else {
                 self.max_tokens_default
             } as usize;
+            // Issue-34 warm-resume: restore a cached strict-prefix blob and prefill only the suffix;
+            // else cold reset. Gated + best-effort (stub ⇒ no blob ⇒ cold). 0 on the default path.
+            let warm_prefix: usize = {
+                #[cfg(feature = "kv_coord")]
+                {
+                    let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
+                    match self.kv.take_warm(&prompt_i32) {
+                        Some((blob, len)) if self.restore_local_stages(&blob) => {
+                            info!(
+                                warm_prefix = len,
+                                "qwen36 single-box warm-resumed from KV blob"
+                            );
+                            len
+                        }
+                        _ => {
+                            self.reset_all();
+                            0
+                        }
+                    }
+                }
+                #[cfg(not(feature = "kv_coord"))]
+                {
+                    self.reset_all();
+                    0
+                }
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 prompt_ids,
-                prefill_idx: 0,
-                step: 0,
+                prefill_idx: warm_prefix,
+                step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
                 gen_ids: Vec::new(),

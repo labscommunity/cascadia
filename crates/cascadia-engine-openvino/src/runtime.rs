@@ -2037,6 +2037,7 @@ impl OvRuntimeEngine {
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
+            #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
             #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
