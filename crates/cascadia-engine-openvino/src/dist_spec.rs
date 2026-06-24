@@ -2480,6 +2480,15 @@ impl OvDistSpecEngine {
     /// for a cached strict prefix. Returns the warm prefix length (0 ⇒ cold). On partial restore,
     /// resets everything cold (a partial restore would corrupt spec-decode).
     fn kv_try_warm_resume(&mut self, prompt_ids: &[i64]) -> usize {
+        // Gated OFF: spec-decode leaves the KV padded with proposed-then-rejected tokens (rig: draft
+        // 148 / target 168 deep for a 98-token accepted prefix), separable only by the host valid_mask,
+        // which the blob does NOT carry. Restoring the raw KV crashes (mask vs KV) or attends junk. The
+        // correct fix carries/compacts the spec-decode state (valid_mask + cursors) across the driver +
+        // worker broadcast — a follow-up. Until then dist-spec serves cold (safe). CASCADIA_DISTSPEC_WARM=1
+        // force-enables it for developing that fix. TODO(issue-34).
+        if std::env::var_os("CASCADIA_DISTSPEC_WARM").is_none() {
+            return 0;
+        }
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
         let Some((blob, len)) = self.kv.take_warm(&prompt_i32) else {
             return 0;
@@ -2495,11 +2504,9 @@ impl OvDistSpecEngine {
             && self.target.stage0_restore(&parts[1])
             && self.target.restore_downstream(epoch).unwrap_or(false);
         if ok {
-            // Cursors track each model's REAL restored KV depth, not the token count (off-by-one:
-            // the turn's last sampled token was never fed ⇒ KV = len-1; same fix as ov-runtime).
-            // draft + target are synced at a turn boundary so their depths match; a single suffix
-            // can only align both when they agree — otherwise fall back to cold rather than feed a
-            // desynced spec-decode state (a wrong cursor reproduces the very Add-shape crash).
+            // Each model's cursor = its real KV depth, not the token count (off-by-one — see
+            // kv_seq_from_blob). draft+target are synced at a turn boundary so depths match; if they
+            // disagree a single suffix can't align both, so fall back to cold.
             let d_pos = crate::kv_coordination::kv_seq_from_blob(&parts[0])
                 .map(|s| s.min(len))
                 .unwrap_or(len);

@@ -2091,10 +2091,7 @@ impl OvRuntimeEngine {
                                 }
                             };
                             if chain_ok {
-                                // The restored KV holds only tokens that were FED — the cached turn's
-                                // last sampled token was never fed back, so KV depth = matched_len - 1.
-                                // Drive position/mask off the REAL KV depth (read from the blob), else
-                                // the suffix decode feeds mask_len = kv+2 against kv+1 keys → Add crash.
+                                // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                                 warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
@@ -2835,15 +2832,10 @@ impl OvRuntimeEngine {
             }
             nt
         } else {
-            // Stateful: the IR keeps KV internally and every shape dim is dynamic. Cold prefill
-            // (warm_prefix==0) feeds the whole prompt in ONE inference at position 0. Issue-34
-            // WARM-resume feeds the SUFFIX in ONE inference at position == the restored KV depth:
-            // build_feed sets mask_len = position + input_len = kv_depth + input_len, which is exactly
-            // present_K (restored kv + new), so the attention shapes line up — the same identity the
-            // cold path relies on at position 0. (The earlier per-token suffix feed was a workaround
-            // for a position/mask off-by-one, not a real prefill-shape limit; with position driven by
-            // the true KV depth a single batched forward is correct AND avoids stalling the suffix
-            // prefill past the gateway's inter-token deadline.)
+            // Stateful: KV is internal, all dims dynamic. Cold feeds the whole prompt at position 0;
+            // warm-resume feeds the suffix at position = real KV depth, where mask_len = kv_depth +
+            // input_len holds, so one batched forward works. (The per-token feed it replaces was a
+            // workaround for the now-fixed off-by-one and stalled the suffix past the gateway deadline.)
             let position = self.position;
             let ts = std::time::Instant::now();
             let (out, shape) = self.run_first(&tokens, position)?;
@@ -4080,9 +4072,7 @@ impl OvRuntimeEngine {
                 let local_ok = match self.kv.take_capture(epoch) {
                     Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
-                            // Track the REAL restored KV depth, not the token count (last sampled
-                            // token of the turn was never fed ⇒ KV = tokens - 1). Same off-by-one
-                            // fix as the head: position must match the keys the suffix decodes against.
+                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
                                 .map(|s| s.min(tokens.len()))
                                 .unwrap_or(tokens.len())
