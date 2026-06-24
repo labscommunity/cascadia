@@ -1388,6 +1388,10 @@ struct ActiveTask {
     emitted: Vec<u8>,
     prefilled: bool,
     last_token: i32,
+    /// Issue-34: number of leading prompt tokens already warm in the OV state (restored from a
+    /// pulled/cached KV blob). The prefill feeds only `prompt_ids[warm_prefix..]`. 0 ⇒ cold (full
+    /// prefill), so the default path is unchanged.
+    warm_prefix: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -1472,6 +1476,9 @@ pub struct OvRuntimeEngine {
     /// link. Reset by any answer at all (a token, a NACK, even a malformed
     /// frame). Drives `escalate_if_downstream_is_gone`.
     consecutive_token_timeouts: u32,
+    /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
 }
 
 impl OvRuntimeEngine {
@@ -2027,13 +2034,34 @@ impl OvRuntimeEngine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
+            // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
+            // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
+            let mut warm_prefix = 0usize;
+            #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
+                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
+                    match self.runtime.set_state_blob(&blob) {
+                        Ok(()) => {
+                            warm_prefix = len;
+                            info!(warm_prefix = len, "ov-runtime warm-resumed from KV blob");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "set_state_blob failed; cold reprefill");
+                            let _ = self.runtime.reset_state();
+                        }
+                    }
+                }
+            }
+            if warm_prefix == 0 && self.static_kv.is_none() {
                 self.runtime.reset_state().map_err(map_ov_err)?;
             }
-            self.position = 0;
+            self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                warm_prefix,
                 "task active (ov-runtime)"
             );
             self.active = Some(ActiveTask {
@@ -2043,6 +2071,7 @@ impl OvRuntimeEngine {
                 emitted: Vec::new(),
                 prefilled: false,
                 last_token: 0,
+                warm_prefix,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -2607,7 +2636,8 @@ impl OvRuntimeEngine {
             let a = self.active.as_mut().unwrap();
             if !a.prefilled {
                 a.prefilled = true;
-                (true, a.prompt_ids.clone())
+                // warm_prefix is 0 on the cold/default path ⇒ full prompt (unchanged behaviour).
+                (true, a.prompt_ids[a.warm_prefix..].to_vec())
             } else {
                 (false, vec![a.last_token as i64])
             }
@@ -2912,6 +2942,17 @@ impl OvRuntimeEngine {
             );
             if std::env::var("CASCADIA_PERF_DUMP").is_ok_and(|v| v == "1") {
                 dump_decode_profile(&self.runtime);
+            }
+            // Issue-34: capture the full post-turn KV under (prompt + generated) for warm-pull.
+            // Best-effort + gated — off-rig get_state_blob returns Stub, so nothing is cached.
+            #[cfg(feature = "kv_coord")]
+            {
+                let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
+                full.extend_from_slice(&active.generated);
+                match self.runtime.get_state_blob() {
+                    Ok(blob) => self.kv.capture(full, blob),
+                    Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
+                }
             }
             self.active = None;
         }
@@ -3614,6 +3655,27 @@ impl Engine for OvRuntimeEngine {
             // prefill completes.
             self.park_prefill_model();
         }
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl OvRuntimeEngine {
+    pub(crate) fn shard_spec(&self) -> &ShardSpec {
+        &self.spec
+    }
+    pub(crate) fn tokenizer_ref(&self) -> Option<&Tokenizer> {
+        self.tokenizer.as_deref()
+    }
+    pub(crate) fn kv_cache(&self) -> &crate::kv_coordination::OvKvCache {
+        &self.kv
+    }
+    pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
+        &mut self.kv
     }
 }
 
@@ -4634,6 +4696,8 @@ impl Builder for OvRuntimeBuilder {
             awaiting_token_seq: 0,
             inbound_seq: None,
             consecutive_token_timeouts: 0,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
         }))
     }
 }
