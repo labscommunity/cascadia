@@ -394,6 +394,9 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    /// Issue-34: leading prompt tokens already warm in the OV state (RESTOREd). Prefill feeds only
+    /// `prompt_ids[warm_prefix..]`. 0 ⇒ cold (default path unchanged).
+    warm_prefix: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -436,6 +439,9 @@ pub struct Gemma4Engine {
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
     step_warn: StepWarnLimiter,
+    /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
 }
 
 impl Gemma4Engine {
@@ -778,11 +784,28 @@ impl Gemma4Engine {
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
-            self.runtime.reset_state().map_err(map_ov_err)?;
-            self.position = 0;
+            // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
+            // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
+            #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
+            let mut warm_prefix = 0usize;
+            #[cfg(feature = "kv_coord")]
+            if self.downstream.is_none() {
+                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
+                    if self.runtime.set_state_blob(&blob).is_ok() {
+                        warm_prefix = len;
+                        info!(warm_prefix = len, "gemma4 warm-resumed from KV blob");
+                    }
+                }
+            }
+            if warm_prefix == 0 {
+                self.runtime.reset_state().map_err(map_ov_err)?;
+            }
+            self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
+                warm_prefix,
                 "gemma4 task active"
             );
             self.active = Some(ActiveTask {
@@ -792,6 +815,7 @@ impl Gemma4Engine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
+                warm_prefix,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -839,7 +863,8 @@ impl Gemma4Engine {
             let a = self.active.as_mut().unwrap();
             if !a.prefilled {
                 a.prefilled = true;
-                (true, a.prompt_ids.clone())
+                // warm_prefix is 0 on the cold/default path ⇒ full prompt (unchanged).
+                (true, a.prompt_ids[a.warm_prefix..].to_vec())
             } else {
                 (false, vec![a.last_token as i64])
             }
@@ -971,6 +996,21 @@ impl Gemma4Engine {
                 other_ms,
                 "gemma4 task done"
             );
+            // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort
+            // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
+            #[cfg(feature = "kv_coord")]
+            {
+                let full: Vec<i32> = active
+                    .prompt_ids
+                    .iter()
+                    .map(|&t| t as i32)
+                    .chain(active.generated.iter().copied())
+                    .collect();
+                match self.runtime.get_state_blob() {
+                    Ok(blob) => self.kv.capture(full, blob),
+                    Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
+                }
+            }
             self.active = None;
         }
 
@@ -1118,6 +1158,69 @@ impl Engine for Gemma4Engine {
             },
         }
         result
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl Gemma4Engine {
+    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain.
+    fn kv_model_fingerprint(&self) -> u64 {
+        let s = &self.spec;
+        let mut buf = s.model_id.clone().into_bytes();
+        buf.extend_from_slice(&s.layer_start.to_le_bytes());
+        buf.extend_from_slice(&s.layer_end.to_le_bytes());
+        buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for Gemma4Engine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_model_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.as_ref()?.encode(text, false).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(token_ids)
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_model_fingerprint();
+        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        self.kv.insert_both(tokens, blob);
+        Ok(())
     }
 }
 
@@ -1473,6 +1576,8 @@ impl Builder for Gemma4Builder {
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
             step_warn: StepWarnLimiter::default(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
         }))
     }
 }
