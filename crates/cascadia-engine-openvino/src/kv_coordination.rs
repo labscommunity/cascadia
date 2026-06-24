@@ -173,6 +173,23 @@ impl OvKvCache {
         self.captures.insert(epoch, (tokens, blob));
     }
 
+    /// Consumer INSERT (pulled, validated blob): stash for BOTH restore paths — token-keyed
+    /// `entries` (the head warm-resumes via `take_warm` by prompt prefix) and epoch-keyed `captures`
+    /// (a worker rank warm-resumes via the head's RESTORE(epoch), having no tokens of its own).
+    pub(crate) fn insert_both(&mut self, tokens: Vec<i32>, blob: Vec<u8>) {
+        if tokens.is_empty() || blob.is_empty() {
+            return;
+        }
+        self.capture_under_epoch(synth_epoch(&tokens), tokens.clone(), blob.clone());
+        self.capture(tokens, blob);
+    }
+
+    /// Worker RESTORE: take the blob stashed under `epoch` (from INSERT/CAPTURE) so the rank can
+    /// `set_state` it. Removed on take (one restore per inserted turn).
+    pub(crate) fn take_capture(&mut self, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
+        self.captures.remove(&epoch)
+    }
+
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
     /// use), then `captures` (worker stash, repeat-serve). `None` if absent or the length drifted.
     pub(crate) fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
@@ -347,7 +364,7 @@ impl KvCoordination for OvRuntimeEngine {
     fn insert(&mut self, manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ()> {
         let (tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
         // Stage the blob; the next prefill warm-resumes via `OvKvCache::take_warm` (rig-certified).
-        self.kv_cache_mut().capture(tokens, blob);
+        self.kv_cache_mut().insert_both(tokens, blob);
         Ok(())
     }
 }
@@ -463,6 +480,18 @@ mod tests {
         // unknown epoch ⇒ None
         assert!(c.serve(0xE2, 3).is_none());
     }
+    #[test]
+    fn insert_both_feeds_head_and_worker_restore_paths() {
+        let mut c = OvKvCache::default();
+        c.insert_both(vec![1, 2, 3], vec![0xAB]);
+        // head path: take_warm by prompt prefix (strict)
+        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3)));
+        // worker path: take_capture by epoch
+        let epoch = synth_epoch(&[1, 2, 3]);
+        assert_eq!(c.take_capture(epoch), Some((vec![1, 2, 3], vec![0xAB])));
+        assert!(c.take_capture(epoch).is_none(), "consumed on take");
+    }
+
     #[test]
     fn offers_take_precedence_and_are_single_use() {
         let mut c = OvKvCache::default();
