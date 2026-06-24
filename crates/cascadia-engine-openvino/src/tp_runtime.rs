@@ -91,6 +91,13 @@ fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     }
     out
 }
+fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
 fn bytes_to_f32(dtype: ShimDType, bytes: &[u8]) -> Vec<f32> {
     match dtype {
         ShimDType::F16 => f16_bytes_to_f32(bytes),
@@ -236,10 +243,10 @@ impl TpRuntimeEngine {
 
         for i in 0..self.num_layers {
             // ----- attention segment -----
-            let hf16 = f32_to_f16_bytes(&hidden);
+            let hf16 = f32_to_bytes(&hidden);
             {
                 let s = &mut self.attn[i];
-                s.set("hidden_states", ShimDType::F16, &[1, seq, self.hidden], &hf16)?;
+                s.set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
                 s.set("attention_mask", ShimDType::I64, &[1, total], &attn_mask)?;
                 s.set("position_ids", ShimDType::I64, &[1, seq], &pos_ids)?;
                 if s.names.contains_key("beam_idx") {
@@ -252,8 +259,8 @@ impl TpRuntimeEngine {
                 *h += r;
             }
             // ----- mlp segment -----
-            let hf16 = f32_to_f16_bytes(&hidden);
-            self.mlp[i].set("hidden_states", ShimDType::F16, &[1, seq, self.hidden], &hf16)?;
+            let hf16 = f32_to_bytes(&hidden);
+            self.mlp[i].set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
             let (pm, _) = self.mlp[i].run()?;
             let rm = self.all_reduce(&pm, shape3)?;
             for (h, r) in hidden.iter_mut().zip(rm) {
@@ -262,8 +269,8 @@ impl TpRuntimeEngine {
         }
 
         if let Some(head) = &mut self.head {
-            let hf16 = f32_to_f16_bytes(&hidden);
-            head.set("hidden_states", ShimDType::F16, &[1, seq, self.hidden], &hf16)?;
+            let hf16 = f32_to_bytes(&hidden);
+            head.set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
             head.run()
         } else {
             Ok((Vec::new(), vec![1, seq, 0]))
