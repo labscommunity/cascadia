@@ -135,6 +135,10 @@ pub enum FrameKind {
     /// windows: every window but the last is `NoSample`, and only the final
     /// `ForwardBatchPrefill` samples the first generated token.
     ForwardBatchPrefillNoSample = 0x53_4D_45_0B, // "SME\x0B"
+    // Issue-34 Task 1.3 (multi-stage KV capture, §8). Appended codes only — never reorder existing
+    // ones; an older peer that lacks these rejects them in `from_code` (loud, not silent corruption).
+    Capture = 0x53_4D_45_30,    // "SME\x30" — head→down: snapshot each stage's KV under epoch E
+    CaptureAck = 0x53_4D_45_31, // "SME\x31" — up: "captured @ E" (propagates head-ward like Token)
 }
 
 impl FrameKind {
@@ -153,6 +157,8 @@ impl FrameKind {
             }
             x if x == FrameKind::RestorePrefix as u32 => Some(FrameKind::RestorePrefix),
             x if x == FrameKind::CachePrefix as u32 => Some(FrameKind::CachePrefix),
+            x if x == FrameKind::Capture as u32 => Some(FrameKind::Capture),
+            x if x == FrameKind::CaptureAck as u32 => Some(FrameKind::CaptureAck),
             _ => None,
         }
     }
@@ -547,6 +553,129 @@ pub async fn recv_token_reply(
                  connection dropped to avoid reading this reply as the next request's"
             ))
         }
+    }
+}
+
+// ───────────────────────── Issue-34 Task 1.3: multi-stage KV capture (§8) ─────────────────────────
+//
+// CAPTURE(epoch, tokens) flows downstream like Forward; each stage snapshots its KV slice under the
+// head-assigned `epoch` (so workers never derive it locally, §8) and keys it by `tokens` (so its
+// served Manifest carries the prefix the consumer re-validates). CaptureAck(epoch) flows upstream like
+// Token; a mid-stage acks up only after its downstream acked, so the head's single ack = "all captured".
+
+/// Hard cap on a Capture frame's token count — bounds the recv-side allocation from the 4-byte count
+/// field against a corrupt/adversarial peer (mirrors `MAX_BATCH_COUNT`). 1 Mi ids = 4 MiB worst case.
+pub const MAX_CAPTURE_TOKENS: u32 = 1 << 20;
+
+/// Pure frame encoder (testable): kind(4) + epoch(8 BE) + count(4 BE) + count×i32 (BE).
+fn capture_frame_bytes(epoch: u64, tokens: &[i32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16 + tokens.len() * 4);
+    b.extend_from_slice(&(FrameKind::Capture as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(tokens.len() as u32).to_be_bytes());
+    for &t in tokens {
+        b.extend_from_slice(&t.to_be_bytes());
+    }
+    b
+}
+
+/// Send a Capture frame downstream (head/mid → next stage).
+pub async fn send_capture(
+    cli: &Mutex<ActivationClient>,
+    epoch: u64,
+    tokens: &[i32],
+) -> TransportResult<()> {
+    let bytes = capture_frame_bytes(epoch, tokens);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a Capture body from upstream (kind already consumed). Returns `(epoch, tokens)`.
+pub async fn recv_capture_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<i32>)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(12).await?;
+    if head.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let count = u32::from_be_bytes(head[8..12].try_into().unwrap());
+    if count > MAX_CAPTURE_TOKENS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture token count {count} exceeds MAX_CAPTURE_TOKENS {MAX_CAPTURE_TOKENS}"
+        ))));
+    }
+    let n = count as usize;
+    let body = if n > 0 {
+        guard.recv_raw(n * 4).await?
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    if body.len() != n * 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let mut tokens = Vec::with_capacity(n);
+    for c in body.chunks_exact(4) {
+        tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok((epoch, tokens))
+}
+
+/// Send a CaptureAck frame upstream (stage → head-ward). Body: 8 B BE epoch.
+pub async fn send_capture_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    epoch: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(FrameKind::CaptureAck as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&epoch.to_be_bytes());
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a CaptureAck body from downstream (kind already consumed). Returns the acked epoch.
+pub async fn recv_capture_ack_body_client(cli: &Mutex<ActivationClient>) -> TransportResult<u64> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod capture_frame_tests {
+    use super::*;
+
+    #[test]
+    fn capture_frame_bytes_layout_roundtrips() {
+        let toks = vec![1, -2, 300, i32::MIN, i32::MAX, 0];
+        let epoch = 0xDEAD_BEEF_0000_0001u64;
+        let b = capture_frame_bytes(epoch, &toks);
+        assert_eq!(b[0..4], (FrameKind::Capture as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            toks.len() as u32
+        );
+        let got: Vec<i32> = b[16..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, toks);
+        assert_eq!(b.len(), 16 + toks.len() * 4);
+    }
+
+    #[test]
+    fn capture_frame_bytes_empty_tokens() {
+        let b = capture_frame_bytes(7, &[]);
+        assert_eq!(b.len(), 16);
+        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 0);
     }
 }
 

@@ -34,6 +34,10 @@ use crate::dist::{
     send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
     send_restore_prefix, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
+#[cfg(feature = "kv_coord")]
+use crate::dist::{
+    recv_capture_ack_body_client, recv_capture_body_server, send_capture, send_capture_ack_upstream,
+};
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
 use crate::ov_moe::OvMoeRunner;
@@ -798,14 +802,23 @@ impl Builder for SparseMoEBuilder {
         // error) on multi-stage configs so the same CLI flag works in
         // both topologies — the multi-stage path silently ignores it.
         let kv_cache_size = if total > 1 {
-            if self.config.kv_prefix_cache_size > 0 {
-                warn!(
-                    requested = self.config.kv_prefix_cache_size,
-                    total,
-                    "kv-prefix-cache disabled: multi-stage cache requires per-stage snapshot exchange (not implemented yet)"
-                );
-            }
-            0
+            // Issue-34 Task 1.3: multi-stage capture is wired under `kv_coord` (per-stage CAPTURE@E
+            // over the pipeline transport, §8). Without the feature there is no warm-pull plane, so
+            // the per-stage cache stays off (allocating it would only waste memory).
+            #[cfg(feature = "kv_coord")]
+            let v = self.config.kv_prefix_cache_size;
+            #[cfg(not(feature = "kv_coord"))]
+            let v = {
+                if self.config.kv_prefix_cache_size > 0 {
+                    warn!(
+                        requested = self.config.kv_prefix_cache_size,
+                        total,
+                        "kv-prefix-cache disabled: multi-stage capture needs the kv_coord feature"
+                    );
+                }
+                0
+            };
+            v
         } else {
             self.config.kv_prefix_cache_size
         };
@@ -869,6 +882,8 @@ impl Builder for SparseMoEBuilder {
             kv_prefix_cache,
             #[cfg(feature = "kv_coord")]
             kv_offers: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_capture: std::collections::HashMap::new(),
         }))
     }
 }
@@ -1066,6 +1081,14 @@ pub struct SparseMoEEngine {
     /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS`.
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_offers:
+        std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+    /// Issue-34 Task 1.3 (multi-stage capture, §8): PERSISTENT per-rank capture store, keyed by the
+    /// head-assigned epoch. Multi-stage `CAPTURE(E,tokens)` stashes each stage's `snapshot_kv()` here;
+    /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
+    /// on the head), these must survive across turns — a forced move can pull a prefix captured many
+    /// turns earlier. Bounded by `kv_prefix_cache.capacity()`; eviction is oldest-arbitrary.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_capture:
         std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
 }
 
@@ -1427,6 +1450,43 @@ impl SparseMoEEngine {
                 }
             }
         };
+
+        // Issue-34 Task 1.3 (§8): capture the full post-turn sequence's KV across the whole chain so
+        // a forced move can warm-resume. The head mints E = synth_epoch(full tokens) and broadcasts
+        // CAPTURE(E, tokens) downstream; each stage snapshots its slice under E and acks back up; the
+        // head's single ack means every stage captured. Then the head seeds its own prefix cache so a
+        // later NEGOTIATE maps the prefix → E. Best-effort: any transport/snapshot error just skips the
+        // cache (warm-pull degrades to cold) and never affects the already-complete served output.
+        #[cfg(feature = "kv_coord")]
+        if self.kv_prefix_cache.enabled() && !result_tokens.is_empty() {
+            let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+            full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
+            let epoch = crate::kv_coordination::synth_epoch(&full_tokens);
+            let acked = self.block_on(async {
+                send_capture(&downstream, epoch, &full_tokens)
+                    .await
+                    .map_err(|e| format!("send_capture: {e}"))?;
+                match recv_kind_client(&downstream).await {
+                    Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(&downstream)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("recv_capture_ack: {e}")),
+                    Ok(Some(other)) => Err(format!("expected CaptureAck, got {other:?}")),
+                    Ok(None) => Err("downstream closed during capture".into()),
+                    Err(e) => Err(format!("recv_kind (capture): {e}")),
+                }
+            });
+            match acked {
+                Ok(()) => {
+                    if let Ok(snap) = self.runner.snapshot_kv() {
+                        let fp = self.runner.fingerprint();
+                        let prompt64: Vec<i64> = full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        self.kv_prefix_cache.insert(prompt64, &fp, snap);
+                    }
+                }
+                Err(e) => warn!(task = %task.task_id, "kv multi-stage capture skipped: {e}"),
+            }
+        }
 
         let n_tokens = result_tokens.len() as u32;
         let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
@@ -2043,6 +2103,32 @@ impl SparseMoEEngine {
         }
     }
 
+    /// Issue-34 Task 1.3: snapshot THIS rank's KV slice and stash it under the head-assigned `epoch`
+    /// for a later per-rank `GET`. Best-effort — a snapshot error logs + skips (the turn already
+    /// served; warm-pull just loses this rank → consumer degrades to cold). Bounded by the prefix
+    /// cache capacity; on overflow an arbitrary older capture is evicted.
+    #[cfg(feature = "kv_coord")]
+    fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>) {
+        if !self.kv_prefix_cache.enabled() {
+            return;
+        }
+        let snap = match self.runner.snapshot_kv() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "kv capture: snapshot_kv failed: {e}");
+                return;
+            }
+        };
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+            let Some(k) = self.kv_capture.keys().next().copied() else {
+                break;
+            };
+            self.kv_capture.remove(&k);
+        }
+        self.kv_capture.insert(epoch, (tokens, snap));
+    }
+
     fn handle_one_frame(
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
@@ -2203,6 +2289,46 @@ impl SparseMoEEngine {
             }
             FrameKind::RestorePrefix | FrameKind::CachePrefix => Err(format!(
                 "rank {} received a KV-prefix-cache frame (glm5 pipeline engine only)",
+                self.rank
+            )),
+            // Issue-34 Task 1.3 (§8): snapshot this stage's KV under the head-assigned epoch, propagate
+            // CAPTURE downstream, and ack upstream only after the downstream ack (so the head's single
+            // ack == every stage captured). Best-effort: capture failure degrades the consumer to cold.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Capture => {
+                let (epoch, tokens) = self
+                    .block_on(recv_capture_body_server(upstream))
+                    .map_err(|e| format!("recv_capture: {e}"))?;
+                self.capture_under_epoch(epoch, tokens.clone());
+                if let Some(down) = downstream.as_ref() {
+                    self.block_on(async {
+                        send_capture(down, epoch, &tokens)
+                            .await
+                            .map_err(|e| format!("send_capture: {e}"))?;
+                        match recv_kind_client(down).await {
+                            Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| format!("recv_capture_ack: {e}")),
+                            Ok(Some(other)) => {
+                                Err(format!("expected CaptureAck downstream, got {other:?}"))
+                            }
+                            Ok(None) => Err("downstream closed during capture-ack".into()),
+                            Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                        }
+                    })?;
+                }
+                self.block_on(send_capture_ack_upstream(upstream, epoch))
+                    .map_err(|e| format!("send_capture_ack: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(feature = "kv_coord"))]
+            FrameKind::Capture => Err(format!(
+                "rank {} received CAPTURE but kv_coord is not built",
+                self.rank
+            )),
+            FrameKind::CaptureAck => Err(format!(
+                "rank {} received unexpected CAPTURE_ACK from upstream",
                 self.rank
             )),
         }
