@@ -12,7 +12,7 @@ use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
     Gemma4Builder, OvDistSpecBuilder, OvDistSpecWorkerBuilder, OvGenaiBuilder, OvRuntimeBuilder,
-    Qwen36Builder,
+    Qwen36Builder, TpRuntimeBuilder,
 };
 use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
@@ -48,6 +48,7 @@ fn engine_name(kind: EngineKind) -> &'static str {
         EngineKind::Gemma4 => "gemma4",
         EngineKind::SparseMoe => "sparse-moe",
         EngineKind::Qwen36Moe => "qwen36-moe",
+        EngineKind::TpRuntime => "tp-runtime",
     }
 }
 
@@ -209,6 +210,11 @@ pub enum EngineKind {
     /// manifest.json) in-process; greedy-only, batch=1. CPU-targeted
     /// for decode (see docs/architectures/qwen36-moe-support.md).
     Qwen36Moe,
+    /// Megatron tensor-parallel engine. Each rank holds a 1/N slice of every
+    /// layer (segmented IR from `tools/tp_export.py`) and all-reduces partials
+    /// after attention + MLP over the transport. 2-node bidirectional peer link
+    /// (--rank = tp_rank, --total = tp_size, --next = peer, --listen = own).
+    TpRuntime,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -717,6 +723,13 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             Ok(Box::new(b))
         }
+        EngineKind::TpRuntime => {
+            let mut b = TpRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
+            }
+            Ok(Box::new(b))
+        }
         EngineKind::Gemma4 => {
             let mut b = Gemma4Builder::new(&args.model, args.rank, args.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
@@ -941,6 +954,10 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     }
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
+    // Tensor parallelism is a 2-node bidirectional peer link, not a daisy chain:
+    // EVERY rank both listens (server) and dials the peer (client), regardless of
+    // is_first/is_last. rank 0 still drives generation (is_first), rank 1 relays.
+    let is_tp = matches!(args.engine, EngineKind::TpRuntime);
 
     info!(
         engine = ?args.engine,
@@ -953,18 +970,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
 
     let (listen_host, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
 
-    let upstream = if is_first {
+    let upstream = if is_first && !is_tp {
         None
     } else {
         Some(PeerEndpoint::new(listen_host.clone(), listen_port))
     };
-    let downstream = if is_last {
+    let downstream = if is_last && !is_tp {
         None
     } else {
         let next = args
             .next
             .as_deref()
-            .ok_or_else(|| anyhow!("--next is required for non-last stages"))?;
+            .ok_or_else(|| anyhow!("--next is required for non-last stages (and for tp-runtime peers)"))?;
         let (h, p) = parse_addr(next, "127.0.0.1")?;
         Some(PeerEndpoint::new(h, p))
     };
@@ -981,13 +998,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         device: args.device.clone(),
         is_first_stage: is_first,
         is_last_stage: is_last,
-        tp_size: 1,
-        tp_rank: 0,
+        tp_size: if is_tp { args.total } else { 1 },
+        tp_rank: if is_tp { args.rank } else { 0 },
     };
 
     let builder = build_builder(&args)?;
     let runner = Arc::new(Runner::new(builder));
-    let listen = if !is_first {
+    let listen = if !is_first || is_tp {
         Some((listen_host.as_str(), listen_port))
     } else {
         None

@@ -16,6 +16,7 @@ pub mod genai;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;
+pub mod tp_runtime;
 
 pub use dist_spec::{
     DistributedMaskedReq, FrameKind, MaskedReq, OvDistSpecBuilder, OvDistSpecEngine,
@@ -26,3 +27,4 @@ pub use genai::{OvGenaiBuilder, OvGenaiEngine};
 pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};
+pub use tp_runtime::{TpRuntimeBuilder, TpRuntimeEngine};
