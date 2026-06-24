@@ -185,9 +185,15 @@ pub struct TpRuntimeEngine {
     position: i64,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
-    // instrumentation (per task, decode-phase): GPU segment-infer time vs all-reduce time
+    // instrumentation (decode-phase only; reset after prefill): wall split into
+    // GPU segment-infer, all-reduce, host input-prep (set_input + conversions).
+    // Everything else in forward (residual adds, argmax, broadcast) is the
+    // remainder t_fwd - (gpu+ar+setup).
     t_gpu_us: u128,
     t_ar_us: u128,
+    t_setup_us: u128,
+    t_fwd_us: u128,
+    decode_steps: u64,
 }
 
 impl TpRuntimeEngine {
@@ -240,12 +246,18 @@ impl TpRuntimeEngine {
         let pos_ids = i64_to_bytes(&(position..position + seq as i64).collect::<Vec<_>>());
         let shape3: [u32; MAX_RANK] = [1, seq as u32, self.hidden as u32];
 
+        let t_fwd0 = Instant::now();
         // embed
+        let ts = Instant::now();
         self.embed.set("input_ids", ShimDType::I64, &[1, seq], &i64_to_bytes(input_ids))?;
+        self.t_setup_us += ts.elapsed().as_micros();
+        let t = Instant::now();
         let (mut hidden, _) = self.embed.run()?;
+        self.t_gpu_us += t.elapsed().as_micros();
 
         for i in 0..self.num_layers {
             // ----- attention segment -----
+            let ts = Instant::now();
             let hf16 = f32_to_bytes(&hidden);
             {
                 let s = &mut self.attn[i];
@@ -256,6 +268,7 @@ impl TpRuntimeEngine {
                     s.set("beam_idx", ShimDType::I32, &[1], &0i32.to_le_bytes())?;
                 }
             }
+            self.t_setup_us += ts.elapsed().as_micros();
             let t = Instant::now();
             let (pa, _) = self.attn[i].run()?;
             self.t_gpu_us += t.elapsed().as_micros();
@@ -266,8 +279,10 @@ impl TpRuntimeEngine {
                 *h += r;
             }
             // ----- mlp segment -----
+            let ts = Instant::now();
             let hf16 = f32_to_bytes(&hidden);
             self.mlp[i].set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
+            self.t_setup_us += ts.elapsed().as_micros();
             let t = Instant::now();
             let (pm, _) = self.mlp[i].run()?;
             self.t_gpu_us += t.elapsed().as_micros();
@@ -279,16 +294,20 @@ impl TpRuntimeEngine {
             }
         }
 
-        if let Some(head) = &mut self.head {
+        let out = if let Some(head) = &mut self.head {
+            let ts = Instant::now();
             let hf16 = f32_to_bytes(&hidden);
             head.set("hidden_states", ShimDType::F32, &[1, seq, self.hidden], &hf16)?;
+            self.t_setup_us += ts.elapsed().as_micros();
             let t = Instant::now();
             let r = head.run();
             self.t_gpu_us += t.elapsed().as_micros();
             r
         } else {
             Ok((Vec::new(), vec![1, seq, 0]))
-        }
+        };
+        self.t_fwd_us += t_fwd0.elapsed().as_micros();
+        out
     }
 
     // ---- rank-0 driver: send control + input_ids to rank 1 ----
@@ -378,11 +397,23 @@ impl TpRuntimeEngine {
         if done {
             let elapsed = a.started.elapsed();
             let n = a.generated.len();
+            // decode-only per-token split (timers were reset after prefill).
+            let ds = self.decode_steps.max(1) as f64;
+            let other_us = (self.t_fwd_us as f64
+                - self.t_gpu_us as f64
+                - self.t_ar_us as f64
+                - self.t_setup_us as f64)
+                .max(0.0);
             info!(task = %tid, tokens = n, elapsed_s = elapsed.as_secs_f64(),
                   tok_s = n as f64 / elapsed.as_secs_f64(),
-                  gpu_ms = self.t_gpu_us as f64 / 1000.0,
-                  allreduce_ms = self.t_ar_us as f64 / 1000.0,
-                  "tp-runtime task done");
+                  decode_steps = self.decode_steps,
+                  decode_tok_s = ds * 1e6 / self.t_fwd_us.max(1) as f64,
+                  fwd_us_tok = self.t_fwd_us as f64 / ds,
+                  gpu_us_tok = self.t_gpu_us as f64 / ds,
+                  allreduce_us_tok = self.t_ar_us as f64 / ds,
+                  setup_us_tok = self.t_setup_us as f64 / ds,
+                  other_us_tok = other_us / ds,
+                  "tp-runtime decode profile");
             // tell rank 1 the request is over
             let _ = self.broadcast(CTRL_STOP, &[]);
             self.active = None;
@@ -470,11 +501,23 @@ impl TpRuntimeEngine {
             warn!("broadcast: {e}");
             return Vec::new();
         }
+        let was_prefill = ctrl == CTRL_PREFILL;
         let pos = self.position;
         let res = self.forward(&input_ids, pos);
         self.position += input_ids.len() as i64;
         if let Some(a) = self.active.as_mut() {
             a.prefilled = true;
+        }
+        // reset accumulators after prefill so the logged split is decode-only;
+        // count this as a decode step otherwise.
+        if was_prefill {
+            self.t_gpu_us = 0;
+            self.t_ar_us = 0;
+            self.t_setup_us = 0;
+            self.t_fwd_us = 0;
+            self.decode_steps = 0;
+        } else {
+            self.decode_steps += 1;
         }
         match res {
             Ok((logits, shape)) => match self.vocab_argmax(&logits, &shape) {
@@ -557,6 +600,23 @@ impl TpRuntimeBuilder {
         let mut p = PluginConfig::new();
         if let Some(d) = &self.cache_dir {
             p = p.with("CACHE_DIR", d);
+        }
+        // GPU dispatch tuning for the many-tiny-segment TP workload. Each of the
+        // 34 segment infers/token pays the GPU-plugin per-invocation floor, so we
+        // pin the lowest-latency single-stream path. Gated by SE_TP_TUNE so a
+        // single binary can A/B baseline vs tuned without a rebuild.
+        //   1 (default): LATENCY hint + 1 stream + high queue priority.
+        //   0: leave plugin defaults (baseline).
+        let tune = std::env::var("SE_TP_TUNE").ok().as_deref() != Some("0");
+        if tune {
+            // Only rock-solid GPU keys: LATENCY pins the single-stream low-latency
+            // schedule, NUM_STREAMS=1 guarantees no throughput-mode stream split.
+            // (Riskier keys like INFERENCE_PRECISION_HINT can fail compile on some
+            // Arc fused kernels — see qwen36.rs — so we avoid them.)
+            p = p.with("PERFORMANCE_HINT", "LATENCY").with("NUM_STREAMS", "1");
+            info!("tp-runtime: GPU dispatch tuning ON (LATENCY/1-stream); set SE_TP_TUNE=0 to disable");
+        } else {
+            info!("tp-runtime: GPU dispatch tuning OFF (plugin defaults)");
         }
         p
     }
@@ -691,6 +751,9 @@ impl Builder for TpRuntimeBuilder {
             active: None,
             t_gpu_us: 0,
             t_ar_us: 0,
+            t_setup_us: 0,
+            t_fwd_us: 0,
+            decode_steps: 0,
         }))
     }
 }
