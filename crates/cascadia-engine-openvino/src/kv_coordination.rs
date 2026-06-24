@@ -52,6 +52,39 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     fnv1a64(&buf)
 }
 
+/// Max tokens in a CAPTURE frame body — DoS bound so a forged frame can't allocate unbounded.
+pub(crate) const MAX_CAPTURE_TOKENS: usize = 1 << 20;
+
+/// §8 CAPTURE frame BODY (transport-agnostic): `u64 epoch | u32 ntok | ntok × i32 (LE)`. The head
+/// broadcasts this after a turn; each engine wraps it in its OWN frame header (qwen36 `frame_header`,
+/// ov-runtime `WireTensor`, dist-spec `FrameKind`). Workers parse it, blob their slice, and ACK.
+pub(crate) fn capture_body_bytes(epoch: u64, tokens: &[i32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12 + tokens.len() * 4);
+    b.extend_from_slice(&epoch.to_le_bytes());
+    b.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for &t in tokens {
+        b.extend_from_slice(&t.to_le_bytes());
+    }
+    b
+}
+
+/// Parse a CAPTURE body. `None` on truncation or an over-bound token count (forged/corrupt frame).
+pub(crate) fn parse_capture_body(b: &[u8]) -> Option<(u64, Vec<i32>)> {
+    if b.len() < 12 {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let ntok = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
+    if ntok > MAX_CAPTURE_TOKENS || b.len() != 12 + ntok * 4 {
+        return None;
+    }
+    let mut tokens = Vec::with_capacity(ntok);
+    for c in b[12..].chunks_exact(4) {
+        tokens.push(i32::from_le_bytes(c.try_into().ok()?));
+    }
+    Some((epoch, tokens))
+}
+
 /// One captured turn: the full token sequence and its opaque KV blob.
 struct OvKvEntry {
     tokens: Vec<i32>,
@@ -61,10 +94,15 @@ struct OvKvEntry {
 /// Per-engine KV blob cache + NEGOTIATE→GET offers. Lives in [`OvRuntimeEngine`] behind `kv_coord`.
 #[derive(Default)]
 pub(crate) struct OvKvCache {
-    /// Captured full-sequence blobs, most-recent first, bounded (LRU).
+    /// Captured full-sequence blobs, most-recent first, bounded (LRU). Head/single-stage path
+    /// (token-keyed: this rank knows the tokens).
     entries: Vec<OvKvEntry>,
     /// `epoch → (tokens, blob)` stashed at NEGOTIATE for the paired GET (short-lived, single-use).
     offers: HashMap<u64, (Vec<i32>, Vec<u8>)>,
+    /// §8 multi-stage worker stash: `epoch → (tokens, blob)`. A worker rank has no tokens of its
+    /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
+    /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
+    captures: HashMap<u64, (Vec<i32>, Vec<u8>)>,
 }
 
 impl OvKvCache {
@@ -76,6 +114,37 @@ impl OvKvCache {
         self.entries.retain(|e| e.tokens != tokens); // de-dup exact key (refresh to front)
         self.entries.insert(0, OvKvEntry { tokens, blob });
         self.entries.truncate(KV_MAX_ENTRIES);
+    }
+
+    /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`. Bounded.
+    pub(crate) fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
+        if blob.is_empty() {
+            return;
+        }
+        if self.captures.len() >= KV_MAX_ENTRIES && !self.captures.contains_key(&epoch) {
+            if let Some(k) = self.captures.keys().next().copied() {
+                self.captures.remove(&k);
+            }
+        }
+        self.captures.insert(epoch, (tokens, blob));
+    }
+
+    /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
+    /// use), then `captures` (worker stash, repeat-serve). `None` if absent or the length drifted.
+    fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
+        let (tokens, blob) = if let Some(off) = self.offers.remove(&epoch) {
+            off
+        } else if let Some(cap) = self.captures.get(&epoch) {
+            cap.clone()
+        } else {
+            return None;
+        };
+        // Head/offers path carries tokens ⇒ length must match what was negotiated. Worker captures
+        // also carry the head-broadcast tokens, so the same check holds for both.
+        if tokens.len() as u32 != len {
+            return None;
+        }
+        Some((tokens, blob))
     }
 
     /// Longest cached entry whose `tokens` is a prefix of `req`. The blob is whole-sequence
@@ -214,10 +283,9 @@ impl KvCoordination for OvRuntimeEngine {
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let model_fp = self.kv_model_fingerprint();
-        let (prefix, blob) = self.kv_cache_mut().offers.remove(&expected_epoch)?;
-        if prefix.len() as u32 != expected_len {
-            return None; // drifted from what was negotiated
-        }
+        // offers (head NEGOTIATE→GET) OR captures (§8 worker stash) — a worker rank has no
+        // NEGOTIATE, so its slice is served from the head-broadcast epoch.
+        let (prefix, blob) = self.kv_cache_mut().serve(expected_epoch, expected_len)?;
         Some(blob_to_wire(
             &prefix,
             &blob,
@@ -283,6 +351,49 @@ mod tests {
         let (blob, len) = c.take_warm(&[1, 2, 3, 4, 5]).unwrap();
         assert_eq!((blob, len), (vec![0xC, 0xD], 3));
         assert!(c.take_warm(&[1, 2, 3, 4, 5]).is_none(), "consumed on take");
+    }
+
+    #[test]
+    fn capture_body_roundtrips() {
+        let tokens = vec![1i32, -2, 3, 1_000_000, i32::MIN, i32::MAX];
+        let b = capture_body_bytes(0xDEAD_BEEF_0000_0001, &tokens);
+        assert_eq!(
+            parse_capture_body(&b),
+            Some((0xDEAD_BEEF_0000_0001, tokens))
+        );
+        // empty token list is valid (epoch-only capture)
+        let e = capture_body_bytes(7, &[]);
+        assert_eq!(parse_capture_body(&e), Some((7, vec![])));
+    }
+    #[test]
+    fn capture_body_rejects_malformed() {
+        assert!(parse_capture_body(&[0u8; 4]).is_none()); // too short for header
+        let mut b = capture_body_bytes(1, &[9, 9]);
+        b.truncate(b.len() - 1); // body shorter than declared ntok
+        assert!(parse_capture_body(&b).is_none());
+        // forged over-bound ntok: header claims a huge count
+        let mut h = 1u64.to_le_bytes().to_vec();
+        h.extend_from_slice(&(u32::MAX).to_le_bytes());
+        assert!(parse_capture_body(&h).is_none());
+    }
+    #[test]
+    fn worker_stash_serves_by_epoch_repeatedly() {
+        let mut c = OvKvCache::default();
+        c.capture_under_epoch(0xE1, vec![11, 22, 33], vec![0xAA, 0xBB]);
+        // served by (epoch, len); repeatable (workers answer multiple per-rank GETs)
+        assert_eq!(c.serve(0xE1, 3), Some((vec![11, 22, 33], vec![0xAA, 0xBB])));
+        assert_eq!(c.serve(0xE1, 3).map(|(_, b)| b), Some(vec![0xAA, 0xBB]));
+        // length drift ⇒ refuse
+        assert!(c.serve(0xE1, 2).is_none());
+        // unknown epoch ⇒ None
+        assert!(c.serve(0xE2, 3).is_none());
+    }
+    #[test]
+    fn offers_take_precedence_and_are_single_use() {
+        let mut c = OvKvCache::default();
+        c.offers.insert(0xF0, (vec![1, 2], vec![0x01]));
+        assert_eq!(c.serve(0xF0, 2), Some((vec![1, 2], vec![0x01])));
+        assert!(c.serve(0xF0, 2).is_none(), "offer consumed on serve");
     }
 
     #[test]
