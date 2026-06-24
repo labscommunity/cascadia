@@ -20,6 +20,31 @@ pub struct TokenLogprobs {
     pub top_logprobs: Vec<TopLogprob>,
 }
 
+/// Why a generation ended. Set on the FINAL chunk by engines that can tell
+/// the difference; maps to OpenAI's `finish_reason`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// EOS token emitted or a stop sequence matched.
+    Stop,
+    /// `max_tokens` reached before a natural stop.
+    Length,
+    /// Client disconnected or an explicit cancel arrived.
+    Cancelled,
+}
+
+impl FinishReason {
+    /// OpenAI wire string. `Cancelled` has no OpenAI equivalent — report it
+    /// as `stop` per the streaming spec (a server SHOULD end cleanly when the
+    /// client goes away); surface `cancelled` only in metrics.
+    pub fn as_openai_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop | FinishReason::Cancelled => "stop",
+            FinishReason::Length => "length",
+        }
+    }
+}
+
 /// One token (or final marker) produced by an engine for a task.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
@@ -52,6 +77,12 @@ pub struct Chunk {
     /// loud (5xx). `None` on every normal token/final chunk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Why generation ended. Set on the FINAL chunk by engines that can tell
+    /// `length` (hit max_tokens) from `stop` (EOS / stop sequence). `None` on
+    /// non-final chunks and on engines that don't distinguish — the API then
+    /// falls back to `"stop"` (the historical behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl Chunk {
@@ -65,6 +96,7 @@ impl Chunk {
             n_tokens: None,
             prompt_tokens: None,
             error: None,
+            finish_reason: None,
         }
     }
 
@@ -78,6 +110,7 @@ impl Chunk {
             n_tokens: None,
             prompt_tokens: None,
             error: None,
+            finish_reason: None,
         }
     }
 
@@ -94,11 +127,18 @@ impl Chunk {
             n_tokens: None,
             prompt_tokens: None,
             error: Some(reason.into()),
+            finish_reason: None,
         }
     }
 
     pub fn with_prompt_tokens(mut self, n: u32) -> Self {
         self.prompt_tokens = Some(n);
+        self
+    }
+
+    /// Tag the final chunk with why generation stopped (length vs stop).
+    pub fn with_finish_reason(mut self, reason: FinishReason) -> Self {
+        self.finish_reason = Some(reason);
         self
     }
 

@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::PluginConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+};
 use futures::stream;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
@@ -641,18 +643,34 @@ impl Builder for SparseMoEBuilder {
     }
 }
 
-/// Build a SamplingConfig for one task. Currently the only knob the
-/// public `GenerationTask` surface exposes is `temperature`; the rest
-/// are hard-coded to defaults that have worked well in K2.6 evals.
-/// Lifted out so the single-stage and multi-stage entry paths can't
-/// drift.
+/// Build a SamplingConfig for one task from the request's `temperature` +
+/// `SamplingParams` (top_p / top_k / seed / frequency & presence penalty).
+/// `repetition_penalty` / `repetition_window` are K2.6-tuned defaults not
+/// exposed on the OpenAI surface. Lifted out so the single-stage and
+/// multi-stage entry paths can't drift.
+/// Infer the OpenAI `finish_reason` for a completed decode: hitting the token
+/// cap is `length`; stopping short of it (EOS / stop sequence) is `stop`. The
+/// runner returns the generated ids excluding EOS, so `n >= max_new` means the
+/// cap was the limiter. An EOS landing exactly at the cap reports `length`.
+fn finish_reason_for(n_tokens: usize, max_new: usize) -> FinishReason {
+    if n_tokens >= max_new {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    }
+}
+
 fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
+    let s = &task.sampling;
     crate::sampling::SamplingConfig {
         temperature: task.temperature.max(0.0),
-        top_p: 1.0,
+        top_p: if s.top_p > 0.0 { s.top_p.min(1.0) } else { 1.0 },
+        top_k: s.top_k,
+        frequency_penalty: s.frequency_penalty,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: 1.05,
         repetition_window: 64,
-        seed: None,
+        seed: s.seed,
     }
 }
 
@@ -960,6 +978,7 @@ impl SparseMoEEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -1063,6 +1082,7 @@ impl SparseMoEEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -1887,6 +1907,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
 
@@ -2019,6 +2040,7 @@ impl OvMoeEngine {
         );
         let mut chunk = Chunk::final_marker(id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(id, chunk)]
     }
 

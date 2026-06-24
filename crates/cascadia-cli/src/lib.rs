@@ -1298,6 +1298,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             max_tokens: args.max_tokens,
             temperature: 0.0,
             logprobs: 0,
+            sampling: cascadia_types::SamplingParams::default(),
             enable_thinking: false,
             trust_remote_code: false,
         };

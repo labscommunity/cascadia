@@ -48,7 +48,19 @@ impl Engine for MockEngine {
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
         if emitted >= max || emitted >= words.len() {
-            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            // Distinguish the stop reason like a real engine: exhausting the
+            // prompt's words is a natural `stop`; hitting the token cap first
+            // is `length`. Lets the API's finish_reason path be tested without
+            // a real model.
+            let reason = if emitted >= words.len() {
+                cascadia_types::FinishReason::Stop
+            } else {
+                cascadia_types::FinishReason::Length
+            };
+            return vec![(
+                task.task_id.clone(),
+                Chunk::final_marker(task.task_id, "").with_finish_reason(reason),
+            )];
         }
         let token = words[emitted].to_string();
         let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");
