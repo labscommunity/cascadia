@@ -1,4 +1,4 @@
-use crate::manifest::{Manifest, DTYPE_SIZE, SCHEMA_VERSION, SEQ_AXIS};
+use crate::manifest::{Manifest, DTYPE_SIZE, OPAQUE_KV_LAYOUT, SCHEMA_VERSION, SEQ_AXIS};
 
 /// Closed enum of structural reject reasons (§6/§11) — never a content-derived value.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,24 +77,31 @@ impl KvSnapshotCodec {
         if m.token_ids[..] != request_token_ids[..p] {
             return Err(ValidateError::TokenMismatch);
         }
+        // Opaque layout (e.g. an OV `VariableState` blob): the producer alone interprets the bytes,
+        // so the per-layer shape rules don't apply — but length + crc still gate against truncation
+        // and corruption. `prefix_token_len`/token checks above stay live (cost-gate + §8 honor).
+        let opaque = m.kv_layout_version == OPAQUE_KV_LAYOUT;
         for (lm, (k, v)) in m.layers.iter().zip(payloads.iter()) {
-            // K and V seq axes must both equal the negotiated prefix length.
-            if lm.k_shape.get(SEQ_AXIS).copied() != Some(m.prefix_token_len)
-                || lm.v_shape.get(SEQ_AXIS).copied() != Some(m.prefix_token_len)
-            {
-                return Err(ValidateError::ShapeSeq);
+            if !opaque {
+                // K and V seq axes must both equal the negotiated prefix length.
+                if lm.k_shape.get(SEQ_AXIS).copied() != Some(m.prefix_token_len)
+                    || lm.v_shape.get(SEQ_AXIS).copied() != Some(m.prefix_token_len)
+                {
+                    return Err(ValidateError::ShapeSeq);
+                }
+                // K and V validated independently (distinct qk_head_dim / v_head_dim, plan C3).
+                // Checked product (see `expected_bytes`): an overflowing/empty shape rejects rather
+                // than wrapping to a small expectation an undersized payload could match.
+                let (Some(k_expect), Some(v_expect)) =
+                    (expected_bytes(&lm.k_shape), expected_bytes(&lm.v_shape))
+                else {
+                    return Err(ValidateError::ByteLenShape);
+                };
+                if lm.k_byte_len != k_expect || lm.v_byte_len != v_expect {
+                    return Err(ValidateError::ByteLenShape);
+                }
             }
-            // K and V validated independently (distinct qk_head_dim / v_head_dim, plan C3).
-            // Checked product (see `expected_bytes`): an overflowing/empty shape rejects rather than
-            // wrapping to a small expectation an undersized payload could match.
-            let (Some(k_expect), Some(v_expect)) =
-                (expected_bytes(&lm.k_shape), expected_bytes(&lm.v_shape))
-            else {
-                return Err(ValidateError::ByteLenShape);
-            };
-            if lm.k_byte_len != k_expect || lm.v_byte_len != v_expect {
-                return Err(ValidateError::ByteLenShape);
-            }
+            // Length + integrity — enforced for BOTH layouts.
             if lm.k_byte_len as usize != k.len() || lm.v_byte_len as usize != v.len() {
                 return Err(ValidateError::ByteLenShape);
             }
@@ -258,6 +265,84 @@ mod tests {
         assert_eq!(
             ok(&m, &k, &v, &[11, 22, 33]),
             Err(ValidateError::ByteLenShape)
+        );
+    }
+
+    /// Opaque manifest: 1 layer, K = blob (arbitrary length/shape), V empty. Producer + consumer
+    /// both declare `OPAQUE_KV_LAYOUT`.
+    fn opaque(blob: &[u8]) -> Manifest {
+        Manifest {
+            schema_version: SCHEMA_VERSION,
+            kv_layout_version: OPAQUE_KV_LAYOUT,
+            engine_rev: 100,
+            partner: PartnerId("a".into()),
+            model_fingerprint: 7,
+            prefix_token_hash: 0,
+            prefix_token_len: 2,
+            snapshot_epoch: 42,
+            num_layers: 1,
+            layers: vec![LayerMeta {
+                layer_index: 0,
+                k_shape: vec![], // ignored in opaque mode
+                v_shape: vec![],
+                k_byte_len: blob.len() as u64,
+                v_byte_len: 0,
+                k_crc32: crc32fast::hash(blob),
+                v_crc32: crc32fast::hash(&[]),
+            }],
+            token_ids: vec![11, 22],
+        }
+    }
+
+    #[test]
+    fn opaque_accepts_arbitrary_shape() {
+        // Odd-length blob with empty shapes — would fail every structured shape rule; opaque skips
+        // them and validates on length + crc.
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let m = opaque(&blob);
+        assert!(
+            KvSnapshotCodec::validate(&m, &[(&blob, &[])], OPAQUE_KV_LAYOUT, 100, 7, &[11, 22, 33])
+                .is_ok()
+        );
+    }
+    #[test]
+    fn opaque_still_checks_crc() {
+        let mut blob = vec![1u8, 2, 3, 4, 5];
+        let m = opaque(&blob); // crc bound to clean blob
+        blob[0] ^= 0xff; // corrupt after manifest built
+        assert_eq!(
+            KvSnapshotCodec::validate(&m, &[(&blob, &[])], OPAQUE_KV_LAYOUT, 100, 7, &[11, 22, 33]),
+            Err(ValidateError::Crc)
+        );
+    }
+    #[test]
+    fn opaque_still_checks_byte_len() {
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let mut m = opaque(&blob);
+        m.layers[0].k_byte_len = 99; // disagrees with payload length
+        assert_eq!(
+            KvSnapshotCodec::validate(&m, &[(&blob, &[])], OPAQUE_KV_LAYOUT, 100, 7, &[11, 22, 33]),
+            Err(ValidateError::ByteLenShape)
+        );
+    }
+    #[test]
+    fn opaque_keeps_token_checks() {
+        // prefix/token semantics still enforced (cost-gate + §8 honor depend on them).
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let m = opaque(&blob);
+        assert_eq!(
+            KvSnapshotCodec::validate(&m, &[(&blob, &[])], OPAQUE_KV_LAYOUT, 100, 7, &[11, 99, 33]),
+            Err(ValidateError::TokenMismatch)
+        );
+    }
+    #[test]
+    fn structured_consumer_rejects_opaque_manifest() {
+        // A structured consumer (layout 3) must reject an opaque manifest — no cross-layout decode.
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let m = opaque(&blob);
+        assert_eq!(
+            KvSnapshotCodec::validate(&m, &[(&blob, &[])], 3, 100, 7, &[11, 22, 33]),
+            Err(ValidateError::LayoutVersion)
         );
     }
 
