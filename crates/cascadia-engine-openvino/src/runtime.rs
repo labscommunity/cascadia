@@ -1549,6 +1549,9 @@ impl OvRuntimeEngine {
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
         let pos: Vec<i64> = (position..position + seq_len as i64).collect();
+        if std::env::var_os("CASCADIA_KV_DEBUG").is_some() {
+            eprintln!("[KVDBG] feed_first_v5: seq_len={seq_len} position={position} mask_total={total}");
+        }
 
         let in_ids = self
             .input_named("input_ids")
@@ -2825,31 +2828,61 @@ impl OvRuntimeEngine {
             }
             nt
         } else {
-            // Stateful: the whole prompt (prefill) or one decode token in a
-            // single multi-token inference; the IR keeps KV internally.
-            let position = self.position;
-            let ts = std::time::Instant::now();
-            let (out, shape) = self.run_first(&tokens, position)?;
-            let alpha = ts.elapsed();
-            self.position += tokens.len() as i64;
-            // 1-token prompt prefill costs the same downstream as a decode
-            // step — keep the strict deadline (mirrors step_middle's
-            // shape[1] > 1) so wedge eviction stays fast.
-            let (nt, wire) = self.resolve_next_token(
-                &out,
-                &shape,
-                single_stage,
-                position,
-                prefill && tokens.len() > 1,
-            )?;
-            if let Some(a) = self.active.as_mut() {
-                a.t_alpha_compute += alpha;
-                a.t_wire += wire;
-                if prefill {
-                    a.t_prefill = a.started.elapsed();
+            // Stateful: the IR keeps KV internally. Cold prefill (warm_prefix==0) feeds the whole
+            // prompt in ONE multi-token inference (input_len == mask_len at position 0 — fast). But
+            // Issue-34 WARM-resume prefills a suffix at a NON-zero position over a restored KV, where
+            // input_len < mask_len; the exported model's prefill graph assumes input_len==mask_len
+            // and throws a shape mismatch. So when resumed, feed the suffix token-by-token (the
+            // decode shapes — input_len==1, mask_len>1 — the model already supports). One forward for
+            // a plain decode step (tokens.len()==1) either way.
+            #[cfg(feature = "kv_coord")]
+            let resumed = prefill && self.active.as_ref().is_some_and(|a| a.warm_prefix > 0);
+            #[cfg(not(feature = "kv_coord"))]
+            let resumed = false;
+            if resumed {
+                let mut nt = 0i32;
+                for &t in &tokens {
+                    let position = self.position;
+                    let ts = std::time::Instant::now();
+                    let (out, shape) = self.run_first(&[t], position)?;
+                    let alpha = ts.elapsed();
+                    self.position += 1;
+                    // Per-token suffix feed: each is a single-token forward
+                    // (input_len==1), like a decode step — never a prefill-budget wait.
+                    let (n, wire) =
+                        self.resolve_next_token(&out, &shape, single_stage, position, false)?;
+                    nt = n;
+                    if let Some(a) = self.active.as_mut() {
+                        a.t_alpha_compute += alpha;
+                        a.t_wire += wire;
+                    }
                 }
+                nt
+            } else {
+                let position = self.position;
+                let ts = std::time::Instant::now();
+                let (out, shape) = self.run_first(&tokens, position)?;
+                let alpha = ts.elapsed();
+                self.position += tokens.len() as i64;
+                // 1-token prompt prefill costs the same downstream as a decode
+                // step — keep the strict deadline (mirrors step_middle's
+                // shape[1] > 1) so wedge eviction stays fast.
+                let (nt, wire) = self.resolve_next_token(
+                    &out,
+                    &shape,
+                    single_stage,
+                    position,
+                    prefill && tokens.len() > 1,
+                )?;
+                if let Some(a) = self.active.as_mut() {
+                    a.t_alpha_compute += alpha;
+                    a.t_wire += wire;
+                    if prefill {
+                        a.t_prefill = a.started.elapsed();
+                    }
+                }
+                nt
             }
-            nt
         };
 
         self.emit_token(next_token)
