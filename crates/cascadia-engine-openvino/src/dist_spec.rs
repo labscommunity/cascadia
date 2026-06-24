@@ -51,6 +51,17 @@ pub enum FrameKind {
     Forward = 1,
     Reset = 3,
     LogitsResponse = 4,
+    // Issue-34 §8 multi-stage KV coordination (append-only; `kv_coord`-gated). CAPTURE snapshots a
+    // rank's KV under the head epoch; RESTORE set_states a pulled slice (ACK body carries the
+    // all-or-nothing verdict). The existing RESET is the cold fallback.
+    #[cfg(feature = "kv_coord")]
+    Capture = 5,
+    #[cfg(feature = "kv_coord")]
+    CaptureAck = 6,
+    #[cfg(feature = "kv_coord")]
+    Restore = 7,
+    #[cfg(feature = "kv_coord")]
+    RestoreAck = 8,
 }
 
 impl FrameKind {
@@ -59,6 +70,14 @@ impl FrameKind {
             1 => Some(Self::Forward),
             3 => Some(Self::Reset),
             4 => Some(Self::LogitsResponse),
+            #[cfg(feature = "kv_coord")]
+            5 => Some(Self::Capture),
+            #[cfg(feature = "kv_coord")]
+            6 => Some(Self::CaptureAck),
+            #[cfg(feature = "kv_coord")]
+            7 => Some(Self::Restore),
+            #[cfg(feature = "kv_coord")]
+            8 => Some(Self::RestoreAck),
             _ => None,
         }
     }
@@ -362,6 +381,16 @@ pub struct MaskedReq {
     inputs: std::collections::HashMap<String, String>,
 }
 
+#[cfg(feature = "kv_coord")]
+impl MaskedReq {
+    pub(crate) fn kv_blob(&mut self) -> Option<Vec<u8>> {
+        self.runtime.get_state_blob().ok()
+    }
+    pub(crate) fn kv_restore(&mut self, b: &[u8]) -> bool {
+        self.runtime.set_state_blob(b).is_ok()
+    }
+}
+
 impl MaskedReq {
     pub fn new(runtime: OvRuntime) -> Result<Self, EngineError> {
         let n_inputs = runtime.input_count();
@@ -552,6 +581,57 @@ pub struct DistributedMaskedReq {
     pub t_alpha_infer: std::time::Duration,
     pub t_alpha_output: std::time::Duration,
     pub t_wire: std::time::Duration,
+}
+
+#[cfg(feature = "kv_coord")]
+impl DistributedMaskedReq {
+    pub(crate) fn stage0_blob(&mut self) -> Option<Vec<u8>> {
+        self.stage0.get_state_blob().ok()
+    }
+    pub(crate) fn stage0_restore(&mut self, b: &[u8]) -> bool {
+        self.stage0.set_state_blob(b).is_ok()
+    }
+
+    /// §8 CAPTURE: broadcast `(epoch, tokens)` down the target chain; await the aggregate ACK.
+    pub(crate) fn capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+    ) -> Result<(), EngineError> {
+        let body = crate::kv_coordination::capture_body_bytes(epoch, tokens);
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&(FrameKind::Capture as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&body).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+
+    /// §8 RESTORE: broadcast `epoch` down the target chain; return the all-or-nothing verdict.
+    pub(crate) fn restore_downstream(&mut self, epoch: u64) -> Result<bool, EngineError> {
+        let downstream = self.downstream.clone();
+        run_async(&self.runtime_handle, async move {
+            let mut g = downstream.lock().await;
+            g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&epoch.to_le_bytes()).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            let vb = g.recv_raw(1).await?;
+            Ok(vb.first() == Some(&1))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
 }
 
 impl DistributedMaskedReq {
@@ -1135,6 +1215,9 @@ pub fn spec_decode_greedy(
 /// of buffering all output and emitting one giant final chunk.
 struct ActiveSpec {
     task: GenerationTask,
+    /// Issue-34: the prompt tokens (capture key = prompt ++ out). `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    prompt_ids: Vec<i64>,
     /// Accumulated accepted tokens (including the first sampled token).
     out: Vec<i64>,
     /// Cumulative byte-length of the detokenized text emitted so far.
@@ -1163,6 +1246,12 @@ pub struct OvDistSpecEngine {
     k: usize,
     pending: Vec<GenerationTask>,
     active: Option<ActiveSpec>,
+    /// Issue-34: opaque KV blob cache + a stable model id (the target pipeline dir) for the
+    /// coordination-plane fingerprint. `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    #[cfg(feature = "kv_coord")]
+    kv_model_id: String,
 }
 
 impl Engine for OvDistSpecEngine {
@@ -1339,6 +1428,11 @@ impl Engine for OvDistSpecEngine {
         };
         Ok(chunks)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
 }
 
 struct RoundResult {
@@ -1377,6 +1471,8 @@ impl OvDistSpecEngine {
 
         Ok(ActiveSpec {
             task,
+            #[cfg(feature = "kv_coord")]
+            prompt_ids: prompt_ids.to_vec(),
             out: vec![first],
             emitted: Vec::new(),
             prev_correction: first,
@@ -1492,6 +1588,18 @@ impl OvDistSpecEngine {
         let Some(active) = self.active.take() else {
             return vec![(task_id.clone(), Chunk::final_marker(task_id, last_delta))];
         };
+        // Issue-34: capture draft+target KV under (prompt ++ accepted) before the next start_task
+        // resets. Best-effort + gated.
+        #[cfg(feature = "kv_coord")]
+        {
+            let tokens: Vec<i32> = active
+                .prompt_ids
+                .iter()
+                .chain(active.out.iter())
+                .map(|&t| t as i32)
+                .collect();
+            self.kv_capture(tokens);
+        }
         info!(
             task = %active.task.task_id,
             tokens = active.out.len(),
@@ -1731,6 +1839,8 @@ impl Builder for OvDistSpecBuilder {
             DistributedMaskedReq::new(stage0, downstream, tokio::runtime::Handle::current())?;
         let masked_draft = MaskedReq::new(draft)?;
         Ok(Box::new(OvDistSpecEngine {
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
             tokenizer,
@@ -1738,6 +1848,8 @@ impl Builder for OvDistSpecBuilder {
             k: self.k as usize,
             pending: Vec::new(),
             active: None,
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
         }))
     }
 }
@@ -1751,6 +1863,14 @@ pub struct OvDistSpecWorkerEngine {
     upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
+    /// Issue-34: opaque KV blob cache + this rank's identity (model id + rank) for the
+    /// coordination-plane fingerprint. `kv_coord` only.
+    #[cfg(feature = "kv_coord")]
+    kv: crate::kv_coordination::OvKvCache,
+    #[cfg(feature = "kv_coord")]
+    kv_model_id: String,
+    #[cfg(feature = "kv_coord")]
+    kv_rank: u32,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -1813,6 +1933,11 @@ impl Engine for OvDistSpecWorkerEngine {
         }
         result.map(|_| Vec::new())
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
 }
 
 impl OvDistSpecWorkerEngine {
@@ -1847,6 +1972,58 @@ impl OvDistSpecWorkerEngine {
             }
             FrameKind::LogitsResponse => Err(EngineError::Backend(
                 "worker received LOGITS_RESPONSE".into(),
+            )),
+            // Issue-34 §8: snapshot this rank's KV under the head epoch, chain downstream, ack up.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Capture => {
+                let up = self.upstream.clone();
+                let body = run_async(&self.runtime_handle, async move {
+                    let mut g = up.lock().await;
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    g.recv_raw(n).await
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
+                    .ok_or_else(|| EngineError::Backend("ov-dist-spec: bad CAPTURE body".into()))?;
+                if let Ok(blob) = self.runtime.get_state_blob() {
+                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                }
+                if !self.is_last {
+                    let _ = self.kv_chain_capture(epoch, &tokens);
+                }
+                self.kv_ack_upstream(FrameKind::CaptureAck as u32, &[])
+            }
+            // RESTORE: set_state this rank's pulled slice; chain; ack the all-or-nothing verdict.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => {
+                let up = self.upstream.clone();
+                let eb = run_async(&self.runtime_handle, async move {
+                    let mut g = up.lock().await;
+                    g.recv_raw(8).await
+                })
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+                let epoch =
+                    u64::from_le_bytes(eb.as_slice().try_into().map_err(|_| {
+                        EngineError::Backend("ov-dist-spec: bad RESTORE body".into())
+                    })?);
+                let local_ok = match self.kv.take_capture(epoch) {
+                    Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+                    None => false,
+                };
+                let down_ok = if self.is_last {
+                    true
+                } else {
+                    self.kv_chain_restore(epoch).unwrap_or(false)
+                };
+                self.kv_ack_upstream(
+                    FrameKind::RestoreAck as u32,
+                    &[u8::from(local_ok && down_ok)],
+                )
+            }
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureAck | FrameKind::RestoreAck => Err(EngineError::Backend(
+                "ov-dist-spec worker: unexpected ack frame from upstream".into(),
             )),
             FrameKind::Forward => {
                 // 2. Read FORWARD body (logical_pos, attn, hidden) from upstream.
@@ -2233,7 +2410,186 @@ impl Builder for OvDistSpecWorkerBuilder {
             upstream,
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
+            #[cfg(feature = "kv_coord")]
+            kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            #[cfg(feature = "kv_coord")]
+            kv_rank: self.rank,
         }))
+    }
+}
+
+// -------- Issue-34 §8: KvCoordination for the dist-spec head + worker --------
+
+#[cfg(feature = "kv_coord")]
+impl OvDistSpecEngine {
+    /// head = rank 0 (holds draft + target stage0); workers are ranks 1.. .
+    fn kv_fingerprint(&self) -> u64 {
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
+    }
+    /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
+    /// the target chain so every worker rank stashes its slice. Best-effort.
+    fn kv_capture(&mut self, tokens: Vec<i32>) {
+        let (Some(d), Some(s)) = (self.draft.kv_blob(), self.target.stage0_blob()) else {
+            return;
+        };
+        let blob = crate::kv_coordination::frame_blobs(&[d, s]);
+        let epoch = crate::kv_coordination::synth_epoch(&tokens);
+        if let Err(e) = self.target.capture_downstream(epoch, &tokens) {
+            warn!(error = %e, "ov-dist-spec: CAPTURE broadcast failed (best-effort)");
+        }
+        self.kv.capture(tokens, blob);
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvDistSpecEngine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.encode(text, false).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(token_ids)
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_fingerprint();
+        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        self.kv.insert_both(tokens, blob);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl OvDistSpecWorkerEngine {
+    fn kv_fingerprint(&self) -> u64 {
+        let mut buf = self.kv_model_id.clone().into_bytes();
+        buf.extend_from_slice(&self.kv_rank.to_le_bytes());
+        crate::kv_coordination::fnv1a64(&buf)
+    }
+    fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
+        let up = self.upstream.clone();
+        let payload = payload.to_vec();
+        run_async(&self.runtime_handle, async move {
+            let mut g = up.lock().await;
+            g.send_raw(&ack_kind.to_be_bytes()).await?;
+            if !payload.is_empty() {
+                g.send_raw(&payload).await?;
+            }
+            Ok::<_, cascadia_transport::TransportError>(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+    fn kv_chain_capture(&mut self, epoch: u64, tokens: &[i32]) -> Result<(), EngineError> {
+        let Some(down) = self.downstream.clone() else {
+            return Ok(());
+        };
+        let body = crate::kv_coordination::capture_body_bytes(epoch, tokens);
+        run_async(&self.runtime_handle, async move {
+            let mut g = down.lock().await;
+            g.send_raw(&(FrameKind::Capture as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+            g.send_raw(&body).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::CaptureAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            Ok(())
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+    fn kv_chain_restore(&mut self, epoch: u64) -> Result<bool, EngineError> {
+        let Some(down) = self.downstream.clone() else {
+            return Ok(true);
+        };
+        run_async(&self.runtime_handle, async move {
+            let mut g = down.lock().await;
+            g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
+                .await?;
+            g.send_raw(&epoch.to_le_bytes()).await?;
+            let kb = g.recv_raw(4).await?;
+            if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
+                return Err(cascadia_transport::TransportError::SocketClosed);
+            }
+            let vb = g.recv_raw(1).await?;
+            Ok(vb.first() == Some(&1))
+        })
+        .map_err(|e| EngineError::Backend(e.to_string()))
+    }
+}
+
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
+    fn model_fingerprint(&self) -> u64 {
+        self.kv_fingerprint()
+    }
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+    fn engine_rev(&self) -> u64 {
+        crate::kv_coordination::KV_ENGINE_REV
+    }
+    fn tokenize(&self, _text: &str) -> Option<Vec<i32>> {
+        None // workers have no tokenizer + never NEGOTIATE
+    }
+    fn lookup(&mut self, _partner: &str, _token_ids: &[i32]) -> Option<(u64, u32)> {
+        None
+    }
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let fp = self.kv_fingerprint();
+        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        Some(crate::kv_coordination::blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            fp,
+            expected_epoch,
+        ))
+    }
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        self.kv.insert_both(tokens, blob);
+        Ok(())
     }
 }
 
