@@ -60,7 +60,13 @@ const FRAME_RESET: u32 = 4;
 const FRAME_RESET_ACK: u32 = 5;
 const FRAME_FORWARD: u32 = 6;
 const FRAME_TOKEN: u32 = 7;
-/// Handshake schema version.
+/// Issue-34 §8: head broadcasts CAPTURE after a turn so every rank snapshots its KV under one
+/// content epoch (carried in the body, not the u32 task-epoch header). Append-only frame codes.
+#[cfg(feature = "kv_coord")]
+const FRAME_CAPTURE: u32 = 8;
+#[cfg(feature = "kv_coord")]
+const FRAME_CAPTURE_ACK: u32 = 9;
+/// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
 
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
@@ -429,6 +435,12 @@ enum InFrame {
         hidden: Vec<f32>,
         n: usize,
     },
+    /// Issue-34 §8 CAPTURE: snapshot local KV under the head's content `kv_epoch` (body-carried).
+    #[cfg(feature = "kv_coord")]
+    Capture {
+        kv_epoch: u64,
+        tokens: Vec<i32>,
+    },
 }
 
 impl Qwen36Engine {
@@ -555,6 +567,15 @@ impl Qwen36Engine {
                 .chain(t.gen_ids.iter())
                 .map(|&u| u as i32)
                 .collect();
+            // Pipeline head: broadcast CAPTURE so every downstream rank snapshots its slice under the
+            // same content epoch (workers have no tokens). Best-effort. rank0's own slice is stashed
+            // token-keyed by kv_capture_local below (the NEGOTIATE/offers path).
+            if self.total > 1 && self.rank == 0 && self.downstream.is_some() && !tokens.is_empty() {
+                let kv_epoch = crate::kv_coordination::synth_epoch(&tokens);
+                if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens) {
+                    warn!(error = %e, "qwen36: CAPTURE broadcast failed (best-effort)");
+                }
+            }
             self.kv_capture_local(tokens);
         }
         self.reset_all();
@@ -786,6 +807,37 @@ impl Qwen36Engine {
         .map_err(|e| EngineError::Backend(format!("qwen36 pipeline RESET not acked: {e}")))
     }
 
+    /// Issue-34 §8: send `CAPTURE(kv_epoch, tokens)` to the downstream peer and await its ACK. Used
+    /// by the head (rank 0, after a turn) and chained by each middle rank. Frame-header epoch is the
+    /// current task epoch (stale-frame machinery); the KV content epoch rides the body.
+    #[cfg(feature = "kv_coord")]
+    fn forward_capture_downstream(&mut self, kv_epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+        let downstream = self
+            .downstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        let h = self.handle()?;
+        let task_epoch = self.epoch;
+        let body = crate::kv_coordination::capture_body_bytes(kv_epoch, tokens);
+        run_async(
+            &h,
+            reply_bounded(async move {
+                let mut g = downstream.lock().await;
+                g.send_raw(&frame_header(FRAME_CAPTURE, task_epoch, 0))
+                    .await?;
+                g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
+                g.send_raw(&body).await?;
+                let hb = g.recv_raw(12).await?;
+                let (kind, _, _) = parse_header(&hb);
+                if kind != FRAME_CAPTURE_ACK {
+                    return Err(TransportError::SocketClosed);
+                }
+                Ok(())
+            }),
+        )
+        .map_err(|e| EngineError::Backend(format!("qwen36 CAPTURE not acked: {e}")))
+    }
+
     /// Rank 0 driver step: same task lifecycle as the single-box step,
     /// with the downstream stage + argmax behind the wire.
     fn step_pipe_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -967,6 +1019,15 @@ impl Qwen36Engine {
                     Ok(InFrame::Hello(g.recv_raw(n).await?))
                 }
                 FRAME_RESET => Ok(InFrame::Reset(epoch)),
+                #[cfg(feature = "kv_coord")]
+                FRAME_CAPTURE => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    let body = g.recv_raw(n).await?;
+                    let (kv_epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
+                        .ok_or(TransportError::SocketClosed)?;
+                    Ok(InFrame::Capture { kv_epoch, tokens })
+                }
                 FRAME_FORWARD => {
                     let (t, _) = g.recv().await?;
                     if !matches!(t.dtype, WireDType::F32) {
@@ -1039,6 +1100,27 @@ impl Qwen36Engine {
                 run_async(&h, async move {
                     let mut g = upstream.lock().await;
                     g.send_raw(&frame_header(FRAME_RESET_ACK, epoch, 0)).await
+                })
+                .map_err(map_wire)
+            }
+            #[cfg(feature = "kv_coord")]
+            InFrame::Capture { kv_epoch, tokens } => {
+                // Snapshot this rank's local KV under the head's content epoch (state is still live —
+                // RESET comes at the next admission), chain CAPTURE downstream, then ack upstream.
+                // Best-effort: a blob/chain miss degrades to no warm-pull, never breaks generation.
+                if let Some(blob) = self.blob_local_stages() {
+                    self.kv.capture_under_epoch(kv_epoch, tokens.clone(), blob);
+                }
+                if !is_last {
+                    if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens) {
+                        warn!(error = %e, "qwen36: CAPTURE chain downstream failed (best-effort)");
+                    }
+                }
+                let h = self.handle()?;
+                let upstream = self.upstream.clone().unwrap();
+                run_async(&h, async move {
+                    let mut g = upstream.lock().await;
+                    g.send_raw(&frame_header(FRAME_CAPTURE_ACK, 0, 0)).await
                 })
                 .map_err(map_wire)
             }
