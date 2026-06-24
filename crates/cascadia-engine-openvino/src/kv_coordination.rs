@@ -33,7 +33,7 @@ const KV_MAX_ENTRIES: usize = 8;
 /// Cap on stashed unconsumed offers (NEGOTIATE without a paired GET).
 const KV_MAX_OFFERS: usize = 32;
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= u64::from(b);
@@ -85,6 +85,50 @@ pub(crate) fn parse_capture_body(b: &[u8]) -> Option<(u64, Vec<i32>)> {
     Some((epoch, tokens))
 }
 
+/// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
+/// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
+/// as a single opaque blob — `OvKvCache` and the wire treat it as one payload.
+pub(crate) fn frame_blobs(blobs: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = 4 + blobs.iter().map(|b| 4 + b.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+    for b in blobs {
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// Inverse of [`frame_blobs`]. `None` on truncation / over-bound count (forged or corrupt bundle).
+pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if b.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes(b[0..4].try_into().ok()?) as usize;
+    // A rank holds at most a model's worth of stages; cap defensively.
+    if count > 1024 {
+        return None;
+    }
+    let mut off = 4;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 4 > b.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(b[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        if off + len > b.len() {
+            return None;
+        }
+        out.push(b[off..off + len].to_vec());
+        off += len;
+    }
+    if off != b.len() {
+        return None; // trailing junk
+    }
+    Some(out)
+}
+
 /// One captured turn: the full token sequence and its opaque KV blob.
 struct OvKvEntry {
     tokens: Vec<i32>,
@@ -131,7 +175,7 @@ impl OvKvCache {
 
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
     /// use), then `captures` (worker stash, repeat-serve). `None` if absent or the length drifted.
-    fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
+    pub(crate) fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
         let (tokens, blob) = if let Some(off) = self.offers.remove(&epoch) {
             off
         } else if let Some(cap) = self.captures.get(&epoch) {
@@ -145,6 +189,24 @@ impl OvKvCache {
             return None;
         }
         Some((tokens, blob))
+    }
+
+    /// NEGOTIATE: longest cached full-sequence that is a prefix of `token_ids`; stash it as an offer
+    /// under its content epoch for the paired GET. Returns `(epoch, prefix_len)`. Engine-agnostic.
+    pub(crate) fn lookup(&mut self, token_ids: &[i32]) -> Option<(u64, u32)> {
+        let (prefix, blob) = {
+            let e = self.longest_prefix(token_ids)?;
+            (e.tokens.clone(), e.blob.clone())
+        };
+        let len = prefix.len() as u32;
+        let epoch = synth_epoch(&prefix);
+        if self.offers.len() >= KV_MAX_OFFERS && !self.offers.contains_key(&epoch) {
+            if let Some(k) = self.offers.keys().next().copied() {
+                self.offers.remove(&k);
+            }
+        }
+        self.offers.insert(epoch, (prefix, blob));
+        Some((epoch, len))
     }
 
     /// Longest cached entry whose `tokens` is a prefix of `req`. The blob is whole-sequence
@@ -178,7 +240,7 @@ impl OvKvCache {
 }
 
 /// Opaque blob → wire `Manifest` + single-payload `(blob, [])`. K carries the blob; V is empty.
-fn blob_to_wire(
+pub(crate) fn blob_to_wire(
     prefix: &[i32],
     blob: &[u8],
     partner: &str,
@@ -212,7 +274,7 @@ fn blob_to_wire(
 
 /// Wire `Manifest` + payloads → `(tokens, blob)`. `None` on a malformed pair (codec already
 /// validated length + crc, so this only guards the opaque-shape contract: exactly one K payload).
-fn wire_to_blob(
+pub(crate) fn wire_to_blob(
     manifest: &Manifest,
     payloads: &[(Vec<u8>, Vec<u8>)],
 ) -> Option<(Vec<i32>, Vec<u8>)> {
@@ -260,20 +322,7 @@ impl KvCoordination for OvRuntimeEngine {
     }
 
     fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
-        let (prefix, blob) = {
-            let e = self.kv_cache().longest_prefix(token_ids)?;
-            (e.tokens.clone(), e.blob.clone())
-        };
-        let len = prefix.len() as u32;
-        let epoch = synth_epoch(&prefix);
-        let offers = &mut self.kv_cache_mut().offers;
-        if offers.len() >= KV_MAX_OFFERS {
-            if let Some(k) = offers.keys().next().copied() {
-                offers.remove(&k);
-            }
-        }
-        offers.insert(epoch, (prefix, blob));
-        Some((epoch, len))
+        self.kv_cache_mut().lookup(token_ids)
     }
 
     fn export(
@@ -376,6 +425,32 @@ mod tests {
         h.extend_from_slice(&(u32::MAX).to_le_bytes());
         assert!(parse_capture_body(&h).is_none());
     }
+    #[test]
+    fn frame_blobs_roundtrips() {
+        let blobs = vec![vec![1u8, 2, 3], vec![], vec![9u8; 50]];
+        let framed = frame_blobs(&blobs);
+        assert_eq!(unframe_blobs(&framed), Some(blobs));
+        // single stage
+        assert_eq!(
+            unframe_blobs(&frame_blobs(&[vec![7u8]])),
+            Some(vec![vec![7u8]])
+        );
+        // empty bundle (no stages)
+        assert_eq!(unframe_blobs(&frame_blobs(&[])), Some(vec![]));
+    }
+    #[test]
+    fn unframe_blobs_rejects_malformed() {
+        assert!(unframe_blobs(&[0u8; 2]).is_none()); // too short for count
+        let mut f = frame_blobs(&[vec![1, 2, 3]]);
+        f.push(0xFF); // trailing junk
+        assert!(unframe_blobs(&f).is_none());
+        // declared len overruns the buffer
+        let mut bad = 1u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(&999u32.to_le_bytes());
+        bad.extend_from_slice(&[1, 2]);
+        assert!(unframe_blobs(&bad).is_none());
+    }
+
     #[test]
     fn worker_stash_serves_by_epoch_repeatedly() {
         let mut c = OvKvCache::default();

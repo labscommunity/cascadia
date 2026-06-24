@@ -3671,9 +3671,6 @@ impl OvRuntimeEngine {
     pub(crate) fn tokenizer_ref(&self) -> Option<&Tokenizer> {
         self.tokenizer.as_deref()
     }
-    pub(crate) fn kv_cache(&self) -> &crate::kv_coordination::OvKvCache {
-        &self.kv
-    }
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
