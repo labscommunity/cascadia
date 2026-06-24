@@ -44,6 +44,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
+use crate::constrained::{apply_mask_bytes, sentinel_mask, ApplyOutcome, GrammarFactory, GrammarMask};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
 // -------- pipeline / stage config --------
@@ -394,6 +395,7 @@ struct ActiveTask {
     last_text: String,
     prefilled: bool,
     last_token: i32,
+    grammar_mask: Option<GrammarMask>,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -435,6 +437,9 @@ pub struct Gemma4Engine {
     /// Cross-stage KV received from upstream this step, keyed by wire tag, ready
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
+    /// Built once at engine construction when a tokenizer is present; `None` for
+    /// tokenizer-less stages. Drives constrained decoding (see constrained.rs).
+    grammar_factory: Option<GrammarFactory>,
     step_warn: StepWarnLimiter,
 }
 
@@ -577,6 +582,7 @@ impl Gemma4Engine {
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
+        mask: &[i8],
     ) -> EngineResult<()> {
         let downstream = self
             .downstream
@@ -595,6 +601,17 @@ impl Gemma4Engine {
         // when it is 0. MAX_RANK=3 + the strict payload==shape*dtype check leave
         // no room to pack it into the hidden tensor.
         let pos = encode_wire_position(position);
+        // Design A (spec §5.3 / slice-3): the per-step token bitmask rides the
+        // activation wire as an always-present I8 frame at a FIXED slot —
+        // immediately after the position frame, BEFORE the variable cross-KV
+        // frames — so the receiver reads it without knowing the cross-KV count.
+        // A real bitset (flag byte 1) or the 1-byte sentinel keeps the frame
+        // count deterministic whether or not a grammar is active.
+        let mask_tensor = WireTensor::new(
+            WireDType::I8,
+            [1u32, 1u32, mask.len() as u32],
+            mask.iter().map(|&b| b as u8).collect(),
+        );
         // Gemma 4 E2B/E4B: this stage's source layers produced cross-stage
         // shared KV (`cross_kv.*` outputs) downstream stages consume as their
         // `external_kv.*` inputs. Read each from the just-completed inference,
@@ -616,6 +633,7 @@ impl Gemma4Engine {
         self.block_on(async move {
             let mut guard = downstream.lock().await;
             guard.send(&pos).await?;
+            guard.send(&mask_tensor).await?;
             guard.send(&hid).await?;
             guard.send(&header).await?;
             for f in &cross_frames {
@@ -653,23 +671,28 @@ impl Gemma4Engine {
         Ok(token)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64, Vec<i8>)> {
         let upstream = self
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Wire order per step: position frame, hidden frame, cross-KV header,
-        // then `count` cross-KV frames (count from the header). Read the first
-        // three, decode the header to learn `count`, then read that many.
-        let (pos_t, hid_t, header_t) = self
+        // Wire order per step: position frame, I8 mask frame (Design A, fixed
+        // slot — always present, sentinel when unconstrained), hidden frame,
+        // cross-KV header, then `count` cross-KV frames (count from the header).
+        // Read the first four, decode the header to learn `count`, then read
+        // that many. The mask rides BEFORE hidden/header so the receiver finds
+        // it at a fixed position regardless of the variable cross-KV count.
+        let (pos_t, mask_t, hid_t, header_t) = self
             .block_on(async {
                 let mut guard = upstream.lock().await;
                 let pos = guard.recv().await?.0;
+                let msk = guard.recv().await?.0;
                 let hid = guard.recv().await?.0;
                 let hdr = guard.recv().await?.0;
-                Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
+                Ok::<_, cascadia_transport::TransportError>((pos, msk, hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let mask: Vec<i8> = mask_t.data.iter().map(|&b| b as i8).collect();
         // Decode + strictly validate the position + header outside the transport
         // closure (so a bad frame is a clear EngineError, not a silent desync).
         let position = decode_wire_position(&pos_t)?;
@@ -738,7 +761,7 @@ impl Gemma4Engine {
                 )))
             }
         };
-        Ok((floats, shape, position))
+        Ok((floats, shape, position, mask))
     }
 
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
@@ -774,6 +797,17 @@ impl Gemma4Engine {
                 prompt_tokens = prompt_ids.len(),
                 "gemma4 task active"
             );
+            let grammar_mask = match task.grammar.as_ref() {
+                Some(spec) => self
+                    .grammar_factory
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EngineError::Backend("grammar requested but no tokenizer/factory".into())
+                    })?
+                    .create(spec)
+                    .map(Some)?,
+                None => None,
+            };
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
@@ -781,6 +815,7 @@ impl Gemma4Engine {
                 last_text: String::new(),
                 prefilled: false,
                 last_token: 0,
+                grammar_mask,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -844,7 +879,11 @@ impl Gemma4Engine {
         let (out, shape) = self.run_first(&tokens, position)?;
         let alpha = ts.elapsed();
         self.position += tokens.len() as i64;
-        let (next_token, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+        // gemma4 runs the whole prompt or one decode token in a single inference
+        // (no per-token static-KV loop), so every call here is the genuine
+        // next-token step — mask_step is always true.
+        let (next_token, wire) =
+            self.resolve_next_token(&out, &shape, single_stage, position, true)?;
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
@@ -863,13 +902,47 @@ impl Gemma4Engine {
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        mask_step: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
-            Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
+            let vocab = *shape
+                .last()
+                .ok_or_else(|| EngineError::Backend("no vocab dim".into()))?;
+            if vocab == 0 || vocab > out.len() {
+                return Err(EngineError::Backend(format!(
+                    "logits len {} < vocab {vocab}",
+                    out.len()
+                )));
+            }
+            let tok = match (
+                mask_step,
+                self.active.as_mut().and_then(|a| a.grammar_mask.as_mut()),
+            ) {
+                (true, Some(mask)) => {
+                    let mut row = out[out.len() - vocab..].to_vec();
+                    match mask.apply(&mut row)? {
+                        ApplyOutcome::Masked => argmax_last_row(&row, vocab),
+                        ApplyOutcome::Complete => {
+                            self.eos_token_ids.first().copied().unwrap_or(128_001) as i32
+                        }
+                    }
+                }
+                _ => argmax_logits(out, shape)?,
+            };
+            Ok((tok, std::time::Duration::ZERO))
         } else {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
-            self.send_hidden_downstream(out, s3, position)?;
+            // Design A: the head owns the grammar matcher and ships the per-step
+            // bitmask (or sentinel) down the wire for the tail to apply.
+            let mask = match (
+                mask_step,
+                self.active.as_mut().and_then(|a| a.grammar_mask.as_mut()),
+            ) {
+                (true, Some(m)) => m.next_mask_bytes()?,
+                _ => sentinel_mask(),
+            };
+            self.send_hidden_downstream(out, s3, position, &mask)?;
             let token = self.recv_token_from_downstream()?;
             Ok((token, ts.elapsed()))
         }
@@ -884,6 +957,12 @@ impl Gemma4Engine {
             .ok_or_else(|| EngineError::Backend("emit_token with no active task".into()))?;
         active.last_token = next_token;
         active.generated.push(next_token);
+
+        if let Some(mask) = active.grammar_mask.as_mut() {
+            if !mask.is_stopped() {
+                mask.accept(next_token as u32)?;
+            }
+        }
 
         let tok = self
             .tokenizer
@@ -951,25 +1030,34 @@ impl Gemma4Engine {
         // The upstream stage carries the absolute start-position; use it
         // directly as the position_ids base and reset own KV when it is 0 (a
         // new sequence). Correct for any prompt length, including 1 token.
-        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        let (hidden, shape, position, mask) = self.recv_hidden_from_upstream()?;
         if position == 0 {
             self.runtime.reset_state().map_err(map_ov_err)?;
         }
         let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
-        let next = argmax_logits(&out, &out_shape)?;
+        let vocab = *out_shape
+            .last()
+            .ok_or_else(|| EngineError::Backend("no vocab dim".into()))?;
+        if vocab > out.len() {
+            return Err(EngineError::Backend("logits shorter than vocab".into()));
+        }
+        let mut row = out[out.len() - vocab..].to_vec();
+        apply_mask_bytes(&mut row, &mask);
+        let next = argmax_last_row(&row, vocab);
         self.send_token_to_upstream(next)?;
         Ok(())
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
-        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        let (hidden, shape, position, mask) = self.recv_hidden_from_upstream()?;
         if position == 0 {
             self.runtime.reset_state().map_err(map_ov_err)?;
         }
         let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let s3 = to_shape3(&out_shape);
-        // Forward the SAME absolute position downstream so every stage aligns.
-        self.send_hidden_downstream(&out, s3, position)?;
+        // Forward the SAME absolute position downstream so every stage aligns,
+        // and the received mask bytes verbatim (this rank has no tokenizer).
+        self.send_hidden_downstream(&out, s3, position, &mask)?;
         let token = self.recv_token_from_downstream()?;
         self.send_token_to_upstream(token)?;
         Ok(())
@@ -1400,6 +1488,11 @@ impl Builder for Gemma4Builder {
             );
         }
 
+        let grammar_factory = match self.tokenizer.as_ref() {
+            Some(tok) => Some(GrammarFactory::new(tok, &self.eos_token_ids)?),
+            None => None,
+        };
+
         Ok(Box::new(Gemma4Engine {
             spec,
             runtime,
@@ -1415,6 +1508,7 @@ impl Builder for Gemma4Builder {
             cross_kv_out,
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
+            grammar_factory,
             step_warn: StepWarnLimiter::default(),
         }))
     }
