@@ -38,6 +38,10 @@ use futures::stream;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
+use crate::constrained::{
+    apply_mask_bytes, sentinel_mask, ApplyOutcome, GrammarFactory, GrammarMask,
+};
+
 const HIDDEN: usize = 2048;
 /// Prefill span per chain pass; bounds the transient [1, T, vocab]
 /// logits buffer (~254 MB f32 at 256 with the 248320 vocab) and the
@@ -287,6 +291,15 @@ impl Builder for Qwen36Builder {
         if self.rank == 0 && (self.emb.is_none() || self.tokenizer.is_none()) {
             return Err(EngineError::NotLoaded);
         }
+        // Only the driver (rank 0) holds the tokenizer; `eos` is a single
+        // optional id here (not a Vec), so widen it to a slice for the factory.
+        let grammar_factory = match self.tokenizer.as_ref() {
+            Some(tok) => Some(GrammarFactory::new(
+                tok,
+                &self.eos.map(|e| vec![e]).unwrap_or_default(),
+            )?),
+            None => None,
+        };
         Ok(Box::new(Qwen36Engine {
             emb: self.emb,
             stages: self.stages.ok_or(EngineError::NotLoaded)?,
@@ -304,6 +317,7 @@ impl Builder for Qwen36Builder {
             peer_epoch: 0,
             handshake_done: false,
             poisoned: None,
+            grammar_factory,
             pending: Vec::new(),
             active: None,
         }))
@@ -350,6 +364,9 @@ pub struct Qwen36Engine {
     /// Set when the startup handshake found a config mismatch (spec
     /// §3.4: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
+    /// Built once at engine construction when a tokenizer is present (rank 0
+    /// only); `None` for tokenizer-less ranks. Drives constrained decoding.
+    grammar_factory: Option<GrammarFactory>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
 }
@@ -375,6 +392,10 @@ struct ActiveTask {
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
     /// decode frames (n=1), for the M4'-1 gate's wire histogram.
     wire_ms: Vec<f64>,
+    /// Driver-side (rank 0 / single-box) grammar matcher; `None` when the task
+    /// carries no grammar. Non-driver ranks never build one — they move wire
+    /// bytes only.
+    grammar_mask: Option<GrammarMask>,
 }
 
 fn le_bytes_i64(vals: &[i64]) -> Vec<u8> {
@@ -391,6 +412,17 @@ fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Greedy argmax over a logits row (single-box driver). Empty row → 0, matching
+/// the prior inline `max_by(total_cmp)…unwrap_or(0)`.
+fn argmax_u32(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 fn run_async<F: std::future::Future>(h: &tokio::runtime::Handle, fut: F) -> F::Output {
@@ -421,6 +453,10 @@ enum InFrame {
         pos: u32,
         hidden: Vec<f32>,
         n: usize,
+        /// Flag-prefixed I8 token bitmask (Design A) ridden in the FORWARD
+        /// body after the hidden tensor; always present (sentinel when
+        /// unconstrained) so the frame count is constant across ranks.
+        mask: Vec<i8>,
     },
 }
 
@@ -530,6 +566,23 @@ impl Qwen36Engine {
             if let Err(e) = st.reset_state() {
                 warn!(error = %e, "qwen36: stage reset_state failed");
             }
+        }
+    }
+
+    /// Driver-side: build the per-task grammar matcher from `task.grammar`.
+    /// `None` when the task carries no grammar (byte-identical path); a grammar
+    /// requested without a factory is an error, never silent.
+    fn build_grammar_mask(&self, task: &GenerationTask) -> EngineResult<Option<GrammarMask>> {
+        match task.grammar.as_ref() {
+            Some(spec) => self
+                .grammar_factory
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Backend("grammar requested but no tokenizer/factory".into())
+                })?
+                .create(spec)
+                .map(Some),
+            None => Ok(None),
         }
     }
 
@@ -660,6 +713,7 @@ impl Qwen36Engine {
         hidden: &[f32],
         n: usize,
         t0: usize,
+        mask: &[i8],
     ) -> EngineResult<(i32, u32)> {
         let downstream = self
             .downstream
@@ -671,6 +725,15 @@ impl Qwen36Engine {
             [1, n as u32, HIDDEN as u32],
             le_bytes_f32(hidden),
         );
+        // Design A (slice-3): the per-step token bitmask rides the FORWARD body
+        // as a self-describing I8 frame right after the hidden tensor — always
+        // present (real bitset or 1-byte sentinel) so the frame count stays
+        // constant whether or not a grammar is active.
+        let mask_tensor = WireTensor::new(
+            WireDType::I8,
+            [1u32, 1u32, mask.len() as u32],
+            mask.iter().map(|&b| b as u8).collect(),
+        );
         run_async(
             &h,
             reply_bounded(async move {
@@ -678,6 +741,7 @@ impl Qwen36Engine {
                 g.send_raw(&frame_header(FRAME_FORWARD, epoch, t0 as u32))
                     .await?;
                 g.send(&tensor).await?;
+                g.send(&mask_tensor).await?;
                 let hb = g.recv_raw(12).await?;
                 let (kind, e, _) = parse_header(&hb);
                 if kind != FRAME_TOKEN || e != epoch {
@@ -701,10 +765,11 @@ impl Qwen36Engine {
         hidden: Vec<f32>,
         n: usize,
         t0: usize,
+        mask: &[i8],
     ) -> EngineResult<(u32, f64)> {
         let epoch = self.epoch;
         let started = Instant::now();
-        let (token, infer_us) = self.forward_downstream(epoch, &hidden, n, t0)?;
+        let (token, infer_us) = self.forward_downstream(epoch, &hidden, n, t0, mask)?;
         let wire_ms =
             (started.elapsed().as_secs_f64() * 1000.0 - infer_us as f64 / 1000.0).max(0.0);
         Ok((token as u32, wire_ms))
@@ -827,6 +892,16 @@ impl Qwen36Engine {
             } else {
                 self.max_tokens_default
             } as usize;
+            let grammar_mask = match self.build_grammar_mask(&task) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(task = %task.task_id, error = %e, "qwen36: grammar build failed");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
+                }
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 prompt_ids,
@@ -839,6 +914,7 @@ impl Qwen36Engine {
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
+                grammar_mask,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -859,10 +935,27 @@ impl Qwen36Engine {
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 let n = toks.len();
+                // Only the LAST prefill chunk's FORWARD produces the first decode
+                // token, so only it carries a real mask; earlier chunks' tokens
+                // are discarded → sentinel. The matcher is still in its initial
+                // (no-token-accepted) state here.
+                let is_final_chunk = end == self.active.as_ref().unwrap().prompt_ids.len();
+                let mask = match self
+                    .active
+                    .as_mut()
+                    .and_then(|t| t.grammar_mask.as_mut())
+                    .filter(|_| is_final_chunk)
+                {
+                    Some(m) => match m.next_mask_bytes() {
+                        Ok(b) => b,
+                        Err(e) => return self.finalize_error(format!("grammar mask failed: {e}")),
+                    },
+                    None => sentinel_mask(),
+                };
                 let res = self
                     .embed_seq(&toks)
                     .and_then(|e| self.chain_pass(&e, t0, t0 + n))
-                    .and_then(|h| self.send_forward_recv_token(h, n, t0));
+                    .and_then(|h| self.send_forward_recv_token(h, n, t0, &mask));
                 match res {
                     Ok((tok, _wire_ms)) => {
                         let t = self.active.as_mut().unwrap();
@@ -886,10 +979,27 @@ impl Qwen36Engine {
                 return self.finalize();
             }
             let step = t.step;
+            // Advance the matcher with the token we are about to emit, then
+            // compute the mask for the NEXT token (reflecting `next` accepted)
+            // — the driver owns the matcher; the wire only carries bytes.
+            let mask = match self.active.as_mut().and_then(|t| t.grammar_mask.as_mut()) {
+                Some(m) => {
+                    if !m.is_stopped() {
+                        if let Err(e) = m.accept(next) {
+                            return self.finalize_error(format!("grammar accept failed: {e}"));
+                        }
+                    }
+                    match m.next_mask_bytes() {
+                        Ok(b) => b,
+                        Err(e) => return self.finalize_error(format!("grammar mask failed: {e}")),
+                    }
+                }
+                None => sentinel_mask(),
+            };
             let res = self
                 .embed_seq(&[next])
                 .and_then(|e| self.chain_pass(&e, step, step + 1))
-                .and_then(|h| self.send_forward_recv_token(h, 1, step));
+                .and_then(|h| self.send_forward_recv_token(h, 1, step, &mask));
             match res {
                 Ok((tok, wire_ms)) => {
                     let t = self.active.as_mut().unwrap();
@@ -949,11 +1059,20 @@ impl Qwen36Engine {
                         return Err(TransportError::SocketClosed);
                     }
                     let n = t.shape[1] as usize;
+                    // The mask frame (Design A) always follows the hidden
+                    // tensor — sentinel when unconstrained — so read it
+                    // unconditionally to keep the relay in lockstep.
+                    let (mt, _) = g.recv().await?;
+                    if !matches!(mt.dtype, WireDType::I8) {
+                        return Err(TransportError::SocketClosed);
+                    }
+                    let mask: Vec<i8> = mt.data.iter().map(|&b| b as i8).collect();
                     Ok(InFrame::Forward {
                         epoch,
                         pos,
                         hidden: f32_from_le(&t.data),
                         n,
+                        mask,
                     })
                 }
                 _ => Err(TransportError::SocketClosed),
@@ -1023,6 +1142,7 @@ impl Qwen36Engine {
                 pos,
                 hidden,
                 n,
+                mask,
             } => {
                 if self.poisoned.is_some() {
                     return Err(EngineError::Backend(
@@ -1053,12 +1173,15 @@ impl Qwen36Engine {
                 // RTT-minus-infer stays the chain's true wire share.
                 let own_us = infer_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 let (next, downstream_us) = if is_last {
-                    let logits = if self.last_logits_only {
+                    let mut logits = if self.last_logits_only {
                         out
                     } else {
                         let row = out.len() / n;
                         out[(n - 1) * row..].to_vec()
                     };
+                    // Apply the driver's wire bitmask before argmax (no-op on a
+                    // sentinel); this rank has no tokenizer, only wire bytes.
+                    apply_mask_bytes(&mut logits, &mask);
                     let next = logits
                         .iter()
                         .enumerate()
@@ -1067,9 +1190,11 @@ impl Qwen36Engine {
                         .unwrap_or(0);
                     (next, 0u32)
                 } else {
-                    // Middle: pass the hidden span on; the chain end's
-                    // token comes back through us.
-                    self.forward_downstream(epoch, &out, n, t0)?
+                    // Middle: pass the hidden span on AND forward the mask
+                    // bytes verbatim (a middle that drops the mask leaves the
+                    // last rank decoding unconstrained); the chain end's token
+                    // comes back through us.
+                    self.forward_downstream(epoch, &out, n, t0, &mask)?
                 };
                 let infer_us = own_us.saturating_add(downstream_us);
                 let h = self.handle()?;
@@ -1153,6 +1278,16 @@ impl Qwen36Engine {
             } else {
                 self.max_tokens_default
             } as usize;
+            let grammar_mask = match self.build_grammar_mask(&task) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(task = %task.task_id, error = %e, "qwen36: grammar build failed");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, e.to_string()),
+                    )];
+                }
+            };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
                 prompt_ids,
@@ -1165,6 +1300,7 @@ impl Qwen36Engine {
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
+                grammar_mask,
             });
         }
         let t = self.active.as_ref().unwrap();
@@ -1201,17 +1337,34 @@ impl Qwen36Engine {
             if t.gen_ids.len() >= t.max_tokens {
                 return self.finalize();
             }
-            let next = t
-                .logits
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            // Mask the local logits row before the argmax (gemma4 single-stage
+            // parity): `Complete` forces EOS, `Masked` argmaxes the masked row;
+            // then advance the matcher with the chosen token. No grammar =>
+            // byte-identical bare argmax (no clone).
+            let t = self.active.as_mut().unwrap();
+            let next = if let Some(m) = t.grammar_mask.as_mut() {
+                let mut row = t.logits.clone();
+                match m.apply(&mut row) {
+                    // Grammar complete: emit EOS (matches gemma4 single-stage).
+                    Ok(ApplyOutcome::Complete) => self.eos.unwrap_or(0),
+                    Ok(ApplyOutcome::Masked) => {
+                        let tok = argmax_u32(&row);
+                        if !m.is_stopped() {
+                            if let Err(e) = m.accept(tok) {
+                                return self.finalize_error(format!("grammar accept failed: {e}"));
+                            }
+                        }
+                        tok
+                    }
+                    Err(e) => return self.finalize_error(format!("grammar mask failed: {e}")),
+                }
+            } else {
+                argmax_u32(&t.logits)
+            };
             if Some(next) == self.eos {
                 return self.finalize();
             }
-            let step = t.step;
+            let step = self.active.as_ref().unwrap().step;
             match self.run_span(&[next], step) {
                 Ok(l) => {
                     let t = self.active.as_mut().unwrap();
@@ -1364,6 +1517,7 @@ mod tests {
             peer_epoch: 0,
             handshake_done: false,
             poisoned: None,
+            grammar_factory: None,
             pending: Vec::new(),
             active: None,
         }
@@ -1431,6 +1585,7 @@ mod tests {
             max_tokens: 16,
             started: Instant::now(),
             wire_ms: Vec::new(),
+            grammar_mask: None,
         });
 
         let out = e.finalize_error("pipeline decode failed: wire closed".into());
