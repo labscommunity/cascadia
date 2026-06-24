@@ -1549,9 +1549,6 @@ impl OvRuntimeEngine {
         let total = position as usize + seq_len;
         let attn = vec![1i64; total];
         let pos: Vec<i64> = (position..position + seq_len as i64).collect();
-        if std::env::var_os("CASCADIA_KV_DEBUG").is_some() {
-            eprintln!("[KVDBG] feed_first_v5: seq_len={seq_len} position={position} mask_total={total}");
-        }
 
         let in_ids = self
             .input_named("input_ids")
