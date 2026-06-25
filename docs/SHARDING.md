@@ -5,6 +5,9 @@ that the worker engines (`ov-runtime`, `ov-dist-spec`) can load. Each
 stage holds a contiguous slab of decoder layers + (on the first stage)
 the embedding + (on the last stage) the final norm + lm_head.
 
+> Running shards on the **Intel NPU** needs a static-shape, stateless export
+> (`--target npu`) and a host-side KV ring — see [NPU_SHARDING.md](NPU_SHARDING.md).
+
 ## Quick start
 
 ```bash
