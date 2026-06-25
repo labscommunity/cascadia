@@ -844,6 +844,16 @@ impl Engine for SparseMoEEngine {
         Ok(())
     }
 
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Drop the queued task. step() runs one task end-to-end and holds the
+        // engine mutex for that whole generation, so cancel() (also &mut self)
+        // runs only between tasks — it prevents a queued task from starting but
+        // cannot interrupt one already decoding. Mid-generation interruption
+        // would need an out-of-mutex cancel token threaded into the decode
+        // loop (architectural follow-up).
+        self.pending.retain(|t| &t.task_id != task_id);
+    }
+
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.total == 1 {
             return self.step_single_stage();
@@ -2185,6 +2195,12 @@ impl Engine for OvMoeEngine {
         }
         self.pending.push_back(task);
         Ok(())
+    }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Same as the dense sparse-MoE engine: drop queued tasks; an in-flight
+        // monolithic generation runs to its step boundary.
+        self.pending.retain(|t| &t.task_id != task_id);
     }
 
     fn step(&mut self) -> Vec<(TaskId, Chunk)> {
