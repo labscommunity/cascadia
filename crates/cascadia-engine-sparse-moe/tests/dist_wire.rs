@@ -52,6 +52,7 @@ async fn forward_frame_round_trips_hidden_state() {
         repetition_penalty: 1.15,
         repetition_window: 256,
         seed: Some(0x1234_5678_9abc_def0),
+        ..SamplingConfig::default()
     };
     let cfg_for_assert = cfg.clone();
 
@@ -101,10 +102,13 @@ fn sampling_wire_round_trips_defaults_and_explicit_values() {
     assert_eq!(back.repetition_window, cfg.repetition_window);
     assert_eq!(back.seed, None);
 
-    // Explicit fields including a seed.
+    // Explicit fields including a seed + the #14 sampling knobs.
     let cfg = SamplingConfig {
         temperature: 0.8,
         top_p: 0.95,
+        top_k: 40,
+        frequency_penalty: 0.5,
+        presence_penalty: -0.25,
         repetition_penalty: 1.1,
         repetition_window: 1024,
         seed: Some(42),
@@ -114,9 +118,36 @@ fn sampling_wire_round_trips_defaults_and_explicit_values() {
     let back = decode_sampling(&bytes);
     assert_eq!(back.temperature, cfg.temperature);
     assert_eq!(back.top_p, cfg.top_p);
+    assert_eq!(back.top_k, cfg.top_k);
+    assert_eq!(back.frequency_penalty, cfg.frequency_penalty);
+    assert_eq!(back.presence_penalty, cfg.presence_penalty);
     assert_eq!(back.repetition_penalty, cfg.repetition_penalty);
     assert_eq!(back.repetition_window, cfg.repetition_window);
     assert_eq!(back.seed, cfg.seed);
+
+    // The Forward frame kind was bumped to a new code alongside the wider
+    // sampling block so a 28-byte-layout peer fails fast (#14).
+    assert_eq!(
+        FrameKind::from_code(0x53_4D_45_04),
+        Some(FrameKind::Forward)
+    );
+    assert_eq!(
+        FrameKind::from_code(0x53_4D_45_05),
+        Some(FrameKind::ForwardBatch)
+    );
+    // The old 28-byte Forward/ForwardBatch codes are now unknown → rejected.
+    assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
+}
+
+#[test]
+fn decode_sanitizes_corrupt_zero_repetition_penalty() {
+    // An all-zero (or otherwise corrupt) sampling block from an out-of-version
+    // peer must not yield repetition_penalty == 0, which the sampler would use
+    // as a divisor (logit / 0 = +inf). It clamps back to the 1.0 no-op.
+    let bytes = [0u8; SAMPLING_WIRE_BYTES];
+    let cfg = decode_sampling(&bytes);
+    assert_eq!(cfg.repetition_penalty, 1.0);
 }
 
 #[tokio::test]
@@ -232,6 +263,7 @@ async fn forward_batch_frame_round_trips_k4() {
         repetition_penalty: 1.0,
         repetition_window: 0,
         seed: Some(42),
+        ..SamplingConfig::default()
     };
     let cfg_for_assert = cfg.clone();
     let past_seq_len_start: u32 = 13;
@@ -393,15 +425,19 @@ async fn forward_batch_rejects_mismatched_shape() {
 
 #[test]
 fn frame_kind_codes_remain_stable() {
-    // Old peers (pre-PR #11) only know Forward/Reset/Token. Adding
-    // ForwardBatch/TokenBatch must not alter the existing codes — a
-    // pre-PR #11 worker still decodes a Forward correctly. This pins
-    // the wire codes so a future refactor can't drift them silently.
-    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_02);
+    // This pins the wire codes so a future refactor can't drift them silently.
+    // Reset/Token carry no sampling block and keep their original codes.
+    // Forward/ForwardBatch were bumped 0x02→0x04 / 0x03→0x05 in #14 when the
+    // sampling block grew 28→40 bytes, so a peer on the old layout fails fast
+    // at parse_kind rather than mis-reading the wider frame.
+    assert_eq!(FrameKind::Forward as u32, 0x53_4D_45_04);
     assert_eq!(FrameKind::Reset as u32, 0x53_4D_45_10);
     assert_eq!(FrameKind::Token as u32, 0x53_4D_45_20);
-    assert_eq!(FrameKind::ForwardBatch as u32, 0x53_4D_45_03);
+    assert_eq!(FrameKind::ForwardBatch as u32, 0x53_4D_45_05);
     assert_eq!(FrameKind::TokenBatch as u32, 0x53_4D_45_21);
+    // The retired 28-byte-layout codes must now be rejected as unknown.
+    assert_eq!(FrameKind::from_code(0x53_4D_45_02), None);
+    assert_eq!(FrameKind::from_code(0x53_4D_45_03), None);
 
     // And round-trip every variant through from_code.
     for k in [

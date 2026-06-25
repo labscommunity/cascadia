@@ -80,10 +80,16 @@ use crate::sampling::SamplingConfig;
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameKind {
-    Forward = 0x53_4D_45_02,      // "SME\x02"
+    // Forward / ForwardBatch carry the SamplingConfig block, which grew from
+    // 28 to 40 bytes when top_k + frequency/presence penalties were added
+    // (#14). Their codes were bumped (0x02→0x04, 0x03→0x05) so a peer running
+    // the old 28-byte layout trips the unknown-kind check in `parse_kind`
+    // instead of mis-reading the larger frame. Reset/Token carry no sampling
+    // and keep their codes.
+    Forward = 0x53_4D_45_04,      // "SME\x04" — was 0x02 (28-byte sampling)
     Reset = 0x53_4D_45_10,        // "SME\x10"
     Token = 0x53_4D_45_20,        // "SME\x20"
-    ForwardBatch = 0x53_4D_45_03, // "SME\x03" — batched K-step verify
+    ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
     TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
 }
 
@@ -162,10 +168,12 @@ fn tensor_to_hidden(t: &Tensor) -> TransportResult<(Vec<f32>, [u32; 3])> {
     Ok((out, t.shape))
 }
 
-/// On-wire encoding of `SamplingConfig`. Fixed 28 bytes BE; the `seed`
+/// On-wire encoding of `SamplingConfig`. Fixed 40 bytes BE; the `seed`
 /// field uses 0 as the sentinel for "no seed" (the engine treats 0 as
-/// invalid anyway — `init_rng` clamps to `max(seed, 1)`).
-pub const SAMPLING_WIRE_BYTES: usize = 28;
+/// invalid anyway — `init_rng` clamps to `max(seed, 1)`). Bytes 28..40 were
+/// added in #14 (top_k + frequency/presence penalties); the Forward frame
+/// kind was bumped alongside so a 28-byte peer fails fast.
+pub const SAMPLING_WIRE_BYTES: usize = 40;
 
 pub fn encode_sampling(cfg: &SamplingConfig, out: &mut [u8; SAMPLING_WIRE_BYTES]) {
     out[0..4].copy_from_slice(&cfg.temperature.to_be_bytes());
@@ -174,6 +182,9 @@ pub fn encode_sampling(cfg: &SamplingConfig, out: &mut [u8; SAMPLING_WIRE_BYTES]
     out[12..20].copy_from_slice(&(cfg.repetition_window as u64).to_be_bytes());
     let seed = cfg.seed.unwrap_or(0);
     out[20..28].copy_from_slice(&seed.to_be_bytes());
+    out[28..32].copy_from_slice(&cfg.top_k.to_be_bytes());
+    out[32..36].copy_from_slice(&cfg.frequency_penalty.to_be_bytes());
+    out[36..40].copy_from_slice(&cfg.presence_penalty.to_be_bytes());
 }
 
 pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
@@ -193,10 +204,14 @@ pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
         0.0,
     )
     .min(1.0);
+    // repetition_penalty is a divisor in the sampler (`logit / α`), so a wire
+    // value of 0 from a corrupt/out-of-version peer would map a positive logit
+    // to +inf. Clamp anything <= 0 (and NaN) back to 1.0 (no-op) — the min is
+    // MIN_POSITIVE, not 0.0, so exactly-zero falls back too.
     let repetition_penalty = sanitize_f32(
         f32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         1.0,
-        0.0,
+        f32::MIN_POSITIVE,
     );
     let rep_window = u64::from_be_bytes([
         bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
@@ -204,9 +219,25 @@ pub fn decode_sampling(bytes: &[u8; SAMPLING_WIRE_BYTES]) -> SamplingConfig {
     let seed_raw = u64::from_be_bytes([
         bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
     ]);
+    let top_k = u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
+    // Penalties may legitimately be negative (OpenAI range -2.0..=2.0), so
+    // only guard NaN here rather than clamping to a min like the others.
+    let frequency_penalty = sanitize_f32(
+        f32::from_be_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+        0.0,
+        f32::NEG_INFINITY,
+    );
+    let presence_penalty = sanitize_f32(
+        f32::from_be_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]),
+        0.0,
+        f32::NEG_INFINITY,
+    );
     SamplingConfig {
         temperature,
         top_p,
+        top_k,
+        frequency_penalty,
+        presence_penalty,
         repetition_penalty,
         repetition_window: rep_window,
         seed: if seed_raw == 0 { None } else { Some(seed_raw) },

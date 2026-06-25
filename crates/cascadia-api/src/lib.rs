@@ -296,6 +296,21 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// OpenAI `stop` is either a single string or an array of strings.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum StopSpec {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+/// OpenAI `stream_options`. Only `include_usage` is honored today.
+#[derive(Deserialize, Debug, Default)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -305,12 +320,64 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub temperature: f32,
     #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub stop: Option<StopSpec>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    /// OpenAI `logprobs` (bool). When true, per-token logprobs are returned
+    /// (engine-permitting).
+    #[serde(default)]
+    pub logprobs: bool,
+    /// OpenAI `top_logprobs` (0..=20): how many alternatives per position.
+    #[serde(default)]
+    pub top_logprobs: Option<u32>,
+    #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Hybrid-reasoning switch (Qwen3+ convention). Default true =
     /// model-default behavior; false asks the engine to skip the
     /// <think> block (engines that can't, ignore it).
     #[serde(default = "default_true")]
     pub enable_thinking: bool,
+}
+
+impl ChatCompletionRequest {
+    /// Build the engine-facing `SamplingParams`, applying OpenAI defaults
+    /// (top_p=1.0, penalties=0.0) when a field is omitted.
+    fn sampling_params(&self) -> cascadia_types::SamplingParams {
+        cascadia_types::SamplingParams {
+            top_p: self.top_p.unwrap_or(1.0),
+            top_k: self.top_k.unwrap_or(0),
+            seed: self.seed,
+            frequency_penalty: self.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: self.presence_penalty.unwrap_or(0.0),
+            stop: self
+                .stop
+                .as_ref()
+                .map(|s| match s {
+                    StopSpec::Single(x) => vec![x.clone()],
+                    StopSpec::Multiple(v) => v.clone(),
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Top-logprobs count to request from the engine (0 = disabled).
+    fn logprobs_count(&self) -> u32 {
+        if self.logprobs {
+            self.top_logprobs.unwrap_or(1).clamp(1, 20)
+        } else {
+            0
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -327,12 +394,21 @@ struct ChatChoiceMessage {
     content: String,
 }
 
+/// OpenAI chat `logprobs` object: one entry per generated token under
+/// `content`. Present only when the request set `logprobs: true` AND the
+/// engine emitted per-token logprobs.
+#[derive(Serialize)]
+struct ChatLogprobs {
+    content: Vec<cascadia_types::TokenLogprobs>,
+}
+
 #[derive(Serialize)]
 struct ChatChoice {
     index: u32,
     message: ChatChoiceMessage,
     finish_reason: &'static str,
-    logprobs: Option<()>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<ChatLogprobs>,
 }
 
 #[derive(Serialize)]
@@ -578,7 +654,8 @@ async fn chat_completions(
         prompt,
         max_tokens: req.max_tokens,
         temperature: req.temperature,
-        logprobs: 0,
+        logprobs: req.logprobs_count(),
+        sampling: req.sampling_params(),
         enable_thinking: req.enable_thinking,
         trust_remote_code: false,
     };
@@ -608,7 +685,12 @@ async fn chat_completions(
     let inflight = InFlightGuard::new(state.stats.clone());
 
     if req.stream {
-        return stream_completion(state, req.model, task, permit, inflight)
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .map(|o| o.include_usage)
+            .unwrap_or(false);
+        return stream_completion(state, req.model, task, permit, inflight, include_usage)
             .await
             .into_response();
     }
@@ -624,6 +706,10 @@ async fn chat_completions(
     let mut buf = String::new();
     let mut completion_tokens: u32 = 0;
     let mut prompt_tokens: u32 = 0;
+    // OpenAI `finish_reason`: `length` when the engine hit max_tokens, else
+    // `stop`. Engines that don't distinguish leave it None → "stop".
+    let mut finish_reason: &'static str = "stop";
+    let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -646,14 +732,37 @@ async fn chat_completions(
         // markers other engines emit, so there's no phantom over-count.
         buf.push_str(&chunk.text);
         completion_tokens += chunk_token_count(&chunk);
+        if let Some(lp) = &chunk.logprobs {
+            logprobs_content.push(lp.clone());
+        }
         if chunk.is_final {
             prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
+            if let Some(fr) = chunk.finish_reason {
+                finish_reason = fr.as_openai_str();
+            }
         }
     }
     state
         .stats
         .tokens_total
         .fetch_add(completion_tokens as u64, Ordering::Relaxed);
+
+    // Honor `stop` sequences by trimming the assembled text at the earliest
+    // match. The engines don't early-stop on strings yet (an engine-side
+    // follow-up would also save compute), so this enforces the OpenAI output
+    // contract at the API boundary and forces finish_reason = "stop".
+    let stops = req.sampling_params().stop;
+    if !stops.is_empty() {
+        if let Some(cut) = stops
+            .iter()
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| buf.find(s.as_str()))
+            .min()
+        {
+            buf.truncate(cut);
+            finish_reason = "stop";
+        }
+    }
 
     Json(ChatCompletionResponse {
         id: task_id,
@@ -666,8 +775,14 @@ async fn chat_completions(
                 role: "assistant",
                 content: buf,
             },
-            finish_reason: "stop",
-            logprobs: None,
+            finish_reason,
+            logprobs: if logprobs_content.is_empty() {
+                None
+            } else {
+                Some(ChatLogprobs {
+                    content: logprobs_content,
+                })
+            },
         }],
         usage: Usage {
             // From the engine's final chunk; 0 when the engine can't tell
@@ -686,6 +801,7 @@ async fn stream_completion(
     task: GenerationTask,
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
+    include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
@@ -700,6 +816,16 @@ async fn stream_completion(
     // Clone the counter handle for per-chunk token accounting in the
     // formatter closure below.
     let stats = state.stats.clone();
+    // Per-request token tallies for the OpenAI `stream_options.include_usage`
+    // final chunk (the global `stats.tokens_total` is cross-request). The
+    // `final_*` handles are read by the trailing usage frame after the body
+    // stream drains; the per-chunk closure gets the originals.
+    let usage_completion = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let usage_prompt = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let final_completion = usage_completion.clone();
+    let final_prompt = usage_prompt.clone();
+    let usage_model = model.clone();
+    let usage_task_id = task_id.clone();
     // Move the permit + in-flight guard into the stream so they're released
     // only when the body is dropped (client disconnect or final chunk).
     let permit_carrier = StreamWithPermit {
@@ -726,6 +852,8 @@ async fn stream_completion(
             let model = model.clone();
             let task_id = task_id.clone();
             let stats = stats.clone();
+            let usage_completion = usage_completion.clone();
+            let usage_prompt = usage_prompt.clone();
             async move {
                 // Count model tokens as they stream so the dashboard's
                 // tokens_total advances live (not just at request end).
@@ -733,9 +861,13 @@ async fn stream_completion(
                 // output there); chunk_token_count yields 0 for empty
                 // markers, so no phantom token.
                 if chunk.error.is_none() {
-                    stats
-                        .tokens_total
-                        .fetch_add(chunk_token_count(&chunk) as u64, Ordering::Relaxed);
+                    let n = chunk_token_count(&chunk);
+                    stats.tokens_total.fetch_add(n as u64, Ordering::Relaxed);
+                    usage_completion.fetch_add(n, Ordering::Relaxed);
+                    if chunk.is_final {
+                        usage_prompt
+                            .store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                    }
                 }
                 // A failed task carries `error` on its final chunk. The 200
                 // headers are already on the wire by the time the body
@@ -769,7 +901,11 @@ async fn stream_completion(
                             "role": "assistant",
                             "content": chunk.text,
                         },
-                        "finish_reason": if chunk.is_final { Some("stop") } else { None },
+                        "finish_reason": if chunk.is_final {
+                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
+                        } else {
+                            None
+                        },
                     }],
                 });
                 let line = format!("data: {payload}\n\n");
@@ -788,8 +924,31 @@ async fn stream_completion(
                 Ok::<Bytes, std::convert::Infallible>(Bytes::from(line))
             }
         })
-        .chain(stream::once(async {
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+        .chain(stream::once(async move {
+            // OpenAI: when stream_options.include_usage is set, emit one final
+            // chunk with empty `choices` carrying `usage`, just before [DONE].
+            // Combined into a single HTTP frame with [DONE] (SSE events are
+            // delimited by \n\n regardless of HTTP chunk boundaries).
+            let mut out = String::new();
+            if include_usage {
+                let prompt = final_prompt.load(Ordering::Relaxed);
+                let completion = final_completion.load(Ordering::Relaxed);
+                let usage = serde_json::json!({
+                    "id": usage_task_id,
+                    "object": "chat.completion.chunk",
+                    "created": now_unix(),
+                    "model": usage_model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion,
+                    },
+                });
+                out.push_str(&format!("data: {usage}\n\n"));
+            }
+            out.push_str("data: [DONE]\n\n");
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(out))
         }));
 
     Response::builder()
@@ -954,6 +1113,140 @@ mod tests {
         // Mock yields words from the prompt; check non-empty content.
         let content = v["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(!content.is_empty(), "completion content was empty");
+    }
+
+    // Helper: POST a chat-completions request body, return (status, parsed JSON).
+    async fn post_chat(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn finish_reason_length_when_max_tokens_hit() {
+        // Mock echoes the prompt's words; with 5 words and max_tokens 2 it hits
+        // the cap before exhausting the prompt → finish_reason "length".
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie delta echo"}],
+                "max_tokens": 2,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn finish_reason_stop_when_prompt_exhausted() {
+        // 2 words, generous cap → the mock exhausts the prompt → "stop".
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo"}],
+                "max_tokens": 64,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn stop_sequence_truncates_output() {
+        // Full output would be "alpha bravo charlie delta "; stop ["charlie"]
+        // trims it to "alpha bravo " and forces finish_reason "stop".
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie delta"}],
+                "max_tokens": 64,
+                "stop": "charlie",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            !content.contains("charlie"),
+            "stop text not trimmed: {content:?}"
+        );
+        assert_eq!(content.trim(), "alpha bravo");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn full_sampling_param_set_is_accepted() {
+        // Every new OpenAI field present + well-typed must parse (no 400).
+        let (status, _v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "alpha bravo"}],
+                "max_tokens": 4,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "seed": 1234,
+                "stop": ["zzz", "qqq"],
+                "frequency_penalty": 0.5,
+                "presence_penalty": -0.25,
+                "logprobs": true,
+                "top_logprobs": 3,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn streaming_usage_emitted_when_requested() {
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "mock-model",
+                            "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+                            "max_tokens": 8,
+                            "stream": true,
+                            "stream_options": {"include_usage": true},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("\"usage\""),
+            "no usage frame in stream: {text}"
+        );
+        assert!(text.contains("\"completion_tokens\""));
+        assert!(text.trim_end().ends_with("data: [DONE]"));
     }
 
     #[tokio::test]

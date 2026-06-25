@@ -1020,6 +1020,9 @@ impl OvRuntimeEngine {
                 n_tokens: None,
                 prompt_tokens: None,
                 error: None,
+                // ov-runtime doesn't yet distinguish length vs stop here; the
+                // API falls back to "stop" (unchanged behavior). #14 follow-up.
+                finish_reason: None,
             }
         } else {
             Chunk::token(task_id.clone(), next_token as i64, delta)

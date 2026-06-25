@@ -335,6 +335,7 @@ fn minimax_m2_full_generate_smoke() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
         seed: Some(42),
+        ..cascadia_engine_sparse_moe::SamplingConfig::default()
     };
     eprintln!(
         "sampling: temp={} top_p={} rep_penalty={} rep_window={}",

@@ -112,6 +112,11 @@ mod sys {
             cfg: *mut cascadia_genconfig_t,
             enabled: i32,
         );
+        pub fn cascadia_genconfig_set_top_p(cfg: *mut cascadia_genconfig_t, v: f32);
+        pub fn cascadia_genconfig_set_top_k(cfg: *mut cascadia_genconfig_t, v: u32);
+        pub fn cascadia_genconfig_set_frequency_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
+        pub fn cascadia_genconfig_set_presence_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
+        pub fn cascadia_genconfig_set_rng_seed(cfg: *mut cascadia_genconfig_t, v: u64);
 
         pub fn cascadia_pipeline_generate(
             handle: *mut cascadia_pipeline_t,
@@ -275,6 +280,14 @@ pub struct GenConfig {
     /// the caller pre-rendered the template (e.g. to honor enable_thinking).
     /// Default false = apply (matches OV's `apply_chat_template = true`).
     pub skip_chat_template: bool,
+    /// OpenAI-compatible sampling knobs (#14). Forwarded to the matching
+    /// `ov::genai::GenerationConfig` fields. Defaults (top_p=1.0 via the
+    /// builder, penalties=0, top_k=0, seed=None) are no-ops.
+    pub top_p: f32,
+    pub top_k: u32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    pub seed: Option<u64>,
 }
 
 /// Optional plugin-config knob (CACHE_DIR, KV_CACHE_PRECISION, etc.).
@@ -459,6 +472,19 @@ impl LlmPipeline {
                 raw_cfg,
                 if cfg.skip_chat_template { 0 } else { 1 },
             );
+            // OpenAI-compatible sampling knobs (#14). top_p / penalties take
+            // their OV defaults (1.0 / 0.0) when unset, so setting them is a
+            // no-op; top_k=0 and seed=None mean "disabled" so only forward
+            // when explicitly chosen (OV treats top_k=0 as no truncation).
+            sys::cascadia_genconfig_set_top_p(raw_cfg, cfg.top_p);
+            if cfg.top_k > 0 {
+                sys::cascadia_genconfig_set_top_k(raw_cfg, cfg.top_k);
+            }
+            sys::cascadia_genconfig_set_frequency_penalty(raw_cfg, cfg.frequency_penalty);
+            sys::cascadia_genconfig_set_presence_penalty(raw_cfg, cfg.presence_penalty);
+            if let Some(seed) = cfg.seed {
+                sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
+            }
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(

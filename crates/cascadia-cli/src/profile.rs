@@ -337,6 +337,7 @@ pub fn probe_device(device: &str, args: &ProfileDevicesArgs) -> DeviceResult {
         num_assistant_tokens: 0,
         max_ngram_size: 0,
         skip_chat_template: false,
+        ..Default::default()
     };
 
     // Warmup. Failure here is fatal for this device (we can't trust

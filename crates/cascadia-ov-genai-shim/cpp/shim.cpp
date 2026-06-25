@@ -270,6 +270,23 @@ void cascadia_genconfig_set_max_ngram_size(cascadia_genconfig_t* cfg, uint32_t v
 void cascadia_genconfig_set_apply_chat_template(cascadia_genconfig_t* cfg, int32_t enabled) {
     if (cfg) cfg->cfg.apply_chat_template = enabled != 0;
 }
+// OpenAI-compatible sampling knobs (#14). All map to standard public fields
+// of ov::genai::GenerationConfig; trivial assignments that cannot throw.
+void cascadia_genconfig_set_top_p(cascadia_genconfig_t* cfg, float v) {
+    if (cfg) cfg->cfg.top_p = v;
+}
+void cascadia_genconfig_set_top_k(cascadia_genconfig_t* cfg, uint32_t v) {
+    if (cfg) cfg->cfg.top_k = static_cast<size_t>(v);
+}
+void cascadia_genconfig_set_frequency_penalty(cascadia_genconfig_t* cfg, float v) {
+    if (cfg) cfg->cfg.frequency_penalty = v;
+}
+void cascadia_genconfig_set_presence_penalty(cascadia_genconfig_t* cfg, float v) {
+    if (cfg) cfg->cfg.presence_penalty = v;
+}
+void cascadia_genconfig_set_rng_seed(cascadia_genconfig_t* cfg, uint64_t v) {
+    if (cfg) cfg->cfg.rng_seed = static_cast<size_t>(v);
+}
 
 int32_t cascadia_pipeline_generate(
     cascadia_pipeline_t* handle, const char* prompt, const cascadia_genconfig_t* cfg,

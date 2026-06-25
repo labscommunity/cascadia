@@ -3,6 +3,53 @@ use serde::{Deserialize, Serialize};
 /// Stable per-request identifier propagated end-to-end.
 pub type TaskId = String;
 
+/// OpenAI-compatible sampling knobs, bundled so they thread through the API,
+/// `GenerationTask`, and every engine as one unit. Engines that don't support
+/// a given field ignore it. `temperature` and `max_tokens` stay on
+/// `GenerationTask` itself (they predate this struct and have many call sites).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SamplingParams {
+    /// Nucleus sampling. 1.0 (or 0.0) disables. Maps to OpenAI `top_p`.
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    /// Top-k truncation. 0 disables. Maps to OpenAI `top_k` (non-standard but
+    /// widely supported).
+    #[serde(default)]
+    pub top_k: u32,
+    /// PRNG seed. None → system entropy. Maps to OpenAI `seed`.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Penalize tokens by how often they already appeared (count-scaled).
+    /// 0.0 disables. Maps to OpenAI `frequency_penalty` (range -2.0..=2.0).
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    /// Penalize tokens that appeared at all (presence, not count). 0.0
+    /// disables. Maps to OpenAI `presence_penalty` (range -2.0..=2.0).
+    #[serde(default)]
+    pub presence_penalty: f32,
+    /// Stop sequences. Generation halts (and the stop text is trimmed) when
+    /// any of these is produced. Maps to OpenAI `stop` (string or array).
+    #[serde(default)]
+    pub stop: Vec<String>,
+}
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            top_p: 1.0,
+            top_k: 0,
+            seed: None,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            stop: Vec::new(),
+        }
+    }
+}
+
 /// One generation request, end-to-end.
 ///
 /// Engines that don't support a given option silently ignore it — the API
@@ -18,6 +65,11 @@ pub struct GenerationTask {
     /// Number of top logprobs to return per token. 0 = disabled.
     #[serde(default)]
     pub logprobs: u32,
+    /// OpenAI-compatible sampling knobs (top_p / top_k / seed / penalties /
+    /// stop). `temperature` above and `max_tokens` stay separate for
+    /// historical reasons.
+    #[serde(default)]
+    pub sampling: SamplingParams,
     /// When true, the engine should expose chain-of-thought / reasoning
     /// tokens if the model supports it (DeepSeek V3.1, Qwen3, GLM-4.7,
     /// etc.).
@@ -41,6 +93,7 @@ impl GenerationTask {
             max_tokens: default_max_tokens(),
             temperature: 0.0,
             logprobs: 0,
+            sampling: SamplingParams::default(),
             enable_thinking: false,
             trust_remote_code: false,
         }
@@ -53,6 +106,11 @@ impl GenerationTask {
 
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = temperature;
+        self
+    }
+
+    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = sampling;
         self
     }
 }

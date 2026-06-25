@@ -10,6 +10,16 @@ pub struct SamplingConfig {
     pub temperature: f32,
     /// Nucleus (top-p). 0.0 or 1.0 → disabled.
     pub top_p: f32,
+    /// Top-k truncation. 0 → disabled. Keeps only the k highest-probability
+    /// tokens before nucleus sampling.
+    pub top_k: u32,
+    /// OpenAI frequency penalty: subtract `frequency_penalty * count(token)`
+    /// from each logit, scaled by how often the token already appeared.
+    /// 0.0 → disabled.
+    pub frequency_penalty: f32,
+    /// OpenAI presence penalty: subtract `presence_penalty` once from any
+    /// logit whose token already appeared at all. 0.0 → disabled.
+    pub presence_penalty: f32,
     /// Repetition penalty α applied to logits of recently-emitted tokens.
     /// 1.0 → no penalty. Typical values: 1.05–1.3. See "CTRL: A Conditional
     /// Transformer Language Model for Controllable Generation" (Keskar et
@@ -28,6 +38,9 @@ impl Default for SamplingConfig {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_window: 0,
             seed: None,
@@ -56,6 +69,26 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
         }
     }
 
+    // OpenAI frequency / presence penalties (subtractive, on logits). Applied
+    // over the full running `history` — which includes the prompt tokens, like
+    // the repetition penalty above. OpenAI scopes these to the completion only;
+    // including the prompt is a deliberate, common local-sampler choice (it also
+    // discourages parroting the prompt). Gated so there's zero cost when unused.
+    if cfg.frequency_penalty != 0.0 || cfg.presence_penalty != 0.0 {
+        let mut seen = std::collections::HashSet::new();
+        for &tok in history.iter() {
+            let i = tok as usize;
+            if i < work.len() {
+                // frequency: once per occurrence => count * penalty in total.
+                work[i] -= cfg.frequency_penalty;
+                // presence: once per distinct token.
+                if seen.insert(tok) {
+                    work[i] -= cfg.presence_penalty;
+                }
+            }
+        }
+    }
+
     // Greedy fallback.
     if cfg.temperature <= 0.0 {
         return argmax(&work);
@@ -76,6 +109,36 @@ pub fn sample(logits: &[f32], history: &[i64], cfg: &SamplingConfig, rng_state: 
     }
     for v in work.iter_mut() {
         *v /= sum;
+    }
+
+    // Top-k. Disabled at 0. Keep the k highest-probability tokens, zero the
+    // rest, renormalize. Applied before top-p (k bounds the candidate set,
+    // p then trims within it — matches common samplers).
+    if cfg.top_k > 0 && (cfg.top_k as usize) < work.len() {
+        let k = cfg.top_k as usize;
+        let mut idx: Vec<usize> = (0..work.len()).collect();
+        idx.sort_by(|&a, &b| {
+            work[b]
+                .partial_cmp(&work[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut keep = vec![false; work.len()];
+        for &i in idx.iter().take(k) {
+            keep[i] = true;
+        }
+        let mut renorm = 0.0f32;
+        for (i, v) in work.iter_mut().enumerate() {
+            if keep[i] {
+                renorm += *v;
+            } else {
+                *v = 0.0;
+            }
+        }
+        if renorm > 0.0 {
+            for v in work.iter_mut() {
+                *v /= renorm;
+            }
+        }
     }
 
     // Top-p (nucleus). Disabled when p ∈ {0, 1}.
@@ -202,6 +265,49 @@ mod tests {
         // After penalty: logit[5] = 10.0 / 10.0 = 1.0. logit[3] = 2.0
         // wins. Greedy → 3.
         assert_eq!(sample(&l, &history, &cfg, &mut s), 3);
+    }
+
+    #[test]
+    fn frequency_penalty_demotes_repeated_token_greedy() {
+        // logit[5] highest; history has 5 three times. A frequency penalty of
+        // 2.0 subtracts 3*2=6 → logit[5]=10-6=4, below logit[3]=5. Greedy → 3.
+        let mut l = vec![0.0_f32; 10];
+        l[5] = 10.0;
+        l[3] = 5.0;
+        let history = vec![5_i64, 5, 5];
+        let mut s = 1;
+        let mut cfg = SamplingConfig::default();
+        cfg.frequency_penalty = 2.0;
+        assert_eq!(sample(&l, &history, &cfg, &mut s), 3);
+    }
+
+    #[test]
+    fn presence_penalty_is_count_independent() {
+        // Presence subtracts once regardless of count. logit[5]=10, history has
+        // 5 five times; presence 1.5 → logit[5]=8.5 (not 10-5*1.5). Still > 8.
+        let mut l = vec![0.0_f32; 10];
+        l[5] = 10.0;
+        l[3] = 8.0;
+        let history = vec![5_i64, 5, 5, 5, 5];
+        let mut s = 1;
+        let mut cfg = SamplingConfig::default();
+        cfg.presence_penalty = 1.5;
+        assert_eq!(sample(&l, &history, &cfg, &mut s), 5);
+    }
+
+    #[test]
+    fn top_k_one_forces_argmax_under_temperature() {
+        // With top_k=1, only the single highest-prob token survives, so even
+        // with temperature on, sampling must return the argmax deterministically.
+        let mut l = vec![1.0_f32; 8];
+        l[4] = 5.0;
+        let mut s = 12345;
+        let mut cfg = SamplingConfig::default();
+        cfg.temperature = 1.0;
+        cfg.top_k = 1;
+        for _ in 0..20 {
+            assert_eq!(sample(&l, &[], &cfg, &mut s), 4);
+        }
     }
 
     #[test]

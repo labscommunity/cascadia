@@ -18,7 +18,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{Error as OvError, GenConfig, LlmPipeline, PluginConfig};
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
+    TaskId,
+};
 use futures::stream;
 use tracing::{info, warn};
 
@@ -243,7 +246,10 @@ pub struct OvGenaiEngine {
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
         let cfg = self.gen_config(
-            /*max_tokens*/ 4, /*temperature*/ 0.0, /*enable_thinking*/ false,
+            /*max_tokens*/ 4,
+            /*temperature*/ 0.0,
+            /*enable_thinking*/ false,
+            &SamplingParams::default(),
         );
         match self.pipe.generate("Hi", &cfg) {
             Ok(_) => info!(
@@ -279,14 +285,16 @@ impl Engine for OvGenaiEngine {
             return Vec::new();
         }
         let task = self.pending.remove(0);
+        let max_new = if task.max_tokens > 0 {
+            task.max_tokens
+        } else {
+            self.max_tokens_default
+        };
         let cfg = self.gen_config(
-            if task.max_tokens > 0 {
-                task.max_tokens
-            } else {
-                self.max_tokens_default
-            },
+            max_new,
             task.temperature,
             task.enable_thinking,
+            &task.sampling,
         );
 
         let started = Instant::now();
@@ -330,7 +338,18 @@ impl Engine for OvGenaiEngine {
         // (`skip_chat_template`) and a slight undercount when ov-genai
         // applies its own template internally (the template wrapping isn't
         // counted). None when the tokenizer is unavailable.
-        let mut chunk = Chunk::final_marker(task.task_id.clone(), text).with_n_tokens(tokens);
+        // finish_reason: ov-genai's GenResult doesn't report why it stopped,
+        // so infer — reaching the token cap is `length`, anything short of it
+        // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
+        // exactly at the cap reports `length` (OpenAI is also ambiguous here).
+        let finish = if tokens >= max_new {
+            FinishReason::Length
+        } else {
+            FinishReason::Stop
+        };
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
+            .with_n_tokens(tokens)
+            .with_finish_reason(finish);
         if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
@@ -339,7 +358,13 @@ impl Engine for OvGenaiEngine {
 }
 
 impl OvGenaiEngine {
-    fn gen_config(&self, max_tokens: u32, temperature: f32, enable_thinking: bool) -> GenConfig {
+    fn gen_config(
+        &self,
+        max_tokens: u32,
+        temperature: f32,
+        enable_thinking: bool,
+        sampling: &SamplingParams,
+    ) -> GenConfig {
         let do_sample = temperature > 0.0;
         let mut cfg = GenConfig {
             max_new_tokens: max_tokens,
@@ -352,6 +377,31 @@ impl OvGenaiEngine {
             // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
             // native templating (the legacy join the API emitted), untouched.
             skip_chat_template: self.prompt_pretemplated && !enable_thinking,
+            // OpenAI sampling knobs (#14). top_p/top_k take effect in the
+            // sampling regime (do_sample, i.e. temperature > 0); penalties and
+            // seed are forwarded regardless.
+            //
+            // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
+            // forwarded to GenerationConfig.rng_seed, but it does NOT make
+            // ov-genai reproducible across requests on this reused
+            // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
+            // the seed VALUE CHANGES between consecutive generate() calls
+            // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
+            // and never calls `clear_request_info`, so two identical seeds in a
+            // row reuse the advanced RNG and diverge. Different seeds DO change
+            // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
+            // honor seed fully (they re-seed per request). Per-request
+            // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
+            // request context per request) — tracked with #20.
+            top_p: if sampling.top_p > 0.0 {
+                sampling.top_p.min(1.0)
+            } else {
+                1.0
+            },
+            top_k: sampling.top_k,
+            frequency_penalty: sampling.frequency_penalty,
+            presence_penalty: sampling.presence_penalty,
+            seed: sampling.seed,
         };
         if self.speculative_k > 0 {
             cfg.num_assistant_tokens = self.speculative_k;
