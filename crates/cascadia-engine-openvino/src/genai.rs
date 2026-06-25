@@ -380,6 +380,19 @@ impl OvGenaiEngine {
             // OpenAI sampling knobs (#14). top_p/top_k take effect in the
             // sampling regime (do_sample, i.e. temperature > 0); penalties and
             // seed are forwarded regardless.
+            //
+            // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
+            // forwarded to GenerationConfig.rng_seed, but it does NOT make
+            // ov-genai reproducible across requests on this reused
+            // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
+            // the seed VALUE CHANGES between consecutive generate() calls
+            // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
+            // and never calls `clear_request_info`, so two identical seeds in a
+            // row reuse the advanced RNG and diverge. Different seeds DO change
+            // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
+            // honor seed fully (they re-seed per request). Per-request
+            // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
+            // request context per request) — tracked with #20.
             top_p: if sampling.top_p > 0.0 {
                 sampling.top_p.min(1.0)
             } else {
