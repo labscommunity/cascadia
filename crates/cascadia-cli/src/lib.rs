@@ -250,7 +250,18 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub api: Option<String>,
 
-    /// Device hint: CPU / GPU / NPU.
+    /// OpenVINO device target. Forwarded verbatim to ov::Core::compile_model.
+    ///
+    /// Valid forms:
+    ///   CPU                       host CPU
+    ///   GPU, GPU.0, GPU.1, ...    a specific GPU (iGPU is .0 by convention)
+    ///   NPU, NPU.0, ...           Neural Processing Unit (Lunar Lake / later)
+    ///   AUTO                      let OpenVINO pick
+    ///   MULTI:GPU.1,GPU.0,CPU     round-robin across devices
+    ///   HETERO:GPU.1,CPU          split the graph by op affinity
+    ///   BATCH:GPU                 auto-batch (throughput-favored)
+    ///
+    /// Run `cascadia doctor` to see which devices OpenVINO can see on this host.
     #[arg(long, default_value = "CPU")]
     pub device: String,
 
@@ -285,6 +296,7 @@ pub struct WorkerArgs {
     pub draft_model: Option<String>,
 
     /// Device for the draft model (default: same as --device).
+    /// Accepts the same OpenVINO device forms as --device.
     #[arg(long)]
     pub draft_device: Option<String>,
 
@@ -440,6 +452,8 @@ pub struct RunArgs {
 
     /// Device hint: GPU / CPU / NPU. Defaults to GPU — run `cascadia
     /// doctor` first to confirm the iGPU is visible to OpenVINO.
+    /// Also accepts indexed/compound OpenVINO forms (GPU.N, AUTO,
+    /// MULTI:, HETERO:, BATCH:) — see `cascadia worker --help`.
     #[arg(long, default_value = "GPU")]
     pub device: String,
 
