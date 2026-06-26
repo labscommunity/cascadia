@@ -42,7 +42,9 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
 // -------- pipeline / stage config --------
 
@@ -433,6 +435,7 @@ pub struct Gemma4Engine {
     /// Cross-stage KV received from upstream this step, keyed by wire tag, ready
     /// to feed into the `external_kv.*` inputs. Rebuilt each step.
     pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
+    step_warn: StepWarnLimiter,
 }
 
 impl Gemma4Engine {
@@ -793,7 +796,11 @@ impl Gemma4Engine {
         // steps and the API returns `data: [DONE]` with zero chunks.
         let res = self.step_first_body();
         if let Err(ref e) = res {
-            warn!(
+            // DEBUG, not WARN: the outer step() emits the rate-limited WARN
+            // for the same error (StepWarnLimiter); a second unconditional
+            // WARN here would bypass the limiter and double-log every
+            // first-stage failure.
+            debug!(
                 error = %e,
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
@@ -1055,9 +1062,26 @@ impl Engine for Gemma4Engine {
             self.step_middle().map(|_| Vec::new())
         };
         match result {
-            Ok(v) => v,
+            Ok(v) => {
+                // First-stage idle steps return Ok(empty) even mid-failure
+                // (a failed step_first clears `active`; the next poll
+                // no-ops), so only a step that did real work closes a
+                // streak. Relay-stage Ok is always a completed relay round.
+                if !v.is_empty() || !self.spec.is_first_stage {
+                    if let Some(suppressed) = self.step_warn.on_success() {
+                        info!(suppressed, "gemma4 step recovered");
+                    }
+                }
+                v
+            }
             Err(e) => {
-                warn!(error = %e, "gemma4 step failed");
+                match self.step_warn.on_failure(std::time::Instant::now()) {
+                    Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
+                    Some(StepWarn::StillFailing { suppressed }) => {
+                        warn!(error = %e, suppressed, "gemma4 step still failing")
+                    }
+                    None => {}
+                }
                 Vec::new()
             }
         }
@@ -1405,6 +1429,7 @@ impl Builder for Gemma4Builder {
             cross_kv_out,
             external_kv_in,
             pending_external_kv: std::collections::HashMap::new(),
+            step_warn: StepWarnLimiter::default(),
         }))
     }
 }

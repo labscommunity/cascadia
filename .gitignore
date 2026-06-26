@@ -29,3 +29,6 @@ models/
 *.gguf
 shards/
 shards_cached/
+
+# Claude Code (local agent state + worktrees)
+.claude/

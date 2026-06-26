@@ -46,6 +46,7 @@ use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
+use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
 // -------- pipeline / stage config --------
 
@@ -443,6 +444,7 @@ pub struct OvRuntimeEngine {
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
+    step_warn: StepWarnLimiter,
 }
 
 impl OvRuntimeEngine {
@@ -861,7 +863,11 @@ impl OvRuntimeEngine {
         // steps and the API returns `data: [DONE]` with zero chunks.
         let res = self.step_first_body();
         if let Err(ref e) = res {
-            warn!(
+            // DEBUG, not WARN: the outer step() emits the rate-limited
+            // WARN for the same error (StepWarnLimiter); a second
+            // unconditional WARN here would bypass the limiter and
+            // double-log every first-stage failure.
+            tracing::debug!(
                 error = %e,
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
@@ -1294,9 +1300,26 @@ impl Engine for OvRuntimeEngine {
             self.step_middle().map(|_| Vec::new())
         };
         match result {
-            Ok(v) => v,
+            Ok(v) => {
+                // First-stage idle steps return Ok(empty) even mid-failure
+                // (a failed step clears `active`; the next poll no-ops), so
+                // only a step that did real work closes a failing streak.
+                // Relay-stage Ok is always a completed relay round.
+                if !v.is_empty() || !self.spec.is_first_stage {
+                    if let Some(suppressed) = self.step_warn.on_success() {
+                        info!(suppressed, "ov-runtime step recovered");
+                    }
+                }
+                v
+            }
             Err(e) => {
-                warn!(error = %e, "ov-runtime step failed");
+                match self.step_warn.on_failure(std::time::Instant::now()) {
+                    Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
+                    Some(StepWarn::StillFailing { suppressed }) => {
+                        warn!(error = %e, suppressed, "ov-runtime step still failing")
+                    }
+                    None => {}
+                }
                 Vec::new()
             }
         }
@@ -1734,6 +1757,7 @@ impl Builder for OvRuntimeBuilder {
             pending: Vec::new(),
             active: None,
             static_kv,
+            step_warn: StepWarnLimiter::default(),
         }))
     }
 }
