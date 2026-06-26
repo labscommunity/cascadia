@@ -654,7 +654,25 @@ fn render_with_chat_env(
         .map(|m| {
             let mut obj = serde_json::json!({ "role": m.role, "content": m.content });
             if let Some(tc) = &m.tool_calls {
-                obj["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+                // HF chat templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
+                // expecting a JSON object; OpenAI ships `arguments` as a string. Parse it for
+                // the template context (the wire format stays a string) so the render doesn't
+                // error ("cannot convert value into pairs") and silently fall back to legacy.
+                let mut tcv = serde_json::to_value(tc).unwrap_or_default();
+                if let Some(arr) = tcv.as_array_mut() {
+                    for call in arr {
+                        if let Some(s) = call
+                            .pointer("/function/arguments")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                                call["function"]["arguments"] = parsed;
+                            }
+                        }
+                    }
+                }
+                obj["tool_calls"] = tcv;
             }
             if let Some(id) = &m.tool_call_id {
                 obj["tool_call_id"] = serde_json::json!(id);
@@ -754,7 +772,8 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             if inner.starts_with('{') || inner.starts_with('[') {
                 let off = after.len() - inner.len();
                 if let Some(len) = balanced_json_end(&after[off..]) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
+                    if let Ok(v) =
+                        serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
                     {
                         if let Some(c) = call_from_value(&v) {
                             calls.push(c);
@@ -2253,6 +2272,37 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_arguments_render_as_object_for_hf_templates() {
+        // Regression: HF tool templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
+        // which needs a JSON object. OpenAI ships `arguments` as a string; passing it through
+        // verbatim makes minijinja error ("cannot convert value into pairs") and the whole
+        // request silently falls back to the legacy `role: content` formatter.
+        const T: &str = "{%- for m in messages -%}{%- if m.tool_calls -%}\
+            {%- for tc in m.tool_calls -%}fn={{ tc.function.name }};\
+            {%- for k, v in tc.function.arguments | items -%}{{ k }}={{ v }};{%- endfor -%}\
+            {%- endfor -%}{%- endif -%}{%- endfor -%}";
+        let msgs = [ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Tokyo"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        }];
+        let env = build_chat_env(T).expect("template parses");
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
+            .expect("arguments|items must not fail the render");
+        assert!(out.contains("fn=get_weather"), "out={out}");
+        assert!(out.contains("city=Tokyo"), "out={out}");
+    }
+
+    #[test]
     fn chat_prompt_renderer_renders_then_falls_back() {
         let msgs = [ChatMessage {
             role: "user".into(),
@@ -2420,7 +2470,8 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()["city"],
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()
+                ["city"],
             "Paris"
         );
         assert!(calls[0].id.starts_with("call_"));
@@ -2478,9 +2529,10 @@ mod tests {
         assert_ne!(calls[0].id, calls[1].id);
 
         // 3) XML dialect still parses through the fallback (regression).
-        let calls =
-            parse_tool_calls("<tool_call><function=g><parameter=x>v</parameter></function></tool_call>")
-                .expect("xml");
+        let calls = parse_tool_calls(
+            "<tool_call><function=g><parameter=x>v</parameter></function></tool_call>",
+        )
+        .expect("xml");
         assert_eq!(calls[0].function.name, "g");
 
         // 4) truncated/unbalanced JSON block => skipped, no panic; a later valid
