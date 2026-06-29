@@ -585,17 +585,26 @@ async fn recv_hidden_frames(
     Ok((seq, pos, hid))
 }
 
+/// Hard ceiling on the active token-response wait, independent of the body
+/// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
+/// letting it govern the token wait would re-couple the engine-lock hold to it —
+/// a high `recv_timeout` would re-grow the self-heal latency the bounded recv
+/// exists to cap (cascadia-enterprise #40). A token *response* of an ACTIVE
+/// generation has a tight real deadline regardless, so cap it here.
+const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Read a seq-tagged token from `downstream`, discarding any STALE orphan
 /// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
-/// bounded by ONE overall `recv_timeout()` deadline: each `recv_token` gets the
-/// REMAINING budget, and the deadline elapsing (or a bounded frame-start
-/// timeout) returns the Err so the engine lock releases for a retry (#40
-/// self-heal). Returns the token whose echoed seq matches `awaiting_seq`.
+/// bounded by ONE overall deadline = `min(recv_timeout(), TOKEN_RECV_DEADLINE_CEILING)`:
+/// each `recv_token` gets the REMAINING budget, and the deadline elapsing (or a
+/// bounded frame-start timeout) returns the Err so the engine lock releases for a
+/// retry (#40 self-heal). Returns the token whose echoed seq matches `awaiting_seq`.
 async fn recv_token_seq_checked(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     awaiting_seq: u32,
 ) -> EngineResult<i32> {
-    let deadline_at = std::time::Instant::now() + cascadia_transport::recv_timeout();
+    let deadline_at = std::time::Instant::now()
+        + cascadia_transport::recv_timeout().min(TOKEN_RECV_DEADLINE_CEILING);
     loop {
         let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
