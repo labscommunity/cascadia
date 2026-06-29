@@ -396,7 +396,7 @@ async fn decode_header_and_recv_body(
 /// strict [`recv_timeout`]. For recvs whose response has a real deadline (the
 /// head/middle awaiting a generation's token) so an ORPHANED wait releases the
 /// caller's engine lock without dropping the once-dialed socket it can't re-dial.
-pub async fn recv_tensor_token(
+pub(crate) async fn recv_tensor_token(
     sock: &mut TcpStream,
     frame_start_deadline: Duration,
 ) -> TransportResult<(Tensor, TransferStats)> {
@@ -1579,6 +1579,13 @@ mod tests {
         assert!(!recv_error_is_connection_fatal(&TransportError::Io(
             io::Error::new(io::ErrorKind::WouldBlock, "retryable")
         )));
+        // #40: the bounded frame-start wait timing out is NON-fatal + retryable —
+        // ZERO bytes were consumed (cancel-safe read), so the socket stays aligned
+        // and the caller re-issues. Pin this so a future refactor can't silently
+        // reclassify it as fatal (which would drop the once-dialed engine loopback).
+        assert!(!recv_error_is_connection_fatal(
+            &TransportError::FrameStartTimeout(Duration::from_secs(1))
+        ));
     }
 
     /// A mid-frame stall (header arrives, payload never does, past the recv
