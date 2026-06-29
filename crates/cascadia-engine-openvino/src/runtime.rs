@@ -488,6 +488,140 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
     Ok(position)
 }
 
+// -------- per-hop sequence echo (token desync guard) --------
+
+/// Encode a per-hop sequence number as its own framed I64 `[1,1,1]` tensor.
+/// Each stage stamps a monotonic seq on the hidden it sends downstream; the
+/// downstream neighbor echoes it back on the token so a LATE orphaned token
+/// (from a slow/recovering peer) can be detected and discarded instead of
+/// silently read by the next request. Paired with `decode_wire_seq`.
+fn encode_wire_seq(seq: u32) -> WireTensor {
+    WireTensor::new(
+        WireDType::I64,
+        [1, 1, 1],
+        (seq as i64).to_le_bytes().to_vec(),
+    )
+}
+
+/// Decode + strictly validate a leading seq frame (I64, 8 bytes). Symmetric
+/// with `encode_wire_seq`; the i64 carries a u32, so the cast round-trips.
+fn decode_wire_seq(t: &WireTensor) -> EngineResult<u32> {
+    if t.dtype != WireDType::I64 || t.data.len() != 8 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 8-byte seq frame, got dtype={:?} len={} — likely a desynced \
+             activation stream or a peer that predates the seq-tagged token wire",
+            t.dtype,
+            t.data.len()
+        )));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&t.data);
+    Ok(i64::from_le_bytes(b) as u32)
+}
+
+/// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
+/// (8 bytes). The seq rides as the low i32; `decode_token_with_seq` reverses it.
+fn encode_token_with_seq(token: i32, seq: u32) -> WireTensor {
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&token.to_le_bytes());
+    bytes.extend_from_slice(&(seq as i32).to_le_bytes());
+    WireTensor::new(WireDType::I32, [1, 1, 2], bytes)
+}
+
+/// Decode an I32 `[1,1,2]` token frame into `(token, echo_seq)`. The seq cast
+/// round-trips the bit pattern (i32 -> u32), so wrap-around values survive.
+fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
+    if t.data.len() < 8 {
+        return Err(EngineError::Backend(format!(
+            "downstream sent {}-byte token tensor; need at least 8 ([token, seq])",
+            t.data.len()
+        )));
+    }
+    let token = i32::from_le_bytes([t.data[0], t.data[1], t.data[2], t.data[3]]);
+    let echo_seq = i32::from_le_bytes([t.data[4], t.data[5], t.data[6], t.data[7]]) as u32;
+    Ok((token, echo_seq))
+}
+
+/// Send the downstream activation frames in wire order: `[seq] [pos?] [hidden]`.
+/// Shared by `send_hidden_downstream` and its loopback tests so the order is
+/// defined in exactly one place.
+async fn send_hidden_frames(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: WireTensor,
+    pos: Option<WireTensor>,
+    hid: WireTensor,
+) -> Result<(), cascadia_transport::TransportError> {
+    let mut guard = downstream.lock().await;
+    guard.send(&seq).await?;
+    if let Some(p) = pos {
+        guard.send(&p).await?;
+    }
+    guard.send(&hid).await?;
+    Ok(())
+}
+
+/// Receive the upstream activation frames in wire order: `[seq] [pos?] [hidden]`.
+/// Lenient (idle-between-requests) recv — the inverse of `send_hidden_frames`.
+async fn recv_hidden_frames(
+    upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
+    want_pos: bool,
+) -> Result<(WireTensor, Option<WireTensor>, WireTensor), cascadia_transport::TransportError> {
+    let mut guard = upstream.lock().await;
+    // The leading seq frame is the IDLE "next request" wait (bounded only by
+    // the transport frame-idle ceiling — "no next request yet" is fine). Every
+    // frame AFTER it is a mid-group reply the peer owes promptly once the group
+    // has started, so deadline those (`recv_reply`) — a half-sent frame group
+    // must not wedge the stage for the whole idle ceiling (#75 mid-pair
+    // protection, generalized to the seq-prefixed wire).
+    let seq = guard.recv().await?.0;
+    let pos = if want_pos {
+        let p = guard.recv_reply().await?.0;
+        debug!("upstream recv: position frame arrived");
+        Some(p)
+    } else {
+        None
+    };
+    let hid = guard.recv_reply().await?.0;
+    Ok((seq, pos, hid))
+}
+
+/// Read a seq-tagged token from `downstream`, discarding any STALE orphan
+/// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
+/// bounded by ONE overall `recv_timeout()` deadline: each `recv_token` gets the
+/// REMAINING budget, and the deadline elapsing (or a bounded frame-start
+/// timeout) returns the Err so the engine lock releases for a retry (#40
+/// self-heal). Returns the token whose echoed seq matches `awaiting_seq`.
+async fn recv_token_seq_checked(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting_seq: u32,
+) -> EngineResult<i32> {
+    let deadline_at = std::time::Instant::now() + cascadia_transport::recv_timeout();
+    loop {
+        let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(EngineError::Backend(
+                "timed out waiting for the downstream token (overall deadline)".into(),
+            ));
+        }
+        let (tensor, _) = {
+            let mut guard = downstream.lock().await;
+            guard.recv_token(remaining).await
+        }
+        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let (token, echo_seq) = decode_token_with_seq(&tensor)?;
+        if echo_seq != awaiting_seq {
+            warn!(
+                event = "stale_token_discarded",
+                expected = awaiting_seq,
+                got = echo_seq,
+                "discarding a stale orphan token from downstream (chain re-formed mid-wait)"
+            );
+            continue;
+        }
+        return Ok(token);
+    }
+}
+
 // -------- static-KV (NPU) state --------
 
 /// Per-layer port wiring for a stateless static-shape (NPU) shard.
@@ -886,6 +1020,20 @@ pub struct OvRuntimeEngine {
     /// Reload source for a parked prefill model.
     prefill_reload: Option<PrefillReload>,
     step_warn: StepWarnLimiter,
+    /// Per-hop sequence echo (token desync guard). Token frames carry no task
+    /// id, so a LATE orphaned token from a slow/recovering downstream would be
+    /// read by the next request → silent off-by-one token desync. Each stage
+    /// stamps a monotonic seq on the hidden it sends downstream and the
+    /// neighbor echoes it on the token; a mismatched echo is discarded.
+    ///
+    /// `downstream_seq`: next seq to stamp on a hidden sent downstream.
+    downstream_seq: u32,
+    /// Seq stamped on the LAST hidden sent downstream; the token echo must
+    /// equal this or it is a stale orphan.
+    awaiting_token_seq: u32,
+    /// Seq read from the upstream hidden; echoed back on the token this stage
+    /// sends upstream.
+    inbound_seq: u32,
 }
 
 impl OvRuntimeEngine {
@@ -1298,6 +1446,12 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        // Stamp the monotonic per-link seq this stage expects the downstream
+        // neighbor to echo back on the token (so a late orphan is detectable).
+        let seq = self.downstream_seq;
+        self.downstream_seq = self.downstream_seq.wrapping_add(1);
+        self.awaiting_token_seq = seq;
+        let seq_frame = encode_wire_seq(seq);
         let mut wire_shape = [1u32; MAX_RANK];
         for (i, d) in shape.iter().enumerate().take(MAX_RANK) {
             wire_shape[i] = *d as u32;
@@ -1308,65 +1462,39 @@ impl OvRuntimeEngine {
         // count. The wire shape has only MAX_RANK=3 dims (all used by
         // [1,1,hidden]) and the transport requires payload_len == shape*dtype,
         // so we can't pack it into the hidden tensor — send it as its own
-        // framed I64 tensor first. recv_hidden_from_upstream mirrors the order.
+        // framed I64 tensor. Wire order: [seq] [pos if static] [hidden];
+        // recv_hidden_from_upstream mirrors it.
         let pos = if self.static_kv.is_some() {
             Some(encode_wire_position(position))
         } else {
             None
         };
-        self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            if let Some(p) = pos {
-                guard.send(&p).await?;
-            }
-            guard.send(&hid).await
-        })
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        self.block_on(send_hidden_frames(&downstream, seq_frame, pos, hid))
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
     }
 
-    fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
+    // `_prefill` (main's widened token-reply budget hint) is intentionally
+    // ignored here: `recv_token_seq_checked` caps the whole token wait itself,
+    // so the prefill vs decode distinction does not change it.
+    fn recv_token_from_downstream(&mut self, _prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         // #40: the token response has a REAL deadline (this is an ACTIVE
         // generation), unlike the idle-between-requests wait in
-        // `recv_hidden_from_upstream`. Use the bounded, NON-fatal frame-start
-        // recv: an orphaned token-wait (the chain re-formed under us) times out
-        // + propagates as a step Err so the caller releases the engine lock for
-        // a retry, instead of blocking deadline-exempt on the frame-idle ceiling
-        // and wedging the lock for the whole budget (cascadia-enterprise #40).
-        // A prefill reply waits on every remaining stage's whole-prompt compute,
-        // so it gets the widened budget (see `PREFILL_REPLY_TIMEOUT_FACTOR`) — a
-        // long prompt on a slow stage must not read as a spurious frame-start
-        // timeout.
-        let deadline = if prefill {
-            cascadia_transport::recv_timeout()
-                .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
-        } else {
-            cascadia_transport::recv_timeout()
-        };
-        let (tensor, _) = self
-            .block_on(async move {
-                let mut guard = downstream.lock().await;
-                guard.recv_token(deadline).await
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        if tensor.data.len() < 4 {
-            return Err(EngineError::Backend(format!(
-                "downstream sent {}-byte token tensor; need at least 4",
-                tensor.data.len()
-            )));
-        }
-        let token = i32::from_le_bytes([
-            tensor.data[0],
-            tensor.data[1],
-            tensor.data[2],
-            tensor.data[3],
-        ]);
-        Ok(token)
+        // `recv_hidden_from_upstream`. The bounded, NON-fatal frame-start recv
+        // (inside recv_token_seq_checked) means an orphaned token-wait (the
+        // chain re-formed under us) times out + propagates as a step Err so the
+        // caller releases the engine lock for a retry, instead of blocking
+        // deadline-exempt on the frame-idle ceiling and wedging the lock for the
+        // whole budget (cascadia-enterprise #40). On top of that, a LATE orphan
+        // token whose echoed seq != the one we stamped is discarded (it would
+        // otherwise be read by the next request → silent token desync).
+        let awaiting = self.awaiting_token_seq;
+        self.block_on(recv_token_seq_checked(&downstream, awaiting))
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
@@ -1374,36 +1502,20 @@ impl OvRuntimeEngine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Static (NPU) shards send a leading I64 position tensor before the
-        // hidden activation (see send_hidden_downstream). Each frame's payload
-        // must match its shape*dtype, so we recv two separate tensors here.
+        // Wire order is [seq] [pos if static] [hidden] (see send_hidden_frames).
+        // Each frame's payload must match its shape*dtype, so we recv each as a
+        // separate tensor. This recv stays LENIENT (idle-between-requests) — the
+        // bounded deadline lives only on the active token wait downstream.
         let want_pos = self.static_kv.is_some();
         debug!(want_pos, "upstream recv: waiting");
-        let (pos_tensor, tensor) = self
-            .block_on(async move {
-                let mut guard = upstream.lock().await;
-                // First frame of a task hop is an IDLE wait (bounded only by
-                // the transport's much larger frame-idle ceiling — "no next
-                // request yet" is fine). On the static path the
-                // hidden tensor that must FOLLOW the position frame is a
-                // mid-pair reply: once the pos frame arrived, the peer owes
-                // the hidden promptly — deadline it so a half-sent pair
-                // can't wedge the stage (see `recv_tensor_reply`).
-                let (pos_tensor, t) = if want_pos {
-                    let pos = guard.recv().await?.0;
-                    tracing::debug!("upstream recv: position frame arrived");
-                    let (t, _) = guard.recv_reply().await?;
-                    (Some(pos), t)
-                } else {
-                    let (t, _) = guard.recv().await?;
-                    (None, t)
-                };
-                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
-            })
+        let (seq_tensor, pos_tensor, tensor) = self
+            .block_on(recv_hidden_frames(&upstream, want_pos))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!("upstream recv: frames arrived");
-        // Decode + strictly validate the position frame outside the transport
-        // closure (so a bad frame yields a clear EngineError, not a desync).
+        // Record the seq this stage must echo back on the token it sends
+        // upstream; decode/validate outside the transport closure so a bad
+        // frame yields a clear EngineError, not a desync.
+        self.inbound_seq = decode_wire_seq(&seq_tensor)?;
         let position = match pos_tensor {
             Some(p) => Some(decode_wire_position(&p)?),
             None => None,
@@ -1434,8 +1546,9 @@ impl OvRuntimeEngine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let bytes = token.to_le_bytes().to_vec();
-        let tensor = WireTensor::new(WireDType::I32, [1, 1, 1], bytes);
+        // Echo the seq the upstream stamped on the hidden it sent us, so it can
+        // detect a stale orphan if this token arrives after its wait moved on.
+        let tensor = encode_token_with_seq(token, self.inbound_seq);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -3802,6 +3915,9 @@ impl Builder for OvRuntimeBuilder {
             park_prefill: self.park_prefill,
             prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
+            downstream_seq: 0,
+            awaiting_token_seq: 0,
+            inbound_seq: 0,
         }))
     }
 }
@@ -4407,5 +4523,163 @@ mod tests {
             "prefill validation should be skipped when disabled; got: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------- per-hop sequence echo (token desync guard) --------
+    //
+    // `OvRuntimeEngine` can't be constructed without a compiled OpenVINO IR
+    // (stub mode errors), so these exercise the extracted wire helpers — the
+    // actual bodies of send_hidden_downstream / recv_hidden_from_upstream /
+    // send_token_to_upstream / recv_token_from_downstream — over real
+    // ActivationServer/ActivationClient loopback pairs, mirroring the transport
+    // crate's roundtrip tests.
+
+    /// Stand up a connected (client, server) loopback pair. `client` is the
+    /// engine's `downstream` (an ActivationClient); `server` plays the
+    /// downstream/upstream peer.
+    async fn loopback() -> (ActivationClient, ActivationServer) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let server = h.await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn recv_token_discards_stale_then_returns_correct() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 5u32;
+        // A stale orphan (wrong echoed seq) precedes the correct token.
+        server.send(&encode_token_with_seq(99, 4)).await.unwrap();
+        server
+            .send(&encode_token_with_seq(42, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, awaiting).await.unwrap();
+        assert_eq!(tok, 42, "stale token must be skipped, correct one returned");
+    }
+
+    #[tokio::test]
+    async fn recv_token_seq_match_returns_immediately() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 7u32;
+        server
+            .send(&encode_token_with_seq(123, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, awaiting).await.unwrap();
+        assert_eq!(tok, 123);
+    }
+
+    #[test]
+    fn token_frame_carries_token_and_seq() {
+        // send_token_to_upstream emits I32[1,1,2] = [token, inbound_seq].
+        let t = encode_token_with_seq(42, 9);
+        assert_eq!(t.dtype, WireDType::I32);
+        assert_eq!(t.shape, [1, 1, 2]);
+        assert_eq!(t.data.len(), 8);
+        assert_eq!(&t.data[0..4], &42i32.to_le_bytes());
+        assert_eq!(&t.data[4..8], &9i32.to_le_bytes());
+        assert_eq!(decode_token_with_seq(&t).unwrap(), (42, 9));
+    }
+
+    #[test]
+    fn seq_frame_roundtrips() {
+        let f = encode_wire_seq(12345);
+        assert_eq!(f.dtype, WireDType::I64);
+        assert_eq!(f.shape, [1, 1, 1]);
+        assert_eq!(decode_wire_seq(&f).unwrap(), 12345);
+    }
+
+    #[tokio::test]
+    async fn hidden_to_token_roundtrip_preserves_seq() {
+        // HEAD sends [seq][hidden] downstream; TAIL recvs them, echoes the
+        // seq on the token; HEAD reads it back and matches on the same seq.
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let stamped = 7u32;
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
+        send_hidden_frames(&downstream, encode_wire_seq(stamped), None, hid.clone())
+            .await
+            .unwrap();
+
+        let (seq_t, pos_t, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        assert!(pos_t.is_none());
+        let inbound = decode_wire_seq(&seq_t).unwrap();
+        assert_eq!(inbound, stamped, "seq must survive the hidden hop");
+        assert_eq!(hid_t.dtype, WireDType::F16);
+        assert_eq!(hid_t.data, hid.data);
+
+        // TAIL echoes the inbound seq on its token.
+        upstream
+            .lock()
+            .await
+            .send(&encode_token_with_seq(55, inbound))
+            .await
+            .unwrap();
+        let tok = recv_token_seq_checked(&downstream, stamped).await.unwrap();
+        assert_eq!(tok, 55);
+    }
+
+    #[tokio::test]
+    async fn static_shard_frame_order_is_seq_pos_hidden() {
+        // With a position frame present, order must be seq, then position,
+        // then hidden — distinct values catch a swap.
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
+        send_hidden_frames(
+            &downstream,
+            encode_wire_seq(3),
+            Some(encode_wire_position(11)),
+            hid.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (seq_t, pos_t, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        assert_eq!(
+            decode_wire_seq(&seq_t).unwrap(),
+            3,
+            "first frame is the seq"
+        );
+        assert_eq!(
+            decode_wire_position(&pos_t.unwrap()).unwrap(),
+            11,
+            "second frame is the position"
+        );
+        assert_eq!(hid_t.data, hid.data, "third frame is the hidden");
+    }
+
+    #[tokio::test]
+    async fn seq_wraps_past_u32_max_without_panic() {
+        // The stamp uses wrapping_add; u32::MAX wraps to 0.
+        assert_eq!(u32::MAX.wrapping_add(1), 0);
+        // A seq at u32::MAX must survive the i32 round-trip on both wires and
+        // still match in the stale check (u32::MAX as i32 == -1, back to MAX).
+        assert_eq!(
+            decode_wire_seq(&encode_wire_seq(u32::MAX)).unwrap(),
+            u32::MAX
+        );
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_with_seq(8, u32::MAX))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, u32::MAX).await.unwrap();
+        assert_eq!(tok, 8);
     }
 }
