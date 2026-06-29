@@ -84,10 +84,6 @@ impl Engine for MockEngine {
         self.pending.push((task, emitted + 1));
         Ok(vec![(task_id, chunk)])
     }
-
-    fn cancel(&mut self, task_id: &TaskId) {
-        self.pending.retain(|(t, _)| t.task_id != *task_id);
-    }
 }
 
 #[derive(Default)]

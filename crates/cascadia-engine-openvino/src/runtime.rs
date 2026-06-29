@@ -1285,20 +1285,6 @@ impl Engine for OvRuntimeEngine {
         Ok(())
     }
 
-    fn cancel(&mut self, task_id: &TaskId) {
-        // Step-wise engine: cancel() runs between steps (both &mut self behind
-        // the runner mutex). Drop the queued task and clear it if it's the one
-        // currently decoding, so step() stops emitting tokens for it.
-        self.pending.retain(|t| &t.task_id != task_id);
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| &a.task.task_id == task_id)
-        {
-            self.active = None;
-        }
-    }
-
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
