@@ -92,6 +92,16 @@ pub enum TransportError {
     /// [`Self::NotConnected`].
     #[error("frame-start idle ceiling hit after {0:?}; connection dropped (black-holed peer?)")]
     FrameIdleCeiling(Duration),
+
+    /// A BOUNDED frame-start wait elapsed with ZERO bytes consumed (used by the
+    /// active-response recv, e.g. the head/middle awaiting a generation's token).
+    /// Unlike [`Self::FrameIdleCeiling`] this is NON-fatal and retryable: no
+    /// partial frame was read, so the socket stays aligned + usable — the caller
+    /// re-issues the recv on the next step. Lets an ORPHANED token-wait (its
+    /// chain re-formed under it) release the engine lock without dropping the
+    /// once-dialed loopback the engine cannot re-dial. See `recv_token`.
+    #[error("frame-start wait timed out after {0:?} with no bytes (retryable)")]
+    FrameStartTimeout(Duration),
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -322,7 +332,18 @@ async fn recv_tensor_inner(
         Some(to) => recv_exact_within(sock, &mut header, to).await?,
         None => recv_exact_frame_start(sock, &mut header).await?,
     }
+    decode_header_and_recv_body(sock, &header, start).await
+}
 
+/// Decode a validated tensor header + read the body under the strict
+/// [`recv_timeout`]. Shared by [`recv_tensor`] (lenient frame-start) and
+/// [`recv_tensor_token`] (bounded frame-start) so the header validation +
+/// body read can't diverge between the two entry points.
+async fn decode_header_and_recv_body(
+    sock: &mut TcpStream,
+    header: &[u8; HEADER_SIZE],
+    start: Instant,
+) -> TransportResult<(Tensor, TransferStats)> {
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
     let dtype_code = u32::from_be_bytes(header[4..8].try_into().unwrap());
     let d0 = u32::from_be_bytes(header[8..12].try_into().unwrap());
@@ -367,6 +388,22 @@ async fn recv_tensor_inner(
         bytes: HEADER_SIZE + payload_len as usize,
     };
     Ok((tensor, stats))
+}
+
+/// Active-response tensor recv: the header frame-START is bounded by
+/// `frame_start_deadline` (returning the NON-fatal
+/// [`TransportError::FrameStartTimeout`] on elapse), the body reads under the
+/// strict [`recv_timeout`]. For recvs whose response has a real deadline (the
+/// head/middle awaiting a generation's token) so an ORPHANED wait releases the
+/// caller's engine lock without dropping the once-dialed socket it can't re-dial.
+pub async fn recv_tensor_token(
+    sock: &mut TcpStream,
+    frame_start_deadline: Duration,
+) -> TransportResult<(Tensor, TransferStats)> {
+    let start = Instant::now();
+    let mut header = [0u8; HEADER_SIZE];
+    recv_exact_frame_start_strict(sock, &mut header, frame_start_deadline).await?;
+    decode_header_and_recv_body(sock, &header, start).await
 }
 
 /// Config override (seconds) for the activation recv timeout; 0 = unset.
@@ -532,6 +569,32 @@ async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> Transpo
             Err(_) => return Err(TransportError::FrameIdleCeiling(ceiling)),
         },
         None => first_read.await?,
+    };
+    if n == 0 {
+        return Err(TransportError::SocketClosed);
+    }
+    if n < buf.len() {
+        recv_exact(sock, &mut buf[n..]).await?;
+    }
+    Ok(())
+}
+
+/// Active-response variant of [`recv_exact_frame_start`]: wait up to `deadline`
+/// for the FIRST byte, then read the remainder under the strict [`recv_timeout`].
+/// On elapse with ZERO bytes read, returns the NON-fatal, retryable
+/// [`TransportError::FrameStartTimeout`] — `tokio::io::AsyncReadExt::read` is
+/// cancel-safe, so the dropped read consumed nothing and the socket stays frame-
+/// aligned for the caller to retry on the next step. Used by [`recv_tensor_token`]
+/// for recvs whose response has a real deadline (token/logits coming back), as
+/// opposed to the idle-between-requests frame-start exemption.
+async fn recv_exact_frame_start_strict(
+    sock: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Duration,
+) -> TransportResult<()> {
+    let n = match tokio::time::timeout(deadline, sock.read(buf)).await {
+        Ok(res) => res?,
+        Err(_) => return Err(TransportError::FrameStartTimeout(deadline)),
     };
     if n == 0 {
         return Err(TransportError::SocketClosed);
@@ -830,6 +893,24 @@ impl ActivationClient {
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor(sock).await;
+        self.drop_connection_if_recv_fatal(res.as_ref().err());
+        res
+    }
+
+    /// Active-response recv (the token/logits coming back from downstream): the
+    /// header frame-start is bounded by `frame_start_deadline`, and a timeout
+    /// there is the NON-fatal [`TransportError::FrameStartTimeout`] — the socket
+    /// is kept (no partial frame consumed) so the caller retries on its next
+    /// step. Used by the ov-runtime head/middle `recv_token_from_downstream`:
+    /// an orphaned token-wait (its chain re-formed under it) must release the
+    /// engine lock WITHOUT dropping the once-dialed loopback it cannot re-dial.
+    /// A mid-frame stall still surfaces fatally (alignment lost).
+    pub async fn recv_token(
+        &mut self,
+        frame_start_deadline: Duration,
+    ) -> TransportResult<(Tensor, TransferStats)> {
+        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = recv_tensor_token(sock, frame_start_deadline).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
@@ -1306,6 +1387,52 @@ mod tests {
         let got = h.await.unwrap();
         set_activation_timeout_secs(0);
         assert!(got.is_err(), "partial frame then stall must still time out");
+    }
+
+    /// #40: `recv_token` (active-response recv) on a connected-but-silent peer
+    /// must return the NON-fatal `FrameStartTimeout` within the bounded deadline
+    /// WITHOUT dropping the socket — so an orphaned token-wait releases the
+    /// engine lock yet the once-dialed loopback survives, and a retry on the
+    /// SAME socket reads the token once it arrives.
+    #[tokio::test]
+    async fn recv_token_frame_start_timeout_is_nonfatal_then_retryable() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1); // bounds the body read; frame-start uses the explicit arg
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let mut server = h.await.unwrap();
+
+        // 1) silent peer → bounded frame-start times out NON-fatally; socket kept.
+        let err = client
+            .recv_token(Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TransportError::FrameStartTimeout(_)),
+            "expected non-fatal FrameStartTimeout, got {err:?}"
+        );
+        assert!(
+            client.sock.is_some(),
+            "a non-fatal frame-start timeout must NOT drop the socket"
+        );
+
+        // 2) peer now sends the token → retry on the SAME socket succeeds.
+        let token = Tensor::new(DType::I32, [1, 1, 1], 7i32.to_le_bytes().to_vec());
+        server.send(&token).await.unwrap();
+        let (got, _) = client.recv_token(Duration::from_secs(2)).await.unwrap();
+        set_activation_timeout_secs(0);
+        assert_eq!(
+            got.data,
+            7i32.to_le_bytes().to_vec(),
+            "retry must read the token on the surviving socket"
+        );
     }
 
     #[test]
