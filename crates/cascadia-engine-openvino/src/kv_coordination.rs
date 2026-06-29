@@ -100,6 +100,82 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
     parts.iter().filter_map(|p| kv_seq_from_blob(p)).max()
 }
 
+/// Compact a `get_state_blob` blob along the seq dim (index 2): keep position `i` only where
+/// `valid[i] != 0` (positions past `valid.len()` are kept), packed in order, rewriting each rank≥3
+/// state's `shape[2]` + data to the kept count. Rank<3 states copy verbatim.
+///
+/// Spec-decode leaves the KV padded with proposed-then-rejected positions, masked out host-side via
+/// `valid_mask` — which the blob does NOT carry. Compacting at capture makes the blob self-describing
+/// (restorable with no external mask), like every other engine's. Identity (verbatim clone) when
+/// nothing is rejected. `None` if the blob is unparseable or a state's byte layout is inconsistent
+/// (caller then skips capture → cold).
+pub(crate) fn kv_compact_blob(blob: &[u8], valid: &[i64]) -> Option<Vec<u8>> {
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
+    }
+    let mut p = 0usize;
+    let count = u32_at(blob, p)?;
+    p += 4;
+    let mut out = Vec::with_capacity(blob.len());
+    out.extend_from_slice(&count.to_le_bytes());
+    for _ in 0..count {
+        let state_start = p;
+        let name_len = u32_at(blob, p)? as usize;
+        let name = blob.get(p.checked_add(4)?..p.checked_add(4)?.checked_add(name_len)?)?;
+        p = p.checked_add(4)?.checked_add(name_len)?;
+        let dtype = *blob.get(p)?;
+        let rank = *blob.get(p.checked_add(1)?)? as usize;
+        p = p.checked_add(2)?;
+        let mut shape = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            shape.push(u64_at(blob, p)? as usize);
+            p = p.checked_add(8)?;
+        }
+        let nb = u64_at(blob, p)? as usize;
+        p = p.checked_add(8)?;
+        let data_start = p;
+        let data_end = data_start.checked_add(nb)?;
+        let data = blob.get(data_start..data_end)?;
+        // rank<3 (no seq dim) or fully-valid ⇒ copy state verbatim.
+        let seq = if rank >= 3 { shape[2] } else { 0 };
+        let kept: Vec<usize> = (0..seq)
+            .filter(|&i| i >= valid.len() || valid[i] != 0)
+            .collect();
+        if rank < 3 || kept.len() == seq {
+            out.extend_from_slice(blob.get(state_start..data_end)?);
+            p = data_end;
+            continue;
+        }
+        // outer = prod(shape[0..2]); cell = bytes per (outer, seq) step (folds heads + trailing dims).
+        let outer: usize = shape[..2].iter().product();
+        if outer == 0 || seq == 0 || nb % (outer * seq) != 0 {
+            return None;
+        }
+        let cell = nb / (outer * seq);
+        let new_seq = kept.len();
+        out.extend_from_slice(&(name_len as u32).to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(dtype);
+        out.push(rank as u8);
+        for (i, &d) in shape.iter().enumerate() {
+            let v = if i == 2 { new_seq as u64 } else { d as u64 };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&((outer * new_seq * cell) as u64).to_le_bytes());
+        for o in 0..outer {
+            for &s in &kept {
+                let off = (o * seq + s) * cell;
+                out.extend_from_slice(data.get(off..off + cell)?);
+            }
+        }
+        p = data_end;
+    }
+    Some(out)
+}
+
 /// Max tokens in a CAPTURE frame body — DoS bound so a forged frame can't allocate unbounded.
 pub(crate) const MAX_CAPTURE_TOKENS: usize = 1 << 20;
 
@@ -131,6 +207,49 @@ pub(crate) fn parse_capture_body(b: &[u8]) -> Option<(u64, Vec<i32>)> {
         tokens.push(i32::from_le_bytes(c.try_into().ok()?));
     }
     Some((epoch, tokens))
+}
+
+/// [`capture_body_bytes`] plus the host `valid_mask` (dist-spec only): base body ++ `u32 mask_len |
+/// mask_len × u8` (1=valid, 0=rejected draft). Workers carry no mask of their own, so the driver
+/// ships it down the CAPTURE chain and each rank compacts its blob with it ([`kv_compact_blob`]).
+pub(crate) fn capture_body_bytes_masked(epoch: u64, tokens: &[i32], valid: &[i64]) -> Vec<u8> {
+    let mut b = capture_body_bytes(epoch, tokens);
+    b.extend_from_slice(&(valid.len() as u32).to_le_bytes());
+    b.reserve(valid.len());
+    for &m in valid {
+        b.push(u8::from(m != 0));
+    }
+    b
+}
+
+/// Inverse of [`capture_body_bytes_masked`]. `None` on truncation / over-bound counts.
+pub(crate) fn parse_capture_body_masked(b: &[u8]) -> Option<(u64, Vec<i32>, Vec<i64>)> {
+    if b.len() < 12 {
+        return None;
+    }
+    let epoch = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let ntok = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
+    if ntok > MAX_CAPTURE_TOKENS {
+        return None;
+    }
+    let tok_end = 12usize.checked_add(ntok.checked_mul(4)?)?;
+    let mut tokens = Vec::with_capacity(ntok);
+    for c in b.get(12..tok_end)?.chunks_exact(4) {
+        tokens.push(i32::from_le_bytes(c.try_into().ok()?));
+    }
+    let mask_len = u32::from_le_bytes(b.get(tok_end..tok_end + 4)?.try_into().ok()?) as usize;
+    if mask_len > MAX_CAPTURE_TOKENS {
+        return None;
+    }
+    let mask_end = (tok_end + 4).checked_add(mask_len)?;
+    if b.len() != mask_end {
+        return None;
+    }
+    let valid = b[tok_end + 4..mask_end]
+        .iter()
+        .map(|&x| i64::from(x != 0))
+        .collect();
+    Some((epoch, tokens, valid))
 }
 
 /// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
@@ -529,6 +648,62 @@ mod tests {
         // Garbage/truncated ⇒ None so the caller falls back to the matched token count.
         assert_eq!(kv_seq_from_blob(&[0u8; 3]), None);
         assert_eq!(kv_seq_from_blob(&1u32.to_le_bytes()), None); // count=1, no state body
+    }
+    #[test]
+    fn kv_compact_blob_gathers_valid_positions() {
+        // One rank-4 state [1,1,4,2] with a distinct 2-byte block per seq position so the gather is
+        // verifiable: pos p ⇒ bytes [10p, 10p+1]. cell = nb/(outer*seq) = 8/4 = 2 bytes.
+        fn state(name: &str, shape: &[u64], data: &[u8]) -> Vec<u8> {
+            let mut b = (name.len() as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(name.as_bytes());
+            b.push(1); // dtype
+            b.push(shape.len() as u8);
+            for &d in shape {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            b.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            b.extend_from_slice(data);
+            b
+        }
+        let data = [0u8, 1, 10, 11, 20, 21, 30, 31]; // pos 0..3
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend(state("k", &[1, 1, 4, 2], &data));
+
+        // Reject pos 1 ⇒ keep [0,2,3], seq 4→3, data gathered in order.
+        let compact = kv_compact_blob(&blob, &[1, 0, 1, 1]).unwrap();
+        assert_eq!(kv_seq_from_blob(&compact), Some(3));
+        let mut want = 1u32.to_le_bytes().to_vec();
+        want.extend(state("k", &[1, 1, 3, 2], &[0, 1, 20, 21, 30, 31]));
+        assert_eq!(compact, want);
+
+        // All-valid ⇒ identity (verbatim).
+        assert_eq!(kv_compact_blob(&blob, &[1, 1, 1, 1]), Some(blob.clone()));
+        // Mask shorter than seq ⇒ uncovered tail positions kept (here all kept ⇒ identity).
+        assert_eq!(kv_compact_blob(&blob, &[1, 0]).map(|b| kv_seq_from_blob(&b)), Some(Some(3)));
+
+        // rank<3 state (no seq dim) copies verbatim.
+        let mut r2 = 1u32.to_le_bytes().to_vec();
+        r2.extend(state("scalar", &[1, 4], &[7, 7, 7, 7]));
+        assert_eq!(kv_compact_blob(&r2, &[0, 0, 0, 0]), Some(r2));
+    }
+    #[test]
+    fn capture_body_masked_roundtrips() {
+        let body = capture_body_bytes_masked(0xABCD, &[5, -3, 7], &[1, 0, 1, 1, 0]);
+        assert_eq!(
+            parse_capture_body_masked(&body),
+            Some((0xABCD, vec![5, -3, 7], vec![1, 0, 1, 1, 0]))
+        );
+        // empty mask is legal
+        assert_eq!(
+            parse_capture_body_masked(&capture_body_bytes_masked(1, &[9], &[])),
+            Some((1, vec![9], vec![]))
+        );
+        // truncated mask ⇒ None
+        let mut t = body.clone();
+        t.pop();
+        assert!(parse_capture_body_masked(&t).is_none());
+        // unmasked body (no mask_len trailer) ⇒ None under the masked parser
+        assert!(parse_capture_body_masked(&capture_body_bytes(1, &[9])).is_none());
     }
     #[test]
     fn unframe_blobs_rejects_malformed() {

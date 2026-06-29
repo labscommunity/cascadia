@@ -401,6 +401,11 @@ impl MaskedReq {
         self.cache_len = len;
         self.logical_pos = len;
     }
+    /// Host valid_mask over the live KV ([0..cache_len)): 1=accepted, 0=rejected draft. Feeds
+    /// `kv_compact_blob` at capture so the stored blob drops speculative positions.
+    pub(crate) fn valid_prefix(&self) -> &[i64] {
+        &self.valid_mask[..self.cache_len.min(self.valid_mask.len())]
+    }
 }
 
 impl MaskedReq {
@@ -615,13 +620,21 @@ impl DistributedMaskedReq {
         self.logical_pos = len;
     }
 
-    /// §8 CAPTURE: broadcast `(epoch, tokens)` down the target chain; await the aggregate ACK.
+    /// Driver valid_mask over the target chain's live KV ([0..cache_len)). Every stage shares the
+    /// driver's per-FORWARD attn, so this one mask compacts stage0 locally AND every worker's blob.
+    pub(crate) fn valid_prefix(&self) -> &[i64] {
+        &self.valid_mask[..self.cache_len.min(self.valid_mask.len())]
+    }
+
+    /// §8 CAPTURE: broadcast `(epoch, tokens, valid_mask)` down the target chain; await the aggregate
+    /// ACK. The mask lets each worker compact its own padded KV blob (workers hold no mask of their own).
     pub(crate) fn capture_downstream(
         &mut self,
         epoch: u64,
         tokens: &[i32],
     ) -> Result<(), EngineError> {
-        let body = crate::kv_coordination::capture_body_bytes(epoch, tokens);
+        let body =
+            crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, self.valid_prefix());
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
@@ -2016,13 +2029,19 @@ impl OvDistSpecWorkerEngine {
                     g.recv_raw(n).await
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
-                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
-                    .ok_or_else(|| EngineError::Backend("ov-dist-spec: bad CAPTURE body".into()))?;
+                let (epoch, tokens, valid) =
+                    crate::kv_coordination::parse_capture_body_masked(&body).ok_or_else(|| {
+                        EngineError::Backend("ov-dist-spec: bad CAPTURE body".into())
+                    })?;
+                // Compact this rank's KV with the driver's mask (shared across the target chain).
                 if let Ok(blob) = self.runtime.get_state_blob() {
-                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                    match crate::kv_coordination::kv_compact_blob(&blob, &valid) {
+                        Some(blob) => self.kv.capture_under_epoch(epoch, tokens.clone(), blob),
+                        None => warn!("ov-dist-spec worker: KV compaction failed; skip capture"),
+                    }
                 }
                 if !self.is_last {
-                    let _ = self.kv_chain_capture(epoch, &tokens);
+                    let _ = self.kv_chain_capture(epoch, &tokens, &valid);
                 }
                 self.kv_ack_upstream(FrameKind::CaptureAck as u32, &[])
             }
@@ -2468,6 +2487,16 @@ impl OvDistSpecEngine {
         let (Some(d), Some(s)) = (self.draft.kv_blob(), self.target.stage0_blob()) else {
             return;
         };
+        // Compact away spec-decode's proposed-then-rejected positions so the stored blob is dense +
+        // self-describing (draft and target each use their own mask). Skip capture if either fails —
+        // a padded blob would crash/attend junk on warm-resume (next resume falls back to cold).
+        let (Some(d), Some(s)) = (
+            crate::kv_coordination::kv_compact_blob(&d, self.draft.valid_prefix()),
+            crate::kv_coordination::kv_compact_blob(&s, self.target.valid_prefix()),
+        ) else {
+            warn!("ov-dist-spec: KV compaction failed; skip capture");
+            return;
+        };
         let blob = crate::kv_coordination::frame_blobs(&[d, s]);
         let epoch = crate::kv_coordination::synth_epoch(&tokens);
         if let Err(e) = self.target.capture_downstream(epoch, &tokens) {
@@ -2480,15 +2509,12 @@ impl OvDistSpecEngine {
     /// for a cached strict prefix. Returns the warm prefix length (0 ⇒ cold). On partial restore,
     /// resets everything cold (a partial restore would corrupt spec-decode).
     fn kv_try_warm_resume(&mut self, prompt_ids: &[i64]) -> usize {
-        // Gated OFF: spec-decode leaves the KV padded with proposed-then-rejected tokens (rig: draft
-        // 148 / target 168 deep for a 98-token accepted prefix), separable only by the host valid_mask,
-        // which the blob does NOT carry. Restoring the raw KV crashes (mask vs KV) or attends junk. The
-        // correct fix carries/compacts the spec-decode state (valid_mask + cursors) across the driver +
-        // worker broadcast — a follow-up. Until then dist-spec serves cold (safe). CASCADIA_DISTSPEC_WARM=1
-        // force-enables it for developing that fix. TODO(issue-34).
-        if std::env::var_os("CASCADIA_DISTSPEC_WARM").is_none() {
-            return 0;
-        }
+        // Spec-decode leaves the KV padded with proposed-then-rejected tokens (rig: draft 148 / target
+        // 168 deep for a 98-token accepted prefix). `kv_capture` now compacts every rank's blob with its
+        // host valid_mask (shipped down the CAPTURE chain), so stored blobs are dense + self-describing —
+        // restorable like any other engine. After compaction the draft sits exactly one token behind the
+        // target (the target holds the last bonus token the draft hasn't fed yet); the resume below
+        // catches the draft up so both align before `start_task` feeds one shared suffix.
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
         let Some((blob, len)) = self.kv.take_warm(&prompt_i32) else {
             return 0;
@@ -2505,21 +2531,29 @@ impl OvDistSpecEngine {
             && self.target.restore_downstream(epoch).unwrap_or(false);
         if ok {
             // Each model's cursor = its real KV depth, not the token count (off-by-one — see
-            // kv_seq_from_blob). draft+target are synced at a turn boundary so depths match; if they
-            // disagree a single suffix can't align both, so fall back to cold.
+            // kv_seq_from_blob). Steady state: draft is 0..=1 behind the target. Align to the target by
+            // feeding the draft the gap token(s) (their KV is exactly what the target already holds), so
+            // `start_task`'s single shared suffix feed lands at the right position on both. Draft ahead,
+            // or a wider gap, can't be reconciled by one suffix ⇒ cold.
             let d_pos = crate::kv_coordination::kv_seq_from_blob(&parts[0])
                 .map(|s| s.min(len))
                 .unwrap_or(len);
             let t_pos = crate::kv_coordination::kv_seq_from_blob(&parts[1])
                 .map(|s| s.min(len))
                 .unwrap_or(len);
-            if d_pos == t_pos {
-                self.draft.kv_set_pos(d_pos);
+            if d_pos <= t_pos && t_pos - d_pos <= 1 {
                 self.target.kv_set_pos(t_pos);
-                info!(warm_prefix = t_pos, matched = len, "ov-dist-spec pipeline warm-resumed");
+                self.draft.kv_set_pos(d_pos);
+                // Catch the draft up to the target (gap is prompt[d_pos..t_pos], the accepted tail).
+                if d_pos < t_pos && self.draft.feed(&prompt_ids[d_pos..t_pos]).is_err() {
+                    let _ = self.target.reset();
+                    let _ = self.draft.reset();
+                    return 0;
+                }
+                info!(warm_prefix = t_pos, d_pos, matched = len, "ov-dist-spec pipeline warm-resumed");
                 t_pos
             } else {
-                warn!(d_pos, t_pos, "ov-dist-spec: draft/target KV depth mismatch; cold reprefill");
+                warn!(d_pos, t_pos, "ov-dist-spec: draft/target KV depth out of range; cold reprefill");
                 let _ = self.target.reset();
                 let _ = self.draft.reset();
                 0
@@ -2597,11 +2631,16 @@ impl OvDistSpecWorkerEngine {
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
-    fn kv_chain_capture(&mut self, epoch: u64, tokens: &[i32]) -> Result<(), EngineError> {
+    fn kv_chain_capture(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        valid: &[i64],
+    ) -> Result<(), EngineError> {
         let Some(down) = self.downstream.clone() else {
             return Ok(());
         };
-        let body = crate::kv_coordination::capture_body_bytes(epoch, tokens);
+        let body = crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, valid);
         run_async(&self.runtime_handle, async move {
             let mut g = down.lock().await;
             g.send_raw(&(FrameKind::Capture as u32).to_be_bytes())
