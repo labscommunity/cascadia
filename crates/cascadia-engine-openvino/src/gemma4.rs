@@ -794,8 +794,8 @@ impl Gemma4Engine {
         // but step_first's "if active.is_none()" gate is false, so the
         // new task is never picked up — runner.poll_next sees empty
         // steps and the API returns `data: [DONE]` with zero chunks.
-        let res = self.step_first_body();
-        if let Err(ref e) = res {
+        let mut res = self.step_first_body();
+        if let Err(e) = res {
             // DEBUG, not WARN: the outer step() emits the rate-limited WARN
             // for the same error (StepWarnLimiter); a second unconditional
             // WARN here would bypass the limiter and double-log every
@@ -805,9 +805,17 @@ impl Gemma4Engine {
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
             );
+            // Attribute to the failed task (if one was active) before we
+            // null it, so the runner routes the failure to that task's
+            // stream instead of ending whichever stream observes the Err.
+            let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
             let _ = self.runtime.reset_state();
             self.position = 0;
+            res = Err(match failed {
+                Some(id) => e.for_task(id),
+                None => e,
+            });
         }
         res
     }
@@ -1053,7 +1061,7 @@ impl Engine for Gemma4Engine {
         }
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
         } else if self.spec.is_last_stage {
@@ -1061,7 +1069,11 @@ impl Engine for Gemma4Engine {
         } else {
             self.step_middle().map(|_| Vec::new())
         };
-        match result {
+        // Keep main's rate-limited WARN (a persistently-failing step() must
+        // not flood logs), but surface the Err to the caller — step_first
+        // already cleared active + reset_state, so callers can now tell
+        // "engine failed" from "still prefilling" (both were empty vecs).
+        match &result {
             Ok(v) => {
                 // First-stage idle steps return Ok(empty) even mid-failure
                 // (a failed step_first clears `active`; the next poll
@@ -1072,19 +1084,16 @@ impl Engine for Gemma4Engine {
                         info!(suppressed, "gemma4 step recovered");
                     }
                 }
-                v
             }
-            Err(e) => {
-                match self.step_warn.on_failure(std::time::Instant::now()) {
-                    Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
-                    Some(StepWarn::StillFailing { suppressed }) => {
-                        warn!(error = %e, suppressed, "gemma4 step still failing")
-                    }
-                    None => {}
+            Err(e) => match self.step_warn.on_failure(std::time::Instant::now()) {
+                Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
+                Some(StepWarn::StillFailing { suppressed }) => {
+                    warn!(error = %e, suppressed, "gemma4 step still failing")
                 }
-                Vec::new()
-            }
+                None => {}
+            },
         }
+        result
     }
 }
 

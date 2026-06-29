@@ -1164,10 +1164,19 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     if !is_first {
         info!("entering relay loop");
         let r = runner.clone();
-        tokio::task::spawn_blocking(move || r.run_relay_loop())
-            .await
-            .ok();
-        return Ok(());
+        let exit = tokio::task::spawn_blocking(move || r.run_relay_loop()).await;
+        // A connection-fatal exit means the peer link is dead and can't be
+        // re-accepted without a rebuild. Return Err so the process exits
+        // non-zero and systemd's `Restart=on-failure` rebuilds the stage,
+        // rather than exit 0 (a "success" systemd won't restart) and leave
+        // the pipeline a stage short. A clean SlotEmpty exit returns Ok.
+        match exit {
+            Ok(cascadia_runner::RelayExit::ConnectionFatal) => {
+                return Err(anyhow!("relay loop exited: peer link dead; rebuild needed"));
+            }
+            Ok(cascadia_runner::RelayExit::SlotEmpty) => return Ok(()),
+            Err(join_err) => return Err(anyhow!("relay loop task panicked: {join_err}")),
+        }
     }
 
     if let Some(api_addr) = &args.api {

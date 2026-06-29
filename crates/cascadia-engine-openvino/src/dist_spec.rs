@@ -1256,11 +1256,11 @@ impl Engine for OvDistSpecEngine {
         }
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         // ---- Activate next pending task (one-time prompt feed + first sample).
         if self.active.is_none() {
             if self.pending.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let task = self.pending.remove(0);
             let enc = match self.tokenizer.encode(task.prompt.clone(), false) {
@@ -1268,7 +1268,7 @@ impl Engine for OvDistSpecEngine {
                 Err(e) => {
                     warn!(error = %e, "tokenize failed");
                     let task_id = task.task_id.clone();
-                    return vec![(task_id, Chunk::final_marker(task.task_id, ""))];
+                    return Ok(vec![(task_id, Chunk::final_marker(task.task_id, ""))]);
                 }
             };
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
@@ -1284,7 +1284,7 @@ impl Engine for OvDistSpecEngine {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
-                    return vec![(task_id.clone(), Chunk::final_marker(task_id, ""))];
+                    return Ok(vec![(task_id.clone(), Chunk::final_marker(task_id, ""))]);
                 }
             }
         }
@@ -1295,7 +1295,7 @@ impl Engine for OvDistSpecEngine {
         let max_tokens = active.task.max_tokens.max(1) as usize;
 
         // First step after init: emit a chunk for the first sampled token.
-        if !active.initialized {
+        let chunks = if !active.initialized {
             active.initialized = true;
             let new_text = decode_delta(&self.tokenizer, &active.out, &mut active.last_text_len);
             // If the first token already hits max_tokens or EOS, finalize now.
@@ -1353,7 +1353,8 @@ impl Engine for OvDistSpecEngine {
                     }
                 }
             }
-        }
+        };
+        Ok(chunks)
     }
 }
 
@@ -1758,7 +1759,7 @@ impl Engine for OvDistSpecWorkerEngine {
         ))
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         // RAII guard: marks the current thread as blocking-pool for
         // the duration of this step so run_async takes the cheap
         // bare-block_on path. The guard restores the previous flag
@@ -1766,13 +1767,17 @@ impl Engine for OvDistSpecWorkerEngine {
         // pool ever migrates this thread to non-blocking work.
         let _guard = BlockingContextGuard::enter();
         let result = self.handle_one_frame();
-        if let Err(e) = result {
-            // Transport-closed errors signal the driver disconnected;
-            // don't spam the log. Drop the upstream/downstream so the
-            // next step exits the relay loop cleanly via NotConnected.
-            let msg = e.to_string();
-            if msg.contains("socket closed") || msg.contains("not connected") {
-                warn!("ov-dist-spec worker: upstream closed, exiting");
+        if let Err(ref e) = result {
+            // Transport-closed errors signal the driver disconnected; don't
+            // spam the log. Drop the upstream/downstream so subsequent steps
+            // fail fast with NotConnected; the relay loop exits ConnectionFatal
+            // on this Err (clean supervisor rebuild), and the sleep below only
+            // throttles the single round before the loop observes the drop.
+            // Fatal-classification is delegated to EngineError::is_connection_fatal
+            // (single source of truth) — clean teardown, black-holed peer (idle
+            // ceiling), peer crash (RST/broken pipe/aborted), mid-frame stall.
+            if e.is_connection_fatal() {
+                warn!(error = %e, "ov-dist-spec worker: connection-fatal transport error, dropping links");
                 // Mark engine as drained by clearing connections.
                 let _ = self.runtime_handle.clone().block_on(async {
                     let mut g = self.upstream.lock().await;
@@ -1790,10 +1795,17 @@ impl Engine for OvDistSpecWorkerEngine {
                 // hot-loop until the runner notices.
                 std::thread::sleep(std::time::Duration::from_millis(200));
             } else {
+                // Non-connection-fatal error (bad frame kind, stray
+                // LOGITS_RESPONSE, reset/inference failure). recv_raw keeps
+                // succeeding on a connected-but-misbehaving peer, so without
+                // a cool-off a bad-frame flood hot-spins the worker loop and
+                // floods the log. Same 200 ms cadence as the fatal branch;
+                // the sleep also caps the warn rate to ~5/s.
                 warn!(error = %e, "ov-dist-spec worker step error");
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
         }
-        Vec::new()
+        result.map(|_| Vec::new())
     }
 }
 

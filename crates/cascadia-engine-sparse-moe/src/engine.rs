@@ -630,6 +630,7 @@ impl Builder for SparseMoEBuilder {
             tokenizer: self.tokenizer,
             pending: VecDeque::new(),
             peer_disconnected: false,
+            disconnect_reported: false,
             transport: self.transport,
             runtime_handle,
             rank,
@@ -704,6 +705,15 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
     (start, end)
 }
 
+/// Whether a worker-rank `step()` should surface its latched upstream
+/// disconnect as a connection-fatal `Err` this call: yes exactly once, on the
+/// first step after the link drops. After that the one-shot is spent so a
+/// re-poll (the relay loop has already exited on the first one) doesn't flood.
+/// Pure, for testing.
+fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
+    peer_disconnected && !already_reported
+}
+
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
 /// per call, so the OS-level backpressure of returning QueueFull is
 /// preferable to silently accreting tasks the engine will not reach for
@@ -730,6 +740,11 @@ pub struct SparseMoEEngine {
     /// step_worker from hot-spinning on `recv_kind_server` returning
     /// `Ok(None)` over and over.
     peer_disconnected: bool,
+    /// Worker rank one-shot: true after `step()` has surfaced the latched
+    /// disconnect as a connection-fatal `Err` to the relay loop. Stops the
+    /// fatal Err from being re-emitted if `step()` is somehow polled again
+    /// before the stage is rebuilt (the relay loop exits on the first one).
+    disconnect_reported: bool,
     /// Last-rank only: tokens this rank has sampled since the last
     /// `Reset`. Used as the `history` argument to `sampling::sample` so
     /// the repetition penalty has the recent local emit-stream to
@@ -854,15 +869,28 @@ impl Engine for SparseMoEEngine {
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.total == 1 {
-            return self.step_single_stage();
+            return Ok(self.step_single_stage());
         }
+        // step_first handles its own errors terminally (final-marker chunk on
+        // the driver), so rank 0 never surfaces an Err here.
         if self.rank == 0 {
-            self.step_first()
-        } else {
-            self.step_worker()
+            return Ok(self.step_first());
         }
+        // Worker rank. step_worker returns empty on a latched upstream
+        // disconnect. The worker's upstream socket can only be re-accepted by
+        // a rebuild, so once disconnected, surface a connection-fatal Err to
+        // run_relay_loop (its ONLY driver — rank-0/single-stage go through
+        // generate()) so it exits and systemd rebuilds the stage, instead of
+        // backing off Ok(empty) forever. Emit it exactly once; the loop bails
+        // on the first fatal Err.
+        let produced = self.step_worker();
+        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
+            self.disconnect_reported = true;
+            return Err(EngineError::NotConnected);
+        }
+        Ok(produced)
     }
 
     fn close(&mut self) {
@@ -2203,15 +2231,19 @@ impl Engine for OvMoeEngine {
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // Behavior-preserving migration to EngineResult: step_single_stage /
+        // step_first / step_worker handle their own errors terminally (the
+        // driver emits a final-marker chunk; the worker latches), so there is
+        // nothing to surface as Err here.
         if self.total <= 1 {
-            return self.step_single_stage();
+            return Ok(self.step_single_stage());
         }
-        if self.rank == 0 {
+        Ok(if self.rank == 0 {
             self.step_first()
         } else {
             self.step_worker()
-        }
+        })
     }
 }
 
@@ -2246,5 +2278,22 @@ mod tests {
     fn single_stage_yields_full_range() {
         let (s, e) = even_moe_split(60, 0, 1);
         assert_eq!((s, e), (0, u32::MAX));
+    }
+
+    /// A latched worker disconnect must surface a connection-fatal Err to the
+    /// relay loop — exactly once — so run_relay_loop exits and systemd
+    /// rebuilds the stage instead of backing off Ok(empty) forever. The Err
+    /// step() emits (EngineError::NotConnected) must be recognized as fatal.
+    #[test]
+    fn worker_disconnect_reports_fatal_once() {
+        // Connected: nothing to report.
+        assert!(!worker_should_report_disconnect(false, false));
+        // First step after the link drops: report.
+        assert!(worker_should_report_disconnect(true, false));
+        // Already reported: suppressed (don't flood if re-polled).
+        assert!(!worker_should_report_disconnect(true, true));
+        // The Err step() returns on that one report is connection-fatal, so
+        // run_relay_loop exits ConnectionFatal.
+        assert!(EngineError::NotConnected.is_connection_fatal());
     }
 }

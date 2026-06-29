@@ -46,6 +46,93 @@ pub enum EngineError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A `step()` failure attributed to a specific task. Engines wrap their
+    /// underlying error in this at the failure site when the active task is
+    /// known, so the runner can route the failure to that task's stream
+    /// instead of ending whichever stream happens to observe it.
+    #[error("task {task_id}: {source}")]
+    Task {
+        task_id: TaskId,
+        #[source]
+        source: Box<EngineError>,
+    },
+}
+
+impl EngineError {
+    /// The task this error is attributed to, if any. Returns `None` for
+    /// engine-level / task-less failures.
+    pub fn task_id(&self) -> Option<&TaskId> {
+        match self {
+            EngineError::Task { task_id, .. } => Some(task_id),
+            _ => None,
+        }
+    }
+
+    /// Attribute an error to `task_id`, wrapping it in [`EngineError::Task`]
+    /// unless it already carries an attribution.
+    pub fn for_task(self, task_id: TaskId) -> Self {
+        match self {
+            EngineError::Task { .. } => self,
+            source => EngineError::Task {
+                task_id,
+                source: Box::new(source),
+            },
+        }
+    }
+
+    /// Whether this error means the engine's peer link is dead and cannot
+    /// recover in-process — a worker stage whose upstream socket is dropped
+    /// can only get a fresh connection by being rebuilt (re-`accept()` only
+    /// happens at startup). The relay loop exits on this so the supervisor
+    /// (systemd `Restart=on-failure`) rebuilds the stage, rather than
+    /// spin-and-flood at the backoff rate forever.
+    ///
+    /// Transport errors reach the engine flattened to strings via
+    /// [`EngineError::Backend`] (the worker calls `e.to_string()`), so this
+    /// matches the same substrings the dist-spec worker uses to classify a
+    /// fatal link drop, plus the structural [`EngineError::NotConnected`].
+    /// Covered: clean teardown ("socket closed"/"not connected"), a
+    /// black-holed peer ("idle ceiling"), a peer crash ("connection
+    /// reset"/"broken pipe"/"connection aborted" — TCP RST is the dominant
+    /// dead-peer case), and a mid-frame stall ("recv_exact timed out"). A
+    /// connected-but-misbehaving peer (bad frame kind, stray response) is
+    /// NOT fatal — that link can still deliver a good frame next.
+    pub fn is_connection_fatal(&self) -> bool {
+        match self {
+            EngineError::NotConnected => true,
+            EngineError::Task { source, .. } => source.is_connection_fatal(),
+            EngineError::Backend(msg) => {
+                let msg = msg.to_ascii_lowercase();
+                // Clean teardown / black-holed peer.
+                msg.contains("socket closed")
+                    || msg.contains("not connected")
+                    || msg.contains("idle ceiling")
+                    // Peer crash: TCP RST / broken pipe / aborted.
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("connection aborted")
+                    // Mid-frame deadline (recv_exact wall-clock bound).
+                    || msg.contains("recv_exact timed out")
+            }
+            // A structurally-typed io error — should a future `?`-on-io path
+            // ever produce one instead of the flattened `Backend` string —
+            // is fatal for the same kinds the transport layer treats as fatal
+            // (see `recv_error_is_connection_fatal`). Belt-and-suspenders: the
+            // dist-spec worker flattens recv errors to `Backend` today, so this
+            // arm is unreachable now, but it keeps the classifier correct if
+            // that ever changes.
+            EngineError::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -70,10 +157,36 @@ pub trait Engine: Send {
 
     /// Make progress on at most one pending task and return any chunks
     /// emitted. Returns an empty Vec when no work is in flight.
-    fn step(&mut self) -> Vec<(TaskId, Chunk)>;
+    ///
+    /// `Err` means the engine failed to make progress (backend or
+    /// transport failure) and is terminal for the in-flight task —
+    /// engines recover their own state so the next submitted task
+    /// starts fresh, but callers must not retry the failed one.
+    ///
+    /// Task attribution: `Err` affects at most the active task; queued
+    /// tasks survive. Implementors that know the failed task SHOULD wrap
+    /// their error with [`EngineError::for_task`] (or return
+    /// [`EngineError::Task`]) so the runner can route the failure to that
+    /// task's stream. A task-less `Err` (no active task, or a genuinely
+    /// engine-level failure) ends whichever stream observes it — correct
+    /// for engine death, the documented behavior for worker stages that
+    /// own no user task.
+    ///
+    /// Failure idiom: implementors should return `Err` for engine-level
+    /// failures (engine unusable / task aborted by the engine); emit a
+    /// final-marker chunk for per-task completion, including task-level
+    /// failure where the engine remains healthy.
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>>;
 
-    /// Best-effort cancellation of an in-flight task. Engines that do
-    /// not support mid-stream cancellation may treat this as a no-op.
+    /// Cancel a task. Implementors SHOULD guarantee that after `cancel`
+    /// returns, `step()` emits no further chunks for `task_id`: a queued
+    /// task is dropped from the pending
+    /// queue; an active task is abandoned and the engine's generation
+    /// state reset so the next task starts fresh instead of waiting for
+    /// the abandoned one to drain to completion. Engines that cannot
+    /// cancel mid-stream may keep the default no-op — the runner still
+    /// suppresses the task's chunks, but the engine slot stays busy
+    /// until the task finishes on its own.
     fn cancel(&mut self, _task_id: &TaskId) {}
 
     /// Tear down the engine. Idempotent.
@@ -101,4 +214,57 @@ pub trait Builder: Send {
 
     /// Tear down any partially-initialised resources (sockets, weights).
     fn close(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_fatal_classification() {
+        // Structural variant.
+        assert!(EngineError::NotConnected.is_connection_fatal());
+        // Flattened transport strings the dist-spec worker produces.
+        for msg in [
+            "socket closed during recv",
+            "not connected; call connect()/accept() first",
+            "frame-start idle ceiling hit after 900s; connection dropped",
+            // Peer crash (TCP RST and its send/half-close variants).
+            "io error: connection reset by peer",
+            "io error: broken pipe",
+            "io error: connection aborted",
+            // Mid-frame stall surfaced by recv_exact's wall-clock bound.
+            "io error: recv_exact timed out after 60s",
+        ] {
+            assert!(
+                EngineError::Backend(msg.into()).is_connection_fatal(),
+                "expected fatal: {msg}"
+            );
+        }
+        // Structurally-typed io errors classify by kind (mirrors the
+        // transport recv-fatal set), independent of the Backend-string path.
+        use std::io::{Error as IoError, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                EngineError::Io(IoError::from(kind)).is_connection_fatal(),
+                "expected fatal io kind: {kind:?}"
+            );
+        }
+        assert!(!EngineError::Io(IoError::from(ErrorKind::NotFound)).is_connection_fatal());
+        // Recoverable / unrelated failures are NOT fatal.
+        assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
+        assert!(
+            !EngineError::Backend("worker received LOGITS_RESPONSE".into()).is_connection_fatal()
+        );
+        assert!(!EngineError::NotLoaded.is_connection_fatal());
+        // A task-attributed fatal error unwraps to its source.
+        let wrapped = EngineError::Backend("socket closed".into()).for_task(TaskId::from("t1"));
+        assert!(wrapped.is_connection_fatal());
+    }
 }

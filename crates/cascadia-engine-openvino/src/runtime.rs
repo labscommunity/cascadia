@@ -861,8 +861,8 @@ impl OvRuntimeEngine {
         // but step_first's "if active.is_none()" gate is false, so the
         // new task is never picked up — runner.poll_next sees empty
         // steps and the API returns `data: [DONE]` with zero chunks.
-        let res = self.step_first_body();
-        if let Err(ref e) = res {
+        let mut res = self.step_first_body();
+        if let Err(e) = res {
             // DEBUG, not WARN: the outer step() emits the rate-limited
             // WARN for the same error (StepWarnLimiter); a second
             // unconditional WARN here would bypass the limiter and
@@ -872,12 +872,20 @@ impl OvRuntimeEngine {
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
             );
+            // Attribute to the failed task (if one was active) before we
+            // null it, so the runner routes the failure to that task's
+            // stream instead of ending whichever stream observes the Err.
+            let failed = self.active.as_ref().map(|a| a.task.task_id.clone());
             self.active = None;
             let _ = self.runtime.reset_state();
             if let Some(sk) = self.static_kv.as_mut() {
                 sk.reset();
             }
             self.position = 0;
+            res = Err(match failed {
+                Some(id) => e.for_task(id),
+                None => e,
+            });
         }
         res
     }
@@ -1277,21 +1285,7 @@ impl Engine for OvRuntimeEngine {
         Ok(())
     }
 
-    fn cancel(&mut self, task_id: &TaskId) {
-        // Step-wise engine: cancel() runs between steps (both &mut self behind
-        // the runner mutex). Drop the queued task and clear it if it's the one
-        // currently decoding, so step() stops emitting tokens for it.
-        self.pending.retain(|t| &t.task_id != task_id);
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|a| &a.task.task_id == task_id)
-        {
-            self.active = None;
-        }
-    }
-
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         let result: EngineResult<Vec<(TaskId, Chunk)>> = if self.spec.is_first_stage {
             self.step_first()
         } else if self.spec.is_last_stage {
@@ -1299,7 +1293,11 @@ impl Engine for OvRuntimeEngine {
         } else {
             self.step_middle().map(|_| Vec::new())
         };
-        match result {
+        // Keep main's rate-limited WARN (a persistently-failing step() must
+        // not flood logs), but surface the Err to the caller — step_first
+        // already cleared active + reset_state, so callers can now tell
+        // "engine failed" from "still prefilling" (both were empty vecs).
+        match &result {
             Ok(v) => {
                 // First-stage idle steps return Ok(empty) even mid-failure
                 // (a failed step clears `active`; the next poll no-ops), so
@@ -1310,18 +1308,36 @@ impl Engine for OvRuntimeEngine {
                         info!(suppressed, "ov-runtime step recovered");
                     }
                 }
-                v
             }
-            Err(e) => {
-                match self.step_warn.on_failure(std::time::Instant::now()) {
-                    Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
-                    Some(StepWarn::StillFailing { suppressed }) => {
-                        warn!(error = %e, suppressed, "ov-runtime step still failing")
-                    }
-                    None => {}
+            Err(e) => match self.step_warn.on_failure(std::time::Instant::now()) {
+                Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
+                Some(StepWarn::StillFailing { suppressed }) => {
+                    warn!(error = %e, suppressed, "ov-runtime step still failing")
                 }
-                Vec::new()
+                None => {}
+            },
+        }
+        result
+    }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        self.pending.retain(|t| t.task_id != *task_id);
+        // Abandoning the active task mirrors the step-failure recovery:
+        // clear it and reset generation state so the next pending task
+        // activates immediately instead of waiting for this one to
+        // drain max_tokens worth of inference on the device.
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.task.task_id == *task_id)
+        {
+            info!(task = %task_id, "ov-runtime cancel: abandoning active task");
+            self.active = None;
+            let _ = self.runtime.reset_state();
+            if let Some(sk) = self.static_kv.as_mut() {
+                sk.reset();
             }
+            self.position = 0;
         }
     }
 }

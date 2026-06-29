@@ -12,11 +12,17 @@ use futures::stream;
 #[derive(Default)]
 pub struct MockEngine {
     pending: Vec<(GenerationTask, usize)>,
+    fail_next_step: Option<String>,
 }
 
 impl MockEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test hook: make the next `step()` return `EngineError::Backend(msg)`.
+    pub fn fail_next_step(&mut self, msg: impl Into<String>) {
+        self.fail_next_step = Some(msg.into());
     }
 }
 
@@ -38,19 +44,22 @@ impl Engine for MockEngine {
         Ok(())
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if let Some(msg) = self.fail_next_step.take() {
+            return Err(EngineError::Backend(msg));
+        }
         if self.pending.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (task, emitted) = self.pending.remove(0);
         // Test sentinel: a prompt containing `__engine_error__` fails the
         // task loud (emits an error chunk) so consumers' failure paths —
         // e.g. the API's 5xx mapping — can be exercised deterministically.
         if task.prompt.contains("__engine_error__") {
-            return vec![(
+            return Ok(vec![(
                 task.task_id.clone(),
                 Chunk::error(task.task_id, "mock injected engine failure"),
-            )];
+            )]);
         }
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
@@ -64,16 +73,16 @@ impl Engine for MockEngine {
             } else {
                 cascadia_types::FinishReason::Length
             };
-            return vec![(
+            return Ok(vec![(
                 task.task_id.clone(),
                 Chunk::final_marker(task.task_id, "").with_finish_reason(reason),
-            )];
+            )]);
         }
         let token = words[emitted].to_string();
         let chunk = Chunk::token(&task.task_id, emitted as i64, token + " ");
         let task_id = task.task_id.clone();
         self.pending.push((task, emitted + 1));
-        vec![(task_id, chunk)]
+        Ok(vec![(task_id, chunk)])
     }
 }
 
@@ -145,7 +154,7 @@ mod tests {
             .unwrap();
         let mut emitted = Vec::new();
         for _ in 0..6 {
-            for (_, chunk) in e.step() {
+            for (_, chunk) in e.step().unwrap() {
                 emitted.push(chunk);
             }
         }
@@ -162,12 +171,12 @@ mod tests {
         e.submit(GenerationTask::new("t1", "the quick brown fox jumps").with_max_tokens(64))
             .unwrap();
         // One token out, then cancel mid-generation.
-        let first = e.step();
+        let first = e.step().unwrap();
         assert_eq!(first.len(), 1);
         assert!(first[0].1.text.starts_with("the"));
         e.cancel(&"t1".to_string());
         // Task is gone — no further compute / emission.
-        assert!(e.step().is_empty());
+        assert!(e.step().unwrap().is_empty());
         // Cancelling an unknown id is a harmless no-op.
         e.cancel(&"nope".to_string());
     }
@@ -178,7 +187,47 @@ mod tests {
         e.submit(GenerationTask::new("t1", "hi")).unwrap();
         e.submit(GenerationTask::new("t1", "hi")).unwrap();
         // We should still have exactly one task pending.
-        let chunks = e.step();
+        let chunks = e.step().unwrap();
         assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn cancel_pending_task_removes_it() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "alpha bravo")).unwrap();
+        e.submit(GenerationTask::new("t2", "charlie delta"))
+            .unwrap();
+        e.cancel(&"t1".to_string());
+        // Only t2 ever emits; t1 is gone.
+        for _ in 0..8 {
+            for (tid, _) in e.step().unwrap() {
+                assert_eq!(tid, "t2");
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_active_task_lets_next_task_activate_immediately() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "alpha bravo charlie").with_max_tokens(8))
+            .unwrap();
+        // t1 is mid-generation (one token emitted).
+        assert_eq!(e.step().unwrap()[0].0, "t1");
+        e.cancel(&"t1".to_string());
+        e.submit(GenerationTask::new("t2", "delta echo").with_max_tokens(8))
+            .unwrap();
+        // The very next step serves t2 — no draining of the abandoned t1.
+        assert_eq!(e.step().unwrap()[0].0, "t2");
+    }
+
+    #[test]
+    fn injected_step_error_surfaces_as_err() {
+        let mut e = MockEngine::new();
+        e.submit(GenerationTask::new("t1", "hello world")).unwrap();
+        e.fail_next_step("boom");
+        let res = e.step();
+        assert!(matches!(res, Err(EngineError::Backend(ref m)) if m == "boom"));
+        // Error is one-shot; the engine resumes on the next step.
+        assert!(!e.step().unwrap().is_empty());
     }
 }
