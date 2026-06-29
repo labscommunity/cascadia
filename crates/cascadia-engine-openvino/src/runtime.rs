@@ -737,25 +737,27 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        // MID-TASK reply: we just sent a hidden state and the pipeline owes
-        // us the sampled token back. Use the deadlined `recv_reply`, NOT the
-        // idle-tolerant `recv` — a frame lost between stages (pipeline-leg
-        // reset) would otherwise block this step loop forever with the task
-        // slot held: the live-rig Item-5 wedge ("task active: 1, task done:
-        // 0" all day). On timeout the error propagates to `step_first`'s
-        // catch, which clears the active task and resets state — the slot
-        // is freed and the next submit starts fresh. A prefill reply waits
-        // on every remaining stage's whole-prompt compute, so it gets the
-        // widened budget (see `recv_tensor_reply_prefill`) — a long prompt
-        // on a slow stage must not read as a wedge.
+        // #40: the token response has a REAL deadline (this is an ACTIVE
+        // generation), unlike the idle-between-requests wait in
+        // `recv_hidden_from_upstream`. Use the bounded, NON-fatal frame-start
+        // recv: an orphaned token-wait (the chain re-formed under us) times out
+        // + propagates as a step Err so the caller releases the engine lock for
+        // a retry, instead of blocking deadline-exempt on the frame-idle ceiling
+        // and wedging the lock for the whole budget (cascadia-enterprise #40).
+        // A prefill reply waits on every remaining stage's whole-prompt compute,
+        // so it gets the widened budget (see `PREFILL_REPLY_TIMEOUT_FACTOR`) — a
+        // long prompt on a slow stage must not read as a spurious frame-start
+        // timeout.
+        let deadline = if prefill {
+            cascadia_transport::recv_timeout()
+                .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+        } else {
+            cascadia_transport::recv_timeout()
+        };
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                if prefill {
-                    guard.recv_reply_prefill().await
-                } else {
-                    guard.recv_reply().await
-                }
+                guard.recv_token(deadline).await
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
