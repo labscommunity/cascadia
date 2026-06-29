@@ -259,6 +259,15 @@ mod tests {
         assert!(!EngineError::Io(IoError::from(ErrorKind::NotFound)).is_connection_fatal());
         // Recoverable / unrelated failures are NOT fatal.
         assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
+        // #40: the bounded frame-start token wait timing out is NON-fatal — it
+        // flattens to this Backend string, which contains "timed out" but NOT
+        // "recv_exact timed out", so it must classify recoverable (the caller
+        // retries on the same live socket). Pin it so a reworded message can't
+        // silently flip it to fatal + drop the once-dialed engine loopback.
+        assert!(!EngineError::Backend(
+            "frame-start wait timed out after 120s with no bytes (retryable)".into()
+        )
+        .is_connection_fatal());
         assert!(
             !EngineError::Backend("worker received LOGITS_RESPONSE".into()).is_connection_fatal()
         );
