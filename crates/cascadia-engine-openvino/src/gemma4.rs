@@ -1085,15 +1085,13 @@ impl Engine for Gemma4Engine {
                     }
                 }
             }
-            Err(e) => {
-                match self.step_warn.on_failure(std::time::Instant::now()) {
-                    Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
-                    Some(StepWarn::StillFailing { suppressed }) => {
-                        warn!(error = %e, suppressed, "gemma4 step still failing")
-                    }
-                    None => {}
+            Err(e) => match self.step_warn.on_failure(std::time::Instant::now()) {
+                Some(StepWarn::First) => warn!(error = %e, "gemma4 step failed"),
+                Some(StepWarn::StillFailing { suppressed }) => {
+                    warn!(error = %e, suppressed, "gemma4 step still failing")
                 }
-            }
+                None => {}
+            },
         }
         result
     }

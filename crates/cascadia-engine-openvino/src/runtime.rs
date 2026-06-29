@@ -1309,15 +1309,13 @@ impl Engine for OvRuntimeEngine {
                     }
                 }
             }
-            Err(e) => {
-                match self.step_warn.on_failure(std::time::Instant::now()) {
-                    Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
-                    Some(StepWarn::StillFailing { suppressed }) => {
-                        warn!(error = %e, suppressed, "ov-runtime step still failing")
-                    }
-                    None => {}
+            Err(e) => match self.step_warn.on_failure(std::time::Instant::now()) {
+                Some(StepWarn::First) => warn!(error = %e, "ov-runtime step failed"),
+                Some(StepWarn::StillFailing { suppressed }) => {
+                    warn!(error = %e, suppressed, "ov-runtime step still failing")
                 }
-            }
+                None => {}
+            },
         }
         result
     }

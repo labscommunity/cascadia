@@ -2231,15 +2231,19 @@ impl Engine for OvMoeEngine {
         self.pending.retain(|t| &t.task_id != task_id);
     }
 
-    fn step(&mut self) -> Vec<(TaskId, Chunk)> {
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // Behavior-preserving migration to EngineResult: step_single_stage /
+        // step_first / step_worker handle their own errors terminally (the
+        // driver emits a final-marker chunk; the worker latches), so there is
+        // nothing to surface as Err here.
         if self.total <= 1 {
-            return self.step_single_stage();
+            return Ok(self.step_single_stage());
         }
-        if self.rank == 0 {
+        Ok(if self.rank == 0 {
             self.step_first()
         } else {
             self.step_worker()
-        }
+        })
     }
 }
 

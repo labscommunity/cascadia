@@ -171,12 +171,12 @@ mod tests {
         e.submit(GenerationTask::new("t1", "the quick brown fox jumps").with_max_tokens(64))
             .unwrap();
         // One token out, then cancel mid-generation.
-        let first = e.step();
+        let first = e.step().unwrap();
         assert_eq!(first.len(), 1);
         assert!(first[0].1.text.starts_with("the"));
         e.cancel(&"t1".to_string());
         // Task is gone — no further compute / emission.
-        assert!(e.step().is_empty());
+        assert!(e.step().unwrap().is_empty());
         // Cancelling an unknown id is a harmless no-op.
         e.cancel(&"nope".to_string());
     }
