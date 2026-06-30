@@ -583,6 +583,12 @@ impl KvCoordination for OvRuntimeEngine {
         self.kv_cache_mut().stash_downstream(epoch, blob);
         Ok(())
     }
+
+    fn apply_warm_resume(&mut self, _epoch: u64, blob: &[u8]) -> bool {
+        // Fields (runtime/position/kv_warm_pending) are module-private to runtime.rs; delegate to the
+        // engine helper that owns them.
+        self.apply_warm_resume_blob(blob)
+    }
 }
 
 /// Shared handle to a captured-snapshot cache. The engine mirrors its captures here; the holder reads

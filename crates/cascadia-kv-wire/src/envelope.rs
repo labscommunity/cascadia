@@ -53,6 +53,17 @@ pub enum KvMessage {
     NotFound,
     Error(String),
     Hint(WarmHint),
+    /// Head→rank-N: pull your rank-N slice for `epoch` from `prev_chain_id` and arm a warm-resume.
+    WarmResumeTrigger {
+        epoch: u64,
+        model_fingerprint: u64,
+        prev_chain_id: [u8; 32],
+        rank: u16,
+    },
+    /// Rank-N→head: warm-resume armed (`ok=true`) or failed (`ok=false`) for `epoch`.
+    WarmResumeConfirm { epoch: u64, ok: bool },
+    /// Head→rank-N: drop the armed warm-resume for `epoch`, go cold.
+    WarmResumeAbort { epoch: u64 },
 }
 
 #[cfg(test)]
@@ -85,6 +96,14 @@ mod tests {
                 prev_chain_id: [9u8; 32],
                 partner: "acme".into(),
             }),
+            KvMessage::WarmResumeTrigger {
+                epoch: 42,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+            },
+            KvMessage::WarmResumeConfirm { epoch: 42, ok: true },
+            KvMessage::WarmResumeAbort { epoch: 42 },
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
