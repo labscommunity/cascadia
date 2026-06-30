@@ -219,6 +219,28 @@ pub trait KvCoordination {
     ) -> Result<(), ()>;
 }
 
+/// Issue-34 Option C: the **holder-serve** half of [`KvCoordination`], decoupled from the engine
+/// lock. `lookup`/`export` read the captured-snapshot cache only (no live inference state), so this is
+/// `&self` + `Send + Sync` and serves over a shared handle the engine hands out via
+/// [`Engine::kv_holder`]. The point: a node is moved-away-from *because* it is busy generating (which
+/// holds the engine lock); routing the holder through that lock would starve every pull. Serving from
+/// this handle instead lets a busy node still answer NEGOTIATE/GET — it touches only the snapshot
+/// cache's own (uncontended-mid-generation) lock.
+#[cfg(feature = "kv_coord")]
+pub trait KvSnapshotHolder: Send + Sync {
+    /// This rank's model fingerprint (static; cache key + cross-rev guard).
+    fn model_fingerprint(&self) -> u64;
+    /// NEGOTIATE: longest-common-prefix of `token_ids` against the captured cache.
+    fn lookup(&self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)>;
+    /// GET: export the snapshot asserted by `(epoch, len)` as wire `Manifest` + per-layer payloads.
+    fn export(
+        &self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
+}
+
 pub trait Engine: Send {
     /// One short forward to compile kernels and warm device caches.
     fn warmup(&mut self);
@@ -268,6 +290,15 @@ pub trait Engine: Send {
     /// the cache (LRU touch, restore). Gated so the wire crate stays out of default trees.
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn KvCoordination> {
+        None
+    }
+
+    /// Issue-34 Option C: a lock-free **holder** handle over this engine's captured-snapshot cache, if
+    /// any. Default `None`. Grabbed once at engine load (cheap `Arc` clone) and served from a holder
+    /// task, so a pull never contends the engine lock the live inference holds. `&self` because it
+    /// shares the cache rather than mutating engine state.
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn KvSnapshotHolder>> {
         None
     }
 
