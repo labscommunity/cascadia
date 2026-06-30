@@ -315,6 +315,11 @@ pub(crate) struct OvKvCache {
     /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
     captures: HashMap<u64, (Vec<i32>, Vec<u8>)>,
+    /// Issue-34 multi-stage cross-chain warm-resume: `epoch → downstream rank's pulled blob`. The head
+    /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
+    /// ships it inline in the `RESTORE(epoch)` frame to that rank (which `set_state`s it). 2-stage today
+    /// (one downstream); keyed by the content epoch so it matches the head's RESTORE epoch. Bounded.
+    downstream: HashMap<u64, Vec<u8>>,
 }
 
 impl OvKvCache {
@@ -358,6 +363,24 @@ impl OvKvCache {
     /// `set_state` it. Removed on take (one restore per inserted turn).
     pub(crate) fn take_capture(&mut self, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
         self.captures.remove(&epoch)
+    }
+
+    /// Head: stash a pulled DOWNSTREAM rank's blob for inline delivery in `RESTORE(epoch)`. Bounded.
+    pub(crate) fn stash_downstream(&mut self, epoch: u64, blob: Vec<u8>) {
+        if blob.is_empty() {
+            return;
+        }
+        if self.downstream.len() >= KV_MAX_ENTRIES && !self.downstream.contains_key(&epoch) {
+            if let Some(k) = self.downstream.keys().next().copied() {
+                self.downstream.remove(&k);
+            }
+        }
+        self.downstream.insert(epoch, blob);
+    }
+
+    /// Head: take the downstream blob to ship in `RESTORE(epoch)`. Removed on take (one per turn).
+    pub(crate) fn take_downstream(&mut self, epoch: u64) -> Option<Vec<u8>> {
+        self.downstream.remove(&epoch)
     }
 
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
@@ -544,6 +567,20 @@ impl KvCoordination for OvRuntimeEngine {
         let (tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
         // Stage the blob; the next prefill warm-resumes via `OvKvCache::take_warm` (rig-certified).
         self.kv_cache_mut().insert_both(tokens, blob);
+        Ok(())
+    }
+
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        // Issue-34 multi-stage: a DOWNSTREAM rank's pulled blob can't be used by the head locally;
+        // stash it under the content epoch so `send_restore_downstream` ships it inline to that rank.
+        let (_tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = synth_epoch(&manifest.token_ids);
+        self.kv_cache_mut().stash_downstream(epoch, blob);
         Ok(())
     }
 }

@@ -4037,6 +4037,13 @@ impl OvRuntimeEngine {
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         let mut data = vec![OPCODE_RESTORE];
         data.extend_from_slice(&epoch.to_le_bytes());
+        // Issue-34 multi-stage cross-chain: ship the downstream rank's pulled blob inline so it can
+        // `set_state` (it has no local capture for a foreign chain's epoch). Absent ⇒ bare RESTORE
+        // (same-chain path, where the rank restores from its own CAPTURE stash).
+        if let Some(blob) = self.kv.take_downstream(epoch) {
+            info!(epoch, blob_len = blob.len(), "ov_restore_carry_downstream");
+            data.extend_from_slice(&blob);
+        }
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
         let ack = self.block_on(async move {
             let mut g = downstream.lock().await;
@@ -4107,23 +4114,43 @@ impl OvRuntimeEngine {
                     .and_then(|b| b.try_into().ok())
                     .map(u64::from_le_bytes)
                     .ok_or_else(|| EngineError::Backend("ov-runtime: bad RESTORE body".into()))?;
-                let local_ok = match self.kv.take_capture(epoch) {
-                    Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
+                // Issue-34 multi-stage cross-chain: the head ships THIS rank's pulled blob inline
+                // (bytes past the 8-byte epoch). Use it directly; else restore from a local CAPTURE
+                // stash (the same-chain path, where the rank captured its own slice).
+                let carried = t.data.get(9..).filter(|b| !b.is_empty());
+                let local_ok = if let Some(blob) = carried {
+                    match self.runtime.set_state_blob(blob) {
                         Ok(()) => {
-                            // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
-                            self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
-                                .map(|s| s.min(tokens.len()))
-                                .unwrap_or(tokens.len())
-                                as i64;
+                            self.position =
+                                crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
                             self.kv_warm_pending = true;
+                            info!(epoch, blob_len = blob.len(), "ov_tail_restore_carried");
                             true
                         }
                         Err(e) => {
-                            warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                            warn!(error = %e, "ov-runtime: set_state(carried) failed; rank cold");
                             false
                         }
-                    },
-                    None => false,
+                    }
+                } else {
+                    match self.kv.take_capture(epoch) {
+                        Some((tokens, blob)) => match self.runtime.set_state_blob(&blob) {
+                            Ok(()) => {
+                                // Real KV depth, not the token count (off-by-one, see kv_seq_from_blob).
+                                self.position = crate::kv_coordination::kv_seq_from_blob(&blob)
+                                    .map(|s| s.min(tokens.len()))
+                                    .unwrap_or(tokens.len())
+                                    as i64;
+                                self.kv_warm_pending = true;
+                                true
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "ov-runtime: set_state failed; rank cold");
+                                false
+                            }
+                        },
+                        None => false,
+                    }
                 };
                 let down_ok = if self.spec.is_last_stage {
                     true

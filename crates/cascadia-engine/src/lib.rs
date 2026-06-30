@@ -217,6 +217,18 @@ pub trait KvCoordination {
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()>;
+    /// Issue-34 multi-stage: stash a pulled DOWNSTREAM rank's snapshot (rank ≠ this head) for inline
+    /// delivery in the head's `RESTORE` frame — the head can't use a downstream rank's KV locally.
+    /// Default: unsupported (single-stage engines never see a rank > 0 insert) ⇒ that rank votes cold.
+    #[allow(clippy::result_unit_err)]
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        _manifest: &cascadia_kv_wire::Manifest,
+        _payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        Err(())
+    }
 }
 
 /// Issue-34 Option C: the **holder-serve** half of [`KvCoordination`], decoupled from the engine
