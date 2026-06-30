@@ -812,6 +812,11 @@ async fn recv_hidden_frames(
 /// exists to cap (internal tracker, issue #40). A token *response* of an ACTIVE
 /// generation has a tight real deadline regardless, so cap it here.
 const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+// Issue-34 warm-resume: bound the downstream RESTORE/ABORT ack. A lost or raced ack must degrade
+// to cold reprefill (the caller aborts + reprefills on Err), never hang the serve at the client
+// deadline. Warm-resume is an optimization, not a correctness gate — generous enough for a valid
+// tail restore, well under any client timeout.
+const RESTORE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Overall budget for one token wait.
 ///
@@ -1479,6 +1484,10 @@ pub struct OvRuntimeEngine {
     /// Issue-34 Option C: opaque KV blob cache + NEGOTIATE/GET offers for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 Option C: lock-free holder mirror of `kv` — the capture sites write both, and
+    /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
     /// Issue-34 consume: set by a `RESTORE` control frame; suppresses the next prefill's implicit
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
@@ -1982,6 +1991,7 @@ impl OvRuntimeEngine {
                     Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
+            info!(dtype = ?first.dtype, len = first.data.len(), want_pos, "ov_tail_upstream_frame_recv");
             #[cfg(feature = "kv_coord")]
             if !want_pos && lead.dtype == WireDType::I8 {
                 self.handle_inbound_control(&lead)?;
@@ -2058,6 +2068,7 @@ impl OvRuntimeEngine {
         }
         if self.active.is_none() && !self.pending.is_empty() {
             let task = self.pending.remove(0);
+            info!(prompt_len = task.prompt.len(), "ov_prefill_begin");
             let tok = self
                 .tokenizer
                 .clone()
@@ -3023,6 +3034,12 @@ impl OvRuntimeEngine {
                                 warn!(error = %e, "ov-runtime: CAPTURE broadcast failed (best-effort)");
                             }
                         }
+                        // Mirror into the lock-free holder cache so a busy node can serve this turn's
+                        // KV to a moved peer without the engine lock.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .capture(full.clone(), blob.clone());
                         self.kv.capture(full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
@@ -3752,6 +3769,14 @@ impl Engine for OvRuntimeEngine {
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.kv_model_fingerprint(),
+        }))
+    }
 }
 
 #[cfg(feature = "kv_coord")]
@@ -3999,6 +4024,7 @@ impl OvRuntimeEngine {
             g.send(&t).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
+        info!(ack_opcode, "ov_tail_ctrl_ack_sent");
         Ok(())
     }
 
@@ -4012,14 +4038,19 @@ impl OvRuntimeEngine {
         let mut data = vec![OPCODE_RESTORE];
         data.extend_from_slice(&epoch.to_le_bytes());
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
-        let ack = self
-            .block_on(async move {
-                let mut g = downstream.lock().await;
-                g.send(&t).await?;
-                let (ack, _) = g.recv().await?;
-                Ok::<_, cascadia_transport::TransportError>(ack)
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let ack = self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t)
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
+                Ok(Ok((ack, _))) => Ok(ack),
+                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
+                Err(_) => Err(EngineError::Backend(
+                    "ov-runtime: RESTORE ack timed out; cold reprefill".into(),
+                )),
+            }
+        })?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_RESTORE_ACK) {
             Ok(ack.data.get(1) == Some(&1))
         } else {
@@ -4037,7 +4068,8 @@ impl OvRuntimeEngine {
         self.block_on(async move {
             let mut g = downstream.lock().await;
             g.send(&t).await?;
-            let _ = g.recv().await?;
+            // Best-effort ack, bounded: a silent downstream must not wedge the abort path.
+            let _ = tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await;
             Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
@@ -4045,12 +4077,18 @@ impl OvRuntimeEngine {
 
     /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
     fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
+        info!(opcode = ?t.data.first().copied(), is_last = self.spec.is_last_stage, "ov_tail_ctrl_recv");
         match t.data.first().copied() {
             // CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream, ack up.
             Some(OPCODE_CAPTURE) => {
                 let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
                     .ok_or_else(|| EngineError::Backend("ov-runtime: bad CAPTURE body".into()))?;
                 if let Ok(blob) = self.runtime.get_state_blob() {
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    self.kv_share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capture_under_epoch(epoch, tokens.clone(), blob.clone());
                     self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
                 }
                 if !self.spec.is_last_stage {
@@ -4965,6 +5003,10 @@ impl Builder for OvRuntimeBuilder {
             consecutive_token_timeouts: 0,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
             #[cfg(feature = "kv_coord")]
             kv_warm_pending: false,
         }))

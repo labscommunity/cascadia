@@ -18,8 +18,9 @@
 //! (cold reprefill — today's behaviour). Warm==cold fidelity is certified on hardware.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use cascadia_engine::KvCoordination;
+use cascadia_engine::{KvCoordination, KvSnapshotHolder};
 use cascadia_kv_wire::{LayerMeta, Manifest, PartnerId, OPAQUE_KV_LAYOUT, SCHEMA_VERSION};
 
 use crate::runtime::OvRuntimeEngine;
@@ -337,6 +338,8 @@ impl OvKvCache {
                 self.captures.remove(&k);
             }
         }
+        tracing::info!(target: "cascadia::kv", event = "kv_cap_under_epoch",
+            epoch, tokens = tokens.len(), blob = blob.len());
         self.captures.insert(epoch, (tokens, blob));
     }
 
@@ -360,6 +363,10 @@ impl OvKvCache {
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
     /// use), then `captures` (worker stash, repeat-serve). `None` if absent or the length drifted.
     pub(crate) fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
+        tracing::info!(target: "cascadia::kv", event = "kv_serve", epoch, want_len = len,
+            in_offers = self.offers.contains_key(&epoch), in_captures = self.captures.contains_key(&epoch),
+            n_offers = self.offers.len(), n_captures = self.captures.len(),
+            cap_epochs = ?self.captures.keys().copied().collect::<Vec<_>>());
         let (tokens, blob) = if let Some(off) = self.offers.remove(&epoch) {
             off
         } else if let Some(cap) = self.captures.get(&epoch) {
@@ -370,6 +377,8 @@ impl OvKvCache {
         // Head/offers path carries tokens ⇒ length must match what was negotiated. Worker captures
         // also carry the head-broadcast tokens, so the same check holds for both.
         if tokens.len() as u32 != len {
+            tracing::info!(target: "cascadia::kv", event = "kv_serve_len_mismatch",
+                epoch, have = tokens.len(), want = len);
             return None;
         }
         Some((tokens, blob))
@@ -473,13 +482,16 @@ pub(crate) fn wire_to_blob(
 }
 
 impl OvRuntimeEngine {
-    /// Stable model+stage fingerprint: the model id plus this stage's layer span, so a stage only
-    /// matches the identical stage on a peer chain (a partial-KV blob is stage-specific).
+    /// MODEL-level fingerprint (`model_id` + `total_layers`), NOT per-stage. A cross-chain pull
+    /// asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all ranks of a model
+    /// must share it; a per-stage layer span (`layer_start`/`layer_end`) would wrongly reject the
+    /// worker ranks of a legitimate move (the tail's stage span differs from the head's). Per-rank
+    /// stage selection is by the dial INDEX (rank N → that rank's holder + slice); a sharding
+    /// mismatch degrades safely (the opaque blob's `set_state` size-rejects ⇒ cold), so the layer
+    /// span is not needed as a guard here.
     pub(crate) fn kv_model_fingerprint(&self) -> u64 {
         let s = self.shard_spec();
         let mut buf = s.model_id.clone().into_bytes();
-        buf.extend_from_slice(&s.layer_start.to_le_bytes());
-        buf.extend_from_slice(&s.layer_end.to_le_bytes());
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
         fnv1a64(&buf)
     }
@@ -533,6 +545,46 @@ impl KvCoordination for OvRuntimeEngine {
         // Stage the blob; the next prefill warm-resumes via `OvKvCache::take_warm` (rig-certified).
         self.kv_cache_mut().insert_both(tokens, blob);
         Ok(())
+    }
+}
+
+/// Shared handle to a captured-snapshot cache. The engine mirrors its captures here; the holder reads
+/// it without ever taking the engine lock (so a busy node can still answer a pull).
+pub(crate) type SharedKvCache = Arc<Mutex<OvKvCache>>;
+
+/// Lock-free [`KvSnapshotHolder`] over a [`SharedKvCache`]. Serves NEGOTIATE/GET by locking ONLY the
+/// snapshot cache — which inference touches only briefly at capture, not across the forward pass — so
+/// the holder no longer starves on the engine lock the live generation holds. `model_fp` is the
+/// engine's static stage fingerprint, snapshotted at handle creation.
+pub(crate) struct OvKvHolder {
+    pub(crate) cache: SharedKvCache,
+    pub(crate) model_fp: u64,
+}
+
+impl KvSnapshotHolder for OvKvHolder {
+    fn model_fingerprint(&self) -> u64 {
+        self.model_fp
+    }
+
+    fn lookup(&self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(token_ids)
+    }
+
+    fn export(
+        &self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let (prefix, blob) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serve(expected_epoch, expected_len)?;
+        Some(blob_to_wire(&prefix, &blob, partner, self.model_fp, expected_epoch))
     }
 }
 
