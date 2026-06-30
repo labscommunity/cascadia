@@ -584,10 +584,13 @@ impl KvCoordination for OvRuntimeEngine {
         Ok(())
     }
 
-    fn apply_warm_resume(&mut self, _epoch: u64, blob: &[u8]) -> bool {
-        // Fields (runtime/position/kv_warm_pending) are module-private to runtime.rs; delegate to the
-        // engine helper that owns them.
-        self.apply_warm_resume_blob(blob)
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // The pull staged this rank's slice under `epoch` (capture cache); set_state it now (plane path).
+        let blob = match self.kv_cache_mut().take_capture(epoch) {
+            Some((_tokens, blob)) => blob,
+            None => return false,
+        };
+        self.apply_warm_resume_blob(&blob)
     }
 }
 

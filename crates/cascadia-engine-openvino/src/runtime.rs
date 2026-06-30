@@ -1492,6 +1492,11 @@ pub struct OvRuntimeEngine {
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
     kv_warm_pending: bool,
+    /// Issue-34 plane-restore: when set, downstream ranks warm-resume out-of-band over the KV plane,
+    /// so `step_first` skips the chain RESTORE/ABORT dance (the spliced transport bypasses it anyway).
+    /// Read once from `CASCADIA_KV_PLANE_RESTORE` at build. Rank0 still warm-resumes locally.
+    #[cfg(feature = "kv_coord")]
+    plane_restore: bool,
 }
 
 impl OvRuntimeEngine {
@@ -2090,7 +2095,12 @@ impl OvRuntimeEngine {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
                             // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
-                            let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                            // plane_restore: downstream ranks warm-resume over the KV plane, so skip
+                            // the chain RESTORE (multi=false ⇒ chain_ok stays true, no downstream call).
+                            let multi = self.downstream.is_some()
+                                && !self.spec.is_last_stage
+                                && !self.plane_restore;
+                            info!(plane_restore = self.plane_restore, "ov_step_first_warm_mode");
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                                 match self.send_restore_downstream(epoch) {
@@ -5052,6 +5062,10 @@ impl Builder for OvRuntimeBuilder {
             )),
             #[cfg(feature = "kv_coord")]
             kv_warm_pending: false,
+            #[cfg(feature = "kv_coord")]
+            plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }))
     }
 }
