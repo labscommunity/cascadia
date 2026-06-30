@@ -3790,6 +3790,22 @@ impl OvRuntimeEngine {
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
+    /// Plane warm-resume (§0(B)): set_state a pulled rank blob directly + arm warm, off the inference
+    /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn apply_warm_resume_blob(&mut self, blob: &[u8]) -> bool {
+        match self.runtime.set_state_blob(blob) {
+            Ok(()) => {
+                self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
+                self.kv_warm_pending = true;
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "ov-runtime: apply_warm_resume set_state failed; cold");
+                false
+            }
+        }
+    }
 }
 
 /// CASCADIA_PERF_DUMP=1 (spike diagnostics): after a task finishes, print an
