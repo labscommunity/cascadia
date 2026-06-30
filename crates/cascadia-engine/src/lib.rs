@@ -229,11 +229,11 @@ pub trait KvCoordination {
     ) -> Result<(), ()> {
         Err(())
     }
-    /// Plane-based cross-chain warm-resume: the holder loop calls this to set_state a pulled rank's KV
-    /// blob directly into the engine (splice-agnostic; §0(B)). Returns true on success (state set +
-    /// warm armed). Default: unsupported.
+    /// Plane-based cross-chain warm-resume: applies the rank's pulled KV staged under `epoch` in this
+    /// engine's cache (splice-agnostic; §0(B)). Returns true on success (state set + warm armed).
+    /// Default: unsupported.
     #[allow(clippy::result_unit_err)]
-    fn apply_warm_resume(&mut self, _epoch: u64, _blob: &[u8]) -> bool {
+    fn apply_warm_resume(&mut self, _epoch: u64) -> bool {
         false
     }
 }
