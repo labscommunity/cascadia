@@ -54,8 +54,10 @@ pub enum KvMessage {
     Error(String),
     Hint(WarmHint),
     /// Head→rank-N: pull your rank-N slice for `epoch` from `prev_chain_id` and arm a warm-resume.
+    /// `prefix_token_len` lets the token-less rank assert a `(epoch, len)` GET without a NEGOTIATE.
     WarmResumeTrigger {
         epoch: u64,
+        prefix_token_len: u32,
         model_fingerprint: u64,
         prev_chain_id: [u8; 32],
         rank: u16,
@@ -98,6 +100,7 @@ mod tests {
             }),
             KvMessage::WarmResumeTrigger {
                 epoch: 42,
+                prefix_token_len: 2,
                 model_fingerprint: 7,
                 prev_chain_id: [9u8; 32],
                 rank: 1,
