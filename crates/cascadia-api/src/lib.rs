@@ -291,10 +291,45 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     })
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default, deserialize_with = "de_null_content")]
     pub content: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+/// OpenAI tool spec (request input). `function` is opaque JSON (name,
+/// description, parameters schema) forwarded verbatim to the chat template.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: serde_json::Value,
+}
+
+/// A structured tool call (response output + round-trip input).
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded argument object (OpenAI ships this as a string).
+    pub arguments: String,
+}
+
+/// null/missing content -> "" (assistant tool-call turns send content: null).
+fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -348,6 +383,10 @@ pub struct ChatCompletionRequest {
     /// <think> block (engines that can't, ignore it).
     #[serde(default = "default_true")]
     pub enable_thinking: bool,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl ChatCompletionRequest {
@@ -392,7 +431,10 @@ fn default_max_tokens() -> u32 {
 #[derive(Serialize)]
 struct ChatChoiceMessage {
     role: &'static str,
-    content: String,
+    /// `Option` so a tool-call turn emits `content: null` (OpenAI shape).
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// OpenAI chat `logprobs` object: one entry per generated token under
@@ -600,43 +642,67 @@ fn render_with_chat_env(
     bos_token: &str,
     eos_token: &str,
     enable_thinking: bool,
+    tools: Option<&[Tool]>,
 ) -> Result<String, String> {
     use minijinja::context;
     use minijinja::value::Value;
-
     let tmpl = env
         .get_template("chat")
         .map_err(|e| format!("template lookup: {e}"))?;
-
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
-            Value::from_serialize(serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            }))
+            let mut obj = serde_json::json!({ "role": m.role, "content": m.content });
+            if let Some(tc) = &m.tool_calls {
+                // HF chat templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
+                // expecting a JSON object; OpenAI ships `arguments` as a string. Parse it for
+                // the template context (the wire format stays a string) so the render doesn't
+                // error ("cannot convert value into pairs") and silently fall back to legacy.
+                let mut tcv = serde_json::to_value(tc).unwrap_or_default();
+                if let Some(arr) = tcv.as_array_mut() {
+                    for call in arr {
+                        if let Some(s) = call
+                            .pointer("/function/arguments")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                        {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                                call["function"]["arguments"] = parsed;
+                            }
+                        }
+                    }
+                }
+                obj["tool_calls"] = tcv;
+            }
+            if let Some(id) = &m.tool_call_id {
+                obj["tool_call_id"] = serde_json::json!(id);
+            }
+            if let Some(name) = &m.name {
+                obj["name"] = serde_json::json!(name);
+            }
+            Value::from_serialize(obj)
         })
         .collect();
-
+    let tools_value: Option<Vec<Value>> =
+        tools.map(|ts| ts.iter().map(Value::from_serialize).collect());
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
-        // Hybrid-reasoning templates (Qwen3.x) read this and inject the
-        // empty think block themselves when false.
         enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
+        tools => tools_value,
     };
-
     tmpl.render(ctx)
         .map_err(|e| format!("template render: {e}"))
 }
 
-fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bool) -> String {
-    // Hybrid: for engines that own native templating (ov-genai), only render
-    // here when thinking is OFF (to inject the empty-think block). With thinking
-    // ON, emit the legacy join so the engine applies its own template natively —
-    // leaving the already-working path byte-identical.
+fn render_prompt(
+    state: &AppState,
+    messages: &[ChatMessage],
+    enable_thinking: bool,
+    tools: Option<&[Tool]>,
+) -> String {
     let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
     if !defer_to_engine {
         if let Some(env) = &state.chat_env {
@@ -646,15 +712,218 @@ fn render_prompt(state: &AppState, messages: &[ChatMessage], enable_thinking: bo
                 &state.bos_token,
                 &state.eos_token,
                 enable_thinking,
+                tools,
             ) {
                 Ok(s) => return s,
                 Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter")
                 }
             }
         }
     }
     render_prompt_legacy(messages)
+}
+
+/// Decide the response message + finish_reason from accumulated text.
+/// `tool_choice == Some("none")` skips parsing (always "stop").
+fn build_choice(
+    buf: String,
+    tool_choice: &Option<serde_json::Value>,
+    tools_present: bool,
+) -> (ChatChoiceMessage, &'static str) {
+    let parse_enabled =
+        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
+    if parse_enabled {
+        if let Some(calls) = parse_tool_calls(&buf) {
+            return (
+                ChatChoiceMessage {
+                    role: "assistant",
+                    content: None,
+                    tool_calls: Some(calls),
+                },
+                "tool_calls",
+            );
+        }
+    }
+    (
+        ChatChoiceMessage {
+            role: "assistant",
+            content: Some(buf),
+            tool_calls: None,
+        },
+        "stop",
+    )
+}
+
+/// Parse model tool-call output into structured calls; None when none found.
+/// Shape-based + engine-agnostic; never panics (each block parsed independently,
+/// malformed blocks skipped).
+pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    if text.contains("<tool_call>") {
+        // Qwen/Hermes: each <tool_call>…</tool_call> block.
+        let mut rest = text;
+        while let Some(start) = rest.find("<tool_call>") {
+            let after = &rest[start + "<tool_call>".len()..];
+            let inner = after.trim_start();
+            // JSON Hermes: scan a brace-balanced (string/escape-aware) object so a
+            // literal "</tool_call>" inside an argument value can't truncate the
+            // block. Fall back to the close-tag delimiter for the XML dialect.
+            if inner.starts_with('{') || inner.starts_with('[') {
+                let off = after.len() - inner.len();
+                if let Some(len) = balanced_json_end(&after[off..]) {
+                    if let Ok(v) =
+                        serde_json::from_str::<serde_json::Value>(after[off..off + len].trim())
+                    {
+                        if let Some(c) = call_from_value(&v) {
+                            calls.push(c);
+                        }
+                    }
+                    let tail = &after[off + len..];
+                    rest = match tail.find("</tool_call>") {
+                        Some(e) => &tail[e + "</tool_call>".len()..],
+                        None => tail,
+                    };
+                    continue;
+                }
+            }
+            let Some(end) = after.find("</tool_call>") else {
+                break;
+            };
+            if let Some(c) = call_from_xml_function(&after[..end]) {
+                // Qwen3/MoE <function=…><parameter=…> XML dialect (non-JSON).
+                calls.push(c);
+            }
+            rest = &after[end + "</tool_call>".len()..];
+        }
+    } else {
+        // Llama-3.1: <|python_tag|> is an explicit tool-call marker. A BARE
+        // whole-output JSON (no marker) is only treated as a call if it carries
+        // `arguments`/`parameters` — a real Llama call always does (`parameters`,
+        // even `{}`), so a plain JSON DATA answer with a stray `name` key (e.g.
+        // {"name":"Alice","age":30}) isn't misread as a tool call.
+        let trimmed = text.trim();
+        let explicit = trimmed.starts_with("<|python_tag|>");
+        let candidate = trimmed
+            .strip_prefix("<|python_tag|>")
+            .map(str::trim)
+            .unwrap_or(trimmed);
+        let looks_json = candidate.starts_with('{') || candidate.starts_with('[');
+        if explicit || looks_json {
+            let tool_shaped = |v: &serde_json::Value| {
+                explicit || v.get("arguments").is_some() || v.get("parameters").is_some()
+            };
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(candidate) {
+                for v in &arr {
+                    if tool_shaped(v) {
+                        if let Some(c) = call_from_value(v) {
+                            calls.push(c);
+                        }
+                    }
+                }
+            } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if tool_shaped(&v) {
+                    if let Some(c) = call_from_value(&v) {
+                        calls.push(c);
+                    }
+                }
+            }
+        }
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// Byte length of the balanced JSON value starting at `s[0]` (`{` or `[`),
+/// string-/escape-aware so brackets inside string values don't miscount.
+/// `None` if `s` doesn't start with a bracket or never balances.
+fn balanced_json_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let (open, close) = match bytes.first()? {
+        b'{' => (b'{', b'}'),
+        b'[' => (b'[', b']'),
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// One `ToolCall` from a parsed JSON value. `name` required (else None → skip).
+/// `arguments` (preferred) or `parameters` (Llama alias); default "{}"; an
+/// already-string arguments value passes through.
+fn call_from_value(v: &serde_json::Value) -> Option<ToolCall> {
+    let name = v.get("name")?.as_str()?.to_string();
+    let arguments = match v.get("arguments").or_else(|| v.get("parameters")) {
+        None => "{}".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => serde_json::to_string(other).ok()?,
+    };
+    Some(ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall { name, arguments },
+    })
+}
+
+/// Parse the Qwen3 `<function=NAME>…<parameter=K>V</parameter>…</function>` XML
+/// tool-call dialect emitted inside a `<tool_call>` block by some Qwen3/MoE
+/// templates (instead of the JSON Hermes form). Parameter values are kept as
+/// strings (the model emits text); arguments is serialised to a JSON object.
+fn call_from_xml_function(block: &str) -> Option<ToolCall> {
+    let fstart = block.find("<function=")?;
+    let after = &block[fstart + "<function=".len()..];
+    let nend = after.find('>')?;
+    let name = after[..nend].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &after[nend + 1..];
+    while let Some(ps) = rest.find("<parameter=") {
+        let pa = &rest[ps + "<parameter=".len()..];
+        let Some(ke) = pa.find('>') else { break };
+        let key = pa[..ke].trim().to_string();
+        let val_rest = &pa[ke + 1..];
+        let Some(ve) = val_rest.find("</parameter>") else {
+            break;
+        };
+        if !key.is_empty() {
+            args.insert(
+                key,
+                serde_json::Value::String(val_rest[..ve].trim().to_string()),
+            );
+        }
+        rest = &val_rest[ve + "</parameter>".len()..];
+    }
+    Some(ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name,
+            arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
+        },
+    })
 }
 
 /// `AppState`-free chat-prompt renderer for in-process callers. Parses the
@@ -687,18 +956,25 @@ impl ChatPromptRenderer {
         }
     }
 
-    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
-    /// template is set or rendering fails.
-    pub fn render(&self, messages: &[ChatMessage]) -> String {
+    /// Render `messages` with optional `tools`, falling back to
+    /// [`render_prompt_legacy`] when no template is set or rendering fails.
+    pub fn render_with_tools(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
         if let Some(env) = &self.env {
-            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true) {
+            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true, tools)
+            {
                 Ok(s) => return s,
                 Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter");
+                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter")
                 }
             }
         }
         render_prompt_legacy(messages)
+    }
+
+    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
+    /// template is set or rendering fails.
+    pub fn render(&self, messages: &[ChatMessage]) -> String {
+        self.render_with_tools(messages, None)
     }
 }
 
@@ -716,7 +992,12 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(&state, &req.messages, req.enable_thinking);
+    let prompt = render_prompt(
+        &state,
+        &req.messages,
+        req.enable_thinking,
+        req.tools.as_deref(),
+    );
     // Degenerate input (no messages, or a render that collapses to nothing)
     // is a client error. Reject here with 400 rather than admitting an empty
     // prompt to the engine, which would generate nothing and return a 200
@@ -784,9 +1065,20 @@ async fn chat_completions(
             .as_ref()
             .map(|o| o.include_usage)
             .unwrap_or(false);
-        return stream_completion(state, req.model, task, permit, inflight, include_usage)
-            .await
-            .into_response();
+        let tool_choice = req.tool_choice.clone();
+        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        return stream_completion(
+            state,
+            req.model,
+            task,
+            permit,
+            inflight,
+            include_usage,
+            tool_choice,
+            tools_present,
+        )
+        .await
+        .into_response();
     }
 
     // Non-streaming: collect full output. Hold the permit + in-flight guard
@@ -858,6 +1150,16 @@ async fn chat_completions(
         }
     }
 
+    let (message, choice_finish) = build_choice(
+        buf,
+        &req.tool_choice,
+        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+    );
+    // A parsed tool call overrides the streamed length/stop detection;
+    // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
+    if choice_finish == "tool_calls" {
+        finish_reason = "tool_calls";
+    }
     Json(ChatCompletionResponse {
         id: task_id,
         object: "chat.completion",
@@ -865,10 +1167,7 @@ async fn chat_completions(
         model: req.model,
         choices: vec![ChatChoice {
             index: 0,
-            message: ChatChoiceMessage {
-                role: "assistant",
-                content: buf,
-            },
+            message,
             finish_reason,
             logprobs: if logprobs_content.is_empty() {
                 None
@@ -1182,6 +1481,9 @@ async fn stream_text_completion(
         .into_response()
 }
 
+// Streaming carries the usage handles (inflight/include_usage) and the tool
+// gate (tool_choice/tools_present) alongside the task plumbing.
+#[allow(clippy::too_many_arguments)]
 async fn stream_completion(
     state: AppState,
     model: String,
@@ -1189,6 +1491,8 @@ async fn stream_completion(
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
     include_usage: bool,
+    tool_choice: Option<serde_json::Value>,
+    tools_present: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
@@ -1200,6 +1504,69 @@ async fn stream_completion(
             return engine_error_response(err);
         }
     };
+    // Buffer + emit one tool delta only when tools are present and not disabled.
+    let tools_active =
+        tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
+    if tools_active {
+        let _permit = permit; // hold the slot until generation completes
+        let _inflight = inflight; // hold the in-flight gauge until generation completes
+        let mut buf = String::new();
+        let mut err: Option<String> = None;
+        let mut stream = chunk_stream;
+        while let Some(chunk) = stream.next().await {
+            if let Some(reason) = &chunk.error {
+                err = Some(reason.clone());
+                break;
+            }
+            buf.push_str(&chunk.text);
+        }
+        let frames: Vec<Bytes> = if let Some(reason) = err {
+            warn!(task = %task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
+            vec![Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": task_id.clone(), "object": "error",
+                    "error": { "message": reason, "type": "engine_error" },
+                })
+            ))]
+        } else if let Some(calls) = parse_tool_calls(&buf) {
+            let tool_calls: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| {
+                serde_json::json!({ "index": i, "id": c.id.clone(), "type": c.r#type.clone(),
+                    "function": { "name": c.function.name.clone(), "arguments": c.function.arguments.clone() } })
+            }).collect();
+            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": { "role": "assistant", "tool_calls": tool_calls }, "finish_reason": serde_json::Value::Null }] });
+            let finish = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": {}, "finish_reason": "tool_calls" }] });
+            vec![
+                Bytes::from(format!("data: {delta}\n\n")),
+                Bytes::from(format!("data: {finish}\n\n")),
+            ]
+        } else {
+            let delta = serde_json::json!({ "id": task_id.clone(), "object": "chat.completion.chunk",
+                "created": now_unix(), "model": model.clone(), "choices": [{ "index": 0,
+                "delta": { "role": "assistant", "content": buf }, "finish_reason": "stop" }] });
+            vec![Bytes::from(format!("data: {delta}\n\n"))]
+        };
+        let body = stream::iter(
+            frames
+                .into_iter()
+                .map(Ok::<Bytes, std::convert::Infallible>),
+        )
+        .chain(stream::once(async {
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"))
+        }));
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(body))
+            .unwrap()
+            .into_response();
+    }
     // Clone the counter handle for per-chunk token accounting in the
     // formatter closure below.
     let stats = state.stats.clone();
@@ -1891,9 +2258,12 @@ mod tests {
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true)
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
@@ -1902,10 +2272,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_arguments_render_as_object_for_hf_templates() {
+        // Regression: HF tool templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
+        // which needs a JSON object. OpenAI ships `arguments` as a string; passing it through
+        // verbatim makes minijinja error ("cannot convert value into pairs") and the whole
+        // request silently falls back to the legacy `role: content` formatter.
+        const T: &str = "{%- for m in messages -%}{%- if m.tool_calls -%}\
+            {%- for tc in m.tool_calls -%}fn={{ tc.function.name }};\
+            {%- for k, v in tc.function.arguments | items -%}{{ k }}={{ v }};{%- endfor -%}\
+            {%- endfor -%}{%- endif -%}{%- endfor -%}";
+        let msgs = [ChatMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            name: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"Tokyo"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        }];
+        let env = build_chat_env(T).expect("template parses");
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
+            .expect("arguments|items must not fail the render");
+        assert!(out.contains("fn=get_weather"), "out={out}");
+        assert!(out.contains("city=Tokyo"), "out={out}");
+    }
+
+    #[test]
     fn chat_prompt_renderer_renders_then_falls_back() {
         let msgs = [ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -1955,5 +2359,496 @@ mod tests {
             "empty/whitespace chat_template.jinja must yield template=None, got {:?}",
             cfg.template
         );
+    }
+
+    #[test]
+    fn request_accepts_tools_and_tool_choice() {
+        let raw = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather",
+            "description":"Get weather","parameters":{"type":"object",
+            "properties":{"city":{"type":"string"}}}}}]}"#;
+        let req: ChatCompletionRequest = serde_json::from_str(raw).unwrap();
+        let tools = req.tools.expect("tools parse");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].r#type, "function");
+        assert_eq!(tools[0].function["name"], "get_weather");
+        assert_eq!(req.tool_choice.unwrap(), serde_json::json!("auto"));
+    }
+
+    #[test]
+    fn message_accepts_null_content_and_tool_calls() {
+        let raw = r#"{"role":"assistant","content":null,
+            "tool_calls":[{"id":"call_abc","type":"function",
+            "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert!(m.content.is_empty(), "null content -> empty string");
+        let calls = m.tool_calls.expect("tool_calls parse");
+        assert_eq!(calls[0].id, "call_abc");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"Paris\"}");
+    }
+
+    #[test]
+    fn message_accepts_tool_role_with_tool_call_id() {
+        let raw = r#"{"role":"tool","content":"{\"temp_c\":18}",
+            "tool_call_id":"call_abc","name":"get_weather"}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(m.name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
+    fn non_tool_choice_message_serializes_content_as_string() {
+        let msg = ChatChoiceMessage {
+            role: "assistant",
+            content: Some("hi".into()),
+            tool_calls: None,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["content"], "hi");
+        assert!(
+            v.get("tool_calls").is_none(),
+            "no tool_calls key on non-tool message"
+        );
+    }
+
+    #[test]
+    fn parse_llama_python_tag_single() {
+        let calls = parse_tool_calls(
+            "<|python_tag|>{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Paris\"}}",
+        )
+        .expect("one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()
+                ["city"],
+            "Paris"
+        );
+        assert!(calls[0].id.starts_with("call_"));
+        assert_eq!(calls[0].r#type, "function");
+    }
+
+    #[test]
+    fn parse_bare_json_requires_tool_shape() {
+        // M3(b): a plain JSON DATA answer with a stray `name` key (no marker, no
+        // args/params) must NOT be misread as a tool call.
+        assert!(parse_tool_calls(r#"{"name":"Alice","age":30}"#).is_none());
+        assert!(parse_tool_calls(r#"[{"name":"Bob"}]"#).is_none());
+        // A real bare Llama call (carries `parameters`, even `{}`) still parses.
+        let calls = parse_tool_calls(r#"{"name":"get_weather","parameters":{"city":"Paris"}}"#)
+            .expect("bare call");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let calls = parse_tool_calls(r#"{"name":"ping","arguments":{}}"#).expect("bare empty-args");
+        assert_eq!(calls[0].function.name, "ping");
+        // The explicit <|python_tag|> marker stays lenient (no params needed).
+        let calls = parse_tool_calls(r#"<|python_tag|>{"name":"now"}"#).expect("explicit no-arg");
+        assert_eq!(calls[0].function.name, "now");
+    }
+
+    #[test]
+    fn parse_qwen_hermes_single() {
+        let calls = parse_tool_calls("<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>").expect("one");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()
+                ["city"],
+            "Paris"
+        );
+    }
+
+    #[test]
+    fn parse_qwen3_xml_function_dialect() {
+        // Qwen3.6-MoE emits the <function=NAME><parameter=K>V</parameter></function>
+        // XML dialect inside <tool_call> (not the JSON Hermes form). Live rig: the MoE
+        // produced exactly this, finish=stop because the parser didn't recognise it.
+        let calls = parse_tool_calls(
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+        )
+        .expect("one tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()
+                ["city"],
+            "Paris"
+        );
+        assert!(calls[0].id.starts_with("call_"));
+        assert_eq!(calls[0].r#type, "function");
+    }
+
+    #[test]
+    fn parse_qwen3_xml_multi_param() {
+        let calls = parse_tool_calls(
+            "<tool_call><function=f><parameter=a>1</parameter><parameter=b>two</parameter></function></tool_call>",
+        )
+        .expect("one");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["a"], "1");
+        assert_eq!(args["b"], "two");
+    }
+
+    #[test]
+    fn parse_tool_call_arg_containing_close_tag() {
+        // An argument value that literally contains "</tool_call>" must not
+        // truncate the block (brace-balanced scan, not first-close-tag).
+        let calls = parse_tool_calls(
+            "<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"</tool_call> bye\"}}</tool_call>",
+        )
+        .expect("one call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "echo");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["text"], "</tool_call> bye");
+    }
+
+    #[test]
+    fn parse_tool_calls_brace_balance_stress() {
+        // 1) nested object/array args + a '}' and a '{' inside a string value +
+        //    an escaped quote — exact JSON must survive the balanced scan.
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"f","arguments":{"o":{"k":1},"a":[1,2],"s":"a{b}c \" }"}}</tool_call>"#,
+        )
+        .expect("nested");
+        assert_eq!(calls.len(), 1);
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["o"]["k"], 1);
+        assert_eq!(args["a"][1], 2);
+        assert_eq!(args["s"], "a{b}c \" }");
+
+        // 2) two blocks; the FIRST carries '</tool_call>' AND '}' inside a value.
+        //    Both calls must survive (no truncation, no bleed into the next).
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"a","arguments":{"t":"</tool_call> } x"}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+        )
+        .expect("two");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "a");
+        assert_eq!(calls[1].function.name, "b");
+        assert_ne!(calls[0].id, calls[1].id);
+
+        // 3) XML dialect still parses through the fallback (regression).
+        let calls = parse_tool_calls(
+            "<tool_call><function=g><parameter=x>v</parameter></function></tool_call>",
+        )
+        .expect("xml");
+        assert_eq!(calls[0].function.name, "g");
+
+        // 4) truncated/unbalanced JSON block => skipped, no panic; a later valid
+        //    block still parses.
+        let calls = parse_tool_calls(
+            r#"<tool_call>{"name":"bad","arguments":{"x":1</tool_call><tool_call>{"name":"ok","arguments":{}}</tool_call>"#,
+        )
+        .expect("recovers");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "ok");
+
+        // 5) a lone unbalanced block never panics and yields nothing.
+        assert!(parse_tool_calls(r#"<tool_call>{"name":"x","arguments":{"a":"#).is_none());
+    }
+
+    #[test]
+    fn parse_qwen_multiple_distinct_ids() {
+        let calls = parse_tool_calls(
+            "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call>\
+            <tool_call>{\"name\":\"b\",\"arguments\":{\"x\":1}}</tool_call>",
+        )
+        .expect("two");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "a");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[1].function.name, "b");
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn parse_skips_malformed_first_block_keeps_valid() {
+        let calls = parse_tool_calls(
+            "<tool_call>{bad</tool_call><tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>",
+        )
+        .expect("one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "b");
+    }
+
+    #[test]
+    fn parse_plain_prose_is_none() {
+        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
+        assert!(parse_tool_calls("you could call <tool_call> here").is_none());
+    }
+
+    #[test]
+    fn parse_missing_name_and_truncated_no_panic() {
+        assert!(parse_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>").is_none());
+        assert!(parse_tool_calls("<tool_call>{\"name\":\"x\",\"argum").is_none());
+        assert!(parse_tool_calls("<|python_tag|>{\"name\":\"x\"").is_none());
+    }
+
+    #[test]
+    fn parse_arguments_already_string_passthrough() {
+        let calls = parse_tool_calls(
+            "<tool_call>{\"name\":\"f\",\"arguments\":\"{\\\"k\\\":1}\"}</tool_call>",
+        )
+        .expect("one");
+        assert_eq!(calls[0].function.arguments, "{\"k\":1}");
+    }
+
+    const TOOL_TEMPLATE: &str = "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}\
+        {% if m.tool_calls %}[CALLS:{% for c in m.tool_calls %}{{ c.function.name }}{% endfor %}]{% endif %}\
+        {% if m.tool_call_id %}[TCID:{{ m.tool_call_id }}]{% endif %}\n{% endfor %}\
+        {% if tools %}[TOOLS:{% for t in tools %}{{ t.function.name }}{% endfor %}]{% endif %}";
+
+    #[test]
+    fn renderer_forwards_tools_into_template() {
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name":"get_weather"}),
+        }];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools)).unwrap();
+        assert!(
+            out.contains("[TOOLS:get_weather]"),
+            "tools not forwarded: {out}"
+        );
+    }
+
+    #[test]
+    fn chat_env_supports_tojson_filter() {
+        // Guards the minijinja `json` feature. Real Llama-3.1/Qwen instruct
+        // templates serialize the tool schema via `{{ tool | tojson }}`; without
+        // `json` the filter is unknown, render_with_chat_env errors, and
+        // render_with_tools silently falls back to the legacy formatter —
+        // dropping tools from the prompt so the model never sees them.
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name":"get_weather"}),
+        }];
+        let env = build_chat_env("{% if tools %}{{ tools | tojson }}{% endif %}")
+            .expect("tojson template must parse");
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools))
+            .expect("tojson template must render (needs minijinja `json` feature)");
+        assert!(
+            out.contains("get_weather"),
+            "tojson did not serialize tools: {out}"
+        );
+    }
+
+    #[test]
+    fn renderer_forwards_assistant_tool_calls_and_tool_result() {
+        let env = build_chat_env(TOOL_TEMPLATE).unwrap();
+        let msgs = [
+            ChatMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                name: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    r#type: "function".into(),
+                    function: FunctionCall {
+                        name: "get_weather".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "18C".into(),
+                name: Some("get_weather".into()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
+        assert!(
+            out.contains("[CALLS:get_weather]"),
+            "assistant tool_calls not rendered: {out}"
+        );
+        assert!(
+            out.contains("[TCID:call_1]"),
+            "tool_call_id not rendered: {out}"
+        );
+    }
+
+    #[test]
+    fn build_choice_emits_tool_calls_when_parsed() {
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"
+                .into(),
+            &Some(serde_json::json!("auto")),
+            true,
+        );
+        assert_eq!(fr, "tool_calls");
+        assert!(m.content.is_none());
+        assert_eq!(m.tool_calls.unwrap()[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn build_choice_none_skips_parse() {
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
+            &Some(serde_json::json!("none")),
+            true,
+        );
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert!(m.content.is_some());
+    }
+
+    #[test]
+    fn build_choice_no_tools_skips_parse() {
+        // tools absent -> never parse, even if output looks like a tool call.
+        let (m, fr) = build_choice(
+            "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
+            &Some(serde_json::json!("auto")),
+            false,
+        );
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert!(m.content.is_some());
+    }
+
+    #[test]
+    fn build_choice_plain_is_stop() {
+        let (m, fr) = build_choice("hello".into(), &None, true);
+        assert_eq!(fr, "stop");
+        assert!(m.tool_calls.is_none());
+        assert_eq!(m.content.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn tool_request_returns_tool_calls_finish_e2e() {
+        let app = make_app().await;
+        let tc =
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather"}}],"stream":false});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+        assert!(v["choices"][0]["message"]["content"].is_null());
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_request_emits_indexed_tool_delta() {
+        let app = make_app().await;
+        let tc =
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"get_weather"}}],"stream":true});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        let (mut saw_tool, mut saw_finish) = (false, false);
+        for line in body.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            if line.trim() == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(line).unwrap();
+            let d = &v["choices"][0]["delta"];
+            if d.get("tool_calls").is_some() {
+                saw_tool = true;
+                assert_eq!(d["tool_calls"][0]["index"], 0);
+                assert_eq!(d["tool_calls"][0]["function"]["name"], "get_weather");
+                assert_eq!(d["role"], "assistant");
+            }
+            if v["choices"][0]["finish_reason"] == "tool_calls" {
+                saw_finish = true;
+            }
+        }
+        assert!(saw_tool, "no tool_calls delta: {body}");
+        assert!(saw_finish, "no tool_calls finish: {body}");
+    }
+
+    #[tokio::test]
+    async fn streaming_non_tool_is_per_token_with_stop() {
+        let app = make_app().await;
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"alpha bravo charlie"}],"stream":true});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+        assert!(
+            !body.contains("tool_calls"),
+            "non-tool stream must not mention tool_calls: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_engine_error_emits_error_event() {
+        let app = make_app().await;
+        let payload = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"__engine_error__"}],
+            "tool_choice":"auto","tools":[{"type":"function","function":{"name":"x"}}],"stream":true});
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains("\"object\":\"error\""),
+            "expected SSE error event: {body}"
+        );
+        assert!(!body.contains("tool_calls"), "{body}");
     }
 }

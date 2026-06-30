@@ -27,7 +27,10 @@ bytes = { workspace = true }
 # `{% macro %}` helpers for tool/role formatting); without it the template
 # fails to parse and rendering silently falls back to the legacy formatter,
 # which degenerates instruct models. `multi_template` covers `{% include %}`.
-minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template"] }
+# `json` registers the `tojson` filter that Llama-3.1/Qwen tool templates use to
+# serialize tool schemas; without it tool requests error and drop to the legacy
+# formatter, silently stripping tools from the prompt.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 
 [dev-dependencies]
