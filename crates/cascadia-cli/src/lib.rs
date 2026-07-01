@@ -596,6 +596,27 @@ pub struct ShardArgs {
     #[arg(long, value_enum, default_value_t = ShardQuant::Int4)]
     pub quantization: ShardQuant,
 
+    /// Deployment target. `npu` emits a stateless static-shape shard
+    /// (no make_stateful, fixed seq/KV) that the NPU compiler accepts;
+    /// `cpu-gpu` (default) emits the stateful dynamic-shape shard.
+    #[arg(long, value_enum, default_value_t = ShardTarget::CpuGpu)]
+    pub target: ShardTarget,
+
+    /// NPU only: fixed query-window length. Must be 1 for `--target npu`
+    /// (the runtime decodes one token per step); ignored otherwise.
+    #[arg(long, default_value_t = 1)]
+    pub static_seq: u32,
+
+    /// NPU only: fixed total context length (past-KV length =
+    /// static_context - static_seq); ignored without `--target npu`.
+    #[arg(long, default_value_t = 1024)]
+    pub static_context: u32,
+
+    /// torch default dtype during export. FP16 reduces memory and is
+    /// required for `--target npu` (the runtime feeds KV as f16).
+    #[arg(long, value_enum, default_value_t = ShardDtype::Fp16)]
+    pub default_dtype: ShardDtype,
+
     /// Explicit per-stage layer boundaries, comma-separated. With
     /// `--num-stages 3 --layer-split 16,24` on a 32-layer model:
     /// stage 0 = [0,16), stage 1 = [16,24), stage 2 = [24,32).
@@ -636,6 +657,39 @@ impl ShardQuant {
             Self::Int4 => "int4",
             Self::Int4Asym => "int4_asym",
             Self::Int8 => "int8",
+        }
+    }
+}
+
+/// Deployment target for a shard. `npu` emits a stateless static-shape
+/// shard the NPU compiler accepts; `cpu-gpu` emits the stateful shard.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardTarget {
+    #[value(name = "cpu-gpu")]
+    CpuGpu,
+    Npu,
+}
+
+impl ShardTarget {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::CpuGpu => "cpu-gpu",
+            Self::Npu => "npu",
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum ShardDtype {
+    Fp16,
+    Fp32,
+}
+
+impl ShardDtype {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Fp16 => "fp16",
+            Self::Fp32 => "fp32",
         }
     }
 }
@@ -1580,8 +1634,62 @@ const QWEN36_SCRIPT: &str = include_str!(concat!(
     "/../../tools/qwen36_surgery/export_qwen36_moe.py"
 ));
 
+/// Assemble the flag list passed to the embedded Python exporter (the args
+/// after `python -u <script>`). Pure + side-effect-free so it's unit-testable
+/// without spawning Python. Order mirrors `export_shards.py`'s argparse:
+/// `--model --output-dir --num-stages --quantization --target --default-dtype`,
+/// then `--static-seq/--static-context` (NPU only — the exporter warns if they
+/// appear on the cpu-gpu path), then `--layer-split`/`--stage` when set.
+///
+/// Fails fast on the one NPU constraint cheap to check here (fp16 default
+/// dtype); the exporter enforces the rest (static-seq == 1, context > seq).
+fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
+    if args.target == ShardTarget::Npu && !matches!(args.default_dtype, ShardDtype::Fp16) {
+        return Err(anyhow!("--default-dtype must be fp16 for --target npu"));
+    }
+    let mut flags = vec![
+        "--model".into(),
+        args.model.clone(),
+        "--output-dir".into(),
+        args.output_dir.clone(),
+        "--num-stages".into(),
+        args.num_stages.to_string(),
+        "--quantization".into(),
+        args.quantization.as_arg().into(),
+        "--target".into(),
+        args.target.as_arg().into(),
+        "--default-dtype".into(),
+        args.default_dtype.as_arg().into(),
+    ];
+    if args.target == ShardTarget::Npu {
+        flags.push("--static-seq".into());
+        flags.push(args.static_seq.to_string());
+        flags.push("--static-context".into());
+        flags.push(args.static_context.to_string());
+    }
+    if let Some(s) = &args.layer_split {
+        flags.push("--layer-split".into());
+        flags.push(s.clone());
+    }
+    if let Some(s) = args.stage {
+        flags.push("--stage".into());
+        flags.push(s.to_string());
+    }
+    Ok(flags)
+}
+
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
     use std::process::{Command, Stdio};
+
+    // Build (and validate) the exporter flag list up front so the NPU
+    // fail-fast guard fires before we probe Python or spawn anything.
+    let flags = shard_exporter_flags(&args)?;
+
+    // static-seq/static-context are NPU-only; the exporter ignores them on the
+    // cpu-gpu path. Warn if the user set them there so it isn't silent.
+    if args.target != ShardTarget::Npu && (args.static_seq != 1 || args.static_context != 1024) {
+        eprintln!("warning: --static-seq/--static-context are ignored without --target npu");
+    }
 
     let python = if let Some(p) = args.python.as_deref() {
         p.to_string()
@@ -1670,27 +1778,14 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
             .with_context(|| format!("writing embedded {name} to temp dir"))?;
     }
 
-    // Build python argv.
+    // Build python argv: `python -u <script> <flags…>` (flags already
+    // validated + assembled by `shard_exporter_flags`).
     let mut cmd = Command::new(&python);
-    cmd.arg("-u")
-        .arg(&script_path)
-        .arg("--model")
-        .arg(&args.model)
-        .arg("--output-dir")
-        .arg(&args.output_dir)
-        .arg("--num-stages")
-        .arg(args.num_stages.to_string())
-        .arg("--quantization")
-        .arg(args.quantization.as_arg());
-    if let Some(s) = &args.layer_split {
-        cmd.arg("--layer-split").arg(s);
-    }
-    if let Some(s) = args.stage {
-        cmd.arg("--stage").arg(s.to_string());
-    }
+    cmd.arg("-u").arg(&script_path).args(&flags);
     eprintln!(
-        "Running exporter: {} -u <embedded> --model {} --output-dir {} --num-stages {}",
-        python, args.model, args.output_dir, args.num_stages
+        "Running exporter: {} -u <embedded> {}",
+        python,
+        flags.join(" ")
     );
     let status = cmd
         .stdin(Stdio::null())
@@ -1874,5 +1969,151 @@ mod cli_version_tests {
             .expect_err("--version stops parsing with a DisplayVersion error");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a `cascadia shard …` argv into its `ShardArgs` (panics on a
+    /// non-shard parse) so the flag-builder tests exercise the real clap path.
+    fn parse_shard(argv: &[&str]) -> ShardArgs {
+        let cli = Cli::try_parse_from(argv).expect("parse shard argv");
+        match cli.cmd {
+            Command::Shard(args) => args,
+            _ => panic!("expected shard subcommand"),
+        }
+    }
+
+    /// True if `flag` appears immediately followed by `value` in the argv.
+    fn has_pair(flags: &[String], flag: &str, value: &str) -> bool {
+        flags.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    /// NPU with a non-fp16 default dtype fails fast in the pure builder.
+    #[test]
+    fn shard_flags_npu_fp32_is_err() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--target",
+            "npu",
+            "--default-dtype",
+            "fp32",
+        ]);
+        assert!(shard_exporter_flags(&args).is_err());
+    }
+
+    /// NPU (fp16) forwards target, dtype, and the static-shape flags.
+    #[test]
+    fn shard_flags_npu_forwards_static() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--target",
+            "npu",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("npu fp16 flags");
+        assert!(has_pair(&flags, "--target", "npu"));
+        assert!(has_pair(&flags, "--default-dtype", "fp16"));
+        assert!(flags.iter().any(|f| f == "--static-seq"));
+        assert!(flags.iter().any(|f| f == "--static-context"));
+    }
+
+    /// Default (cpu-gpu) forwards target + dtype but omits the static flags.
+    #[test]
+    fn shard_flags_cpu_gpu_omits_static() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("cpu-gpu flags");
+        assert!(has_pair(&flags, "--target", "cpu-gpu"));
+        assert!(has_pair(&flags, "--default-dtype", "fp16"));
+        assert!(!flags.iter().any(|f| f == "--static-seq"));
+        assert!(!flags.iter().any(|f| f == "--static-context"));
+    }
+
+    /// `--layer-split`/`--stage` are forwarded when present.
+    #[test]
+    fn shard_flags_forwards_layer_split_and_stage() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--layer-split",
+            "8",
+            "--stage",
+            "1",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("layer-split/stage flags");
+        assert!(has_pair(&flags, "--layer-split", "8"));
+        assert!(has_pair(&flags, "--stage", "1"));
+    }
+
+    /// `--target npu` parses into the NPU variant.
+    #[test]
+    fn shard_target_npu_parses() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--target",
+            "npu",
+        ])
+        .expect("parse shard --target npu");
+        let Command::Shard(args) = cli.cmd else {
+            panic!("expected shard subcommand");
+        };
+        assert_eq!(args.target, ShardTarget::Npu);
+    }
+
+    /// Omitting `--target` defaults to the cpu-gpu path (backward compatible).
+    #[test]
+    fn shard_target_defaults_to_cpu_gpu() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+        ])
+        .expect("parse shard without --target");
+        let Command::Shard(args) = cli.cmd else {
+            panic!("expected shard subcommand");
+        };
+        assert_eq!(args.target, ShardTarget::CpuGpu);
     }
 }
