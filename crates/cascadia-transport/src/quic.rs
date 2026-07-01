@@ -72,7 +72,7 @@ fn quic_err(context: &str, e: impl std::fmt::Display) -> TransportError {
     TransportError::Quic(format!("{context}: {e}"))
 }
 
-/// Shared transport params (keep-alive + idle timeout) for both ends.
+/// Shared transport params (keep-alive + idle timeout + flow control).
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     tc.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
@@ -80,13 +80,43 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     if let Ok(idle) = quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT) {
         tc.max_idle_timeout(Some(idle));
     }
+    // Generous flow-control windows. With quinn's defaults a large activation
+    // frame stalls on MAX_STREAM_DATA / MAX_DATA credit round-trips — measured
+    // ~2.5 RTT for a 64 KiB frame at 20-50 ms RTT (netem). The relay is one
+    // long-lived connection per stage carrying frames up to MAX_TENSOR_BYTES,
+    // so a fixed multi-MiB window (cheap memory) lets a frame stream in ~1 RTT.
+    let stream_win: u32 = 16 * 1024 * 1024; // 16 MiB per stream
+    let conn_win: u32 = 32 * 1024 * 1024; // 32 MiB connection-wide
+    tc.stream_receive_window(stream_win.into());
+    tc.receive_window(conn_win.into());
+    tc.send_window(conn_win as u64);
     Arc::new(tc)
 }
 
 /// Explicit ring provider — avoids depending on a process-default
 /// `CryptoProvider` being installed (rustls 0.23 requires one otherwise).
+///
+/// `CASCADIA_QUIC_CIPHER` optionally pins the TLS 1.3 AEAD to `aesgcm` or
+/// `chacha`. Diagnostic knob: lets a benchmark measure crypto's share of the
+/// per-byte cost. Unset = rustls' normal preference (AES-GCM where AES-NI is
+/// present, which is every CPU we target).
 fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    use rustls::crypto::ring::cipher_suite::{
+        TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256,
+    };
+    let mut provider = rustls::crypto::ring::default_provider();
+    // AES-128-GCM must stay present regardless — QUIC derives its *initial*
+    // packet keys from it. The negotiated 1-RTT suite is the list head.
+    match std::env::var("CASCADIA_QUIC_CIPHER").as_deref() {
+        Ok("aesgcm") | Ok("aes") => {
+            provider.cipher_suites = vec![TLS13_AES_128_GCM_SHA256];
+        }
+        Ok("chacha") | Ok("chacha20") => {
+            provider.cipher_suites = vec![TLS13_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256];
+        }
+        _ => {}
+    }
+    Arc::new(provider)
 }
 
 /// Build a QUIC server config from a fresh ephemeral self-signed cert.
