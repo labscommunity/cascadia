@@ -1108,6 +1108,8 @@ pub struct Gemma4Builder {
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
+    pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
     spec: Option<ShardSpec>,
     tokenizer: Option<Arc<Tokenizer>>,
@@ -1154,6 +1156,11 @@ impl Gemma4Builder {
         self.dyn_quant_group = Some(group.into());
         self
     }
+    /// Append extra `(key, value)` OV plugin properties (CLI perf flags).
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties.extend(props);
+        self
+    }
 
     fn plugin(&self) -> PluginConfig {
         let mut p = PluginConfig::new();
@@ -1165,6 +1172,9 @@ impl Gemma4Builder {
         }
         if let Some(g) = &self.dyn_quant_group {
             p = p.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
+        for (key, val) in &self.ov_properties {
+            p = p.with(key, val);
         }
         p
     }

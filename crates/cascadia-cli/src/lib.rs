@@ -291,6 +291,49 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
 
+    /// OV performance hint: LATENCY, THROUGHPUT, or CUMULATIVE_THROUGHPUT.
+    /// LATENCY suits single-user decode; THROUGHPUT enables NUM_STREAMS
+    /// auto-tuning. See OpenVINO high-level-performance-hints docs (2026).
+    #[arg(long, value_name = "MODE")]
+    pub ov_performance_mode: Option<String>,
+
+    /// OV inference precision hint: f16, bf16, or f32. Strongly recommended
+    /// on Xe2/Battlemage GPUs, where f16/bf16 share XMX throughput but the
+    /// default can silently fall back to f32. See OpenVINO gpu-device docs.
+    #[arg(long, value_name = "PREC")]
+    pub ov_inference_precision: Option<String>,
+
+    /// OV number of parallel inference streams (NUM_STREAMS).
+    #[arg(long, value_name = "N")]
+    pub ov_num_streams: Option<u32>,
+
+    /// OV host CPU inference thread cap (INFERENCE_NUM_THREADS).
+    #[arg(long, value_name = "N")]
+    pub ov_num_threads: Option<u32>,
+
+    /// OV: allow internal auto-batching on the GPU plugin (ALLOW_AUTO_BATCHING).
+    #[arg(long)]
+    pub ov_allow_auto_batching: bool,
+
+    /// OV execution mode: ACCURACY or PERFORMANCE (EXECUTION_MODE_HINT).
+    #[arg(long, value_name = "MODE")]
+    pub ov_execution_mode: Option<String>,
+
+    /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
+    /// Silently dropped unless --device names an NPU plugin.
+    #[arg(long, value_name = "TOKS")]
+    pub npu_prefill_chunk_size: Option<u32>,
+
+    /// NPU max prompt length (MAX_PROMPT_LEN, static-shape constraint).
+    /// Silently dropped unless --device names an NPU plugin.
+    #[arg(long, value_name = "TOKS")]
+    pub npu_max_prompt_len: Option<u32>,
+
+    /// NPU min response length (MIN_RESPONSE_LEN, static-shape constraint).
+    /// Silently dropped unless --device names an NPU plugin.
+    #[arg(long, value_name = "TOKS")]
+    pub npu_min_response_len: Option<u32>,
+
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
     pub draft_model: Option<String>,
@@ -495,6 +538,15 @@ impl WorkerArgs {
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
+            ov_performance_mode: None,
+            ov_inference_precision: None,
+            ov_num_streams: None,
+            ov_num_threads: None,
+            ov_allow_auto_batching: false,
+            ov_execution_mode: None,
+            npu_prefill_chunk_size: None,
+            npu_max_prompt_len: None,
+            npu_min_response_len: None,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -668,6 +720,62 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// True when `device` names an OpenVINO NPU plugin (e.g. "NPU", "NPU.0").
+/// NPU-only plugin properties error if passed to a non-NPU plugin, so the
+/// gate below strips them unless this returns true. Matching the issue #13
+/// contract, the check is a case-insensitive `starts_with("NPU")`; compound
+/// AUTO/HETERO device strings that merely mention NPU are deliberately not
+/// treated as NPU targets.
+fn device_is_npu(device: &str) -> bool {
+    device.trim().to_ascii_uppercase().starts_with("NPU")
+}
+
+/// Translate the `--ov-*` / `--npu-*` performance flags on `args` into the
+/// `(key, value)` OpenVINO plugin properties consumed by every OV engine
+/// builder. NPU-only properties are dropped unless `--device` names an NPU
+/// plugin. Returns entries in a stable order (general hints first, NPU
+/// knobs last) so callers and tests see a deterministic list.
+fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
+    let mut props: Vec<(String, String)> = Vec::new();
+
+    // General performance hints — valid on every OV plugin.
+    if let Some(mode) = &args.ov_performance_mode {
+        props.push(("PERFORMANCE_HINT".into(), mode.clone()));
+    }
+    if let Some(prec) = &args.ov_inference_precision {
+        props.push(("INFERENCE_PRECISION_HINT".into(), prec.clone()));
+    }
+    if let Some(n) = args.ov_num_streams {
+        props.push(("NUM_STREAMS".into(), n.to_string()));
+    }
+    if let Some(n) = args.ov_num_threads {
+        props.push(("INFERENCE_NUM_THREADS".into(), n.to_string()));
+    }
+    if args.ov_allow_auto_batching {
+        props.push(("ALLOW_AUTO_BATCHING".into(), "true".into()));
+    }
+    if let Some(mode) = &args.ov_execution_mode {
+        props.push(("EXECUTION_MODE_HINT".into(), mode.clone()));
+    }
+
+    // NPU-only knobs — passing these to a non-NPU plugin errors, so gate on
+    // the device. Keeping the gate here (single source of truth) means the
+    // engine builders and the C++ shim never see NPU keys on a GPU/CPU run.
+    if device_is_npu(&args.device) {
+        if let Some(n) = args.npu_prefill_chunk_size {
+            props.push(("NPUW_LLM_PREFILL_CHUNK_SIZE".into(), n.to_string()));
+        }
+        if let Some(n) = args.npu_max_prompt_len {
+            props.push(("MAX_PROMPT_LEN".into(), n.to_string()));
+        }
+        if let Some(n) = args.npu_min_response_len {
+            props.push(("MIN_RESPONSE_LEN".into(), n.to_string()));
+        }
+    }
+
+    props
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -703,6 +811,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             if let Some(draft) = &args.draft_model {
                 let device = args
                     .draft_device
@@ -729,6 +838,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             Ok(Box::new(b))
         }
         EngineKind::Gemma4 => {
@@ -742,6 +852,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             Ok(Box::new(b))
         }
         EngineKind::OvDistSpec => {
@@ -764,6 +875,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 if let Some(group) = &args.ov_dyn_quant_group {
                     b = b.with_dyn_quant_group(group);
                 }
+                b = b.with_ov_properties(ov_perf_properties(args));
                 Ok(Box::new(b))
             } else {
                 let mut b =
@@ -777,6 +889,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 if let Some(group) = &args.ov_dyn_quant_group {
                     b = b.with_dyn_quant_group(group);
                 }
+                b = b.with_ov_properties(ov_perf_properties(args));
                 Ok(Box::new(b))
             }
         }
@@ -787,6 +900,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 cfg.cache_dir = Some(dir);
             }
+            cfg.ov_properties = ov_perf_properties(args);
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
             cfg.max_cached_experts = args.max_cached_experts;
@@ -1513,4 +1627,97 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ov_property_tests {
+    use super::*;
+
+    fn args_for(device: &str) -> WorkerArgs {
+        WorkerArgs::single_node(
+            "model".into(),
+            device.into(),
+            EngineKind::OvGenai,
+            "127.0.0.1:8080".into(),
+        )
+    }
+
+    fn prop<'a>(props: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        props
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn device_is_npu_matches_npu_plugins_only() {
+        assert!(device_is_npu("NPU"));
+        assert!(device_is_npu("NPU.0"));
+        assert!(device_is_npu("npu"));
+        assert!(device_is_npu("  NPU  "));
+        assert!(!device_is_npu("GPU"));
+        assert!(!device_is_npu("CPU"));
+        // Compound AUTO/HETERO strings that merely mention NPU are not NPU targets.
+        assert!(!device_is_npu("AUTO:NPU,CPU"));
+    }
+
+    #[test]
+    fn unset_flags_produce_no_properties() {
+        let args = args_for("GPU");
+        assert!(ov_perf_properties(&args).is_empty());
+    }
+
+    #[test]
+    fn general_hints_map_to_ov_property_keys() {
+        let mut args = args_for("GPU");
+        args.ov_performance_mode = Some("LATENCY".into());
+        args.ov_inference_precision = Some("f16".into());
+        args.ov_num_streams = Some(2);
+        args.ov_num_threads = Some(8);
+        args.ov_allow_auto_batching = true;
+        args.ov_execution_mode = Some("PERFORMANCE".into());
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+        assert_eq!(prop(&props, "INFERENCE_PRECISION_HINT"), Some("f16"));
+        assert_eq!(prop(&props, "NUM_STREAMS"), Some("2"));
+        assert_eq!(prop(&props, "INFERENCE_NUM_THREADS"), Some("8"));
+        assert_eq!(prop(&props, "ALLOW_AUTO_BATCHING"), Some("true"));
+        assert_eq!(prop(&props, "EXECUTION_MODE_HINT"), Some("PERFORMANCE"));
+    }
+
+    #[test]
+    fn auto_batching_absent_when_flag_unset() {
+        let args = args_for("GPU");
+        assert_eq!(
+            prop(&ov_perf_properties(&args), "ALLOW_AUTO_BATCHING"),
+            None
+        );
+    }
+
+    #[test]
+    fn npu_props_dropped_on_non_npu_device() {
+        let mut args = args_for("GPU");
+        args.npu_prefill_chunk_size = Some(512);
+        args.npu_max_prompt_len = Some(1024);
+        args.npu_min_response_len = Some(128);
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), None);
+        assert_eq!(prop(&props, "MAX_PROMPT_LEN"), None);
+        assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), None);
+    }
+
+    #[test]
+    fn npu_props_included_on_npu_device() {
+        let mut args = args_for("NPU.0");
+        args.npu_prefill_chunk_size = Some(512);
+        args.npu_max_prompt_len = Some(1024);
+        args.npu_min_response_len = Some(128);
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), Some("512"));
+        assert_eq!(prop(&props, "MAX_PROMPT_LEN"), Some("1024"));
+        assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), Some("128"));
+    }
 }

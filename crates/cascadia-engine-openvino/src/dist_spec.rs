@@ -1557,6 +1557,8 @@ pub struct OvDistSpecBuilder {
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
+    pub ov_properties: Vec<(String, String)>,
     stage0: Option<OvRuntime>,
     draft: Option<OvRuntime>,
     tokenizer: Option<Arc<Tokenizer>>,
@@ -1581,6 +1583,7 @@ impl OvDistSpecBuilder {
             cache_dir: None,
             kv_cache_precision: None,
             dyn_quant_group: None,
+            ov_properties: Vec::new(),
             stage0: None,
             draft: None,
             tokenizer: None,
@@ -1606,6 +1609,11 @@ impl OvDistSpecBuilder {
         self.dyn_quant_group = Some(group.into());
         self
     }
+    /// Append extra `(key, value)` OV plugin properties (CLI perf flags).
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties.extend(props);
+        self
+    }
 
     fn plugin(&self) -> PluginConfig {
         let mut p = PluginConfig::new();
@@ -1617,6 +1625,9 @@ impl OvDistSpecBuilder {
         }
         if let Some(g) = &self.dyn_quant_group {
             p = p.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
+        for (key, val) in &self.ov_properties {
+            p = p.with(key, val);
         }
         p
     }
@@ -2050,6 +2061,8 @@ pub struct OvDistSpecWorkerBuilder {
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
+    pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
     inputs: std::collections::HashMap<String, String>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -2073,6 +2086,7 @@ impl OvDistSpecWorkerBuilder {
             cache_dir: None,
             kv_cache_precision: None,
             dyn_quant_group: None,
+            ov_properties: Vec::new(),
             runtime: None,
             inputs: std::collections::HashMap::new(),
             upstream: None,
@@ -2094,6 +2108,11 @@ impl OvDistSpecWorkerBuilder {
         self.dyn_quant_group = Some(group.into());
         self
     }
+    /// Append extra `(key, value)` OV plugin properties (CLI perf flags).
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties.extend(props);
+        self
+    }
 
     fn plugin(&self) -> PluginConfig {
         let mut p = PluginConfig::new();
@@ -2105,6 +2124,9 @@ impl OvDistSpecWorkerBuilder {
         }
         if let Some(g) = &self.dyn_quant_group {
             p = p.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
+        for (key, val) in &self.ov_properties {
+            p = p.with(key, val);
         }
         p
     }

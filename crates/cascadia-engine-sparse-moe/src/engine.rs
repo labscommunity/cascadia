@@ -45,6 +45,9 @@ pub struct SparseMoEBuilderConfig {
     pub model_dir: PathBuf,
     pub device: String,
     pub cache_dir: Option<String>,
+    /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
+    /// Applied only to the head IR (the sole OV-compiled component here).
+    pub ov_properties: Vec<(String, String)>,
     pub max_cached_experts: u32,
     /// Pipeline stage index (0-based).
     pub rank: u32,
@@ -132,6 +135,7 @@ impl SparseMoEBuilderConfig {
             model_dir: model_dir.into(),
             device: device.into(),
             cache_dir: None,
+            ov_properties: Vec::new(),
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
             // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT).
@@ -344,6 +348,9 @@ impl Builder for SparseMoEBuilder {
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.config.cache_dir {
             plugin = plugin.with("CACHE_DIR", d.clone());
+        }
+        for (key, val) in &self.config.ov_properties {
+            plugin = plugin.with(key, val);
         }
 
         // OV-IR shell backend (MiniMax-M2): the whole architecture lives in

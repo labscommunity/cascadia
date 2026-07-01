@@ -32,6 +32,9 @@ pub struct OvGenaiBuilder {
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
+    /// Extra `(key, value)` OV plugin properties (PERFORMANCE_HINT,
+    /// INFERENCE_PRECISION_HINT, NPU knobs, …) plumbed verbatim from the CLI.
+    pub ov_properties: Vec<(String, String)>,
     pub draft_model_path: Option<String>,
     pub draft_device: Option<String>,
     pub speculative_k: u32,
@@ -50,6 +53,7 @@ impl OvGenaiBuilder {
             cache_dir: None,
             kv_cache_precision: None,
             dyn_quant_group: None,
+            ov_properties: Vec::new(),
             draft_model_path: None,
             draft_device: None,
             speculative_k: 0,
@@ -75,6 +79,11 @@ impl OvGenaiBuilder {
     }
     pub fn with_dyn_quant_group(mut self, group: impl Into<String>) -> Self {
         self.dyn_quant_group = Some(group.into());
+        self
+    }
+    /// Append extra `(key, value)` OV plugin properties (CLI perf flags).
+    pub fn with_ov_properties(mut self, props: Vec<(String, String)>) -> Self {
+        self.ov_properties.extend(props);
         self
     }
     pub fn with_draft(
@@ -103,6 +112,9 @@ impl OvGenaiBuilder {
         }
         if let Some(group) = &self.dyn_quant_group {
             cfg = cfg.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", group);
+        }
+        for (key, val) in &self.ov_properties {
+            cfg = cfg.with(key, val);
         }
         cfg
     }
