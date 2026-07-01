@@ -14,15 +14,35 @@
 //!
 //! This is intentionally simple — raw TCP, point-to-point. It is the
 //! data plane between adjacent pipeline stages.
+//!
+//! ## Transports
+//!
+//! Two substrates carry the identical framing above:
+//!
+//! * **TCP** (default) — a raw length-prefixed byte stream, byte-identical
+//!   to `cascadia/worker/transport.py`.
+//! * **QUIC** (`quic` cargo feature, opt-in) — the same framing over a
+//!   single long-lived bidirectional [`quinn`] stream (UDP + TLS 1.3).
+//!   Encrypts every hop and rides out packet loss on lossy/WAN links;
+//!   opt-in because userspace QUIC costs more CPU/packet than kernel TCP
+//!   on a clean LAN. Selected process-wide via [`set_transport_kind`] —
+//!   the whole pipeline ring must agree on one substrate.
+//!
+//! The [`ActivationServer`] / [`ActivationClient`] public API is identical
+//! across both; only the constructor's [`TransportKind`] differs.
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
+
+#[cfg(feature = "quic")]
+mod quic;
 
 pub const HEADER_SIZE: usize = 20;
 pub const MAX_RANK: usize = 3;
@@ -44,10 +64,66 @@ pub const MAX_TENSOR_BYTES: usize = 256 * 1024 * 1024;
 /// gigabyte of "control bytes".
 pub const MAX_RAW_BYTES: usize = 64 * 1024;
 
+/// Wire substrate for the activation relay.
+///
+/// `Tcp` is the default and is byte-identical to Python cascadia. `Quic`
+/// runs the same framing over an encrypted QUIC stream and requires the
+/// `quic` cargo feature — selecting it in a build without that feature
+/// fails loudly at [`ActivationServer::start`] / [`ActivationClient::connect`]
+/// rather than silently downgrading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransportKind {
+    #[default]
+    Tcp,
+    Quic,
+}
+
+impl TransportKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Quic,
+            _ => Self::Tcp,
+        }
+    }
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Tcp => 0,
+            Self::Quic => 1,
+        }
+    }
+}
+
+/// Process-wide default transport, consulted by [`ActivationServer::new`] /
+/// [`ActivationClient::new`]. Mirrors the [`set_activation_timeout_secs`]
+/// global: a worker runs exactly one pipeline stage over one substrate, so
+/// the choice is a process-level setting, set once at startup from the CLI
+/// flag before any transport is constructed.
+static DEFAULT_TRANSPORT_KIND: AtomicU8 = AtomicU8::new(0);
+
+/// Select the default transport for every subsequently-constructed
+/// [`ActivationServer`] / [`ActivationClient`]. Call once at worker startup
+/// (before the engine builder connects) — the whole ring must agree.
+pub fn set_transport_kind(kind: TransportKind) {
+    DEFAULT_TRANSPORT_KIND.store(kind.as_u8(), Ordering::Relaxed);
+}
+
+/// The current process-wide default transport.
+pub fn transport_kind() -> TransportKind {
+    TransportKind::from_u8(DEFAULT_TRANSPORT_KIND.load(Ordering::Relaxed))
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("socket closed during recv")]
     SocketClosed,
+
+    #[error(
+        "QUIC transport requested but not compiled in — rebuild with the `quic` cargo feature"
+    )]
+    QuicUnavailable,
+
+    #[error("quic error: {0}")]
+    Quic(String),
 
     #[error("tensor rank > {MAX_RANK} not supported (got {0} dims)")]
     RankTooHigh(usize),
@@ -148,7 +224,13 @@ pub struct TransferStats {
 }
 
 /// Send a tensor over a connected stream.
-pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResult<TransferStats> {
+///
+/// Generic over any [`AsyncWrite`] sink so the identical framing rides
+/// either a [`TcpStream`] or a `quinn` [`SendStream`](quic).
+pub async fn send_tensor<W: AsyncWrite + Unpin + ?Sized>(
+    sock: &mut W,
+    tensor: &Tensor,
+) -> TransportResult<TransferStats> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&(tensor.data.len() as u32).to_be_bytes());
@@ -174,7 +256,11 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 /// Also cross-checks the per-element count against the declared
 /// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
 /// trigger overflow downstream.
-pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+///
+/// Generic over any [`AsyncRead`] source (TCP or a `quinn` `RecvStream`).
+pub async fn recv_tensor<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
+) -> TransportResult<(Tensor, TransferStats)> {
     recv_tensor_inner(sock, None).await
 }
 
@@ -190,7 +276,9 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
 /// step loop for the whole idle ceiling with the task slot held
 /// (overload-backlog Item 5: forwarded-to head wedges, task never
 /// finalizes).
-pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+pub async fn recv_tensor_reply<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
+) -> TransportResult<(Tensor, TransferStats)> {
     recv_tensor_inner(sock, Some(recv_timeout())).await
 }
 
@@ -207,8 +295,8 @@ pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
 /// [`recv_tensor_reply`] with the widened prefill budget. Use for the token
 /// reply to a multi-token (prefill) hidden state; everything else uses
 /// `recv_tensor_reply`.
-pub async fn recv_tensor_reply_prefill(
-    sock: &mut TcpStream,
+pub async fn recv_tensor_reply_prefill<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
 ) -> TransportResult<(Tensor, TransferStats)> {
     // saturating_mul: an absurdly large configured base must clamp, not
     // panic the engine thread (Duration's Mul panics on overflow).
@@ -219,8 +307,8 @@ pub async fn recv_tensor_reply_prefill(
     .await
 }
 
-async fn recv_tensor_inner(
-    sock: &mut TcpStream,
+async fn recv_tensor_inner<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
     deadline_first_byte: Option<Duration>,
 ) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
@@ -422,7 +510,10 @@ fn frame_idle_ceiling() -> Option<Duration> {
 /// [`TransportError::FrameIdleCeiling`] — distinguishable from the
 /// per-frame deadline's `Io(TimedOut)` so the wrappers can treat it as
 /// connection-fatal.
-async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact_frame_start<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
+    buf: &mut [u8],
+) -> TransportResult<()> {
     let first_read = sock.read(buf);
     let n = match frame_idle_ceiling() {
         Some(ceiling) => match tokio::time::timeout(ceiling, first_read).await {
@@ -440,7 +531,10 @@ async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> Transpo
     Ok(())
 }
 
-async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
+    buf: &mut [u8],
+) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
     // sends one byte per second — must not be able to pin a worker
@@ -462,8 +556,8 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     recv_exact_within(sock, buf, recv_timeout()).await
 }
 
-async fn recv_exact_within(
-    sock: &mut TcpStream,
+async fn recv_exact_within<R: AsyncRead + Unpin + ?Sized>(
+    sock: &mut R,
     buf: &mut [u8],
     to: Duration,
 ) -> TransportResult<()> {
@@ -487,21 +581,123 @@ async fn recv_exact_within(
     }
 }
 
-/// TCP server that receives activations from upstream.
+/// Write all bytes then flush an async sink. Shared by `send_raw` across
+/// both substrates.
+async fn write_all_flush<W: AsyncWrite + Unpin + ?Sized>(
+    sock: &mut W,
+    bytes: &[u8],
+) -> TransportResult<()> {
+    sock.write_all(bytes).await?;
+    sock.flush().await?;
+    Ok(())
+}
+
+/// A live point-to-point connection over either substrate. Both variants
+/// carry the identical byte-framing; the enum just routes each read/write
+/// to the right half of the underlying socket (a `TcpStream` is its own
+/// reader and writer; a QUIC stream is a `SendStream` + `RecvStream` pair).
+enum Conn {
+    Tcp(TcpStream),
+    #[cfg(feature = "quic")]
+    Quic(quic::QuicConn),
+}
+
+impl Conn {
+    async fn send_tensor(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
+        match self {
+            Conn::Tcp(s) => send_tensor(s, tensor).await,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => send_tensor(&mut q.send, tensor).await,
+        }
+    }
+
+    async fn recv_tensor(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        match self {
+            Conn::Tcp(s) => recv_tensor(s).await,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => recv_tensor(&mut q.recv).await,
+        }
+    }
+
+    async fn recv_tensor_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        match self {
+            Conn::Tcp(s) => recv_tensor_reply(s).await,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => recv_tensor_reply(&mut q.recv).await,
+        }
+    }
+
+    async fn recv_tensor_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
+        match self {
+            Conn::Tcp(s) => recv_tensor_reply_prefill(s).await,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => recv_tensor_reply_prefill(&mut q.recv).await,
+        }
+    }
+
+    async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
+        match self {
+            Conn::Tcp(s) => write_all_flush(s, bytes).await,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => write_all_flush(&mut q.send, bytes).await,
+        }
+    }
+
+    async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        match self {
+            Conn::Tcp(s) => recv_exact_frame_start(s, &mut buf).await?,
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => recv_exact_frame_start(&mut q.recv, &mut buf).await?,
+        }
+        Ok(buf)
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            Conn::Tcp(s) => {
+                let _ = s.shutdown().await;
+            }
+            #[cfg(feature = "quic")]
+            Conn::Quic(q) => q.shutdown(),
+        }
+    }
+}
+
+/// A bound listener over either substrate.
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(feature = "quic")]
+    Quic(quic::QuicListener),
+}
+
+/// Server that receives activations from the upstream stage. Binds a TCP
+/// listener or a QUIC endpoint depending on its [`TransportKind`].
 pub struct ActivationServer {
     bind_host: String,
     bind_port: u16,
-    listener: Option<TcpListener>,
-    client: Option<TcpStream>,
+    kind: TransportKind,
+    listener: Option<Listener>,
+    client: Option<Conn>,
     accepted_addr: Option<SocketAddr>,
     actual_port: u16,
 }
 
 impl ActivationServer {
+    /// Construct a server using the process-wide default transport (see
+    /// [`set_transport_kind`]). Call `set_transport_kind` before this.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self::new_with_kind(host, port, transport_kind())
+    }
+
+    /// Construct a server pinned to a specific transport, independent of
+    /// the process-wide default. Used by tests and callers that want to
+    /// force a substrate.
+    pub fn new_with_kind(host: impl Into<String>, port: u16, kind: TransportKind) -> Self {
         Self {
             bind_host: host.into(),
             bind_port: port,
+            kind,
             listener: None,
             client: None,
             accepted_addr: None,
@@ -510,12 +706,30 @@ impl ActivationServer {
     }
 
     pub async fn start(&mut self) -> TransportResult<()> {
-        let listener = TcpListener::bind((self.bind_host.as_str(), self.bind_port)).await?;
-        self.actual_port = listener.local_addr()?.port();
-        self.listener = Some(listener);
+        match self.kind {
+            TransportKind::Tcp => {
+                let listener = TcpListener::bind((self.bind_host.as_str(), self.bind_port)).await?;
+                self.actual_port = listener.local_addr()?.port();
+                self.listener = Some(Listener::Tcp(listener));
+            }
+            TransportKind::Quic => {
+                #[cfg(feature = "quic")]
+                {
+                    let listener =
+                        quic::QuicListener::bind(&self.bind_host, self.bind_port).await?;
+                    self.actual_port = listener.local_port();
+                    self.listener = Some(Listener::Quic(listener));
+                }
+                #[cfg(not(feature = "quic"))]
+                {
+                    return Err(TransportError::QuicUnavailable);
+                }
+            }
+        }
         info!(
             host = %self.bind_host,
             port = self.actual_port,
+            transport = ?self.kind,
             "ActivationServer listening"
         );
         Ok(())
@@ -527,22 +741,32 @@ impl ActivationServer {
 
     pub async fn accept(&mut self) -> TransportResult<()> {
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
-        let (sock, addr) = listener.accept().await?;
-        sock.set_nodelay(true).ok();
+        let (conn, addr) = match listener {
+            Listener::Tcp(l) => {
+                let (sock, addr) = l.accept().await?;
+                sock.set_nodelay(true).ok();
+                (Conn::Tcp(sock), addr)
+            }
+            #[cfg(feature = "quic")]
+            Listener::Quic(ep) => {
+                let (qc, addr) = ep.accept().await?;
+                (Conn::Quic(qc), addr)
+            }
+        };
         info!(peer = %addr, "ActivationServer accepted connection");
-        self.client = Some(sock);
+        self.client = Some(conn);
         self.accepted_addr = Some(addr);
         Ok(())
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor(sock).await;
+        let conn = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor().await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
 
-    /// A recv timeout is connection-fatal: drop the socket here, at the
+    /// A recv timeout is connection-fatal: drop the connection here, at the
     /// transport layer, so a half-consumed or abandoned frame can never be
     /// read into a different request (token frames carry no task id). Covers
     /// both the frame-start idle ceiling and a mid-frame stall — see
@@ -557,12 +781,12 @@ impl ActivationServer {
 
     /// Mid-task reply recv — strict deadline on the first byte. See
     /// [`recv_tensor_reply`] for the call-site rule. A failed reply
-    /// poisons the connection (see `poison`: the socket is dropped
+    /// poisons the connection (see `poison`: the connection is dropped
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply(sock).await;
+        let conn = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor_reply().await;
         if res.is_err() {
             self.poison().await;
         }
@@ -570,12 +794,12 @@ impl ActivationServer {
     }
 
     /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
-    /// A failed reply poisons the connection (see `poison`: the socket
-    /// is dropped and later calls fail fast with `NotConnected`;
-    /// recover with a fresh connection).
+    /// A failed reply poisons the connection (see `poison`: the
+    /// connection is dropped and later calls fail fast with
+    /// `NotConnected`; recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply_prefill(sock).await;
+        let conn = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor_reply_prefill().await;
         if res.is_err() {
             self.poison().await;
         }
@@ -589,25 +813,29 @@ impl ActivationServer {
     /// the connection so later calls fail fast with `NotConnected` instead
     /// of corrupting — recovery is a fresh connection, not reuse.
     async fn poison(&mut self) {
-        if let Some(mut s) = self.client.take() {
-            let _ = s.shutdown().await;
+        if let Some(mut conn) = self.client.take() {
+            conn.shutdown().await;
         }
         self.accepted_addr = None;
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        self.client
+            .as_mut()
+            .ok_or(TransportError::NotConnected)?
+            .send_tensor(tensor)
+            .await
     }
 
     /// Send raw bytes over the established connection. Used by the
     /// dist-spec engines to prefix tensor frames with control bytes
     /// (kind + logical_pos_start).
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        Ok(())
+        self.client
+            .as_mut()
+            .ok_or(TransportError::NotConnected)?
+            .send_raw(bytes)
+            .await
     }
 
     /// Receive exactly `n` raw bytes from the established connection.
@@ -617,42 +845,74 @@ impl ActivationServer {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
-        let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        let mut buf = vec![0u8; n];
-        let res = recv_exact_frame_start(sock, &mut buf).await;
+        let conn = self.client.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_raw(n).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
-        res?;
-        Ok(buf)
+        res
     }
 
     pub async fn close(&mut self) {
-        if let Some(mut sock) = self.client.take() {
-            let _ = sock.shutdown().await;
+        if let Some(mut conn) = self.client.take() {
+            conn.shutdown().await;
         }
         self.listener = None;
         self.accepted_addr = None;
     }
 }
 
-/// TCP client that sends activations to downstream.
+/// Client that sends activations to the downstream stage. Dials over TCP
+/// or QUIC depending on its [`TransportKind`].
 pub struct ActivationClient {
     host: String,
     port: u16,
-    sock: Option<TcpStream>,
+    kind: TransportKind,
+    sock: Option<Conn>,
+    /// Kept alive for the connection's life so the QUIC connection driver
+    /// keeps running. `None` on the TCP path.
+    #[cfg(feature = "quic")]
+    endpoint: Option<quic::QuicClientEndpoint>,
 }
 
 impl ActivationClient {
+    /// Construct a client using the process-wide default transport (see
+    /// [`set_transport_kind`]).
     pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self::new_with_kind(host, port, transport_kind())
+    }
+
+    /// Construct a client pinned to a specific transport, independent of
+    /// the process-wide default.
+    pub fn new_with_kind(host: impl Into<String>, port: u16, kind: TransportKind) -> Self {
         Self {
             host: host.into(),
             port,
+            kind,
             sock: None,
+            #[cfg(feature = "quic")]
+            endpoint: None,
         }
     }
 
     /// Connect with retries until `timeout` elapses (mirrors the Python
     /// implementation's wait-for-peer behaviour during pipeline startup).
     pub async fn connect_with_timeout(&mut self, timeout: Duration) -> TransportResult<()> {
+        match self.kind {
+            TransportKind::Tcp => self.connect_tcp(timeout).await,
+            TransportKind::Quic => {
+                #[cfg(feature = "quic")]
+                {
+                    self.connect_quic(timeout).await
+                }
+                #[cfg(not(feature = "quic"))]
+                {
+                    let _ = timeout;
+                    Err(TransportError::QuicUnavailable)
+                }
+            }
+        }
+    }
+
+    async fn connect_tcp(&mut self, timeout: Duration) -> TransportResult<()> {
         let start = Instant::now();
         let deadline = start + timeout;
         // Tell the operator up-front what we're waiting on. Without this
@@ -673,7 +933,7 @@ impl ActivationClient {
                 Ok(sock) => {
                     sock.set_nodelay(true).ok();
                     info!(host = %self.host, port = self.port, "ActivationClient connected");
-                    self.sock = Some(sock);
+                    self.sock = Some(Conn::Tcp(sock));
                     return Ok(());
                 }
                 Err(err) => {
@@ -710,18 +970,75 @@ impl ActivationClient {
         Err(TransportError::ConnectTimeout(timeout))
     }
 
+    /// QUIC dial: bind an ephemeral client endpoint once, then retry the
+    /// handshake (each attempt bounded internally) until the downstream is
+    /// up or the deadline passes. Mirrors [`connect_tcp`]'s retry cadence.
+    #[cfg(feature = "quic")]
+    async fn connect_quic(&mut self, timeout: Duration) -> TransportResult<()> {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let addr = quic::resolve(&self.host, self.port).await?;
+        let endpoint = quic::QuicClientEndpoint::bind_for(addr).await?;
+        info!(
+            host = %self.host,
+            port = self.port,
+            timeout_s = timeout.as_secs(),
+            "waiting for downstream QUIC peer to accept (start the downstream worker first)"
+        );
+        let mut last_err: Option<TransportError> = None;
+        let mut next_progress = start + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match endpoint.connect_once(addr).await {
+                Ok(conn) => {
+                    info!(host = %self.host, port = self.port, "ActivationClient connected (quic)");
+                    self.sock = Some(Conn::Quic(conn));
+                    self.endpoint = Some(endpoint);
+                    return Ok(());
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    let now = Instant::now();
+                    if now >= next_progress {
+                        warn!(
+                            host = %self.host,
+                            port = self.port,
+                            waited_s = now.duration_since(start).as_secs(),
+                            timeout_s = timeout.as_secs(),
+                            "still waiting for downstream QUIC peer (not accepting yet)"
+                        );
+                        next_progress = now + Duration::from_secs(5);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+        warn!(
+            host = %self.host,
+            port = self.port,
+            timeout_s = timeout.as_secs(),
+            last_error = ?last_err.as_ref().map(|e| e.to_string()),
+            "could not connect to downstream QUIC peer within timeout — check that the \
+             downstream worker is running with --transport quic, that its --listen port \
+             matches this --next, and that no firewall blocks the UDP port"
+        );
+        Err(last_err.unwrap_or(TransportError::ConnectTimeout(timeout)))
+    }
+
     pub async fn connect(&mut self) -> TransportResult<()> {
         self.connect_with_timeout(DEFAULT_CONNECT_TIMEOUT).await
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        self.sock
+            .as_mut()
+            .ok_or(TransportError::NotConnected)?
+            .send_tensor(tensor)
+            .await
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor(sock).await;
+        let conn = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor().await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res
     }
@@ -737,12 +1054,12 @@ impl ActivationClient {
 
     /// Mid-task reply recv — strict deadline on the first byte. See
     /// [`recv_tensor_reply`] for the call-site rule. A failed reply
-    /// poisons the connection (see `poison`: the socket is dropped
+    /// poisons the connection (see `poison`: the connection is dropped
     /// and later calls fail fast with `NotConnected`; recover with a
     /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply(sock).await;
+        let conn = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor_reply().await;
         if res.is_err() {
             self.poison().await;
         }
@@ -750,12 +1067,12 @@ impl ActivationClient {
     }
 
     /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
-    /// A failed reply poisons the connection (see `poison`: the socket
-    /// is dropped and later calls fail fast with `NotConnected`;
-    /// recover with a fresh connection).
+    /// A failed reply poisons the connection (see `poison`: the
+    /// connection is dropped and later calls fail fast with
+    /// `NotConnected`; recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let res = recv_tensor_reply_prefill(sock).await;
+        let conn = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_tensor_reply_prefill().await;
         if res.is_err() {
             self.poison().await;
         }
@@ -765,33 +1082,36 @@ impl ActivationClient {
     /// See [`ActivationServer::poison`]: a failed reply means unknown
     /// framing state — fail fast on reuse instead of corrupting.
     async fn poison(&mut self) {
-        if let Some(mut s) = self.sock.take() {
-            let _ = s.shutdown().await;
+        if let Some(mut conn) = self.sock.take() {
+            conn.shutdown().await;
         }
     }
 
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        Ok(())
+        self.sock
+            .as_mut()
+            .ok_or(TransportError::NotConnected)?
+            .send_raw(bytes)
+            .await
     }
 
     pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
         if n > MAX_RAW_BYTES {
             return Err(TransportError::RawSizeTooLarge(n));
         }
-        let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        let mut buf = vec![0u8; n];
-        let res = recv_exact_frame_start(sock, &mut buf).await;
+        let conn = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
+        let res = conn.recv_raw(n).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
-        res?;
-        Ok(buf)
+        res
     }
 
     pub async fn close(&mut self) {
-        if let Some(mut sock) = self.sock.take() {
-            let _ = sock.shutdown().await;
+        if let Some(mut conn) = self.sock.take() {
+            conn.shutdown().await;
+        }
+        #[cfg(feature = "quic")]
+        {
+            self.endpoint = None;
         }
     }
 }

@@ -8,9 +8,12 @@ repository.workspace = true
 description = "cascadia binary — distributed LLM inference for Intel hardware."
 
 [features]
-default = []
+default = ["quic"]
 openvino = ["cascadia-cli/openvino"]
 dashboard-embed = ["cascadia-cli/dashboard-embed"]
+# QUIC activation transport (`cascadia worker --transport quic`). On by
+# default; `--no-default-features` yields a lean TCP-only binary.
+quic = ["cascadia-cli/quic"]
 
 [[bin]]
 name = "cascadia"

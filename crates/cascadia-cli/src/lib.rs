@@ -217,6 +217,29 @@ pub enum EngineKind {
     Qwen36Moe,
 }
 
+/// Inter-stage activation transport substrate.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportArg {
+    /// Raw length-prefixed TCP relay (default). Byte-identical to Python
+    /// cascadia; lowest overhead on a clean LAN / Thunderbolt fabric.
+    Tcp,
+    /// The same framing over an encrypted QUIC (UDP + TLS 1.3) stream.
+    /// Encrypts every hop and rides out packet loss on lossy/WAN links.
+    /// Requires a build with the `quic` cargo feature (on by default);
+    /// selecting it in a `--no-default-features` build fails loudly at
+    /// startup rather than silently downgrading.
+    Quic,
+}
+
+impl From<TransportArg> for cascadia_transport::TransportKind {
+    fn from(t: TransportArg) -> Self {
+        match t {
+            TransportArg::Tcp => cascadia_transport::TransportKind::Tcp,
+            TransportArg::Quic => cascadia_transport::TransportKind::Quic,
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
     /// 0-based stage index.
@@ -247,6 +270,13 @@ pub struct WorkerArgs {
     /// Bind address for the upstream-receiving socket (default :9100).
     #[arg(long, default_value = ":9100")]
     pub listen: String,
+
+    /// Inter-stage activation transport: `tcp` (default) or `quic`.
+    /// The whole pipeline ring must agree — set the same value on every
+    /// stage. `quic` encrypts each hop and tolerates lossy/WAN links; it
+    /// needs a build with the `quic` cargo feature (on by default).
+    #[arg(long, value_enum, default_value_t = TransportArg::Tcp)]
+    pub transport: TransportArg,
 
     /// Downstream peer (host:port) — required for non-last stages.
     #[arg(long)]
@@ -545,6 +575,8 @@ impl WorkerArgs {
             layer_end: 0,
             model,
             listen: ":9100".into(),
+            // Single-node `run` has no inter-stage hop; transport is moot.
+            transport: TransportArg::Tcp,
             next: None,
             api: Some(api),
             device,
@@ -1239,8 +1271,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         total = args.total,
         device = %args.device,
         model = %args.model,
+        transport = ?args.transport,
         "cascadia worker starting"
     );
+
+    // Select the activation substrate process-wide before any engine
+    // builder constructs a transport. The whole ring must agree; the
+    // operator sets --transport identically on every stage.
+    cascadia_transport::set_transport_kind(args.transport.into());
 
     let (listen_host, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
 

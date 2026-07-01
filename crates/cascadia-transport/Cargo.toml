@@ -5,10 +5,36 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TCP activation tensor relay between pipeline stages — length-prefixed tensor wire format."
+description = "Activation tensor relay between pipeline stages — length-prefixed tensor wire format (TCP default; optional QUIC)."
+
+[features]
+default = []
+# Opt-in QUIC (UDP + TLS 1.3) backend for the activation relay. Off by
+# default: the TCP path keeps the exact length-prefixed wire format and
+# pulls no extra deps. Enable to make `--transport quic` selectable at runtime.
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 [dependencies]
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+# QUIC backend (feature `quic` only). quinn 0.11 + rustls 0.23 on the ring
+# provider (no aws-lc-rs C build); rcgen mints the ephemeral self-signed
+# cert. rustls is already in the tree via reqwest's rustls-tls, so this
+# only adds quinn + rcgen to a `--features quic` build.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+], optional = true }
+rcgen = { version = "0.13", default-features = false, features = [
+    "crypto",
+    "ring",
+], optional = true }

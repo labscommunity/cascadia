@@ -122,9 +122,16 @@ pub struct MockPipeline {
 }
 
 impl MockPipeline {
-    /// Spawn an N-stage mock pipeline on 127.0.0.1, downstream-first (each
-    /// upstream needs its downstream listening before it connects).
+    /// Spawn an N-stage mock pipeline on 127.0.0.1 over the default (TCP)
+    /// transport.
     pub async fn spawn(stages: usize) -> Self {
+        Self::spawn_with_transport(stages, "tcp").await
+    }
+
+    /// Spawn an N-stage mock pipeline on 127.0.0.1, downstream-first (each
+    /// upstream needs its downstream listening before it connects), passing
+    /// `--transport {transport}` to every stage.
+    pub async fn spawn_with_transport(stages: usize, transport: &str) -> Self {
         assert!(stages >= 1, "need at least one stage");
         let bin = binary_path();
         assert!(bin.exists(), "cascadia binary not built ({:?})", bin);
@@ -146,6 +153,8 @@ impl MockPipeline {
                 "mock".into(),
                 "--model".into(),
                 "mock-model".into(),
+                "--transport".into(),
+                transport.into(),
                 "--log-level".into(),
                 "warn".into(),
             ];
@@ -323,6 +332,45 @@ mod tests {
             .as_str()
             .expect("content string");
         assert!(!content.is_empty(), "pipeline produced empty completion");
+    }
+
+    /// Same 2-stage loopback pipeline as above but launched with
+    /// `--transport quic` on every stage. This is a *wiring* smoke test: it
+    /// proves the flag parses, `set_transport_kind` runs, the quic-enabled
+    /// binary starts, and the pipeline forms and serves. It does NOT prove
+    /// QUIC data flow — the mock engine's `connect()` is a no-op and never
+    /// crosses a tensor, so no QUIC endpoint is created here. The real
+    /// QUIC data-plane proof lives in cascadia-transport's `quic_roundtrip`
+    /// integration tests; end-to-end QUIC over a real engine needs
+    /// hardware/models and is validated on the fleet like other engines.
+    #[tokio::test]
+    async fn multi_stage_mock_pipeline_loopback_quic() {
+        let pipe = MockPipeline::spawn_with_transport(2, "quic").await;
+        assert!(
+            pipe.wait_for_health(Duration::from_secs(20)).await,
+            "2-stage --transport quic pipeline entry did not become healthy"
+        );
+
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "alpha bravo charlie"}],
+            "max_tokens": 2,
+            "stream": false,
+        });
+        let r = client
+            .post(pipe.url("/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .expect("post chat to quic pipeline entry");
+        assert!(
+            r.status().is_success(),
+            "quic pipeline chat status: {}",
+            r.status()
+        );
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
     }
 
     /// Cross-node sharded e2e: brings up an N-stage topology across real fleet
