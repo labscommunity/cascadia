@@ -90,6 +90,17 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     tc.stream_receive_window(stream_win.into());
     tc.receive_window(conn_win.into());
     tc.send_window(conn_win as u64);
+    // Larger initial congestion window. Flow-control windows alone did NOT
+    // fix the ~2.5-RTT penalty for a 64 KiB frame at 20-50 ms RTT (netem):
+    // the gate is slow-start (default initial cwnd ~14 KiB, restarted after
+    // each inter-request idle), not flow-control credit. Peers here are
+    // cooperating pipeline stages sending a frame per decode step after a
+    // compute-bound idle, so a bigger initial window lets a typical
+    // activation frame clear in ~1 RTT. Kept moderate (not multi-MiB) to
+    // avoid an over-aggressive first burst on a genuinely lossy path.
+    let mut cubic = quinn::congestion::CubicConfig::default();
+    cubic.initial_window(256 * 1024); // 256 KiB
+    tc.congestion_controller_factory(std::sync::Arc::new(cubic));
     Arc::new(tc)
 }
 
