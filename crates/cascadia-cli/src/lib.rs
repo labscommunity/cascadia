@@ -731,14 +731,21 @@ fn device_is_npu(device: &str) -> bool {
 }
 
 /// Translate the `--ov-*` / `--npu-*` performance flags on `args` into the
-/// `(key, value)` OpenVINO plugin properties consumed by every OV engine
-/// builder. NPU-only properties are dropped unless `--device` names an NPU
-/// plugin. Returns entries in a stable order (general hints first, NPU
-/// knobs last) so callers and tests see a deterministic list.
+/// `(key, value)` OpenVINO plugin properties fed to the OV engine builders.
+/// General hints apply to any engine; the NPU-only knobs are emitted only for
+/// an NPU device on the `ov-genai` engine (the sole engine that routes them
+/// through an `ov::genai` LLMPipeline — see the NPU block below). Returns
+/// entries in a stable order (general hints first, NPU knobs last) so callers
+/// and tests see a deterministic list.
 fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     let mut props: Vec<(String, String)> = Vec::new();
 
-    // General performance hints — valid on every OV plugin.
+    // General performance hints. PERFORMANCE_HINT / INFERENCE_PRECISION_HINT /
+    // EXECUTION_MODE_HINT are plugin-agnostic ov::hint properties. NUM_STREAMS,
+    // INFERENCE_NUM_THREADS (CPU-oriented) and ALLOW_AUTO_BATCHING (GPU/AUTO)
+    // are only effective on the plugins that own them; they are opt-in, so we
+    // forward the user's request verbatim and let OV accept or reject it rather
+    // than second-guessing the target device here.
     if let Some(mode) = &args.ov_performance_mode {
         props.push(("PERFORMANCE_HINT".into(), mode.clone()));
     }
@@ -758,10 +765,15 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
         props.push(("EXECUTION_MODE_HINT".into(), mode.clone()));
     }
 
-    // NPU-only knobs — passing these to a non-NPU plugin errors, so gate on
-    // the device. Keeping the gate here (single source of truth) means the
-    // engine builders and the C++ shim never see NPU keys on a GPU/CPU run.
-    if device_is_npu(&args.device) {
+    // NPU-only knobs. These are ov::genai LLMPipeline convenience keys — the
+    // GenAI NPU path consumes MAX_PROMPT_LEN / MIN_RESPONSE_LEN and drives the
+    // NPUW LLM pipeline (NPUW_LLM_PREFILL_CHUNK_SIZE). Only the ov-genai engine
+    // routes properties through an LLMPipeline; every other OV engine compiles
+    // via raw ov::Core::compile_model, which does not understand these keys (it
+    // rejects or ignores them). So gate on BOTH the device (NPU) and the engine
+    // (ov-genai). Keeping the gate here (single source of truth) means the
+    // builders and the C++ shim never see an NPU key on a run that can't use it.
+    if device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai) {
         if let Some(n) = args.npu_prefill_chunk_size {
             props.push(("NPUW_LLM_PREFILL_CHUNK_SIZE".into(), n.to_string()));
         }
@@ -1634,10 +1646,14 @@ mod ov_property_tests {
     use super::*;
 
     fn args_for(device: &str) -> WorkerArgs {
+        args_for_engine(device, EngineKind::OvGenai)
+    }
+
+    fn args_for_engine(device: &str, engine: EngineKind) -> WorkerArgs {
         WorkerArgs::single_node(
             "model".into(),
             device.into(),
-            EngineKind::OvGenai,
+            engine,
             "127.0.0.1:8080".into(),
         )
     }
@@ -1719,5 +1735,43 @@ mod ov_property_tests {
         assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), Some("512"));
         assert_eq!(prop(&props, "MAX_PROMPT_LEN"), Some("1024"));
         assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), Some("128"));
+    }
+
+    #[test]
+    fn npu_props_dropped_on_non_genai_engine_even_on_npu_device() {
+        // MAX_PROMPT_LEN / MIN_RESPONSE_LEN / NPUW_LLM_PREFILL_CHUNK_SIZE are
+        // ov::genai LLMPipeline convenience keys. Only ov-genai routes props
+        // through the GenAI pipeline; the other OV engines hit raw
+        // compile_model, which cannot consume them. So they must be gated on
+        // engine == ov-genai, not device alone.
+        for engine in [
+            EngineKind::OvRuntime,
+            EngineKind::Gemma4,
+            EngineKind::OvDistSpec,
+            EngineKind::SparseMoe,
+        ] {
+            let mut args = args_for_engine("NPU.0", engine);
+            args.npu_prefill_chunk_size = Some(512);
+            args.npu_max_prompt_len = Some(1024);
+            args.npu_min_response_len = Some(128);
+
+            let props = ov_perf_properties(&args);
+            assert_eq!(
+                prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"),
+                None,
+                "{engine:?}"
+            );
+            assert_eq!(prop(&props, "MAX_PROMPT_LEN"), None, "{engine:?}");
+            assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), None, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn general_hints_still_apply_on_non_genai_engine() {
+        // The engine gate is NPU-knob-specific; general hints stay engine-agnostic.
+        let mut args = args_for_engine("GPU", EngineKind::OvRuntime);
+        args.ov_performance_mode = Some("LATENCY".into());
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
     }
 }

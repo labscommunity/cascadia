@@ -2,18 +2,26 @@
 
 Cascadia plumbs the OpenVINO plugin properties that materially affect LLM
 inference on Intel hardware through the `cascadia worker` / `cascadia run`
-CLI and into every OV-routed engine (`ov-genai`, `ov-runtime`,
-`ov-dist-spec`, and the head IR in `sparse-moe`). All flags are opt-in: when
-unset, the engine builders behave exactly as before, so tuning never changes
-default behavior.
+CLI and into the OV-routed engines: `ov-genai`, `ov-runtime`, `gemma4`,
+`ov-dist-spec`, and the OV IRs in `sparse-moe`. (`qwen36-moe` is intentionally
+excluded — it compiles with a fixed plugin config because some hints, e.g.
+`INFERENCE_PRECISION_HINT=f32` / `EXECUTION_MODE_HINT=ACCURACY`, break its
+IRs; see `qwen36.rs`.) All flags are opt-in: when unset, the engine builders
+behave exactly as before, so tuning never changes default behavior.
 
-Each flag maps 1:1 to an `ov::AnyMap` entry passed to
+Each general flag maps 1:1 to an `ov::AnyMap` entry passed to
 `ov::Core::compile_model(model, device, props)`. Cascadia does not validate
 values — OpenVINO rejects an invalid one with its own error message.
 
 ## Flags
 
-### General hints (valid on every device)
+### General hints
+
+Forwarded verbatim to whichever engine you select. `PERFORMANCE_HINT`,
+`INFERENCE_PRECISION_HINT`, and `EXECUTION_MODE_HINT` are plugin-agnostic;
+`NUM_STREAMS`, `INFERENCE_NUM_THREADS` (CPU-oriented), and
+`ALLOW_AUTO_BATCHING` (GPU/AUTO) are only effective on the plugins that own
+them — set them for the matching `--device`.
 
 | Flag | OV property | Notes |
 |---|---|---|
@@ -26,9 +34,14 @@ values — OpenVINO rejects an invalid one with its own error message.
 
 ### NPU-only knobs
 
-These are **silently dropped unless `--device` names an NPU plugin**
-(a case-insensitive `starts_with("NPU")`, e.g. `NPU` or `NPU.0`). Passing an
-NPU property to a non-NPU plugin errors, so the gate keeps GPU/CPU runs safe.
+These are `ov::genai` `LLMPipeline` convenience keys, so they apply **only to
+`--engine ov-genai` on an NPU device**. They are silently dropped otherwise —
+both when `--device` is not an NPU plugin (case-insensitive
+`starts_with("NPU")`, e.g. `NPU` or `NPU.0`) **and** on every non-`ov-genai`
+engine (`ov-runtime`, `gemma4`, `ov-dist-spec`, `sparse-moe`), which compile
+via raw `ov::Core::compile_model` and cannot consume these keys. Use
+`--engine ov-genai` to reach the NPU LLM pipeline that handles static-shape
+compilation internally.
 
 | Flag | OV property | Notes |
 |---|---|---|
