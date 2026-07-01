@@ -320,17 +320,20 @@ pub struct WorkerArgs {
     pub ov_execution_mode: Option<String>,
 
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
-    /// Silently dropped unless --device names an NPU plugin.
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_prefill_chunk_size: Option<u32>,
 
     /// NPU max prompt length (MAX_PROMPT_LEN, static-shape constraint).
-    /// Silently dropped unless --device names an NPU plugin.
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_max_prompt_len: Option<u32>,
 
     /// NPU min response length (MIN_RESPONSE_LEN, static-shape constraint).
-    /// Silently dropped unless --device names an NPU plugin.
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_min_response_len: Option<u32>,
 

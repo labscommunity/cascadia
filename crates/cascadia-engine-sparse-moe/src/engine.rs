@@ -46,9 +46,11 @@ pub struct SparseMoEBuilderConfig {
     pub device: String,
     pub cache_dir: Option<String>,
     /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
-    /// Applied to every OV-compiled IR on this rank (embedding, transformer
-    /// shells, and head) via the shared `PluginConfig`; the per-expert CPU
-    /// compiles use their own fresh plugin and are unaffected.
+    /// Applied via the shared `PluginConfig` to every OV-compiled IR on this
+    /// rank: embedding, transformer shells, head, and — for `ov_ir`-format
+    /// experts — each per-expert IR. Exempt: the per-layer router subgraphs
+    /// (compiled with a fresh empty plugin) and `int4_bin` experts (no OV
+    /// compile at all).
     pub ov_properties: Vec<(String, String)>,
     pub max_cached_experts: u32,
     /// Pipeline stage index (0-based).
