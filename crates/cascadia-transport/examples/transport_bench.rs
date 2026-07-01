@@ -96,10 +96,23 @@ async fn run_client(kind: TransportKind, host: &str, port: u16) {
     } else {
         "tcp"
     };
+    // Optional overrides for targeted runs (e.g. under netem, where a full
+    // sweep at 20 ms RTT would take minutes): `BENCH_ITERS` caps iterations
+    // per size; `BENCH_ONLY_BYTES` restricts the sweep to one payload size.
+    let iters_cap: Option<usize> = std::env::var("BENCH_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let only: Option<usize> = std::env::var("BENCH_ONLY_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok());
     println!("transport,bytes,iters,p50_us,p90_us,p99_us,mean_us,mb_per_s");
     for &(nbytes, iters) in SWEEP {
+        if only.is_some_and(|o| o != nbytes) {
+            continue;
+        }
+        let iters = iters_cap.map(|c| c.min(iters)).unwrap_or(iters);
         let t = make_tensor(nbytes);
-        let warm = (iters / 20).max(50);
+        let warm = (iters / 20).max(10);
         for _ in 0..warm {
             client.send(&t).await.unwrap();
             client.recv().await.unwrap();
