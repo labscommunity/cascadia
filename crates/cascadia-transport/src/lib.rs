@@ -223,6 +223,33 @@ pub struct TransferStats {
     pub bytes: usize,
 }
 
+/// Whether per-hop transfer-stats logging is on (env `CASCADIA_TRANSPORT_STATS`
+/// set to a non-empty, non-`0` value). Read once.
+fn stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CASCADIA_TRANSPORT_STATS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Emit one `tracing` event per tensor hop when [`stats_enabled`]. `dir` is
+/// `"send"` or `"recv"`. Lets a real pipeline run surface transport-only
+/// timings (bytes + wall-clock ms), isolated from engine compute, so the
+/// per-frame vs per-byte TCP/QUIC split can be measured on real traffic.
+fn log_hop(dir: &'static str, stats: &TransferStats) {
+    if stats_enabled() {
+        info!(
+            target: "cascadia_transport::stats",
+            dir,
+            bytes = stats.bytes,
+            elapsed_ms = stats.elapsed_ms,
+        );
+    }
+}
+
 /// Send a tensor over a connected stream.
 ///
 /// Generic over any [`AsyncWrite`] sink so the identical framing rides
@@ -243,10 +270,12 @@ pub async fn send_tensor<W: AsyncWrite + Unpin + ?Sized>(
     sock.write_all(&tensor.data).await?;
     sock.flush().await?;
 
-    Ok(TransferStats {
+    let stats = TransferStats {
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         bytes: HEADER_SIZE + tensor.data.len(),
-    })
+    };
+    log_hop("send", &stats);
+    Ok(stats)
 }
 
 /// Receive a tensor from a connected stream.
@@ -352,6 +381,7 @@ async fn recv_tensor_inner<R: AsyncRead + Unpin + ?Sized>(
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         bytes: HEADER_SIZE + payload_len as usize,
     };
+    log_hop("recv", &stats);
     Ok((tensor, stats))
 }
 
