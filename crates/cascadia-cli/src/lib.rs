@@ -290,6 +290,32 @@ fn preflight_ip(ip: std::net::IpAddr, n: u32) -> Result<()> {
     Ok(())
 }
 
+/// Reject `--listen :0` for auto-ring: port 0 means "let the OS pick a
+/// port," but auto-ring advertises `listen_port` over mDNS for peers to
+/// dial — a peer dialing port 0 would never connect. Split out so it's
+/// unit-testable without spinning up `run_auto_election`'s async election.
+fn preflight_listen_port(listen_port: u16) -> Result<()> {
+    if listen_port == 0 {
+        bail!("--listen must specify a nonzero port for auto-ring (got :0); peers dial the advertised relay port");
+    }
+    Ok(())
+}
+
+/// Reject `--settle >= --discover-timeout`: the settle barrier waits for
+/// the discovered peer set to stay stable for `settle` seconds, but that
+/// wait is bounded by `discover_timeout` — if settle is >= the timeout,
+/// the barrier can never resolve before discovery gives up. Split out so
+/// it's unit-testable without spinning up the async election.
+fn preflight_settle(settle: u64, discover_timeout: u64) -> Result<()> {
+    if settle >= discover_timeout {
+        bail!(
+            "--settle ({settle}s) must be less than --discover-timeout ({discover_timeout}s), \
+             else the barrier can never settle before discovery times out"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
@@ -328,6 +354,17 @@ mod preflight_tests {
         assert!(preflight_ip("127.0.0.1".parse().unwrap(), 2).is_err());
         assert!(preflight_ip("127.0.0.1".parse().unwrap(), 1).is_ok());
         assert!(preflight_ip("192.168.0.5".parse().unwrap(), 3).is_ok());
+    }
+    #[test]
+    fn listen_port_zero_rejected() {
+        assert!(preflight_listen_port(0).is_err());
+        assert!(preflight_listen_port(9100).is_ok());
+    }
+    #[test]
+    fn settle_must_be_less_than_discover_timeout() {
+        assert!(preflight_settle(30, 120).is_ok());
+        assert!(preflight_settle(120, 120).is_err());
+        assert!(preflight_settle(121, 120).is_err());
     }
 }
 
@@ -1177,10 +1214,6 @@ struct AutoRing {
     topology: cascadia_topology::Topology,
     discovery: cascadia_discovery::DiscoveryService,
     self_node: cascadia_topology::NodeInfo,
-    /// Held through the election so a fast peer's dial finds a listener;
-    /// dropped just before runner.start_with_listen (the engine binds the
-    /// port itself — holding this would AddrInUse it).
-    prebound: Option<tokio::net::TcpListener>,
 }
 
 async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoRing> {
@@ -1198,6 +1231,8 @@ async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoR
     let ns = cluster_namespace();
     // Honor --listen: advertise the SAME relay port the engine will bind.
     let (_, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
+    preflight_listen_port(listen_port)?;
+    preflight_settle(args.settle, args.discover_timeout)?;
 
     let self_node = cascadia_topology::NodeInfo {
         node_id: node_id.clone(),
@@ -1220,15 +1255,15 @@ async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoR
         last_seen: 0.0,
     };
 
-    // Pre-bind the relay port for the election window: an already-committed
-    // upstream's dial completes its TCP handshake while we finish Phase 2.
-    // Dropped by cmd_worker just before start_with_listen (see AutoRing doc).
-    let prebound = tokio::net::TcpListener::bind(("0.0.0.0", listen_port))
-        .await
-        .map_err(|e| {
-            anyhow!("pre-bind :{listen_port} failed (another worker on this host?): {e}")
-        })?;
-
+    // NOTE: we deliberately do NOT pre-bind the relay port here. An
+    // already-committed upstream's dial that races ahead of our own listener
+    // hits connection-refused (closed port) and self-heals via the
+    // transport dialer's connect-refused + 500ms retry loop in
+    // `connect_with_timeout`. A pre-bound listener would instead let that
+    // dial complete into the kernel accept-queue, only for us to drop it
+    // (and RST the already-ESTABLISHED connection) right before
+    // `start_with_listen` — turning a self-healing race into a connection-
+    // fatal one that kills the stage on its first send/recv. See PR review.
     let topology = cascadia_topology::Topology::new();
     topology.add_node(self_node.clone());
     let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), ns.clone());
@@ -1268,7 +1303,6 @@ async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoR
         topology,
         discovery,
         self_node,
-        prebound: Some(prebound),
     })
 }
 
@@ -1347,12 +1381,11 @@ async fn cmd_worker(mut args: WorkerArgs) -> Result<()> {
     } else {
         None
     };
-    // Release the election-era relay listener so the engine can bind the
-    // port itself (holding it would AddrInUse every non-first stage). The
-    // dialer's 500ms connect retry absorbs the sub-second rebind gap.
-    if let Some(a) = auto.as_mut() {
-        a.prebound.take();
-    }
+    // No election-era listener to release here: run_auto_election does not
+    // pre-bind the relay port (see its comment). The engine binds it fresh
+    // via start_with_listen below; any upstream dial that raced ahead hits
+    // connection-refused and self-heals via connect_with_timeout's 500ms
+    // retry loop.
     runner.start_with_listen(peers, shard, listen).await?;
 
     // Probe listener: bind a TCP socket on listen_port so the
@@ -1461,7 +1494,11 @@ async fn cmd_worker(mut args: WorkerArgs) -> Result<()> {
     // Auto path: publish api_port now that rank 0 is known, PRESERVING the
     // committed ring_digest carried in self_node (props_from_node rewrites the
     // whole TXT record; blanking the digest would strand a straggler in Phase 2).
-    if api_port.is_some() && self_node.cluster_size.is_some() {
+    // Gated to rank == 0: if an operator passes --api on the identical command
+    // to every box, non-coordinator ranks would otherwise advertise an api_port
+    // they never serve (rank > 0 returns in the relay arm before the API block
+    // below), leaving the dashboard pointing at a dead address for every stage.
+    if api_port.is_some() && self_node.cluster_size.is_some() && rt.rank == 0 {
         let mut sn = self_node.clone();
         sn.api_port = api_port;
         topology.add_node(sn.clone());

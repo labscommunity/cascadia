@@ -79,9 +79,9 @@ pub async fn cmd_discover(args: DiscoverArgs) -> Result<()> {
             args.namespace
         );
         println!();
-        println!("Note: workers do not yet advertise on the network automatically —");
-        println!("auto-ring formation is tracked in issue #52. For now, wire peers");
-        println!("manually with --listen / --next host:port.");
+        println!("Note: workers advertise automatically via mDNS auto-ring — run");
+        println!("`cascadia worker --cluster-size N` on every box (issue #89). You can");
+        println!("still wire peers manually with --listen / --next host:port instead.");
         return Ok(());
     }
 
