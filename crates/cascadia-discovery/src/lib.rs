@@ -104,6 +104,15 @@ fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
     if let Some(api_port) = info.api_port {
         p.insert("api_port".into(), api_port.to_string());
     }
+    if let Some(h) = &info.model_hash {
+        p.insert("model_hash".into(), h.clone());
+    }
+    if let Some(cs) = info.cluster_size {
+        p.insert("cluster_size".into(), cs.to_string());
+    }
+    if let Some(d) = &info.ring_digest {
+        p.insert("ring_digest".into(), d.clone());
+    }
     p
 }
 
@@ -140,6 +149,18 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         })
         .unwrap_or_default();
 
+    // Election fields. Guard hash shape (16 lowercase hex) so a corrupt or
+    // hostile TXT value degrades to "absent" instead of poisoning matching.
+    let hex16 = |s: String| -> Option<String> {
+        (s.len() == 16
+            && s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+        .then_some(s)
+    };
+    let model_hash = get("model_hash").and_then(hex16);
+    let cluster_size = get("cluster_size").and_then(|s| s.parse().ok());
+    let ring_digest = get("ring_digest").and_then(hex16);
+
     let host = srv
         .get_addresses()
         .iter()
@@ -160,9 +181,9 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         cpu_cores,
         os,
         engines,
-        model_hash: None,
-        cluster_size: None,
-        ring_digest: None,
+        model_hash,
+        cluster_size,
+        ring_digest,
         last_seen: 0.0,
     })
 }
@@ -338,5 +359,66 @@ mod tests {
             .and_then(|s| s.strip_suffix('.'))
             .unwrap_or(&fullname);
         assert_eq!(stripped, "host.lan-r0");
+    }
+
+    #[test]
+    fn election_fields_round_trip_when_present() {
+        let mut node = NodeInfo::new("host-192-168-0-5", "192.168.0.5", 9100);
+        node.model_hash = Some("af63dc4c8601ec8c".into());
+        node.cluster_size = Some(3);
+        node.ring_digest = Some("cbf29ce484222325".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "default").expect("decode");
+        assert_eq!(decoded.model_hash, Some("af63dc4c8601ec8c".into()));
+        assert_eq!(decoded.cluster_size, Some(3));
+        assert_eq!(decoded.ring_digest, Some("cbf29ce484222325".into()));
+    }
+
+    #[test]
+    fn absent_election_fields_decode_to_none_not_empty() {
+        // A worker (old binary / manual path) advertises none of the 3 fields.
+        let node = NodeInfo::new("host-192-168-0-9", "192.168.0.9", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.model_hash, None, "must be None, not Some(\"\")");
+        assert_eq!(decoded.cluster_size, None, "must be None, not Some(0)");
+        assert_eq!(decoded.ring_digest, None);
+    }
+
+    #[test]
+    fn malformed_election_values_decode_to_none() {
+        let node = NodeInfo::new("h", "127.0.0.1", 9100);
+        let mut props = props_from_node(&node);
+        props.insert("cluster_size".into(), "not-a-number".into());
+        // Non-16-hex model_hash (e.g. hostile/corrupt TXT) is treated as absent.
+        props.insert("model_hash".into(), "zz-not-hex".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.cluster_size, None);
+        assert_eq!(decoded.model_hash, None);
     }
 }
