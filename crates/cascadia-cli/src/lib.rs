@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
@@ -147,6 +147,75 @@ mod namespace_tests {
     }
 }
 
+/// Which worker mode the flags select. Pure — unit-tested without clap.
+#[derive(Debug, PartialEq)]
+enum WorkerMode {
+    Manual { rank: u32, total: u32 },
+    Auto { cluster_size: u32 },
+}
+
+/// Rank/total after mode resolution (manual flags or auto election).
+/// The ONLY place Option<u32> rank/total get unwrapped.
+#[derive(Clone, Copy, Debug)]
+struct RankTotal {
+    rank: u32,
+    total: u32,
+}
+
+fn resolve_worker_mode(
+    rank: Option<u32>,
+    total: Option<u32>,
+    cluster_size: Option<u32>,
+) -> Result<WorkerMode> {
+    match (rank, total, cluster_size) {
+        (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => Err(anyhow!(
+            "--cluster-size is mutually exclusive with --rank/--total"
+        )),
+        (Some(r), Some(t), None) => Ok(WorkerMode::Manual { rank: r, total: t }),
+        (None, None, Some(n)) if n >= 1 => Ok(WorkerMode::Auto { cluster_size: n }),
+        (None, None, Some(_)) => Err(anyhow!("--cluster-size must be >= 1")),
+        (None, None, None) => Err(anyhow!(
+            "pass --cluster-size N (auto-ring) or --rank/--total (manual)"
+        )),
+        _ => Err(anyhow!("--rank and --total must be given together")),
+    }
+}
+
+#[cfg(test)]
+mod worker_mode_tests {
+    use super::*;
+    #[test]
+    fn auto_when_cluster_size() {
+        assert_eq!(
+            resolve_worker_mode(None, None, Some(3)).unwrap(),
+            WorkerMode::Auto { cluster_size: 3 }
+        );
+    }
+    #[test]
+    fn manual_when_rank_total() {
+        assert_eq!(
+            resolve_worker_mode(Some(0), Some(2), None).unwrap(),
+            WorkerMode::Manual { rank: 0, total: 2 }
+        );
+    }
+    #[test]
+    fn cluster_size_plus_rank_errors() {
+        assert!(resolve_worker_mode(Some(0), None, Some(3)).is_err());
+    }
+    #[test]
+    fn neither_errors() {
+        assert!(resolve_worker_mode(None, None, None).is_err());
+    }
+    #[test]
+    fn cluster_size_zero_errors() {
+        assert!(resolve_worker_mode(None, None, Some(0)).is_err());
+    }
+    #[test]
+    fn rank_without_total_errors() {
+        assert!(resolve_worker_mode(Some(0), None, None).is_err());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -231,13 +300,30 @@ pub enum EngineKind {
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
-    /// 0-based stage index.
+    /// 0-based stage index (manual path). Omit for auto-ring (--cluster-size).
     #[arg(long)]
-    pub rank: u32,
-
-    /// Total number of stages.
+    pub rank: Option<u32>,
+    /// Total stages (manual path). Omit for auto-ring (--cluster-size).
     #[arg(long)]
-    pub total: u32,
+    pub total: Option<u32>,
+    /// Auto-ring: form an N-stage ring from mDNS-discovered peers running the
+    /// identical command. Mutually exclusive with --rank/--total.
+    /// K8s/cloud note: mDNS multicast does not cross pods — use the explicit
+    /// --rank/--total/--next flags there (the escape hatch; RFC #28).
+    #[arg(long)]
+    pub cluster_size: Option<u32>,
+    /// Auto-ring: seconds to wait for N peers before giving up.
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+    pub discover_timeout: u64,
+    /// Auto-ring: seconds to wait for membership-digest agreement. Keep this
+    /// at 2x the mDNS re-announce interval or more, so one lost digest update
+    /// does not spuriously abort (spec F8).
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub agree_timeout: u64,
+    /// Auto-ring: seconds the discovered set must stay stable before agreement.
+    /// Must exceed the discovery debounce window (750ms); minimum 1.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+    pub settle: u64,
 
     /// First transformer layer this stage holds (global, 0-based, inclusive).
     /// Together with --layer-end, pins an explicit asymmetric layer split
@@ -500,8 +586,12 @@ impl WorkerArgs {
     /// into `cmd_run`) means `run` and `worker` can't silently drift.
     fn single_node(model: String, device: String, engine: EngineKind, api: String) -> Self {
         WorkerArgs {
-            rank: 0,
-            total: 1,
+            rank: Some(0),
+            total: Some(1),
+            cluster_size: None,
+            discover_timeout: 120,
+            agree_timeout: 30,
+            settle: 2,
             layer_start: 0,
             layer_end: 0,
             model,
@@ -699,11 +789,11 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
-fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+fn build_builder(args: &WorkerArgs, rt: RankTotal) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
         EngineKind::OvGenai => {
-            if args.total != 1 {
+            if rt.total != 1 {
                 return Err(anyhow!("ov-genai is single-stage only; use --total 1"));
             }
             if args.draft_model.is_some() && args.prompt_lookup > 0 {
@@ -737,7 +827,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
-            let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            let mut b = OvRuntimeBuilder::new(&args.model, rt.rank, rt.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -750,7 +840,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(b))
         }
         EngineKind::Gemma4 => {
-            let mut b = Gemma4Builder::new(&args.model, args.rank, args.total, &args.device);
+            let mut b = Gemma4Builder::new(&args.model, rt.rank, rt.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -764,7 +854,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::OvDistSpec => {
             // Driver = rank 0 (needs --draft-model). Worker = rank > 0.
-            if args.rank == 0 {
+            if rt.rank == 0 {
                 let draft = args
                     .draft_model
                     .as_deref()
@@ -785,7 +875,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 Ok(Box::new(b))
             } else {
                 let mut b =
-                    OvDistSpecWorkerBuilder::new(&args.model, args.rank, args.total, &args.device);
+                    OvDistSpecWorkerBuilder::new(&args.model, rt.rank, rt.total, &args.device);
                 if let Some(dir) = &args.ov_cache_dir {
                     b = b.with_cache_dir(dir);
                 }
@@ -800,7 +890,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total)
+                .with_rank(rt.rank, rt.total)
                 .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 cfg.cache_dir = Some(dir);
@@ -841,7 +931,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
         EngineKind::Qwen36Moe => Ok(Box::new(
-            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+            Qwen36Builder::new(&args.model, &args.device).with_rank(rt.rank, rt.total),
         )),
     }
 }
@@ -964,20 +1054,25 @@ fn install_shutdown_signal_handler(
 }
 
 async fn cmd_worker(args: WorkerArgs) -> Result<()> {
-    if args.rank >= args.total {
-        return Err(anyhow!(
-            "--rank must be in [0, {}); got {}",
-            args.total,
-            args.rank
-        ));
-    }
-    let is_first = args.rank == 0;
-    let is_last = args.rank == args.total - 1;
+    let rt: RankTotal = match resolve_worker_mode(args.rank, args.total, args.cluster_size)? {
+        WorkerMode::Manual { rank, total } => {
+            if rank >= total {
+                bail!("--rank must be in [0, {total}); got {rank}");
+            }
+            RankTotal { rank, total }
+        }
+        WorkerMode::Auto { .. } => {
+            // Wired in a later task (auto-ring stays unreachable until then).
+            bail!("auto-ring not wired yet");
+        }
+    };
+    let is_first = rt.rank == 0;
+    let is_last = rt.rank == rt.total - 1;
 
     info!(
         engine = ?args.engine,
-        rank = args.rank,
-        total = args.total,
+        rank = rt.rank,
+        total = rt.total,
         device = %args.device,
         model = %args.model,
         "cascadia worker starting"
@@ -1017,7 +1112,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         tp_rank: 0,
     };
 
-    let builder = build_builder(&args)?;
+    let builder = build_builder(&args, rt)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
         Some((listen_host.as_str(), listen_port))
@@ -1094,7 +1189,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         .and_then(|a| parse_addr(a, "0.0.0.0").ok())
         .map(|(_, p)| p);
     let self_node = cascadia_topology::NodeInfo {
-        node_id: format!("{}-r{}", specs.hostname, args.rank),
+        node_id: format!("{}-r{}", specs.hostname, rt.rank),
         host: cascadia_discovery::local_ip().to_string(),
         port: listen_port,
         api_port,
