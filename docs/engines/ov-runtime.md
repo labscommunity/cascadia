@@ -23,7 +23,7 @@ cascadia shard \
 
 Produces:
 
-```
+```text
 <pipeline_dir>/
   pipeline_config.json
   config.json              # copy from the source HF model dir

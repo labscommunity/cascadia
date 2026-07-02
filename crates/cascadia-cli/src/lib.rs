@@ -330,7 +330,7 @@ pub struct WorkerArgs {
     /// Override the MoE top-K dispatch (sparse-moe engine only).
     /// If set and < manifest top_k, dispatch only the first K' experts
     /// per token. K2.6 manifest default is 8; K=4 gives +146% tok/s on
-    /// 10-prompt eval with matched quality. See docs/A3_TOPK_REDUCTION.md.
+    /// 10-prompt eval with matched quality. See docs/perf/A3_TOPK_REDUCTION.md.
     #[arg(long)]
     pub top_k_override: Option<u32>,
 

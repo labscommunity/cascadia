@@ -120,7 +120,7 @@ Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 
 
 ### Engines
 
-```
+```console
 $ cascadia engines
   mock           deterministic word-echo engine for tests
   ov-genai       single-stage openvino_genai.LLMPipeline; FastDraft + Prompt Lookup
@@ -131,7 +131,7 @@ $ cascadia engines
   qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards
 ```
 
-`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output — see [docs/MINIMAX_M2.md](docs/MINIMAX_M2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). Tuning: [docs/A3_TOPK_REDUCTION.md](docs/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
+`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output — see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
 
 ### Supported model families
 
@@ -146,7 +146,7 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 - `cascadia-api/` — OpenAI-compatible HTTP (axum)
 - `cascadia-runner/` — Per-stage runner; concurrent-safe chunk streaming
 - `cascadia-engine/` — `Engine` + `Builder` traits — the plugin seam
-- `cascadia-engine-openvino/` — Three OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`)
+- `cascadia-engine-openvino/` — Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen36-moe`)
 - `cascadia-engine-sparse-moe/` — Sparse-MoE engine; routes only the top-k experts per token
 - `cascadia-int4-gemm/` — hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
 - `cascadia-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
@@ -156,9 +156,9 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 
 ### Cluster status
 
-- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN, but workers still need explicit ranks — full auto-ring formation is not yet wired into `cascadia worker` (tracked in [#52](https://github.com/labscommunity/cascadia/issues/52)).
+- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN, but workers still need explicit ranks — full auto-ring formation is not yet wired into `cascadia worker` (tracked in [#89](https://github.com/labscommunity/cascadia/issues/89)).
 - **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host and writes `device_profile.json` — step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
-- **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
+- **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/TENSOR_PARALLELISM.md](docs/TENSOR_PARALLELISM.md).
 
 ## Deploying
 

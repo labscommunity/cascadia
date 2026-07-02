@@ -107,7 +107,8 @@ first-step):
 
 ≈ **3–4× faster warm** and ≈3× faster first token, at equal (coherent)
 output quality. **int4 (group-32) is the recommended config** — smallest
-(~115 GB), fastest, and fully coherent once the engine bug below is fixed;
+(~115 GB), fastest, and fully coherent (with the `SNIPPETS_MODE`
+workaround described below);
 `ov_ir` is the simpler reference. (NF4/int8/fp8 also work but buy nothing
 over int4 here — see below.)
 

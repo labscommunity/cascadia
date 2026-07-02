@@ -452,7 +452,7 @@ pub struct Runner {
     _safetensors_source: Arc<SafetensorsExpertSource>,
     /// If `Some(k')` with k' < manifest.top_k, forward_shells dispatches
     /// only the first k' of the routed top-K experts per token. See
-    /// `docs/A3_TOPK_REDUCTION.md` for the productionization Pareto.
+    /// `docs/perf/A3_TOPK_REDUCTION.md` for the productionization Pareto.
     top_k_override: Option<u32>,
     /// If `Some(t)` with t > 0, skip experts whose routing weight is
     /// below t. Applied AFTER `top_k_override`.

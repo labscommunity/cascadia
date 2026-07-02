@@ -134,7 +134,7 @@ measured axis (§5), not a default.
   single stream** — but it lives or dies on RTT (see the wire-latency
   measurement in §5).
 - **Tensor parallelism** — the repo already documents it
-  (`docs/architecture/tensor-parallelism.md`) as the latency-reducing
+  (`docs/TENSOR_PARALLELISM.md`) as the latency-reducing
   design on high-bandwidth fabric; per-layer all-reduce of 2048-dim
   activations. Same network-bound character as expert parallelism;
   examine together.
@@ -366,7 +366,7 @@ GPU-prefill→CPU-decode handoff inside a rank (state round-trip proven
 by the spikes above, but the state get/set FFI in the shim is not
 built).
 
-### Pipeline mode (multi-node)
+## 6. Pipeline mode (multi-node)
 
 The staged engine runs as an N-rank layer pipeline
 (`--rank i --total N`). Rank 0 holds embeddings + stage 0 + tokenizer
@@ -428,7 +428,7 @@ single-box envelope, wire p50 ~21 ms / p95 ~24 ms. A 3-stage chain
 with a real middle rank measured per-hop-additive wire (~2× single
 hop) and parity exact — 2-node remains the perf-reference config.
 
-## 6. Out of scope (v1, regardless of strategy)
+## 7. Out of scope (v1, regardless of strategy)
 
 Vision tower; MTP/speculative decoding; batching/multi-stream (priced
 spec change, not a default); prefix caching on linear layers;

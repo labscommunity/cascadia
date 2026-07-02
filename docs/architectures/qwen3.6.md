@@ -32,7 +32,7 @@ name input_ids was not found"). The `ov-genai` engine auto-detects this
 layout and uses `VLMPipeline` (text-only) via the shim's
 `cascadia_pipeline_create_vlm`:
 
-```
+```bash
 # Pre-exported IR (preferred):
 #   https://huggingface.co/OpenVINO/Qwen3.6-35B-A3B-int4-ov
 cascadia run --engine ov-genai --model /path/to/Qwen3.6-35B-A3B-int4-ov --device GPU
@@ -41,7 +41,7 @@ cascadia run --engine ov-genai --model /path/to/Qwen3.6-35B-A3B-int4-ov --device
 Or export yourself with Optimum-Intel on the 2026.2 toolchain
 (`tools/requirements.txt` pins the floors):
 
-```
+```bash
 optimum-cli export openvino -m Qwen/Qwen3.6-35B-A3B \
     --weight-format int4 --task text-generation-with-past <out-dir>
 ```
@@ -83,8 +83,6 @@ Follow-ups (validated on the same node):
   regression: the NPU-proven `llama-3.1-8b-instruct-npu-ov` export served
   fine on NPU. Dynamic-shape `int4-ov` exports are CPU/GPU artifacts; NPU
   needs its dedicated static-shape exports, as before.
-- **OVMS 2026.2.0** installed via the repinned `install-ovms.ps1`
-  (URL + SHA256 verified end-to-end).
 
 **Tool-calling validated** on BOTH serving paths through
 `/v1/chat/completions` (CPU): a hermes-format tool schema in
@@ -111,9 +109,11 @@ GenAI level is the follow-up) and passed with 256-token budgets. True bf16 HF-re
 parity is NOT claimable on the hardware tested (35B bf16 needs ~70 GB;
 a 32 GB node cannot hold it) — the gate is factual correctness +
 cross-path consistency on
-the official int4 artifact, stated per the no-silent-caps rule.
+the official int4 artifact — we state the actual gate used rather
+than claiming full HF-reference parity.
 
-Still pending: iGPU repeat of the tool-calling probe and prompt set.
+Known limitation: the tool-calling probe and prompt set have been
+validated on CPU only, not yet repeated on iGPU.
 
 ## Why `cascadia shard` rejects it
 

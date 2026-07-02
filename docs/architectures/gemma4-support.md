@@ -19,7 +19,7 @@ shard` auto-dispatches to it on detection of `model_type ∈
 
 Tested on a Linux/Xeon export host (OpenVINO 2026.1):
 
-```
+```console
 $ python tools/export_shards.py \
     --model google/gemma-4-E2B-it \
     --output-dir /tmp/test_gemma4_e2b \
@@ -121,24 +121,30 @@ now shipped).
 - [x] Tested end-to-end on a Xeon export host with Gemma-4-E2B-it.
 
 **Phase B — Rust runtime (`crates/cascadia-engine-openvino`) — shipped
-(`--engine gemma4`, `gemma4.rs`):**
+(`--engine gemma4`, `gemma4.rs`), simpler than originally sketched:**
 
-- [x] New `Gemma4Stage` engine that:
-  - Reads the extended `stage_config.json` schema (per-layer
-    `head_dims`, `layer_types`, `is_shared`, `own_kv_head_dims`,
-    `cross_stage_sources_local`, `external_shared_sources`,
-    `pli_dim`, `downstream_pli_count`, `final_logit_softcapping`).
-  - Allocates per-layer KV cache with per-layer head_dim.
-  - Skips KV allocation for `is_shared[i] = true` layers.
-  - Sends/receives `external_kv.N.key/value` pairs over the wire
-    alongside `hidden_states`.
-  - On stage 0 (embed), emits `hidden_states + downstream_PLI`
-    concatenated on the last dim. On middle stages, slices off the
-    head-stage PLI before sending.
-  - On the head stage, samples directly from the post-softcap
-    `logits` output.
-- [x] Stage-config schema versioning (`export_version:
-  "gemma4_cached_v1"`).
+Most of the contract ended up baked into the IRs themselves, so the
+engine reads a slim `stage_config.json` (layer range, embed/head
+roles, `stateful` flag, `cross_stage_sources_local`,
+`external_shared_sources`) rather than the richer schema sketched
+below:
+
+- [x] Own KV is OV internal state (stateful IRs) — no per-layer KV
+  allocation in Rust; per-layer head_dims live inside the IR.
+- [x] Cross-stage shared KV: `cross_kv.N` outputs / `external_kv.N`
+  inputs relayed over the wire, tagged by global source-layer id so
+  the consumer pairs frames explicitly.
+- [x] PLI rides inside the `hidden_states` tensor (the wire tensor is
+  simply wider when `pli_dim > 0`); concat/slice is in the exported
+  graph, not the engine.
+- [x] `final_logit_softcapping` is applied inside the head-stage IR;
+  the engine samples its `logits` output directly.
+
+Original sketch (kept for context — superseded by the above): an
+extended stage-config schema carrying per-layer `head_dims`,
+`layer_types`, `is_shared`, `own_kv_head_dims`, `pli_dim`,
+`downstream_pli_count`, `final_logit_softcapping`, with the engine
+allocating per-layer KV and slicing PLI itself.
 
 **Phase C — End-to-end testing:**
 

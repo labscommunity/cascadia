@@ -23,7 +23,7 @@ cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
 
 Output:
 
-```
+```text
 ~/cascadia/llama-8b-2stage/
   pipeline_config.json    # global metadata: model_id, layer count, vocab, etc.
   tokenizer/              # tokenizer.json + config.json + special tokens
@@ -140,7 +140,7 @@ the HF reference).
 The right answer is determined by **memory** more than throughput. A
 shard's GPU memory footprint at runtime is roughly:
 
-```
+```text
 shard_size ≈ (layers_in_shard / total_layers) × model_size_int4
            + KV_cache_per_token × max_context_len
            + workspace (~500 MB OV plugin)
@@ -154,7 +154,6 @@ to keep each shard under 8 GB of weights + leave room for KV cache.
 Practical layout: `--num-stages 4 --layer-split 20,40,60` (uneven, with
 the most layers on the GPU/CPU node that has the most free RAM).
 
-For Mixtral 8x7B INT4 (~28 GB): same story — split 3-4 ways.
 
 There's a per-stage overhead (network round-trip + OV plugin init), so
 **don't** over-shard a model that fits on fewer nodes. 2 stages costs

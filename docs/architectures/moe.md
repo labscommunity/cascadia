@@ -50,7 +50,7 @@ that fits them all. The choices that differ:
 `crates/cascadia-engine-sparse-moe/` implements a specialised MoE
 runtime for **Kimi K2.6** (60-layer Mixtral-style with 384 experts
 per layer, top-8 routing) and **MiniMax-M2** (62-layer all-MoE,
-256 experts top-8 — see [docs/MINIMAX_M2.md](../MINIMAX_M2.md)). It
+256 experts top-8 — see [minimax-m2.md](minimax-m2.md)). It
 uses:
 
 - per-expert OV IRs (each expert is exported as its own IR)
@@ -63,15 +63,14 @@ This is NOT wired into `cascadia shard`; the engine is invoked via
 `--engine sparse-moe` directly against the pre-built artefacts. One
 per-family exporter ships in this repo:
 `tools/export_minimax_m2.py` produces the full sparse-MoE layout for
-MiniMax-M2 ([docs/MINIMAX_M2.md](../MINIMAX_M2.md) documents the
+MiniMax-M2 ([minimax-m2.md](minimax-m2.md) documents the
 pipeline). The Kimi K2.6 artefacts come from an external export
 pipeline that is not part of this repo.
 
-Known-working export paths also exist for Mixtral and the Gemma 4
-26B-A4B MoE, but those don't ship here yet. If/when Cascadia grows
-generic MoE support, each family would land as its own
-`export_<family>.py` beside the generic exporter (the MiniMax-M2 and
-Gemma 4 exporters set the pattern).
+If/when Cascadia grows support for more MoE families (Mixtral and the
+Gemma 4 26B-A4B are the obvious candidates), each would land as its
+own `export_<family>.py` beside the generic exporter — the MiniMax-M2
+and Gemma 4 exporters set the pattern.
 
 ## Until then
 
@@ -79,11 +78,13 @@ Gemma 4 exporters set the pattern).
 fast (before downloading weights) with an error explaining that the
 generic exporter builds dense decoder layers only — MoE routing +
 per-expert MLPs are not implemented, and falling back to a dense layer
-would silently emit garbage. The message also points at the two paths
-that DO work: hybrid Qwen3.5/3.6 MoE (`model_type: qwen3_5_moe`) is
-dispatched automatically to the dedicated IR-surgery exporter (see
-[qwen36-moe-support.md](qwen36-moe-support.md)), and Kimi K2.6 /
-MiniMax-M2 serve via `--engine sparse-moe` against pre-built artefacts.
+would silently emit garbage. The message points at what DOES work for
+hybrid Qwen3.5/3.6 MoE (`model_type: qwen3_5_moe`): automatic dispatch
+to the dedicated IR-surgery exporter (see
+[qwen36-moe-support.md](qwen36-moe-support.md)) or single-stage
+`--engine ov-genai` on OV GenAI ≥ 2026.2. Separately from the sharder,
+Kimi K2.6 / MiniMax-M2 serve via `--engine sparse-moe` against
+pre-built artefacts (above).
 
 The same rejection applies to: Qwen3-MoE, Llama 4, gpt-oss, GraniteMoE,
 Hunyuan, Gemma 4 26B-A4B, DeepSeek-V3.

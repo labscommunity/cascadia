@@ -51,7 +51,7 @@ pub struct SparseMoEBuilderConfig {
     /// Number of pipeline stages.
     pub total: u32,
     /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
-    /// token are dispatched per shell layer. See `docs/A3_TOPK_REDUCTION.md`.
+    /// token are dispatched per shell layer. See `docs/perf/A3_TOPK_REDUCTION.md`.
     pub top_k_override: Option<u32>,
     /// Skip experts whose router weight falls below this threshold.
     /// 0.0 / None = disabled. Applied AFTER `top_k_override`.

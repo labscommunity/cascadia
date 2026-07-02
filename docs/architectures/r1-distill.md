@@ -54,7 +54,7 @@ AI PCs reachable over the network; `node-a.local` / `node-b.local`
 and the `192.168.1.10` / `192.168.1.20` addresses below are
 placeholders — node A is .10, node B is .20.)
 
-```
+```console
 $ curl http://192.168.1.10:8000/v1/chat/completions -d '{
     "model": "r1-distill-qwen-1.5b",
     "messages": [{"role": "user", "content": "What is 17 * 23? Think step by step."}],
@@ -76,7 +76,7 @@ end-of-chain-of-thought.)
 `ReadValue` nodes (via `apply_make_stateful_transformation`) that the
 OpenVINO CPU plugin rejected with:
 
-```
+```text
 Check 'idx < parentEdges.size()' failed at
 src/plugins/intel_cpu/src/node.cpp:687:
 Node ReadValue_33408 contains less parent edges than 0

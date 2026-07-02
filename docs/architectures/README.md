@@ -11,9 +11,9 @@ This directory holds per-family deep-dives for non-trivial cases.
 ## Per-family notes
 
 - [`gemma4-support.md`](./gemma4-support.md) — Gemma 4 (April 2026):
-  what makes it different from Gemma 3, and the dedicated
+  what makes it different from Gemma 3, the dedicated
   `tools/export_gemma4.py` exporter (#48) that `cascadia shard`
-  auto-dispatches to (exporter-only today; Rust-runtime port is Phase B).
+  auto-dispatches to, and the `gemma4` engine that serves the shards.
 - [`phi.md`](./phi.md) — Phi-3 / Phi-4 family: partial rotary (handled,
   #69), LongRoPE (soft-dropped), and sliding window.
 - [`moe.md`](./moe.md) — Mixtral, Qwen3-MoE, Llama 4, gpt-oss,
@@ -25,6 +25,13 @@ This directory holds per-family deep-dives for non-trivial cases.
   for `mistral3` multimodal wrappers.
 - [`r1-distill.md`](./r1-distill.md) — DeepSeek R1 Distills (Qwen / Llama):
   they ride the base qwen2 / llama paths; pipeline-parallel recipe.
+- [`qwen3.6.md`](./qwen3.6.md) — Qwen3.6-35B-A3B single-stage support:
+  hybrid GatedDeltaNet + MoE facts, serving paths, hardware validation.
+- [`qwen36-moe-support.md`](./qwen36-moe-support.md) — Qwen3.6 staged
+  serving: IR-surgery exporter, the `qwen36-moe` engine, and multi-node
+  pipeline mode with acceptance gates.
+- [`minimax-m2.md`](./minimax-m2.md) — MiniMax-M2 on the sparse-MoE
+  engine: export pipeline, quantization configs, measured throughput.
 
 ## How to add a new family
 

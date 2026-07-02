@@ -89,7 +89,7 @@ JSON, schema `version: 1`. See `crates/cascadia-cli/src/profile.rs`.
 Run 2026-05-21, OpenVINO 2026.1.0, openvino_genai 2026.1.0.0-2957-1dabb8c2255.
 Model: Qwen3-1.7B int4, exported via Optimum-Intel. 32-token greedy decode,
 3 measured runs (best reported), 1 warmup. Numbers from `cascadia
-profile-devices` itself (this PR's tool), not a separate Python harness.
+profile-devices` itself, not a separate Python harness.
 
 | Device                       | compile (s) | best run (s) | **tok/s** | vs GPU alone |
 |------------------------------|-------------|--------------|-----------|--------------|
@@ -170,7 +170,7 @@ That's worth amortising via the `--ov-cache-dir` flag (or `cascadia
 worker --ov-cache-dir`) so subsequent invocations on the same model hit
 a cached blob in ≈1 s instead.
 
-## What this PR does NOT do
+## What this does NOT do
 
 It does not build the ILP solver or the OV IR-rewrite step that sets
 per-op affinities. The data above doesn't yet justify that work: the

@@ -56,7 +56,7 @@ C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point cat
 
 ## `cascadia-types`
 
-Zero-dependency wire/value types shared by every crate: generation tasks and chunks, shard descriptions, peer layout. Keeping them dependency-free lets engines and transports evolve without version-lockstep.
+Engine-agnostic core types (serde-serializable): generation tasks and chunks, shard descriptions, peer layout. Only `serde` + `thiserror` as dependencies, so downstream crates share vocabulary without version-lockstep.
 
 ## `cascadia-transport`
 
@@ -76,4 +76,4 @@ Model registry plus on-demand HuggingFace pull. Registry lives at `~/.cache/casc
 
 ## `cascadia-cli` + `cascadia`
 
-`cascadia worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.
+`cascadia worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `completions` (shell completions), `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.

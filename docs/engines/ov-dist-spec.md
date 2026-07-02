@@ -14,7 +14,7 @@ Combines pipeline parallelism with speculative decoding: the **driver** holds a 
 Requires **v5 shards** (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via `cascadia shard` — its exporter (`tools/export_shards.py`) emits `v5_canonical_inputs` shards; see [../SHARDING.md](../SHARDING.md).
 
 Driver expects the full pipeline directory:
-```
+```text
 <pipeline_dir>/
   pipeline_config.json
   tokenizer/                 (optional; falls back to model_id's HF cache)
@@ -26,7 +26,7 @@ Driver expects the full pipeline directory:
 ```
 
 Workers can hold just their own stage as a flat dir:
-```
+```text
 <worker_model_dir>/
   openvino_model.xml
   openvino_model.bin
@@ -45,7 +45,7 @@ Mask-based rewind is **driver-side only** — the worker just sees a new `attent
 
 ## Topology
 
-```
+```text
 driver (rank 0, has draft + stage_0 + tokenizer)
        ⇣ FORWARD
 worker (rank 1, has stage_1)
