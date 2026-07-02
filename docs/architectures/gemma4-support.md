@@ -13,12 +13,11 @@ the same `model_type: "gemma4"` outer wrapper (the text backbone is
 
 ## What ships in this PR
 
-`tools/export_gemma4.py` — a Gemma-4-specific exporter ported from
-rainier's `scripts/export_gemma4_e2b_cached_shards.py`. `cascadia
+`tools/export_gemma4.py` — a Gemma-4-specific exporter. `cascadia
 shard` auto-dispatches to it on detection of `model_type ∈
 {"gemma4", "gemma4_text"}`.
 
-Tested on miner (Linux/Xeon, OpenVINO 2026.1):
+Tested on a Linux/Xeon export host (OpenVINO 2026.1):
 
 ```
 $ python tools/export_shards.py \
@@ -83,9 +82,9 @@ and try INT4 once you've confirmed parity.
 * **`final_logit_softcapping=30.0`** — applied in the head stage:
   `logits = softcap * tanh(logits / softcap)`.
 * **Q/K/V RMSNorm per head before rotary** — handled by the manual
-  cached_gemma4_layer_forward (rainier discovered HF's Gemma 4 path
-  has a FP16/FP32 autocast issue that breaks tracing; the cached
-  forward keeps dtypes consistent).
+  cached_gemma4_layer_forward (HF's Gemma 4 path has a FP16/FP32
+  autocast issue that breaks tracing; the cached forward keeps
+  dtypes consistent).
 * **Patched ov_utils.torch_tensor_to_ov_const** — reshapes 0-dim
   scalar tensors to (1,) so the per-layer scalar buffers don't crash
   OV's PyTorch frontend.
@@ -120,7 +119,7 @@ and try INT4 once you've confirmed parity.
   MLP + optional PLI + optional layer_scalar).
 - [x] Self-verify each stage on CPU after export.
 - [x] Skip 26B-A4B MoE variant cleanly.
-- [x] Tested end-to-end on miner with Gemma-4-E2B-it.
+- [x] Tested end-to-end on a Xeon export host with Gemma-4-E2B-it.
 
 **Phase B — Rust runtime (`crates/cascadia-engine-openvino`):**
 
@@ -143,12 +142,11 @@ and try INT4 once you've confirmed parity.
 
 **Phase C — End-to-end testing:**
 
-- [ ] 2-stage pipeline-parallel on miner (rank 0) + beta (rank 1)
+- [ ] 2-stage pipeline-parallel across two nodes (rank 0 + rank 1)
   via cascadia worker. Verify Gemma-4-E2B-it produces sensible
   tokens for a chat prompt.
-- [ ] 3-stage shard for Gemma-4-31B-it across miner + beta +
-  charlie. Verify single-box runtime memory stays under the
-  per-box envelope.
+- [ ] 3-stage shard for Gemma-4-31B-it across three nodes. Verify
+  single-box runtime memory stays under the per-box envelope.
 
 ## Why Gemma 4 needs its own exporter
 
@@ -168,8 +166,6 @@ all break on Gemma 4:
    earlier stage's source layer.
 
 A separate code path is cleaner than threading these as flags
-through the generic stage builder. Rainier's working Python
-prototype (the source we ported from) had reached the same
-conclusion in its standalone E2B exporter, and we expect the same
-pattern when Llama 4 / Qwen3-MoE / gpt-oss eventually land — each
-gets its own `export_<family>.py`.
+through the generic stage builder, and we expect the same pattern
+when Llama 4 / Qwen3-MoE / gpt-oss eventually land — each gets its
+own `export_<family>.py`.

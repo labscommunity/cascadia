@@ -96,7 +96,7 @@ Experts can run two ways (manifest `experts_format`, exporter `--experts`):
   the Rust unit test `int4_bin_expert_matches_fp32_within_tolerance` and a
   Python packer round-trip.
 
-Measured on the miner (Xeon Gold 6252, full 230B M2, 24 tokens, identical
+Measured on a Xeon Gold 6252 host (full 230B M2, 24 tokens, identical
 fp32 shells, `SNIPPETS_MODE=DISABLE`; warm = steady-state, excluding cold
 first-step):
 

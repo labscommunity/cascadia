@@ -27,11 +27,9 @@ which skips experts whose router weight is below the threshold. The
 two flags compose (`--top-k-override` is applied first, then
 `--routing-threshold` filters the remaining experts).
 
-## Measured Pareto on K2.6 (miner single-stage, Xeon Gold 6252 + DDR4-2133)
+## Measured Pareto on K2.6 (single-stage, Xeon Gold 6252 + DDR4-2133)
 
 Bench: 10-prompt factual eval, max_tokens=64, single replicate per K.
-Source: `autolab/k26-perf` branch experiments `009_a3_robustness_10prompt`,
-`011_a3_k4_longcontext`, `013_a3_k4_vs_k8_longcontext`.
 
 | K | tok/s | Δ vs K=8 | Quality (substring + coherent) |
 |--:|------:|---------:|--------------------------------|
@@ -61,8 +59,6 @@ sampling temperature:
 | Long-context + max throughput (low-temp only) | K=4 | 9/10 | +210% |
 | High-temperature workload (temp ≥ 0.5) | K=6 | 8-10/10 | +51-75% |
 | Maximum quality | K=8 | 8-9/10 | (ref) |
-
-**Source:** autolab/k26-perf iter 018/019/021.
 
 **K=6 is the surprising universal best default.** At long context
 (max_tokens=64), K=6 PERFECTLY passes 10/10 prompts while K=8 only
@@ -101,9 +97,9 @@ output distribution on harder prompts.
   incoherent ("Pyth" "Pyth" for the Python prompt, "delighted" for
   Washington). For high-temperature chat workloads (temp ≥ 0.5),
   recommend K=6 or K=8. The +146% throughput win only applies in the
-  low-temperature regime. Source: `autolab/k26-perf` iter 018.
-- Measured on miner single-stage (disk-bound regime — K2.6 = 553 GB,
-  RAM = 133 GB). The 2-box matias setup (compute-bound) may show a
+  low-temperature regime.
+- Measured single-stage on a Xeon host (disk-bound regime — K2.6 =
+  553 GB, RAM = 133 GB). A 2-box compute-bound setup may show a
   smaller relative win but the quality picture should hold.
 - 10-prompt substring eval is narrow. A proper MMLU/LongBench eval
   would tighten the quality claim. The 1-prompt quality difference
@@ -115,12 +111,6 @@ output distribution on harder prompts.
 
 ## Sources
 
-- `autolab/k26-perf` PR #11 — long-lived research branch with full Pareto
-  bench artifacts.
-- `experiments/009_a3_robustness_10prompt/result.md` — 10-prompt eval
-  K=3 vs K=4 vs K=8 at max_tokens=16.
-- `experiments/013_a3_k4_vs_k8_longcontext/result.md` — apples-to-apples
-  K=4 vs K=8 at max_tokens=64.
 - arxiv 2505.03531 "Faster MoE LLM Inference" — sigmoid-router MoE
   literature.
 - KTransformers V0.3 `-ser` knob — related production knob on

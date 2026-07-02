@@ -51,26 +51,22 @@ that fits them all. The choices that differ:
 runtime for **Kimi K2.6 only** (60-layer Mixtral-style with 384 experts
 per layer, top-8 routing). It uses:
 
-- per-expert OV IRs (rainier exports each expert as its own IR)
+- per-expert OV IRs (each expert is exported as its own IR)
 - a router pass that picks top-k experts per token
 - the hand-rolled AVX-512 INT4 GEMM kernel for the expert matmul
 - a bounded LRU cache of compiled experts (most aren't in memory at
   once on a 133-GB-RAM box)
 
-This is NOT wired into `cascadia shard`. It has its own export
-pipeline (`/mnt/external_ssd/kimi-k26-*/` on the miner) and is invoked
-via `--engine sparse-moe` directly against the pre-built artefacts.
+This is NOT wired into `cascadia shard`. The expert-bin export
+pipeline is not part of this repo; the engine is invoked via
+`--engine sparse-moe` directly against the pre-built artefacts.
 
-Rainier has working exporters for:
-
-- `scripts/export_cached_shards_v6_mixtral.py` — Mixtral
-- `scripts/export_cached_shards_v7_sparse_moe.py` — Kimi K2.6
-- `scripts/export_cached_shards_v8_batched_moe.py` — batched expert
-  variant
-- `scripts/export_gemma4_moe_shards.py` — Gemma 4 26B-A4B MoE
-
-These are the reference implementations to port if/when cascadia grows
-generic MoE support.
+Known-working export paths exist for Mixtral, Kimi K2.6 sparse-MoE
+(plus a batched-expert variant), and the Gemma 4 26B-A4B MoE, but
+none ship in this repo yet. If/when cascadia grows generic MoE
+support, each family would land as its own `export_<family>.py`
+beside the generic exporter (the Gemma 4 dense exporter sets the
+pattern).
 
 ## Until then
 

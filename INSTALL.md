@@ -16,7 +16,7 @@ After any build, run **`cascadia doctor`** — it checks your toolchain and tell
 The fast path. Builds on macOS / Linux / Windows with nothing but Rust. The OpenVINO-backed engines return a clean runtime error; the `mock` engine works, so you can exercise the full API, transport, and multi-stage plumbing.
 
 ```bash
-rustup default stable        # need 1.75+
+rustup default stable        # need 1.85+
 cargo build --release -p cascadia
 ./target/release/cascadia doctor
 ```

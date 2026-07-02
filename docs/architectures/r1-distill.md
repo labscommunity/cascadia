@@ -49,12 +49,12 @@ answer = text.split("</think>")[-1].strip() if "</think>" in text else text
 **End-to-end pipeline-parallel works on Intel iGPU (Lunar Lake).**
 Verified 2026-05-21 with `r1-distill-qwen-1.5b` (int4, 917 MB total)
 sharded across two Lunar Lake iGPU AI PCs (rank 0 → rank 1), API on
-rank 0:8000. (The original `beta`/`charlie` validation hosts were
-retired 2026-05-29; the recipe below is host-agnostic — substitute
-any two AI PCs reachable over the network.)
+rank 0:8000. (The recipe below is host-agnostic — substitute any two
+AI PCs reachable over the network; `node-a.local` / `node-b.local`
+below are placeholders.)
 
 ```
-$ curl http://192.168.86.31:8000/v1/chat/completions -d '{
+$ curl http://192.168.1.10:8000/v1/chat/completions -d '{
     "model": "r1-distill-qwen-1.5b",
     "messages": [{"role": "user", "content": "What is 17 * 23? Think step by step."}],
     "max_tokens": 96
@@ -89,13 +89,13 @@ iGPU. Pipeline-parallel `--engine ov-runtime` runs on `--device CPU`,
 
 Steps to reproduce the pipeline-parallel run:
 
-1. Export 2-stage int4 shards on the miner (only needs CPU + plenty
-   of disk; nothing to do with the actual runtime). `int4` is
+1. Export 2-stage int4 shards on an export host (only needs CPU +
+   plenty of disk; nothing to do with the actual runtime). `int4` is
    important — `int8` triggers a similar OV stateful issue when the
    nncf compressed weights interact with `ReadValue` ops.
 
    ```bash
-   ssh miner "source ~/.venv/rainier/bin/activate && \
+   ssh <export-host> "source ~/.venv/export/bin/activate && \
      python ~/cascadia/tools/export_shards.py \
        --model r1-distill-qwen-1.5b \
        --output-dir /tmp/r1_int4 \
@@ -108,39 +108,39 @@ Steps to reproduce the pipeline-parallel run:
 2. Tarball + ship shards to both AI PCs:
 
    ```bash
-   ssh miner 'tar -C /tmp -czf /tmp/r1_int4.tgz r1_int4'
-   scp miner:/tmp/r1_int4.tgz /tmp/r1_int4.tgz
-   scp /tmp/r1_int4.tgz cascadia@beta.local:C:/Users/cascadia/r1_int4.tgz
-   scp /tmp/r1_int4.tgz cascadia@charlie.local:C:/Users/cascadia/r1_int4.tgz
-   ssh cascadia@beta.local    'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
-   ssh cascadia@charlie.local 'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
+   ssh <export-host> 'tar -C /tmp -czf /tmp/r1_int4.tgz r1_int4'
+   scp <export-host>:/tmp/r1_int4.tgz /tmp/r1_int4.tgz
+   scp /tmp/r1_int4.tgz cascadia@node-a.local:C:/Users/cascadia/r1_int4.tgz
+   scp /tmp/r1_int4.tgz cascadia@node-b.local:C:/Users/cascadia/r1_int4.tgz
+   ssh cascadia@node-a.local 'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
+   ssh cascadia@node-b.local 'powershell -Command "mkdir C:\tmp\r1_int4 -Force; tar -xzf C:\Users\cascadia\r1_int4.tgz -C C:\tmp\r1_int4"'
    ```
 
-3. Launch the rank-1 worker on **charlie** (downstream — Lunar Lake
+3. Launch the rank-1 worker on **node-b** (downstream — Lunar Lake
    iGPU). Keep the SSH session OPEN; on Windows, closing the
    parent SSH session kills the worker even with
-   `Start-Process -WindowStyle Hidden` (a known OpenSSH-Windows
-   quirk, see `local-ai-pc-fleet` memory):
+   `Start-Process -WindowStyle Hidden` (a known OpenSSH-on-Windows
+   quirk):
 
    ```bash
-   ssh cascadia@charlie.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
+   ssh cascadia@node-b.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
      $env:PATH = ''C:\openvino_genai\runtime\bin\intel64\Release;C:\openvino_genai\runtime\3rdparty\tbb\bin;'' + $env:PATH;
-     & C:\tahoma\tahoma.exe worker --rank 1 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --listen 0.0.0.0:9100"'
+     & C:\cascadia\cascadia.exe worker --rank 1 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --listen 0.0.0.0:9100"'
    ```
 
-4. In a second terminal, launch the rank-0 worker on **beta**
+4. In a second terminal, launch the rank-0 worker on **node-a**
    (upstream — Lunar Lake iGPU — serves the API):
 
    ```bash
-   ssh cascadia@beta.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
+   ssh cascadia@node-a.local 'powershell -NoProfile -ExecutionPolicy Bypass -Command "
      $env:PATH = ''C:\openvino_genai\runtime\bin\intel64\Release;C:\openvino_genai\runtime\3rdparty\tbb\bin;'' + $env:PATH;
-     & C:\tahoma\tahoma.exe worker --rank 0 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --next 192.168.86.39:9100 --api 0.0.0.0:8000"'
+     & C:\cascadia\cascadia.exe worker --rank 0 --total 2 --engine ov-runtime --device GPU --model C:\tmp\r1_int4\r1_int4 --next 192.168.1.20:9100 --api 0.0.0.0:8000"'
    ```
 
 5. From a third terminal:
 
    ```bash
-   curl http://beta.local:8000/v1/chat/completions -d '{
+   curl http://node-a.local:8000/v1/chat/completions -d '{
      "model": "r1-distill-qwen-1.5b",
      "messages": [{"role": "user", "content": "What is 17 * 23?"}],
      "max_tokens": 64

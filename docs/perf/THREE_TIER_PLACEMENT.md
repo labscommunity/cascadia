@@ -41,7 +41,7 @@ mapped out where placement helps — and surfaced a UMA surprise:
 > regime 2. (This is PowerInfer §6.3 adapted to UMA, where pressure-relief —
 > not capacity — turns out to be the lever.)
 
-## Measured hardware — pawan-01 (the validation box)
+## Measured hardware (the validation box)
 
 `Intel Core Ultra 7 258V` (Lunar Lake), **31.6 GB** unified DDR5 (UMA):
 
@@ -146,7 +146,7 @@ tiers):
    The argv planning is pure + unit-tested; the spawner tears the ring down
    on any stage exit / Ctrl-C.
 
-## Validation on pawan-01 (measured)
+## Validation on the Lunar Lake box (measured)
 
 End-to-end `profile-stages → place → run-placement`, real GPU/CPU/NPU, greedy
 decode. Per-stage decode latency measured **GPU < CPU < NPU** (e.g. on the

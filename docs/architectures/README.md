@@ -39,19 +39,19 @@ This directory holds per-family deep-dives for non-trivial cases.
    exporter needs an explicit branch (and `check_export_quirks` / `is_moe_config`
    may need updating) — and the Rust runtime
    (`crates/cascadia-engine-openvino/`) may need a matching change.
-4. Add an e2e test on the fleet: `cascadia shard --model <hf-id>
-   --output-dir /tmp/shards --num-stages 2` on the miner, then
-   `cascadia worker --engine ov-runtime --rank 0` on the miner and
+4. Add an e2e test: `cascadia shard --model <hf-id>
+   --output-dir /tmp/shards --num-stages 2` on an export host, then
+   `cascadia worker --engine ov-runtime --rank 0` on that host and
    `--rank 1` on an AI PC. Hit `/v1/chat/completions` and inspect a
    short generation.
 
 ## Reference
 
-- Rainier's `scripts/export_*` family contains battle-tested Python
-  exporters for several architectures including Gemma 4 E2B and the
-  26B-A4B MoE. Cascadia's `tools/export_shards.py` is a generic
-  refactor of rainier's `export_cached_shards_v5.py`. Use rainier as
-  the reference when porting a new family.
+- Cascadia's exporter is `tools/export_shards.py`, driven by
+  `cascadia shard`. Architecture-specific exporters (e.g.
+  `tools/export_gemma4.py`) live beside it and are auto-dispatched
+  on `model_type` — use them as the template when porting a new
+  family that doesn't fit the generic path.
 - [OpenVINO GenAI supported models](https://openvinotoolkit.github.io/openvino.genai/docs/supported-models/)
   is the upstream list of what `openvino_genai::LLMPipeline` can load
   via `optimum-cli`. Anything on that list is a candidate for the

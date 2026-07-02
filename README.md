@@ -148,7 +148,7 @@ $ cascadia engines
 
 ## Architecture
 
-See [`CLAUDE.md`](CLAUDE.md) for design rationale. Key crates:
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for design rationale and per-crate responsibilities. Key crates:
 
 - `cascadia-api/` — OpenAI-compatible HTTP (axum)
 - `cascadia-runner/` — Per-stage runner; concurrent-safe chunk streaming
@@ -170,7 +170,7 @@ Per-engine guides:
 
 ## Cluster
 
-- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN and lists peer `host:port`s to plug into `--next`, but workers still need explicit ranks — full auto-ring formation (rank assignment + stage-count agreement + pipeline ordering) is not yet wired into `cascadia worker` (tracked in [#52](https://github.com/labscommunity/cascadia/issues/52); see [docs/STATUS.md](docs/STATUS.md) "Known limitations").
+- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN and lists peer `host:port`s to plug into `--next`, but workers still need explicit ranks — full auto-ring formation (rank assignment + stage-count agreement + pipeline ordering) is not yet wired into `cascadia worker` (tracked in [#52](https://github.com/labscommunity/cascadia/issues/52)).
 - **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host — cold-compile time + decode tok/s — and writes `device_profile.json`. Use it to pick `--device` today; it's step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
 - **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/architecture/tensor-parallelism.md](docs/architecture/tensor-parallelism.md).
 
@@ -178,11 +178,11 @@ Per-engine guides:
 
 Cascadia does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Cascadia handles `SIGTERM` cleanly (`runner.close()` then exit 0).
 
-**Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [`docs/STATUS.md`](docs/STATUS.md) "Security model" for the threat model and Phase 14 hardening details.
+**Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [SECURITY.md](SECURITY.md) for the threat model and built-in hardening.
 
 ## Troubleshooting
 
-**`config.json not in <model dir>`** — `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. v5 shards from rainier do not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root.
+**`config.json not in <model dir>`** — `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
 
 **`could not connect to … within 30s`** — Start the downstream worker first; the upstream waits for the upstream socket to bind. Check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
@@ -196,4 +196,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, an
 
 ## License
 
-Apache-2.0 (target). The repository is private during incubation.
+Apache-2.0 — see [LICENSE](LICENSE). Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

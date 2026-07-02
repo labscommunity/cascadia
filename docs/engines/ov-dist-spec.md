@@ -10,7 +10,7 @@ Combines pipeline parallelism with speculative decoding: the **driver** holds a 
 
 ## Shard format
 
-Requires **v5 shards** (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via rainier's `scripts/export_cached_shards_v5.py`.
+Requires **v5 shards** (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via `cascadia shard` — its exporter (`tools/export_shards.py`) emits `v5_canonical_inputs` shards; see [../SHARDING.md](../SHARDING.md).
 
 Driver expects the full pipeline directory:
 ```
@@ -71,7 +71,7 @@ cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
 
 K is the draft length per spec round. Higher K = more parallel target verifications but more wasted work when the draft is wrong.
 
-Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, alpha+charlie via TB:
+Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, two hosts linked via Thunderbolt:
 
 | K | 64-tok factual | accept | 256-tok creative | accept |
 |---|----------------|--------|------------------|--------|

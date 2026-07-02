@@ -1,6 +1,13 @@
 # Architecture
 
-Cascadia is a Rust workspace under `rust/`. Each crate has a single responsibility and a stable interface; engines and discovery backends are swappable.
+Cascadia is a Cargo workspace at the repo root. Each crate has a single responsibility and a stable interface; engines and discovery backends are swappable.
+
+## Design decisions
+
+- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, and `sparse-moe` ship behind them. Future engines (IPEX, OneAPI direct) plug behind the same trait.
+- **Discovery: zero-config peer-to-peer.** Workers find each other over mDNS; no central control plane.
+- **Topology stores measured latency + bandwidth.** Latency is the dominant placement signal on Intel fleets — a 50 ms WAN hop drops throughput 65% — so Cascadia's topology graph stores per-link measurements, not just edge types.
+- **Rust-only workers.** One static binary per node; no runtime Python dependency, no pip install on workers. Python is only needed at export time (`cascadia shard`).
 
 ## `cascadia-api`
 
@@ -29,13 +36,25 @@ Three engines:
 
 Deterministic word-echo engine — splits the prompt and emits one word per `step()`. Used by API / runner / CLI tests.
 
+## `cascadia-engine-sparse-moe`
+
+CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models). Loads per-layer shell IRs plus per-(layer, expert) IRs and dispatches only the top-k experts the router selects each step, instead of running all of them.
+
+## `cascadia-int4-gemm`
+
+Hand-rolled AVX-512 INT4 GEMM kernels for the sparse-MoE expert path — group-32 symmetric quantization with bf16 scales, matching the compressed-tensors on-disk format.
+
+## `cascadia-dashboard`
+
+Dashboard HTTP routes (`/api/topology`, `/api/stats`, `/api/events` SSE) and an embedded Vite SPA (behind the `embed-spa` feature) for visualizing a cluster. Kept separate from `cascadia-api` so the OpenAI surface doesn't grow a topology dependency or bundled static assets.
+
 ## `cascadia-ov-genai-shim`
 
 C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.2+ SDK.
 
 ## `cascadia-transport`
 
-TCP activation relay between pipeline stages. Wire format is byte-identical to rainier's reference Python relay: 20-byte header (`payload_len`, `dtype`, `dim0`, `dim1`, `dim2`) then row-major payload. dtype codes: `0=f32, 1=f16, 2=i8, 3=i32, 4=i64`. Caps incoming payloads at 256 MiB and applies a 60 s read timeout per recv.
+TCP activation relay between pipeline stages. Wire format: 20-byte header (`payload_len`, `dtype`, `dim0`, `dim1`, `dim2`) then row-major payload. dtype codes: `0=f32, 1=f16, 2=i8, 3=i32, 4=i64`. Caps incoming payloads at 256 MiB and applies a 60 s read timeout per recv.
 
 ## `cascadia-topology`
 
@@ -43,7 +62,7 @@ Topology graph with per-link latency and bandwidth measurements. This is where C
 
 ## `cascadia-discovery`
 
-mDNS peer discovery via the `mdns-sd` crate. Advertises `_cascadia._tcp.local.` and browses for siblings in the same `CASCADIA_NAMESPACE`. Zero-config: spin up a worker and the master finds it.
+mDNS peer discovery via the `mdns-sd` crate. Advertises `_cascadia._tcp.local.` and browses for siblings in the same namespace (a TXT-record field; peers in other namespaces are ignored). Zero-config: spin up workers on the same LAN and they find each other.
 
 ## `cascadia-download`
 
