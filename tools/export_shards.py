@@ -1791,11 +1791,33 @@ def main():
             sys.path.insert(0, _here)
             from export_gemma4_text import run_export as _g4t_run_export
 
+            # The surgery tool has NO NPU static-export support: it always emits
+            # a stateful/dynamic IR the NPU compiler rejects. Fail fast rather
+            # than silently downgrading to a cpu-gpu shard the user didn't ask
+            # for.
+            if args.target == "npu":
+                raise SystemExit(
+                    "gemma-4 OpenVINO-IR sharding does not yet support "
+                    "--target npu (the IR-surgery exporter emits a "
+                    "stateful/dynamic IR the NPU compiler rejects); use "
+                    "--target cpu-gpu."
+                )
+            # --layer-split is a generic-exporter feature; the surgery tool
+            # slices at even decoder-layer ranges only. Reject rather than
+            # silently ignore a user-supplied split.
+            if args.layer_split:
+                raise SystemExit(
+                    "--layer-split is not supported for gemma-4 IR surgery "
+                    "(it slices at even decoder-layer ranges); omit it or use "
+                    "the generic exporter."
+                )
+
             _g4t_run_export(
                 model=args.model,
                 output_dir=args.output_dir,
                 num_stages=args.num_stages,
                 quantization=args.quantization,
+                stage=args.stage,
             )
             return
 
