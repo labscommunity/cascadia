@@ -581,6 +581,10 @@ impl WorkerArgs {
     }
 }
 
+/// Default fixed total context length for NPU static-shape shards. Shared by
+/// the clap default and the cpu-gpu "ignored" guard so they can't drift.
+const DEFAULT_STATIC_CONTEXT: u32 = 1024;
+
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
     /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct)
@@ -614,7 +618,7 @@ pub struct ShardArgs {
 
     /// NPU only: fixed total context length (past-KV length =
     /// static_context - static_seq); ignored without `--target npu`.
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = DEFAULT_STATIC_CONTEXT)]
     pub static_context: u32,
 
     /// torch default dtype during export. FP16 reduces memory and is
@@ -684,7 +688,7 @@ impl ShardTarget {
     }
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardDtype {
     Fp16,
     Fp32,
@@ -1699,7 +1703,9 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
 
     // static-seq/static-context are NPU-only; the exporter ignores them on the
     // cpu-gpu path. Warn if the user set them there so it isn't silent.
-    if args.target != ShardTarget::Npu && (args.static_seq != 1 || args.static_context != 1024) {
+    if args.target != ShardTarget::Npu
+        && (args.static_seq != 1 || args.static_context != DEFAULT_STATIC_CONTEXT)
+    {
         eprintln!("warning: --static-seq/--static-context are ignored without --target npu");
     }
 
