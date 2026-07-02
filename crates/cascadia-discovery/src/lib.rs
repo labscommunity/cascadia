@@ -160,6 +160,9 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         cpu_cores,
         os,
         engines,
+        model_hash: None,
+        cluster_size: None,
+        ring_digest: None,
         last_seen: 0.0,
     })
 }

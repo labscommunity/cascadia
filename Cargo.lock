@@ -458,6 +458,7 @@ dependencies = [
  "chrono",
  "parking_lot",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

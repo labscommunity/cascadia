@@ -1087,6 +1087,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         cpu_cores: specs.cpu_cores,
         os: specs.os,
         engines,
+        model_hash: None,
+        cluster_size: None,
+        ring_digest: None,
         last_seen: 0.0,
     };
     topology.add_node(self_node.clone());

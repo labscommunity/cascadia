@@ -20,7 +20,10 @@ fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// One node's advertised capacity. Populated by discovery + heartbeats.
+/// One node's advertised capacity **+ election advertisement**. Populated by
+/// discovery + heartbeats. The `model_hash`/`cluster_size`/`ring_digest` fields
+/// carry mDNS auto-ring (#89) negotiation state, not capacity — see
+/// docs/superpowers/specs/2026-07-01-mdns-auto-ring-design.md.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NodeInfo {
     pub node_id: String,
@@ -52,6 +55,16 @@ pub struct NodeInfo {
     pub os: String,
     #[serde(default)]
     pub engines: Vec<String>,
+    /// FNV-1a hash of the worker's `--model` string (auto-ring model match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_hash: Option<String>,
+    /// Operator's `--cluster-size` (auto-ring participant marker). `None` =
+    /// not an auto-ring participant (manual/dashboard-only worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_size: Option<u32>,
+    /// Phase-2 agreement digest of this node's resolved member ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_digest: Option<String>,
     #[serde(default = "now_ts")]
     pub last_seen: f64,
 }
@@ -77,6 +90,9 @@ impl NodeInfo {
             cpu_cores: 0,
             os: String::new(),
             engines: Vec::new(),
+            model_hash: None,
+            cluster_size: None,
+            ring_digest: None,
             last_seen: now_ts(),
         }
     }
@@ -212,5 +228,29 @@ impl Topology {
             inner.edges.retain(|(s, d), _| s != id && d != id);
         }
         stale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_defaults_election_fields_to_none() {
+        let n = NodeInfo::new("n1", "127.0.0.1", 9100);
+        assert_eq!(n.model_hash, None);
+        assert_eq!(n.cluster_size, None);
+        assert_eq!(n.ring_digest, None);
+    }
+
+    #[test]
+    fn election_fields_omitted_from_json_when_none() {
+        let n = NodeInfo::new("n1", "127.0.0.1", 9100);
+        let j = serde_json::to_string(&n).unwrap();
+        assert!(
+            !j.contains("model_hash"),
+            "None fields must be skipped: {j}"
+        );
+        assert!(!j.contains("ring_digest"), "{j}");
     }
 }
