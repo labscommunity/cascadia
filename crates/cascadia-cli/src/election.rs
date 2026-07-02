@@ -1,5 +1,6 @@
 //! Auto-ring election (#89): pure ring resolution + membership digest, and
-//! the two-phase mDNS barrier. See docs/superpowers/specs/2026-07-01-mdns-auto-ring-design.md.
+//! the two-phase mDNS barrier. See issue #89 for the two-phase design
+//! (fixed-size barrier + membership-digest agreement).
 
 use cascadia_topology::NodeInfo;
 use cascadia_types::hash::fnv1a_hex;
@@ -171,13 +172,39 @@ pub async fn elect(
     let mut me = self_node.clone();
     let discover_deadline = tokio::time::Instant::now() + t.discover;
     let mut stable_since: Option<(String, tokio::time::Instant)> = None; // (digest, since)
+
+    // F2 diagnostic: whether the most recent step was over-subscribed
+    // (> N participants), so the discover-deadline abort can pick the
+    // "over-subscribed" message instead of the shortfall-shaped one. Set on
+    // every loop iteration before it is read, so no initial value is needed.
+    let mut last_over;
+    // F3 diagnostic: one-shot warn if a different host advertises our
+    // node_id (hostname+IP collision) — guarded so it doesn't spam every
+    // POLL_INTERVAL tick.
+    let mut warned_collision = false;
     let members = loop {
+        if !warned_collision {
+            if let Some(other) = topo
+                .nodes()
+                .iter()
+                .find(|n| n.node_id == me.node_id && (n.host != me.host || n.port != me.port))
+            {
+                tracing::warn!(
+                    node_id = %me.node_id,
+                    other_host = %other.host,
+                    other_port = other.port,
+                    "another host advertises this node_id (hostname+IP collision); ring cannot form — ensure one auto-ring worker per host"
+                );
+                warned_collision = true;
+            }
+        }
         let members = current_members(topo, &me, p);
         match phase1_step(&members, p) {
             Step::Conflict(msg) => return Err(RingError::Election(msg)),
             Step::Ready(_) => {
                 // Settle: the RESOLVED ORDER (member_digest — excludes
                 // last_seen churn) must hold for t.settle before Phase 2.
+                last_over = false;
                 let d = member_digest(&members);
                 match &stable_since {
                     Some((prev, since)) if *prev == d => {
@@ -197,6 +224,7 @@ pub async fn elect(
                     "more than N participants; waiting for prune"
                 );
                 stable_since = None;
+                last_over = true;
             }
             Step::Wait => {
                 tracing::info!(
@@ -205,10 +233,25 @@ pub async fn elect(
                     "waiting for peers"
                 );
                 stable_since = None;
+                last_over = false;
             }
         }
         if tokio::time::Instant::now() >= discover_deadline {
             let ids: Vec<String> = members.iter().map(|m| m.node_id.clone()).collect();
+            // The TooMany/over-subscribed classification itself is covered
+            // by the pure elect_tests::over_n_toomany and
+            // skew_tests::fully_connected_over_n_all_fail_cardinality tests;
+            // elect() isn't unit-tested, so this message branch is trusted
+            // rather than separately exercised.
+            if last_over || members.len() > p.cluster_size as usize {
+                return Err(RingError::Election(format!(
+                    "{} participants for --cluster-size {} in namespace '{}' (another cluster sharing this namespace? set CASCADIA_NAMESPACE): {:?}",
+                    members.len(),
+                    p.cluster_size,
+                    p.namespace,
+                    ids
+                )));
+            }
             return Err(RingError::Election(format!(
                 "discovered {} of {} participants in namespace '{}' after {:?}: {:?}",
                 members.len(),
@@ -233,6 +276,15 @@ pub async fn elect(
         .map_err(|e| RingError::Election(format!("cannot advertise digest (mDNS daemon): {e}")))?;
 
     let mut agree_deadline = tokio::time::Instant::now() + t.agree;
+    // Absolute Phase-2 bound: the restartable agree_deadline tolerates a single
+    // lost digest update, but a peer flapping its membership every < agree window
+    // would restart it forever. This hard ceiling guarantees elect() terminates.
+    // Instant-based, so not meaningfully unit-testable as a pure predicate;
+    // exercised only by the #[ignore]d elect_integration path (real time,
+    // real mDNS). Note this instead of faking a clock here.
+    const PHASE2_CEILING_MULT: u32 = 4;
+    let phase2_start = tokio::time::Instant::now();
+    let phase2_ceiling = t.agree * PHASE2_CEILING_MULT;
     loop {
         let members = current_members(topo, &me, p);
         if agreed(&members, &digest, p.cluster_size) {
@@ -250,6 +302,12 @@ pub async fn elect(
                 tracing::warn!(error = %e, "digest re-advertise failed; peers may not converge");
             }
             agree_deadline = tokio::time::Instant::now() + t.agree; // restart window
+        }
+        if phase2_start.elapsed() >= phase2_ceiling {
+            return Err(RingError::Election(format!(
+                "ring membership kept changing for {phase2_ceiling:?} (flapping peer?) in namespace '{}'; last digest {digest}",
+                p.namespace
+            )));
         }
         if tokio::time::Instant::now() >= agree_deadline {
             let views: Vec<(String, Option<String>)> = members
