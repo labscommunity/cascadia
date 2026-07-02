@@ -19,9 +19,13 @@ on:
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
+# Scope the group by event so a push to main can never cancel an in-flight
+# scheduled scan (or vice versa) — a cancelled scan reports grey, not red,
+# and its advisory verdict is silently lost. Only PR runs supersede each
+# other; push/schedule runs queue and all complete.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Least-privilege: only needs to read the repo to scan the dependency tree.
 permissions:
