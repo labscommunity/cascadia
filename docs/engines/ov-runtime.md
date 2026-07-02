@@ -54,12 +54,12 @@ For `ov-dist-spec` you need v5 shards instead — see [ov-dist-spec.md](ov-dist-
 ```bash
 # Last stage (rank 1):
 cascadia worker --rank 1 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v3 \
+              --model /shards/shards_2stage \
               --listen 10.10.10.2:9100
 
 # First stage (rank 0):
 cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v3 \
+              --model /shards/shards_2stage \
               --next 10.10.10.2:9100 --api :8000
 ```
 
@@ -67,4 +67,4 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 - Cross-stage activation transfer is hidden_states float16 — small enough that LAN/TB is rarely the bottleneck.
 - Same shards file path on every node simplifies launch (use `--model <same-path>` everywhere).
-- Tokenizer is loaded from the model_id's HF snapshot if the bundled `tokenizer/` dir uses a class the local `transformers` install can't import (common with older shard exports).
+- The tokenizer is loaded from the shard tree's `tokenizer/tokenizer.json` via the Rust `tokenizers` crate. If it's missing, the worker warns at load and first-stage tokenization fails — copy `tokenizer.json` from the source model into `tokenizer/`.

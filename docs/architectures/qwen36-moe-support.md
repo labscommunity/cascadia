@@ -1,9 +1,12 @@
 # Qwen3.6-35B-A3B sharded support
 
 Single-stage (nonsharded) serving works and is hardware-validated
-(`qwen3.6.md`). The cross-node sharded design is below: strategy is
-all-CPU OV-IR experts, measured full-layer-loop envelope ~17 tok/s on
-Lunar Lake.
+(`qwen3.6.md`), and the staged engine (`--engine qwen36-moe`) is
+shipped — single-box and N-rank pipeline. Strategy: all-CPU OV-IR
+experts. Measured on Lunar Lake: 4.7-8.8 tok/s single-box short-context
+(4.1-4.8 tok/s in 2-node pipeline mode); the ~17 tok/s figure quoted in
+the early strategy probe (§5) was a synthetic full-layer-loop upper
+bound, not an end-to-end number.
 
 ## 1. Model facts (verified against config.json + the official IR)
 
@@ -58,9 +61,11 @@ Lunar Lake.
   negligible — batching 8 experts/call was *slower* (41.7 ms).
   Strategy (C) is viable, not dead.
 - **The sparse-moe engine is NOT a portable base today** (feasibility
-  review): the OV shell path is vestigial (`manifest.shell_xml` has
-  zero callers); all in-range layers run hard-coded Kimi-shaped Rust
-  shells (MLA constants, `HIDDEN=7168`); `format.rs` structurally
+  review at the time; since then MiniMax-M2 support activated the
+  OV-IR shell backend — see `manifest.rs`): the OV shell path was
+  vestigial (`manifest.shell_xml` had zero callers); all in-range
+  layers ran hard-coded Kimi-shaped Rust shells (MLA constants,
+  `HIDDEN=7168`); `format.rs` structurally
   rejects non-Kimi expert bins (size check); the expert-bin exporter
   is not part of this repo; `LayerState` is KV-only with no layer-type
   concept. **Shared-expert plumbing DOES already exist**
@@ -105,7 +110,7 @@ The strategy probe in §5 decided this by measurement.
   5 ms/call prior; only alive if that prior fails to hold (it did not
   hold — see §3 and the probe results in §5).
 - **(D) Re-target to AVX-512 hosts (Xeon-class servers)** — abandons
-  the AI-PC story for this model; zero kernel work.
+  the AI PC story for this model; zero kernel work.
 
 Cross-device placement note: GPU shells + CPU experts = ~80
 transitions/token; at 0.25–1 ms each that alone caps 12–50 tok/s.
@@ -135,7 +140,7 @@ measured axis (§5), not a default.
   examine together.
 - **Runtime reuse (llama.cpp/GGUF)** — ggml has AVX2 int4 kernels and
   qwen3-MoE support today; a GGUF side-engine contradicts the
-  OV-centric stack but is the cheapest path to "fast on AI-PC CPU".
+  OV-centric stack but is the cheapest path to "fast on AI PC CPU".
   Named for honesty; likely rejected on stack-coherence grounds — but
   rejected explicitly, not silently.
 - **Wait for vendor** — Intel's CB/paged path (OVMS) gains Qwen3.x MoE
@@ -390,10 +395,10 @@ cascadia worker --rank 0 --total 2 --engine qwen36-moe \
   --next <node-b-host>:9100 --api :8000
 ```
 
-Ranks ≥ 1 need only `manifest.json`, `generation_config.json`, and
-their own `stage<i>/` directory from the shard tree; embeddings and
-the tokenizer load on rank 0 only — no need to copy the full tree to
-every node.
+Ranks ≥ 1 need only `manifest.json` and their own `stage<i>/`
+directory from the shard tree (`generation_config.json`, embeddings,
+and the tokenizer are read on rank 0 only) — no need to copy the full
+tree to every node.
 
 **Acceptance gates** (harnesses: `tools/qwen36_surgery/m4_gate_serving.py`
 for gates 1–2 + the prompt set, `m4_gate_robustness.py` for gate 3;

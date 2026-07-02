@@ -11,7 +11,7 @@ the same `model_type: "gemma4"` outer wrapper (the text backbone is
 | **26B-A4B-it** (MoE) | 48 | — | — | — | — | — | yes |
 | **31B-it** | 60 | 5376 | 256 / 512 | 16 / 4  |   0 |  0 / 60 | yes |
 
-## What ships in this PR
+## What ships
 
 `tools/export_gemma4.py` — a Gemma-4-specific exporter. `cascadia
 shard` auto-dispatches to it on detection of `model_type ∈
@@ -94,15 +94,14 @@ and try INT4 once you've confirmed parity.
 * **26B-A4B MoE variant** — `enable_moe_block=True` in its text
   config; runs into the same MoE blocker as the rest of the family.
   Tracked in [`moe.md`](./moe.md).
-* **Multi-stage pipeline-parallel runtime** — the exported IRs use a
-  custom I/O contract (cross/external KV, downstream-PLI side
-  channel, per-layer head_dim, optional final softcap) that the
-  current Rust runtime in `crates/cascadia-engine-openvino/` does
-  not yet understand. The IRs are runnable directly via
-  `openvino.Core().compile_model()`; pipeline-parallel via `cascadia
-  worker` follows in a separate PR (Phase B below).
 
-## Port plan — remaining phases
+The exported IRs use a custom I/O contract (cross/external KV,
+downstream-PLI side channel, per-layer head_dim, optional final
+softcap), served by the dedicated `gemma4` engine in
+`crates/cascadia-engine-openvino/` (`--engine gemma4`; Phase B below,
+now shipped).
+
+## Port plan — status
 
 **Phase A — exporter (shipped, #48):**
 
@@ -121,9 +120,10 @@ and try INT4 once you've confirmed parity.
 - [x] Skip 26B-A4B MoE variant cleanly.
 - [x] Tested end-to-end on a Xeon export host with Gemma-4-E2B-it.
 
-**Phase B — Rust runtime (`crates/cascadia-engine-openvino`):**
+**Phase B — Rust runtime (`crates/cascadia-engine-openvino`) — shipped
+(`--engine gemma4`, `gemma4.rs`):**
 
-- [ ] New `Gemma4Stage` engine that:
+- [x] New `Gemma4Stage` engine that:
   - Reads the extended `stage_config.json` schema (per-layer
     `head_dims`, `layer_types`, `is_shared`, `own_kv_head_dims`,
     `cross_stage_sources_local`, `external_shared_sources`,
@@ -137,7 +137,7 @@ and try INT4 once you've confirmed parity.
     head-stage PLI before sending.
   - On the head stage, samples directly from the post-softcap
     `logits` output.
-- [ ] Stage-config schema versioning (`export_version:
+- [x] Stage-config schema versioning (`export_version:
   "gemma4_cached_v1"`).
 
 **Phase C — End-to-end testing:**

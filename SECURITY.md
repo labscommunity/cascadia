@@ -17,9 +17,10 @@ transport encryption.
 
 **What you get out of the box:**
 
-* HTTP API: request body cap (default 64 KiB), prompt cap (default
-  32 KiB), concurrent-request semaphore (default 16) — all
-  operator-configurable. Oversized prompt → 413; over-capacity → 503.
+* HTTP API: request body cap (64 KiB), prompt cap (32 KiB),
+  concurrent-request semaphore (16). These are library-config defaults
+  (`cascadia-api` `Config`); the shipped CLI does not currently expose
+  flags to change them. Oversized prompt → 413; over-capacity → 503.
   Engine errors map cleanly to 5xx (no panics).
 * Engine queue: pending-task cap on the OpenVINO engines (256);
   `EngineError::QueueFull` → 503.

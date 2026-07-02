@@ -47,7 +47,7 @@ const MROPE_ROWS: usize = 4;
 
 // Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
 // HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
-// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. Spec §3.1 frames
+// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. The design frames
 // the position as an i64 prefix tensor; this header carries the same
 // information in the day-0 probe's framing (kind+epoch+pos), which the
 // probe validated end-to-end on the live relay.
@@ -58,7 +58,7 @@ const FRAME_RESET: u32 = 4;
 const FRAME_RESET_ACK: u32 = 5;
 const FRAME_FORWARD: u32 = 6;
 const FRAME_TOKEN: u32 = 7;
-/// Handshake schema version (spec §3.4).
+/// Handshake schema version.
 const PROTO_VERSION: u32 = 1;
 
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
@@ -341,14 +341,14 @@ pub struct Qwen36Engine {
     /// Raw manifest.json for the startup handshake (full-text compare —
     /// small file, stronger than a hash and needs no new dependency).
     manifest_json: String,
-    /// Task epoch (spec §3.3). Rank 0 bumps per admission; frames carry
+    /// Task epoch. Rank 0 bumps per admission; frames carry
     /// it; the downstream drops frames from older epochs.
     epoch: u32,
     /// Downstream side: epoch of the last RESET accepted.
     peer_epoch: u32,
     handshake_done: bool,
     /// Set when the startup handshake found a config mismatch (spec
-    /// §3.4: refuse to serve). Admissions fail loud with this reason.
+    /// handshake rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
@@ -596,7 +596,7 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("pipeline mode without runtime handle".into()))
     }
 
-    /// Handshake payload (spec §3.4): manifest full text, stage layout,
+    /// Handshake payload: manifest full text, stage layout,
     /// wire dtype, protocol version. The shim exposes no OV version
     /// string; the manifest compare covers export-level skew.
     fn hello_payload(&self) -> Vec<u8> {
@@ -610,7 +610,7 @@ impl Qwen36Engine {
         .into_bytes()
     }
 
-    /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit (spec §3.4).
+    /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit.
     /// Middles chain the payload on, so one ACK means the whole chain
     /// validated against this rank's manifest.
     fn handshake_a(&mut self) -> EngineResult<()> {
@@ -627,7 +627,7 @@ impl Qwen36Engine {
         Ok(())
     }
 
-    /// Rank 0: RESET → RESET_ACK for the current epoch (spec §3.2).
+    /// Rank 0: RESET → RESET_ACK for the current epoch.
     /// Fail-loud, no retry — the API caller retries the task.
     fn reset_exchange(&mut self) -> EngineResult<()> {
         let epoch = self.epoch;
@@ -789,7 +789,7 @@ impl Qwen36Engine {
                     )];
                 }
             }
-            // Admission (spec §3.2): reset local state, bump the epoch,
+            // Admission: reset local state, bump the epoch,
             // RESET/RESET_ACK the downstream, then admit at position 0.
             self.reset_all();
             self.epoch = self.epoch.wrapping_add(1);
@@ -1005,7 +1005,7 @@ impl Qwen36Engine {
                 // Chain the reset before acking upstream: the ack means
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
-                // rank 0 (spec §3.2).
+                // rank 0 (reset protocol).
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -1031,7 +1031,7 @@ impl Qwen36Engine {
                     ));
                 }
                 if epoch != self.peer_epoch {
-                    // Stale epoch (spec §3.3): drop silently; the driver's
+                    // Stale epoch: drop silently; the driver's
                     // recv times out and fails its task loud.
                     warn!(
                         epoch,
@@ -1086,7 +1086,7 @@ impl Qwen36Engine {
         }
     }
 
-    /// Downstream side of the §3.4 handshake: compare the peer's payload
+    /// Downstream side of the handshake: compare the peer's payload
     /// against ours field by field.
     fn validate_hello(&self, payload: &[u8]) -> Option<String> {
         let theirs: serde_json::Value = match serde_json::from_slice(payload) {
@@ -1312,7 +1312,7 @@ impl Engine for Qwen36Engine {
         }
         // Relay stage: PROPAGATE the error (like runtime/gemma4/sparse-moe). A
         // dead upstream is connection-fatal, and `run_relay_loop` only restarts
-        // the stage when step() returns that Err (§3.5: peer loss = operator
+        // the stage when step() returns that Err (failure semantics: peer loss = operator
         // restart). Swallowing it into Ok(Vec::new()) would leave a silent
         // zombie that never rebuilds. The runner throttles non-fatal errors via
         // RELAY_ERR_BACKOFF, so no in-engine backoff is needed.

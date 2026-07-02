@@ -51,7 +51,8 @@ Verified 2026-05-21 with `r1-distill-qwen-1.5b` (int4, 917 MB total)
 sharded across two Lunar Lake iGPU AI PCs (rank 0 → rank 1), API on
 rank 0:8000. (The recipe below is host-agnostic — substitute any two
 AI PCs reachable over the network; `node-a.local` / `node-b.local`
-below are placeholders.)
+and the `192.168.1.10` / `192.168.1.20` addresses below are
+placeholders — node A is .10, node B is .20.)
 
 ```
 $ curl http://192.168.1.10:8000/v1/chat/completions -d '{

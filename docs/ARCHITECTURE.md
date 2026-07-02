@@ -4,7 +4,7 @@ Cascadia is a Cargo workspace at the repo root. Each crate has a single responsi
 
 ## Design decisions
 
-- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, and `sparse-moe` ship behind them. Future engines (IPEX, OneAPI direct) plug behind the same trait.
+- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; seven engines ship behind them (`mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen36-moe`). Future engines (IPEX, OneAPI direct) plug behind the same trait.
 - **Discovery: zero-config peer-to-peer.** Workers find each other over mDNS; no central control plane.
 - **Topology stores measured latency + bandwidth.** Latency is the dominant placement signal on Intel fleets — a 50 ms WAN hop drops throughput 65% — so Cascadia's topology graph stores per-link measurements, not just edge types.
 - **Rust-only workers.** One static binary per node; no runtime Python dependency, no pip install on workers. Python is only needed at export time (`cascadia shard`).
@@ -26,11 +26,13 @@ Two trait definitions — the plugin seam:
 
 ## `cascadia-engine-openvino`
 
-Three engines:
+Five engines:
 
 - `ov-genai` — single-stage `openvino_genai.LLMPipeline` via the C++ FFI shim. FastDraft + Prompt Lookup variants.
 - `ov-runtime` — multi-stage stateful KV cache. Pre-exported per-stage v3+ shards; each stage owns its layer range and runs SDPA attention with internal RoPE.
 - `ov-dist-spec` — multi-stage spec decode with mask-based KV-cache rewind on rejected drafts. v5 shards (canonical optimum-style inputs).
+- `gemma4` — Gemma 4 multi-stage: per-layer-type attention, KV-sharing, per-layer-input embeddings. `gemma4_cached_v1` shards.
+- `qwen36-moe` — Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE) from `qwen3_5_moe` IR-surgery shards; single-box or N-rank pipeline. See [architectures/qwen36-moe-support.md](architectures/qwen36-moe-support.md).
 
 ## `cascadia-engine-mock`
 
@@ -38,7 +40,7 @@ Deterministic word-echo engine — splits the prompt and emits one word per `ste
 
 ## `cascadia-engine-sparse-moe`
 
-CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models, MiniMax-M2). Runs attention/norm shells natively in Rust (default; OV IR shells are an optional backend) and dispatches only the top-k experts the router selects each step — experts execute through the `cascadia-int4-gemm` kernels against per-expert weight binaries, instead of running all of them.
+CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models, MiniMax-M2). Runs attention/norm shells natively in Rust (default; OV IR shells are an optional backend) and dispatches only the top-k experts the router selects each step. Experts execute as per-(layer, expert) OV IRs by default, or through the `cascadia-int4-gemm` AVX-512 kernels against packed int4 weight binaries (`int4_bin` backend).
 
 ## `cascadia-int4-gemm`
 
@@ -51,6 +53,10 @@ Dashboard HTTP routes (`/api/topology`, `/api/stats`, `/api/events` SSE) and an 
 ## `cascadia-ov-genai-shim`
 
 C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point catches `...` so a C++ exception cannot unwind into Rust UB. Stub mode (no link) is the default for dev / CI; `--features openvino` links against the real OV GenAI 2026.2+ SDK.
+
+## `cascadia-types`
+
+Zero-dependency wire/value types shared by every crate: generation tasks and chunks, shard descriptions, peer layout. Keeping them dependency-free lets engines and transports evolve without version-lockstep.
 
 ## `cascadia-transport`
 
@@ -70,4 +76,4 @@ Model registry plus on-demand HuggingFace pull. Registry lives at `~/.cache/casc
 
 ## `cascadia-cli` + `cascadia`
 
-`cascadia worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the only subcommand that does work. `cascadia engines` lists registered engines. The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.
+`cascadia worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.

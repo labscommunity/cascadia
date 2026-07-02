@@ -72,7 +72,7 @@ const INITIAL_KV_CAPACITY: usize = 32;
 ///
 /// **KV is stored as bf16-as-u16.** Halves
 /// the per-layer footprint and the per-token bandwidth touched at
-/// attention time (the dominant cost per q1 once expert dispatch is
+/// attention time (profiling showed it dominates once expert dispatch is
 /// thinned by A3 K-override). The SDPA kernel upconverts to f32 inline.
 struct LayerState {
     lid: u32,

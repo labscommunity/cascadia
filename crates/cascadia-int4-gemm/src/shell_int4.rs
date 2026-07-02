@@ -502,7 +502,7 @@ pub fn shell_forward_decode_int4_with_capacity_sparse(
     // SDPA — parallelize per-head attention.
     // Each head's body is independent (writes to a disjoint V_HEAD_DIM
     // slice of attn_out). Rayon over the 64 heads gives ~core-count
-    // speedup on the attention bucket (14.5% of decode per q1).
+    // speedup on the attention bucket (14.5% of decode per profiling).
     //
     // past_k/past_v are bf16-as-u16. The
     // upconvert `f32::from_bits((bits as u32) << 16)` is a single shift

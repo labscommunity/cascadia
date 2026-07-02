@@ -7,6 +7,7 @@ Combines pipeline parallelism with speculative decoding: the **driver** holds a 
 - The target model fits across `N` machines but not on one.
 - You have a draft model that shares the target's tokenizer (e.g. Llama-3.2-1B for a Llama-3.1 target).
 - You want the spec-decode token-rate boost without losing the ability to run a model bigger than one node.
+- Your generations are long-form (roughly ≥ 1,000 tokens): below that, the per-round network coordination doesn't amortize and a good single-node config tends to win.
 
 ## Shard format
 
