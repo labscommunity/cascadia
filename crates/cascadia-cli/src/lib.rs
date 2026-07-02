@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod election;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
