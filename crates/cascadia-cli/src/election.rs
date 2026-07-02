@@ -491,3 +491,147 @@ mod elect_tests {
         assert!(!agreed(&m, &d, 3));
     }
 }
+
+#[cfg(test)]
+mod skew_tests {
+    use super::*;
+    fn n(id: &str, mem: u64) -> NodeInfo {
+        let mut x = NodeInfo::new(id, id, 9100);
+        x.memory_mb = mem;
+        x.model_hash = Some("h".into());
+        x.cluster_size = Some(3);
+        x.engines = vec!["ov-runtime".into()];
+        x
+    }
+
+    #[test]
+    fn ghost_with_changed_memory_never_silently_miswires() {
+        // Same node_id set {a,b,c}; observer A saw b@0 (stale ghost record),
+        // observer C saw b@16000. Digests differ -> unanimity impossible ->
+        // nobody commits (safe abort), never a mis-ranked ring.
+        let a_view = vec![n("a", 32000), n("b", 0), n("c", 8000)];
+        let c_view = vec![n("a", 32000), n("b", 16000), n("c", 8000)];
+        assert_ne!(member_digest(&a_view), member_digest(&c_view));
+    }
+
+    #[test]
+    fn fully_connected_over_n_all_fail_cardinality() {
+        let four = vec![n("a", 4), n("b", 3), n("c", 2), n("d", 1)];
+        let p = ElectParams {
+            self_id: "a".into(),
+            namespace: "default".into(),
+            model_hash: "h".into(),
+            engine: "ov-runtime".into(),
+            cluster_size: 3,
+        };
+        assert!(matches!(phase1_step(&four, &p), Step::TooMany(_)));
+        // And even if all four advertised the same 4-digest, agreed() with
+        // n=3 fails the len==N guard on every node -> symmetric abort.
+        let d = member_digest(&four);
+        let mut all = four.clone();
+        for x in &mut all {
+            x.ring_digest = Some(d.clone());
+        }
+        assert!(!agreed(&all, &d, 3));
+    }
+
+    #[test]
+    fn stable_exactly_n_all_agree_same_ring() {
+        let m = vec![n("a", 32000), n("b", 16000), n("c", 8000)];
+        let d = member_digest(&m);
+        let mut all = m.clone();
+        for x in &mut all {
+            x.ring_digest = Some(d.clone());
+        }
+        assert!(agreed(&all, &d, 3));
+        let ra = resolve_ring(&all, "a").unwrap();
+        let rb = resolve_ring(&all, "b").unwrap();
+        assert_eq!(ra.rank, 0);
+        assert_eq!(rb.rank, 1);
+        assert_eq!(ra.next, Some(("b".into(), 9100)));
+        assert_eq!(ra.coordinator_host, "a");
+        assert_eq!(rb.coordinator_host, "a");
+    }
+
+    #[test]
+    fn staggered_arrival_never_ready_before_n() {
+        // Scripted arrival: 1 then 2 then 3 participants; Ready fires only at 3.
+        let p = ElectParams {
+            self_id: "a".into(),
+            namespace: "default".into(),
+            model_hash: "h".into(),
+            engine: "ov-runtime".into(),
+            cluster_size: 3,
+        };
+        let s1 = vec![n("a", 3)];
+        let s2 = vec![n("a", 3), n("b", 2)];
+        let s3 = vec![n("a", 3), n("b", 2), n("c", 1)];
+        assert_eq!(phase1_step(&s1, &p), Step::Wait);
+        assert_eq!(phase1_step(&s2, &p), Step::Wait);
+        assert!(matches!(phase1_step(&s3, &p), Step::Ready(_)));
+    }
+}
+
+#[cfg(test)]
+mod elect_integration {
+    use super::*;
+    use cascadia_topology::Topology;
+
+    /// Three concurrent elect() instances over real mDNS must converge to one
+    /// consistent ring (ranks 0,1,2 exactly once, same coordinator) — this is
+    /// the simultaneous-startup acceptance check. Requires a multicast-capable
+    /// host: run with `cargo test -p cascadia-cli -- --ignored elect_integration`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn three_concurrent_elections_converge() {
+        let ns = format!("test-{}", std::process::id());
+        // Fixture hash MUST be 16-hex: foreign records pass through the
+        // TXT decode's hex16 guard, which drops anything else.
+        let h = cascadia_types::hash::fnv1a_hex(b"itest");
+        let mut handles = Vec::new();
+        for (i, mem) in [(0u16, 32000u64), (1, 16000), (2, 8000)] {
+            let ns = ns.clone();
+            let h = h.clone();
+            handles.push(tokio::spawn(async move {
+                let mut node =
+                    cascadia_topology::NodeInfo::new(format!("itest-n{i}"), "127.0.0.1", 9100 + i);
+                node.namespace = ns.clone();
+                node.memory_mb = mem;
+                node.model_hash = Some(h.clone());
+                node.cluster_size = Some(3);
+                node.engines = vec!["mock".into()];
+                let topo = Topology::new();
+                topo.add_node(node.clone());
+                let mut disco =
+                    cascadia_discovery::DiscoveryService::new(topo.clone(), node.namespace.clone());
+                disco.start(node.clone()).unwrap();
+                let p = ElectParams {
+                    self_id: node.node_id.clone(),
+                    namespace: node.namespace.clone(),
+                    model_hash: h,
+                    engine: "mock".into(),
+                    cluster_size: 3,
+                };
+                let t = ElectTimeouts {
+                    discover: std::time::Duration::from_secs(30),
+                    agree: std::time::Duration::from_secs(15),
+                    settle: std::time::Duration::from_secs(1),
+                };
+                elect(&topo, &mut disco, &node, &p, &t).await
+            }));
+        }
+        let mut ranks = Vec::new();
+        let mut coordinators = Vec::new();
+        for hnd in handles {
+            let (ring, _digest) = hnd.await.unwrap().expect("election must converge");
+            ranks.push(ring.rank);
+            coordinators.push(ring.coordinator_host.clone());
+        }
+        ranks.sort_unstable();
+        assert_eq!(ranks, vec![0, 1, 2], "duplicate or gap rank");
+        assert!(
+            coordinators.windows(2).all(|w| w[0] == w[1]),
+            "coordinator disagreement"
+        );
+    }
+}
