@@ -956,6 +956,69 @@ def read_arch(src_dir: str):
             tc.get("num_kv_shared_layers", 0) or 0)
 
 
+def run_export(model, output_dir, num_stages=1, quantization="int4",
+               allow_kv_share=False, validate=False,
+               boundary_suffix=DEFAULT_LAYERNORM_SUFFIX,
+               stage=None, num_layers=None, hidden_size=None,
+               no_last_logits_only=False, keep_grafted=False,
+               skip_tokenizer_regen=False, **_ignored) -> None:
+    """Programmatic entry point for the gemma-4 VLM-IR -> text surgery.
+
+    Mirrors ``qwen36_surgery/export_qwen36_moe.run_export``: ``main()`` parses
+    argv then calls this. The generic ``cascadia shard`` dispatcher
+    (``tools/export_shards.py``) calls it directly with ``model``,
+    ``output_dir``, ``num_stages``, ``quantization``. ``quantization`` is
+    accepted for CLI symmetry but IGNORED — the surgery inherits the source
+    int4 IR's quantized weights byte-for-byte (never re-quantizes). ``**_ignored``
+    absorbs generic-exporter kwargs that do not apply here (``layer_split``,
+    ``target``, ``default_dtype``, ``static_seq``, ``static_context``, …) so the
+    dispatcher can forward them harmlessly. The graft/slice ALGORITHM and every
+    guard below are unchanged from the original ``main()``.
+    """
+    if num_stages < 1:
+        raise SystemExit("--num-stages must be >= 1")
+
+    # Guard: never write into the source model dir (flatten_config /
+    # regenerate_tokenizer_bos overwrite files in-place).
+    if os.path.abspath(model) == os.path.abspath(output_dir):
+        raise SystemExit(
+            "--output-dir must differ from --model (this tool rewrites "
+            "config.json / tokenizer in the output dir in place)")
+
+    t0 = time.time()
+    grafted, info = graft_text_frontend(model,
+                                        tag_inputs_embeds=(num_stages > 1))
+    log(f"graft done at +{time.time() - t0:.1f}s (per_layer_dropped="
+        f"{info['per_layer_dropped']})")
+
+    if num_stages == 1:
+        save_whole(grafted, model, output_dir,
+                   skip_tokenizer_regen=skip_tokenizer_regen)
+    else:
+        nl, hs, kv_shared = read_arch(model)
+        num_layers = num_layers or nl
+        hidden_size = hidden_size or hs
+        if num_layers is None:
+            raise SystemExit(
+                "could not determine num_hidden_layers from config; pass "
+                "--num-layers")
+        if num_stages > num_layers:
+            raise SystemExit(
+                f"--num-stages ({num_stages}) exceeds decoder layer count "
+                f"({num_layers}); would produce empty/invalid stages")
+        log(f"slicing {num_layers} layers into {num_stages} stages "
+            f"(hidden={hidden_size}, num_kv_shared_layers={kv_shared})")
+        slice_stages(
+            grafted, model, output_dir, num_stages,
+            num_layers, hidden_size, kv_shared, boundary_suffix,
+            last_logits_only=not no_last_logits_only,
+            only_stage=stage, keep_grafted=keep_grafted,
+            skip_tokenizer_regen=skip_tokenizer_regen,
+            allow_kv_share=allow_kv_share, validate=validate)
+
+    log(f"ALL DONE in {time.time() - t0:.0f}s")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -988,48 +1051,15 @@ def main() -> None:
     args = ap.parse_args()
 
     num_stages = args.total if args.total is not None else args.num_stages
-    if num_stages < 1:
-        raise SystemExit("--num-stages must be >= 1")
 
-    # Guard: never write into the source model dir (flatten_config /
-    # regenerate_tokenizer_bos overwrite files in-place).
-    if os.path.abspath(args.model) == os.path.abspath(args.output_dir):
-        raise SystemExit(
-            "--output-dir must differ from --model (this tool rewrites "
-            "config.json / tokenizer in the output dir in place)")
-
-    t0 = time.time()
-    grafted, info = graft_text_frontend(args.model,
-                                        tag_inputs_embeds=(num_stages > 1))
-    log(f"graft done at +{time.time() - t0:.1f}s (per_layer_dropped="
-        f"{info['per_layer_dropped']})")
-
-    if num_stages == 1:
-        save_whole(grafted, args.model, args.output_dir,
-                   skip_tokenizer_regen=args.skip_tokenizer_regen)
-    else:
-        nl, hs, kv_shared = read_arch(args.model)
-        num_layers = args.num_layers or nl
-        hidden_size = args.hidden_size or hs
-        if num_layers is None:
-            raise SystemExit(
-                "could not determine num_hidden_layers from config; pass "
-                "--num-layers")
-        if num_stages > num_layers:
-            raise SystemExit(
-                f"--num-stages ({num_stages}) exceeds decoder layer count "
-                f"({num_layers}); would produce empty/invalid stages")
-        log(f"slicing {num_layers} layers into {num_stages} stages "
-            f"(hidden={hidden_size}, num_kv_shared_layers={kv_shared})")
-        slice_stages(
-            grafted, args.model, args.output_dir, num_stages,
-            num_layers, hidden_size, kv_shared, args.boundary_suffix,
-            last_logits_only=not args.no_last_logits_only,
-            only_stage=args.stage, keep_grafted=args.keep_grafted,
-            skip_tokenizer_regen=args.skip_tokenizer_regen,
-            allow_kv_share=args.allow_kv_share, validate=args.validate)
-
-    log(f"ALL DONE in {time.time() - t0:.0f}s")
+    run_export(
+        model=args.model, output_dir=args.output_dir, num_stages=num_stages,
+        allow_kv_share=args.allow_kv_share, validate=args.validate,
+        boundary_suffix=args.boundary_suffix, stage=args.stage,
+        num_layers=args.num_layers, hidden_size=args.hidden_size,
+        no_last_logits_only=args.no_last_logits_only,
+        keep_grafted=args.keep_grafted,
+        skip_tokenizer_regen=args.skip_tokenizer_regen)
 
 
 if __name__ == "__main__":

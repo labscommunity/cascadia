@@ -169,6 +169,11 @@ pub enum Command {
     Engines,
     /// Shard a HuggingFace causal-LM model into per-stage OpenVINO IRs
     /// for distributed inference. See `cascadia shard --help`.
+    ///
+    /// Model-specific dispatch happens inside the embedded exporter: a
+    /// gemma-4 OpenVINO-IR dir (`openvino_language_model.xml` present) routes
+    /// to the text-surgery path (`tools/gemma4_surgery/export_gemma4_text.py`),
+    /// while safetensors gemma-4 still uses the torch `export_gemma4.py`.
     Shard(ShardArgs),
     /// Profile available OV devices on this host against a single
     /// model. Writes `device_profile.json`. See `cascadia
@@ -1633,6 +1638,13 @@ const QWEN36_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/qwen36_surgery/export_qwen36_moe.py"
 ));
+/// Gemma-4 VLM-IR -> text-only surgery exporter (grafts a text front-end and
+/// slices at decoder boundaries on the OpenVINO IR, no torch), dispatched by
+/// export_shards.py when --model is a gemma-4 OpenVINO-IR dir.
+const GEMMA4_TEXT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/gemma4_surgery/export_gemma4_text.py"
+));
 
 /// Assemble the flag list passed to the embedded Python exporter (the args
 /// after `python -u <script>`). Pure + side-effect-free so it's unit-testable
@@ -1773,6 +1785,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         ("export_gemma4.py", GEMMA4_SCRIPT),
         ("model_aliases.py", ALIASES_SCRIPT),
         ("export_qwen36_moe.py", QWEN36_SCRIPT),
+        ("export_gemma4_text.py", GEMMA4_TEXT_SCRIPT),
     ] {
         std::fs::write(_tmpdir.path().join(name), body)
             .with_context(|| format!("writing embedded {name} to temp dir"))?;

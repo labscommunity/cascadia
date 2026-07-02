@@ -1771,6 +1771,34 @@ def main():
         ("gemma4" in t) or ("gemma_4" in t) or ("gemma-4" in t)
         for t in (_outer_mt, _inner_mt)
     ):
+        # An already-exported gemma-4 OpenVINO VLM IR dir (optimum-intel:
+        # openvino_language_model.xml + text_embeddings sub-IRs) routes to the
+        # IR-surgery exporter, which grafts a text-only front-end and slices at
+        # decoder boundaries WITHOUT torch / a RAM wall. Safetensors gemma-4
+        # (no such IR) falls through to the torch export_gemma4 path below.
+        if os.path.isdir(args.model) and os.path.exists(
+            os.path.join(args.model, "openvino_language_model.xml")
+        ):
+            print(
+                "Detected Gemma 4 OpenVINO-IR input - dispatching to IR-surgery "
+                "exporter tools/gemma4_surgery/export_gemma4_text.py",
+                flush=True,
+            )
+            _here = os.path.dirname(os.path.abspath(__file__))
+            # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
+            # CLI extracts the embedded scripts into
+            sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+            sys.path.insert(0, _here)
+            from export_gemma4_text import run_export as _g4t_run_export
+
+            _g4t_run_export(
+                model=args.model,
+                output_dir=args.output_dir,
+                num_stages=args.num_stages,
+                quantization=args.quantization,
+            )
+            return
+
         print(
             "Detected Gemma 4 - dispatching to the dedicated exporter "
             "tools/export_gemma4.py (per-layer-type attention / KV-sharing / "
