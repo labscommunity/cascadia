@@ -22,8 +22,8 @@ fn now_ts() -> f64 {
 
 /// One node's advertised capacity **+ election advertisement**. Populated by
 /// discovery + heartbeats. The `model_hash`/`cluster_size`/`ring_digest` fields
-/// carry mDNS auto-ring (#89) negotiation state, not capacity — see
-/// docs/superpowers/specs/2026-07-01-mdns-auto-ring-design.md.
+/// carry mDNS auto-ring (#89) negotiation state, not capacity. See issue #89
+/// for the auto-ring election design.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NodeInfo {
     pub node_id: String,
