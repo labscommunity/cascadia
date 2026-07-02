@@ -22,19 +22,18 @@ yanked = "deny"
 
 [licenses]
 # Cascadia ships Apache-2.0 (see workspace Cargo.toml). Allow the permissive
-# licenses common in the Rust ecosystem that are compatible with Apache-2.0
-# redistribution. Anything not on this list fails the build and must be
-# reviewed before being added.
+# licenses common in the Rust ecosystem, plus MPL-2.0 (weak copyleft,
+# file-scoped) — all compatible with Apache-2.0 redistribution. Only licenses
+# actually present in the tree are listed, so a green run has no unmatched-
+# allowance warnings; anything new fails the build and gets reviewed here.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
-    "MIT-0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
@@ -55,7 +54,8 @@ allow-wildcard-paths = true
 multiple-versions = "warn"
 
 [sources]
-# Only pull from crates.io and explicitly-allowed git sources.
+# Only pull from crates.io and explicitly-allowed git sources (none currently
+# — add `allow-git` entries as needed).
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
