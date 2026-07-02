@@ -157,9 +157,19 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
     """
     core = ov.Core()
     log("=== read sub-IRs ===")
-    lm = core.read_model(os.path.join(src_dir, "openvino_language_model.xml"))
-    emb = core.read_model(os.path.join(src_dir, "openvino_text_embeddings_model.xml"))
-    pl = core.read_model(os.path.join(src_dir, "openvino_text_embeddings_per_layer_model.xml"))
+
+    def _read_sub_ir(fname):
+        path = os.path.join(src_dir, fname)
+        if not os.path.exists(path):
+            raise RuntimeError(
+                f"required gemma-4 sub-IR missing: {path} (is --model a "
+                f"complete optimum-intel gemma-4 VLM OpenVINO IR dir?)"
+            )
+        return core.read_model(path)
+
+    lm = _read_sub_ir("openvino_language_model.xml")
+    emb = _read_sub_ir("openvino_text_embeddings_model.xml")
+    pl = _read_sub_ir("openvino_text_embeddings_per_layer_model.xml")
 
     # --- locate LM params ---
     p_embeds = find_param(lm, "inputs_embeds")
@@ -215,10 +225,14 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
     if p_tok_type is not None:
         import numpy as _np
         n_tt = len(list(p_tok_type.output(0).get_target_inputs()))
+        # Match the zero-constant dtype to token_type_ids' element type: an
+        # i32-typed token_type_ids would throw at graft time against a hardcoded
+        # i64 constant (Multiply requires matching operand element types).
+        _tt_np_dtype = p_tok_type.get_element_type().to_dtype()
         zeros_tt = ops.multiply(
             maybe_convert(shared_ids.output(0), p_tok_type.get_element_type(),
-                          "ttids->i64"),
-            ops.constant(_np.array(0, dtype=_np.int64)))
+                          "ttids->tok_type"),
+            ops.constant(_np.array(0, dtype=_tt_np_dtype)))
         rewire_param_to_source(p_tok_type, zeros_tt.output(0),
                                "lm.token_type_ids(zeros)")
         log(f"  [lm.token_type_ids] neutralized -> zeros ({n_tt} consumer(s)),"
@@ -357,13 +371,14 @@ def regenerate_tokenizer_bos(model_dir: str) -> None:
     # older exports), so the proven BOS regen (Hello -> [2, 9259]) is unchanged.
     tok_cfg_path = os.path.join(model_dir, "tokenizer_config.json")
     if os.path.exists(tok_cfg_path):
-        tok_cfg = json.load(open(tok_cfg_path, encoding="utf-8"))
+        with open(tok_cfg_path, encoding="utf-8") as f:
+            tok_cfg = json.load(f)
         if isinstance(tok_cfg.get("extra_special_tokens"), list):
             if not os.path.exists(tok_cfg_path + ".t5.orig"):
                 shutil.copy2(tok_cfg_path, tok_cfg_path + ".t5.orig")
             tok_cfg["extra_special_tokens"] = {}
-            json.dump(tok_cfg, open(tok_cfg_path, "w", encoding="utf-8"),
-                      indent=2)
+            with open(tok_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(tok_cfg, f, indent=2)
             log("  coerced transformers-5 extra_special_tokens list -> {} in "
                 "tokenizer_config.json (backed up .t5.orig)")
 
@@ -401,7 +416,8 @@ def flatten_config(config_path: str) -> None:
     level, set text architecture/model_type, carry BOS/EOS/PAD ids. Backs up
     the original to ``*.vlm.orig``.
     """
-    cfg = json.load(open(config_path, encoding="utf-8"))
+    with open(config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
     if "text_config" not in cfg:
         log("  config already flat (no text_config) — leaving as-is")
         return
@@ -416,7 +432,8 @@ def flatten_config(config_path: str) -> None:
     flat["transformers_version"] = cfg.get("transformers_version")
     if not os.path.exists(config_path + ".vlm.orig"):
         shutil.copy2(config_path, config_path + ".vlm.orig")
-    json.dump(flat, open(config_path, "w", encoding="utf-8"), indent=2)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(flat, f, indent=2)
     log(f"wrote flat config. keys: {sorted(flat.keys())}")
     log(f"  num_hidden_layers={flat.get('num_hidden_layers')} "
         f"num_key_value_heads={flat.get('num_key_value_heads')} "
@@ -554,7 +571,7 @@ def _op_scope_layer(op):
     return int(m.group(1)) if m else None
 
 
-def _nearest_scope_layer(root, max_ops: int = 64):
+def _nearest_scope_layer(root, max_ops: int = 256):
     """Shallowest ``layers.{idx}`` scope reachable backward from ``root``
     (inclusive), or None. For a KV Assign the value stored is the layer's
     concatenated cache, produced by ``layers.{idx}.self_attn/aten::cat`` — so
@@ -758,7 +775,7 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
     # value ReadValue<->Assign pair on the same side of the boundary, so a
     # num_kv_shared_layers==0 model has NO genuine-KV orphans (only shape-only
     # bookkeeping reads get rewired below).
-    sinks, all_vids, vid_parsed = [], [], []
+    sinks, all_vids = [], []
     for op in model.get_ops():
         if op.get_type_name() != "Assign":
             continue
@@ -766,15 +783,22 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
         all_vids.append(vid)
         idx = _nearest_scope_layer(op)
         if idx is None:
-            idx = sink_layer_index(vid)  # fallback: un-scoped variable_id
-            if idx is not None:
-                vid_parsed.append(vid)
-        if idx is not None and a <= idx <= b:
+            # A mis-attributed KV sink silently corrupts attention (its
+            # ReadValue<->Assign pair could land on the wrong side of a stage
+            # boundary). The variable_id parse lives in a DIFFERENT index space
+            # (optimum sequences it per attention-type for gemma-4's
+            # heterogeneous sliding/global KV), so falling back to it is wrong.
+            # Fail hard instead.
+            raise SystemExit(
+                f"KV Assign (variable_id={vid!r}) has no layers.N op scope "
+                f"within the BFS bound; cannot attribute it to a decoder layer. "
+                f"A mis-attributed KV sink corrupts attention, so refusing the "
+                f"variable_id-parse fallback (wrong index space). Inspect this "
+                f"Assign's producer scope or raise _nearest_scope_layer's "
+                f"max_ops."
+            )
+        if a <= idx <= b:
             sinks.append(op)
-    if vid_parsed:
-        log(f"  WARNING: {len(vid_parsed)} Assign(s) had no layers.N op scope; "
-            f"attributed by variable_id parse (verify on-node): "
-            f"{vid_parsed[:4]}")
 
     # original Parameters still reachable from results + sinks (input_ids,
     # attention_mask, position_ids, beam_idx — but never hidden_states)
@@ -954,7 +978,11 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         # has_head, stateful, num_kv_heads, head_dim, export_version) plus
         # gemma-4 diagnostics it ignores (stage, inputs, state_vars).
         stage_cfg = {
-            "stage": i, "layer_start": a, "layer_end": b,
+            # layer_end is HALF-OPEN (rainier-v3 contract: cascadia-types
+            # num_layers = layer_end - layer_start). stage_ranges returns an
+            # INCLUSIVE b, so write b + 1. The internal slice math keeps using
+            # the inclusive b (and b+1 for the residual cut) untouched.
+            "stage": i, "layer_start": a, "layer_end": b + 1,
             "has_embed": first, "has_head": last, "stateful": True,
             "num_kv_heads": num_kv_heads,
             "head_dim": head_dim,
@@ -1113,7 +1141,8 @@ def read_arch(src_dir: str):
     interleaves sliding/global attention with different KV geometry, so these
     are the per-model defaults ov-runtime's StageConfig carries as ``Option``
     hints — not authoritative per-layer values."""
-    cfg = json.load(open(os.path.join(src_dir, "config.json"), encoding="utf-8"))
+    with open(os.path.join(src_dir, "config.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
     tc = cfg.get("text_config", cfg)
     return (tc.get("num_hidden_layers"), tc.get("hidden_size"),
             tc.get("num_kv_shared_layers", 0) or 0,
@@ -1166,6 +1195,12 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
             raise SystemExit(
                 "could not determine num_hidden_layers from config; pass "
                 "--num-layers")
+        if hidden_size is None:
+            raise SystemExit(
+                "could not determine hidden_size from config; pass "
+                "--hidden-size (PipelineConfig.hidden_size is a required "
+                "non-optional field, so a null would make the sliced tree "
+                "fail to load)")
         if num_stages > num_layers:
             raise SystemExit(
                 f"--num-stages ({num_stages}) exceeds decoder layer count "
