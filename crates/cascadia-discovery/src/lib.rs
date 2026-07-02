@@ -170,6 +170,20 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
     };
 
     let node_id = get("node_id")?;
+    // member_digest (cascadia-cli/src/election.rs) joins `memory_mb:node_id`
+    // pairs with '\n'; that's only injective if node_id contains neither
+    // separator. Auto-ring node_ids are sanitized to [A-Za-z0-9-], but this
+    // function decodes a peer's node_id RAW from an mDNS TXT record with no
+    // charset guard — a hostile/malformed LAN peer could otherwise engineer
+    // two divergent member sets that hash to the same digest, so `agreed()`
+    // would pass while nodes wire different rings. Reject at the decode
+    // boundary, same as the namespace-mismatch rejection below. Do NOT widen
+    // this to a full charset allowlist: MANUAL-path node_ids are
+    // `{hostname}-r{rank}` and legitimately contain dots (FQDNs).
+    if node_id.contains(':') || node_id.contains('\n') {
+        debug!(%node_id, "rejecting peer: node_id contains reserved digest separator");
+        return None;
+    }
     let namespace = get("namespace").unwrap_or_else(|| "default".into());
     if namespace != expected_namespace {
         return None;
@@ -522,6 +536,79 @@ mod tests {
         .unwrap();
         let decoded = node_from_service(&info, "default").unwrap();
         assert_eq!(decoded.model_hash, None);
+    }
+
+    // CRITICAL: member_digest (cascadia-cli/src/election.rs) joins
+    // `memory_mb:node_id` pairs with '\n'. If a peer's raw node_id can
+    // contain ':' or '\n', two different member sets can be engineered to
+    // hash to the same digest, so agreed() would pass on divergent sets and
+    // nodes would silently wire different rings. node_from_service must
+    // reject such peers at the decode boundary.
+    #[test]
+    fn node_id_with_digest_separator_is_rejected() {
+        let node = NodeInfo::new("evil\n1:x", "127.0.0.1", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            "evil-service", // instance name must be a valid mDNS label; the
+            // node_id lives in the TXT record props, not the service name.
+            "evil.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        assert!(node_from_service(&info, "default").is_none());
+
+        let node2 = NodeInfo::new("a:b", "127.0.0.1", 9100);
+        let info2 = ServiceInfo::new(
+            SERVICE_TYPE,
+            "evil-service-2",
+            "evil2.local.",
+            node2.host.as_str(),
+            node2.port,
+            Some(props_from_node(&node2)),
+        )
+        .expect("build ServiceInfo");
+        assert!(node_from_service(&info2, "default").is_none());
+    }
+
+    // Guard against over-rejection: MANUAL-path node_ids are
+    // `{hostname}-r{rank}` and legitimately contain dots (FQDNs). Only ':'
+    // and '\n' are reserved digest separators.
+    #[test]
+    fn dotted_hostname_node_id_still_accepted() {
+        let node = NodeInfo::new("host.lan-r0", "192.168.0.5", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "default").expect("decode");
+        assert_eq!(decoded.node_id, "host.lan-r0");
+    }
+
+    // CASCADIA_NAMESPACE="" must not silently break matching: an empty
+    // namespace should round-trip through props_from_node / node_from_service
+    // just like any other value.
+    #[test]
+    fn empty_namespace_round_trips() {
+        let mut node = NodeInfo::new("h-empty-ns", "127.0.0.1", 9100);
+        node.namespace = "".into();
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h-empty-ns.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "").expect("decode");
+        assert_eq!(decoded.namespace, "");
     }
 }
 
