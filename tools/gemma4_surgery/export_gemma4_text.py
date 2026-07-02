@@ -21,12 +21,15 @@ N == 1  (whole IR, for the ov-genai engine)
 
 N > 1   (sliced stages, for the ov-runtime distributed engine)
     Graft as above, then slice the grafted IR at decoder-layer boundaries into
-    N per-stage stateful shards + a ``manifest.json`` (+ per-stage
-    ``stage_config.json``), mirroring
-    ``tools/qwen36_surgery/export_qwen36_moe.py``'s boundary + sink-ownership
-    contract, so a gemma-4 too big for one node (31B) runs pipeline-parallel.
-    Stage 0 keeps the grafted ``input_ids -> embeddings`` front-end; the last
-    stage keeps the ``logits`` output.
+    N per-stage stateful shards in the rainier-v3 on-disk layout the ov-runtime
+    engine loads (``crates/cascadia-engine-openvino/src/runtime.rs``): a root
+    ``pipeline_config.json`` + per-stage ``stage_{i}/openvino_model.xml`` +
+    ``stage_{i}/stage_config.json`` — byte-for-key identical to what
+    ``tools/export_shards.py`` writes. The boundary + sink-ownership algorithm
+    mirrors ``tools/qwen36_surgery/export_qwen36_moe.py``, so a gemma-4 too big
+    for one node (31B) runs pipeline-parallel. Stage 0 keeps the grafted
+    ``input_ids -> embeddings`` front-end; the last stage keeps the ``logits``
+    output.
 
     Slicing is REFUSED for models with ``num_kv_shared_layers > 0`` (E2B=20,
     E4B=18): those layers reuse an earlier layer's KV cache, and this tool does
@@ -88,6 +91,11 @@ GRAFTED_EMBEDS_NAME = "grafted_inputs_embeds"
 
 # Fixed short prompt for the N>1 parity gate (leading BOS=2 for gemma-4).
 VALIDATE_PROMPT_IDS = [2, 651, 6037, 603, 578, 3311]
+
+# Stamped into the N>1 rainier-v3 layout (pipeline_config.json +
+# stage_config.json) that ov-runtime loads, so the engine + on-node operator
+# can identify which exporter produced these shards.
+EXPORT_VERSION = "gemma4_text_surgery_v1"
 
 
 def log(msg: str) -> None:
@@ -753,11 +761,27 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                  keep_grafted: bool = False,
                  skip_tokenizer_regen: bool = False,
                  allow_kv_share: bool = False,
-                 validate: bool = False) -> None:
-    """N>1: slice the grafted IR into per-stage stateful shards + manifest.
+                 validate: bool = False,
+                 num_kv_heads=None, head_dim=None) -> None:
+    """N>1: slice the grafted IR into per-stage stateful shards, emitting the
+    rainier-v3 on-disk layout that the ov-runtime engine loads.
+
+    Layout (mirrors ``tools/export_shards.py`` so ov-runtime's
+    ``read_pipeline_config`` / ``read_stage_config`` find every field):
+
+        <out>/pipeline_config.json          (model_id, num_stages, num_layers,
+                                              hidden_size, export_version)
+        <out>/stage_{i}/openvino_model.xml  + openvino_model.bin
+        <out>/stage_{i}/stage_config.json   (layer_start, layer_end, has_embed,
+                                              has_head, stateful, num_kv_heads,
+                                              head_dim, export_version)
 
     Saves the grafted IR to a temp dir first, then re-reads it per stage
     (mmap, no RAM wall) — mirroring qwen36's ``extract_stage(xml_path, ...)``.
+    ``num_kv_heads`` / ``head_dim`` are best-effort per-model defaults carried
+    into each ``stage_config.json`` as the ``Option`` hints StageConfig reads.
+    The graft/slice ALGORITHM is unchanged — only the emitted filenames + JSON
+    keys differ from the earlier qwen36-family layout.
     """
     # HARD guard: KV-sharing severed across a stage boundary silently rewires
     # an orphan ReadValue to the WRONG cache -> silent garbage. This tool emits
@@ -784,12 +808,23 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             f"{num_kv_shared_layers}; correctness depends on boundaries keeping "
             f"each sharing group inside one stage. VALIDATE on-node.")
 
-    manifest = {
-        "arch": "gemma4_text",
-        "hidden_size": hidden_size,
+    # Top-level metadata in the rainier-v3 layout ov-runtime loads. The first
+    # five keys are what PipelineConfig reads; the rest are gemma-4-specific
+    # diagnostics ov-runtime ignores (no deny_unknown_fields) but keep for the
+    # on-node operator.
+    model_id = os.path.basename(os.path.abspath(src_dir))
+    pipeline_config = {
+        "model_id": model_id,
+        "num_stages": num_stages,
         "num_layers": num_layers,
+        "hidden_size": hidden_size,
+        "export_version": EXPORT_VERSION,
+        # gemma-4 diagnostics (ignored by ov-runtime's PipelineConfig):
+        "arch": "gemma4_text",
         "num_kv_shared_layers": num_kv_shared_layers,
-        "source": os.path.basename(os.path.abspath(src_dir)),
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "source": model_id,
         "last_logits_only": last_logits_only,
         "kv_share_overridden": bool(allow_kv_share and num_kv_shared_layers),
         "stages": [],
@@ -802,33 +837,39 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         t0 = time.time()
         stage, state_vars, all_vids = extract_stage(
             grafted_xml, a, b, first, last, suffix, last_logits_only)
-        sdir = os.path.join(out_dir, f"stage{i}")
+        sdir = os.path.join(out_dir, f"stage_{i}")
         os.makedirs(sdir, exist_ok=True)
-        ov.save_model(stage, os.path.join(sdir, "stage.xml"),
+        ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"),
                       compress_to_fp16=False)
         inputs = [p.get_friendly_name() for p in stage.get_parameters()]
+        # Keys ov-runtime's StageConfig reads (layer_start/end, has_embed,
+        # has_head, stateful, num_kv_heads, head_dim, export_version) plus
+        # gemma-4 diagnostics it ignores (stage, inputs, state_vars).
         stage_cfg = {
             "stage": i, "layer_start": a, "layer_end": b,
             "has_embed": first, "has_head": last, "stateful": True,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "export_version": EXPORT_VERSION,
             "inputs": inputs,
             "state_vars": state_vars,
         }
         with open(os.path.join(sdir, "stage_config.json"), "w") as f:
             json.dump(stage_cfg, f, indent=2)
-        manifest["stages"].append(stage_cfg)
-        log(f"stage{i}: layers {a}..{b} saved in {time.time() - t0:.0f}s "
+        pipeline_config["stages"].append(stage_cfg)
+        log(f"stage_{i}: layers {a}..{b} saved in {time.time() - t0:.0f}s "
             f"inputs={inputs} states={len(state_vars)}")
         if i == 0:
             log(f"  (discovered {len(all_vids)} Assign variable_ids; "
                 f"sample: {all_vids[:4]})")
 
     # --stage i is an incremental single-stage export: don't clobber a
-    # complete manifest.json (finding #5).
+    # complete pipeline_config.json (finding #5).
     if only_stage is None:
-        with open(os.path.join(out_dir, "manifest.json"), "w") as f:
-            json.dump(manifest, f, indent=2)
+        with open(os.path.join(out_dir, "pipeline_config.json"), "w") as f:
+            json.dump(pipeline_config, f, indent=2)
     else:
-        log(f"  (--stage {only_stage}: skipping manifest.json write)")
+        log(f"  (--stage {only_stage}: skipping pipeline_config.json write)")
 
     # tokenizer/detokenizer/config alongside the stages (single-dir UX), same
     # as qwen36 — plus the proven BOS regen + config flatten.
@@ -914,14 +955,15 @@ def _validate(grafted_xml: str, out_dir: str, ranges, last_logits_only: bool,
     hidden, chain_logits = None, None
     input_leak = []
     for i in range(len(ranges)):
-        sm = core.read_model(os.path.join(out_dir, f"stage{i}", "stage.xml"))
+        sm = core.read_model(
+            os.path.join(out_dir, f"stage_{i}", "openvino_model.xml"))
         sc = core.compile_model(sm, device)
         names = [inp.get_any_name() for inp in sc.inputs]
         if i != 0 and any("input_ids" in n for n in names):
             input_leak.append((i, names))
         out = sc.create_infer_request().infer(feeds(sc, hidden=hidden))
         hidden = np.asarray(out[sc.outputs[0]]).astype(np.float32)
-        log(f"  stage{i} ran, out shape {hidden.shape} inputs={names}")
+        log(f"  stage_{i} ran, out shape {hidden.shape} inputs={names}")
     chain_logits = last_row(hidden).astype(np.float32)
 
     d = float(np.abs(chain_logits - ref_logits).max())
@@ -948,12 +990,20 @@ def _validate(grafted_xml: str, out_dir: str, ranges, last_logits_only: bool,
 # ===========================================================================
 
 def read_arch(src_dir: str):
-    """Pull (num_layers, hidden_size, num_kv_shared_layers) from the VLM
-    config's ``text_config`` (or the top level if already flat)."""
+    """Pull (num_layers, hidden_size, num_kv_shared_layers, num_kv_heads,
+    head_dim) from the VLM config's ``text_config`` (or the top level if
+    already flat).
+
+    ``num_kv_heads`` / ``head_dim`` are the model's DEFAULT
+    ``num_key_value_heads`` / ``head_dim`` (best-effort, may be None). gemma-4
+    interleaves sliding/global attention with different KV geometry, so these
+    are the per-model defaults ov-runtime's StageConfig carries as ``Option``
+    hints — not authoritative per-layer values."""
     cfg = json.load(open(os.path.join(src_dir, "config.json"), encoding="utf-8"))
     tc = cfg.get("text_config", cfg)
     return (tc.get("num_hidden_layers"), tc.get("hidden_size"),
-            tc.get("num_kv_shared_layers", 0) or 0)
+            tc.get("num_kv_shared_layers", 0) or 0,
+            tc.get("num_key_value_heads"), tc.get("head_dim"))
 
 
 def run_export(model, output_dir, num_stages=1, quantization="int4",
@@ -995,7 +1045,7 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
         save_whole(grafted, model, output_dir,
                    skip_tokenizer_regen=skip_tokenizer_regen)
     else:
-        nl, hs, kv_shared = read_arch(model)
+        nl, hs, kv_shared, n_kv_heads, hd = read_arch(model)
         num_layers = num_layers or nl
         hidden_size = hidden_size or hs
         if num_layers is None:
@@ -1014,7 +1064,8 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
             last_logits_only=not no_last_logits_only,
             only_stage=stage, keep_grafted=keep_grafted,
             skip_tokenizer_regen=skip_tokenizer_regen,
-            allow_kv_share=allow_kv_share, validate=validate)
+            allow_kv_share=allow_kv_share, validate=validate,
+            num_kv_heads=n_kv_heads, head_dim=hd)
 
     log(f"ALL DONE in {time.time() - t0:.0f}s")
 
