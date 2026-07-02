@@ -486,8 +486,26 @@ mod tests {
         let node = NodeInfo::new("h", "127.0.0.1", 9100);
         let mut props = props_from_node(&node);
         props.insert("cluster_size".into(), "not-a-number".into());
-        // Non-16-hex model_hash (e.g. hostile/corrupt TXT) is treated as absent.
-        props.insert("model_hash".into(), "zz-not-hex".into());
+        // 16-char non-hex model_hash (right length, wrong character class) is
+        // treated as absent — exercises the hex16 guard's char-class branch,
+        // not just its length check.
+        props.insert("model_hash".into(), "gggggggggggggggg".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props.clone()),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.cluster_size, None);
+        assert_eq!(decoded.model_hash, None);
+
+        // 16-char uppercase hex is also rejected — hex16 requires lowercase
+        // (matches the encode side, which always emits lowercase digests).
+        props.insert("model_hash".into(), "AF63DC4C8601EC8C".into());
         let info = ServiceInfo::new(
             SERVICE_TYPE,
             &node.node_id,
@@ -498,7 +516,6 @@ mod tests {
         )
         .unwrap();
         let decoded = node_from_service(&info, "default").unwrap();
-        assert_eq!(decoded.cluster_size, None);
         assert_eq!(decoded.model_hash, None);
     }
 }
