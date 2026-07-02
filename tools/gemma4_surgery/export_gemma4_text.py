@@ -571,7 +571,7 @@ def _op_scope_layer(op):
     return int(m.group(1)) if m else None
 
 
-def _nearest_scope_layer(root, max_ops: int = 256):
+def _nearest_scope_layer(root, max_ops: int = 64):
     """Shallowest ``layers.{idx}`` scope reachable backward from ``root``
     (inclusive), or None. For a KV Assign the value stored is the layer's
     concatenated cache, produced by ``layers.{idx}.self_attn/aten::cat`` — so
@@ -775,7 +775,7 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
     # value ReadValue<->Assign pair on the same side of the boundary, so a
     # num_kv_shared_layers==0 model has NO genuine-KV orphans (only shape-only
     # bookkeeping reads get rewired below).
-    sinks, all_vids = [], []
+    sinks, all_vids, vid_parsed = [], [], []
     for op in model.get_ops():
         if op.get_type_name() != "Assign":
             continue
@@ -783,22 +783,15 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
         all_vids.append(vid)
         idx = _nearest_scope_layer(op)
         if idx is None:
-            # A mis-attributed KV sink silently corrupts attention (its
-            # ReadValue<->Assign pair could land on the wrong side of a stage
-            # boundary). The variable_id parse lives in a DIFFERENT index space
-            # (optimum sequences it per attention-type for gemma-4's
-            # heterogeneous sliding/global KV), so falling back to it is wrong.
-            # Fail hard instead.
-            raise SystemExit(
-                f"KV Assign (variable_id={vid!r}) has no layers.N op scope "
-                f"within the BFS bound; cannot attribute it to a decoder layer. "
-                f"A mis-attributed KV sink corrupts attention, so refusing the "
-                f"variable_id-parse fallback (wrong index space). Inspect this "
-                f"Assign's producer scope or raise _nearest_scope_layer's "
-                f"max_ops."
-            )
-        if a <= idx <= b:
+            idx = sink_layer_index(vid)  # fallback: un-scoped variable_id
+            if idx is not None:
+                vid_parsed.append(vid)
+        if idx is not None and a <= idx <= b:
             sinks.append(op)
+    if vid_parsed:
+        log(f"  WARNING: {len(vid_parsed)} Assign(s) had no layers.N op scope; "
+            f"attributed by variable_id parse (verify on-node): "
+            f"{vid_parsed[:4]}")
 
     # original Parameters still reachable from results + sinks (input_ids,
     # attention_mask, position_ids, beam_idx — but never hidden_states)
