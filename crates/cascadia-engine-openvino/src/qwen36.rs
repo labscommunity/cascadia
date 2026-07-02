@@ -1,6 +1,6 @@
 //! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
 //! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
-//! (M3', --total 1) or as an N-node stage pipeline (M4'-1, --rank R
+//! (single-box, --total 1) or as an N-node stage pipeline (--rank R
 //! --total N). Greedy-only, batch=1; the decode loop is a port of
 //! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
 //! greedy token parity vs the whole model.
@@ -45,7 +45,7 @@ const HIDDEN: usize = 2048;
 const PREFILL_CHUNK: usize = 256;
 const MROPE_ROWS: usize = 4;
 
-// M4'-1 wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
+// Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
 // HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
 // [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. Spec §3.1 frames
 // the position as an i64 prefix tensor; this header carries the same
@@ -373,7 +373,7 @@ struct ActiveTask {
     max_tokens: usize,
     started: Instant,
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
-    /// decode frames (n=1), for the M4'-1 gate's wire histogram.
+    /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
 }
 
@@ -554,7 +554,8 @@ impl Qwen36Engine {
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
-            // M4'-1 gate 4: decode wire histogram (p95 > 40 ms blocks).
+            // Pipeline gate 4: decode wire histogram (p95 > 40 ms blocks; see
+            // docs/architectures/qwen36-moe-support.md "Pipeline mode").
             let mut w = t.wire_ms.clone();
             w.sort_by(f64::total_cmp);
             let pct = |p: f64| w[((w.len() - 1) as f64 * p) as usize];
@@ -587,7 +588,7 @@ impl Qwen36Engine {
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
 
-    // -------- pipeline mode (M4'-1) --------
+    // -------- pipeline mode --------
 
     fn handle(&self) -> EngineResult<tokio::runtime::Handle> {
         self.runtime_handle
@@ -694,7 +695,7 @@ impl Qwen36Engine {
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
-    /// minus the chain's accumulated infer time) for the M4'-1 gate's
+    /// minus the chain's accumulated infer time) for the pipeline gate's
     /// wire histogram.
     fn send_forward_recv_token(
         &mut self,
@@ -1113,7 +1114,7 @@ impl Qwen36Engine {
         None
     }
 
-    /// Single-box step (M3' path), unchanged.
+    /// Single-box step path.
     fn step_local(&mut self) -> Vec<(TaskId, Chunk)> {
         // Admit the next task: position-0 entry per task (linear state
         // cannot be trimmed — spec §4.1).

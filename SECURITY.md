@@ -17,10 +17,12 @@ transport encryption.
 
 **What you get out of the box:**
 
-* HTTP API: 64 KiB request body cap, 32 KiB prompt cap, 16 concurrent
-  request semaphore. Oversized prompt → 413; over-capacity → 503.
+* HTTP API: request body cap (default 64 KiB), prompt cap (default
+  32 KiB), concurrent-request semaphore (default 16) — all
+  operator-configurable. Oversized prompt → 413; over-capacity → 503.
   Engine errors map cleanly to 5xx (no panics).
-* Engine queue: 256-task pending cap; `EngineError::QueueFull` → 503.
+* Engine queue: pending-task cap on the OpenVINO engines (256);
+  `EngineError::QueueFull` → 503.
 * TCP relay: 256 MiB cap on tensor payloads, 64 KiB cap on raw control
   recvs, shape × dtype overflow check before alloc, 60 s read timeout
   on every recv. A wedged or hostile peer can't pin a worker thread or

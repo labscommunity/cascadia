@@ -1,4 +1,4 @@
-"""M4' spike 3 (final pre-engine gate): full 2-stage GREEDY decode after
+"""Cross-node spike (final pre-engine gate): full 2-stage GREEDY decode after
 GPU-prefill state handoff, vs the blessed CPU-pure golden.
 
 Memory-sequenced for a 31.6 GB node (run with cascadia-node STOPPED):

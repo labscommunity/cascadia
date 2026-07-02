@@ -1,4 +1,4 @@
-"""M3' acceptance: whole-model greedy reference for engine parity.
+"""Whole-model greedy reference for engine parity acceptance.
 
 Mirrors the engine exactly: legacy prompt render ("role: content"),
 tokenizer.json with special tokens, T=1 prefill, greedy decode with

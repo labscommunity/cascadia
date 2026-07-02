@@ -10,9 +10,9 @@ Pipeline-parallel inference using pre-exported per-stage OpenVINO IRs with inter
 
 ## Shard format
 
-Pre-export with `cascadia shard` (which produces v3+ shards — the
-current exporter emits the v5 `v5_canonical_inputs` layout; legacy v3
-shards are also accepted):
+Pre-export with `cascadia shard` (the exporter emits the v5
+`v5_canonical_inputs` layout; the engine also accepts legacy v3
+shards):
 
 ```bash
 cascadia shard \
@@ -37,7 +37,8 @@ Produces:
 Current (v5) stage IRs use the canonical `(input_ids|hidden_states,
 attention_mask, position_ids, beam_idx)` inputs; legacy v3 stage IRs
 have `(input_ids|hidden_states, cos, sin)` positional inputs instead —
-the engine detects the layout from `export_version`. Both use stateful
+the engine auto-detects the layout from the stage IR's input names
+(`export_version` in `stage_config.json` is informational). Both use stateful
 KV cache. For v3 the Rust port sends `cos` / `sin` / `hidden_states` as
 f16 to match the export's default dtype — v3 shards exported with
 `--default-dtype fp32` are not currently supported.

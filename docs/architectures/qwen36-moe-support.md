@@ -352,19 +352,76 @@ XML. Proven step by step:
   The state-handoff spike's hidden-level drift does not flip greedy
   near-ties here.
 
-**Cross-node pre-engine gates: ALL GREEN.** Go/no-go picture: the
-viable cross-node build is a 2-node layer pipeline (wire tax
-~14.5 ms/token ≈ 7% via a relayed path) with per-node
-GPU-prefill→CPU-decode handoff (state round-trip proven,
-token-faithful); expert parallelism stays dead on relay-linked meshes.
-What the engine needs: state get/set FFI in the shim,
-upstream/downstream transport in the qwen36 engine (drop the
-single-box invariant), cross-node position-0 reset coordination. That
-build is a separate work item with its own spec round. Standing
-corrections whenever it is scoped: the single-box staged engine is the
-user-value deliverable; a mesh milestone must name a concrete scenario
-a single box cannot serve (multi-stream = a §4.1 invariant-1 spec
-change, priced separately) — otherwise it is cut, not deferred.
+**Cross-node pre-engine gates: ALL GREEN.** These spikes established
+the go/no-go picture: a layer pipeline pays ~1 RTT/token (viable even
+over a relayed path at ~7% of the decode budget); expert parallelism
+stays dead on relay-linked meshes. The pipeline build shipped — see
+"Pipeline mode (multi-node)" below. Still open: per-node
+GPU-prefill→CPU-decode handoff inside a rank (state round-trip proven
+by the spikes above, but the state get/set FFI in the shim is not
+built).
+
+### Pipeline mode (multi-node)
+
+The staged engine runs as an N-rank layer pipeline
+(`--rank i --total N`). Rank 0 holds embeddings + stage 0 + tokenizer
+and drives decode; middle ranks relay (run their stage, pass the span
+downstream, return the token back upstream); the last rank holds the
+logits head and answers each FORWARD with the argmax token. Control
+frames (HELLO handshake, RESET/RESET_ACK) chain through middle ranks —
+one ACK at rank 0 means the whole chain is at position 0. Frames are
+lockstep on one transport session per hop (12-byte header
+`[kind][epoch][pos]` + body); stale-epoch frames are dropped, and
+peer loss mid-task fails the task loud — recovery is restarting the
+affected workers, never partial-state serving. The full frame format
+and invariants are documented in the `qwen36.rs` module doc.
+
+Launch **highest rank first**, then descending — each rank's listener
+must be up before its upstream dials:
+
+```bash
+# Node B (rank 1 of 2: stage 1 + logits head):
+cascadia worker --rank 1 --total 2 --engine qwen36-moe \
+  --model /path/to/qwen36-shards-2stage --device CPU --listen :9100
+
+# Node A (rank 0: embeddings + stage 0 + tokenizer + API):
+cascadia worker --rank 0 --total 2 --engine qwen36-moe \
+  --model /path/to/qwen36-shards-2stage --device CPU \
+  --next <node-b-host>:9100 --api :8000
+```
+
+Ranks ≥ 1 need only `manifest.json`, `generation_config.json`, and
+their own `stage<i>/` directory from the shard tree; embeddings and
+the tokenizer load on rank 0 only — no need to copy the full tree to
+every node.
+
+**Acceptance gates** (harnesses: `tools/qwen36_surgery/m4_gate_serving.py`
+for gates 1–2 + the prompt set, `m4_gate_robustness.py` for gate 3;
+gate 4 is read from the rank-0 wire-histogram log line):
+
+1. **Token agreement** — 64-token greedy through the pipeline must be
+   char-identical to the single-box engine on the same shard tree. On
+   divergence, apply the near-tie coherence judgment (§5 "Prototype
+   and engine validation"): report the divergence index plus both
+   continuations rather than raw equality.
+2. **Decode throughput** — ≥ 4 tok/s short-context (completion tokens
+   over decode wall time, cross-checked against the engine's `tok_s`
+   log line).
+3. **Robustness rows** — cancel mid-decode then a clean follow-up
+   task; SSE client disconnect mid-decode then clean follow-up; three
+   sequential tasks with identical outputs (no state bleed); kill a
+   downstream rank mid-decode → rank 0 fails the task loud and the
+   server stays healthy; kill rank 0 mid-decode → downstream survives
+   with rate-limited warnings; restart all ranks → next task clean.
+4. **Wire histogram** — per-decode-frame RTT minus the peer-reported
+   infer time; **p95 > 40 ms blocks**. Measure over a long window:
+   relayed paths are bursty and a short window under-samples the tail.
+
+Measured on the validation pair (Intel Lunar Lake nodes, CPU decode,
+2-stage): parity exact, 4.1–4.8 tok/s short-context vs a 4.7–8.8
+single-box envelope, wire p50 ~21 ms / p95 ~24 ms. A 3-stage chain
+with a real middle rank measured per-hop-additive wire (~2× single
+hop) and parity exact — 2-node remains the perf-reference config.
 
 ## 6. Out of scope (v1, regardless of strategy)
 

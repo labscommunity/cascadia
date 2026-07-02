@@ -1664,7 +1664,6 @@ impl Runner {
         );
         l0.past_seq_len = past_seq_len + 1;
 
-        // Instrumentation: per-token layer-0 timing.
         info!(
             stage = "layer0",
             duration_us = _t0.elapsed().as_micros() as u64,
@@ -1834,7 +1833,6 @@ impl Runner {
             combine_total_us += combine_t0.elapsed().as_micros() as u64;
         }
 
-        // Instrumentation: per-token shells breakdown.
         // Also log prefetch counters so we can see how the
         // submit/drop ratio evolves across a generation. Counters are
         // cumulative-since-Runner-load, so the deltas across consecutive
@@ -1914,7 +1912,6 @@ impl Runner {
             DType::Bf16 => bf16_bytes_to_f32(&head_bytes),
             _ => return Err(RunnerError::Internal(format!("head dtype {:?}", head_dt))),
         };
-        // Instrumentation: per-token head timing.
         info!(
             stage = "head",
             duration_us = _t0.elapsed().as_micros() as u64,

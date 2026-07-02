@@ -1212,7 +1212,6 @@ impl SparseMoEEngine {
             .map_err(|e| format!("forward_shells: {e}"))?;
 
         // Send hidden downstream and wait for token to come back.
-        // Instrumentation: split timing of send vs round-trip.
         let wire_t0 = Instant::now();
         let result = self.block_on(async {
             send_forward(

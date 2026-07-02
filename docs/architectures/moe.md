@@ -48,8 +48,10 @@ that fits them all. The choices that differ:
 ## What cascadia has today
 
 `crates/cascadia-engine-sparse-moe/` implements a specialised MoE
-runtime for **Kimi K2.6 only** (60-layer Mixtral-style with 384 experts
-per layer, top-8 routing). It uses:
+runtime for **Kimi K2.6** (60-layer Mixtral-style with 384 experts
+per layer, top-8 routing) and **MiniMax-M2** (62-layer all-MoE,
+256 experts top-8 — see [docs/MINIMAX_M2.md](../MINIMAX_M2.md)). It
+uses:
 
 - per-expert OV IRs (each expert is exported as its own IR)
 - a router pass that picks top-k experts per token
@@ -57,16 +59,19 @@ per layer, top-8 routing). It uses:
 - a bounded LRU cache of compiled experts (most aren't in memory at
   once on a 133-GB-RAM box)
 
-This is NOT wired into `cascadia shard`. The expert-bin export
-pipeline is not part of this repo; the engine is invoked via
-`--engine sparse-moe` directly against the pre-built artefacts.
+This is NOT wired into `cascadia shard`; the engine is invoked via
+`--engine sparse-moe` directly against the pre-built artefacts. One
+per-family exporter ships in this repo:
+`tools/export_minimax_m2.py` produces the full sparse-MoE layout for
+MiniMax-M2 ([docs/MINIMAX_M2.md](../MINIMAX_M2.md) documents the
+pipeline). The Kimi K2.6 artefacts come from an external export
+pipeline that is not part of this repo.
 
-Known-working export paths exist for Mixtral, Kimi K2.6 sparse-MoE
-(plus a batched-expert variant), and the Gemma 4 26B-A4B MoE, but
-none ship in this repo yet. If/when cascadia grows generic MoE
-support, each family would land as its own `export_<family>.py`
-beside the generic exporter (the Gemma 4 dense exporter sets the
-pattern).
+Known-working export paths also exist for Mixtral and the Gemma 4
+26B-A4B MoE, but those don't ship here yet. If/when cascadia grows
+generic MoE support, each family would land as its own
+`export_<family>.py` beside the generic exporter (the MiniMax-M2 and
+Gemma 4 exporters set the pattern).
 
 ## Until then
 

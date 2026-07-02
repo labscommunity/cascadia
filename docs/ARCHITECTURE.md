@@ -38,7 +38,7 @@ Deterministic word-echo engine — splits the prompt and emits one word per `ste
 
 ## `cascadia-engine-sparse-moe`
 
-CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models). Loads per-layer shell IRs plus per-(layer, expert) IRs and dispatches only the top-k experts the router selects each step, instead of running all of them.
+CPU-targeted sparse mixture-of-experts engine (Kimi K2.6-style models, MiniMax-M2). Runs attention/norm shells natively in Rust (default; OV IR shells are an optional backend) and dispatches only the top-k experts the router selects each step — experts execute through the `cascadia-int4-gemm` kernels against per-expert weight binaries, instead of running all of them.
 
 ## `cascadia-int4-gemm`
 

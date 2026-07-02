@@ -137,7 +137,7 @@ fn gather_node_specs() -> NodeSpecs {
         SECURITY: cascadia's HTTP API and inter-stage TCP relay are \
         plaintext and unauthenticated. Bind only to trusted networks \
         (LAN, loopback) or terminate TLS + auth at a reverse proxy in \
-        front of `--api`. See the README \"Security\" section \
+        front of `--api`. See SECURITY.md in the repository root \
         for the full threat model."
 )]
 pub struct Cli {
