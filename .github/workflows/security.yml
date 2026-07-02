@@ -1,0 +1,45 @@
+# Supply-chain security gate. Runs cargo-deny over the workspace to catch
+# RUSTSEC advisories, disallowed licenses, banned crates, and untrusted crate
+# sources. Runs on every push/PR to main AND on a weekly schedule — the cron
+# re-checks a fixed dependency tree against a freshly-fetched advisory DB, so a
+# newly-disclosed CVE is surfaced even when no code changed.
+#
+# Policy lives in deny.toml at the repo root; run `cargo deny check` locally to
+# reproduce.
+
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege: only needs to read the repo to scan the dependency tree.
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    # Bound the job so a hang can't sit on a runner burning billed minutes.
+    timeout-minutes: 15
+    steps:
+      # Actions pinned to full commit SHAs (supply-chain hardening). The
+      # trailing comment records the tag for readability and manual bumps.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          command: check all
