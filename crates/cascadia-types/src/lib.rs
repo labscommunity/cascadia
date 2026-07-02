@@ -7,6 +7,7 @@
 
 pub mod chunk;
 pub mod error;
+pub mod hash;
 pub mod load;
 pub mod peer;
 pub mod shard;
