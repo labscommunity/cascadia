@@ -441,6 +441,25 @@ mod tests {
     use cascadia_engine::EngineError;
     use cascadia_types::{PeerEndpoint, PeerLayout, ShardSpec};
 
+    #[test]
+    fn ov_properties_reach_plugin_config() {
+        // Intercepts the PluginConfig the builder hands to
+        // ov::Core::compile_model: every injected (key, value) — the CLI's
+        // --ov-* perf flags — must land in its entries, alongside the
+        // pre-existing cache_dir wiring.
+        let b = OvGenaiBuilder::new("/x", "GPU")
+            .with_cache_dir("/tmp/ovc")
+            .with_ov_properties(vec![
+                ("PERFORMANCE_HINT".into(), "LATENCY".into()),
+                ("INFERENCE_PRECISION_HINT".into(), "f16".into()),
+            ]);
+        let cfg = b.build_plugin_config();
+        let has = |k: &str, v: &str| cfg.entries.iter().any(|(ek, ev)| ek == k && ev == v);
+        assert!(has("CACHE_DIR", "/tmp/ovc"));
+        assert!(has("PERFORMANCE_HINT", "LATENCY"));
+        assert!(has("INFERENCE_PRECISION_HINT", "f16"));
+    }
+
     #[tokio::test]
     async fn rejects_peer_layout() {
         let mut b = OvGenaiBuilder::new("/x", "CPU");

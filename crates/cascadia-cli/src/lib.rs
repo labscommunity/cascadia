@@ -304,18 +304,22 @@ pub struct WorkerArgs {
     pub ov_inference_precision: Option<String>,
 
     /// OV number of parallel inference streams (NUM_STREAMS).
+    /// See OpenVINO optimizing-throughput (streams-and-threads) docs (2026).
     #[arg(long, value_name = "N")]
     pub ov_num_streams: Option<u32>,
 
-    /// OV host CPU inference thread cap (INFERENCE_NUM_THREADS).
+    /// OV host CPU inference thread cap (INFERENCE_NUM_THREADS). CPU plugin
+    /// only. See OpenVINO CPU-device docs (2026).
     #[arg(long, value_name = "N")]
     pub ov_num_threads: Option<u32>,
 
     /// OV: allow internal auto-batching on the GPU plugin (ALLOW_AUTO_BATCHING).
+    /// See OpenVINO automatic-batching docs (2026).
     #[arg(long)]
     pub ov_allow_auto_batching: bool,
 
     /// OV execution mode: ACCURACY or PERFORMANCE (EXECUTION_MODE_HINT).
+    /// See OpenVINO precision-control (execution-mode) docs (2026).
     #[arg(long, value_name = "MODE")]
     pub ov_execution_mode: Option<String>,
 
