@@ -439,6 +439,95 @@ def find_output_by_name(model: ov.Model, name: str):
     return None
 
 
+# --- GLOBAL-LAYER attribution for KV state sinks ---------------------------
+# The stage boundary is cut by GLOBALLY-indexed op scopes (``layers.{idx}`` —
+# see layer_entry_output). optimum, however, may number a stateful model's KV
+# variable_ids by ATTENTION-TYPE SEQUENCE, not global layer: gemma-4 interleaves
+# sliding/local and global attention with DIFFERENT KV geometry (the
+# num_global_key_value_heads / k_eq_v split, PR #72 — sliding is 8x256, global
+# is 2x512). Attributing an Assign to a stage by the number inside its
+# variable_id therefore uses the WRONG index space, splitting a layer's
+# key/value ReadValue<->Assign pair across the boundary. The genuine KV read is
+# then orphaned, and the by-kind orphan rewire wires a wrong-geometry cache onto
+# it, so OpenVINO rejects the past(+)current Concat at serialize (the observed
+# 26B --num-stages 2 crash). Attributing each Assign to the ``layers.{idx}``
+# scope of the ops that FEED it keeps the pair together in the SAME index space
+# the boundary uses — the same globally-indexed contract qwen36 encodes with its
+# explicit per-layer variable_id map (layer_state_vids).
+_LAYER_SCOPE_RE = re.compile(r"layers\.(\d+)")
+
+
+def _op_scope_layer(op):
+    """Global decoder-layer index from an op's ``layers.{idx}`` friendly-name
+    scope, or None."""
+    m = _LAYER_SCOPE_RE.search(op.get_friendly_name())
+    return int(m.group(1)) if m else None
+
+
+def _nearest_scope_layer(root, max_ops: int = 64):
+    """Shallowest ``layers.{idx}`` scope reachable backward from ``root``
+    (inclusive), or None. For a KV Assign the value stored is the layer's
+    concatenated cache, produced by ``layers.{idx}.self_attn/aten::cat`` — so
+    the nearest scope IS the layer that owns the Assign, in the same index space
+    the boundary cut uses. Bounded so it never walks the whole graph."""
+    from collections import deque
+
+    seen, q, visited = set(), deque([root]), 0
+    while q and visited < max_ops:
+        node = q.popleft()
+        iid = node.get_instance_id()
+        if iid in seen:
+            continue
+        seen.add(iid)
+        visited += 1
+        layer = _op_scope_layer(node)
+        if layer is not None:
+            return layer
+        for iv in node.input_values():
+            q.append(iv.get_node())
+    return None
+
+
+def _readvalue_scope_layer(rv_op):
+    """Best-effort global layer index for a KV ReadValue, from a consumer's
+    ``layers.{idx}`` scope (falls back to the variable_id parse). Diagnostics
+    only — used to name the offending layer in error messages."""
+    for out in rv_op.outputs():
+        for tgt in out.get_target_inputs():
+            layer = _op_scope_layer(tgt.get_node())
+            if layer is not None:
+                return layer
+    return sink_layer_index(rv_op.get_variable_id())
+
+
+def _feeds_attention_concat(rv_op) -> bool:
+    """True if a ReadValue directly feeds a self-attention KV Concat
+    (past(+)current) — i.e. a GENUINE KV read, not a shape-only bookkeeping
+    read. Such a read must never be substituted by another layer's cache
+    (silent garbage): its Assign should have been owned by this stage."""
+    for out in rv_op.outputs():
+        for tgt in out.get_target_inputs():
+            c = tgt.get_node()
+            if (c.get_type_name() == "Concat"
+                    and "self_attn" in c.get_friendly_name()):
+                return True
+    return False
+
+
+def _shapes_compatible(ps_a, ps_b) -> bool:
+    """KV-cache PartialShape compatibility for orphan substitution: same rank
+    and, on every axis where BOTH dims are static, equal length. The dynamic
+    sequence axis is a wildcard; the static head-count and head-dim axes must
+    match, so a global-layer cache ([?,2,?,512]) can never be substituted onto a
+    sliding-layer read ([?,8,?,256])."""
+    try:
+        # OpenVINO's own check: dynamic dims are wildcards, static dims must
+        # be equal, ranks must be mergeable — exactly the semantics we want.
+        return ps_a.compatible(ps_b)
+    except Exception:  # noqa: BLE001 - older OV: structural fallback
+        return str(ps_a) == str(ps_b)
+
+
 def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
                   suffix: str, last_logits_only: bool):
     """Cut the grafted IR into the stateful shard for layers ``a..b``.
@@ -509,15 +598,31 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
         results = [ops.result(out)]
         results[0].output(0).set_names({"stage_hidden_out"})
 
-    # per-layer KV Assign sinks owned by this range
-    sinks, all_vids = [], []
+    # per-layer KV Assign sinks owned by this range. Attribute each Assign to
+    # the GLOBAL decoder layer of the ops that FEED it (``layers.{idx}`` scope)
+    # — the same index space the boundary cut uses — instead of the number
+    # inside the variable_id, which optimum may sequence per attention-type for
+    # gemma-4's heterogeneous sliding/global KV. This keeps each layer's key AND
+    # value ReadValue<->Assign pair on the same side of the boundary, so a
+    # num_kv_shared_layers==0 model has NO genuine-KV orphans (only shape-only
+    # bookkeeping reads get rewired below).
+    sinks, all_vids, vid_parsed = [], [], []
     for op in model.get_ops():
-        if op.get_type_name() == "Assign":
-            vid = op.get_variable_id()
-            all_vids.append(vid)
-            idx = sink_layer_index(vid)
-            if idx is not None and a <= idx <= b:
-                sinks.append(op)
+        if op.get_type_name() != "Assign":
+            continue
+        vid = op.get_variable_id()
+        all_vids.append(vid)
+        idx = _nearest_scope_layer(op)
+        if idx is None:
+            idx = sink_layer_index(vid)  # fallback: un-scoped variable_id
+            if idx is not None:
+                vid_parsed.append(vid)
+        if idx is not None and a <= idx <= b:
+            sinks.append(op)
+    if vid_parsed:
+        log(f"  WARNING: {len(vid_parsed)} Assign(s) had no layers.N op scope; "
+            f"attributed by variable_id parse (verify on-node): "
+            f"{vid_parsed[:4]}")
 
     # original Parameters still reachable from results + sinks (input_ids,
     # attention_mask, position_ids, beam_idx — but never stage_hidden)
@@ -539,12 +644,18 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
     stage = ov.Model(results, sinks, params_new + orig,
                      f"gemma4_stage_{a}_{b}")
 
-    # Orphan-state rewire (qwen36): global bookkeeping (past-length / mask
-    # ShapeOf chains) can reach a ReadValue whose Assign lives in another
-    # stage. Redirect each orphan onto a same-kind cache this stage owns.
-    # (For num_kv_shared_layers==0 models — the only ones slice_stages permits
-    # without --allow-kv-share — every orphan is genuine bookkeeping, not a
-    # cross-stage KV dependency.)
+    # Orphan-state rewire. With sink ownership attributed by global-layer scope
+    # (above), a num_kv_shared_layers==0 model has NO genuine-KV orphans — every
+    # layer's key AND value ReadValue is owned by the stage that owns the layer.
+    # The only orphans left are shape-only bookkeeping reads (mask / position
+    # ShapeOf chains that reach an out-of-stage layer's cache); those are safe to
+    # redirect onto a same-kind cache this stage owns — but ONLY a
+    # SHAPE-COMPATIBLE one. gemma-4's heterogeneous attention gives 'key'/'value'
+    # caches TWO geometries (sliding [?,8,?,256] vs global [?,2,?,512]), so a
+    # kind-ONLY substitution can wire the wrong geometry onto a consumer and
+    # OpenVINO rejects the past(+)current Concat at serialize (the 26B crash).
+    # Match on (kind AND partial_shape); refuse with a clear error rather than
+    # force a wrong-shape or genuine-KV substitution.
     owned = {s.get_variable_id() for s in stage.get_sinks()}
     by_kind, orphans = {}, []
     for op in stage.get_ops():
@@ -552,20 +663,49 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
             continue
         vid = op.get_variable_id()
         kind = sink_kind(vid)
+        ps = op.output(0).get_partial_shape()
         if vid in owned:
-            by_kind.setdefault(kind, op)
+            by_kind.setdefault(kind, []).append((op, ps))
         else:
-            orphans.append((op, kind))
-    for op, kind in orphans:
-        sub = by_kind.get(kind)
+            orphans.append((op, kind, ps))
+    for op, kind, ps in orphans:
+        # A genuine KV read (feeds the layer's self-attention KV Concat) must
+        # never be substituted — that would silently corrupt attention. Its
+        # Assign should have been owned by this stage; reaching here means sink
+        # ownership could not attribute the layer for this IR's variable-id
+        # layout, so refuse loudly instead of guessing.
+        if _feeds_attention_concat(op):
+            layer = _readvalue_scope_layer(op)
+            raise SystemExit(
+                f"gemma4 slice stage {a}..{b}: KV ReadValue "
+                f"{op.get_variable_id()} (layer {layer}, shape {ps}) is a "
+                f"genuine self-attention KV read but its Assign was not owned "
+                f"by this stage — a stage boundary split this layer's KV "
+                f"ReadValue<->Assign pair. Substituting another cache would "
+                f"silently corrupt attention, so the stage is refused. Re-run "
+                f"on-node and check the logged Assign variable_ids / layers.N "
+                f"scoping for this IR.")
+        candidates = by_kind.get(kind, [])
+        sub = next((c for c, cps in candidates if _shapes_compatible(cps, ps)),
+                   None)
         if sub is None:
-            raise RuntimeError(
-                f"no owned same-kind substitute for orphan state "
-                f"{op.get_variable_id()} (kind={kind}) in stage {a}..{b}")
+            owned_shapes = sorted({str(cps) for _, cps in candidates})
+            layer = _readvalue_scope_layer(op)
+            raise SystemExit(
+                f"gemma4 slice stage {a}..{b}: no shape-compatible owned "
+                f"'{kind}' cache for orphan state {op.get_variable_id()} "
+                f"(layer {layer}, shape {ps}); this stage owns '{kind}' caches "
+                f"with shapes {owned_shapes or '[]'}. A stage boundary split a "
+                f"KV group with incompatible geometry (gemma-4 heterogeneous "
+                f"sliding/global attention: e.g. sliding [?,8,?,256] vs global "
+                f"[?,2,?,512]) and this stage owns no cache of matching "
+                f"geometry — the boundary cannot be placed here without "
+                f"cross-stage KV passing (not emitted by this tool).")
         for tgt in list(op.output(0).get_target_inputs()):
             tgt.replace_source_output(sub.output(0))
     if orphans:
-        log(f"  rewired {len(orphans)} orphan state read(s) onto owned caches")
+        log(f"  rewired {len(orphans)} orphan state read(s) onto "
+            f"shape-compatible owned caches")
 
     return stage, sorted({s.get_variable_id() for s in sinks}), all_vids
 
