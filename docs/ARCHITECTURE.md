@@ -68,7 +68,7 @@ Topology graph with per-link latency and bandwidth measurements. This is where C
 
 ## `cascadia-discovery`
 
-mDNS peer discovery via the `mdns-sd` crate. Advertises `_cascadia._tcp.local.` and browses for siblings in the same namespace (a TXT-record field; peers in other namespaces are ignored). Zero-config: spin up workers on the same LAN and they find each other.
+mDNS peer discovery via the `mdns-sd` crate. Advertises `_cascadia._tcp.local.` and browses for siblings in the same `CASCADIA_NAMESPACE`, which is now honored by both `worker` and `discover`. Zero-config: spin up a worker and the coordinator finds it — `worker --cluster-size N` auto-forms the pipeline ring from the discovered peers.
 
 ## `cascadia-download`
 

@@ -22,6 +22,9 @@ export type NodeInfo = {
   engines: string[];
   /** Unix seconds, fractional. Compared against Date.now()/1000 for freshness. */
   last_seen: number;
+  model_hash?: string;
+  cluster_size?: number;
+  ring_digest?: string;
 };
 
 export type Edge = {

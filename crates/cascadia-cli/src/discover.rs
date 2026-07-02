@@ -6,9 +6,11 @@
 //! `host:port` you'd pass to another worker's `--next`.
 //!
 //! It deliberately does NOT auto-assign ranks, agree on a stage count,
-//! or order peers into a pipeline — that full auto-ring formation is
-//! tracked separately (see issue #52, follow-ups). Today `worker` still
-//! takes explicit `--rank`/`--total`/`--next`; `discover` just removes
+//! or order peers into a pipeline itself — auto-ring formation now
+//! exists via `cascadia worker --cluster-size N` (issue #89), which
+//! elects ranks and forms the pipeline from discovered peers. `worker`
+//! still accepts explicit `--rank`/`--total`/`--next` as the manual
+//! path; `discover` remains the read-only browse tool that removes
 //! the "what's my peer's address?" guesswork.
 
 use std::time::Duration;
