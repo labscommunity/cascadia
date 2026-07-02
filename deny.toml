@@ -42,14 +42,13 @@ allow = [
 # Require high confidence when detecting a crate's license from its text.
 confidence-threshold = 0.9
 
-# Cascadia's crates depend on each other with `version = "*"` path deps and
-# are not marked `publish = false`, so cargo-deny treats them as publishable
-# and flags the intra-workspace wildcards (allow-wildcard-paths can't exempt
-# "public" crates). Warn rather than fail: these are internal path deps, not
-# unpinned crates.io deps. To promote back to `deny`, add `publish = false` to
-# every non-published crate manifest so allow-wildcard-paths applies.
+# Wildcard version requirements never gate an external dep — deny them.
+# Intra-workspace deps are bare `path` deps (no version, which Cargo treats as
+# `*`); allow-wildcard-paths exempts those because every workspace crate is
+# marked `publish = false`. Removing `publish = false` from a crate puts its
+# path deps back under this deny.
 [bans]
-wildcards = "warn"
+wildcards = "deny"
 allow-wildcard-paths = true
 # Duplicate versions of the same crate bloat the tree and widen the audit
 # surface. Warn (don't fail) — transitive dep graphs make this hard to zero out.
