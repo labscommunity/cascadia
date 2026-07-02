@@ -46,8 +46,28 @@ ov::AnyMap collect_properties(const char* const* kv, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         const char* key = kv[2 * i];
         const char* val = kv[2 * i + 1];
-        if (key && val) {
-            props[std::string(key)] = std::string(val);
+        if (!key || !val) {
+            continue;
+        }
+        std::string k(key);
+        // A few properties are consumed by ov::genai's own pipeline code
+        // (NPU static-LLM path), not the plugin config parser. genai reads
+        // them via Any::as<int64_t>() and throws on a string Any
+        // ("Failed to extract MAX_PROMPT_LEN. Type mismatch: expected int").
+        // The Rust side sends every value as a string, so coerce these known
+        // integer keys to int64_t here. Plugin-parsed properties (CACHE_DIR,
+        // PERFORMANCE_HINT, INFERENCE_PRECISION_HINT, NUM_STREAMS, …) accept
+        // strings fine and stay strings.
+        if (k == "MAX_PROMPT_LEN" || k == "MIN_RESPONSE_LEN" ||
+            k == "NPUW_LLM_PREFILL_CHUNK_SIZE") {
+            try {
+                props[k] = static_cast<int64_t>(std::stoll(val));
+            } catch (...) {
+                // Not an integer — let OV report it against the string value.
+                props[k] = std::string(val);
+            }
+        } else {
+            props[k] = std::string(val);
         }
     }
     return props;
