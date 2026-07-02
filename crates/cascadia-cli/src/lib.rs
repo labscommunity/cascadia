@@ -256,6 +256,10 @@ mod worker_mode_tests {
     fn rank_without_total_errors() {
         assert!(resolve_worker_mode(Some(0), None, None).is_err());
     }
+    #[test]
+    fn total_without_rank_errors() {
+        assert!(resolve_worker_mode(None, Some(2), None).is_err());
+    }
 }
 
 /// Reject flag combinations that are incompatible with auto-ring
@@ -273,9 +277,7 @@ fn preflight_auto(args: &WorkerArgs, n: u32) -> Result<()> {
         bail!("--engine ov-dist-spec auto-ring requires --draft-model on every box (the elected rank 0 needs it; other ranks ignore it)");
     }
     if !args.advertise_engines.is_empty() {
-        // The election's engine cross-check compares the single running
-        // engine; a multi-entry advertised list would defeat it.
-        bail!("--advertise-engines is not valid with --cluster-size");
+        bail!("--advertise-engines is not valid with --cluster-size (the election cross-checks the single running engine)");
     }
     Ok(())
 }
@@ -1230,7 +1232,9 @@ async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoR
     let topology = cascadia_topology::Topology::new();
     topology.add_node(self_node.clone());
     let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), ns.clone());
-    discovery.start(self_node.clone())?;
+    discovery
+        .start(self_node.clone())
+        .context("start mDNS discovery for auto-ring election")?;
 
     let p = election::ElectParams {
         self_id: node_id,
