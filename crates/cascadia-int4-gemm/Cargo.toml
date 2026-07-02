@@ -16,7 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-# autolab iter 038 (C1 Windows port): PrefetchVirtualMemory + friends
+# Windows port: PrefetchVirtualMemory + friends
 # for the Windows arm of advise_willneed. Bundled in `windows-sys` so
 # we only pull the Win32 import lib, no proc-macros or extra crates.
 [target.'cfg(windows)'.dependencies]
@@ -26,8 +26,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-# (canonical reference decompression for cross-validation lives in
-# rainier/scripts/k26_export_per_expert_v2.py — we cross-validate the
+# (no external reference decompressor is linked — we cross-validate the
 # Rust kernel against bytes-on-disk only).
 tempfile = { workspace = true }
 

@@ -12,7 +12,7 @@ use half::{bf16, f16};
 /// Build a causal mask of shape `[1, 1, seq, past + seq]`, f32, with 0
 /// where the query can attend and -1e9 where it can't.
 ///
-/// `-1e9` matches the convention rainier exported the shells with —
+/// `-1e9` matches the convention the shells were exported with —
 /// `-inf` triggered NaN paths in some attention kernels.
 pub fn causal_mask_f32(seq: usize, past: usize) -> (Vec<f32>, [usize; 4]) {
     let full = past + seq;

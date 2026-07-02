@@ -54,7 +54,7 @@ jobs:
       - name: Lint (clippy)
         # Warnings tolerated for now — the engine crates have a few
         # dead-code fields kept around for serde compatibility with
-        # rainier shard configs. Promote to `-D warnings` once those
+        # legacy shard configs. Promote to `-D warnings` once those
         # are tagged with `#[allow(dead_code)]` or actually used.
         run: cargo clippy --workspace --all-targets
 

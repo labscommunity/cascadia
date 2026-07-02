@@ -570,7 +570,7 @@ pub struct DistributedMaskedReq {
     logical_pos: usize,
     // Per-task accumulators — `spec_decode_greedy` resets these at task
     // start so the final `spec_decode timing` line attributes target
-    // time correctly between alpha-side compute and wire (charlie+net).
+    // time correctly between rank-0-side compute and wire (downstream+net).
     pub t_alpha_setup: std::time::Duration,
     pub t_alpha_infer: std::time::Duration,
     pub t_alpha_output: std::time::Duration,
@@ -623,10 +623,10 @@ impl DistributedMaskedReq {
         Ok(())
     }
 
-    /// Async-split: does sync alpha-side stage_0 work then spawns the network
+    /// Async-split: does sync rank-0-side stage_0 work then spawns the network
     /// round-trip as a tokio task. Returns a handle the caller awaits via
-    /// `feed_recv_async`. Lets the caller do other alpha work (next-round
-    /// drafts, post-round draft.feed) DURING the charlie wait window.
+    /// `feed_recv_async`. Lets the caller do other rank-0 work (next-round
+    /// drafts, post-round draft.feed) DURING the downstream wait window.
     /// State (cache_len, logical_pos) is updated on send so back-to-back
     /// `feed_send_async` calls stay consistent.
     pub fn feed_send_async(&mut self, input_ids: &[i64]) -> Result<TargetSendHandle, EngineError> {
@@ -643,7 +643,7 @@ impl DistributedMaskedReq {
         }
         let pos: Vec<i64> = (self.logical_pos as i64..(self.logical_pos + n) as i64).collect();
 
-        // Run stage 0 locally (sync — alpha GPU compute).
+        // Run stage 0 locally (synchronous GPU compute).
         let in_ids = self.stage0_inputs.get("input_ids").unwrap().clone();
         let attn_name = self.stage0_inputs.get("attention_mask").unwrap().clone();
         let pos_name = self.stage0_inputs.get("position_ids").unwrap().clone();
@@ -1038,8 +1038,8 @@ pub fn spec_decode_greedy(
         stats.total_drafts += drafts.len() as u32;
 
         // Verify [prev_correction, drafts...] — ASYNC SPLIT.
-        // Send target verify (alpha stage_0 sync, then spawn network task).
-        // While charlie computes stage_1 (~43ms), do the SPECULATIVE first
+        // Send target verify (rank-0 stage_0 sync, then spawn network task).
+        // While the downstream rank computes stage_1 (~43ms), do the SPECULATIVE first
         // half of post-round draft work: draft.feed(drafts.last()) is needed
         // in the all-accepted case anyway. If speculation is wrong (some
         // drafts rejected), we'll rewind the draft state.
@@ -1140,7 +1140,7 @@ pub fn spec_decode_greedy(
         // Per-task target.feed breakdown:
         // alpha_setup (set_input) + alpha_infer (stage_0 GPU compute)
         // + alpha_output (read stage_0 output) + wire (send +
-        // charlie stage_1 + recv).
+        // downstream stage_1 + recv).
         target_alpha_setup_ms = target.t_alpha_setup.as_millis() as u64,
         target_alpha_infer_ms = target.t_alpha_infer.as_millis() as u64,
         target_alpha_output_ms = target.t_alpha_output.as_millis() as u64,

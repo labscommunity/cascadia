@@ -3,7 +3,7 @@
 //! Follow-up to iter 042 ([`crate::kernel_avx512_multi`]) targeting the
 //! oproj shape (N=7168, K=8192, 28 MB int4 ≈ 14 MB packed). Iter 042
 //! flagged oproj as "DRAM-bandwidth-bound" and suggested AMX as the
-//! next swing. **`perf stat` on miner disproved that hypothesis:**
+//! next swing. **`perf stat` on the Xeon bench host disproved that hypothesis:**
 //!
 //! ```text
 //! LLC-load-misses  =  2.27% of LLC loads      → NOT DRAM-bound
@@ -11,7 +11,7 @@
 //! IPC              = 1.10 insn/cycle          → pipeline-stall-bound
 //! ```
 //!
-//! The 14 MB int4 weight matrix fits in the miner Xeon Gold 6252's
+//! The 14 MB int4 weight matrix fits in the Xeon Gold 6252's
 //! 35.8 MiB L3 cache, and almost all weight loads hit L3 (97.7% hit
 //! rate). The bottleneck is not DRAM throughput — it's redundant
 //! input reads.
@@ -54,13 +54,13 @@
 //!
 //! ## Hardware tested
 //!
-//! - **Miner Xeon Gold 6252** (Cascade Lake, 24 cores, avx512f+bw+vl+vnni)
+//! - **Xeon Gold 6252** (Cascade Lake, 24 cores, avx512f+bw+vl+vnni)
 //!   — bench target. No AMX (AMX is 4th-gen Xeon+ only).
-//! - **Matias-02/03** (Lunar Lake Core Ultra 7 258V) — no AMX.
+//! - **Lunar Lake** (Core Ultra 7 258V) — no AMX.
 //!
-//! There is no AMX hardware in the cascadia fleet as of 2026-05-18. An
+//! None of the hardware tested has AMX. An
 //! AMX path would require Sapphire Rapids / Granite Rapids Xeon or
-//! Lunar Lake-X (none currently available).
+//! Lunar Lake-X.
 //!
 //! ## What iter 046 SKIPPED
 //!
@@ -306,7 +306,7 @@ pub fn dequant_gemm_int4_multi_blocked_auto(
     assert_eq!(ys.len(), seq * n_rows);
     #[cfg(target_arch = "x86_64")]
     {
-        // Microbench on miner (iter 046, Xeon Gold 6252) showed:
+        // Microbench (iter 046, Xeon Gold 6252) showed:
         //   seq=2: blocked ~0.6-1.0x of iter 042 (regression, RB=2
         //          register pressure overcomes the halved xs reuse).
         //   seq=4: blocked ~0.7-2.0x of iter 042 (mixed).

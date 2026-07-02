@@ -4,7 +4,6 @@
 #
 # Prereqs:
 #   - self-hosted runners online with labels [self-hosted, ai-pc, windows]
-#     (provisioned via cascadia-fleet — see that repo's docs/RUNNERS.md)
 #   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
 #     root on the runners.
 #

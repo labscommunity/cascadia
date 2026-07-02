@@ -1,11 +1,11 @@
 //! Hand-rolled int4 GEMM for the Kimi K2.6 expert path.
 //!
-//! Why this exists: the rainier-exported per-expert OV IRs round-trip
+//! Why this exists: the exported per-expert OV IRs round-trip
 //! their int4 weights through OV's CPU plugin one Linear at a time. The
 //! per-call inference overhead (~5 ms) dominates for these tiny ~24 MB
 //! experts — 480 expert calls × 5 ms = 2.4 s/tok lower bound. A pure
 //! Rust kernel with memmap'd packed weights and AVX-512 SIMD is bound by
-//! DRAM bandwidth (~140 GB/s on the Xeon Gold 6252 in the miner) and so
+//! DRAM bandwidth (~140 GB/s on the Xeon Gold 6252 bench host) and so
 //! has a much tighter ceiling.
 //!
 //! Format: each expert is three int4-packed Linear weight matrices with

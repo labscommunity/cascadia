@@ -336,7 +336,7 @@ impl Int4Shell {
 /// to a larger capacity and avoid per-token Vec realloc, use
 /// [`shell_forward_decode_int4_with_capacity`].
 ///
-/// **autolab campaign 029 (A8): KV cache is bf16-quantized in storage.**
+/// **KV cache is bf16-quantized in storage.**
 /// The SDPA kernel upconverts to f32 on-the-fly per dot-product element.
 pub fn shell_forward_decode_int4(
     shell: &Int4Shell,
@@ -362,7 +362,7 @@ pub fn shell_forward_decode_int4(
 /// alloc/copy traffic across long-context generations.
 ///
 /// Layout of `past_k`: `[NUM_HEADS, capacity, QK_HEAD_DIM]` flat,
-/// row-major, **bf16-as-u16** (autolab campaign 029 / A8). Head `h`'s
+/// row-major, **bf16-as-u16**. Head `h`'s
 /// populated keys occupy
 /// `past_k[h * capacity * QK_HEAD_DIM .. h * capacity * QK_HEAD_DIM + past_seq_len * QK_HEAD_DIM]`.
 /// `past_v` is laid out similarly with `V_HEAD_DIM`. KV halves memory
@@ -499,12 +499,12 @@ pub fn shell_forward_decode_int4_with_capacity_sparse(
         new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
     }
 
-    // SDPA — autolab campaign 010 (F4): parallelize per-head attention.
+    // SDPA — parallelize per-head attention.
     // Each head's body is independent (writes to a disjoint V_HEAD_DIM
     // slice of attn_out). Rayon over the 64 heads gives ~core-count
     // speedup on the attention bucket (14.5% of decode per q1).
     //
-    // autolab campaign 029 (A8): past_k/past_v are bf16-as-u16. The
+    // past_k/past_v are bf16-as-u16. The
     // upconvert `f32::from_bits((bits as u32) << 16)` is a single shift
     // per element and stays cheap. The new (this-step) k/v are still
     // f32 — they are written to the bf16 cache by the caller after this
@@ -659,7 +659,7 @@ pub fn shell_forward_decode_int4_with_capacity_sparse(
 // Adds a seq>=1 API on top of the single-token shell forward so future
 // chunked-prefill / spec-decode driver loops can batch N tokens through
 // one shell forward instead of N sequential seq=1 calls. The KV cache
-// here is `[u16]` (autolab campaign 029 / A8 — bf16 storage) just like
+// here is `[u16]` (bf16 storage) just like
 // the seq=1 path; the iter 042 multi-token AVX-512 tile and iter 046
 // row-blocked tile are dispatched per-shape via `dispatch_int4_multi`.
 

@@ -3,9 +3,9 @@
 //! Kimi K2.6 has 60 MoE layers with 384 experts each and top-8 routing.
 //! Naive OV traced exports include all 384 experts as a weighted sum
 //! every forward pass, which runs ~50x the compute a real sparse-routed
-//! model would (DISCOVERIES — rainier, 2026-04). This crate runs the
-//! pre-exported per-expert IRs the rainier exporter produces and
-//! dispatches only the top-k experts the router actually selected.
+//! model would. This crate runs the pre-exported per-expert IRs the
+//! exporter produces and dispatches only the top-k experts the router
+//! actually selected.
 //!
 //! Model directory layout:
 //!

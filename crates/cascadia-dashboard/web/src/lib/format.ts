@@ -37,8 +37,8 @@ export function isFresh(lastSeen: number, nowSeconds: number = Date.now() / 1000
 /**
  * Color band for a measured edge latency. Tuned for Intel AI PC fleets:
  * within-switch links are sub-millisecond, across-switch a few ms, and
- * anything past ~20 ms is a WAN hop that hurts pipeline throughput (per
- * rainier's experiments — 50 ms WAN hop drops throughput ~65%).
+ * anything past ~20 ms is a WAN hop that hurts pipeline throughput
+ * (empirically, a 50 ms WAN hop drops throughput ~65%).
  */
 export type LatencyBand = "great" | "good" | "warm" | "bad";
 

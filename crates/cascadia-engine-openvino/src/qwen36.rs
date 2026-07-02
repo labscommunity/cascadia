@@ -11,7 +11,7 @@
 //! recovery — spec §4.1); cancellation drops the task and the next
 //! admission's reset restores the invariant.
 //!
-//! Pipeline mode (qwen36-m4-pipeline-spec.md): rank 0 holds embeddings
+//! Pipeline mode (docs/architectures/qwen36-moe-support.md): rank 0 holds embeddings
 //! + stage 0 + tokenizer and drives decode; middle ranks relay (run
 //! their stage, pass the span downstream, return the token back); the
 //! last rank holds the logits head and answers each FORWARD with the

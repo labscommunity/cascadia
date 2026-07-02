@@ -339,7 +339,7 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// receiving side so an adversarial / corrupt peer cannot ask us to
 /// allocate megabytes of token-buffer or hidden-state buffer from a
 /// 4-byte count field. 256 is well above any sensible spec-decode K
-/// (the rainier reference uses K=8; even K=64 is extreme).
+/// (the reference implementation uses K=8; even K=64 is extreme).
 pub const MAX_BATCH_COUNT: u32 = 256;
 
 /// Send a ForwardBatch frame downstream: kind + past_seq_len_start

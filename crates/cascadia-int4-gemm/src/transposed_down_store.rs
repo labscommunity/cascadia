@@ -6,14 +6,12 @@
 //!
 //! PR #43 (the AXPY-form kernel) cached each expert's transposed
 //! down weight in **anonymous** heap memory (`Vec<u8>` inside a
-//! `LruCache`). On K2.6 (~518 GiB mmap'd model, miner has 133 GiB
-//! RAM) that 4 GiB of pinned anon memory displaced ~910 experts'
+//! `LruCache`). On K2.6 (~518 GiB mmap'd model, a 133 GiB-RAM
+//! host) that 4 GiB of pinned anon memory displaced ~910 experts'
 //! worth of model mmap pages from the page cache, causing
 //! subsequent expert dispatches to hit cold NVMe seeks (~576 ms
 //! per fully-cold expert). The net was a 2.5× end-to-end
 //! regression at the kernel-level speedup we'd have otherwise gotten.
-//!
-//! Full post-mortem: rainier `docs/AXPY_REGRESSION_ANALYSIS.md`.
 //!
 //! ## How this fixes it
 //!

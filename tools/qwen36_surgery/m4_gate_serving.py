@@ -1,6 +1,6 @@
 """M4'-1 serving gates (run on/against the rank-0 node API).
 
-Gates covered (qwen36-m4-pipeline-spec.md §6):
+Gates covered (see docs/architectures/qwen36-moe-support.md):
   1. token agreement vs the blessed single-box golden
      (golden/qwen36_parity_64.json) — text-prefix compare; on divergence
      report the index + both continuations for the M3' §5 near-tie

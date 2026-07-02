@@ -13,8 +13,8 @@ Needs no extra disk (reads the FP8 source already on disk). Slow — for a
 short quality check, not throughput.
 
     python test_minimax_m2_fp_experts.py \
-        --model-dir /media/tatef/extssd/m2/export \
-        --fp8-dir   /media/tatef/extssd/m2/fp8 \
+        --model-dir /path/to/m2/export \
+        --fp8-dir   /path/to/m2/fp8 \
         --prompt "The capital of France is" --max-new 24 --rep-penalty 1.3 --rep-window 64
 """
 import argparse

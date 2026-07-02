@@ -2,7 +2,7 @@
 //!
 //! Mirrors the richer parts of `cascadia/shared/topology.py`. Nodes are
 //! advertised by discovery; edges store *measured* latency + bandwidth
-//! (per rainier's 1,200+ experiments showing latency drives placement on
+//! (1,200+ placement experiments showed latency drives placement on
 //! Intel fleets). A missing edge means we never probed it — placement
 //! should treat unmeasured edges pessimistically rather than as missing.
 

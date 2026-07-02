@@ -160,9 +160,8 @@ pub fn embed_token_bf16(embed_table_bf16: &[u8], token_id: i64) -> Vec<f32> {
 /// of the new token id).
 ///
 /// `past_k` shape `[NUM_HEADS, capacity, QK_HEAD_DIM]`, `past_v`
-/// shape `[NUM_HEADS, capacity, V_HEAD_DIM]`, **bf16-as-u16** storage
-/// (autolab campaign 029 / A8). Only the first `past_seq_len` slots
-/// per head are populated.
+/// shape `[NUM_HEADS, capacity, V_HEAD_DIM]`, **bf16-as-u16** storage.
+/// Only the first `past_seq_len` slots per head are populated.
 pub fn layer0_forward_decode_int4_with_capacity(
     layer: &Int4Layer0,
     x_f32: &[f32],
@@ -284,7 +283,7 @@ pub fn layer0_forward_decode_int4_with_capacity_sparse(
         new_v[h * V_HEAD_DIM..(h + 1) * V_HEAD_DIM].copy_from_slice(v_src);
     }
 
-    // SDPA — autolab campaign 029 (A8): past_k/past_v are bf16-as-u16,
+    // SDPA — past_k/past_v are bf16-as-u16,
     // upconverted to f32 inline at each dot-product element. The new
     // (this-step) k/v stay f32 — the caller writes them into the bf16
     // cache after we return.
@@ -511,8 +510,8 @@ pub fn layer0_forward_decode_int4_multi_with_capacity(
 /// reference implementation for the bit-identity tests against
 /// [`layer0_forward_decode_int4_multi_batched`].
 ///
-/// KV cache here is **bf16-as-u16** (autolab campaign 029 / A8) just
-/// like the seq=1 path. The per-token KV append uses [`write_present_kv_bf16`]
+/// KV cache here is **bf16-as-u16** just like the seq=1 path.
+/// The per-token KV append uses [`write_present_kv_bf16`]
 /// for the inline f32 → bf16 round at each slot.
 pub fn layer0_forward_decode_int4_multi_scalar(
     layer: &Int4Layer0,
@@ -573,7 +572,7 @@ pub fn layer0_forward_decode_int4_multi_scalar(
 /// that serialized cost — the SIMD wins iter 048 wired for the 60
 /// shells now also apply to the single layer-0 call.
 ///
-/// **KV cache is bf16-as-u16** (autolab campaign 029 / A8). SDPA
+/// **KV cache is bf16-as-u16.** SDPA
 /// reads past_k/past_v with inline `f32::from_bits((bits as u32) << 16)`
 /// upconvert per element, and the per-token KV append uses
 /// [`write_present_kv_bf16`] for the inline f32 → bf16 round.
@@ -676,8 +675,8 @@ fn layer0_forward_decode_int4_multi_batched(
     );
 
     // ============ PHASE B: per-token RoPE + SDPA + KV append ============
-    // SDPA reads past_k/past_v as bf16-as-u16 with inline upconvert
-    // (autolab campaign 029 / A8). new_k/new_v stay f32 for the
+    // SDPA reads past_k/past_v as bf16-as-u16 with inline upconvert.
+    // new_k/new_v stay f32 for the
     // current-step dot product, then are written into the cache as
     // bf16 by `write_present_kv_bf16` so the next token sees them.
     let mut attn_outs = vec![0.0f32; seq * (NUM_HEADS * V_HEAD_DIM)];
@@ -784,8 +783,8 @@ fn layer0_forward_decode_int4_multi_batched(
     //
     // Shape N=7168, K=8192 — identical to the shell's o_proj, so
     // `ProjShape::Oproj` routes through the iter 046 row-blocked tile
-    // at seq>=4 (+41% over iter 042 at seq=4-16, verified by iter 046
-    // miner microbench). At seq=2-3 it auto-falls-back to iter 042.
+    // at seq>=4 (+41% over iter 042 at seq=4-16, verified by the iter
+    // 046 Xeon microbench). At seq=2-3 it auto-falls-back to iter 042.
     let mut o_outs = vec![0.0f32; seq * HIDDEN];
     dispatch_int4_multi(
         ProjShape::Oproj,
@@ -1068,7 +1067,7 @@ mod tests {
 
     /// Same as `multi_layer0_batched_matches_scalar_seq_4_iter048_dispatch`
     /// but at seq=8 — exercises iter 046's sweet spot (consistent +40%
-    /// over iter 042 per the iter 046 miner microbench at seq=8).
+    /// over iter 042 per the iter 046 Xeon microbench at seq=8).
     /// Layer 0's down_proj (66 MB, biggest single int4 matrix in the
     /// model) is the projection most sensitive to row-blocking; if its
     /// dispatch breaks, this test catches it.

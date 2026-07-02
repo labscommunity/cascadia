@@ -400,7 +400,7 @@ struct ActiveTask {
     /// Cumulative time inside `run_first` (stage_0 compute + read).
     t_alpha_compute: std::time::Duration,
     /// Cumulative time inside `send_hidden_downstream` +
-    /// `recv_token_from_downstream` — i.e. wire send + charlie wait + recv.
+    /// `recv_token_from_downstream` — i.e. wire send + downstream wait + recv.
     t_wire: std::time::Duration,
 }
 

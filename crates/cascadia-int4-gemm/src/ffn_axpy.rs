@@ -55,8 +55,6 @@
 //!   no PowerInfer source copied.
 //! - Premise (down is the most sparsifiable FFN tensor): TEAL
 //!   (Liu et al. 2024, arxiv:2408.14690 Fig 7).
-//!
-//! See rainier `docs/POWERINFER_PORT.md` for the full technique map.
 
 use rayon::prelude::*;
 

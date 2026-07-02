@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """cascadia Gemma 4 exporter — per-stage stateful OpenVINO IR shards.
 
-Ported from rainier's `scripts/export_gemma4_e2b_cached_shards.py`
-(2026-04-24), the Python prototype that produced working multi-stage
-Gemma 4 E2B shards for the rainier 2-stage worker / coordinator. The
-algorithm handles every Gemma 4-specific quirk the generic exporter
-in `export_shards.py` cannot:
+Ported from the reference Python prototype (2026-04-24) that produced
+working multi-stage Gemma 4 E2B shards for a 2-stage worker /
+coordinator pipeline. The algorithm handles every Gemma 4-specific
+quirk the generic exporter in `export_shards.py` cannot:
 
 * Per-layer-type asymmetric attention — `head_dim=256` for
   sliding-attention layers vs `global_head_dim=512` for
@@ -72,8 +71,8 @@ def apply_patches() -> None:
        0-dim buffers in the model and reshape to (1,) so the same
        issue doesn't surface during trace via ``register_buffer``.
 
-    These mirror rainier's `apply_patches` + the per-buffer loop in
-    `main`. Idempotent; safe to call multiple times.
+    These mirror the reference exporter's patches. Idempotent; safe
+    to call multiple times.
     """
     import openvino.frontend.pytorch.utils as ov_utils
 
