@@ -7,6 +7,15 @@
 #     (provisioned via cascadia-fleet — see that repo's docs/RUNNERS.md)
 #   - repository variable INTEL_OPENVINO_DIR pointing at the OpenVINO GenAI SDK
 #     root on the runners.
+#
+# SECURITY — fork PRs must NEVER run on the self-hosted runners. Untrusted fork
+# code here = arbitrary code execution on our hardware. The job-level `if` below
+# skips fork PRs, but a fork can edit that guard in its own PR, so it is
+# defense-in-depth only. The tamper-proof barriers live in repo/org settings and
+# MUST be on before this repo goes public: (1) require approval for all outside
+# collaborators; (2) keep these runners off fork-PR workflows (isolated org
+# runner group and/or ephemeral). Never add a `pull_request` job on
+# [self-hosted, ...] without the guard.
 
 name: AI-PC tests
 
@@ -46,11 +55,18 @@ jobs:
     runs-on: [self-hosted, ai-pc, windows]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned to full commit SHAs (supply-chain hardening). The
+      # trailing comment records the tag for readability and manual bumps.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA-pinned: the `stable` channel now comes from `toolchain:`, not the ref.
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: ai-pc-openvino
           cache-on-failure: true
