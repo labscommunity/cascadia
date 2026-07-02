@@ -25,7 +25,9 @@ jobs:
     timeout-minutes: 30
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening). The
-      # trailing comment records the tag for readability and manual bumps.
+      # trailing comment records the tag (or channel branch, for
+      # dtolnay/rust-toolchain, which publishes no tags) for readability
+      # and manual bumps.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false

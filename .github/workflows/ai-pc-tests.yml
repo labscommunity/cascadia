@@ -12,10 +12,19 @@
 # code here = arbitrary code execution on our hardware. The job-level `if` below
 # skips fork PRs, but a fork can edit that guard in its own PR, so it is
 # defense-in-depth only. The tamper-proof barriers live in repo/org settings and
-# MUST be on before this repo goes public: (1) require approval for all outside
-# collaborators; (2) keep these runners off fork-PR workflows (isolated org
-# runner group and/or ephemeral). Never add a `pull_request` job on
-# [self-hosted, ...] without the guard.
+# MUST be on before this repo goes public:
+#   (1) require approval for workflow runs from all outside collaborators;
+#   (2) keep these runners off fork-PR workflows (isolated org runner group
+#       and/or ephemeral);
+#   (3) enable branch protection on main with ci and cargo-deny as required
+#       checks. Caution if making THIS job required: the fork-PR guard and the
+#       paths filter both produce *skipped* runs, and skipped satisfies a
+#       required check — pair the paths filter with a same-name no-op job and
+#       decide explicitly whether skipped-equals-pass is acceptable;
+#   (4) after going public, verify the weekly security.yml cron stays enabled —
+#       GitHub auto-disables scheduled workflows in public repos after 60 days
+#       without repo activity.
+# Never add a `pull_request` job on [self-hosted, ...] without the guard.
 
 name: AI-PC tests
 
@@ -56,7 +65,9 @@ jobs:
     timeout-minutes: 45
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening). The
-      # trailing comment records the tag for readability and manual bumps.
+      # trailing comment records the tag (or channel branch, for
+      # dtolnay/rust-toolchain, which publishes no tags) for readability
+      # and manual bumps.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false

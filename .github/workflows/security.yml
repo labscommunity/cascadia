@@ -1,6 +1,7 @@
 # Supply-chain security gate. Runs cargo-deny over the workspace to catch
-# RUSTSEC advisories, disallowed licenses, banned crates, and untrusted crate
-# sources. Runs on every push/PR to main AND on a weekly schedule — the cron
+# RUSTSEC advisories, disallowed licenses, dependency bans (wildcard version
+# requirements; no crates are name-banned yet), and untrusted crate sources.
+# Runs on every push/PR to main AND on a weekly schedule — the cron
 # re-checks a fixed dependency tree against a freshly-fetched advisory DB, so a
 # newly-disclosed CVE is surfaced even when no code changed.
 #
