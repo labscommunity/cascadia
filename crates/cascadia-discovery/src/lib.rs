@@ -282,6 +282,8 @@ impl DiscoveryService {
         let handle = std::thread::spawn(move || {
             let debounce = RemoveDebounce::new(DEBOUNCE_WINDOW);
             loop {
+                // 200ms tick = sweep granularity; 3-4 sweeps per DEBOUNCE_WINDOW
+                // (750ms) bounds extra removal latency at one tick.
                 match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(ServiceEvent::ServiceResolved(srv)) => {
                         if let Some(node) = node_from_service(&srv, &namespace) {
@@ -308,6 +310,9 @@ impl DiscoveryService {
                     // Daemon shut down -> channel closed -> exit so close()'s
                     // join() returns (mdns-sd Receiver is flume; the concrete
                     // error type isn't re-exported, so use is_disconnected()).
+                    // Note: pending debounce entries are not flushed on
+                    // shutdown; the topology handle may briefly retain a
+                    // departing peer. Fine for process exit (the common path).
                     Err(_) if receiver.is_disconnected() => break,
                     Err(_) => {} // timeout tick
                 }
@@ -540,6 +545,21 @@ mod debounce_tests {
         assert_eq!(
             d.expired(t0 + Duration::from_secs(1)),
             vec!["n2".to_string()]
+        );
+    }
+    #[test]
+    fn window_boundary_is_refresh_inclusive_expire_exclusive() {
+        let d = RemoveDebounce::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        d.on_removed("n3", t0);
+        // exactly at the window edge: still a refresh...
+        assert!(d.on_resolved("n3", t0 + Duration::from_millis(500)));
+        d.on_removed("n4", t0);
+        // ...and exactly at the edge, not yet expired.
+        assert!(d.expired(t0 + Duration::from_millis(500)).is_empty());
+        assert_eq!(
+            d.expired(t0 + Duration::from_millis(501)),
+            vec!["n4".to_string()]
         );
     }
 }
