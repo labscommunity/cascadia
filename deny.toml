@@ -1,0 +1,61 @@
+# cargo-deny configuration — supply-chain gate for the Cascadia workspace.
+# Enforced in CI (.github/workflows/security.yml) and runnable locally:
+#   cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail the build on any RUSTSEC advisory in the dependency tree. This is the
+# real security gate: a NEW vulnerability, unsound, or unmaintained advisory
+# turns CI red and forces a review.
+#
+# The list below is the *accepted baseline* — advisories present as of
+# 2026-07-02 whose fix is not a compatible-version bump away. Each is `unsound`
+# or `unmaintained` (there are no open `vulnerability`-class advisories). Each
+# entry states its actual blocker; remove the entry when the blocker clears.
+ignore = [
+    "RUSTSEC-2026-0002", # lru 0.12.5 — IterMut Stacked-Borrows unsoundness. Patched in 0.16.3+, but 0.12 → 0.16+ is a breaking upgrade of a direct dep (cascadia-engine-sparse-moe); ignore until that crate migrates.
+    "RUSTSEC-2025-0119", # number_prefix 0.4.0 (unmaintained) — transitive via indicatif → hf-hub → cascadia-download; no safe upgrade.
+    "RUSTSEC-2024-0436", # paste 1.0.15 (unmaintained) — transitive via tokenizers; no safe upgrade.
+]
+# Never ship a version that has been yanked from the registry.
+yanked = "deny"
+
+[licenses]
+# Cascadia ships Apache-2.0 (see workspace Cargo.toml). Allow the permissive
+# licenses common in the Rust ecosystem, plus MPL-2.0 (weak copyleft,
+# file-scoped) — all compatible with Apache-2.0 redistribution. Only licenses
+# actually present in the tree are listed, so a green run has no unmatched-
+# allowance warnings; anything new fails the build and gets reviewed here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+# Require high confidence when detecting a crate's license from its text.
+confidence-threshold = 0.9
+
+# Wildcard version requirements never gate an external dep — deny them.
+# Intra-workspace deps are bare `path` deps (no version, which Cargo treats as
+# `*`); allow-wildcard-paths exempts those because every workspace crate is
+# marked `publish = false`. Removing `publish = false` from a crate puts its
+# path deps back under this deny.
+[bans]
+wildcards = "deny"
+allow-wildcard-paths = true
+# Duplicate versions of the same crate bloat the tree and widen the audit
+# surface. Warn (don't fail) — transitive dep graphs make this hard to zero out.
+multiple-versions = "warn"
+
+[sources]
+# Only pull from crates.io and explicitly-allowed git sources (none currently
+# — add `allow-git` entries as needed).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

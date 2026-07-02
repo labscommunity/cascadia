@@ -12,20 +12,35 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: this workflow only reads the repo to build and test.
+# Any job needing more must opt in explicitly.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: cargo test (stub)
     runs-on: ubuntu-latest
+    # Bound the job so a hang can't sit on a runner burning billed minutes.
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned to full commit SHAs (supply-chain hardening). The
+      # trailing comment records the tag (or channel branch, for
+      # dtolnay/rust-toolchain, which publishes no tags) for readability
+      # and manual bumps.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        # SHA-pinned: the `stable` channel now comes from `toolchain:`, not the ref.
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
