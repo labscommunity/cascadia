@@ -129,6 +129,24 @@ fn gather_node_specs() -> NodeSpecs {
     }
 }
 
+/// Namespace for discovery/advertise: CASCADIA_NAMESPACE, else "default".
+pub(crate) fn cluster_namespace() -> String {
+    std::env::var("CASCADIA_NAMESPACE").unwrap_or_else(|_| "default".into())
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::cluster_namespace;
+    // NOTE: env is process-global; keep this the ONLY test in the crate that
+    // touches CASCADIA_NAMESPACE (a set_var sibling would race under the
+    // parallel test runner).
+    #[test]
+    fn defaults_to_default_when_unset() {
+        std::env::remove_var("CASCADIA_NAMESPACE");
+        assert_eq!(cluster_namespace(), "default");
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -1080,7 +1098,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         host: cascadia_discovery::local_ip().to_string(),
         port: listen_port,
         api_port,
-        namespace: "default".to_owned(),
+        namespace: cluster_namespace(),
         device,
         memory_mb: specs.memory_mb,
         cpu_model: specs.cpu_model,
@@ -1093,7 +1111,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         last_seen: 0.0,
     };
     topology.add_node(self_node.clone());
-    let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), "default");
+    let mut discovery =
+        cascadia_discovery::DiscoveryService::new(topology.clone(), cluster_namespace());
     if let Err(e) = discovery.start(self_node.clone()) {
         tracing::warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
     }

@@ -21,9 +21,8 @@ use clap::Parser;
 /// Browse the LAN for Cascadia peers and print what's advertising.
 #[derive(Parser, Debug, Clone)]
 pub struct DiscoverArgs {
-    /// Discovery namespace to browse. Peers in a different namespace are
-    /// ignored (matches the worker's namespace partitioning).
-    #[arg(long, default_value = "default")]
+    /// Discovery namespace to browse. Defaults to $CASCADIA_NAMESPACE or "default".
+    #[arg(long, default_value_t = crate::cluster_namespace())]
     pub namespace: String,
 
     /// How long to listen for peer announcements, in seconds. mDNS
