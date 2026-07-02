@@ -302,6 +302,14 @@ TOKENIZER_SUBDIR_FILES = (
     "config.json",
     "generation_config.json",
     "added_tokens.json",
+    # ov-runtime's chat formatter (cascadia-api::load_chat_template_config)
+    # looks for the gemma turn-marker template at ``tokenizer/chat_template.jinja``
+    # (or a ``chat_template`` field in ``tokenizer/tokenizer_config.json``, which
+    # gemma-4 does NOT embed). Without it rank 0 falls back to legacy
+    # "role: content" formatting and the instruction-tuned model degenerates
+    # (observed: "la la la ..." instead of a coherent answer). Ship the jinja
+    # into the subdir so the turn markers are applied.
+    "chat_template.jinja",
 )
 
 
@@ -666,6 +674,55 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
             if n:
                 log(f"  rewired {n} grafted-inputs_embeds shape-consumer(s) "
                     f"onto hidden_states")
+
+        # Sever the input_ids-rooted attention-mask padding branch from mid/last
+        # stages. gemma-4's mask reconstruction feeds a SECOND consumer off the
+        # input_ids Parameter (Multiply_30620 -> Pad -> Equal(pad_id) -> ... ->
+        # aten::masked_fill/Select_1 -> SDPA mask) that the inputs_embeds rewire
+        # above does NOT touch — leaving input_ids alive in a stage ov-runtime
+        # never feeds it (mid stages get hidden_states/attention_mask/position_
+        # ids/beam_idx only). That is the "[CPU] Select ... dim index 2 mismatch"
+        # compile failure: the branch's query seq-dim comes from input_ids while
+        # the causal side comes from arange(hidden_states/attention_mask), so the
+        # masked_fill Select cannot broadcast.
+        #
+        # The branch is VALUE-independent: its root op multiplies input_ids by a
+        # 0 constant (Multiply_30620, Constant=[0]), so it depends on input_ids
+        # ONLY for its [batch, query_seq] shape. hidden_states carries that exact
+        # [batch, query_seq] in its first two axes and is the same source the
+        # residual stream + SDPA query use. Rebuild the branch root as
+        # zeros[batch, query_seq] (i64) from ShapeOf(hidden_states) and redirect
+        # every input_ids consumer onto it: values are byte-identical (still
+        # zeros), the query seq-dim now flows from hidden_states so the Select
+        # broadcasts, and input_ids drops to zero consumers -> it is not reached
+        # by the results/sinks walk below and falls out of the stage Parameter
+        # list entirely (the total input_ids redirect llama/qwen36 get for free).
+        import numpy as _np
+        ids_param = None
+        for p in model.get_parameters():
+            names = set(p.output(0).get_names()) | {p.get_friendly_name()}
+            if any("input_ids" in nm for nm in names):
+                ids_param = p
+                break
+        if ids_param is not None:
+            consumers = list(ids_param.output(0).get_target_inputs())
+            if consumers:
+                hs_shape = ops.shape_of(param.output(0), output_type="i64")
+                bt_seq = ops.gather(
+                    hs_shape,
+                    ops.constant(_np.array([0, 1], dtype=_np.int64)),
+                    ops.constant(_np.array(0, dtype=_np.int64)))
+                zeros_ids = ops.broadcast(
+                    ops.constant(_np.array(0, dtype=_np.int64)),
+                    bt_seq.output(0))
+                zeros_out = maybe_convert(
+                    zeros_ids.output(0), ids_param.get_element_type(),
+                    "hidden_states->input_ids_pad")
+                for tgt in consumers:
+                    tgt.replace_source_output(zeros_out)
+                log(f"  severed input_ids padding branch: rewired "
+                    f"{len(consumers)} consumer(s) onto zeros[batch,seq] from "
+                    f"hidden_states; input_ids Parameter drops out of stage")
 
     if last:
         # Natural logits output; optionally sliced to the last position so
