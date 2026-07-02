@@ -199,6 +199,23 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
     rewire_param_to_source(emb_ids, shared_ids.output(0), "emb.input_ids")
     rewire_param_to_source(pl_ids, shared_ids.output(0), "pl.input_ids")
 
+    # --- neutralize VLM-only token_type_ids (present in 31B / transformers>=5
+    #     exports; absent on E2B). Text-only => every token is text (type 0).
+    #     Feed a dynamic all-zeros i64 tensor shaped like input_ids so the
+    #     Parameter can be DROPPED (ov-genai LLMPipeline never feeds it). ---
+    p_tok_type = find_param(lm, "token_type_ids")
+    if p_tok_type is not None:
+        import numpy as _np
+        n_tt = len(list(p_tok_type.output(0).get_target_inputs()))
+        zeros_tt = ops.multiply(
+            maybe_convert(shared_ids.output(0), p_tok_type.get_element_type(),
+                          "ttids->i64"),
+            ops.constant(_np.array(0, dtype=_np.int64)))
+        rewire_param_to_source(p_tok_type, zeros_tt.output(0),
+                               "lm.token_type_ids(zeros)")
+        log(f"  [lm.token_type_ids] neutralized -> zeros ({n_tt} consumer(s)),"
+            f" param dropped")
+
     # --- graft emb_out -> inputs_embeds consumers ---
     emb_src = maybe_convert(emb_out, p_embeds.get_element_type(),
                             "emb->inputs_embeds")
@@ -276,6 +293,25 @@ def regenerate_tokenizer_bos(model_dir: str) -> None:
     import numpy as np
     from transformers import AutoTokenizer
     from openvino_tokenizers import convert_tokenizer
+
+    # transformers-5 VLM exports write tokenizer_config.json with
+    # ``extra_special_tokens`` as a LIST; AutoTokenizer.from_pretrained then
+    # raises (older transformers expected a dict). Text-only regen only needs
+    # BOS, so coerce a list-valued field to {} in the output-dir copy (backing
+    # the original up as .t5.orig, matching the tool's *.orig backup convention)
+    # before loading. No-op when the field is already a dict or absent (E2B /
+    # older exports), so the proven BOS regen (Hello -> [2, 9259]) is unchanged.
+    tok_cfg_path = os.path.join(model_dir, "tokenizer_config.json")
+    if os.path.exists(tok_cfg_path):
+        tok_cfg = json.load(open(tok_cfg_path, encoding="utf-8"))
+        if isinstance(tok_cfg.get("extra_special_tokens"), list):
+            if not os.path.exists(tok_cfg_path + ".t5.orig"):
+                shutil.copy2(tok_cfg_path, tok_cfg_path + ".t5.orig")
+            tok_cfg["extra_special_tokens"] = {}
+            json.dump(tok_cfg, open(tok_cfg_path, "w", encoding="utf-8"),
+                      indent=2)
+            log("  coerced transformers-5 extra_special_tokens list -> {} in "
+                "tokenizer_config.json (backed up .t5.orig)")
 
     hf = AutoTokenizer.from_pretrained(model_dir, add_bos_token=True)
     log(f"loaded hf tokenizer: {type(hf).__name__} bos={hf.bos_token} "
