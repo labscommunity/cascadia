@@ -290,6 +290,44 @@ def copy_aux(src_dir: str, dst_dir: str) -> None:
             log(f"skip (absent) {fn}")
 
 
+# HF tokenizer files ov-runtime loads from ``<out>/tokenizer/`` (see
+# runtime.rs:12 doc + loader: ``tokenizer/tokenizer.json`` for the Rust
+# ``tokenizers`` crate, plus ``config.json`` / ``generation_config.json`` for
+# rotary + eos lookup). Mirrors ``tools/export_shards.py::copy_tokenizer``.
+TOKENIZER_SUBDIR_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "config.json",
+    "generation_config.json",
+    "added_tokens.json",
+)
+
+
+def copy_tokenizer_subdir(model_dir: str) -> None:
+    """Populate ``<model_dir>/tokenizer/`` from the finalized root files.
+
+    ov-runtime (the N>1 engine) expects the HF tokenizer + config under a
+    ``tokenizer/`` subdir, NOT at the model root (runtime.rs:1556 joins
+    ``pipeline_dir/tokenizer`` first). Run AFTER ``flatten_config`` and
+    ``regenerate_tokenizer_bos`` so the flat text-gen ``config.json`` and the
+    BOS/transformers-5-coerced ``tokenizer_config.json`` are the versions that
+    ship. Root files are left in place (N==1 ov-genai + the regen step read
+    them there), so this is additive. Mirrors
+    ``tools/export_shards.py::copy_tokenizer``.
+    """
+    tok_dir = os.path.join(model_dir, "tokenizer")
+    os.makedirs(tok_dir, exist_ok=True)
+    copied = 0
+    for fn in TOKENIZER_SUBDIR_FILES:
+        src = os.path.join(model_dir, fn)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(tok_dir, fn))
+            copied += 1
+    log(f"copied {copied} tokenizer file(s) into {tok_dir}")
+
+
 def regenerate_tokenizer_bos(model_dir: str) -> None:
     """Regenerate the OV tokenizer/detokenizer with a leading BOS.
 
@@ -589,19 +627,32 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
             raise RuntimeError(
                 f"stage input boundary not found: layers.{a}.{suffix} "
                 f"(override with --boundary-suffix; check op names on-node)")
+        # ov-runtime feeds the inter-stage activation as f16 under the tensor
+        # name ``hidden_states`` (runtime.rs:17 wire-format doc, :608
+        # ``input_named("hidden_states")``, :623/:1733 F16 feed) — the exact
+        # contract ``tools/export_shards.py`` emits (its whole model is traced
+        # at torch.float16, so its non-first ``hidden_states`` Parameter is
+        # f16; runtime.rs:1355 names it ``hidden_states``). Match BOTH: name
+        # the Parameter ``hidden_states`` and give it element type f16 so the
+        # F16 feed is accepted. The grafted residual-stream boundary may be a
+        # wider dtype (the graft is saved compress_to_fp16=False), so insert a
+        # Convert from the f16 input to the boundary's native element type
+        # before rewiring consumers (a no-op when the boundary is already f16).
         param = ops.parameter(entry.get_partial_shape(),
-                              entry.get_element_type(), name="stage_hidden")
-        param.output(0).set_names({"stage_hidden"})
+                              ov.Type.f16, name="hidden_states")
+        param.output(0).set_names({"hidden_states"})
+        hidden_src = maybe_convert(param.output(0), entry.get_element_type(),
+                                   "hidden_states->stage-boundary")
         for tgt in list(entry.get_target_inputs()):
-            tgt.replace_source_output(param.output(0))
+            tgt.replace_source_output(hidden_src)
         params_new.append(param)
 
         # Drop the token-embedding matrix from mid/last stages. The grafted
         # inputs_embeds Output (tagged GRAFTED_EMBEDS_NAME) still feeds two
         # things: (a) layer 0's scaled residual path — pruned in a non-first
         # stage — and (b) mask/position ShapeOf chains that read it for SHAPE
-        # only. stage_hidden has the identical [?,?,hidden] shape, so redirect
-        # ALL its consumers onto stage_hidden; the embedding subgraph (and its
+        # only. hidden_states has the identical [?,?,hidden] shape, so redirect
+        # ALL its consumers onto hidden_states; the embedding subgraph (and its
         # input_ids Parameter, unless per_layer keeps it) then drops out.
         emb_src_out = find_output_by_name(model, GRAFTED_EMBEDS_NAME)
         if emb_src_out is None:
@@ -610,11 +661,11 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
         if emb_src_out is not None and emb_src_out is not entry:
             n = 0
             for tgt in list(emb_src_out.get_target_inputs()):
-                tgt.replace_source_output(param.output(0))
+                tgt.replace_source_output(hidden_src)
                 n += 1
             if n:
                 log(f"  rewired {n} grafted-inputs_embeds shape-consumer(s) "
-                    f"onto stage_hidden")
+                    f"onto hidden_states")
 
     if last:
         # Natural logits output; optionally sliced to the last position so
@@ -669,7 +720,7 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
             f"{vid_parsed[:4]}")
 
     # original Parameters still reachable from results + sinks (input_ids,
-    # attention_mask, position_ids, beam_idx — but never stage_hidden)
+    # attention_mask, position_ids, beam_idx — but never hidden_states)
     seen, reach = set(), set()
     stack = list(results) + sinks
     while stack:
@@ -680,7 +731,7 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
         for iv in node.input_values():
             src = iv.get_node()
             if (src.get_type_name() == "Parameter"
-                    and src.get_friendly_name() != "stage_hidden"):
+                    and src.get_friendly_name() != "hidden_states"):
                 reach.add(src)
             stack.append(src)
     orig = [p for p in model.get_parameters() if p in reach]
@@ -883,6 +934,12 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         except Exception as e:  # noqa: BLE001
             log(f"  WARNING: tokenizer regen failed ({e}); rerun on-node")
 
+    # ov-runtime reads the HF tokenizer + config from a ``tokenizer/`` subdir
+    # (not the model root) — mirror export_shards.py. Runs after flatten_config
+    # + regen so the shipped tokenizer/ has the flat text-gen config.json and
+    # the coerced tokenizer_config.json. N==1 (ov-genai) reads root, untouched.
+    copy_tokenizer_subdir(out_dir)
+
     # Parity gate (on-node): chained stages vs the grafted whole IR. Run before
     # the temp grafted IR is removed. Can't chain a partial export.
     if validate:
@@ -903,7 +960,7 @@ def _validate(grafted_xml: str, out_dir: str, ranges, last_logits_only: bool,
 
     Ports the intent of qwen36's ``_validate`` + ``probe_chain_vs_full_prompt``:
     run the grafted WHOLE IR and the CHAINED stages on the same fixed short
-    prompt, feeding each stage's output as the next stage's ``stage_hidden``
+    prompt, feeding each stage's output as the next stage's ``hidden_states``
     input (the tiling contract). Assert last-position top-1 logit agreement,
     top-5 overlap, and bounded relative drift. Also asserts mid/last stages
     carry NO ``input_ids`` (finding #4). Prints EXPORT_VALIDATE_OK/FAIL and
@@ -922,7 +979,7 @@ def _validate(grafted_xml: str, out_dir: str, ranges, last_logits_only: bool,
             et = inp.get_element_type().to_dtype()
             ps = inp.get_partial_shape()
             rank = ps.rank.get_length() if ps.rank.is_static else 1
-            if nm == "stage_hidden":
+            if nm == "hidden_states":
                 f[nm] = hidden.astype(et)
             elif "input_ids" in nm:
                 f[nm] = ids.astype(et)
