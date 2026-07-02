@@ -1558,6 +1558,13 @@ async fn cmd_worker(mut args: WorkerArgs) -> Result<()> {
         // non-zero and systemd's `Restart=on-failure` rebuilds the stage,
         // rather than exit 0 (a "success" systemd won't restart) and leave
         // the pipeline a stage short. A clean SlotEmpty exit returns Ok.
+        //
+        // Auto-ring note (spec F4): a ring member that aborts post-commit exits
+        // its process; this rank then sees connect-failure or ConnectionReset ->
+        // ConnectionFatal -> non-zero exit -> systemd rebuild. Deliberately NO
+        // first-frame deadline: idle rings are legal (transport frame_idle_ceiling).
+        // Covered by cascadia-runner's relay_loop_exits_on_connection_fatal_step
+        // and recv-RST tests.
         match exit {
             Ok(cascadia_runner::RelayExit::ConnectionFatal) => {
                 return Err(anyhow!("relay loop exited: peer link dead; rebuild needed"));
