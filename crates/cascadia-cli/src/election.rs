@@ -284,7 +284,9 @@ pub async fn elect(
     // real mDNS). Note this instead of faking a clock here.
     const PHASE2_CEILING_MULT: u32 = 4;
     let phase2_start = tokio::time::Instant::now();
-    let phase2_ceiling = t.agree * PHASE2_CEILING_MULT;
+    // saturating_mul: `Duration * u32` panics on overflow; an absurd
+    // --agree-timeout (near u64::MAX secs) must not crash the node.
+    let phase2_ceiling = t.agree.saturating_mul(PHASE2_CEILING_MULT);
     loop {
         let members = current_members(topo, &me, p);
         if agreed(&members, &digest, p.cluster_size) {
