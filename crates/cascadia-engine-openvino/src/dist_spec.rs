@@ -1356,6 +1356,14 @@ impl Engine for OvDistSpecEngine {
         };
         Ok(chunks)
     }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        if crate::clear_task(&mut self.pending, &mut self.active, task_id, |a, id| {
+            a.task.task_id == *id
+        }) {
+            tracing::debug!(task = %task_id, "ov-dist-spec: cancelled active task");
+        }
+    }
 }
 
 struct RoundResult {

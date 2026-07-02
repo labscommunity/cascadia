@@ -86,3 +86,7 @@ Sweet spot is K=5 for short factual prompts; drop to K=3 for long-creative outpu
 - **Streaming**: yields one chunk per task with `is_final=True`. Per-token streaming is a follow-up.
 - **Draft / target tokeniser must match.** FastDraft companions are trained per target family; mixing across families won't work.
 - **`--draft-model` and `--prompt-lookup` are mutually exclusive.** Both set `GenerationConfig.num_assistant_tokens`; the validator rejects the combination.
+
+## Cancellation
+
+`cancel(task_id)` drops the task from the pending queue if it has not started yet. A task already inside `generate()` runs to completion — it is a single blocking FFI call into `openvino_genai` with no interruption hook — so only queued (not in-flight) tasks are cancellable on this engine.
