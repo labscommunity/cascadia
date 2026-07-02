@@ -148,6 +148,48 @@ mod namespace_tests {
     }
 }
 
+/// Auto-ring node_id: "{hostname}-{ip}", every char outside [A-Za-z0-9-]
+/// mapped to '-', capped at 63 bytes (mDNS instance / DNS label limit).
+/// Rank-independent — rank is unknown before election. Manual path keeps
+/// "{hostname}-r{rank}".
+#[allow(dead_code)] // consumed by run_auto_election (next commit)
+fn auto_node_id(hostname: &str, ip: &str) -> String {
+    let mut s: String = format!("{hostname}-{ip}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.len() > 63 {
+        s.truncate(63);
+    } // safe: output is pure ASCII
+    s
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::auto_node_id;
+    #[test]
+    fn dots_become_dashes() {
+        assert_eq!(auto_node_id("ws", "192.168.0.5"), "ws-192-168-0-5");
+    }
+    #[test]
+    fn illegal_chars_sanitized() {
+        assert!(auto_node_id("my box!", "10.0.0.1")
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+    #[test]
+    fn capped_at_63_bytes_even_with_non_ascii() {
+        let long = "héllo".repeat(30);
+        assert!(auto_node_id(&long, "10.0.0.1").len() <= 63);
+    }
+}
+
 /// Which worker mode the flags select. Pure — unit-tested without clap.
 #[derive(Debug, PartialEq)]
 enum WorkerMode {
