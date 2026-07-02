@@ -145,6 +145,8 @@ pub struct ElectTimeouts {
     pub settle: Duration,
 }
 
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Member view = participants from the topology, with self's entry overlaid
 /// (spec F5: self is injected explicitly, never via mDNS self-reflection).
 fn current_members(topo: &Topology, me: &NodeInfo, p: &ElectParams) -> Vec<NodeInfo> {
@@ -216,14 +218,15 @@ pub async fn elect(
                 ids
             )));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     };
 
     // ---- Phase 2: agree via digest ----
     let mut digest = member_digest(&members);
     me.ring_digest = Some(digest.clone());
-    // F5/livelock fix: our digest must be visible in the SAME view `agreed`
-    // reads. update_txt only informs peers; write the local topology too.
+    // Keep the local topology consistent with what we advertise —
+    // current_members overlays self from `me`, but other consumers (and any
+    // future refactor reading self from topo) must see the same digest.
     topo.add_node(me.clone());
     disco
         .update_txt(me.clone())
@@ -258,7 +261,7 @@ pub async fn elect(
                 p.namespace, digest, views
             )));
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -298,8 +301,21 @@ mod tests {
             node("c", "h3", 8000),
         ];
         let want = resolve_ring(&base, "b").unwrap();
-        let shuffled = vec![base[2].clone(), base[0].clone(), base[1].clone()];
-        assert_eq!(resolve_ring(&shuffled, "b").unwrap(), want);
+        // All 6 permutations of the 3-element input must resolve "b" to the
+        // same assignment: resolve_ring sorts internally, so input order
+        // must never leak into the result.
+        const PERMS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for idxs in PERMS {
+            let shuffled: Vec<_> = idxs.iter().map(|&i| base[i].clone()).collect();
+            assert_eq!(resolve_ring(&shuffled, "b").unwrap(), want, "perm {idxs:?}");
+        }
     }
 
     #[test]
@@ -409,11 +425,16 @@ mod elect_tests {
     fn engine_mismatch_conflicts() {
         let mut m = vec![
             part("a", 1, "h", 3),
-            part("b", 1, "h", 3),
+            part("bad-engine-peer", 1, "h", 3),
             part("c", 1, "h", 3),
         ];
         m[1].engines = vec!["mock".into()];
-        assert!(matches!(phase1_step(&m, &params()), Step::Conflict(_)));
+        match phase1_step(&m, &params()) {
+            Step::Conflict(msg) => {
+                assert!(msg.contains("bad-engine-peer"), "offender not named: {msg}")
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
     #[test]
     fn conflict_preempts_count() {
@@ -476,9 +497,8 @@ mod elect_tests {
     }
     #[test]
     fn agreement_fails_when_self_digest_missing() {
-        // Regression for the self-write-back livelock: if self's entry lacks
-        // the digest, unanimity must be false (which is why elect MUST write
-        // its digest into the local topology, not only the mDNS TXT).
+        // Regression for the self-write-back livelock: elect keeps topo
+        // consistent; if a view lacks self's digest, unanimity must fail.
         let mut m = vec![
             part("a", 1, "h", 3),
             part("b", 1, "h", 3),
@@ -581,6 +601,11 @@ mod elect_integration {
     /// consistent ring (ranks 0,1,2 exactly once, same coordinator) — this is
     /// the simultaneous-startup acceptance check. Requires a multicast-capable
     /// host: run with `cargo test -p cascadia-cli -- --ignored elect_integration`.
+    /// Note: single-host multi-daemon multicast often does NOT deliver in CI
+    /// containers/sandboxes (each daemon only sees itself) — run on a real
+    /// LAN. Ports 9100-9102 are SRV metadata only (no socket bind), so a
+    /// stray worker cannot EADDRINUSE this test; the unique namespace
+    /// isolates it.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn three_concurrent_elections_converge() {
@@ -633,5 +658,6 @@ mod elect_integration {
             coordinators.windows(2).all(|w| w[0] == w[1]),
             "coordinator disagreement"
         );
+        // no explicit disco.close(): process exits after this #[ignore]d manual run
     }
 }
