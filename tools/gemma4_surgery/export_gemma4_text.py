@@ -576,7 +576,17 @@ def _nearest_scope_layer(root, max_ops: int = 64):
     (inclusive), or None. For a KV Assign the value stored is the layer's
     concatenated cache, produced by ``layers.{idx}.self_attn/aten::cat`` — so
     the nearest scope IS the layer that owns the Assign, in the same index space
-    the boundary cut uses. Bounded so it never walks the whole graph."""
+    the boundary cut uses. Bounded so it never walks the whole graph.
+
+    ``max_ops=64`` is validated (31B dense + 26B-A4B-it distributed coherent).
+    Do NOT raise it blindly: a review round widened it to 256 to "harden"
+    attribution, which mis-attributed some Assigns into an ADJACENT layer's
+    ``layers.{idx}`` scope and was reverted. When the BFS legitimately returns
+    None, the caller falls back to the variable_id index (``sink_layer_index``),
+    which is correct for the sinks 64 hops can't reach. (Separately: if a
+    surgered stage tree generates degenerate ``thought``-loop output, suspect a
+    BASE source IR, not attribution — the instruction-tuned ``-it`` variant is
+    required; base ``gemma-4-*-int4-ov`` loops on a chat prompt on ANY tool.)"""
     from collections import deque
 
     seen, q, visited = set(), deque([root]), 0
