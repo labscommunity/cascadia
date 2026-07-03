@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cascadia_engine::Builder;
 use cascadia_engine_mock::MockBuilder;
 use cascadia_engine_openvino::{
@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod election;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
@@ -129,6 +130,244 @@ fn gather_node_specs() -> NodeSpecs {
     }
 }
 
+/// Namespace for discovery/advertise: CASCADIA_NAMESPACE, else "default".
+pub(crate) fn cluster_namespace() -> String {
+    std::env::var("CASCADIA_NAMESPACE").unwrap_or_else(|_| "default".into())
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::cluster_namespace;
+    // NOTE: env is process-global; keep this the ONLY test in the crate that
+    // touches CASCADIA_NAMESPACE (a set_var sibling would race under the
+    // parallel test runner).
+    #[test]
+    fn defaults_to_default_when_unset() {
+        std::env::remove_var("CASCADIA_NAMESPACE");
+        assert_eq!(cluster_namespace(), "default");
+    }
+}
+
+/// Auto-ring node_id: "{hostname}-{ip}", every char outside [A-Za-z0-9-]
+/// mapped to '-', capped at 63 bytes (mDNS instance / DNS label limit).
+/// Rank-independent — rank is unknown before election. Manual path keeps
+/// "{hostname}-r{rank}".
+fn auto_node_id(hostname: &str, ip: &str) -> String {
+    let mut s: String = format!("{hostname}-{ip}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.len() > 63 {
+        s.truncate(63);
+    } // safe: output is pure ASCII
+    s
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::auto_node_id;
+    #[test]
+    fn dots_become_dashes() {
+        assert_eq!(auto_node_id("ws", "192.168.0.5"), "ws-192-168-0-5");
+    }
+    #[test]
+    fn illegal_chars_sanitized() {
+        assert!(auto_node_id("my box!", "10.0.0.1")
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+    #[test]
+    fn capped_at_63_bytes_even_with_non_ascii() {
+        let long = "héllo".repeat(30);
+        assert!(auto_node_id(&long, "10.0.0.1").len() <= 63);
+    }
+}
+
+/// Which worker mode the flags select. Pure — unit-tested without clap.
+#[derive(Debug, PartialEq)]
+enum WorkerMode {
+    Manual { rank: u32, total: u32 },
+    Auto { cluster_size: u32 },
+}
+
+/// Rank/total after mode resolution (manual flags or auto election).
+/// The ONLY place Option<u32> rank/total get unwrapped.
+#[derive(Clone, Copy, Debug)]
+struct RankTotal {
+    rank: u32,
+    total: u32,
+}
+
+fn resolve_worker_mode(
+    rank: Option<u32>,
+    total: Option<u32>,
+    cluster_size: Option<u32>,
+) -> Result<WorkerMode> {
+    match (rank, total, cluster_size) {
+        (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => Err(anyhow!(
+            "--cluster-size is mutually exclusive with --rank/--total"
+        )),
+        (Some(r), Some(t), None) => Ok(WorkerMode::Manual { rank: r, total: t }),
+        (None, None, Some(n)) if n >= 1 => Ok(WorkerMode::Auto { cluster_size: n }),
+        (None, None, Some(_)) => Err(anyhow!("--cluster-size must be >= 1")),
+        (None, None, None) => Err(anyhow!(
+            "pass --cluster-size N (auto-ring) or --rank/--total (manual)"
+        )),
+        _ => Err(anyhow!("--rank and --total must be given together")),
+    }
+}
+
+#[cfg(test)]
+mod worker_mode_tests {
+    use super::*;
+    #[test]
+    fn auto_when_cluster_size() {
+        assert_eq!(
+            resolve_worker_mode(None, None, Some(3)).unwrap(),
+            WorkerMode::Auto { cluster_size: 3 }
+        );
+    }
+    #[test]
+    fn manual_when_rank_total() {
+        assert_eq!(
+            resolve_worker_mode(Some(0), Some(2), None).unwrap(),
+            WorkerMode::Manual { rank: 0, total: 2 }
+        );
+    }
+    #[test]
+    fn cluster_size_plus_rank_errors() {
+        assert!(resolve_worker_mode(Some(0), None, Some(3)).is_err());
+    }
+    #[test]
+    fn neither_errors() {
+        assert!(resolve_worker_mode(None, None, None).is_err());
+    }
+    #[test]
+    fn cluster_size_zero_errors() {
+        assert!(resolve_worker_mode(None, None, Some(0)).is_err());
+    }
+    #[test]
+    fn rank_without_total_errors() {
+        assert!(resolve_worker_mode(Some(0), None, None).is_err());
+    }
+    #[test]
+    fn total_without_rank_errors() {
+        assert!(resolve_worker_mode(None, Some(2), None).is_err());
+    }
+}
+
+/// Reject flag combinations that are incompatible with auto-ring
+/// (`--cluster-size`). Called before `run_auto_election` so a bad
+/// combination fails fast instead of after paying the discover/agree
+/// timeouts.
+fn preflight_auto(args: &WorkerArgs, n: u32) -> Result<()> {
+    if matches!(args.engine, EngineKind::OvGenai) && n > 1 {
+        bail!("--engine ov-genai is single-stage only; auto-ring needs a multi-stage engine (ov-runtime, gemma4, ov-dist-spec, sparse-moe, qwen36-moe)");
+    }
+    if args.layer_start != 0 || args.layer_end != 0 {
+        bail!("--layer-start/--layer-end are not valid with --cluster-size (auto-ring uses an even split)");
+    }
+    if matches!(args.engine, EngineKind::OvDistSpec) && args.draft_model.is_none() {
+        bail!("--engine ov-dist-spec auto-ring requires --draft-model on every box (the elected rank 0 needs it; other ranks ignore it)");
+    }
+    if !args.advertise_engines.is_empty() {
+        bail!("--advertise-engines is not valid with --cluster-size (the election cross-checks the single running engine)");
+    }
+    Ok(())
+}
+
+/// Split from cmd_worker so the loopback gate is unit-testable.
+fn preflight_ip(ip: std::net::IpAddr, n: u32) -> Result<()> {
+    if ip.is_loopback() && n > 1 {
+        bail!("no reachable LAN IP (local_ip() returned loopback); auto-ring needs a routable address on every box");
+    }
+    Ok(())
+}
+
+/// Reject `--listen :0` for auto-ring: port 0 means "let the OS pick a
+/// port," but auto-ring advertises `listen_port` over mDNS for peers to
+/// dial — a peer dialing port 0 would never connect. Split out so it's
+/// unit-testable without spinning up `run_auto_election`'s async election.
+fn preflight_listen_port(listen_port: u16) -> Result<()> {
+    if listen_port == 0 {
+        bail!("--listen must specify a nonzero port for auto-ring (got :0); peers dial the advertised relay port");
+    }
+    Ok(())
+}
+
+/// Reject `--settle >= --discover-timeout`: the settle barrier waits for
+/// the discovered peer set to stay stable for `settle` seconds, but that
+/// wait is bounded by `discover_timeout` — if settle is >= the timeout,
+/// the barrier can never resolve before discovery gives up. Split out so
+/// it's unit-testable without spinning up the async election.
+fn preflight_settle(settle: u64, discover_timeout: u64) -> Result<()> {
+    if settle >= discover_timeout {
+        bail!(
+            "--settle ({settle}s) must be less than --discover-timeout ({discover_timeout}s), \
+             else the barrier can never settle before discovery times out"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    fn base() -> WorkerArgs {
+        WorkerArgs::single_node(
+            "m".into(),
+            "CPU".into(),
+            EngineKind::OvRuntime,
+            ":8000".into(),
+        )
+    }
+    #[test]
+    fn ov_genai_multistage_rejected() {
+        let mut a = base();
+        a.engine = EngineKind::OvGenai;
+        assert!(preflight_auto(&a, 3).is_err());
+    }
+    #[test]
+    fn layer_flags_rejected() {
+        let mut a = base();
+        a.layer_start = 4;
+        assert!(preflight_auto(&a, 3).is_err());
+    }
+    #[test]
+    fn dist_spec_without_draft_rejected() {
+        let mut a = base();
+        a.engine = EngineKind::OvDistSpec;
+        assert!(preflight_auto(&a, 3).is_err());
+    }
+    #[test]
+    fn ov_runtime_ok() {
+        assert!(preflight_auto(&base(), 3).is_ok());
+    }
+    #[test]
+    fn loopback_multinode_rejected() {
+        assert!(preflight_ip("127.0.0.1".parse().unwrap(), 2).is_err());
+        assert!(preflight_ip("127.0.0.1".parse().unwrap(), 1).is_ok());
+        assert!(preflight_ip("192.168.0.5".parse().unwrap(), 3).is_ok());
+    }
+    #[test]
+    fn listen_port_zero_rejected() {
+        assert!(preflight_listen_port(0).is_err());
+        assert!(preflight_listen_port(9100).is_ok());
+    }
+    #[test]
+    fn settle_must_be_less_than_discover_timeout() {
+        assert!(preflight_settle(30, 120).is_ok());
+        assert!(preflight_settle(120, 120).is_err());
+        assert!(preflight_settle(121, 120).is_err());
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
@@ -213,13 +452,30 @@ pub enum EngineKind {
 
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
-    /// 0-based stage index.
+    /// 0-based stage index (manual path). Omit for auto-ring (--cluster-size).
     #[arg(long)]
-    pub rank: u32,
-
-    /// Total number of stages.
+    pub rank: Option<u32>,
+    /// Total stages (manual path). Omit for auto-ring (--cluster-size).
     #[arg(long)]
-    pub total: u32,
+    pub total: Option<u32>,
+    /// Auto-ring: form an N-stage ring from mDNS-discovered peers running the
+    /// identical command. Mutually exclusive with --rank/--total.
+    /// K8s/cloud note: mDNS multicast does not cross pods — use the explicit
+    /// --rank/--total/--next flags there (the escape hatch; RFC #28).
+    #[arg(long)]
+    pub cluster_size: Option<u32>,
+    /// Auto-ring: seconds to wait for N peers before giving up.
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+    pub discover_timeout: u64,
+    /// Auto-ring: seconds to wait for membership-digest agreement. Keep this
+    /// at 2x the mDNS re-announce interval or more, so one lost digest update
+    /// does not spuriously abort (spec F8).
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    pub agree_timeout: u64,
+    /// Auto-ring: seconds the discovered set must stay stable before agreement.
+    /// Must exceed the discovery debounce window (750ms); minimum 1.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+    pub settle: u64,
 
     /// First transformer layer this stage holds (global, 0-based, inclusive).
     /// Together with --layer-end, pins an explicit asymmetric layer split
@@ -482,8 +738,12 @@ impl WorkerArgs {
     /// into `cmd_run`) means `run` and `worker` can't silently drift.
     fn single_node(model: String, device: String, engine: EngineKind, api: String) -> Self {
         WorkerArgs {
-            rank: 0,
-            total: 1,
+            rank: Some(0),
+            total: Some(1),
+            cluster_size: None,
+            discover_timeout: 120,
+            agree_timeout: 30,
+            settle: 2,
             layer_start: 0,
             layer_end: 0,
             model,
@@ -681,11 +941,11 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
-fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+fn build_builder(args: &WorkerArgs, rt: RankTotal) -> Result<Box<dyn Builder>> {
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
         EngineKind::OvGenai => {
-            if args.total != 1 {
+            if rt.total != 1 {
                 return Err(anyhow!("ov-genai is single-stage only; use --total 1"));
             }
             if args.draft_model.is_some() && args.prompt_lookup > 0 {
@@ -719,7 +979,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
-            let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            let mut b = OvRuntimeBuilder::new(&args.model, rt.rank, rt.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -732,7 +992,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(b))
         }
         EngineKind::Gemma4 => {
-            let mut b = Gemma4Builder::new(&args.model, args.rank, args.total, &args.device);
+            let mut b = Gemma4Builder::new(&args.model, rt.rank, rt.total, &args.device);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -746,7 +1006,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::OvDistSpec => {
             // Driver = rank 0 (needs --draft-model). Worker = rank > 0.
-            if args.rank == 0 {
+            if rt.rank == 0 {
                 let draft = args
                     .draft_model
                     .as_deref()
@@ -767,7 +1027,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 Ok(Box::new(b))
             } else {
                 let mut b =
-                    OvDistSpecWorkerBuilder::new(&args.model, args.rank, args.total, &args.device);
+                    OvDistSpecWorkerBuilder::new(&args.model, rt.rank, rt.total, &args.device);
                 if let Some(dir) = &args.ov_cache_dir {
                     b = b.with_cache_dir(dir);
                 }
@@ -782,7 +1042,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::SparseMoe => {
             let mut cfg = SparseMoEBuilderConfig::new(&args.model, &args.device)
-                .with_rank(args.rank, args.total)
+                .with_rank(rt.rank, rt.total)
                 .with_kv_prefix_cache_size(args.kv_prefix_cache_size);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 cfg.cache_dir = Some(dir);
@@ -823,7 +1083,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
         EngineKind::Qwen36Moe => Ok(Box::new(
-            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
+            Qwen36Builder::new(&args.model, &args.device).with_rank(rt.rank, rt.total),
         )),
     }
 }
@@ -945,21 +1205,134 @@ fn install_shutdown_signal_handler(
     })
 }
 
-async fn cmd_worker(args: WorkerArgs) -> Result<()> {
-    if args.rank >= args.total {
-        return Err(anyhow!(
-            "--rank must be in [0, {}); got {}",
-            args.total,
-            args.rank
-        ));
+/// Everything cmd_worker needs from a completed election. `discovery` MUST
+/// stay alive for the whole serving run (its Drop unregisters mDNS).
+struct AutoRing {
+    rt: RankTotal,
+    next: Option<(String, u16)>,
+    coordinator_host: String,
+    topology: cascadia_topology::Topology,
+    discovery: cascadia_discovery::DiscoveryService,
+    self_node: cascadia_topology::NodeInfo,
+}
+
+async fn run_auto_election(args: &WorkerArgs, cluster_size: u32) -> Result<AutoRing> {
+    let specs = tokio::task::spawn_blocking(gather_node_specs)
+        .await
+        .unwrap_or_default();
+    let ip = cascadia_discovery::local_ip();
+    preflight_ip(ip, cluster_size)?;
+    if cluster_namespace() == "default" {
+        tracing::warn!("auto-ring on the shared 'default' namespace; set CASCADIA_NAMESPACE to isolate this cluster");
     }
-    let is_first = args.rank == 0;
-    let is_last = args.rank == args.total - 1;
+    let ip = ip.to_string();
+    let node_id = auto_node_id(&specs.hostname, &ip);
+    let model_hash = cascadia_types::hash::fnv1a_hex(args.model.as_bytes());
+    let ns = cluster_namespace();
+    // Honor --listen: advertise the SAME relay port the engine will bind.
+    let (_, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
+    preflight_listen_port(listen_port)?;
+    preflight_settle(args.settle, args.discover_timeout)?;
+
+    let self_node = cascadia_topology::NodeInfo {
+        node_id: node_id.clone(),
+        host: ip,
+        port: listen_port,
+        api_port: None, // advertised only after rank 0 is elected
+        namespace: ns.clone(),
+        device: args
+            .advertise_device
+            .clone()
+            .unwrap_or_else(|| args.device.clone()),
+        memory_mb: specs.memory_mb,
+        cpu_model: specs.cpu_model,
+        cpu_cores: specs.cpu_cores,
+        os: specs.os,
+        engines: vec![engine_name(args.engine).to_owned()],
+        model_hash: Some(model_hash.clone()),
+        cluster_size: Some(cluster_size),
+        ring_digest: None,
+        last_seen: 0.0,
+    };
+
+    // NOTE: we deliberately do NOT pre-bind the relay port here. An
+    // already-committed upstream's dial that races ahead of our own listener
+    // hits connection-refused (closed port) and self-heals via the
+    // transport dialer's connect-refused + 500ms retry loop in
+    // `connect_with_timeout`. A pre-bound listener would instead let that
+    // dial complete into the kernel accept-queue, only for us to drop it
+    // (and RST the already-ESTABLISHED connection) right before
+    // `start_with_listen` — turning a self-healing race into a connection-
+    // fatal one that kills the stage on its first send/recv. See PR review.
+    let topology = cascadia_topology::Topology::new();
+    topology.add_node(self_node.clone());
+    let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), ns.clone());
+    discovery
+        .start(self_node.clone())
+        .context("start mDNS discovery for auto-ring election")?;
+
+    let p = election::ElectParams {
+        self_id: node_id,
+        namespace: ns,
+        model_hash,
+        engine: engine_name(args.engine).to_owned(),
+        cluster_size,
+    };
+    let t = election::ElectTimeouts {
+        discover: std::time::Duration::from_secs(args.discover_timeout),
+        agree: std::time::Duration::from_secs(args.agree_timeout),
+        settle: std::time::Duration::from_secs(args.settle),
+    };
+    let (ring, committed_digest) =
+        election::elect(&topology, &mut discovery, &self_node, &p, &t).await?;
+
+    // Keep self_node consistent with what elect advertised (F6: later
+    // api_port re-advertise must carry this digest, not blank it).
+    let mut self_node = self_node;
+    self_node.ring_digest = Some(committed_digest);
+
+    tracing::info!(rank = ring.rank, total = ring.total, next = ?ring.next,
+        coordinator = %ring.coordinator_host, "auto-ring elected");
+    Ok(AutoRing {
+        rt: RankTotal {
+            rank: ring.rank,
+            total: ring.total,
+        },
+        next: ring.next.clone(),
+        coordinator_host: ring.coordinator_host,
+        topology,
+        discovery,
+        self_node,
+    })
+}
+
+async fn cmd_worker(mut args: WorkerArgs) -> Result<()> {
+    let mut auto: Option<AutoRing> = None;
+    let rt: RankTotal = match resolve_worker_mode(args.rank, args.total, args.cluster_size)? {
+        WorkerMode::Manual { rank, total } => {
+            if rank >= total {
+                bail!("--rank must be in [0, {total}); got {rank}");
+            }
+            RankTotal { rank, total }
+        }
+        WorkerMode::Auto { cluster_size } => {
+            preflight_auto(&args, cluster_size)?;
+            let ring = run_auto_election(&args, cluster_size).await?;
+            let rt = ring.rt; // RankTotal is Copy — no partial move
+            auto = Some(ring);
+            rt
+        }
+    };
+    if auto.is_some() && rt.rank == 0 && args.api.is_none() {
+        args.api = Some(":8000".into());
+    }
+    let is_first = rt.rank == 0;
+    let is_last = rt.rank == rt.total - 1;
 
     info!(
         engine = ?args.engine,
-        rank = args.rank,
-        total = args.total,
+        rank = rt.rank,
+        total = rt.total,
         device = %args.device,
         model = %args.model,
         "cascadia worker starting"
@@ -974,6 +1347,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     };
     let downstream = if is_last {
         None
+    } else if let Some((host, port)) = auto.as_ref().and_then(|a| a.next.clone()) {
+        Some(PeerEndpoint::new(host, port))
     } else {
         let next = args
             .next
@@ -999,13 +1374,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         tp_rank: 0,
     };
 
-    let builder = build_builder(&args)?;
+    let builder = build_builder(&args, rt)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
         Some((listen_host.as_str(), listen_port))
     } else {
         None
     };
+    // No election-era listener to release here: run_auto_election does not
+    // pre-bind the relay port (see its comment). The engine binds it fresh
+    // via start_with_listen below; any upstream dial that raced ahead hits
+    // connection-refused and self-heals via connect_with_timeout's 500ms
+    // retry loop.
     runner.start_with_listen(peers, shard, listen).await?;
 
     // Probe listener: bind a TCP socket on listen_port so the
@@ -1049,52 +1429,97 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // coordinator's dashboard /api/topology can render the full cluster
     // and not just self. Best-effort: a host without a working multicast
     // path (CI sandbox, restricted LAN) still serves; the dashboard just
-    // shows fewer nodes. We bind `_discovery` for the rest of this
-    // function so its Drop unregisters the mDNS record cleanly on
-    // shutdown (relay loop or `serve_with_nodelay`).
-    let topology = cascadia_topology::Topology::new();
-    let engines = if !args.advertise_engines.is_empty() {
-        args.advertise_engines.clone()
-    } else {
-        vec![engine_name(args.engine).to_owned()]
-    };
-    let device = args
-        .advertise_device
-        .clone()
-        .unwrap_or_else(|| args.device.clone());
-    // sysinfo + hostname do blocking syscalls; gather them off the async
-    // runtime thread so they don't stall worker startup.
-    let specs = tokio::task::spawn_blocking(gather_node_specs)
-        .await
-        .unwrap_or_default();
+    // shows fewer nodes. The manual path advertises here; the auto path
+    // already advertised in run_auto_election — this join point makes
+    // sure only ONE DiscoveryService instance exists either way, so
+    // heartbeat/latency-probe/DashboardState all hang off the same
+    // topology + discovery daemon.
+    //
     // Advertise the API/dashboard port separately from the relay port so
     // the dashboard can show a node's reachable address (the relay `port`
-    // isn't an HTTP endpoint). None for relay-only stages.
+    // isn't an HTTP endpoint). None for relay-only stages. Hoisted above
+    // the join because it depends only on `args`, and the auto path needs
+    // it re-applied post-election (rank 0 is only known after elect()).
     let api_port = args
         .api
         .as_deref()
         .and_then(|a| parse_addr(a, "0.0.0.0").ok())
         .map(|(_, p)| p);
-    let self_node = cascadia_topology::NodeInfo {
-        node_id: format!("{}-r{}", specs.hostname, args.rank),
-        host: cascadia_discovery::local_ip().to_string(),
-        port: listen_port,
-        api_port,
-        namespace: "default".to_owned(),
-        device,
-        memory_mb: specs.memory_mb,
-        cpu_model: specs.cpu_model,
-        cpu_cores: specs.cpu_cores,
-        os: specs.os,
-        engines,
-        last_seen: 0.0,
+    let coordinator_host = auto.as_ref().map(|a| a.coordinator_host.clone());
+
+    let (topology, mut discovery, self_node) = match auto.take() {
+        Some(a) => (a.topology, a.discovery, a.self_node),
+        None => {
+            let engines = if !args.advertise_engines.is_empty() {
+                args.advertise_engines.clone()
+            } else {
+                vec![engine_name(args.engine).to_owned()]
+            };
+            let device = args
+                .advertise_device
+                .clone()
+                .unwrap_or_else(|| args.device.clone());
+            // sysinfo + hostname do blocking syscalls; gather them off the
+            // async runtime thread so they don't stall worker startup.
+            let specs = tokio::task::spawn_blocking(gather_node_specs)
+                .await
+                .unwrap_or_default();
+            let self_node = cascadia_topology::NodeInfo {
+                node_id: format!("{}-r{}", specs.hostname, rt.rank),
+                host: cascadia_discovery::local_ip().to_string(),
+                port: listen_port,
+                api_port,
+                namespace: cluster_namespace(),
+                device,
+                memory_mb: specs.memory_mb,
+                cpu_model: specs.cpu_model,
+                cpu_cores: specs.cpu_cores,
+                os: specs.os,
+                engines,
+                model_hash: None,
+                cluster_size: None,
+                ring_digest: None,
+                last_seen: 0.0,
+            };
+            let topology = cascadia_topology::Topology::new();
+            topology.add_node(self_node.clone());
+            let mut discovery =
+                cascadia_discovery::DiscoveryService::new(topology.clone(), cluster_namespace());
+            if let Err(e) = discovery.start(self_node.clone()) {
+                tracing::warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
+            }
+            (topology, discovery, self_node)
+        }
     };
-    topology.add_node(self_node.clone());
-    let mut discovery = cascadia_discovery::DiscoveryService::new(topology.clone(), "default");
-    if let Err(e) = discovery.start(self_node.clone()) {
-        tracing::warn!(error = %e, "mDNS discovery failed to start; cluster topology may be incomplete");
+    // Auto path: publish api_port now that rank 0 is known, PRESERVING the
+    // committed ring_digest carried in self_node (props_from_node rewrites the
+    // whole TXT record; blanking the digest would strand a straggler in Phase 2).
+    // Gated to rank == 0: if an operator passes --api on the identical command
+    // to every box, non-coordinator ranks would otherwise advertise an api_port
+    // they never serve (rank > 0 returns in the relay arm before the API block
+    // below), leaving the dashboard pointing at a dead address for every stage.
+    if api_port.is_some() && self_node.cluster_size.is_some() && rt.rank == 0 {
+        let mut sn = self_node.clone();
+        sn.api_port = api_port;
+        topology.add_node(sn.clone());
+        if let Err(e) = discovery.update_txt(sn) {
+            tracing::warn!(error = %e, "api_port re-advertise failed; dashboard may show no API address");
+        }
     }
-    let _discovery = discovery;
+
+    if self_node.cluster_size.is_some() {
+        let port = api_port.unwrap_or(8000);
+        if rt.rank == 0 {
+            tracing::info!("auto-ring: serving API at http://{}:{port}", self_node.host);
+        } else {
+            tracing::info!(
+                rank = rt.rank,
+                total = rt.total,
+                "auto-ring: coordinator = {}:{port}",
+                coordinator_host.as_deref().unwrap_or("?")
+            );
+        }
+    }
 
     // Self-heartbeat: re-insert our own NodeInfo every 2 s so last_seen
     // stays current in the local topology even when no mDNS event has
@@ -1170,6 +1595,13 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // non-zero and systemd's `Restart=on-failure` rebuilds the stage,
         // rather than exit 0 (a "success" systemd won't restart) and leave
         // the pipeline a stage short. A clean SlotEmpty exit returns Ok.
+        //
+        // Auto-ring note (spec F4): a ring member that aborts post-commit exits
+        // its process; this rank then sees connect-failure or ConnectionReset ->
+        // ConnectionFatal -> non-zero exit -> systemd rebuild. Deliberately NO
+        // first-frame deadline: idle rings are legal (transport frame_idle_ceiling).
+        // Covered by cascadia-runner's relay_loop_exits_on_connection_fatal_step
+        // and recv-RST tests.
         match exit {
             Ok(cascadia_runner::RelayExit::ConnectionFatal) => {
                 return Err(anyhow!("relay loop exited: peer link dead; rebuild needed"));

@@ -6,9 +6,11 @@
 //! `host:port` you'd pass to another worker's `--next`.
 //!
 //! It deliberately does NOT auto-assign ranks, agree on a stage count,
-//! or order peers into a pipeline — that full auto-ring formation is
-//! tracked separately (see issue #52, follow-ups). Today `worker` still
-//! takes explicit `--rank`/`--total`/`--next`; `discover` just removes
+//! or order peers into a pipeline itself — auto-ring formation now
+//! exists via `cascadia worker --cluster-size N` (issue #89), which
+//! elects ranks and forms the pipeline from discovered peers. `worker`
+//! still accepts explicit `--rank`/`--total`/`--next` as the manual
+//! path; `discover` remains the read-only browse tool that removes
 //! the "what's my peer's address?" guesswork.
 
 use std::time::Duration;
@@ -21,9 +23,8 @@ use clap::Parser;
 /// Browse the LAN for Cascadia peers and print what's advertising.
 #[derive(Parser, Debug, Clone)]
 pub struct DiscoverArgs {
-    /// Discovery namespace to browse. Peers in a different namespace are
-    /// ignored (matches the worker's namespace partitioning).
-    #[arg(long, default_value = "default")]
+    /// Discovery namespace to browse. Defaults to $CASCADIA_NAMESPACE or "default".
+    #[arg(long, default_value_t = crate::cluster_namespace())]
     pub namespace: String,
 
     /// How long to listen for peer announcements, in seconds. mDNS
@@ -78,9 +79,9 @@ pub async fn cmd_discover(args: DiscoverArgs) -> Result<()> {
             args.namespace
         );
         println!();
-        println!("Note: workers do not yet advertise on the network automatically —");
-        println!("auto-ring formation is tracked in issue #52. For now, wire peers");
-        println!("manually with --listen / --next host:port.");
+        println!("Note: workers advertise automatically via mDNS auto-ring — run");
+        println!("`cascadia worker --cluster-size N` on every box (issue #89). You can");
+        println!("still wire peers manually with --listen / --next host:port instead.");
         return Ok(());
     }
 

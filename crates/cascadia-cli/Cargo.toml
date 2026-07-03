@@ -48,3 +48,4 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 dirs = "5"
 sysinfo = "0.33"
+thiserror.workspace = true

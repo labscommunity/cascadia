@@ -17,6 +17,50 @@ use tracing::{debug, info, warn};
 
 pub const SERVICE_TYPE: &str = "_cascadia._tcp.local.";
 
+/// Debounce window for browse Removed/Resolved pairs. Must be shorter than
+/// the worker's --settle (>=1s) so a truly-dead peer clears before commit,
+/// and long enough to absorb a re-register's Removed->Resolved gap.
+const DEBOUNCE_WINDOW: Duration = Duration::from_millis(750);
+
+/// Debounce for browse Removed/Resolved: a Removed followed by a Resolved for
+/// the same id within the window is a TXT refresh (keep membership), not a leave.
+struct RemoveDebounce {
+    window: Duration,
+    pending: Mutex<HashMap<String, std::time::Instant>>,
+}
+
+impl RemoveDebounce {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+    fn on_removed(&self, id: &str, now: std::time::Instant) {
+        self.pending.lock().insert(id.to_string(), now);
+    }
+    /// Returns true if this Resolved cancelled a pending removal (refresh).
+    fn on_resolved(&self, id: &str, now: std::time::Instant) -> bool {
+        if let Some(t) = self.pending.lock().remove(id) {
+            return now.duration_since(t) <= self.window;
+        }
+        false
+    }
+    /// Ids whose Removed timer expired at `now` (=> truly remove).
+    fn expired(&self, now: std::time::Instant) -> Vec<String> {
+        let mut g = self.pending.lock();
+        let dead: Vec<String> = g
+            .iter()
+            .filter(|(_, t)| now.duration_since(**t) > self.window)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dead {
+            g.remove(id);
+        }
+        dead
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("mdns error: {0}")]
@@ -104,6 +148,15 @@ fn props_from_node(info: &NodeInfo) -> HashMap<String, String> {
     if let Some(api_port) = info.api_port {
         p.insert("api_port".into(), api_port.to_string());
     }
+    if let Some(h) = &info.model_hash {
+        p.insert("model_hash".into(), h.clone());
+    }
+    if let Some(cs) = info.cluster_size {
+        p.insert("cluster_size".into(), cs.to_string());
+    }
+    if let Some(d) = &info.ring_digest {
+        p.insert("ring_digest".into(), d.clone());
+    }
     p
 }
 
@@ -117,6 +170,20 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
     };
 
     let node_id = get("node_id")?;
+    // member_digest (cascadia-cli/src/election.rs) joins `memory_mb:node_id`
+    // pairs with '\n'; that's only injective if node_id contains neither
+    // separator. Auto-ring node_ids are sanitized to [A-Za-z0-9-], but this
+    // function decodes a peer's node_id RAW from an mDNS TXT record with no
+    // charset guard — a hostile/malformed LAN peer could otherwise engineer
+    // two divergent member sets that hash to the same digest, so `agreed()`
+    // would pass while nodes wire different rings. Reject at the decode
+    // boundary, same as the namespace-mismatch rejection below. Do NOT widen
+    // this to a full charset allowlist: MANUAL-path node_ids are
+    // `{hostname}-r{rank}` and legitimately contain dots (FQDNs).
+    if node_id.contains(':') || node_id.contains('\n') {
+        debug!(%node_id, "rejecting peer: node_id contains reserved digest separator");
+        return None;
+    }
     let namespace = get("namespace").unwrap_or_else(|| "default".into());
     if namespace != expected_namespace {
         return None;
@@ -140,6 +207,18 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         })
         .unwrap_or_default();
 
+    // Election fields. Guard hash shape (16 lowercase hex) so a corrupt or
+    // hostile TXT value degrades to "absent" instead of poisoning matching.
+    let hex16 = |s: String| -> Option<String> {
+        (s.len() == 16
+            && s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+        .then_some(s)
+    };
+    let model_hash = get("model_hash").and_then(hex16);
+    let cluster_size = get("cluster_size").and_then(|s| s.parse().ok());
+    let ring_digest = get("ring_digest").and_then(hex16);
+
     let host = srv
         .get_addresses()
         .iter()
@@ -160,6 +239,9 @@ fn node_from_service(srv: &ServiceInfo, expected_namespace: &str) -> Option<Node
         cpu_cores,
         os,
         engines,
+        model_hash,
+        cluster_size,
+        ring_digest,
         last_seen: 0.0,
     })
 }
@@ -174,8 +256,9 @@ pub struct DiscoveryService {
     /// JoinHandle for the background browse-loop thread. Held so we
     /// don't lose the handle (preventing it from being silently
     /// orphaned on drop) and so close() can wait for the thread to
-    /// exit cleanly after the daemon shutdown causes its receiver
-    /// channel to close.
+    /// exit cleanly. The loop polls with `recv_timeout` and breaks as
+    /// soon as `receiver.is_disconnected()` is true, which happens
+    /// once the daemon shuts down and drops its sender.
     browse_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -211,15 +294,19 @@ impl DiscoveryService {
         let topology = self.topology.clone();
         let namespace = self.namespace.clone();
         let handle = std::thread::spawn(move || {
-            for event in receiver.iter() {
-                match event {
-                    ServiceEvent::ServiceResolved(srv) => {
+            let debounce = RemoveDebounce::new(DEBOUNCE_WINDOW);
+            loop {
+                // 200ms tick = sweep granularity; 3-4 sweeps per DEBOUNCE_WINDOW
+                // (750ms) bounds extra removal latency at one tick.
+                match receiver.recv_timeout(Duration::from_millis(200)) {
+                    Ok(ServiceEvent::ServiceResolved(srv)) => {
                         if let Some(node) = node_from_service(&srv, &namespace) {
+                            debounce.on_resolved(&node.node_id, std::time::Instant::now());
                             debug!(node_id = %node.node_id, "discovered");
                             topology.add_node(node);
                         }
                     }
-                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                    Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
                         // The mDNS fullname is `<node_id>.<SERVICE_TYPE>`.
                         // Strip the service-type suffix rather than splitting
                         // on the first '.', so a node_id containing a dot
@@ -230,10 +317,23 @@ impl DiscoveryService {
                             .strip_suffix(SERVICE_TYPE)
                             .and_then(|s| s.strip_suffix('.'))
                             .unwrap_or(&fullname);
-                        debug!(%node_id, "peer removed");
-                        topology.remove_node(node_id);
+                        // Do NOT remove yet — debounce absorbs re-register flaps.
+                        debounce.on_removed(node_id, std::time::Instant::now());
                     }
-                    other => debug!(?other, "discovery event"),
+                    Ok(other) => debug!(?other, "discovery event"),
+                    // Daemon shut down -> channel closed -> exit so close()'s
+                    // join() returns (mdns-sd Receiver is flume; the concrete
+                    // error type isn't re-exported, so use is_disconnected()).
+                    // Note: pending debounce entries are not flushed on
+                    // shutdown; the topology handle may briefly retain a
+                    // departing peer. Fine for process exit (the common path).
+                    Err(_) if receiver.is_disconnected() => break,
+                    Err(_) => {} // timeout tick
+                }
+                // Sweep on EVERY iteration, not only on timeout.
+                for id in debounce.expired(std::time::Instant::now()) {
+                    debug!(%id, "peer removed (debounce expired)");
+                    topology.remove_node(&id);
                 }
             }
         });
@@ -253,12 +353,35 @@ impl DiscoveryService {
             }
         }
         // Best-effort join of the browse loop. Once the daemon is
-        // shut down its sender drops and `receiver.iter()` returns
-        // None, which lets the thread exit. We don't fail close() on
-        // a panicked thread.
+        // shut down its sender drops, so the loop's next
+        // `recv_timeout` (at most 200ms out) observes
+        // `receiver.is_disconnected()` and breaks. We don't fail
+        // close() on a panicked thread.
         if let Some(handle) = self.browse_thread.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Re-advertise this node's TXT (ring_digest / api_port changed) without a
+    /// membership gap: mdns-sd re-registers the same fullname in place
+    /// (HashMap replace + unsolicited announce). Peers that do see a
+    /// Removed/Resolved pair absorb it via the browse-loop debounce.
+    pub fn update_txt(&mut self, node: NodeInfo) -> Result<()> {
+        let daemon = self
+            .daemon
+            .as_ref()
+            .ok_or_else(|| Error::Mdns("discovery not started".into()))?;
+        let host_name = format!("{}.local.", node.node_id);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            &host_name,
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )?;
+        daemon.register(info)?;
+        Ok(())
     }
 }
 
@@ -335,5 +458,195 @@ mod tests {
             .and_then(|s| s.strip_suffix('.'))
             .unwrap_or(&fullname);
         assert_eq!(stripped, "host.lan-r0");
+    }
+
+    #[test]
+    fn election_fields_round_trip_when_present() {
+        let mut node = NodeInfo::new("host-192-168-0-5", "192.168.0.5", 9100);
+        node.model_hash = Some("af63dc4c8601ec8c".into());
+        node.cluster_size = Some(3);
+        node.ring_digest = Some("cbf29ce484222325".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "default").expect("decode");
+        assert_eq!(decoded.model_hash, Some("af63dc4c8601ec8c".into()));
+        assert_eq!(decoded.cluster_size, Some(3));
+        assert_eq!(decoded.ring_digest, Some("cbf29ce484222325".into()));
+    }
+
+    #[test]
+    fn absent_election_fields_decode_to_none_not_empty() {
+        // A worker (old binary / manual path) advertises none of the 3 fields.
+        let node = NodeInfo::new("host-192-168-0-9", "192.168.0.9", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.model_hash, None, "must be None, not Some(\"\")");
+        assert_eq!(decoded.cluster_size, None, "must be None, not Some(0)");
+        assert_eq!(decoded.ring_digest, None);
+    }
+
+    #[test]
+    fn malformed_election_values_decode_to_none() {
+        let node = NodeInfo::new("h", "127.0.0.1", 9100);
+        let mut props = props_from_node(&node);
+        props.insert("cluster_size".into(), "not-a-number".into());
+        // 16-char non-hex model_hash (right length, wrong character class) is
+        // treated as absent — exercises the hex16 guard's char-class branch,
+        // not just its length check.
+        props.insert("model_hash".into(), "gggggggggggggggg".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props.clone()),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.cluster_size, None);
+        assert_eq!(decoded.model_hash, None);
+
+        // 16-char uppercase hex is also rejected — hex16 requires lowercase
+        // (matches the encode side, which always emits lowercase digests).
+        props.insert("model_hash".into(), "AF63DC4C8601EC8C".into());
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props),
+        )
+        .unwrap();
+        let decoded = node_from_service(&info, "default").unwrap();
+        assert_eq!(decoded.model_hash, None);
+    }
+
+    // CRITICAL: member_digest (cascadia-cli/src/election.rs) joins
+    // `memory_mb:node_id` pairs with '\n'. If a peer's raw node_id can
+    // contain ':' or '\n', two different member sets can be engineered to
+    // hash to the same digest, so agreed() would pass on divergent sets and
+    // nodes would silently wire different rings. node_from_service must
+    // reject such peers at the decode boundary.
+    #[test]
+    fn node_id_with_digest_separator_is_rejected() {
+        let node = NodeInfo::new("evil\n1:x", "127.0.0.1", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            "evil-service", // instance name must be a valid mDNS label; the
+            // node_id lives in the TXT record props, not the service name.
+            "evil.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        assert!(node_from_service(&info, "default").is_none());
+
+        let node2 = NodeInfo::new("a:b", "127.0.0.1", 9100);
+        let info2 = ServiceInfo::new(
+            SERVICE_TYPE,
+            "evil-service-2",
+            "evil2.local.",
+            node2.host.as_str(),
+            node2.port,
+            Some(props_from_node(&node2)),
+        )
+        .expect("build ServiceInfo");
+        assert!(node_from_service(&info2, "default").is_none());
+    }
+
+    // Guard against over-rejection: MANUAL-path node_ids are
+    // `{hostname}-r{rank}` and legitimately contain dots (FQDNs). Only ':'
+    // and '\n' are reserved digest separators.
+    #[test]
+    fn dotted_hostname_node_id_still_accepted() {
+        let node = NodeInfo::new("host.lan-r0", "192.168.0.5", 9100);
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "host.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "default").expect("decode");
+        assert_eq!(decoded.node_id, "host.lan-r0");
+    }
+
+    // CASCADIA_NAMESPACE="" must not silently break matching: an empty
+    // namespace should round-trip through props_from_node / node_from_service
+    // just like any other value.
+    #[test]
+    fn empty_namespace_round_trips() {
+        let mut node = NodeInfo::new("h-empty-ns", "127.0.0.1", 9100);
+        node.namespace = "".into();
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            &node.node_id,
+            "h-empty-ns.local.",
+            node.host.as_str(),
+            node.port,
+            Some(props_from_node(&node)),
+        )
+        .expect("build ServiceInfo");
+        let decoded = node_from_service(&info, "").expect("decode");
+        assert_eq!(decoded.namespace, "");
+    }
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn resolved_within_window_is_a_refresh() {
+        let d = RemoveDebounce::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        d.on_removed("n1", t0);
+        assert!(d.on_resolved("n1", t0 + Duration::from_millis(100)));
+        assert!(d.expired(t0 + Duration::from_secs(5)).is_empty());
+    }
+    #[test]
+    fn removed_without_resolve_expires_to_true_removal() {
+        let d = RemoveDebounce::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        d.on_removed("n2", t0);
+        assert_eq!(
+            d.expired(t0 + Duration::from_secs(1)),
+            vec!["n2".to_string()]
+        );
+    }
+    #[test]
+    fn window_boundary_is_refresh_inclusive_expire_exclusive() {
+        let d = RemoveDebounce::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        d.on_removed("n3", t0);
+        // exactly at the window edge: still a refresh...
+        assert!(d.on_resolved("n3", t0 + Duration::from_millis(500)));
+        d.on_removed("n4", t0);
+        // ...and exactly at the edge, not yet expired.
+        assert!(d.expired(t0 + Duration::from_millis(500)).is_empty());
+        assert_eq!(
+            d.expired(t0 + Duration::from_millis(501)),
+            vec!["n4".to_string()]
+        );
     }
 }
