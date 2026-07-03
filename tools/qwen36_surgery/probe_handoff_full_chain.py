@@ -1,4 +1,4 @@
-"""M4' spike 3 (final pre-engine gate): full 2-stage GREEDY decode after
+"""Cross-node spike (final pre-engine gate): full 2-stage GREEDY decode after
 GPU-prefill state handoff, vs the blessed CPU-pure golden.
 
 Memory-sequenced for a 31.6 GB node (run with cascadia-node STOPPED):
@@ -11,6 +11,7 @@ Memory-sequenced for a 31.6 GB node (run with cascadia-node STOPPED):
 Gate: coherent continuation + early-token agreement. GPU/CPU f16 regime
 mixing makes full parity impossible; report the match prefix length.
 """
+from pathlib import Path
 import gc
 import json
 
@@ -19,7 +20,7 @@ import openvino as ov
 from tokenizers import Tokenizer
 
 SH = r"C:\cascadia\models\qwen36-shards-2stage"
-GOLDEN = r"C:\Users\devcloud\Workspaces\cascadia-oss\tools\qwen36_surgery\golden\qwen36_parity_64.json"
+GOLDEN = str(Path(__file__).resolve().parent / "golden" / "qwen36_parity_64.json")
 HIDDEN, N_DEC = 2048, 16
 
 tok = Tokenizer.from_file(SH + r"\tokenizer.json")

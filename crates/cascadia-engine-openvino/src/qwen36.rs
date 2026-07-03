@@ -1,6 +1,6 @@
 //! Qwen3.6-35B-A3B staged engine: runs the IR-surgery shard chain
 //! (tools/qwen36_surgery/export_qwen36_moe.py) in-process on one box
-//! (M3', --total 1) or as an N-node stage pipeline (M4'-1, --rank R
+//! (single-box, --total 1) or as an N-node stage pipeline (--rank R
 //! --total N). Greedy-only, batch=1; the decode loop is a port of
 //! `tools/qwen36_surgery/proto_m3_decode.py`, which measured 64/64
 //! greedy token parity vs the whole model.
@@ -8,10 +8,11 @@
 //! Stage dirs are stateful OV IRs (DeltaNet conv/ssm + attention KV as
 //! ReadValue/Assign). Linear state cannot be trimmed: every task starts
 //! with `reset_state()` on every stage (position-0 re-entry is the only
-//! recovery — spec §4.1); cancellation drops the task and the next
-//! admission's reset restores the invariant.
+//! recovery — docs/architectures/qwen36-moe-support.md §4.1);
+//! cancellation drops the task and the next admission's reset restores
+//! the invariant.
 //!
-//! Pipeline mode (qwen36-m4-pipeline-spec.md): rank 0 holds embeddings
+//! Pipeline mode (docs/architectures/qwen36-moe-support.md): rank 0 holds embeddings
 //! + stage 0 + tokenizer and drives decode; middle ranks relay (run
 //! their stage, pass the span downstream, return the token back); the
 //! last rank holds the logits head and answers each FORWARD with the
@@ -45,12 +46,13 @@ const HIDDEN: usize = 2048;
 const PREFILL_CHUNK: usize = 256;
 const MROPE_ROWS: usize = 4;
 
-// M4'-1 wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
+// Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
 // HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
-// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. Spec §3.1 frames
-// the position as an i64 prefix tensor; this header carries the same
-// information in the day-0 probe's framing (kind+epoch+pos), which the
-// probe validated end-to-end on the live relay.
+// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. An earlier design
+// draft framed the position as an i64 prefix tensor; the shipped header
+// carries the same information in the day-0 probe's framing
+// (kind+epoch+pos), which the probe validated end-to-end on the live
+// relay.
 const FRAME_HELLO: u32 = 1;
 const FRAME_HELLO_ACK: u32 = 2;
 const FRAME_HELLO_NAK: u32 = 3;
@@ -58,7 +60,7 @@ const FRAME_RESET: u32 = 4;
 const FRAME_RESET_ACK: u32 = 5;
 const FRAME_FORWARD: u32 = 6;
 const FRAME_TOKEN: u32 = 7;
-/// Handshake schema version (spec §3.4).
+/// Handshake schema version.
 const PROTO_VERSION: u32 = 1;
 
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
@@ -341,14 +343,14 @@ pub struct Qwen36Engine {
     /// Raw manifest.json for the startup handshake (full-text compare —
     /// small file, stronger than a hash and needs no new dependency).
     manifest_json: String,
-    /// Task epoch (spec §3.3). Rank 0 bumps per admission; frames carry
+    /// Task epoch. Rank 0 bumps per admission; frames carry
     /// it; the downstream drops frames from older epochs.
     epoch: u32,
     /// Downstream side: epoch of the last RESET accepted.
     peer_epoch: u32,
     handshake_done: bool,
-    /// Set when the startup handshake found a config mismatch (spec
-    /// §3.4: refuse to serve). Admissions fail loud with this reason.
+    /// Set when the startup handshake found a config mismatch (handshake
+    /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
@@ -373,7 +375,7 @@ struct ActiveTask {
     max_tokens: usize,
     started: Instant,
     /// Pipeline rank 0: per-frame FORWARD→TOKEN round-trip times for
-    /// decode frames (n=1), for the M4'-1 gate's wire histogram.
+    /// decode frames (n=1), for the pipeline gate-4 wire histogram.
     wire_ms: Vec<f64>,
 }
 
@@ -554,7 +556,8 @@ impl Qwen36Engine {
             "qwen36 task done"
         );
         if !t.wire_ms.is_empty() {
-            // M4'-1 gate 4: decode wire histogram (p95 > 40 ms blocks).
+            // Pipeline gate 4: decode wire histogram (p95 > 40 ms blocks; see
+            // docs/architectures/qwen36-moe-support.md "Pipeline mode").
             let mut w = t.wire_ms.clone();
             w.sort_by(f64::total_cmp);
             let pct = |p: f64| w[((w.len() - 1) as f64 * p) as usize];
@@ -587,7 +590,7 @@ impl Qwen36Engine {
         vec![(t.task_id.clone(), Chunk::error(t.task_id, reason))]
     }
 
-    // -------- pipeline mode (M4'-1) --------
+    // -------- pipeline mode --------
 
     fn handle(&self) -> EngineResult<tokio::runtime::Handle> {
         self.runtime_handle
@@ -595,7 +598,7 @@ impl Qwen36Engine {
             .ok_or_else(|| EngineError::Backend("pipeline mode without runtime handle".into()))
     }
 
-    /// Handshake payload (spec §3.4): manifest full text, stage layout,
+    /// Handshake payload: manifest full text, stage layout,
     /// wire dtype, protocol version. The shim exposes no OV version
     /// string; the manifest compare covers export-level skew.
     fn hello_payload(&self) -> Vec<u8> {
@@ -609,7 +612,7 @@ impl Qwen36Engine {
         .into_bytes()
     }
 
-    /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit (spec §3.4).
+    /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit.
     /// Middles chain the payload on, so one ACK means the whole chain
     /// validated against this rank's manifest.
     fn handshake_a(&mut self) -> EngineResult<()> {
@@ -626,7 +629,7 @@ impl Qwen36Engine {
         Ok(())
     }
 
-    /// Rank 0: RESET → RESET_ACK for the current epoch (spec §3.2).
+    /// Rank 0: RESET → RESET_ACK for the current epoch.
     /// Fail-loud, no retry — the API caller retries the task.
     fn reset_exchange(&mut self) -> EngineResult<()> {
         let epoch = self.epoch;
@@ -694,7 +697,7 @@ impl Qwen36Engine {
     }
 
     /// Rank 0 wrapper: token + the round-trip's wire share in ms (RTT
-    /// minus the chain's accumulated infer time) for the M4'-1 gate's
+    /// minus the chain's accumulated infer time) for the pipeline gate's
     /// wire histogram.
     fn send_forward_recv_token(
         &mut self,
@@ -788,7 +791,7 @@ impl Qwen36Engine {
                     )];
                 }
             }
-            // Admission (spec §3.2): reset local state, bump the epoch,
+            // Admission: reset local state, bump the epoch,
             // RESET/RESET_ACK the downstream, then admit at position 0.
             self.reset_all();
             self.epoch = self.epoch.wrapping_add(1);
@@ -1004,7 +1007,7 @@ impl Qwen36Engine {
                 // Chain the reset before acking upstream: the ack means
                 // "everything downstream of you is at position 0". A
                 // failed downstream reset = no ack = task fails loud at
-                // rank 0 (spec §3.2).
+                // rank 0 (reset protocol).
                 self.reset_all();
                 self.peer_epoch = epoch;
                 if !is_last {
@@ -1030,7 +1033,7 @@ impl Qwen36Engine {
                     ));
                 }
                 if epoch != self.peer_epoch {
-                    // Stale epoch (spec §3.3): drop silently; the driver's
+                    // Stale epoch: drop silently; the driver's
                     // recv times out and fails its task loud.
                     warn!(
                         epoch,
@@ -1085,7 +1088,7 @@ impl Qwen36Engine {
         }
     }
 
-    /// Downstream side of the §3.4 handshake: compare the peer's payload
+    /// Downstream side of the handshake: compare the peer's payload
     /// against ours field by field.
     fn validate_hello(&self, payload: &[u8]) -> Option<String> {
         let theirs: serde_json::Value = match serde_json::from_slice(payload) {
@@ -1113,10 +1116,10 @@ impl Qwen36Engine {
         None
     }
 
-    /// Single-box step (M3' path), unchanged.
+    /// Single-box step path.
     fn step_local(&mut self) -> Vec<(TaskId, Chunk)> {
         // Admit the next task: position-0 entry per task (linear state
-        // cannot be trimmed — spec §4.1).
+        // cannot be trimmed — docs/architectures/qwen36-moe-support.md §4.1).
         if self.active.is_none() {
             if self.pending.is_empty() {
                 return Vec::new();
@@ -1311,7 +1314,7 @@ impl Engine for Qwen36Engine {
         }
         // Relay stage: PROPAGATE the error (like runtime/gemma4/sparse-moe). A
         // dead upstream is connection-fatal, and `run_relay_loop` only restarts
-        // the stage when step() returns that Err (§3.5: peer loss = operator
+        // the stage when step() returns that Err (failure semantics: peer loss = operator
         // restart). Swallowing it into Ok(Vec::new()) would leave a silent
         // zombie that never rebuilds. The runner throttles non-fatal errors via
         // RELAY_ERR_BACKOFF, so no in-engine backoff is needed.

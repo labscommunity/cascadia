@@ -137,7 +137,7 @@ fn gather_node_specs() -> NodeSpecs {
         SECURITY: cascadia's HTTP API and inter-stage TCP relay are \
         plaintext and unauthenticated. Bind only to trusted networks \
         (LAN, loopback) or terminate TLS + auth at a reverse proxy in \
-        front of `--api`. See rust/docs/STATUS.md \"Security model\" \
+        front of `--api`. See SECURITY.md in the repository root \
         for the full threat model."
 )]
 pub struct Cli {
@@ -330,7 +330,7 @@ pub struct WorkerArgs {
     /// Override the MoE top-K dispatch (sparse-moe engine only).
     /// If set and < manifest top_k, dispatch only the first K' experts
     /// per token. K2.6 manifest default is 8; K=4 gives +146% tok/s on
-    /// 10-prompt eval with matched quality. See docs/A3_TOPK_REDUCTION.md.
+    /// 10-prompt eval with matched quality. See docs/perf/A3_TOPK_REDUCTION.md.
     #[arg(long)]
     pub top_k_override: Option<u32>,
 
@@ -363,8 +363,8 @@ pub struct WorkerArgs {
     /// resident expert RAM at ~6–20 GiB depending on backend.
     ///
     /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var
-    /// (MIT-licensed; see rainier `docs/POWERINFER_PORT.md`). The env
-    /// var `CASCADIA_MAX_EXPERTS_CACHED` overrides this flag at runtime.
+    /// (MIT-licensed). The env var `CASCADIA_MAX_EXPERTS_CACHED`
+    /// overrides this flag at runtime.
     #[arg(long, default_value_t = 0, env = "CASCADIA_MAX_EXPERTS_CACHED")]
     pub max_cached_experts: u32,
 
@@ -380,7 +380,7 @@ pub struct WorkerArgs {
     ///
     /// Inspired by PowerInfer-2 §4.4 (skip Up/Down when Gate=0; ReLU)
     /// adapted to SwiGLU via the CATS / CHESS magnitude-threshold
-    /// approach. See rainier `docs/POWERINFER_PORT.md`.
+    /// approach.
     #[arg(long, default_value_t = 0.0, env = "CASCADIA_FFN_SPARSITY_THRESHOLD")]
     pub ffn_sparsity_threshold: f32,
 
@@ -399,7 +399,7 @@ pub struct WorkerArgs {
     /// shares `--max-cached-experts` as its capacity.
     ///
     /// Ports PowerInfer SmallThinker `fused_sparse_moe.cpp:174-186`
-    /// (MIT). See rainier `docs/POWERINFER_PORT.md`.
+    /// (MIT).
     #[arg(long, default_value_t = false, env = "CASCADIA_FFN_AXPY_DOWN")]
     pub ffn_axpy_down: bool,
 

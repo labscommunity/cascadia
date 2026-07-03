@@ -3,11 +3,11 @@
 @tailwind utilities;
 
 /*
- * Design system — adapted from cascadia-website + tahoma-demo. Light mode
+ * Design system for the Cascadia dashboard. Light mode
  * only by intent: the audience is Intel hardware operators showing this on
  * AI PC screens (not at 3am from a dark room), and the cascadia visual
- * language is editorial-on-paper, not command-center-on-black. Both inputs
- * the visual identity is built on lean light; reproducing that faithfully
+ * language is editorial-on-paper, not command-center-on-black. The
+ * visual identity leans light; reproducing that faithfully
  * was the brief.
  *
  * Note we deliberately do NOT match exo's dark "command center" theme.

@@ -1,7 +1,8 @@
 # Three-tier {iGPU, NPU, CPU} placement (#41)
 
-Status: **in progress** (branch `feat/three-tier-placement-41`).
-Builds on `profile-devices` (#45, step 1) and the now-working CPU (#62)
+Design + validation record for [#41](https://github.com/labscommunity/cascadia/issues/41);
+shipped as `cascadia profile-stages` / `place` / `run-placement`.
+Builds on `profile-devices` (#45, step 1) and the CPU (#62)
 and NPU (#63) shard-execution paths.
 
 ## TL;DR of the measure-first phase
@@ -41,7 +42,7 @@ mapped out where placement helps — and surfaced a UMA surprise:
 > regime 2. (This is PowerInfer §6.3 adapted to UMA, where pressure-relief —
 > not capacity — turns out to be the lever.)
 
-## Measured hardware — pawan-01 (the validation box)
+## Measured hardware (the validation box)
 
 `Intel Core Ultra 7 258V` (Lunar Lake), **31.6 GB** unified DDR5 (UMA):
 
@@ -98,7 +99,7 @@ per-(stage, device) profile:
 
 Decision: `x[s][d] ∈ {0,1}`, each stage on exactly one device.
 
-```
+```text
 minimize    Σ_s Σ_d  lat[s][d] · x[s][d]        (+ transport between tiers)
 subject to  Σ_d x[s][d] = 1                       ∀ stage s
             Σ_s mem[s] · x[s][d] ≤ cap[d]          ∀ device d   (addressing limit)
@@ -146,7 +147,7 @@ tiers):
    The argv planning is pure + unit-tested; the spawner tears the ring down
    on any stage exit / Ctrl-C.
 
-## Validation on pawan-01 (measured)
+## Validation on the Lunar Lake box (measured)
 
 End-to-end `profile-stages → place → run-placement`, real GPU/CPU/NPU, greedy
 decode. Per-stage decode latency measured **GPU < CPU < NPU** (e.g. on the

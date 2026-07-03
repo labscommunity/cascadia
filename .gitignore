@@ -30,5 +30,7 @@ models/
 shards/
 shards_cached/
 
-# Claude Code (local agent state + worktrees)
+# Local AI-tooling state (agent scratch, never commit)
 .claude/
+.swarm/
+ruvector.db

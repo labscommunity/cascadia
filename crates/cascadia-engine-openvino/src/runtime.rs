@@ -1,11 +1,11 @@
 //! Multi-stage OpenVINO Runtime engine.
 //!
 //! Rust port of `cascadia/worker/engines/openvino/ov_runtime.py`. Loads
-//! pre-exported per-stage stateful OV IRs (rainier v3+ format), runs them
+//! pre-exported per-stage stateful OV IRs (v3+ shard format), runs them
 //! across the existing TCP transport, with stateful KV cache internal to
 //! the IR and `reset_state()` between independent generation tasks.
 //!
-//! Pipeline-dir layout (matches rainier's exporter):
+//! Pipeline-dir layout (as produced by `cascadia shard`):
 //! ```text
 //! <pipeline-dir>/
 //!     pipeline_config.json
@@ -416,7 +416,7 @@ struct ActiveTask {
     /// Cumulative time inside `run_first` (stage_0 compute + read).
     t_alpha_compute: std::time::Duration,
     /// Cumulative time inside `send_hidden_downstream` +
-    /// `recv_token_from_downstream` — i.e. wire send + charlie wait + recv.
+    /// `recv_token_from_downstream` — i.e. wire send + downstream wait + recv.
     t_wire: std::time::Duration,
 }
 
@@ -1551,7 +1551,7 @@ impl Builder for OvRuntimeBuilder {
         ));
 
         // Rotary from the model's HF config.json. Look in the pipeline
-        // tokenizer dir first (rainier exports include config.json there);
+        // tokenizer dir first (the sharder writes config.json there);
         // fall back to the HF cache via env, else error.
         let tokenizer_dir = self.pipeline_dir.join("tokenizer");
         let cfg = match load_model_config(&tokenizer_dir) {

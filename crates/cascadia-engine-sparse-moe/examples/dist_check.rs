@@ -4,7 +4,7 @@
 //! the client side (connect, send Forward N times with synthetic
 //! hidden state, recv Token, time the round-trip). Used to verify the
 //! sparse-MoE pipeline-parallel wire protocol works over a real
-//! cross-host network (e.g. Tailscale's DERP relay between two Intel
+//! cross-host network (e.g. a relayed VPN link between two Intel
 //! AI PCs).
 //!
 //! ```text

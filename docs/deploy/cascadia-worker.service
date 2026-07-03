@@ -29,10 +29,9 @@ ExecStart=/usr/bin/env cascadia worker \
     --model ${CASCADIA_SHARDS} \
     --listen ${CASCADIA_LISTEN} \
     --next ${CASCADIA_NEXT} \
-    --pid-file /run/cascadia/cascadia-worker-%i.pid \
-    --log-level INFO
+    --log-level info
 
-# Cascadia handles SIGTERM cleanly via signal.signal(SIGTERM, _shutdown).
+# Cascadia handles SIGTERM cleanly: runner.close() then exit 0.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 

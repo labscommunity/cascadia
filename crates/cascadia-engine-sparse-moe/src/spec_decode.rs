@@ -24,7 +24,7 @@
 /// "wishful thinking" and is discarded.
 ///
 /// Mirrors the inner loop of `dist_spec.rs::do_one_round` and the
-/// rainier `k26_spec_decode.py` accept loop.
+/// reference Python spec-decode accept loop.
 pub fn count_accepted(drafts: &[i64], target_samples: &[i64]) -> usize {
     let mut accepted = 0usize;
     let n = drafts.len().min(target_samples.len());

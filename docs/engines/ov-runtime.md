@@ -10,18 +10,20 @@ Pipeline-parallel inference using pre-exported per-stage OpenVINO IRs with inter
 
 ## Shard format
 
-Pre-export with rainier's `scripts/export_cached_shards_v3.py`:
+Pre-export with `cascadia shard` (the exporter emits the v5
+`v5_canonical_inputs` layout; the engine also accepts legacy v3
+shards):
 
 ```bash
-python scripts/export_cached_shards_v3.py \
-    --model-dir /path/to/Llama-3.1-8B-Instruct \
-    --output-dir /shards/shards_2stage_v3 \
+cascadia shard \
+    --model /path/to/Llama-3.1-8B-Instruct \
+    --output-dir /shards/shards_2stage \
     --num-stages 2 --layer-split 16 --quantization int4
 ```
 
 Produces:
 
-```
+```text
 <pipeline_dir>/
   pipeline_config.json
   config.json              # copy from the source HF model dir
@@ -32,10 +34,14 @@ Produces:
     stage_config.json
 ```
 
-Each stage IR has `(input_ids|hidden_states, cos, sin)` positional
-inputs and stateful KV cache. The Rust port sends `cos` / `sin` /
-`hidden_states` as f16 to match the export's default dtype — v3 shards
-exported with `--default-dtype fp32` are not currently supported.
+Current (v5) stage IRs use the canonical `(input_ids|hidden_states,
+attention_mask, position_ids, beam_idx)` inputs; legacy v3 stage IRs
+have `(input_ids|hidden_states, cos, sin)` positional inputs instead —
+the engine auto-detects the layout from the stage IR's input names
+(`export_version` in `stage_config.json` is informational). Both use stateful
+KV cache. For v3 the Rust port sends `cos` / `sin` / `hidden_states` as
+f16 to match the export's default dtype — v3 shards exported with
+`--default-dtype fp32` are not currently supported.
 
 `config.json` (the source model's HF config) is required at the
 pipeline root or under `tokenizer/` so the Rust runtime can derive
@@ -48,12 +54,12 @@ For `ov-dist-spec` you need v5 shards instead — see [ov-dist-spec.md](ov-dist-
 ```bash
 # Last stage (rank 1):
 cascadia worker --rank 1 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v3 \
+              --model /shards/shards_2stage \
               --listen 10.10.10.2:9100
 
 # First stage (rank 0):
 cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
-              --model /shards/shards_2stage_v3 \
+              --model /shards/shards_2stage \
               --next 10.10.10.2:9100 --api :8000
 ```
 
@@ -61,4 +67,4 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 - Cross-stage activation transfer is hidden_states float16 — small enough that LAN/TB is rarely the bottleneck.
 - Same shards file path on every node simplifies launch (use `--model <same-path>` everywhere).
-- Tokenizer is loaded from the model_id's HF snapshot if the bundled `tokenizer/` dir uses a class the local `transformers` install can't import (common with rainier exports).
+- The tokenizer is loaded from the shard tree's `tokenizer/tokenizer.json` via the Rust `tokenizers` crate. If it's missing, the worker warns at load and first-stage tokenization fails — copy `tokenizer.json` from the source model into `tokenizer/`.

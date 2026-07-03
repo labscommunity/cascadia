@@ -207,8 +207,7 @@ pub unsafe extern "C" fn cascadia_int4_destroy_shell_int4(h: *mut CascadiaShellI
 
 /// Run int4 shell forward.
 ///
-/// **autolab campaign 029 (A8):** The inner Rust kernel now uses
-/// bf16-as-u16 for past_k/past_v. To preserve this C-FFI's ABI
+/// The inner Rust kernel uses **bf16-as-u16** for past_k/past_v. To preserve this C-FFI's ABI
 /// (Python harness passes f32 KV), we convert the f32 inputs into a
 /// transient bf16 staging buffer before the call. Net effect for FFI
 /// callers: no source change required, slightly more work per call.

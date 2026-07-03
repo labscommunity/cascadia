@@ -1,6 +1,6 @@
 //! CLI: load one expert.bin, run forward on an input vector, print
 //! output as raw f32 bytes (no JSON, no framing). Used by the Python
-//! cross-validation harness on the miner.
+//! cross-validation harness on the Xeon bench host.
 //!
 //! Usage::
 //!

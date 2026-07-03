@@ -44,8 +44,7 @@
 //!   and CHESS (Liu et al. 2024) — Apache-2.0 / MIT.
 //!
 //! Both are referenced (not copied) — this is an independent Rust
-//! implementation. See rainier `docs/POWERINFER_PORT.md` for the
-//! full technique map.
+//! implementation.
 
 use half::bf16;
 use rayon::prelude::*;
@@ -1089,8 +1088,8 @@ mod tests {
         );
         // Outputs are not bit-identical (some lanes dropped), but they
         // shouldn't diverge wildly. Use a generous tolerance — the
-        // exact value depends on the weights' distribution. Realistic
-        // miner bench will produce the actual quality numbers.
+        // exact value depends on the weights' distribution. The
+        // Xeon bench will produce the actual quality numbers.
         let max_dev: f32 = (0..hidden)
             .map(|h| (out_dense[h].to_f32() - out_sparse[h].to_f32()).abs())
             .fold(0.0, f32::max);

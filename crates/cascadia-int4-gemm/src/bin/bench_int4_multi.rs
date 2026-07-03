@@ -7,7 +7,7 @@
 //!   2. Tiled multi: one call of `dequant_gemm_int4_multi_auto` (weights
 //!      stay in registers across all `seq` tokens — `~W` weight motion).
 //!
-//! Run on the miner via:
+//! Run on the Xeon bench host via:
 //!
 //! ```text
 //! cargo run --release --bin bench_int4_multi -- --shape qproj --iters 50

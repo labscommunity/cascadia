@@ -385,7 +385,7 @@ def _validate(model_dir, output_dir, xml, ranges):
 
     print("EXPORT_VALIDATE_OK" if ok else "EXPORT_VALIDATE_FAIL", flush=True)
     if ok:
-        print("note: >=64-token greedy parity is the M3' engine-level "
+        print("note: >=64-token greedy parity is the engine-level "
               "criterion (qwen36_parity golden test); this validates one "
               f"step token-level + {N_DEC}-token greedy.", flush=True)
 

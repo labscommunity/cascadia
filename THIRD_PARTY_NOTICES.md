@@ -1,6 +1,6 @@
 # Third-party notices
 
-Cascadia is released under Apache-2.0 (target). This file lists
+Cascadia is released under the Apache License 2.0 (see [LICENSE](LICENSE)). This file lists
 third-party code and ideas that have informed parts of the cascadia
 implementation, together with their licences. Inclusion here does not
 imply that any of those parties endorse cascadia.
@@ -23,9 +23,7 @@ plus the upstream `ggml` / `llama.cpp` authors led by Georgi Gerganov.
   SmallThinker `fused_sparse_moe.cpp`).
 
 **Implementation:** clean-room Rust re-implementation. No PowerInfer
-source files have been copied into the cascadia tree. See
-rainier `docs/POWERINFER_PORT.md` for the full technique map
-([github.com/labscommunity/rainier](https://github.com/labscommunity/rainier/blob/main/docs/POWERINFER_PORT.md)).
+source files have been copied into the cascadia tree.
 
 **Papers cited:**
 - PowerInfer, arxiv:2312.12456

@@ -7,7 +7,7 @@
 //! per-(model, device) baseline that justifies — or invalidates — the
 //! ILP itself. Without this measurement an operator can't tell whether
 //! `--device GPU` already wins, whether `HETERO:GPU,CPU` regresses
-//! (it did on Lunar Lake in our beta sweep), or whether NPU is even
+//! (it did on a Lunar Lake test sweep), or whether NPU is even
 //! reachable for a given model class.
 //!
 //! Output is a `device_profile.json` with the schema in

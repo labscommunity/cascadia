@@ -1,6 +1,6 @@
-# M3' prototype: greedy 64-token decode over the 2-stage shard chain vs
+# Prototype: greedy 64-token decode over the 2-stage shard chain vs
 # the whole model. Outputs: token-sequence parity + per-token timing.
-# Also decides M3' architecture: if dense-MoE stages are fast enough on
+# Also decides the staged architecture: if dense-MoE stages are fast enough on
 # CPU, monolithic stages suffice; else MoE must be externalized (routed).
 import time
 import numpy as np

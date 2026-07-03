@@ -45,50 +45,46 @@ that fits them all. The choices that differ:
 4. **`norm_topk_prob`**: whether the top-k weights are re-normalised
    to sum to 1 after selection.
 
-## What cascadia has today
+## What Cascadia has today
 
 `crates/cascadia-engine-sparse-moe/` implements a specialised MoE
-runtime for **Kimi K2.6 only** (60-layer Mixtral-style with 384 experts
-per layer, top-8 routing). It uses:
+runtime for **Kimi K2.6** (60-layer Mixtral-style with 384 experts
+per layer, top-8 routing) and **MiniMax-M2** (62-layer all-MoE,
+256 experts top-8 — see [minimax-m2.md](minimax-m2.md)). It
+uses:
 
-- per-expert OV IRs (rainier exports each expert as its own IR)
+- per-expert OV IRs (each expert is exported as its own IR)
 - a router pass that picks top-k experts per token
 - the hand-rolled AVX-512 INT4 GEMM kernel for the expert matmul
 - a bounded LRU cache of compiled experts (most aren't in memory at
   once on a 133-GB-RAM box)
 
-This is NOT wired into `cascadia shard`. It has its own export
-pipeline (`/mnt/external_ssd/kimi-k26-*/` on the miner) and is invoked
-via `--engine sparse-moe` directly against the pre-built artefacts.
+This is NOT wired into `cascadia shard`; the engine is invoked via
+`--engine sparse-moe` directly against the pre-built artefacts. One
+per-family exporter ships in this repo:
+`tools/export_minimax_m2.py` produces the full sparse-MoE layout for
+MiniMax-M2 ([minimax-m2.md](minimax-m2.md) documents the
+pipeline). The Kimi K2.6 artefacts come from an external export
+pipeline that is not part of this repo.
 
-Rainier has working exporters for:
-
-- `scripts/export_cached_shards_v6_mixtral.py` — Mixtral
-- `scripts/export_cached_shards_v7_sparse_moe.py` — Kimi K2.6
-- `scripts/export_cached_shards_v8_batched_moe.py` — batched expert
-  variant
-- `scripts/export_gemma4_moe_shards.py` — Gemma 4 26B-A4B MoE
-
-These are the reference implementations to port if/when cascadia grows
-generic MoE support.
+If/when Cascadia grows support for more MoE families (Mixtral and the
+Gemma 4 26B-A4B are the obvious candidates), each would land as its
+own `export_<family>.py` beside the generic exporter — the MiniMax-M2
+and Gemma 4 exporters set the pattern.
 
 ## Until then
 
-`cascadia shard --model mistralai/Mixtral-8x7B-Instruct-v0.1 ...` will
-fail with:
+`cascadia shard --model mistralai/Mixtral-8x7B-Instruct-v0.1 ...` fails
+fast (before downloading weights) with an error explaining that the
+generic exporter builds dense decoder layers only — MoE routing +
+per-expert MLPs are not implemented, and falling back to a dense layer
+would silently emit garbage. The message points at what DOES work for
+hybrid Qwen3.5/3.6 MoE (`model_type: qwen3_5_moe`): automatic dispatch
+to the dedicated IR-surgery exporter (see
+[qwen36-moe-support.md](qwen36-moe-support.md)) or single-stage
+`--engine ov-genai` on OV GenAI ≥ 2026.2. Separately from the sharder,
+Kimi K2.6 / MiniMax-M2 serve via `--engine sparse-moe` against
+pre-built artefacts (above).
 
-```
-error: model mistralai/Mixtral-8x7B-Instruct-v0.1 reports model_type
-       "mixtral" with num_local_experts=8 and num_experts_per_tok=2.
-       cascadia's generic sharding path does not support MoE routing.
-
-       Options:
-       - For Kimi K2.6-style sparse-MoE (one model only today), use
-         the standalone `cascadia worker --engine sparse-moe` against
-         pre-built artefacts.
-       - To add generic MoE support, see
-         docs/architectures/moe.md#what-cascadia-has-today.
-```
-
-Same will apply to: Qwen3-MoE, Llama 4, gpt-oss, GraniteMoE, Hunyuan,
-Gemma 4 26B-A4B, DeepSeek-V3.
+The same rejection applies to: Qwen3-MoE, Llama 4, gpt-oss, GraniteMoE,
+Hunyuan, Gemma 4 26B-A4B, DeepSeek-V3.

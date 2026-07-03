@@ -6,12 +6,10 @@ PP and TP compose. A typical exo-style cluster of four nodes might run as `total
 
 ## Status
 
-The Python prototype shipped a `TPGroup` (ring all-reduce over TCP) plus
-`ShardSpec.tp_size` / `tp_rank` plumbing. The Rust port has not yet
-re-landed TP — `--tp-size` / `--tp-rank` flags do not exist on
-`cascadia worker` today. Re-introducing TP requires:
-
-What's **not** here yet (per-engine work, requires re-exported shards):
+**Not implemented.** `ShardSpec` carries `tp_size` / `tp_rank` plumbing
+in the type system, but no engine implements TP and `--tp-size` /
+`--tp-rank` flags do not exist on `cascadia worker` today. Everything
+below is a design sketch, not runnable behavior. Landing TP requires:
 
 1. **Column / row-parallel shard exports.** Today's v5 shards bake the full weight matrices into each stage; running them on multiple TP ranks would just compute the same thing twice. The export script needs to slice:
    - `q_proj`, `k_proj`, `v_proj`: column-parallel (split along output dim).
@@ -21,15 +19,15 @@ What's **not** here yet (per-engine work, requires re-exported shards):
 2. **Engine integration.** After attention's `o_proj` and MLP's `down_proj` the engine must call `TPGroup.all_reduce_sum_inplace(activations)` before passing the result to the residual stream / next layer. Engines that opt in declare it on their builder.
 3. **KV cache sharding.** With column-parallel attention each TP rank only computes `num_heads / tp_size` heads; the per-rank stateful KV cache shrinks proportionally.
 
-## Wire protocol
+## Wire protocol (design sketch)
 
-`TPGroup` opens one outbound connection to `(tp_rank + 1) mod tp_size` and accepts one inbound from `(tp_rank - 1) mod tp_size`. Collectives use the standard ring algorithm: reduce-scatter (`tp_size - 1` rounds) followed by all-gather (`tp_size - 1` rounds). Per round each rank sends `bytes / tp_size` and receives the same — bandwidth-optimal for a given tensor size.
+The planned `TPGroup` opens one outbound connection to `(tp_rank + 1) mod tp_size` and accepts one inbound from `(tp_rank - 1) mod tp_size`. Collectives use the standard ring algorithm: reduce-scatter (`tp_size - 1` rounds) followed by all-gather (`tp_size - 1` rounds). Per round each rank sends `bytes / tp_size` and receives the same — bandwidth-optimal for a given tensor size.
 
 Frame format per chunk: `[4B byte_count BE][raw bytes]`. No tensor metadata — the dtype + shape come from the caller's contract that every rank pass an identically-shaped tensor.
 
-## Launch
+## Launch (illustrative — these flags don't exist yet)
 
-For a 2 × 2 grid (PP=2, TP=2), each of the four nodes runs a worker with both pipeline coordinates and TP coordinates set:
+For a 2 × 2 grid (PP=2, TP=2), each of the four nodes would run a worker with both pipeline coordinates and TP coordinates set:
 
 ```bash
 # rank 0, tp_rank 0  (stage 0, TP rank 0)

@@ -7,13 +7,14 @@ Combines pipeline parallelism with speculative decoding: the **driver** holds a 
 - The target model fits across `N` machines but not on one.
 - You have a draft model that shares the target's tokenizer (e.g. Llama-3.2-1B for a Llama-3.1 target).
 - You want the spec-decode token-rate boost without losing the ability to run a model bigger than one node.
+- Your generations are long-form (roughly ≥ 1,000 tokens): below that, the per-round network coordination doesn't amortize and a good single-node config tends to win.
 
 ## Shard format
 
-Requires **v5 shards** (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via rainier's `scripts/export_cached_shards_v5.py`.
+Requires **v5 shards** (canonical optimum-style inputs: `input_ids|hidden_states, attention_mask, position_ids, beam_idx`). v3 shards are rejected at load time. Generate via `cascadia shard` — its exporter (`tools/export_shards.py`) emits `v5_canonical_inputs` shards; see [../SHARDING.md](../SHARDING.md).
 
 Driver expects the full pipeline directory:
-```
+```text
 <pipeline_dir>/
   pipeline_config.json
   tokenizer/                 (optional; falls back to model_id's HF cache)
@@ -25,7 +26,7 @@ Driver expects the full pipeline directory:
 ```
 
 Workers can hold just their own stage as a flat dir:
-```
+```text
 <worker_model_dir>/
   openvino_model.xml
   openvino_model.bin
@@ -44,7 +45,7 @@ Mask-based rewind is **driver-side only** — the worker just sees a new `attent
 
 ## Topology
 
-```
+```text
 driver (rank 0, has draft + stage_0 + tokenizer)
        ⇣ FORWARD
 worker (rank 1, has stage_1)
@@ -71,7 +72,7 @@ cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
 
 K is the draft length per spec round. Higher K = more parallel target verifications but more wasted work when the draft is wrong.
 
-Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, alpha+charlie via TB:
+Measured on Llama-3.1-8B INT4 target + Llama-3.2-1B INT4 draft, two hosts linked via Thunderbolt:
 
 | K | 64-tok factual | accept | 256-tok creative | accept |
 |---|----------------|--------|------------------|--------|

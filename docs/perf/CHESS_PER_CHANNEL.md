@@ -1,6 +1,6 @@
 # Per-channel FFN sparsity thresholds (CHESS) — workflow & file format
 
-**Status:** landed alongside PR for issue [#38](https://github.com/labscommunity/cascadia/issues/38).
+**Status:** shipped (issue [#38](https://github.com/labscommunity/cascadia/issues/38)).
 **Builds on:** [#34](https://github.com/labscommunity/cascadia/issues/34) (global-τ infra),
 [#35](https://github.com/labscommunity/cascadia/issues/35) (AXPY-form down kernel).
 
@@ -12,7 +12,7 @@ quality cost rises steeply past τ ≈ 0.05 on K2.6 because *some* channels are
 reliably small-magnitude contributors (safe to drop) while *others* are
 reliably large-magnitude (must keep). A global τ can't separate them.
 
-This PR adds **per-channel thresholds**: τ becomes a vector `τ[c] ∈ R^{intermediate}`
+Per-channel thresholds change that: τ becomes a vector `τ[c] ∈ R^{intermediate}`
 calibrated offline from a representative corpus, following the
 [CHESS](https://arxiv.org/abs/2409.01366) approach (Liu et al. 2024, MIT).
 Same dispatch shape, same kernels — just substitute a vector cutoff for the
@@ -97,7 +97,7 @@ cascadia worker \
 Then exercise the model with a representative prompt corpus via the
 `/v1/chat/completions` endpoint. 500–1000 prompts × ~50 tokens each is
 the CATS / CHESS reference budget. On K2.6 single-stage that's roughly
-half an hour of wall time on miner.
+half an hour of wall time on a Xeon-class host.
 
 On clean shutdown (`SIGTERM`), the engine drains the in-memory histograms
 to `/tmp/k26_gate_caps/layer_<lid>.bin` — one file per covered layer,
@@ -114,7 +114,7 @@ cargo run --release --bin calibrate_ffn_thresholds -- \
 ```
 
 The tool reads the histograms, computes per-channel quantiles, and writes
-the threshold JSON file. Wall time on miner: seconds.
+the threshold JSON file. Wall time: seconds.
 
 ### Phase 3 — serve
 
@@ -153,7 +153,7 @@ global-τ as a conservative fallback for the rest).
 3. **End-to-end tok/s**: PR #34 reported no net wall-time win at quality-
    preserving τ on K2.6 (the global-τ path's safe τ ≤ 0.05 leaves too many
    lanes active for the down kernel to recoup the overhead). Per-channel
-   at 0.5 active_frac, paired with `--ffn-axpy-down`, should put us into
+   at 0.5 active_frac, paired with `--ffn-axpy-down`, should land in
    the regime where the kernel speedup ceiling (1/active_frac = 2×) is
    actually realisable on the down projection.
 
@@ -181,9 +181,9 @@ API leaves room for this extension.
 - **CATS** — Lee et al. 2024, "CATS: Contextually-Aware Thresholding for
   Sparsity in LLMs" (arxiv:2404.08763, Apache-2.0). The global-τ baseline
   PR #34 implemented.
-- **PowerInfer** — Song et al. 2024, the two-phase Gate-then-Up/Down skip
-  pattern (MIT). See rainier `docs/POWERINFER_PORT.md` for the full
-  technique map.
+- **PowerInfer** — Song et al. 2024, "PowerInfer: Fast Large Language
+  Model Serving with a Consumer-grade GPU" (arxiv:2312.12456, MIT).
+  The two-phase Gate-then-Up/Down skip pattern.
 
 Cascadia's CHESS port is an independent Rust implementation — referenced,
 not copied — under Apache-2.0.

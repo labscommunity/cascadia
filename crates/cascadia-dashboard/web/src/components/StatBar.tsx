@@ -9,7 +9,7 @@ export type ChatStats = {
 };
 
 /**
- * Bottom-of-card stat bar — modelled on tahoma-demo's four-cell footer.
+ * Bottom-of-card stat bar with four cells.
  * Tabular numerics so the values don't jitter as digits change width.
  */
 export function StatBar({ stats }: { stats: ChatStats | null }) {

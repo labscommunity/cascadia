@@ -1,10 +1,11 @@
-"""M4'-1 serving gates (run on/against the rank-0 node API).
+"""Pipeline serving gates (run on/against the rank-0 node API).
 
-Gates covered (qwen36-m4-pipeline-spec.md §6):
+Gates covered (definitions: docs/architectures/qwen36-moe-support.md,
+"Pipeline mode (multi-node)", gates 1-2):
   1. token agreement vs the blessed single-box golden
      (golden/qwen36_parity_64.json) — text-prefix compare; on divergence
-     report the index + both continuations for the M3' §5 near-tie
-     coherence judgment (not raw ==).
+     report the index + both continuations for the near-tie coherence
+     judgment (same doc, §5 "Prototype and engine validation" — not raw ==).
   2. decode >= 4 tok/s short-ctx (completion_tokens / decode wall;
      cross-check against the engine's `tok_s` log line).
   promptset: the 6-prompt #77 set (expect-substring assertions), saved

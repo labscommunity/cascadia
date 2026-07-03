@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TCP activation tensor relay between pipeline stages — wire-compatible with Python cascadia."
+description = "TCP activation tensor relay between pipeline stages — length-prefixed tensor wire format."
 
 [dependencies]
 tokio = { workspace = true }

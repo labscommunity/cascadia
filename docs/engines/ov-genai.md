@@ -1,6 +1,6 @@
 # `ov-genai` — single-stage `openvino_genai.LLMPipeline`
 
-Wraps Intel's `openvino_genai.LLMPipeline` to expose **FastDraft speculative decode** and **Prompt Lookup decoding** — the two acceleration paths the legacy `ov-optimum` engine doesn't surface. Both are mathematically lossless under greedy decoding.
+Wraps Intel's `openvino_genai.LLMPipeline` to expose **FastDraft speculative decode** and **Prompt Lookup decoding**. Both are mathematically lossless under greedy decoding.
 
 ## When to use
 

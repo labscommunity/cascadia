@@ -1,4 +1,6 @@
-"""M4'-1 robustness matrix (qwen36-m4-pipeline-spec.md §6 gate 3).
+"""Robustness matrix gate for the staged qwen36-moe engine (pipeline
+gate 3; definitions: docs/architectures/qwen36-moe-support.md,
+"Pipeline mode (multi-node)").
 
 Automated rows:
   cancel     - cancel mid-decode entered at A (/v1/cancel/:id), then a

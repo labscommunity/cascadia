@@ -47,7 +47,7 @@ pub struct Manifest {
     /// matching the compressed-tensors on-disk format and runs the
     /// cascadia-int4-gemm AVX-512 kernel directly. The int4_bin path
     /// skips the ~5 ms OV per-call overhead and is ~6x faster on the
-    /// miner Xeon for tiny experts like K2.6's 2048×7168 MLPs.
+    /// Xeon bench host for tiny experts like K2.6's 2048×7168 MLPs.
     #[serde(default = "default_experts_format")]
     pub experts_format: String,
     /// Shell execution backend. "rust_k26" (default) runs the hardcoded

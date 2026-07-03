@@ -27,8 +27,8 @@
 //! matches how the per-token kernels write into the engine's
 //! `MultiShellOutputs` flat buffers.
 //!
-//! This file ships the AVX-512 fmadd variant (works on the miner Xeon
-//! Gold 6252's avx512f/bw/vl). An AVX-VNNI path that does int8 GEMM
+//! This file ships the AVX-512 fmadd variant (works on the Xeon
+//! Gold 6252 bench host's avx512f/bw/vl). An AVX-VNNI path that does int8 GEMM
 //! with `_mm512_dpbusd_epi32` is sketched in
 //! [`dequant_gemm_int4_multi_vnni_tile`] as a future swing — but with
 //! f32 inputs and bf16 scales, the f32 FMA path is the right baseline.
@@ -220,7 +220,7 @@ pub fn dequant_gemm_int4_multi_auto(
         // For seq=1, the per-token kernel beats the tile because the
         // tile pays a per-row scratch + scatter cost that doesn't
         // amortize across only one token. Microbench (iter 042 on
-        // miner) showed the multi tile losing ~0.7-0.9x at seq=1 vs
+        // the Xeon bench host) showed the multi tile losing ~0.7-0.9x at seq=1 vs
         // the established single-token kernel; for seq>=2 the multi
         // tile wins 1.3-3x depending on shape and contention.
         if seq >= 2

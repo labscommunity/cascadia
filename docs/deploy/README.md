@@ -4,12 +4,11 @@ Cascadia is a long-running CLI process; it does not daemonize itself. Run it und
 
 ## Linux (systemd)
 
-A template unit lives at [`cascadia-worker.service`](cascadia-worker.service). It expects a `cascadia` user, a checkout/install at `/opt/cascadia`, and shards under `/opt/cascadia/shards/`.
+A template unit lives at [`cascadia-worker.service`](cascadia-worker.service). It expects a `cascadia` user, the `cascadia` binary on `PATH` (or adjust `ExecStart`), and shards under `/opt/cascadia/shards/`.
 
 ```bash
 # Adjust the Environment= lines in the unit file, then:
 sudo cp docs/deploy/cascadia-worker.service /etc/systemd/system/cascadia-worker@.service
-sudo mkdir -p /run/cascadia && sudo chown cascadia:cascadia /run/cascadia
 sudo systemctl daemon-reload
 
 # Start the worker for stage 0 and stage 1:
@@ -21,31 +20,31 @@ sudo systemctl status cascadia-worker@0.service
 sudo journalctl -u cascadia-worker@0.service -f
 ```
 
-The unit is `Type=simple` and uses `--pid-file /run/cascadia/cascadia-worker-%i.pid`. Cascadia writes its PID on start and removes it via `atexit` on clean exit. systemd also restarts the worker on failure (`Restart=on-failure`, capped at 3 starts/min).
+The unit is `Type=simple`, so systemd tracks the worker process directly — no PID file needed. It restarts the worker on failure (`Restart=on-failure`, capped at 3 starts/min).
 
-`KillSignal=SIGTERM` works with the SIGTERM handler in `cli.cmd_worker` — the worker calls `runner.close()` (drops sockets, releases GPU contexts) before exiting.
+`KillSignal=SIGTERM` works with the worker's SIGTERM handler — the worker calls `runner.close()` (drops sockets, releases GPU contexts) before exiting 0.
 
 ## Windows (NSSM)
 
 ```powershell
 # Install nssm (https://nssm.cc), then:
-nssm install cascadia-worker-0 "C:\Python311\python.exe" `
-    "-m cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU " `
+nssm install cascadia-worker-0 "C:\cascadia\cascadia.exe" `
+    "worker --rank 0 --total 2 --engine ov-runtime --device GPU " `
     "--model C:\cascadia\shards --next 10.0.0.2:9100 --listen :9100 " `
-    "--pid-file C:\ProgramData\cascadia\worker-0.pid --log-level INFO"
+    "--log-level info"
 nssm set cascadia-worker-0 AppStdout C:\ProgramData\cascadia\worker-0.log
 nssm set cascadia-worker-0 AppStderr C:\ProgramData\cascadia\worker-0.log
 nssm set cascadia-worker-0 AppExit Default Restart
 nssm start cascadia-worker-0
 ```
 
-NSSM sends `SIGTERM`-equivalent on stop (`Process` graceful shutdown then `WM_CLOSE` then `TerminateProcess`) which our handler picks up.
+NSSM's graceful-stop sequence (console event, then `WM_CLOSE`, then `TerminateProcess`) gives the worker a chance to shut down cleanly.
 
 > Note: Windows OpenSSH spawns processes in Session 0 / Services context that die when the SSH session closes. Always use NSSM (or Task Scheduler `/RU SYSTEM`) for production workers — never rely on `start /B` over SSH.
 
 ## macOS (launchd)
 
-For dev only — Cascadia is Intel-Linux-target. A minimal `~/Library/LaunchAgents/com.cascadia.worker.plist`:
+For dev only — there is no Intel GPU runtime on macOS, so use the `mock` engine (or a stub build). A minimal `~/Library/LaunchAgents/com.cascadia.worker.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -60,10 +59,9 @@ For dev only — Cascadia is Intel-Linux-target. A minimal `~/Library/LaunchAgen
     <string>worker</string>
     <string>--rank</string><string>0</string>
     <string>--total</string><string>1</string>
-    <string>--engine</string><string>ov-optimum</string>
-    <string>--model</string><string>unsloth/Meta-Llama-3.1-8B-Instruct</string>
+    <string>--engine</string><string>mock</string>
+    <string>--model</string><string>mock-model</string>
     <string>--api</string><string>:8000</string>
-    <string>--pid-file</string><string>/tmp/cascadia-worker.pid</string>
   </array>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/tmp/cascadia-worker.out</string>
@@ -81,14 +79,14 @@ The HTTP API exposes:
 - `GET /health` → `{"status": "ok"}`
 - `GET /v1/models` → list of served model ids
 
-For supervisors that probe via TCP or HTTP, point them at the API port. For pipeline workers (rank > 0) without an API, supervisors should rely on PID file presence + the process exit code.
+For supervisors that probe via TCP or HTTP, point them at the API port. Pipeline workers (rank > 0) don't serve an API; supervise them by process state and exit code — under systemd `Type=simple` that's automatic, and a TCP probe of the `--listen` port works as a liveness check.
 
 ## Logs
 
-Cascadia logs to stdout/stderr in plain text:
+Cascadia logs to stdout/stderr in plain text via `tracing` (level set by `--log-level`, default `info`):
 
-```
-2026-05-01 20:41:23,189 INFO cascadia.worker.runner | runner ready
+```text
+2026-07-02T17:41:23.189Z  INFO cascadia_runner: runner ready
 ```
 
 For structured log shipping (Loki, CloudWatch), wrap the `cascadia worker` command with whatever envelope your shipper expects — Cascadia intentionally does not bundle a JSON formatter.

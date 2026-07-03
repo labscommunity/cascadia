@@ -297,7 +297,7 @@ impl SafetensorsExpertSource {
         ]
     }
 
-    /// autolab iter 029 (C1): issue `madvise(MADV_WILLNEED)` on every
+    /// Issue `madvise(MADV_WILLNEED)` on every
     /// byte slice for one expert. Non-blocking — the kernel queues
     /// async readahead. Returns the number of slices for which madvise
     /// succeeded (caller can ignore; useful for instrumentation).

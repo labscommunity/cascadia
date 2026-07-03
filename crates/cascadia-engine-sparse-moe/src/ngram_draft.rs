@@ -16,7 +16,7 @@
 //! - **Works on repeated structure**: empirically (Yang et al.,
 //!   "Prompt Lookup Decoding", 2025) ~1.5-2× speedup on completion
 //!   tasks with long shared structure (code, JSON, repetitive prose).
-//!   K2.6's typical autolab eval prompts ("The capital of France
+//!   K2.6's typical eval prompts ("The capital of France
 //!   is...", code completions) have this structure.
 //!
 //! This module is pure (no model deps), so it's testable without
@@ -47,7 +47,7 @@ pub const MIN_NGRAM: usize = 2;
 pub const MAX_NGRAM: usize = 4;
 
 /// How many tokens to draft per round (the `K` of speculative decoding).
-/// Default tuned to the rainier K2.6 numbers (`SPEC_K=8`); callers can
+/// Default tuned to measured K2.6 numbers (`SPEC_K=8`); callers can
 /// override per task via [`Draft::with_draft_k`].
 pub const DEFAULT_DRAFT_K: usize = 8;
 
@@ -80,7 +80,7 @@ impl Draft {
     }
 
     /// Override draft K. Clamped to `1..=64`; values outside that range
-    /// are dropped (negative ROI per the rainier K-sweep data).
+    /// are dropped (negative ROI per the K-sweep data).
     pub fn with_draft_k(mut self, k: usize) -> Self {
         self.draft_k = k.clamp(1, 64);
         self

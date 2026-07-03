@@ -38,7 +38,7 @@ def main():
     layers = man.get("exported_layers", list(range(man["num_layers"])))
 
     core = ov.Core()
-    # SNIPPETS bug workaround seen on K2.6 shells (rainier): harmless if unsupported.
+    # SNIPPETS bug workaround seen on K2.6 shells: harmless if unsupported.
     try:
         core.set_property("CPU", {"SNIPPETS_MODE": "DISABLE"})
     except Exception:

@@ -8,8 +8,8 @@
 //! the PyTorch model. Skips (passes) when the env var is unset, so the
 //! suite stays green on machines without OpenVINO or the fixture.
 //!
-//! Run on the miner:
-//!   M2_MODEL_DIR=/media/tatef/extssd/m2/tiny_fp32 \
+//! Run on a Xeon host:
+//!   M2_MODEL_DIR=/path/to/m2/tiny_fp32 \
 //!     cargo test -p cascadia-engine-sparse-moe --test minimax_m2_eval -- --nocapture
 
 use std::path::PathBuf;
@@ -283,7 +283,7 @@ fn drive_two_rank_greedy(
 /// reference at 230B (won't fit in RAM), so this just confirms the Rust
 /// runtime loads the real INT4 graphs, generates tokens through the
 /// single-stage OV-IR pipeline, and decodes to non-empty text — the
-/// "single-stage run on the miner" deliverable. Prompt overridable via
+/// single-stage-run-on-one-host deliverable. Prompt overridable via
 /// `M2_PROMPT`; token budget via `M2_MAX_NEW` (default 30).
 #[test]
 fn minimax_m2_full_generate_smoke() {

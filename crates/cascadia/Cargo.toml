@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "cascadia binary — distributed LLM inference for Intel hardware (Rust port)."
+description = "cascadia binary — distributed LLM inference for Intel hardware."
 
 [features]
 default = []

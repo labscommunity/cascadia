@@ -11,16 +11,15 @@ the same `model_type: "gemma4"` outer wrapper (the text backbone is
 | **26B-A4B-it** (MoE) | 48 | — | — | — | — | — | yes |
 | **31B-it** | 60 | 5376 | 256 / 512 | 16 / 4  |   0 |  0 / 60 | yes |
 
-## What ships in this PR
+## What ships
 
-`tools/export_gemma4.py` — a Gemma-4-specific exporter ported from
-rainier's `scripts/export_gemma4_e2b_cached_shards.py`. `cascadia
+`tools/export_gemma4.py` — a Gemma-4-specific exporter. `cascadia
 shard` auto-dispatches to it on detection of `model_type ∈
 {"gemma4", "gemma4_text"}`.
 
-Tested on miner (Linux/Xeon, OpenVINO 2026.1):
+Tested on a Linux/Xeon export host (OpenVINO 2026.1):
 
-```
+```console
 $ python tools/export_shards.py \
     --model google/gemma-4-E2B-it \
     --output-dir /tmp/test_gemma4_e2b \
@@ -83,9 +82,9 @@ and try INT4 once you've confirmed parity.
 * **`final_logit_softcapping=30.0`** — applied in the head stage:
   `logits = softcap * tanh(logits / softcap)`.
 * **Q/K/V RMSNorm per head before rotary** — handled by the manual
-  cached_gemma4_layer_forward (rainier discovered HF's Gemma 4 path
-  has a FP16/FP32 autocast issue that breaks tracing; the cached
-  forward keeps dtypes consistent).
+  cached_gemma4_layer_forward (HF's Gemma 4 path has a FP16/FP32
+  autocast issue that breaks tracing; the cached forward keeps
+  dtypes consistent).
 * **Patched ov_utils.torch_tensor_to_ov_const** — reshapes 0-dim
   scalar tensors to (1,) so the per-layer scalar buffers don't crash
   OV's PyTorch frontend.
@@ -95,15 +94,14 @@ and try INT4 once you've confirmed parity.
 * **26B-A4B MoE variant** — `enable_moe_block=True` in its text
   config; runs into the same MoE blocker as the rest of the family.
   Tracked in [`moe.md`](./moe.md).
-* **Multi-stage pipeline-parallel runtime** — the exported IRs use a
-  custom I/O contract (cross/external KV, downstream-PLI side
-  channel, per-layer head_dim, optional final softcap) that the
-  current Rust runtime in `crates/cascadia-engine-openvino/` does
-  not yet understand. The IRs are runnable directly via
-  `openvino.Core().compile_model()`; pipeline-parallel via `cascadia
-  worker` follows in a separate PR (Phase B below).
 
-## Port plan — remaining phases
+The exported IRs use a custom I/O contract (cross/external KV,
+downstream-PLI side channel, per-layer head_dim, optional final
+softcap), served by the dedicated `gemma4` engine in
+`crates/cascadia-engine-openvino/` (`--engine gemma4`; Phase B below,
+now shipped).
+
+## Port plan — status
 
 **Phase A — exporter (shipped, #48):**
 
@@ -120,35 +118,41 @@ and try INT4 once you've confirmed parity.
   MLP + optional PLI + optional layer_scalar).
 - [x] Self-verify each stage on CPU after export.
 - [x] Skip 26B-A4B MoE variant cleanly.
-- [x] Tested end-to-end on miner with Gemma-4-E2B-it.
+- [x] Tested end-to-end on a Xeon export host with Gemma-4-E2B-it.
 
-**Phase B — Rust runtime (`crates/cascadia-engine-openvino`):**
+**Phase B — Rust runtime (`crates/cascadia-engine-openvino`) — shipped
+(`--engine gemma4`, `gemma4.rs`), simpler than originally sketched:**
 
-- [ ] New `Gemma4Stage` engine that:
-  - Reads the extended `stage_config.json` schema (per-layer
-    `head_dims`, `layer_types`, `is_shared`, `own_kv_head_dims`,
-    `cross_stage_sources_local`, `external_shared_sources`,
-    `pli_dim`, `downstream_pli_count`, `final_logit_softcapping`).
-  - Allocates per-layer KV cache with per-layer head_dim.
-  - Skips KV allocation for `is_shared[i] = true` layers.
-  - Sends/receives `external_kv.N.key/value` pairs over the wire
-    alongside `hidden_states`.
-  - On stage 0 (embed), emits `hidden_states + downstream_PLI`
-    concatenated on the last dim. On middle stages, slices off the
-    head-stage PLI before sending.
-  - On the head stage, samples directly from the post-softcap
-    `logits` output.
-- [ ] Stage-config schema versioning (`export_version:
-  "gemma4_cached_v1"`).
+Most of the contract ended up baked into the IRs themselves, so the
+engine reads a slim `stage_config.json` (layer range, embed/head
+roles, `stateful` flag, `cross_stage_sources_local`,
+`external_shared_sources`) rather than the richer schema sketched
+below:
+
+- [x] Own KV is OV internal state (stateful IRs) — no per-layer KV
+  allocation in Rust; per-layer head_dims live inside the IR.
+- [x] Cross-stage shared KV: `cross_kv.N` outputs / `external_kv.N`
+  inputs relayed over the wire, tagged by global source-layer id so
+  the consumer pairs frames explicitly.
+- [x] PLI rides inside the `hidden_states` tensor (the wire tensor is
+  simply wider when `pli_dim > 0`); concat/slice is in the exported
+  graph, not the engine.
+- [x] `final_logit_softcapping` is applied inside the head-stage IR;
+  the engine samples its `logits` output directly.
+
+Original sketch (kept for context — superseded by the above): an
+extended stage-config schema carrying per-layer `head_dims`,
+`layer_types`, `is_shared`, `own_kv_head_dims`, `pli_dim`,
+`downstream_pli_count`, `final_logit_softcapping`, with the engine
+allocating per-layer KV and slicing PLI itself.
 
 **Phase C — End-to-end testing:**
 
-- [ ] 2-stage pipeline-parallel on miner (rank 0) + beta (rank 1)
+- [ ] 2-stage pipeline-parallel across two nodes (rank 0 + rank 1)
   via cascadia worker. Verify Gemma-4-E2B-it produces sensible
   tokens for a chat prompt.
-- [ ] 3-stage shard for Gemma-4-31B-it across miner + beta +
-  charlie. Verify single-box runtime memory stays under the
-  per-box envelope.
+- [ ] 3-stage shard for Gemma-4-31B-it across three nodes. Verify
+  single-box runtime memory stays under the per-box envelope.
 
 ## Why Gemma 4 needs its own exporter
 
@@ -168,8 +172,6 @@ all break on Gemma 4:
    earlier stage's source layer.
 
 A separate code path is cleaner than threading these as flags
-through the generic stage builder. Rainier's working Python
-prototype (the source we ported from) had reached the same
-conclusion in its standalone E2B exporter, and we expect the same
-pattern when Llama 4 / Qwen3-MoE / gpt-oss eventually land — each
-gets its own `export_<family>.py`.
+through the generic stage builder, and we expect the same pattern
+when Llama 4 / Qwen3-MoE / gpt-oss eventually land — each gets its
+own `export_<family>.py`.

@@ -1,8 +1,7 @@
 //! On-disk and in-memory layout of one expert's packed int4 weights.
 //!
-//! The exporter (see `rainier/scripts/k26_extract_expert_bins.py`)
-//! writes a flat binary per (layer, expert) with the six tensors
-//! laid out contiguously, no padding, no header:
+//! The exporter writes a flat binary per (layer, expert) with the
+//! six tensors laid out contiguously, no padding, no header:
 //!
 //!   gate_packed:  i32 [INTERMEDIATE, PACKED_COLS_IN]      ≈ 7.34 MiB
 //!   gate_scale:   u16 [INTERMEDIATE, GROUPS_IN]           ≈ 0.9  MiB

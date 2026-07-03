@@ -1,4 +1,4 @@
-//! Shared step-failure WARN rate-limiter (cascadia-enterprise issue #30).
+//! Shared step-failure WARN rate-limiter.
 //!
 //! A persistently-failing `Engine::step()` driven by the relay loop logs
 //! one WARN per call (~90k/s when the upstream connection drops and recv

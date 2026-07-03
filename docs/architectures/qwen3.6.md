@@ -1,9 +1,9 @@
 # Qwen3.6-35B-A3B (and Qwen3.5) — hybrid Gated-DeltaNet MoE
 
-Tracking issue: #77. Status: **single-stage supported and validated on
-hardware (2026-06-11); multi-stage rejected — see
-[qwen36-moe-support.md](qwen36-moe-support.md) for the deferred sharded
-design.**
+Tracking issue: #77. Status: **single-stage supported and
+hardware-validated; the generic multi-stage exporter rejects it — see
+[qwen36-moe-support.md](qwen36-moe-support.md) for the dedicated
+sharded (IR-surgery) path.**
 
 ## The model
 
@@ -32,7 +32,7 @@ name input_ids was not found"). The `ov-genai` engine auto-detects this
 layout and uses `VLMPipeline` (text-only) via the shim's
 `cascadia_pipeline_create_vlm`:
 
-```
+```bash
 # Pre-exported IR (preferred):
 #   https://huggingface.co/OpenVINO/Qwen3.6-35B-A3B-int4-ov
 cascadia run --engine ov-genai --model /path/to/Qwen3.6-35B-A3B-int4-ov --device GPU
@@ -41,7 +41,7 @@ cascadia run --engine ov-genai --model /path/to/Qwen3.6-35B-A3B-int4-ov --device
 Or export yourself with Optimum-Intel on the 2026.2 toolchain
 (`tools/requirements.txt` pins the floors):
 
-```
+```bash
 optimum-cli export openvino -m Qwen/Qwen3.6-35B-A3B \
     --weight-format int4 --task text-generation-with-past <out-dir>
 ```
@@ -50,7 +50,7 @@ INT4 weights are ~18–20 GB — fits a single 32 GB Intel AI PC via UMA.
 NPU is out of scope (35B does not fit). Vision input is not supported on
 this path (text-only).
 
-## Validation record (2026-06-11, cascadia-pawan-01)
+## Validation record (Intel Lunar Lake node)
 
 Hardware: Core Ultra 7 258V (Lunar Lake), 32 GB UMA, Windows; SDK: OV
 GenAI 2026.2 (build 21894); model: `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
@@ -74,7 +74,7 @@ GenAI 2026.2 (build 21894); model: `OpenVINO/Qwen3.6-35B-A3B-int4-ov`
   the same prompt (GPU numerics under batched verification) — HF-parity
   checks must compare per decode mode, applied output not intermediates.
 
-Same-day follow-ups (also validated 2026-06-11):
+Follow-ups (validated on the same node):
 
 - **CPU device**: coherent completion through the API (`--device CPU`).
 - **2026.2 engine regression smoke** (ov-genai, dense Qwen3-1.7B-int4-ov):
@@ -83,11 +83,9 @@ Same-day follow-ups (also validated 2026-06-11):
   regression: the NPU-proven `llama-3.1-8b-instruct-npu-ov` export served
   fine on NPU. Dynamic-shape `int4-ov` exports are CPU/GPU artifacts; NPU
   needs its dedicated static-shape exports, as before.
-- **OVMS 2026.2.0** installed via the repinned `install-ovms.ps1`
-  (URL + SHA256 verified end-to-end).
 
-**Tool-calling validated (2026-06-12)** on BOTH serving paths through
-`/v1/chat/completions` on pawan-01 (CPU): a hermes-format tool schema in
+**Tool-calling validated** on BOTH serving paths through
+`/v1/chat/completions` (CPU): a hermes-format tool schema in
 the system message yields a well-formed
 `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>`
 from the nonsharded `ov-genai` path (reasoned, then called) and from the
@@ -95,24 +93,27 @@ staged `qwen36-moe` engine (empty think, then called). Prompt-level
 validation per #77 — an OpenAI `tools`/`tool_calls` API surface is a
 separate feature, not in #77 scope.
 
-**`usage` token counts fixed (2026-06-12)**: real `prompt_tokens` ride
-the engine's final chunk; `total = prompt + completion`. **Thinking-mode
-(2026-06-12)**: `enable_thinking: false` on the request prefills the
+**`usage` token counts fixed**: real `prompt_tokens` ride
+the engine's final chunk; `total = prompt + completion`.
+**Thinking-mode**: `enable_thinking: false` on the request prefills the
 template's empty think block (staged engine); default unchanged.
 
-**Fixed prompt set validated (2026-06-12)**: 6/6 factual-correctness
+**Fixed prompt set validated**: 6/6 factual-correctness
 PASS on BOTH paths (`tools/qwen36_surgery/promptset.json`; outputs in
 `tools/qwen36_surgery/golden/promptset_*.json`). Staged engine ran with
 `enable_thinking: false` and small budgets; the `ov-genai` path thinks
 unconditionally (the pipeline applies the chat template internally, so
 prompt-level think suppression doesn't reach the assistant position —
-attempted and reverted in 2fbdda6; GenAI-level template kwargs is the
-follow-up) and passed with 256-token budgets. True bf16 HF-reference
-parity is NOT claimable on this fleet (35B bf16 needs ~70 GB; nodes are
-31.6 GB) — the gate is factual correctness + cross-path consistency on
-the official int4 artifact, stated per the no-silent-caps rule.
+that approach was tried and reverted; passing template kwargs at the
+GenAI level is the follow-up) and passed with 256-token budgets. True bf16 HF-reference
+parity is NOT claimable on the hardware tested (35B bf16 needs ~70 GB;
+a 32 GB node cannot hold it) — the gate is factual correctness +
+cross-path consistency on
+the official int4 artifact — we state the actual gate used rather
+than claiming full HF-reference parity.
 
-Still pending: iGPU repeat of the tool-calling probe and prompt set.
+Known limitation: the tool-calling probe and prompt set have been
+validated on CPU only, not yet repeated on iGPU.
 
 ## Why `cascadia shard` rejects it
 
@@ -124,5 +125,4 @@ config-first (nested `text_config` unwrap + `qwen3_5_moe` model_type,
 \#77) with a pointer to the `ov-genai` path above.
 
 The pipeline-parallel design (the actual too-big-for-one-box story) is
-specced separately in [qwen36-moe-support.md](qwen36-moe-support.md) and
-deferred behind its M1 feasibility measurements.
+documented separately in [qwen36-moe-support.md](qwen36-moe-support.md).

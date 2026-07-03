@@ -21,7 +21,7 @@
 //! cargo run --release --bin bench_ffn_sparsity -- --iters 200
 //! ```
 //!
-//! On miner (Cascade Lake AVX-512+VNNI) the AVX-512 path is taken;
+//! On a Cascade Lake Xeon (AVX-512+VNNI) the AVX-512 path is taken;
 //! on Apple Silicon the scalar path runs (much slower, but
 //! correctness-checks).
 

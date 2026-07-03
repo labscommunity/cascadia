@@ -51,7 +51,7 @@ pub struct SparseMoEBuilderConfig {
     /// Number of pipeline stages.
     pub total: u32,
     /// If `Some(k)` and `k < manifest.top_k`, only the first k experts per
-    /// token are dispatched per shell layer. See `docs/A3_TOPK_REDUCTION.md`.
+    /// token are dispatched per shell layer. See `docs/perf/A3_TOPK_REDUCTION.md`.
     pub top_k_override: Option<u32>,
     /// Skip experts whose router weight falls below this threshold.
     /// 0.0 / None = disabled. Applied AFTER `top_k_override`.
@@ -85,7 +85,7 @@ pub struct SparseMoEBuilderConfig {
     /// skip — see [`crate::runner::Runner::set_ffn_sparsity_threshold`].
     /// `0.0` = disabled (dense fallback; output bit-identical).
     /// Useful range for SwiGLU: 0.05–0.15. Higher = more skip + lower
-    /// quality. See rainier `docs/POWERINFER_PORT.md`.
+    /// quality.
     pub ffn_sparsity_threshold: f32,
     /// Issue #35 — use the AXPY-form down kernel from
     /// [`cascadia_int4_gemm::ffn_axpy`] in the sparse FFN path. Only
@@ -94,8 +94,7 @@ pub struct SparseMoEBuilderConfig {
     /// [`Self::ffn_axpy_cache_dir`] (default
     /// `<model_dir>/.cascadia_transposed_down_v1/`) and mmap'd at
     /// runtime — this is the on-disk-cache fix that addresses PR #43's
-    /// initial mmap-page-cache-eviction regression (see rainier
-    /// `docs/AXPY_REGRESSION_ANALYSIS.md`).
+    /// initial mmap-page-cache-eviction regression.
     pub ffn_axpy_down: bool,
     /// Override location for the AXPY-form transposed-down cache.
     /// `None` ⇒ `<model_dir>/.cascadia_transposed_down_v1/`. Set
@@ -135,8 +134,7 @@ impl SparseMoEBuilderConfig {
             cache_dir: None,
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
-            // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT) —
-            // rainier `docs/POWERINFER_PORT.md`.
+            // See PowerInfer SmallThinker `MAX_N_CACHED` (MIT).
             max_cached_experts: 0,
             rank: 0,
             total: 1,
@@ -179,8 +177,7 @@ impl SparseMoEBuilderConfig {
     ///
     /// Inspired by PowerInfer SmallThinker's `MAX_N_CACHED` env var.
     /// At K2.6 dimensions each cached expert is ≈25 MiB so a cap of 256
-    /// roughly bounds the expert pool at 6.4 GiB. See
-    /// rainier `docs/POWERINFER_PORT.md` for guidance.
+    /// roughly bounds the expert pool at 6.4 GiB.
     pub fn with_max_cached_experts(mut self, n: u32) -> Self {
         self.max_cached_experts = n;
         self
@@ -189,8 +186,7 @@ impl SparseMoEBuilderConfig {
     /// Set the magnitude threshold for two-phase Gate-first FFN
     /// sparsity. `0.0` = dense (default; output bit-identical to the
     /// pre-port path). `0.05`–`0.15` is the useful range for SwiGLU.
-    /// See [`crate::runner::Runner::set_ffn_sparsity_threshold`] and
-    /// rainier `docs/POWERINFER_PORT.md`.
+    /// See [`crate::runner::Runner::set_ffn_sparsity_threshold`].
     pub fn with_ffn_sparsity_threshold(mut self, t: f32) -> Self {
         self.ffn_sparsity_threshold = if t > 0.0 { t } else { 0.0 };
         self
@@ -1216,7 +1212,6 @@ impl SparseMoEEngine {
             .map_err(|e| format!("forward_shells: {e}"))?;
 
         // Send hidden downstream and wait for token to come back.
-        // autolab/k26-perf q1 instrumentation: split timing of send vs round-trip.
         let wire_t0 = Instant::now();
         let result = self.block_on(async {
             send_forward(
@@ -1723,7 +1718,7 @@ impl SparseMoEEngine {
     /// TokenBatch to forward upstream on a mid rank.
     ///
     /// The wire savings vs K separate Forward frames is one round-trip
-    /// of latency per K verifies. At the cascadia-enterprise fleet's 22 ms cross-host RT,
+    /// of latency per K verifies. At a measured 22 ms cross-host RTT,
     /// K=8 saves ~7 round-trips per spec-decode round (~154 ms). The
     /// per-token shell compute is unchanged — `shell_forward_decode_int4`
     /// still only accepts seq=1, so this is a wire-batching unlock, not

@@ -70,9 +70,9 @@ const INITIAL_KV_CAPACITY: usize = 32;
 /// first `past_seq_len` slots per head are populated. We track `kv_capacity` separately
 /// from `past_seq_len` so a steady-state generation never triggers a realloc.
 ///
-/// **autolab campaign 029 (A8): KV is stored as bf16-as-u16.** Halves
+/// **KV is stored as bf16-as-u16.** Halves
 /// the per-layer footprint and the per-token bandwidth touched at
-/// attention time (the dominant cost per q1 once expert dispatch is
+/// attention time (profiling showed it dominates once expert dispatch is
 /// thinned by A3 K-override). The SDPA kernel upconverts to f32 inline.
 struct LayerState {
     lid: u32,
@@ -104,7 +104,7 @@ struct Layer0State {
     _embed_pin: Arc<Shard>,
     /// Pointer into the mmap — bf16 `[vocab_size, HIDDEN]` flat.
     embed_tokens_bf16: &'static [u8],
-    /// bf16-as-u16 KV (autolab 029 / A8).
+    /// bf16-as-u16 KV.
     past_k: Vec<u16>,
     past_v: Vec<u16>,
     past_seq_len: usize,
@@ -258,7 +258,7 @@ impl SafetensorsExpertCache {
     }
 }
 
-/// autolab iter 029 (C1): one prefetch request — kindly hint the kernel
+/// One prefetch request — kindly hint the kernel
 /// to start reading the weights for expert `eid` on layer `lid`. The
 /// prefetcher thread translates this into `madvise(MADV_WILLNEED)` calls
 /// on the six safetensors slices that make up the expert. Sent on a
@@ -382,8 +382,7 @@ pub struct RunnerOptions {
     /// [`Self::ffn_axpy_cache_dir`], then mmap'd at runtime.
     /// The kernel speedup ceiling is `1 / active_frac` vs the dense
     /// down; the on-disk cache prevents the page-cache eviction
-    /// regression an in-memory cache caused (PR #43 post-mortem:
-    /// rainier `docs/AXPY_REGRESSION_ANALYSIS.md`).
+    /// regression an in-memory cache caused (PR #43 post-mortem).
     pub ffn_axpy_down: bool,
     /// Directory where the AXPY-form transposed-and-requantized
     /// down weights are persisted. `None` ⇒ default
@@ -453,12 +452,12 @@ pub struct Runner {
     _safetensors_source: Arc<SafetensorsExpertSource>,
     /// If `Some(k')` with k' < manifest.top_k, forward_shells dispatches
     /// only the first k' of the routed top-K experts per token. See
-    /// `docs/A3_TOPK_REDUCTION.md` for the productionization Pareto.
+    /// `docs/perf/A3_TOPK_REDUCTION.md` for the productionization Pareto.
     top_k_override: Option<u32>,
     /// If `Some(t)` with t > 0, skip experts whose routing weight is
     /// below t. Applied AFTER `top_k_override`.
     routing_threshold: Option<f32>,
-    /// autolab iter 029 (C1): cache of the *previous* token's routed
+    /// Cache of the *previous* token's routed
     /// expert IDs per layer (indexed by position in `self.layers`, not
     /// by `lid`). Empty `Vec<u32>` means "no history yet" (just after
     /// `reset_kv` or first prefill token). Used as a simple
@@ -466,7 +465,7 @@ pub struct Runner {
     /// `forward_shells` we push these IDs to the prefetcher so the OS
     /// can start pulling pages while this token's earlier layers run.
     last_routing_ids: Vec<Vec<u32>>,
-    /// autolab iter 029 (C1): background prefetcher fed by
+    /// Background prefetcher fed by
     /// `last_routing_ids` at the start of each `forward_shells`. `None`
     /// when prefetching is disabled (env var `CASCADIA_EXPERT_PREFETCH=0`
     /// or experts_format != safetensors_bin).
@@ -490,7 +489,7 @@ pub struct Runner {
     /// disabled or the cache directory isn't writable (the runner
     /// logs + falls back to the dense path in that case).
     ///
-    /// On miner-class storage (NVMe) first-touch cost: ~6 ms to
+    /// On NVMe-class storage first-touch cost: ~6 ms to
     /// build + write 8.26 MiB per expert; subsequent dispatches
     /// across process restarts pay only the mmap-fault cost
     /// (~ms when warm in page cache, ~ms-tens to re-fault).
@@ -551,7 +550,7 @@ impl Runner {
     ///
     /// Attribution: the bounded-LRU pattern follows PowerInfer
     /// SmallThinker's `MAX_N_CACHED` env var (Song et al., SJTU-IPADS,
-    /// 2024; MIT-licensed). See rainier `docs/POWERINFER_PORT.md`.
+    /// 2024; MIT-licensed).
     pub fn load_with_options(
         model_dir: PathBuf,
         device: &str,
@@ -737,7 +736,7 @@ impl Runner {
             }
         };
 
-        // autolab iter 029 (C1): spin up the prefetcher thread when we're
+        // Spin up the prefetcher thread when we're
         // serving experts directly from safetensors mmaps. Disabled when
         // CASCADIA_EXPERT_PREFETCH=0 so it's easy to A/B at runtime. Other
         // expert backends (ov_ir, int4_bin) don't benefit from madvise
@@ -893,8 +892,7 @@ impl Runner {
     /// `|silu(gate)|` falls below `threshold · max_i |silu(gate_i)|`
     /// before the up / down phases. See
     /// [`cascadia_int4_gemm::expert_forward_sparse`] for the algorithm
-    /// and rainier `docs/POWERINFER_PORT.md` for the PowerInfer-2 §4.4
-    /// attribution.
+    /// (technique from PowerInfer-2 §4.4).
     pub fn set_ffn_sparsity_threshold(&mut self, v: f32) {
         self.ffn_sparsity_threshold = if v > 0.0 { v } else { 0.0 };
         // Reset running stats so the next reading reflects the new
@@ -974,8 +972,7 @@ impl Runner {
                     // unlike the original in-memory cache (PR #43)
                     // the on-disk pages are evictable by the kernel,
                     // so they don't displace the K2.6 model's mmap
-                    // pages from the page cache. See the post-mortem
-                    // at rainier `docs/AXPY_REGRESSION_ANALYSIS.md`.
+                    // pages from the page cache (PR #43 post-mortem).
                     //
                     // Pull the slice handles out of `w` first so the
                     // `c.get(...)` borrow ends and we can split-
@@ -1366,7 +1363,7 @@ impl Runner {
         if let Some(l0) = self.layer0.as_mut() {
             l0.past_seq_len = 0;
         }
-        // autolab iter 029 (C1): a fresh prompt has zero correlation
+        // A fresh prompt has zero correlation
         // with the previous prompt's expert routing — wipe the
         // same-as-last-token predictor so we don't waste prefetch
         // bandwidth on irrelevant experts.
@@ -1379,8 +1376,8 @@ impl Runner {
     /// decoding to discard rejected-draft positions without paying the cost
     /// of resetting + replaying the kept prefix.
     ///
-    /// **Equivalence to mask-based rewind.** rainier's `MaskedReq.rewind(k)`
-    /// (see `docs/SPEC_DECODE_SUMMARY.md`) leaves K/V values physically in
+    /// **Equivalence to mask-based rewind.** The reference Python
+    /// implementation's mask-based rewind leaves K/V values physically in
     /// the OV stateful cache and flips an `attention_mask[j] = 0` flag so
     /// future queries skip those positions. We don't have an OV-stateful
     /// cache here — the int4 shell's K/V is a raw f32 buffer that we
@@ -1667,7 +1664,6 @@ impl Runner {
         );
         l0.past_seq_len = past_seq_len + 1;
 
-        // autolab/k26-perf q1 instrumentation: per-token layer-0 timing.
         info!(
             stage = "layer0",
             duration_us = _t0.elapsed().as_micros() as u64,
@@ -1717,7 +1713,7 @@ impl Runner {
 
         let n_layers = self.layers.len();
 
-        // autolab iter 029 (C1): kick off madvise(WILLNEED) for every
+        // Kick off madvise(WILLNEED) for every
         // predicted next-token expert before we run any layer's attn.
         // Predictor is "same as last token" — i.e. the IDs we stored in
         // `last_routing_ids[i]` after the previous call. This races the
@@ -1757,9 +1753,9 @@ impl Runner {
             }
             let capacity = self.layers[i].kv_capacity;
 
-            // Run Rust shell forward — same int4 kernel rainier's eval
-            // used via the cdylib, just called directly since we're in
-            // the same Cargo workspace. The `_with_capacity` variant
+            // Run Rust shell forward — same int4 kernel the reference
+            // eval used via the cdylib, just called directly since we're
+            // in the same Cargo workspace. The `_with_capacity` variant
             // lets us pass a pre-allocated [H, capacity, D] buffer
             // with only the first `past_seq_len` slots populated.
             let shell_t0 = Instant::now();
@@ -1806,7 +1802,7 @@ impl Runner {
             }
             let experts_t0 = Instant::now();
             let mut moe = vec![0.0f32; hidden];
-            // autolab iter 029 (C1): collect this layer's actually-fired
+            // Collect this layer's actually-fired
             // expert IDs so the next forward_shells call can use them as
             // its prefetch predictor. Same-as-last-token heuristic.
             let mut this_token_ids: Vec<u32> = Vec::with_capacity(effective_top_k);
@@ -1837,8 +1833,7 @@ impl Runner {
             combine_total_us += combine_t0.elapsed().as_micros() as u64;
         }
 
-        // autolab/k26-perf q1 instrumentation: per-token shells breakdown.
-        // iter 029 (C1): also log prefetch counters so we can see how the
+        // Also log prefetch counters so we can see how the
         // submit/drop ratio evolves across a generation. Counters are
         // cumulative-since-Runner-load, so the deltas across consecutive
         // tokens tell us submits-per-token and drops-per-token.
@@ -1917,7 +1912,6 @@ impl Runner {
             DType::Bf16 => bf16_bytes_to_f32(&head_bytes),
             _ => return Err(RunnerError::Internal(format!("head dtype {:?}", head_dt))),
         };
-        // autolab/k26-perf q1 instrumentation: per-token head timing.
         info!(
             stage = "head",
             duration_us = _t0.elapsed().as_micros() as u64,
@@ -2339,7 +2333,7 @@ impl Runner {
         //
         // We could be cleverer (cache after each step, or at
         // configurable boundaries) — defer until profiling shows
-        // demand. The dominant cost on the rainier baseline is
+        // demand. The dominant cost on the measured baseline is
         // prefill, and a full-prompt snapshot pays it off in one hit.
         if !cache_hit {
             if let Some(c) = cache.as_mut() {
@@ -2459,9 +2453,9 @@ impl Runner {
     ///
     /// The real payoff is in pipeline-parallel mode: every accepted
     /// draft saves one full wire round-trip through the pipeline. At
-    /// the 22 ms cross-host RT measured on the cascadia-enterprise fleet, K=8 with
+    /// the 22 ms cross-host RT measured on a multi-host Intel fleet, K=8 with
     /// 70% acceptance saves `5.6 × 22 ms = 123 ms` per round — roughly
-    /// the same proportional cost as rainier reported on llama 3.1 8B.
+    /// the same proportional cost as reported on llama 3.1 8B.
     ///
     /// **Distributed support is currently OUT OF SCOPE**. The
     /// pipeline-parallel `step_first` / `step_worker` paths in
@@ -2475,8 +2469,8 @@ impl Runner {
     /// - Greedy acceptance: we accept consecutive matches between
     ///   draft and target greedy argmax, stopping at the first
     ///   mismatch. The "bonus" target token at the first mismatch is
-    ///   itself a valid sample we keep (matches rainier's
-    ///   `k26_spec_decode.py` line 282).
+    ///   itself a valid sample we keep (matches the reference Python
+    ///   spec-decode implementation).
     /// - KV rewind: after each round, `rewind_kv(rejected)` truncates
     ///   the K/V buffers back to the accepted prefix. The draft's
     ///   history is mirrored via [`crate::ngram_draft::Draft::rewind`].
@@ -2485,7 +2479,7 @@ impl Runner {
     ///   classical Leviathan et al. "rejection sampling" acceptance
     ///   rule applies; we punt to plain [`Self::generate`] in that
     ///   case rather than ship an incorrect acceptance test. This
-    ///   matches rainier's `MaskedReq.feed` path which is also
+    ///   matches the reference Python implementation, which is also
     ///   greedy-only.
     ///
     /// Returns the generated tokens (excluding the prompt; excluding
@@ -2831,7 +2825,7 @@ fn grow_layer0_kv_capacity(l0: &mut Layer0State) -> Result<(), RunnerError> {
 ///
 /// Uses `try_reserve_exact` + `resize` so OOM at long context bubbles
 /// up as a recoverable `Err` instead of an abort from the global
-/// allocator. autolab 029 (A8): elements are 2 bytes, not 4.
+/// allocator. KV is bf16-as-u16: elements are 2 bytes, not 4.
 fn grow_kv_buffer(
     src: &[u16],
     past_seq: usize,
@@ -2977,7 +2971,7 @@ mod tests {
     fn write_present_kv_into_empty_slot() {
         // 2 heads, capacity=3, head_dim=2, past_seq=0.
         // Buffer starts zero; expect present rows at slot 0 of each head.
-        // (autolab 029 / A8: buf is now bf16-as-u16; we feed f32 in.)
+        // (buf is bf16-as-u16; we feed f32 in.)
         let mut buf = vec![0u16; 2 * 3 * 2];
         let present = vec![1.0_f32, 2.0, 3.0, 4.0]; // h0=[1,2], h1=[3,4]
         write_present_kv(&mut buf, &present, 0, 3, 2, 2);

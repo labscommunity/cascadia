@@ -1,7 +1,8 @@
 # Contributing to Cascadia
 
 Thanks for hacking on Cascadia. This is the short version of what you
-need to be productive.
+need to be productive. By participating you agree to our
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Get a build running
 
@@ -19,9 +20,8 @@ cascadia doctor                       # sanity-check your environment
 
 Cascadia is a Cargo workspace; one concern per crate. The `Engine` +
 `Builder` traits in `cascadia-engine` are the plugin seam — engines must
-not depend on each other. See **[CLAUDE.md](CLAUDE.md)** for the design
-rationale and **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for crate
-responsibilities and the wire format.
+not depend on each other. See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+for the design rationale, crate responsibilities, and the wire format.
 
 ## Before you commit
 
@@ -50,9 +50,6 @@ These are **non-negotiable** for this repo:
 
 - **[Conventional Commits](https://www.conventionalcommits.org/):**
   `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, `test:`.
-- **Single-author commits only. Never add `Co-Authored-By` lines** — no
-  Claude, no other tools, no other authors. This applies to every commit,
-  including AI-assisted ones.
 - **One logical change per commit.** Smaller is better.
 - **Don't skip hooks** (`--no-verify`) and don't bypass commit signing.
 - **Branch + PR is the unit of work.** Never push to `main`. Branch off

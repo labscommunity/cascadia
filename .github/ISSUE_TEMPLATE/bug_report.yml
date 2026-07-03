@@ -1,0 +1,53 @@
+name: Bug report
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What went wrong, and what did you expect instead?
+      placeholder: |
+        `cascadia worker --rank 0 ...` exits with "..."
+        Expected it to serve the API on :8000.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, in order. Include the model and stage count if sharding is involved.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Cascadia version / commit
+      placeholder: v0.1.0 / 780cbf4
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: Engine
+      placeholder: mock / ov-genai / ov-runtime / ov-dist-spec / gemma4 / sparse-moe / qwen36-moe
+  - type: input
+    id: hardware
+    attributes:
+      label: OS + hardware
+      description: OS, CPU/GPU/NPU model. `cascadia doctor` output helps.
+      placeholder: Windows 11, Intel Core Ultra 7 258V (Lunar Lake iGPU)
+    validations:
+      required: true
+  - type: input
+    id: openvino
+    attributes:
+      label: OpenVINO version (if using an OV engine)
+      placeholder: openvino_genai 2026.2.0.0
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant worker output (use `--log-level debug` if possible).
+      render: text
