@@ -291,11 +291,11 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
 
-    /// OV performance hint: LATENCY, THROUGHPUT, or CUMULATIVE_THROUGHPUT.
-    /// LATENCY suits single-user decode; THROUGHPUT enables NUM_STREAMS
-    /// auto-tuning. See OpenVINO high-level-performance-hints docs (2026).
-    #[arg(long, value_name = "MODE")]
-    pub ov_performance_mode: Option<String>,
+    /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
+    /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
+    /// high-level-performance-hints docs (2026).
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub ov_performance_mode: Option<OvPerformanceMode>,
 
     /// OV inference precision hint: f16, bf16, or f32. Strongly recommended
     /// on Xe2/Battlemage GPUs, where f16/bf16 share XMX throughput but the
@@ -318,10 +318,11 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub ov_allow_auto_batching: bool,
 
-    /// OV execution mode: ACCURACY or PERFORMANCE (EXECUTION_MODE_HINT).
-    /// See OpenVINO precision-control (execution-mode) docs (2026).
-    #[arg(long, value_name = "MODE")]
-    pub ov_execution_mode: Option<String>,
+    /// OV execution mode (EXECUTION_MODE_HINT). PERFORMANCE trades a little
+    /// accuracy for throughput. See OpenVINO precision-control
+    /// (execution-mode) docs (2026).
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub ov_execution_mode: Option<OvExecutionMode>,
 
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; silently dropped
@@ -638,6 +639,51 @@ impl ShardQuant {
     }
 }
 
+/// OpenVINO performance hint (`PERFORMANCE_HINT`). These map to
+/// `ov::hint::PerformanceMode` and are device-independent, so — unlike
+/// `--ov-inference-precision`, whose valid set is device-specific (`bf16` /
+/// `dynamic` vary per device) and is therefore left a free string for OV to
+/// validate — we enumerate them and reject typos at parse time.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum OvPerformanceMode {
+    #[value(name = "LATENCY")]
+    Latency,
+    #[value(name = "THROUGHPUT")]
+    Throughput,
+    #[value(name = "CUMULATIVE_THROUGHPUT")]
+    CumulativeThroughput,
+}
+
+impl OvPerformanceMode {
+    fn as_ov(self) -> &'static str {
+        match self {
+            Self::Latency => "LATENCY",
+            Self::Throughput => "THROUGHPUT",
+            Self::CumulativeThroughput => "CUMULATIVE_THROUGHPUT",
+        }
+    }
+}
+
+/// OpenVINO execution mode (`EXECUTION_MODE_HINT`). Maps to
+/// `ov::hint::ExecutionMode`; device-independent, so enumerated like
+/// [`OvPerformanceMode`].
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum OvExecutionMode {
+    #[value(name = "ACCURACY")]
+    Accuracy,
+    #[value(name = "PERFORMANCE")]
+    Performance,
+}
+
+impl OvExecutionMode {
+    fn as_ov(self) -> &'static str {
+        match self {
+            Self::Accuracy => "ACCURACY",
+            Self::Performance => "PERFORMANCE",
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
     match cli.cmd {
@@ -753,8 +799,8 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     // are only effective on the plugins that own them; they are opt-in, so we
     // forward the user's request verbatim and let OV accept or reject it rather
     // than second-guessing the target device here.
-    if let Some(mode) = &args.ov_performance_mode {
-        props.push(("PERFORMANCE_HINT".into(), mode.clone()));
+    if let Some(mode) = args.ov_performance_mode {
+        props.push(("PERFORMANCE_HINT".into(), mode.as_ov().into()));
     }
     if let Some(prec) = &args.ov_inference_precision {
         props.push(("INFERENCE_PRECISION_HINT".into(), prec.clone()));
@@ -768,8 +814,8 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     if args.ov_allow_auto_batching {
         props.push(("ALLOW_AUTO_BATCHING".into(), "true".into()));
     }
-    if let Some(mode) = &args.ov_execution_mode {
-        props.push(("EXECUTION_MODE_HINT".into(), mode.clone()));
+    if let Some(mode) = args.ov_execution_mode {
+        props.push(("EXECUTION_MODE_HINT".into(), mode.as_ov().into()));
     }
 
     // NPU-only knobs. These are ov::genai LLMPipeline convenience keys — the
@@ -808,7 +854,41 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
+/// Warn when a performance flag the user explicitly set will be silently
+/// ignored for the chosen engine/device, so an ineffective flag is visible at
+/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
+/// warning in `build_builder`'s sparse-moe arm).
+fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
+    // NPU LLM knobs apply only to ov-genai on an NPU device (see
+    // `ov_perf_properties`). If the user set one but that gate won't fire, the
+    // value is dropped — say so, or they chase a shape/truncation bug with no
+    // signal pointing at the ignored flag.
+    let npu_flag_set = args.npu_prefill_chunk_size.is_some()
+        || args.npu_max_prompt_len.is_some()
+        || args.npu_min_response_len.is_some();
+    let npu_gate_open = device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai);
+    if npu_flag_set && !npu_gate_open {
+        tracing::warn!(
+            engine = ?args.engine,
+            device = %args.device,
+            "ignoring --npu-* flags: NPU LLM knobs apply only with \
+             --engine ov-genai on an NPU device"
+        );
+    }
+
+    // qwen36-moe compiles with a fixed plugin config and receives no OV perf
+    // properties (some hints break its IRs — see qwen36.rs). If the user set
+    // general hints, warn they won't take effect on this engine.
+    if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
+        tracing::warn!(
+            "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
+             with a fixed plugin config and does not apply them"
+        );
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+    warn_ignored_ov_perf_flags(args);
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
         EngineKind::OvGenai => {
@@ -1693,12 +1773,12 @@ mod ov_property_tests {
     #[test]
     fn general_hints_map_to_ov_property_keys() {
         let mut args = args_for("GPU");
-        args.ov_performance_mode = Some("LATENCY".into());
+        args.ov_performance_mode = Some(OvPerformanceMode::Latency);
         args.ov_inference_precision = Some("f16".into());
         args.ov_num_streams = Some(2);
         args.ov_num_threads = Some(8);
         args.ov_allow_auto_batching = true;
-        args.ov_execution_mode = Some("PERFORMANCE".into());
+        args.ov_execution_mode = Some(OvExecutionMode::Performance);
 
         let props = ov_perf_properties(&args);
         assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
@@ -1777,7 +1857,7 @@ mod ov_property_tests {
     fn general_hints_still_apply_on_non_genai_engine() {
         // The engine gate is NPU-knob-specific; general hints stay engine-agnostic.
         let mut args = args_for_engine("GPU", EngineKind::OvRuntime);
-        args.ov_performance_mode = Some("LATENCY".into());
+        args.ov_performance_mode = Some(OvPerformanceMode::Latency);
         let props = ov_perf_properties(&args);
         assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
     }
