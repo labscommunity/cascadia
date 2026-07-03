@@ -119,11 +119,10 @@ pub(crate) fn dispatch_int4_multi(
         }
         ProjShape::LargeShape => {
             // iter 075: shared_gate / shared_up bucket. The iter 046
-            // microbench (commit 77bc56f) showed these only
-            // consistently win at seq>=8 — at seq=4 the smaller N=2048
-            // doesn't pay off the blocked tile's RB=2 register
-            // pressure. Keep iter 042 for seq<8 to avoid regressing
-            // the chunked-prefill seq=4 case.
+            // microbench showed these only consistently win at seq>=8 —
+            // at seq=4 the smaller N=2048 doesn't pay off the blocked
+            // tile's RB=2 register pressure. Keep iter 042 for seq<8 to
+            // avoid regressing the chunked-prefill seq=4 case.
             if seq >= 8 {
                 dequant_gemm_int4_multi_blocked_auto(
                     packed, scale_bits, xs, n_rows, k_cols, seq, ys,
@@ -1104,9 +1103,9 @@ fn shell_forward_decode_int4_multi_batched(
     // Batched shared_gate + shared_up.
     //
     // **iter 075 dispatch.** Both shared_gate and shared_up are N=2048,
-    // K=7168 → 7 MB packed int4. The iter 046 microbench (commit
-    // 77bc56f) showed +28% over iter 042 at seq=16 on this shape, but
-    // the win only materializes at seq>=8 — at seq=4 the smaller N
+    // K=7168 → 7 MB packed int4. The iter 046 microbench showed +28%
+    // over iter 042 at seq=16 on this shape, but the win only
+    // materializes at seq>=8 — at seq=4 the smaller N
     // doesn't pay off the RB=2 register pressure. `ProjShape::LargeShape`
     // routes through iter 046 blocked at seq>=8 and stays on iter 042
     // for seq<8.

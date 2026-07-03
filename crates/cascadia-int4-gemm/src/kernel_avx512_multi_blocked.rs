@@ -77,7 +77,6 @@
 //! lost vs iter 042's tile across all seq tested (0.63–0.87x), because
 //! the HW prefetcher already handles the sequential packed stream
 //! well and the extra prefetch instructions added front-end pressure.
-//! See iter 046 commit message for the negative-result details.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 

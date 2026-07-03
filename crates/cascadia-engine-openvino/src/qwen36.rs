@@ -8,8 +8,9 @@
 //! Stage dirs are stateful OV IRs (DeltaNet conv/ssm + attention KV as
 //! ReadValue/Assign). Linear state cannot be trimmed: every task starts
 //! with `reset_state()` on every stage (position-0 re-entry is the only
-//! recovery — spec §4.1); cancellation drops the task and the next
-//! admission's reset restores the invariant.
+//! recovery — docs/architectures/qwen36-moe-support.md §4.1);
+//! cancellation drops the task and the next admission's reset restores
+//! the invariant.
 //!
 //! Pipeline mode (docs/architectures/qwen36-moe-support.md): rank 0 holds embeddings
 //! + stage 0 + tokenizer and drives decode; middle ranks relay (run
@@ -47,10 +48,11 @@ const MROPE_ROWS: usize = 4;
 
 // Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
 // HELLO/HELLO_NAK: [len u32][json], FORWARD: one WireTensor f32
-// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. The design frames
-// the position as an i64 prefix tensor; this header carries the same
-// information in the day-0 probe's framing (kind+epoch+pos), which the
-// probe validated end-to-end on the live relay.
+// [1,n,HIDDEN], TOKEN: [i32 BE]. ACKs are header-only. An earlier design
+// draft framed the position as an i64 prefix tensor; the shipped header
+// carries the same information in the day-0 probe's framing
+// (kind+epoch+pos), which the probe validated end-to-end on the live
+// relay.
 const FRAME_HELLO: u32 = 1;
 const FRAME_HELLO_ACK: u32 = 2;
 const FRAME_HELLO_NAK: u32 = 3;
@@ -347,8 +349,8 @@ pub struct Qwen36Engine {
     /// Downstream side: epoch of the last RESET accepted.
     peer_epoch: u32,
     handshake_done: bool,
-    /// Set when the startup handshake found a config mismatch (spec
-    /// handshake rule: refuse to serve). Admissions fail loud with this reason.
+    /// Set when the startup handshake found a config mismatch (handshake
+    /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
@@ -1117,7 +1119,7 @@ impl Qwen36Engine {
     /// Single-box step path.
     fn step_local(&mut self) -> Vec<(TaskId, Chunk)> {
         // Admit the next task: position-0 entry per task (linear state
-        // cannot be trimmed — spec §4.1).
+        // cannot be trimmed — docs/architectures/qwen36-moe-support.md §4.1).
         if self.active.is_none() {
             if self.pending.is_empty() {
                 return Vec::new();

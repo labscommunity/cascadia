@@ -399,10 +399,10 @@ pub fn layer0_forward_decode_int4_with_capacity_sparse(
 // Multi-token (seq >= 1) entry point (iter 041)
 // =====================================================================
 //
-// Per the iter 048 commit body: "Layer-0 multi still uses the scalar
-// loop. Layer 0 is one call per token (not per layer × per token), so
-// the wiring effort isn't justified yet." Future iter can swap the body
-// for a tile if profiles ever flag layer 0.
+// Layer-0 multi still uses the scalar loop: layer 0 is one call per
+// token (not per layer × per token), so the wiring effort isn't
+// justified yet. Future iter can swap the body for a tile if profiles
+// ever flag layer 0.
 //
 // KV cache here is `[u16]` (bf16 storage, A8) just like the seq=1 path.
 // `write_present_kv_bf16` does the inline f32 -> bf16 round on each

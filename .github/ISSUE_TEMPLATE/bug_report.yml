@@ -31,7 +31,7 @@ body:
     id: engine
     attributes:
       label: Engine
-      placeholder: mock / ov-genai / ov-runtime / ov-dist-spec / sparse-moe
+      placeholder: mock / ov-genai / ov-runtime / ov-dist-spec / gemma4 / sparse-moe / qwen36-moe
   - type: input
     id: hardware
     attributes:
