@@ -35,6 +35,16 @@ typedef struct cascadia_runtime_t cascadia_runtime_t;
 /// not thread-safe — read it on the same thread that triggered the error.
 const char* cascadia_last_error_message();
 
+/// Test-only: run collect_properties() over `properties_kv` and report how
+/// `key` was stored — 1 = int64_t (written to *out_i64), 0 = string, -1 =
+/// absent. Exists so the Rust test can verify the NPU LLM keys are coerced to
+/// int64 (ov::genai reads them via Any::as<int64_t>()) without a real model.
+int32_t cascadia_debug_property_int64_kind(
+    const char* const* properties_kv,
+    size_t properties_count,
+    const char* key,
+    int64_t* out_i64);
+
 // ---- Pipeline (LLMPipeline) construction ---------------------------------
 
 int32_t cascadia_pipeline_create(
