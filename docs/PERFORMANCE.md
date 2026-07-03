@@ -1,23 +1,33 @@
 # OpenVINO performance tuning
 
 Cascadia plumbs the OpenVINO plugin properties that materially affect LLM
-inference on Intel hardware through the `cascadia worker` / `cascadia run`
-CLI and into the OV-routed engines: `ov-genai`, `ov-runtime`, `gemma4`,
+inference on Intel hardware through the `cascadia worker` CLI and into the
+OV-routed engines: `ov-genai`, `ov-runtime`, `gemma4`,
 `ov-dist-spec`, and the OV IRs in `sparse-moe`. (`qwen36-moe` is intentionally
 excluded — it compiles with a fixed plugin config because some hints, e.g.
 `INFERENCE_PRECISION_HINT=f32` / `EXECUTION_MODE_HINT=ACCURACY`, break its
 IRs; see `qwen36.rs`.) All flags are opt-in: when unset, the engine builders
 behave exactly as before, so tuning never changes default behavior.
 
-Each general flag maps 1:1 to an `ov::AnyMap` entry passed to
-`ov::Core::compile_model(model, device, props)`. Cascadia does not validate
-values — OpenVINO rejects an invalid one with its own error message.
+> **`sparse-moe`:** general hints reach its OV-compiled experts, but the same
+> `f32` / `ACCURACY` hints that break `qwen36-moe` can also fail to compile
+> experts backed by f16-only fused kernels. OpenVINO surfaces that as a compile
+> error (not silent), so treat those two hints as experimental there and
+> benchmark before relying on them.
+
+Each general flag maps to an `ov::AnyMap` entry handed to the OV compile step —
+`ov::Core::compile_model` for the raw engines, the `ov::genai::LLMPipeline`
+constructor for `ov-genai`. Values are forwarded to OpenVINO, which rejects an
+invalid one with its own error message; the two fixed-set flags
+(`--ov-performance-mode`, `--ov-execution-mode`) are additionally checked
+against their allowed values at the CLI.
 
 ## Flags
 
 ### General hints
 
-Forwarded verbatim to whichever engine you select. `PERFORMANCE_HINT`,
+Forwarded to whichever OV-routed engine you select — all except
+`qwen36-moe` (setting them there logs a warning and has no effect). `PERFORMANCE_HINT`,
 `INFERENCE_PRECISION_HINT`, and `EXECUTION_MODE_HINT` are plugin-agnostic;
 `NUM_STREAMS`, `INFERENCE_NUM_THREADS` (CPU-oriented), and
 `ALLOW_AUTO_BATCHING` (GPU/AUTO) are only effective on the plugins that own
@@ -63,7 +73,7 @@ workload.
 
 ## Verifying properties reach the plugin
 
-Set `OV_LOG_LEVEL=4` to have the OpenVINO plugin log the applied config at
+Set `OPENVINO_LOG_LEVEL=4` to have the OpenVINO plugin log the applied config at
 `compile_model` time, then confirm each flag you passed appears in the dumped
 property map.
 
