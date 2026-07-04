@@ -291,6 +291,57 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub ov_dyn_quant_group: Option<String>,
 
+    /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
+    /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
+    /// high-level-performance-hints docs (2026).
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub ov_performance_mode: Option<OvPerformanceMode>,
+
+    /// OV inference precision hint: f16, bf16, or f32. Strongly recommended
+    /// on Xe2/Battlemage GPUs, where f16/bf16 share XMX throughput but the
+    /// default can silently fall back to f32. See OpenVINO gpu-device docs.
+    #[arg(long, value_name = "PREC")]
+    pub ov_inference_precision: Option<String>,
+
+    /// OV number of parallel inference streams (NUM_STREAMS).
+    /// See OpenVINO optimizing-throughput (streams-and-threads) docs (2026).
+    #[arg(long, value_name = "N")]
+    pub ov_num_streams: Option<u32>,
+
+    /// OV host CPU inference thread cap (INFERENCE_NUM_THREADS). CPU plugin
+    /// only. See OpenVINO CPU-device docs (2026).
+    #[arg(long, value_name = "N")]
+    pub ov_num_threads: Option<u32>,
+
+    /// OV: allow internal auto-batching on the GPU plugin (ALLOW_AUTO_BATCHING).
+    /// See OpenVINO automatic-batching docs (2026).
+    #[arg(long)]
+    pub ov_allow_auto_batching: bool,
+
+    /// OV execution mode (EXECUTION_MODE_HINT). PERFORMANCE trades a little
+    /// accuracy for throughput. See OpenVINO precision-control
+    /// (execution-mode) docs (2026).
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub ov_execution_mode: Option<OvExecutionMode>,
+
+    /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    #[arg(long, value_name = "TOKS")]
+    pub npu_prefill_chunk_size: Option<u32>,
+
+    /// NPU max prompt length (MAX_PROMPT_LEN, static-shape constraint).
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    #[arg(long, value_name = "TOKS")]
+    pub npu_max_prompt_len: Option<u32>,
+
+    /// NPU min response length (MIN_RESPONSE_LEN, static-shape constraint).
+    /// Applied only with --engine ov-genai on an NPU device; silently dropped
+    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    #[arg(long, value_name = "TOKS")]
+    pub npu_min_response_len: Option<u32>,
+
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
     pub draft_model: Option<String>,
@@ -495,6 +546,15 @@ impl WorkerArgs {
             ov_cache_dir: None,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
+            ov_performance_mode: None,
+            ov_inference_precision: None,
+            ov_num_streams: None,
+            ov_num_threads: None,
+            ov_allow_auto_batching: false,
+            ov_execution_mode: None,
+            npu_prefill_chunk_size: None,
+            npu_max_prompt_len: None,
+            npu_min_response_len: None,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -575,6 +635,51 @@ impl ShardQuant {
             Self::Int4 => "int4",
             Self::Int4Asym => "int4_asym",
             Self::Int8 => "int8",
+        }
+    }
+}
+
+/// OpenVINO performance hint (`PERFORMANCE_HINT`). These map to
+/// `ov::hint::PerformanceMode` and are device-independent, so — unlike
+/// `--ov-inference-precision`, whose valid set is device-specific (`bf16` /
+/// `dynamic` vary per device) and is therefore left a free string for OV to
+/// validate — we enumerate them and reject typos at parse time.
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum OvPerformanceMode {
+    #[value(name = "LATENCY")]
+    Latency,
+    #[value(name = "THROUGHPUT")]
+    Throughput,
+    #[value(name = "CUMULATIVE_THROUGHPUT")]
+    CumulativeThroughput,
+}
+
+impl OvPerformanceMode {
+    fn as_ov(self) -> &'static str {
+        match self {
+            Self::Latency => "LATENCY",
+            Self::Throughput => "THROUGHPUT",
+            Self::CumulativeThroughput => "CUMULATIVE_THROUGHPUT",
+        }
+    }
+}
+
+/// OpenVINO execution mode (`EXECUTION_MODE_HINT`). Maps to
+/// `ov::hint::ExecutionMode`; device-independent, so enumerated like
+/// [`OvPerformanceMode`].
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum OvExecutionMode {
+    #[value(name = "ACCURACY")]
+    Accuracy,
+    #[value(name = "PERFORMANCE")]
+    Performance,
+}
+
+impl OvExecutionMode {
+    fn as_ov(self) -> &'static str {
+        match self {
+            Self::Accuracy => "ACCURACY",
+            Self::Performance => "PERFORMANCE",
         }
     }
 }
@@ -668,6 +773,74 @@ fn resolve_ov_cache_dir(arg: Option<&str>) -> Option<String> {
     }
 }
 
+/// True when `device` names an OpenVINO NPU plugin (e.g. "NPU", "NPU.0").
+/// NPU-only plugin properties error if passed to a non-NPU plugin, so the
+/// gate below strips them unless this returns true. Matching the issue #13
+/// contract, the check is a case-insensitive `starts_with("NPU")`; compound
+/// AUTO/HETERO device strings that merely mention NPU are deliberately not
+/// treated as NPU targets.
+fn device_is_npu(device: &str) -> bool {
+    device.trim().to_ascii_uppercase().starts_with("NPU")
+}
+
+/// Translate the `--ov-*` / `--npu-*` performance flags on `args` into the
+/// `(key, value)` OpenVINO plugin properties fed to the OV engine builders.
+/// General hints apply to any engine; the NPU-only knobs are emitted only for
+/// an NPU device on the `ov-genai` engine (the sole engine that routes them
+/// through an `ov::genai` LLMPipeline — see the NPU block below). Returns
+/// entries in a stable order (general hints first, NPU knobs last) so callers
+/// and tests see a deterministic list.
+fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
+    let mut props: Vec<(String, String)> = Vec::new();
+
+    // General performance hints. PERFORMANCE_HINT / INFERENCE_PRECISION_HINT /
+    // EXECUTION_MODE_HINT are plugin-agnostic ov::hint properties. NUM_STREAMS,
+    // INFERENCE_NUM_THREADS (CPU-oriented) and ALLOW_AUTO_BATCHING (GPU/AUTO)
+    // are only effective on the plugins that own them; they are opt-in, so we
+    // forward the user's request verbatim and let OV accept or reject it rather
+    // than second-guessing the target device here.
+    if let Some(mode) = args.ov_performance_mode {
+        props.push(("PERFORMANCE_HINT".into(), mode.as_ov().into()));
+    }
+    if let Some(prec) = &args.ov_inference_precision {
+        props.push(("INFERENCE_PRECISION_HINT".into(), prec.clone()));
+    }
+    if let Some(n) = args.ov_num_streams {
+        props.push(("NUM_STREAMS".into(), n.to_string()));
+    }
+    if let Some(n) = args.ov_num_threads {
+        props.push(("INFERENCE_NUM_THREADS".into(), n.to_string()));
+    }
+    if args.ov_allow_auto_batching {
+        props.push(("ALLOW_AUTO_BATCHING".into(), "true".into()));
+    }
+    if let Some(mode) = args.ov_execution_mode {
+        props.push(("EXECUTION_MODE_HINT".into(), mode.as_ov().into()));
+    }
+
+    // NPU-only knobs. These are ov::genai LLMPipeline convenience keys — the
+    // GenAI NPU path consumes MAX_PROMPT_LEN / MIN_RESPONSE_LEN and drives the
+    // NPUW LLM pipeline (NPUW_LLM_PREFILL_CHUNK_SIZE). Only the ov-genai engine
+    // routes properties through an LLMPipeline; every other OV engine compiles
+    // via raw ov::Core::compile_model, which does not understand these keys (it
+    // rejects or ignores them). So gate on BOTH the device (NPU) and the engine
+    // (ov-genai). Keeping the gate here (single source of truth) means the
+    // builders and the C++ shim never see an NPU key on a run that can't use it.
+    if device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai) {
+        if let Some(n) = args.npu_prefill_chunk_size {
+            props.push(("NPUW_LLM_PREFILL_CHUNK_SIZE".into(), n.to_string()));
+        }
+        if let Some(n) = args.npu_max_prompt_len {
+            props.push(("MAX_PROMPT_LEN".into(), n.to_string()));
+        }
+        if let Some(n) = args.npu_min_response_len {
+            props.push(("MIN_RESPONSE_LEN".into(), n.to_string()));
+        }
+    }
+
+    props
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -681,7 +854,41 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
+/// Warn when a performance flag the user explicitly set will be silently
+/// ignored for the chosen engine/device, so an ineffective flag is visible at
+/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
+/// warning in `build_builder`'s sparse-moe arm).
+fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
+    // NPU LLM knobs apply only to ov-genai on an NPU device (see
+    // `ov_perf_properties`). If the user set one but that gate won't fire, the
+    // value is dropped — say so, or they chase a shape/truncation bug with no
+    // signal pointing at the ignored flag.
+    let npu_flag_set = args.npu_prefill_chunk_size.is_some()
+        || args.npu_max_prompt_len.is_some()
+        || args.npu_min_response_len.is_some();
+    let npu_gate_open = device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai);
+    if npu_flag_set && !npu_gate_open {
+        tracing::warn!(
+            engine = ?args.engine,
+            device = %args.device,
+            "ignoring --npu-* flags: NPU LLM knobs apply only with \
+             --engine ov-genai on an NPU device"
+        );
+    }
+
+    // qwen36-moe compiles with a fixed plugin config and receives no OV perf
+    // properties (some hints break its IRs — see qwen36.rs). If the user set
+    // general hints, warn they won't take effect on this engine.
+    if matches!(args.engine, EngineKind::Qwen36Moe) && !ov_perf_properties(args).is_empty() {
+        tracing::warn!(
+            "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
+             with a fixed plugin config and does not apply them"
+        );
+    }
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
+    warn_ignored_ov_perf_flags(args);
     match args.engine {
         EngineKind::Mock => Ok(Box::new(MockBuilder::new())),
         EngineKind::OvGenai => {
@@ -703,6 +910,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             if let Some(draft) = &args.draft_model {
                 let device = args
                     .draft_device
@@ -729,6 +937,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             Ok(Box::new(b))
         }
         EngineKind::Gemma4 => {
@@ -742,6 +951,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(group) = &args.ov_dyn_quant_group {
                 b = b.with_dyn_quant_group(group);
             }
+            b = b.with_ov_properties(ov_perf_properties(args));
             Ok(Box::new(b))
         }
         EngineKind::OvDistSpec => {
@@ -764,6 +974,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 if let Some(group) = &args.ov_dyn_quant_group {
                     b = b.with_dyn_quant_group(group);
                 }
+                b = b.with_ov_properties(ov_perf_properties(args));
                 Ok(Box::new(b))
             } else {
                 let mut b =
@@ -777,6 +988,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 if let Some(group) = &args.ov_dyn_quant_group {
                     b = b.with_dyn_quant_group(group);
                 }
+                b = b.with_ov_properties(ov_perf_properties(args));
                 Ok(Box::new(b))
             }
         }
@@ -787,6 +999,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 cfg.cache_dir = Some(dir);
             }
+            cfg.ov_properties = ov_perf_properties(args);
             cfg.top_k_override = args.top_k_override;
             cfg.routing_threshold = args.routing_threshold;
             cfg.max_cached_experts = args.max_cached_experts;
@@ -1513,4 +1726,139 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ov_property_tests {
+    use super::*;
+
+    fn args_for(device: &str) -> WorkerArgs {
+        args_for_engine(device, EngineKind::OvGenai)
+    }
+
+    fn args_for_engine(device: &str, engine: EngineKind) -> WorkerArgs {
+        WorkerArgs::single_node(
+            "model".into(),
+            device.into(),
+            engine,
+            "127.0.0.1:8080".into(),
+        )
+    }
+
+    fn prop<'a>(props: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        props
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn device_is_npu_matches_npu_plugins_only() {
+        assert!(device_is_npu("NPU"));
+        assert!(device_is_npu("NPU.0"));
+        assert!(device_is_npu("npu"));
+        assert!(device_is_npu("  NPU  "));
+        assert!(!device_is_npu("GPU"));
+        assert!(!device_is_npu("CPU"));
+        // Compound AUTO/HETERO strings that merely mention NPU are not NPU targets.
+        assert!(!device_is_npu("AUTO:NPU,CPU"));
+    }
+
+    #[test]
+    fn unset_flags_produce_no_properties() {
+        let args = args_for("GPU");
+        assert!(ov_perf_properties(&args).is_empty());
+    }
+
+    #[test]
+    fn general_hints_map_to_ov_property_keys() {
+        let mut args = args_for("GPU");
+        args.ov_performance_mode = Some(OvPerformanceMode::Latency);
+        args.ov_inference_precision = Some("f16".into());
+        args.ov_num_streams = Some(2);
+        args.ov_num_threads = Some(8);
+        args.ov_allow_auto_batching = true;
+        args.ov_execution_mode = Some(OvExecutionMode::Performance);
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+        assert_eq!(prop(&props, "INFERENCE_PRECISION_HINT"), Some("f16"));
+        assert_eq!(prop(&props, "NUM_STREAMS"), Some("2"));
+        assert_eq!(prop(&props, "INFERENCE_NUM_THREADS"), Some("8"));
+        assert_eq!(prop(&props, "ALLOW_AUTO_BATCHING"), Some("true"));
+        assert_eq!(prop(&props, "EXECUTION_MODE_HINT"), Some("PERFORMANCE"));
+    }
+
+    #[test]
+    fn auto_batching_absent_when_flag_unset() {
+        let args = args_for("GPU");
+        assert_eq!(
+            prop(&ov_perf_properties(&args), "ALLOW_AUTO_BATCHING"),
+            None
+        );
+    }
+
+    #[test]
+    fn npu_props_dropped_on_non_npu_device() {
+        let mut args = args_for("GPU");
+        args.npu_prefill_chunk_size = Some(512);
+        args.npu_max_prompt_len = Some(1024);
+        args.npu_min_response_len = Some(128);
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), None);
+        assert_eq!(prop(&props, "MAX_PROMPT_LEN"), None);
+        assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), None);
+    }
+
+    #[test]
+    fn npu_props_included_on_npu_device() {
+        let mut args = args_for("NPU.0");
+        args.npu_prefill_chunk_size = Some(512);
+        args.npu_max_prompt_len = Some(1024);
+        args.npu_min_response_len = Some(128);
+
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), Some("512"));
+        assert_eq!(prop(&props, "MAX_PROMPT_LEN"), Some("1024"));
+        assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), Some("128"));
+    }
+
+    #[test]
+    fn npu_props_dropped_on_non_genai_engine_even_on_npu_device() {
+        // MAX_PROMPT_LEN / MIN_RESPONSE_LEN / NPUW_LLM_PREFILL_CHUNK_SIZE are
+        // ov::genai LLMPipeline convenience keys. Only ov-genai routes props
+        // through the GenAI pipeline; the other OV engines hit raw
+        // compile_model, which cannot consume them. So they must be gated on
+        // engine == ov-genai, not device alone.
+        for engine in [
+            EngineKind::OvRuntime,
+            EngineKind::Gemma4,
+            EngineKind::OvDistSpec,
+            EngineKind::SparseMoe,
+        ] {
+            let mut args = args_for_engine("NPU.0", engine);
+            args.npu_prefill_chunk_size = Some(512);
+            args.npu_max_prompt_len = Some(1024);
+            args.npu_min_response_len = Some(128);
+
+            let props = ov_perf_properties(&args);
+            assert_eq!(
+                prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"),
+                None,
+                "{engine:?}"
+            );
+            assert_eq!(prop(&props, "MAX_PROMPT_LEN"), None, "{engine:?}");
+            assert_eq!(prop(&props, "MIN_RESPONSE_LEN"), None, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn general_hints_still_apply_on_non_genai_engine() {
+        // The engine gate is NPU-knob-specific; general hints stay engine-agnostic.
+        let mut args = args_for_engine("GPU", EngineKind::OvRuntime);
+        args.ov_performance_mode = Some(OvPerformanceMode::Latency);
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+    }
 }

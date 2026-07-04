@@ -64,6 +64,15 @@ mod sys {
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
 
+        // Test-only: see cpp/shim.cpp. Reports how collect_properties() stored
+        // `key` — 1 = int64 (written to *out_i64), 0 = string, -1 = absent.
+        pub fn cascadia_debug_property_int64_kind(
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            key: *const c_char,
+            out_i64: *mut i64,
+        ) -> c_int;
+
         pub fn cascadia_pipeline_create(
             model_path: *const c_char,
             device: *const c_char,
@@ -1019,5 +1028,80 @@ mod tests {
     fn live_cpu_full_name_nonempty() {
         let name = device_full_name("CPU").expect("FULL_DEVICE_NAME");
         assert!(!name.is_empty(), "FULL_DEVICE_NAME for CPU was empty");
+    }
+
+    // The NPU static-LLM keys must reach OV as int64 Anys — ov::genai reads
+    // them via Any::as<int64_t>() and throws on a string Any. This is the
+    // regression guard for the string->int64 coercion in collect_properties
+    // and for the exact key set shared with cascadia-cli's ov_perf_properties:
+    // a rename on either side of the FFI flips a key to string/absent here.
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn collect_properties_coerces_npu_integer_keys_to_int64() {
+        use std::ffi::CString;
+        use std::os::raw::c_char;
+
+        let pairs = [
+            ("MAX_PROMPT_LEN", "1024"),
+            ("MIN_RESPONSE_LEN", "128"),
+            ("NPUW_LLM_PREFILL_CHUNK_SIZE", "512"),
+            ("CACHE_DIR", "/tmp/ov_cache"),
+        ];
+        let mut owned: Vec<CString> = Vec::new();
+        for &(k, v) in pairs.iter() {
+            owned.push(CString::new(k).unwrap());
+            owned.push(CString::new(v).unwrap());
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        // (kind, value): kind 1 = int64 (value set), 0 = string, -1 = absent.
+        let kind_of = |key: &str| -> (i32, i64) {
+            let key_c = CString::new(key).unwrap();
+            let mut out: i64 = 0;
+            let k = unsafe {
+                super::sys::cascadia_debug_property_int64_kind(
+                    ptrs.as_ptr(),
+                    pairs.len(),
+                    key_c.as_ptr(),
+                    &mut out,
+                )
+            };
+            (k, out)
+        };
+
+        assert_eq!(kind_of("MAX_PROMPT_LEN"), (1, 1024));
+        assert_eq!(kind_of("MIN_RESPONSE_LEN"), (1, 128));
+        assert_eq!(kind_of("NPUW_LLM_PREFILL_CHUNK_SIZE"), (1, 512));
+        // Plugin-parsed properties stay strings.
+        assert_eq!(kind_of("CACHE_DIR").0, 0, "CACHE_DIR must stay a string");
+        // Absent key.
+        assert_eq!(kind_of("NOPE").0, -1);
+    }
+
+    // A value that isn't a clean integer must fall back to a string Any (so OV
+    // reports the bad value) rather than being silently truncated by stoll's
+    // partial parse ("512abc" -> 512).
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn collect_properties_rejects_partial_integer_to_string() {
+        use std::ffi::CString;
+        use std::os::raw::c_char;
+
+        let owned = [
+            CString::new("MAX_PROMPT_LEN").unwrap(),
+            CString::new("512abc").unwrap(),
+        ];
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        let key_c = CString::new("MAX_PROMPT_LEN").unwrap();
+        let mut out: i64 = 0;
+        let kind = unsafe {
+            super::sys::cascadia_debug_property_int64_kind(
+                ptrs.as_ptr(),
+                1,
+                key_c.as_ptr(),
+                &mut out,
+            )
+        };
+        assert_eq!(kind, 0, "partial-numeric value must fall back to string");
     }
 }

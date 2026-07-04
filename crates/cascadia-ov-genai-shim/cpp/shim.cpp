@@ -46,8 +46,39 @@ ov::AnyMap collect_properties(const char* const* kv, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         const char* key = kv[2 * i];
         const char* val = kv[2 * i + 1];
-        if (key && val) {
-            props[std::string(key)] = std::string(val);
+        if (!key || !val) {
+            continue;
+        }
+        std::string k(key);
+        // A few properties are consumed by ov::genai's own pipeline code
+        // (NPU static-LLM path), not the plugin config parser. genai reads
+        // them via Any::as<int64_t>() and throws on a string Any
+        // ("Failed to extract MAX_PROMPT_LEN. Type mismatch: expected int").
+        // The Rust side sends every value as a string, so coerce these known
+        // integer keys to int64_t here. Plugin-parsed properties (CACHE_DIR,
+        // PERFORMANCE_HINT, INFERENCE_PRECISION_HINT, NUM_STREAMS, …) accept
+        // strings fine and stay strings.
+        if (k == "MAX_PROMPT_LEN" || k == "MIN_RESPONSE_LEN" ||
+            k == "NPUW_LLM_PREFILL_CHUNK_SIZE") {
+            try {
+                // Require the WHOLE value to be an integer: std::stoll parses a
+                // leading numeric prefix and silently drops the rest ("512abc"
+                // -> 512), which would hand OV a wrong-but-valid int. Check pos
+                // reached the end; otherwise fall through to the string branch
+                // and let OV report the bad value.
+                const std::string s(val);
+                size_t pos = 0;
+                long long parsed = std::stoll(s, &pos);
+                if (pos != s.size()) {
+                    throw std::invalid_argument("trailing chars after integer");
+                }
+                props[k] = static_cast<int64_t>(parsed);
+            } catch (...) {
+                // Not an integer — let OV report it against the string value.
+                props[k] = std::string(val);
+            }
+        } else {
+            props[k] = std::string(val);
         }
     }
     return props;
@@ -145,6 +176,25 @@ extern "C" {
 
 const char* cascadia_last_error_message() {
     return g_last_error.c_str();
+}
+
+// Test-only introspection over collect_properties(): run it on `properties_kv`
+// / `properties_count` and report how `key` landed in the resulting AnyMap.
+// Returns 1 and writes *out_i64 if stored as int64_t, 0 if stored as a string,
+// -1 if absent. Lets the Rust test pin the string->int64 coercion of the NPU
+// LLM keys (which ov::genai reads via Any::as<int64_t>()) without a real model.
+int32_t cascadia_debug_property_int64_kind(
+    const char* const* properties_kv, size_t properties_count,
+    const char* key, int64_t* out_i64) {
+    if (!key) return -1;
+    auto props = collect_properties(properties_kv, properties_count);
+    auto it = props.find(std::string(key));
+    if (it == props.end()) return -1;
+    if (it->second.is<int64_t>()) {
+        if (out_i64) *out_i64 = it->second.as<int64_t>();
+        return 1;
+    }
+    return 0;
 }
 
 // ===================== LLMPipeline (genai) =====================

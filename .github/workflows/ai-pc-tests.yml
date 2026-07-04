@@ -89,11 +89,12 @@ jobs:
         run: cargo build --release -p cascadia --features openvino
 
       # OV-gated tests (skipped on the ubuntu stub CI because they need the real
-      # runtime + an Intel device).
+      # OpenVINO runtime). Also runs cascadia-ov-genai-shim, which holds the
+      # collect_properties int64-coercion tests (ov::Any only, no device needed).
       - name: Run OpenVINO-feature tests
         env:
           INTEL_OPENVINO_DIR: ${{ vars.INTEL_OPENVINO_DIR }}
-        run: cargo test -p cascadia-engine-openvino --features openvino --no-fail-fast
+        run: cargo test -p cascadia-engine-openvino -p cascadia-ov-genai-shim --features openvino --no-fail-fast
 
       # Optional end-to-end smoke once a small model is staged on the runners:
       # bring up the cascadia binary against the real engine and hit
