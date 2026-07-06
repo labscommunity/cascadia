@@ -21,7 +21,7 @@ N == 1  (whole IR, for the ov-genai engine)
 
 N > 1   (sliced stages, for the ov-runtime distributed engine)
     Graft as above, then slice the grafted IR at decoder-layer boundaries into
-    N per-stage stateful shards in the rainier-v3 on-disk layout the ov-runtime
+    N per-stage stateful shards in the v3 on-disk layout the ov-runtime
     engine loads (``crates/cascadia-engine-openvino/src/runtime.rs``): a root
     ``pipeline_config.json`` + per-stage ``stage_{i}/openvino_model.xml`` +
     ``stage_{i}/stage_config.json`` — byte-for-key identical to what
@@ -92,7 +92,7 @@ GRAFTED_EMBEDS_NAME = "grafted_inputs_embeds"
 # Fixed short prompt for the N>1 parity gate (leading BOS=2 for gemma-4).
 VALIDATE_PROMPT_IDS = [2, 651, 6037, 603, 578, 3311]
 
-# Stamped into the N>1 rainier-v3 layout (pipeline_config.json +
+# Stamped into the N>1 v3 layout (pipeline_config.json +
 # stage_config.json) that ov-runtime loads, so the engine + on-node operator
 # can identify which exporter produced these shards.
 EXPORT_VERSION = "gemma4_text_surgery_v1"
@@ -899,7 +899,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
                  validate: bool = False,
                  num_kv_heads=None, head_dim=None) -> None:
     """N>1: slice the grafted IR into per-stage stateful shards, emitting the
-    rainier-v3 on-disk layout that the ov-runtime engine loads.
+    v3 on-disk layout that the ov-runtime engine loads.
 
     Layout (mirrors ``tools/export_shards.py`` so ov-runtime's
     ``read_pipeline_config`` / ``read_stage_config`` find every field):
@@ -943,7 +943,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             f"{num_kv_shared_layers}; correctness depends on boundaries keeping "
             f"each sharing group inside one stage. VALIDATE on-node.")
 
-    # Top-level metadata in the rainier-v3 layout ov-runtime loads. The first
+    # Top-level metadata in the v3 layout ov-runtime loads. The first
     # five keys are what PipelineConfig reads; the rest are gemma-4-specific
     # diagnostics ov-runtime ignores (no deny_unknown_fields) but keep for the
     # on-node operator.
@@ -981,7 +981,7 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         # has_head, stateful, num_kv_heads, head_dim, export_version) plus
         # gemma-4 diagnostics it ignores (stage, inputs, state_vars).
         stage_cfg = {
-            # layer_end is HALF-OPEN (rainier-v3 contract: cascadia-types
+            # layer_end is HALF-OPEN (v3 contract: cascadia-types
             # num_layers = layer_end - layer_start). stage_ranges returns an
             # INCLUSIVE b, so write b + 1. The internal slice math keeps using
             # the inclusive b (and b+1 for the residual cut) untouched.
