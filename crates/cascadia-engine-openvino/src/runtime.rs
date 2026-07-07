@@ -785,8 +785,9 @@ impl OvRuntimeEngine {
         let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
-                // First frame of a task hop is an IDLE wait (no deadline —
-                // "no next request yet" is fine). On the static path the
+                // First frame of a task hop is an IDLE wait (bounded only by
+                // the transport's much larger frame-idle ceiling — "no next
+                // request yet" is fine). On the static path the
                 // hidden tensor that must FOLLOW the position frame is a
                 // mid-pair reply: once the pos frame arrived, the peer owes
                 // the hidden promptly — deadline it so a half-sent pair

@@ -181,12 +181,13 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
 /// Like [`recv_tensor`] but for a MID-TASK reply: the peer owes us a prompt
 /// response to a frame we just sent (e.g. the pipeline tail returning the
 /// sampled token for a hidden state), so the header's FIRST byte is read
-/// under the strict recv timeout instead of the idle-tolerant indefinite
-/// wait. Call-site rule: a stage waiting for the NEXT task idles on
-/// `recv` (no deadline — "no work yet" is not a failure); a stage waiting
-/// for a reply to in-flight work uses `recv_reply` — otherwise a single
-/// frame lost mid-task (e.g. a pipeline-leg reset between stages) blocks
-/// the engine's step loop forever and the task slot is never freed
+/// under the strict recv timeout instead of the idle-tolerant wait (bounded
+/// only by the much larger `frame_idle_ceiling`). Call-site rule: a stage
+/// waiting for the NEXT task idles on `recv` (idle-ceiling bound only —
+/// "no work yet" is not a failure); a stage waiting for a reply to
+/// in-flight work uses `recv_reply` — otherwise a single frame lost
+/// mid-task (e.g. a pipeline-leg reset between stages) stalls the engine's
+/// step loop for the whole idle ceiling with the task slot held
 /// (overload-backlog Item 5: forwarded-to head wedges, task never
 /// finalizes).
 pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
@@ -196,10 +197,11 @@ pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor,
 /// A PREFILL reply is owed only after every remaining downstream stage has
 /// run whole-prompt inference sequentially — the wait scales with prompt
 /// length × pipeline depth, not with a single frame transfer (which is what
-/// the base recv timeout was sized for). Budget: 10× the base, which at the
-/// 60s default restores the pre-idle-tolerance 600s bound; decode replies
-/// (sub-second when healthy) keep the strict [`recv_tensor_reply`] deadline
-/// so wedge eviction stays fast where it matters.
+/// the base recv timeout was sized for). Budget: this factor × the base
+/// recv timeout, sized to comfortably cover whole-prompt compute across the
+/// deepest pipelines we run; decode replies (sub-second when healthy) keep
+/// the strict [`recv_tensor_reply`] deadline so wedge eviction stays fast
+/// where it matters.
 pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
 
 /// [`recv_tensor_reply`] with the widened prefill budget. Use for the token
@@ -555,7 +557,9 @@ impl ActivationServer {
 
     /// Mid-task reply recv — strict deadline on the first byte. See
     /// [`recv_tensor_reply`] for the call-site rule. A failed reply
-    /// poisons the connection (see [`Self::poison`]).
+    /// poisons the connection (see `poison`: the socket is dropped
+    /// and later calls fail fast with `NotConnected`; recover with a
+    /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply(sock).await;
@@ -566,7 +570,9 @@ impl ActivationServer {
     }
 
     /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
-    /// A failed reply poisons the connection (see [`Self::poison`]).
+    /// A failed reply poisons the connection (see `poison`: the socket
+    /// is dropped and later calls fail fast with `NotConnected`;
+    /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply_prefill(sock).await;
@@ -731,7 +737,9 @@ impl ActivationClient {
 
     /// Mid-task reply recv — strict deadline on the first byte. See
     /// [`recv_tensor_reply`] for the call-site rule. A failed reply
-    /// poisons the connection (see [`Self::poison`]).
+    /// poisons the connection (see `poison`: the socket is dropped
+    /// and later calls fail fast with `NotConnected`; recover with a
+    /// fresh connection).
     pub async fn recv_reply(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply(sock).await;
@@ -742,7 +750,9 @@ impl ActivationClient {
     }
 
     /// Prefill-budget reply recv — see [`recv_tensor_reply_prefill`].
-    /// A failed reply poisons the connection (see [`Self::poison`]).
+    /// A failed reply poisons the connection (see `poison`: the socket
+    /// is dropped and later calls fail fast with `NotConnected`;
+    /// recover with a fresh connection).
     pub async fn recv_reply_prefill(&mut self) -> TransportResult<(Tensor, TransferStats)> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         let res = recv_tensor_reply_prefill(sock).await;
