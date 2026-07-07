@@ -31,7 +31,9 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 ## Quick start
 
-The 5-minute path — no OpenVINO, works on any machine with Rust:
+**On an Intel machine?** Grab a self-contained bundle from [Releases](https://github.com/labscommunity/cascadia/releases) — OpenVINO runtime included, no build, no SDK. Unzip and run `cascadia doctor`.
+
+Or the 5-minute source path — no OpenVINO, works on any machine with Rust:
 
 ```bash
 cargo build --release -p cascadia
@@ -50,7 +52,7 @@ A JSON chat-completion back means the full path (API → engine → streaming) w
 
 ## Installation
 
-Two build modes:
+**Prebuilt bundles** for Linux and Windows x86_64 are on the [Releases page](https://github.com/labscommunity/cascadia/releases) — binary + OpenVINO runtime libraries, ready to run. Building from source instead has two modes:
 
 ```bash
 # Stub mode — Rust only. Good for dev / CI on macOS / Linux / Windows.
