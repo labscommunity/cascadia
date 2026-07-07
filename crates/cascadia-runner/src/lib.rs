@@ -355,8 +355,13 @@ impl Stream for ChunkStream {
                 Err(e) => match e.task_id() {
                     Some(failed) if failed != &this.task_id => {
                         // Misattribution guard: fail the named task's stream,
-                        // not ours. Cancelling it makes its own poll_next
-                        // observe termination on its next turn.
+                        // not ours. Route the failure as a final error chunk
+                        // into its buffer — a cancel marker would end its
+                        // stream silently and its client would get a
+                        // truncated 200. Skip the push if its buffer already
+                        // ends in an error chunk (a non-clearing engine
+                        // re-emits the same failure every step; one is
+                        // enough).
                         let failed = failed.clone();
                         warn!(
                             failed_task = %failed,
@@ -365,8 +370,21 @@ impl Stream for ChunkStream {
                             "engine step failed for another task; routing failure to it"
                         );
                         let mut bufs = this.buffers.lock();
-                        bufs.cancelled.insert(failed.clone());
-                        bufs.chunks.remove(&failed);
+                        // Cancelled task = no consumer left; recreating its
+                        // buffer entry would leak until close() (mirror the
+                        // cancelled-check on the distribution path below).
+                        if !bufs.cancelled.contains(&failed) {
+                            let buf = bufs.chunks.entry(failed.clone()).or_default();
+                            // Dedup: one error chunk max. If the buffer
+                            // already ends in a NORMAL final chunk the task
+                            // completed first — the drain delivers that and
+                            // drops the appended error with the entry, which
+                            // is deliberate (a post-completion failure is
+                            // contract noise; the warn above records it).
+                            if !buf.back().is_some_and(|c| c.error.is_some()) {
+                                buf.push_back(Chunk::error(failed.clone(), e.to_string()));
+                            }
+                        }
                         drop(bufs);
                         // Bound only a *non-clearing* engine: one that re-emits
                         // the SAME foreign-task Err every step (never dropping
@@ -380,28 +398,46 @@ impl Stream for ChunkStream {
                         if this.last_errored_task.as_ref() == Some(&failed) {
                             this.consecutive_foreign_err += 1;
                         } else {
-                            this.last_errored_task = Some(failed);
+                            this.last_errored_task = Some(failed.clone());
                             this.consecutive_foreign_err = 1;
                         }
                         if this.consecutive_foreign_err >= MAX_CONSECUTIVE_EMPTY_STEPS {
+                            // Abnormal close of a healthy stream — fail it
+                            // loud (see the own-task arm below).
                             this.done = true;
+                            this.buffers.lock().chunks.remove(&this.task_id);
                             warn!(
                                 task = %this.task_id,
                                 "engine re-failed the same foreign task for {} consecutive steps; closing stream",
                                 MAX_CONSECUTIVE_EMPTY_STEPS
                             );
-                            return Poll::Ready(None);
+                            return Poll::Ready(Some(Chunk::error(
+                                this.task_id.clone(),
+                                format!(
+                                    "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
+                                    MAX_CONSECUTIVE_EMPTY_STEPS
+                                ),
+                            )));
                         }
                         continue;
                     }
                     _ => {
+                        // Surface the failure as a final error chunk: a bare
+                        // end-of-stream builds a 200 with truncated text and
+                        // finish_reason "stop" at the API layer. The error
+                        // chunk routes through the existing 503 / SSE-error
+                        // paths instead.
                         this.done = true;
+                        this.buffers.lock().chunks.remove(&this.task_id);
                         warn!(
                             task = %this.task_id,
                             error = %e,
                             "engine step failed; closing stream"
                         );
-                        return Poll::Ready(None);
+                        return Poll::Ready(Some(Chunk::error(
+                            this.task_id.clone(),
+                            e.to_string(),
+                        )));
                     }
                 },
             };
@@ -409,13 +445,23 @@ impl Stream for ChunkStream {
             if produced.is_empty() {
                 this.consecutive_empty += 1;
                 if this.consecutive_empty >= MAX_CONSECUTIVE_EMPTY_STEPS {
+                    // An engine that wedges by stalling (Ok-empty forever)
+                    // is a failure the client must see — fail loud like the
+                    // step-error arms above.
                     this.done = true;
+                    this.buffers.lock().chunks.remove(&this.task_id);
                     warn!(
                         task = %this.task_id,
                         "engine made no progress for {} consecutive steps; closing stream",
                         MAX_CONSECUTIVE_EMPTY_STEPS
                     );
-                    return Poll::Ready(None);
+                    return Poll::Ready(Some(Chunk::error(
+                        this.task_id.clone(),
+                        format!(
+                            "engine made no progress for {} consecutive steps",
+                            MAX_CONSECUTIVE_EMPTY_STEPS
+                        ),
+                    )));
                 }
                 continue;
             }
@@ -748,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_error_terminates_stream() {
+    async fn step_error_surfaces_error_chunk_then_terminates() {
         let runner = Runner::new(Box::new(FailingBuilder));
         runner
             .start(
@@ -760,8 +806,24 @@ mod tests {
         let mut stream = runner
             .generate(GenerationTask::new("t1", "hello").with_max_tokens(8))
             .unwrap();
-        // The first poll hits the step error and ends the stream — no
-        // empty-step spinning, no chunks.
+        // The first poll hits the step error. The failure must reach the
+        // consumer as a final error chunk — a bare end-of-stream builds a
+        // 200 with truncated text and finish_reason "stop" at the API layer,
+        // indistinguishable from the model choosing to stop.
+        let chunk = stream
+            .next()
+            .await
+            .expect("failed task must surface a final error chunk, not a silent end");
+        assert!(chunk.is_final);
+        assert!(
+            chunk
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("transport down")),
+            "error chunk must carry the step failure, got: {:?}",
+            chunk.error
+        );
+        // And then the stream terminates — no empty-step spinning.
         assert!(stream.next().await.is_none());
     }
 
@@ -855,11 +917,22 @@ mod tests {
             "healthy task b's stream was killed by task a's failure: {b_chunk:?}"
         );
 
-        // A's stream ends (None) — it was the failed task.
+        // A's stream surfaces the routed failure as a final error chunk —
+        // ending it silently would give A's client a truncated 200.
+        let a_chunk = stream_a
+            .next()
+            .await
+            .expect("failed task a must surface a final error chunk, not a silent end");
+        assert!(a_chunk.is_final);
         assert!(
-            stream_a.next().await.is_none(),
-            "failed task a's stream should have ended"
+            a_chunk
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("transport down")),
+            "task a's error chunk must carry the failure, got: {:?}",
+            a_chunk.error
         );
+        assert!(stream_a.next().await.is_none());
         // B's stream is now complete too.
         assert!(stream_b.next().await.is_none());
     }
@@ -931,17 +1004,120 @@ mod tests {
             .generate(GenerationTask::new("ours", "x").with_max_tokens(64))
             .unwrap();
 
-        // Must terminate (None), not hang. Bounded by the no-progress guard.
+        // Must terminate, not hang — and the abnormal close must surface as
+        // a final error chunk (a bare end-of-stream would build a truncated
+        // 200 at the API layer), bounded by the no-progress guard.
+        let last = stream
+            .next()
+            .await
+            .expect("observing stream must surface an error chunk when the engine wedges");
+        assert!(last.is_final);
         assert!(
-            stream.next().await.is_none(),
-            "stream should terminate on a non-clearing foreign-task Err, not spin"
+            last.error.is_some(),
+            "guard close must carry an error, got: {last:?}"
         );
+        assert!(stream.next().await.is_none());
         // One step per no-progress round; capped by the guard, not unbounded.
         let n = steps.load(Ordering::SeqCst);
         assert!(
             n <= MAX_CONSECUTIVE_EMPTY_STEPS,
             "stream busy-spun on a non-clearing foreign-task Err: {n} steps"
         );
+    }
+
+    /// A foreign-task failure routed to a task whose client already went
+    /// away (cancelled / stream dropped) must NOT recreate that task's
+    /// buffer entry — nothing will ever drain it, so it would leak until
+    /// close(). Mirrors the cancelled-check on the distribution path.
+    #[tokio::test]
+    async fn foreign_err_for_cancelled_task_does_not_recreate_buffer() {
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = Runner::new(Box::new(ForeignErrSpinBuilder {
+            fail: "dead".to_string(),
+            steps,
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        // "dead" was cancelled before its failure surfaced (the dead
+        // transport is often exactly why the client disconnected).
+        runner.cancel(&"dead".to_string());
+        let mut stream = runner
+            .generate(GenerationTask::new("ours", "x").with_max_tokens(4))
+            .unwrap();
+        // Drive until our stream closes (the engine never serves us).
+        while stream.next().await.is_some() {}
+        assert!(
+            !runner.buffers.lock().chunks.contains_key("dead"),
+            "routing a failure to a cancelled task must not recreate its buffer entry"
+        );
+    }
+
+    /// Engine that never errors and never produces: every step is Ok(empty).
+    /// Models a wedged engine that stalls instead of failing.
+    struct StallingEngine;
+
+    impl Engine for StallingEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct StallingBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for StallingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(StallingEngine))
+        }
+    }
+
+    /// The no-progress guard must fail loud: an engine that wedges by
+    /// producing nothing (rather than by erroring) is a failure the client
+    /// must see, not a truncated 200 with finish_reason "stop".
+    #[tokio::test]
+    async fn no_progress_close_surfaces_error_chunk() {
+        let runner = Runner::new(Box::new(StallingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t1", "hello").with_max_tokens(8))
+            .unwrap();
+        let last = stream
+            .next()
+            .await
+            .expect("no-progress close must surface a final error chunk");
+        assert!(last.is_final);
+        assert!(
+            last.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no progress")),
+            "error chunk must name the stall, got: {:?}",
+            last.error
+        );
+        assert!(stream.next().await.is_none());
     }
 
     /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
