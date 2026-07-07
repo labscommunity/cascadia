@@ -1035,6 +1035,73 @@ mod tests {
         );
     }
 
+    /// Client twin of `reply_wait_longer_than_timeout_fails_fast`: the
+    /// engine's downstream leg is an `ActivationClient` (the production
+    /// path for `recv_token_from_downstream`), and its reply methods are
+    /// separate near-verbatim copies of the server's — pin them
+    /// independently so the twins can't drift apart.
+    #[tokio::test]
+    async fn client_reply_wait_longer_than_timeout_fails_fast() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            // Send nothing: the "reply" never comes. Outlive the 1s deadline
+            // so the client hits the timeout path, not a clean EOF.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let started = std::time::Instant::now();
+        let got = client.recv_reply().await;
+        let waited = started.elapsed();
+        h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_err(),
+            "a missing mid-task reply must time out, got {got:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "must fail within ~the recv timeout, waited {waited:?}"
+        );
+    }
+
+    /// Client twin of `reply_timeout_poisons_connection`: a timed-out reply
+    /// on the downstream leg must poison the client's socket so a late
+    /// reply can't be consumed by the NEXT task as fresh data.
+    #[tokio::test]
+    async fn client_reply_timeout_poisons_connection() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2500)).await; // miss the 1s deadline
+            let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+            let _ = server.send(&tensor).await; // late reply — client may have hung up
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let first = client.recv_reply().await;
+        let second = client.recv().await;
+        h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            first.is_err(),
+            "the late reply must time out, got {first:?}"
+        );
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "a poisoned connection must fail fast, not serve the stale frame: {second:?}"
+        );
+    }
+
     /// Once a frame has started, a stalled peer must still hit the timeout
     /// (slow-loris / wedged-peer bound is preserved).
     #[tokio::test]
