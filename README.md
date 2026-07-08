@@ -172,13 +172,13 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 
 ## Deploying
 
-Cascadia does not daemonize itself, so it needs to be ran under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Cascadia handles `SIGTERM` cleanly.
+Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Cascadia handles `SIGTERM` cleanly.
 
 **Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [SECURITY.md](SECURITY.md) for the threat model and built-in hardening.
 
 ## Troubleshooting
 
-`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
+**`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
 
 **`could not connect to … within 30s`**: start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
