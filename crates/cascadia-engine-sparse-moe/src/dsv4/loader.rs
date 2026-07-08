@@ -240,6 +240,18 @@ fn load_stage_inner(
         .copied()
         .filter(|&li| li >= lo && li < hi)
         .collect();
+    // The stage MUST cover its whole [lo, hi) range. A manifest whose
+    // exported_layers misses part of the range (e.g. a stale per-layer
+    // manifest left behind by an incremental export) would otherwise load
+    // silently with missing layers and generate deterministic garbage.
+    let want: Vec<usize> = (lo..hi).collect();
+    if stage_layers != want {
+        return Err(LoadError::Manifest(format!(
+            "stage [{lo},{hi}) needs layers {want:?} but manifest exported_layers \
+             covers only {stage_layers:?} (full list: {:?}) — stale or partial manifest?",
+            m.exported_layers
+        )));
+    }
     let mut layers = Vec::with_capacity(stage_layers.len());
     for &li in &stage_layers {
         let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
