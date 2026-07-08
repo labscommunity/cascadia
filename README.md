@@ -58,11 +58,11 @@ There are follow-up steps for performing real inference in **[QUICKSTART.md](QUI
 **Prebuilt bundles** for Linux and Windows x86_64 are on the [Releases page](https://github.com/labscommunity/cascadia/releases): binary + OpenVINO runtime libraries, ready to run. Building from source instead has two modes:
 
 ```bash
-# Stub mode — Rust only. Good for dev / CI on macOS / Linux / Windows.
+# Stub mode. Rust only. Good for dev / CI on macOS / Linux / Windows.
 # Engines that need OpenVINO return a clean runtime error.
 cargo build --release -p cascadia
 
-# Real OpenVINO mode — links against openvino-genai 2026.2.0+. Required
+# Real OpenVINO mode. Links against openvino-genai 2026.2.0+. Required
 # for inference on real Intel hardware.
 INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
@@ -82,7 +82,7 @@ Prerequisites:
 ### Single machine
 
 ```bash
-# `run` is single-machine sugar — picks the ov-genai engine, GPU device,
+# `run` is single-machine sugar, picks the ov-genai engine, GPU device,
 # and an OpenAI API on :8000. The model is fetched from HuggingFace on
 # first use and cached under ~/.cache/cascadia/models/.
 cascadia run unsloth/Meta-Llama-3.1-8B-Instruct
@@ -110,7 +110,7 @@ cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
              --num-stages 2 --quantization int4
 ```
 
-Copy the output directory to each node (`scp -r` / `rsync`), or re-shard separately on each node — whichever is faster on your network. Then run one worker per node — **start the last stage first** so the first stage finds it (if it isn't up yet, the first stage prints a clear "waiting for downstream peer" line and retries):
+Copy the output directory to each node (`scp -r` / `rsync`), or re-shard separately on each node, whichever is faster on your network. Then run one worker per node: **start the last stage first** so the first stage finds it (if it isn't up yet, the first stage prints a clear "waiting for downstream peer" line and retries):
 
 ```bash
 # Node B (last stage, listens for activations):
@@ -141,33 +141,33 @@ $ cascadia engines
   qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards
 ```
 
-`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output — see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
+`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
 
 ### Supported model families
 
 `cascadia shard` works today with Llama (1–3.3), Mistral (7B, NeMo, Small 3.x text), Qwen2 / Qwen2.5, Qwen3 dense, DeepSeek R1 Distills (Qwen and Llama variants), Phi-3, Phi-4 / Phi-4-mini (partial rotary), and Gemma 1 / Gemma 2 (logit softcapping + the 4-norm structure; sliding-window attention is treated as full-causal, so output is exact within the window). Gemma 4 (E2B / E4B / 31B) exports through a dedicated path (`tools/export_gemma4.py`, auto-dispatched by `cascadia shard`).
 
-Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia shard` dispatches it to a dedicated IR-surgery exporter and it serves through the `qwen36-moe` engine ([docs/architectures/qwen36-moe-support.md](docs/architectures/qwen36-moe-support.md)). Other mixture-of-experts and architecturally-incompatible families — Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the Gemma 4 26B-A4B MoE variant, and Mamba hybrids — are detected and rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md) and [docs/architectures/](docs/architectures/) for the full per-family status table and deep-dives.
+Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia shard` dispatches it to a dedicated IR-surgery exporter and it serves through the `qwen36-moe` engine ([docs/architectures/qwen36-moe-support.md](docs/architectures/qwen36-moe-support.md)). Other mixture-of-experts and architecturally-incompatible families like Llama 4, Qwen3-MoE, Mixtral, gpt-oss, full DeepSeek-V2/V3, Gemma 3, the Gemma 4 26B-A4B MoE variant, and Mamba hybrids are detected and rejected up front with a clear error. See [docs/SHARDING.md](docs/SHARDING.md) and [docs/architectures/](docs/architectures/) for the full per-family status table and deep-dives.
 
 ## Architecture
 
 Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` traits in `cascadia-engine` are the plugin seam. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for design rationale and per-crate responsibilities. Key crates:
 
-- `cascadia-api/` — OpenAI-compatible HTTP (axum)
-- `cascadia-runner/` — Per-stage runner; concurrent-safe chunk streaming
-- `cascadia-engine/` — `Engine` + `Builder` traits — the plugin seam
-- `cascadia-engine-openvino/` — Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen36-moe`)
-- `cascadia-engine-sparse-moe/` — Sparse-MoE engine; routes only the top-k experts per token
-- `cascadia-int4-gemm/` — hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
-- `cascadia-ov-genai-shim/` — C++ FFI shim wrapping `openvino-genai`
-- `cascadia-transport/` — TCP activation relay (length-prefixed tensor wire format)
-- `cascadia-topology/` — Per-link latency + bandwidth measurements
-- `cascadia-discovery/` — mDNS peer discovery on `_cascadia._tcp.local.`
+- `cascadia-api/`: OpenAI-compatible HTTP (axum)
+- `cascadia-runner/`: Per-stage runner; concurrent-safe chunk streaming
+- `cascadia-engine/`: `Engine` + `Builder` traits (the plugin seam)
+- `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen36-moe`)
+- `cascadia-engine-sparse-moe/`: Sparse-MoE engine; routes only the top-k experts per token
+- `cascadia-int4-gemm/`: hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
+- `cascadia-ov-genai-shim/`: C++ FFI shim wrapping `openvino-genai`
+- `cascadia-transport/`: TCP activation relay (length-prefixed tensor wire format)
+- `cascadia-topology/`: Per-link latency + bandwidth measurements
+- `cascadia-discovery/`: mDNS peer discovery on `_cascadia._tcp.local.`
 
 ### Cluster status
 
-- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN, but workers still need explicit ranks — full auto-ring formation is not yet wired into `cascadia worker` (tracked in [#89](https://github.com/labscommunity/cascadia/issues/89)).
-- **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host and writes `device_profile.json` — step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
+- **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN, but workers still need explicit ranks, full auto-ring formation is not yet wired into `cascadia worker` (tracked in [#89](https://github.com/labscommunity/cascadia/issues/89)).
+- **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host and writes `device_profile.json`, step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
 - **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/TENSOR_PARALLELISM.md](docs/TENSOR_PARALLELISM.md).
 
 ## Deploying
