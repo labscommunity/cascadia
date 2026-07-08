@@ -145,7 +145,11 @@ jobs:
           # Load the bundled .so's at runtime from a lib/ dir beside the binary.
           # $ORIGIN is a literal token for the dynamic loader — GitHub does not
           # shell-expand env values, so it reaches ld intact.
-          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib"
+          # --disable-new-dtags emits DT_RPATH rather than DT_RUNPATH: RUNPATH
+          # only covers the binary's own NEEDED entries, while libopenvino.so
+          # (which carries no runpath) must still resolve libtbb.so.12 from
+          # the same lib/ dir. RPATH applies to those transitive lookups too.
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
         run: cargo build --release -p cascadia --features openvino
 
       - name: Package bundle
