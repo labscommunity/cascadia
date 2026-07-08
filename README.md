@@ -13,27 +13,28 @@
 
 ---
 
-Cascadia distributes LLM inference across Intel laptops, desktops, and AI PCs. Shard a model across the machines you already have and serve it through an OpenAI-compatible API — no cloud, no NVIDIA GPUs required.
+Cascadia distributes LLM inference across Intel laptops, desktops, and AI PCs. Shard a model across the machines you already have and serve it through an OpenAI-compatible API. No cloud or NVIDIA GPUs required.
 
 Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, and require sending your data offsite. Cascadia lets you point a few Intel machines at each other and run models that none of them could handle alone.
 
 ## Features
 
-- **OpenAI-compatible API** — `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
-- **Pipeline parallelism** — shard a model into stages and run each stage on a different machine, activations relayed over TCP
-- **Built-in sharder** — `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
-- **Seven engines** — `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6 and MiniMax-M2, and `qwen36-moe` for Qwen3.6's hybrid MoE
-- **Single static binary per node** — Rust only at runtime; no Python on workers
-- **Zero-config peer discovery** — `cascadia discover` finds LAN peers over mDNS
-- **`cascadia doctor`** — diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
+- **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
+- **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
+- **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
+- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models like Kimi K2.6 and MiniMax-M2, and `qwen36-moe` for Qwen3.6's hybrid MoE
+- **Single static binary per node**: Rust only at runtime; no Python on workers
+- **Zero-config peer discovery**: `cascadia discover` finds LAN peers over mDNS
+- **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
 
-**Status: pre-alpha.** Working on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake) and Arc B-series (Battlemage) discrete GPUs. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
+> [!NOTE]
+> Cascadia is in **pre-alpha status**. It works on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake) and Arc B-series (Battlemage) discrete GPUs. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
 
 ## Quick start
 
-**On an Intel machine?** Grab a self-contained bundle from [Releases](https://github.com/labscommunity/cascadia/releases) — OpenVINO runtime included, no build, no SDK. Unzip and run `cascadia doctor`.
+**On an Intel machine?** Grab a self-contained bundle from [Releases](https://github.com/labscommunity/cascadia/releases): OpenVINO runtime included, no build, no SDK. Unzip and run `cascadia doctor`.
 
-Or the 5-minute source path — no OpenVINO, works on any machine with Rust:
+Or build from source. You must have Rust installed; OpenVINO isn't required, and Cascadia will mock responses:
 
 ```bash
 cargo build --release -p cascadia
@@ -48,11 +49,13 @@ curl http://localhost:8000/v1/chat/completions -d '{
 }'
 ```
 
-A JSON chat-completion back means the full path (API → engine → streaming) works. **[QUICKSTART.md](QUICKSTART.md)** walks this through, then real inference.
+If you receive a JSON chat-completion back, it means the full path (API → engine → streaming) works.
+
+There are follow-up steps for performing real inference in **[QUICKSTART.md](QUICKSTART.md)**.
 
 ## Installation
 
-**Prebuilt bundles** for Linux and Windows x86_64 are on the [Releases page](https://github.com/labscommunity/cascadia/releases) — binary + OpenVINO runtime libraries, ready to run. Building from source instead has two modes:
+**Prebuilt bundles** for Linux and Windows x86_64 are on the [Releases page](https://github.com/labscommunity/cascadia/releases): binary + OpenVINO runtime libraries, ready to run. Building from source instead has two modes:
 
 ```bash
 # Stub mode — Rust only. Good for dev / CI on macOS / Linux / Windows.
@@ -65,9 +68,14 @@ INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
   cargo build --release -p cascadia --features openvino
 ```
 
-Prerequisites: Rust 1.85+; for `--features openvino`, a C++ toolchain (VS 2022 Build Tools on Windows, `g++` ≥ 12 on Linux) plus the OpenVINO GenAI SDK. **[INSTALL.md](INSTALL.md)** has download links, the Linux GPU-runtime steps (`./scripts/setup-openvino.sh` automates them), and the Docker image.
+Prerequisites: 
+- Rust 1.85+; for `--features openvino`
+- A C++ toolchain (VS 2022 Build Tools on Windows, `g++` ≥ 12 on Linux) and the OpenVINO GenAI SDK
 
-> After building, run **`cascadia doctor`**. On Intel AI PCs the GPU can be invisible to OpenVINO even with a working driver, and that failure is otherwise silent — you just get slow CPU inference. `doctor` makes it loud and tells you how to fix it.
+**[INSTALL.md](INSTALL.md)** has download links, the Linux GPU-runtime steps (`./scripts/setup-openvino.sh` automates them), and the Docker image.
+
+> [!IMPORTANT]
+> After building, run **`cascadia doctor`**. On Intel AI PCs, the GPU can be invisible to OpenVINO even with a working driver. That failure is otherwise silent (you would just get slow CPU inference). `doctor` detects the problem and tells you how to fix it.
 
 ## Usage
 
@@ -164,19 +172,19 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 
 ## Deploying
 
-Cascadia does not daemonize itself — run it under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Cascadia handles `SIGTERM` cleanly.
+Cascadia does not daemonize itself, so it needs to be ran under systemd / NSSM / launchd. See [`docs/deploy/`](docs/deploy/) for a systemd unit template and Windows / macOS recipes. Cascadia handles `SIGTERM` cleanly.
 
 **Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [SECURITY.md](SECURITY.md) for the threat model and built-in hardening.
 
 ## Troubleshooting
 
-**`config.json not in <model dir>`** — `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
+`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
 
-**`could not connect to … within 30s`** — Start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
+**`could not connect to … within 30s`**: start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
-**Worker dies silently when SSH session closes** — On Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production.
+**Worker dies silently when SSH session closes**: on Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production.
 
-`cascadia doctor` diagnoses most environment/hardware issues before they bite.
+`cascadia doctor` diagnoses most other environment/hardware issues.
 
 ## Documentation
 
@@ -193,8 +201,10 @@ Cascadia does not daemonize itself — run it under systemd / NSSM / launchd. Se
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, and commit conventions. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test gate, crate layout, and commit conventions.
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Apache-2.0 (see [LICENSE](LICENSE)). Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
