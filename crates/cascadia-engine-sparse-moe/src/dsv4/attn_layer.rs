@@ -16,17 +16,23 @@
 
 use super::compress::Compressor;
 use super::indexer::Indexer;
-use super::math::{act_quant_sim, linear_bf16, rms_normalize, rmsnorm, to_bf16};
+use super::math::{
+    act_quant_sim, dot_bf16w, linear_bf16_w, rms_normalize, rmsnorm, to_bf16,
+};
 use super::rope::{apply_rope_row, Freqs};
 
 pub struct AttnWeights {
-    pub wq_a: Vec<f32>,      // [q_lora, dim]
+    // Projection weights are stored as bf16 bits (`u16`): at batch=1 these
+    // GEMVs are memory-bandwidth-bound, and the model is bf16-native, so
+    // halving the bytes streamed ~halves the projection cost for free. The
+    // GEMV widens each weight back to f32 on the fly (`math::dot_bf16w`).
+    pub wq_a: Vec<u16>,      // [q_lora, dim]
     pub q_norm_w: Vec<f32>,  // [q_lora]
-    pub wq_b: Vec<f32>,      // [h*hd, q_lora]
-    pub wkv: Vec<f32>,       // [hd, dim]
+    pub wq_b: Vec<u16>,      // [h*hd, q_lora]
+    pub wkv: Vec<u16>,       // [hd, dim]
     pub kv_norm_w: Vec<f32>, // [hd]
-    pub wo_a: Vec<f32>,      // [groups*o_lora, h*hd/groups]
-    pub wo_b: Vec<f32>,      // [dim, groups*o_lora]
+    pub wo_a: Vec<u16>,      // [groups*o_lora, h*hd/groups]
+    pub wo_b: Vec<u16>,      // [dim, groups*o_lora]
     pub sink: Vec<f32>,      // [h]
 }
 
@@ -110,7 +116,7 @@ impl AttentionLayer {
     /// q_norm(wq_a(x)) — also feeds the indexer. [q_lora]
     fn qr_row(&self, x: &[f32]) -> Vec<f32> {
         let mut qr = vec![0.0f32; self.q_lora];
-        linear_bf16(x, &self.w.wq_a, self.q_lora, self.dim, &mut qr);
+        linear_bf16_w(x, &self.w.wq_a, self.q_lora, self.dim, &mut qr);
         rmsnorm(&mut qr, &self.w.q_norm_w, self.eps);
         qr
     }
@@ -119,7 +125,7 @@ impl AttentionLayer {
     fn q_row(&self, qr: &[f32], pos: usize) -> Vec<f32> {
         let (h, hd) = (self.h, self.hd);
         let mut q = vec![0.0f32; h * hd];
-        linear_bf16(qr, &self.w.wq_b, h * hd, self.q_lora, &mut q);
+        linear_bf16_w(qr, &self.w.wq_b, h * hd, self.q_lora, &mut q);
         rms_normalize(&mut q, hd, self.eps);
         for hi in 0..h {
             apply_rope_row(
@@ -136,7 +142,7 @@ impl AttentionLayer {
     /// kv latent for one token at `pos`: [hd], normed + roped + FP8 sim.
     fn kv_row(&self, x: &[f32], pos: usize) -> Vec<f32> {
         let mut kv = vec![0.0f32; self.hd];
-        linear_bf16(x, &self.w.wkv, self.hd, self.dim, &mut kv);
+        linear_bf16_w(x, &self.w.wkv, self.hd, self.dim, &mut kv);
         rmsnorm(&mut kv, &self.w.kv_norm_w, self.eps);
         apply_rope_row(&mut kv, &self.freqs, pos, self.rd, false);
         let non_rope = self.hd - self.rd;
@@ -162,15 +168,11 @@ impl AttentionLayer {
             let og = &o[g * gd..(g + 1) * gd];
             for r in 0..o_lora {
                 let row = &self.w.wo_a[(g * o_lora + r) * gd..(g * o_lora + r + 1) * gd];
-                let mut acc = 0.0f32;
-                for k in 0..gd {
-                    acc += og[k] * row[k];
-                }
-                mid[g * o_lora + r] = to_bf16(acc);
+                mid[g * o_lora + r] = to_bf16(dot_bf16w(row, og));
             }
         }
         let mut out = vec![0.0f32; self.dim];
-        linear_bf16(&mid, &self.w.wo_b, self.dim, groups * o_lora, &mut out);
+        linear_bf16_w(&mid, &self.w.wo_b, self.dim, groups * o_lora, &mut out);
         out
     }
 

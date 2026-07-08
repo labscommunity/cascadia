@@ -256,6 +256,11 @@ fn load_stage_inner(
     for &li in &stage_layers {
         let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
         let g = |n: &str| st.f32(n).map(|t| t.1);
+        // Projection weights are stored bf16 in memory (half the streamed
+        // bytes at batch=1); downcast the f32 tensor to bf16 bits on load.
+        let gb = |n: &str| -> Result<Vec<u16>, LoadError> {
+            Ok(g(n)?.iter().map(|v| bf16::from_f32(*v).to_bits()).collect())
+        };
         let ratio = m.compress_ratios[li];
         let is_hash = li < m.n_hash_layers;
 
@@ -338,13 +343,13 @@ fn load_stage_inner(
             max_seq,
             m.rms_norm_eps,
             AttnWeights {
-                wq_a: g("attn.wq_a.weight")?,
+                wq_a: gb("attn.wq_a.weight")?,
                 q_norm_w: g("attn.q_norm.weight")?,
-                wq_b: g("attn.wq_b.weight")?,
-                wkv: g("attn.wkv.weight")?,
+                wq_b: gb("attn.wq_b.weight")?,
+                wkv: gb("attn.wkv.weight")?,
                 kv_norm_w: g("attn.kv_norm.weight")?,
-                wo_a: g("attn.wo_a.weight")?,
-                wo_b: g("attn.wo_b.weight")?,
+                wo_a: gb("attn.wo_a.weight")?,
+                wo_b: gb("attn.wo_b.weight")?,
                 sink: g("attn.attn_sink")?,
             },
             comp,

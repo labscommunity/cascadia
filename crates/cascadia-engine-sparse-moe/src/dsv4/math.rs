@@ -268,6 +268,85 @@ pub fn linear_bf16(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut 
     });
 }
 
+/// Dot of bf16-bit weights `w` with f32 activations `x`. The weights are read
+/// as 2-byte bf16 — half the memory traffic of an f32 row, which is the whole
+/// point on the batch-1 attention projections (bandwidth-bound). Each weight
+/// widens to f32 by the exact `<<16` bit expansion (bf16 is the top 16 bits of
+/// an f32), then multiplies in f32. AVX2 widens 8 lanes per instruction; the
+/// scalar fallback (non-x86 dev hosts) sums left-to-right so it matches a
+/// `to_bf16`-then-`dot_scalar` weight exactly — the tiny goldens stay stable.
+pub fn dot_bf16w(w: &[u16], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-gated at runtime; both reads are bounded by `n`.
+            return unsafe { dot_bf16w_avx2(w, x) };
+        }
+    }
+    dot_bf16w_scalar(w, x)
+}
+
+#[inline]
+fn dot_bf16w_scalar(w: &[u16], x: &[f32]) -> f32 {
+    let n = w.len().min(x.len());
+    let mut acc = 0.0f32;
+    for k in 0..n {
+        acc += f32::from_bits((w[k] as u32) << 16) * x[k];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16w_avx2(w: &[u16], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let (pw, px) = (w.as_ptr(), x.as_ptr());
+    let widen = |p: *const u16| -> __m256 {
+        // load 8 bf16 bits -> zero-extend to u32 -> <<16 -> reinterpret f32
+        let bits = _mm_loadu_si128(p as *const __m128i);
+        _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16))
+    };
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        acc0 = _mm256_fmadd_ps(widen(pw.add(i)), _mm256_loadu_ps(px.add(i)), acc0);
+        acc1 = _mm256_fmadd_ps(widen(pw.add(i + 8)), _mm256_loadu_ps(px.add(i + 8)), acc1);
+        i += 16;
+    }
+    while i + 8 <= n {
+        acc0 = _mm256_fmadd_ps(widen(pw.add(i)), _mm256_loadu_ps(px.add(i)), acc0);
+        i += 8;
+    }
+    let acc = _mm256_add_ps(acc0, acc1);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s);
+    let sums = _mm_add_ps(s, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < n {
+        total += f32::from_bits((*pw.add(i) as u32) << 16) * *px.add(i);
+        i += 1;
+    }
+    total
+}
+
+/// [`linear_bf16`] with bf16-bit-stored weights (half the weight bandwidth).
+/// Used for the attention projections, whose f32 weights dominated decode.
+pub fn linear_bf16_w(x: &[f32], w: &[u16], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(w.len(), out_dim * in_dim);
+    assert_eq!(y.len(), out_dim);
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        *yy = to_bf16(dot_bf16w(row, x));
+    });
+}
+
 /// Same as [`linear_bf16`] but keeps the output in f32 (for the fp32 paths:
 /// gate scores, compressor wkv/wgate). Bit-identical rayon parallelisation.
 pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {

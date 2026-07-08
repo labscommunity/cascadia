@@ -46,15 +46,22 @@ fn assert_close(name: &str, got: &[f32], want: &[f32], atol: f32, rtol: f32) {
 
 fn build_layer(fx: &StFile, li: usize) -> AttentionLayer {
     let g = |suf: &str| fx.f32(&format!("int.w.layers.{li}.attn.{suf}")).unwrap().1;
+    // projection weights are stored bf16 (see AttnWeights)
+    let gb = |suf: &str| {
+        g(suf)
+            .iter()
+            .map(|v| half::bf16::from_f32(*v).to_bits())
+            .collect::<Vec<u16>>()
+    };
     let ratio = RATIOS[li];
     let w = AttnWeights {
-        wq_a: g("wq_a.weight"),
+        wq_a: gb("wq_a.weight"),
         q_norm_w: g("q_norm.weight"),
-        wq_b: g("wq_b.weight"),
-        wkv: g("wkv.weight"),
+        wq_b: gb("wq_b.weight"),
+        wkv: gb("wkv.weight"),
         kv_norm_w: g("kv_norm.weight"),
-        wo_a: g("wo_a.weight"),
-        wo_b: g("wo_b.weight"),
+        wo_a: gb("wo_a.weight"),
+        wo_b: gb("wo_b.weight"),
         sink: g("attn_sink"),
     };
     let comp = (ratio > 0).then(|| {

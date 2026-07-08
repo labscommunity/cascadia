@@ -56,15 +56,22 @@ fn build_model(fx: &StFile) -> DsV4Model {
     let mut layers = Vec::new();
     for li in 0..4 {
         let ga = |suf: &str| g(&format!("layers.{li}.attn.{suf}"));
+        // projection weights are stored bf16 (see AttnWeights)
+        let gab = |suf: &str| {
+            ga(suf)
+                .iter()
+                .map(|v| half::bf16::from_f32(*v).to_bits())
+                .collect::<Vec<u16>>()
+        };
         let ratio = RATIOS[li];
         let attn_w = AttnWeights {
-            wq_a: ga("wq_a.weight"),
+            wq_a: gab("wq_a.weight"),
             q_norm_w: ga("q_norm.weight"),
-            wq_b: ga("wq_b.weight"),
-            wkv: ga("wkv.weight"),
+            wq_b: gab("wq_b.weight"),
+            wkv: gab("wkv.weight"),
             kv_norm_w: ga("kv_norm.weight"),
-            wo_a: ga("wo_a.weight"),
-            wo_b: ga("wo_b.weight"),
+            wo_a: gab("wo_a.weight"),
+            wo_b: gab("wo_b.weight"),
             sink: ga("attn_sink"),
         };
         let comp = (ratio > 0).then(|| {
