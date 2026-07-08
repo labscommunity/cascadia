@@ -173,32 +173,40 @@ pub fn hadamard(x: &mut [f32], dim: usize, scale: f32) {
 
 /// f32 GEMV: y[o] = sum_k w[o*k_dim + k] * x[k]; output bf16-rounded
 /// (the reference's F.linear on bf16 rounds its output to bf16).
+///
+/// Output rows are independent, so we split them across cores with rayon.
+/// The per-row accumulation order is unchanged, so the result is BIT-IDENTICAL
+/// to the sequential version — this is pure throughput, no numerics change.
+/// The MoE experts + every attention projection funnel through here, so this
+/// is where the CPU time is; a single scalar thread was using 1/8 of the box.
 pub fn linear_bf16(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
     assert_eq!(x.len(), in_dim);
     assert_eq!(w.len(), out_dim * in_dim);
     assert_eq!(y.len(), out_dim);
-    for o in 0..out_dim {
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
         let row = &w[o * in_dim..(o + 1) * in_dim];
         let mut acc = 0.0f32;
         for k in 0..in_dim {
             acc += row[k] * x[k];
         }
-        y[o] = to_bf16(acc);
-    }
+        *yy = to_bf16(acc);
+    });
 }
 
 /// Same as [`linear_bf16`] but keeps the output in f32 (for the fp32 paths:
-/// gate scores, compressor wkv/wgate).
+/// gate scores, compressor wkv/wgate). Bit-identical rayon parallelisation.
 pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
     assert_eq!(x.len(), in_dim);
     assert_eq!(w.len(), out_dim * in_dim);
     assert_eq!(y.len(), out_dim);
-    for o in 0..out_dim {
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
         let row = &w[o * in_dim..(o + 1) * in_dim];
         let mut acc = 0.0f32;
         for k in 0..in_dim {
             acc += row[k] * x[k];
         }
-        y[o] = acc;
-    }
+        *yy = acc;
+    });
 }

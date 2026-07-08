@@ -48,15 +48,21 @@ impl MmapExpert {
 
     /// y = W x with W dequantized row-by-row; y[o] rounded to bf16 exactly
     /// like `linear_bf16` over an eagerly-dequantized W.
+    ///
+    /// Output rows are independent: dequant + dot each on its own core (rayon),
+    /// with a per-row scratch buffer. Bit-identical to the sequential version
+    /// (same per-row accumulation order), just spread across the CPU — this is
+    /// the real-model MoE hot path (256 experts, mmap int4).
     fn gemv(&self, sec_off: usize, out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]) {
+        use rayon::prelude::*;
         debug_assert_eq!(x.len(), in_dim);
         debug_assert_eq!(y.len(), out_dim);
         let ng = in_dim / G;
         let packed = &self.mmap[sec_off..sec_off + out_dim * in_dim / 2];
         let scales = &self.mmap
             [sec_off + out_dim * in_dim / 2..sec_off + out_dim * in_dim / 2 + out_dim * ng * 2];
-        let mut row = vec![0.0f32; in_dim];
-        for o in 0..out_dim {
+        y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+            let mut row = vec![0.0f32; in_dim];
             // dequant row `o` (same decode as loader::dequant_int4)
             for g in 0..ng {
                 let s =
@@ -74,8 +80,8 @@ impl MmapExpert {
             for k in 0..in_dim {
                 acc += row[k] * x[k];
             }
-            y[o] = to_bf16(acc);
-        }
+            *yy = to_bf16(acc);
+        });
     }
 
     /// Mirror of `Expert::forward`: silu(clamp(w1 x)) * clamp(w3 x)

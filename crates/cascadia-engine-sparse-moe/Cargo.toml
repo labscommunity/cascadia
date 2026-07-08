@@ -30,6 +30,7 @@ tokenizers = { workspace = true }
 half = "2"
 lru = "0.12"
 memmap2 = "0.9"
+rayon = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
