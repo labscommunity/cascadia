@@ -132,6 +132,7 @@ fn gather_node_specs() -> NodeSpecs {
 #[derive(Parser, Debug)]
 #[command(
     name = "cascadia",
+    version,
     about = "Distributed LLM inference for Intel hardware",
     long_about = "Distributed LLM inference for Intel hardware.\n\n\
         SECURITY: cascadia's HTTP API and inter-stage TCP relay are \
@@ -1860,5 +1861,18 @@ mod ov_property_tests {
         args.ov_performance_mode = Some(OvPerformanceMode::Latency);
         let props = ov_perf_properties(&args);
         assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+    }
+}
+
+#[cfg(test)]
+mod cli_version_tests {
+    use super::*;
+
+    #[test]
+    fn version_flag_reports_the_workspace_version() {
+        let err = Cli::try_parse_from(["cascadia", "--version"])
+            .expect_err("--version stops parsing with a DisplayVersion error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 }
