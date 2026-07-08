@@ -171,6 +171,84 @@ pub fn hadamard(x: &mut [f32], dim: usize, scale: f32) {
     }
 }
 
+/// f32 dot product, AVX2+FMA when the CPU has it (8 lanes) else scalar.
+/// The vectorised reduction sums in a different order than the scalar
+/// left-to-right loop, so results differ by ULPs — the model tolerates that
+/// (the same arch already runs coherently under AVX-512 vs scalar). Hosts
+/// without AVX2 (e.g. arm64 dev machines) take the scalar path, so the golden
+/// tests stay bit-identical there.
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-gated at runtime; slices are the same length.
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    dot_scalar(a, b)
+}
+
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for k in 0..a.len() {
+        acc += a[k] * b[k];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    // 4 independent accumulators hide FMA latency; 32 elems/iter.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 8)),
+            _mm256_loadu_ps(pb.add(i + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 16)),
+            _mm256_loadu_ps(pb.add(i + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 24)),
+            _mm256_loadu_ps(pb.add(i + 24)),
+            acc3,
+        );
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+        i += 8;
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    // horizontal sum of the 8 lanes
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s);
+    let sums = _mm_add_ps(s, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < n {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
 /// f32 GEMV: y[o] = sum_k w[o*k_dim + k] * x[k]; output bf16-rounded
 /// (the reference's F.linear on bf16 rounds its output to bf16).
 ///
@@ -186,11 +264,7 @@ pub fn linear_bf16(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut 
     assert_eq!(y.len(), out_dim);
     y.par_iter_mut().enumerate().for_each(|(o, yy)| {
         let row = &w[o * in_dim..(o + 1) * in_dim];
-        let mut acc = 0.0f32;
-        for k in 0..in_dim {
-            acc += row[k] * x[k];
-        }
-        *yy = to_bf16(acc);
+        *yy = to_bf16(dot(row, x));
     });
 }
 
@@ -203,10 +277,6 @@ pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [
     assert_eq!(y.len(), out_dim);
     y.par_iter_mut().enumerate().for_each(|(o, yy)| {
         let row = &w[o * in_dim..(o + 1) * in_dim];
-        let mut acc = 0.0f32;
-        for k in 0..in_dim {
-            acc += row[k] * x[k];
-        }
-        *yy = acc;
+        *yy = dot(row, x);
     });
 }

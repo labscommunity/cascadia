@@ -61,27 +61,34 @@ impl MmapExpert {
         let packed = &self.mmap[sec_off..sec_off + out_dim * in_dim / 2];
         let scales = &self.mmap
             [sec_off + out_dim * in_dim / 2..sec_off + out_dim * in_dim / 2 + out_dim * ng * 2];
-        y.par_iter_mut().enumerate().for_each(|(o, yy)| {
-            let mut row = vec![0.0f32; in_dim];
-            // dequant row `o` (same decode as loader::dequant_int4)
-            for g in 0..ng {
-                let s =
-                    bf16::from_le_bytes([scales[(o * ng + g) * 2], scales[(o * ng + g) * 2 + 1]])
+        // Chunk the output rows so each rayon task reuses ONE dequant scratch
+        // (a per-row alloc was thousands of mallocs per GEMV). Within a chunk,
+        // dequant row -> AVX2 dot -> bf16 round, same order as the scalar path.
+        let chunk = 32usize;
+        y.par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, ychunk)| {
+                let mut row = vec![0.0f32; in_dim];
+                for (j, yy) in ychunk.iter_mut().enumerate() {
+                    let o = ci * chunk + j;
+                    // dequant row `o` (same decode as loader::dequant_int4)
+                    for g in 0..ng {
+                        let s = bf16::from_le_bytes([
+                            scales[(o * ng + g) * 2],
+                            scales[(o * ng + g) * 2 + 1],
+                        ])
                         .to_f32();
-                for i in 0..G / 2 {
-                    let byte = packed[o * in_dim / 2 + g * G / 2 + i];
-                    let lo = (byte & 0x0F) as i32 - 8;
-                    let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-                    row[g * G + 2 * i] = lo as f32 * s;
-                    row[g * G + 2 * i + 1] = hi as f32 * s;
+                        for i in 0..G / 2 {
+                            let byte = packed[o * in_dim / 2 + g * G / 2 + i];
+                            let lo = (byte & 0x0F) as i32 - 8;
+                            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+                            row[g * G + 2 * i] = lo as f32 * s;
+                            row[g * G + 2 * i + 1] = hi as f32 * s;
+                        }
+                    }
+                    *yy = to_bf16(super::math::dot(&row, x));
                 }
-            }
-            let mut acc = 0.0f32;
-            for k in 0..in_dim {
-                acc += row[k] * x[k];
-            }
-            *yy = to_bf16(acc);
-        });
+            });
     }
 
     /// Mirror of `Expert::forward`: silu(clamp(w1 x)) * clamp(w3 x)

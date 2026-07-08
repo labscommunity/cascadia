@@ -396,6 +396,7 @@ dependencies = [
  "half",
  "lru",
  "memmap2",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
