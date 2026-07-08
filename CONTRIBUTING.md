@@ -56,6 +56,17 @@ These are **non-negotiable** for this repo:
   `main` (`feat/<short-desc>-<issue#>`), open a PR into `main`, reference
   the issue.
 
+## Releases (maintainers)
+
+Releases are automated by release-please from the Conventional Commits
+above — another reason they're non-negotiable. On every push to `main` it
+maintains a `chore(main): release X.Y.Z` PR carrying the version bump,
+`CHANGELOG.md`, and `Cargo.lock`. **Merging that PR is the release**: the same run tags
+`vX.Y.Z`, publishes a pre-release, builds the Linux + Windows OpenVINO
+bundles, attaches them, and promotes to a full release. Wrong version
+proposed? Edit the release PR. Hotfix path: push a `v*` tag by hand and
+`release.yml` builds it directly.
+
 ## Filing issues
 
 Search existing issues/PRs first. For OpenVINO-related bugs, note the

@@ -1,0 +1,99 @@
+# release-please — versioning + changelog + release orchestration for cascadia.
+#
+# Driven by Conventional Commits. Two things happen here:
+#
+#   * Every push to main → release-please opens/updates ONE release PR that
+#     bumps the workspace version (Cargo.toml marker + manifest), refreshes
+#     Cargo.lock, and rewrites CHANGELOG.md. Merging feature PRs does NOT
+#     release; changes accumulate in that PR.
+#   * When the release PR is merged, release-please creates the tag `vX.Y.Z`
+#     and a GitHub Release marked PRE-RELEASE, then the build job (the reusable
+#     release.yml, same run) builds the binary bundles, attaches them, and
+#     promotes the release to a full release. A release only loses its
+#     pre-release badge once both bundles are attached.
+#
+# Chosen over release-plz: release-please never touches cargo registries or
+# runs `cargo package`, so it works for this never-published workspace
+# (release-plz cannot release publish=false crates today — see its #2595/#2789).
+# The release is published (not draft) because draft releases don't create git
+# tags, which breaks both the tag checkout and release-please's own changelog
+# ranges (release-please #1650). Pre-release + promote-on-assets covers the gap.
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # push the release branch/tag, create the release
+  pull-requests: write   # open / update the release PR
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      # Actions pinned to full commit SHAs (supply-chain hardening); trailing
+      # comment records the tag, matching ci.yml / release.yml.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # release-please edits manifests as text, so it can't refresh Cargo.lock
+      # (which records every workspace member's version). Do it here whenever
+      # the release PR was created or updated.
+      - name: Refresh Cargo.lock on the release PR
+        if: steps.rp.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PRS: ${{ steps.rp.outputs.prs }}
+        run: |
+          branch="$(printf '%s' "$PRS" | jq -r '.[0].headBranchName')"
+          if [ -z "$branch" ] || [ "$branch" = "null" ]; then
+            echo "::error::could not determine release PR branch from outputs.prs"
+            exit 1
+          fi
+          # checkout ran with persist-credentials: false — authenticate explicitly.
+          auth_url="https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          git fetch "$auth_url" "$branch"
+          git checkout -B "$branch" FETCH_HEAD
+          # Metadata-only: syncs workspace member versions in the lockfile.
+          cargo update --workspace --quiet
+          if ! git diff --quiet Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "chore: refresh Cargo.lock for release"
+            git push "$auth_url" "HEAD:$branch"
+          else
+            echo "Cargo.lock already in sync"
+          fi
+
+  # Build + attach the binary bundles in the SAME run (reusable workflow), then
+  # promote the release. No dispatch needed, so the GITHUB_TOKEN retrigger
+  # restriction never comes into play.
+  build:
+    name: build bundles
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

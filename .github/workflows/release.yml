@@ -1,0 +1,279 @@
+# Build the cascadia OpenVINO binary bundles for Linux and Windows (x86_64) and
+# attach them to the GitHub Release for a `vX.Y.Z` tag.
+#
+# Three ways in:
+#   * release-please cuts a tag + pre-release, then calls this workflow in the
+#     same run (workflow_call). See release-please.yml.
+#   * A maintainer hand-pushes a `v*` tag (e.g. a hotfix) — the push trigger
+#     runs this directly and creates the pre-release itself.
+#   * Manual re-run for an existing tag via workflow_dispatch (e.g. after a
+#     build failure).
+# The final job promotes the release (drops the pre-release badge) once both
+# bundles are attached — a release is never "full" without its binaries.
+#
+# Flavor : `--features openvino` (real inference). Each bundle ships the cascadia
+#          binary PLUS the OpenVINO GenAI runtime libraries it dynamically links.
+#          The binary does NOT work standalone — see INSTALL.md.
+# Targets: linux-x86_64, windows-x86_64 (both Intel). macOS has no Intel GPU
+#          runtime — it is stub-only (dev) and intentionally not released here.
+# Runner : GitHub-hosted. The OpenVINO *build* only links against the SDK
+#          headers/libs; it does not need a GPU (a GPU is only required to *run*
+#          inference). So hosted runners suffice and releases don't depend on the
+#          self-hosted AI-PCs being online.
+#
+# ┌─ OpenVINO GenAI SDK archives ──────────────────────────────────────────────┐
+# │ Both URLs in `env:` below were probed 2026-07-06 and return HTTP 206 (they  │
+# │ exist). When bumping the version, re-confirm against the storage index:     │
+# │   https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/│
+# │ Keep the Linux archive's OS matched to the runner (ubuntu22 ↔ ubuntu-22.04) │
+# │ so the prebuilt SDK's glibc/ABI lines up with what we link against.         │
+# └────────────────────────────────────────────────────────────────────────────┘
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.0)."
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.2.0). Must already exist."
+        required: true
+        type: string
+
+# Never cancel a half-published release mid-upload. Key on the tag being built.
+# `inputs.tag` covers both workflow_call and workflow_dispatch; on tag pushes
+# it's empty and github.ref identifies the tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+# Least-privilege default; the jobs that touch the release opt into write.
+permissions:
+  contents: read
+
+env:
+  # OpenVINO GenAI SDK archives (the single source of truth for the version).
+  # To bump: edit BOTH full URLs and re-confirm them against the storage index
+  # in the header banner above.
+  OV_LINUX_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/linux/openvino_genai_ubuntu22_2026.2.0.0_x86_64.tar.gz"
+  OV_WINDOWS_URL: "https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/2026.2/windows/openvino_genai_windows_2026.2.0.0_x86_64.zip"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── Validate the tag and make sure a Release exists to upload into.
+  #    release-please normally created the pre-release already; a hand-pushed
+  #    hotfix tag won't have one, so create it here. Idempotent either way.
+  ensure-release:
+    name: validate tag + ensure release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      # The tag to build: the call/dispatch input when present, else the pushed tag.
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Validate tag and ensure a release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Reject a malformed / injected tag before anything is built or shipped.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Refusing to build a malformed tag: '$TAG' (want vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # Pre-release until the bundles are attached (the promote job flips it).
+            gh release create "$TAG" --prerelease --verify-tag \
+              --title "cascadia $TAG" --generate-notes
+          fi
+
+  build-linux:
+    name: linux-x86_64 (openvino)
+    needs: ensure-release
+    # ubuntu-22.04 → glibc 2.35 floor, and matches the ubuntu22 OV archive.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Build exactly the tagged commit on either trigger path.
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-linux-openvino
+
+      # INSTALL.md requires g++ >= 12; ubuntu-22.04 ships g++ 11 by default.
+      # cc-rs honours $CXX for the C++ shim compile.
+      - name: Install g++-12
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-12
+
+      - name: Download + extract OpenVINO GenAI SDK
+        run: |
+          mkdir -p "$RUNNER_TEMP/ov"
+          curl -fSL "$OV_LINUX_URL" -o "$RUNNER_TEMP/ov.tgz"
+          # Archive has a single top-level SDK dir; --strip-components lands its
+          # contents (runtime/, setupvars.sh, …) directly under $RUNNER_TEMP/ov.
+          tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
+          echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
+
+      - name: Build cascadia (openvino)
+        env:
+          CXX: g++-12
+          # Load the bundled .so's at runtime from a lib/ dir beside the binary.
+          # $ORIGIN is a literal token for the dynamic loader — GitHub does not
+          # shell-expand env values, so it reaches ld intact.
+          # --disable-new-dtags emits DT_RPATH rather than DT_RUNPATH: RUNPATH
+          # only covers the binary's own NEEDED entries, while libopenvino.so
+          # (which carries no runpath) must still resolve libtbb.so.12 from
+          # the same lib/ dir. RPATH applies to those transitive lookups too.
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
+        run: cargo build --release -p cascadia --features openvino
+
+      - name: Package bundle
+        id: pkg
+        run: |
+          ver="${TAG#v}"
+          name="cascadia-${ver}-linux-x86_64"
+          dest="$RUNNER_TEMP/$name"
+          mkdir -p "$dest/lib"
+          cp target/release/cascadia "$dest/"
+          # OpenVINO runtime + device plugins (INSTALL.md).
+          cp -a "$INTEL_OPENVINO_DIR/runtime/lib/intel64/." "$dest/lib/"
+          # TBB, if the SDK keeps it separate rather than under lib/intel64.
+          # Shared libraries only — the SDK dir also carries cmake/ and
+          # pkgconfig/ dev files that don't belong in a runtime bundle.
+          if [ -d "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib" ]; then
+            cp -a "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib/"lib*.so* "$dest/lib/"
+          fi
+          # Redistribution notices for the bundled Intel libraries. The 2026.2
+          # SDK keeps them in docs/licensing; unconditional so a layout change
+          # fails the build instead of silently shipping without notices.
+          cp -a "$INTEL_OPENVINO_DIR/docs/licensing" "$dest/openvino-licensing"
+          cp INSTALL.md README.md LICENSE THIRD_PARTY_NOTICES.md "$dest/"
+          tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name"
+          echo "asset=$RUNNER_TEMP/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bundle to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" "${{ steps.pkg.outputs.asset }}" --clobber
+
+  build-windows:
+    name: windows-x86_64 (openvino)
+    needs: ensure-release
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-windows-openvino
+
+      # MSVC (VS 2022 Build Tools) is preinstalled on windows-latest; cc-rs
+      # locates it via vswhere, so no Developer Command Prompt is needed here.
+      - name: Download + extract OpenVINO GenAI SDK
+        shell: pwsh
+        run: |
+          $tmp = $env:RUNNER_TEMP
+          Invoke-WebRequest -Uri $env:OV_WINDOWS_URL -OutFile "$tmp/ov.zip"
+          Expand-Archive -Path "$tmp/ov.zip" -DestinationPath "$tmp/ov_raw" -Force
+          # Archive contains a single top-level SDK folder; point the env at it.
+          $root = (Get-ChildItem -Directory "$tmp/ov_raw")[0].FullName
+          "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build cascadia (openvino)
+        shell: pwsh
+        run: cargo build --release -p cascadia --features openvino
+
+      - name: Package bundle
+        id: pkg
+        shell: pwsh
+        run: |
+          $ver  = $env:TAG -replace '^v',''
+          $name = "cascadia-$ver-windows-x86_64"
+          $dest = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $ov  = $env:INTEL_OPENVINO_DIR
+          Copy-Item target/release/cascadia.exe $dest/
+          # Windows loads DLLs from the .exe's own directory — keep them flat.
+          # openvino.dll + openvino_genai.dll + the device plugin DLLs.
+          # (No plugins.xml since OV 2026 — plugin registration is static.)
+          Copy-Item "$ov/runtime/bin/intel64/Release/*.dll" $dest/
+          # Release TBB only — the SDK ships *_debug.dll variants alongside.
+          Copy-Item "$ov/runtime/3rdparty/tbb/bin/*.dll" $dest/ -Exclude *_debug.dll
+          # Redistribution notices (see the linux job) — unconditional so a
+          # layout change fails the build, not silently drops them.
+          Copy-Item -Recurse "$ov/docs/licensing" "$dest/openvino-licensing"
+          Copy-Item INSTALL.md,README.md,LICENSE,THIRD_PARTY_NOTICES.md $dest/
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -Path $dest -DestinationPath $zip -Force
+          "asset=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload bundle to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload $env:TAG "${{ steps.pkg.outputs.asset }}" --clobber
+
+  # ── Promote once both bundles are attached: a release only loses its
+  #    pre-release badge when its binaries are verifiably present.
+  promote:
+    name: promote release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Verify assets and drop the pre-release badge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          assets="$(gh release view "$TAG" --json assets --jq '[.assets[].name] | join(" ")')"
+          echo "assets: $assets"
+          case "$assets" in
+            *linux-x86_64*windows-x86_64*|*windows-x86_64*linux-x86_64*) ;;
+            *) echo "::error::expected both linux and windows bundles on $TAG, found: $assets"; exit 1 ;;
+          esac
+          gh release edit "$TAG" --prerelease=false --latest
+          echo "release $TAG promoted"

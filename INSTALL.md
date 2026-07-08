@@ -1,13 +1,25 @@
 # Installing Cascadia
 
-Two ways to run Cascadia, depending on what you want:
+Three ways to run Cascadia, depending on what you want:
 
-| Goal | Build | Needs |
+| Goal | How | Needs |
 | --- | --- | --- |
-| Try it / develop / CI | **Stub mode** | Rust only |
-| Real inference on Intel hardware | **OpenVINO mode** | Rust + C++ toolchain + OpenVINO GenAI SDK + (Linux) GPU runtime |
+| Run it on Intel hardware | **Prebuilt bundle** (below) | an Intel driver; (Linux GPU) the runtime stack |
+| Try it / develop / CI | **Stub mode** build | Rust only |
+| Build real inference yourself | **OpenVINO mode** build | Rust + C++ toolchain + OpenVINO GenAI SDK + (Linux) GPU runtime |
 
-After any build, run **`cascadia doctor`** — it checks your toolchain and tells you whether OpenVINO can actually see your GPU (a step that fails silently otherwise).
+After any install, run **`cascadia doctor`** — it checks your toolchain and tells you whether OpenVINO can actually see your GPU (a step that fails silently otherwise).
+
+---
+
+## Prebuilt binaries (recommended)
+
+Each [GitHub Release](https://github.com/labscommunity/cascadia/releases) ships self-contained bundles with the OpenVINO runtime included — no SDK install, no `INTEL_OPENVINO_DIR`:
+
+- **Windows** — `cascadia-<ver>-windows-x86_64.zip`: unzip, run `cascadia.exe doctor`. Needs only a current Intel graphics driver (the OpenCL/GPU runtime ships inside it).
+- **Linux** — `cascadia-<ver>-linux-x86_64.tar.gz`: untar, run `./cascadia doctor`. Bundled libraries load from `lib/` beside the binary. Needs glibc 2.35+ (Ubuntu 22.04 or newer) and, for GPU inference, the Intel GPU runtime stack below (`./scripts/setup-openvino.sh`).
+
+Python is not needed to run anything — only `cascadia shard` uses it (see "Export-time Python" below).
 
 ---
 
