@@ -159,8 +159,10 @@ jobs:
           # OpenVINO runtime + device plugins (INSTALL.md).
           cp -a "$INTEL_OPENVINO_DIR/runtime/lib/intel64/." "$dest/lib/"
           # TBB, if the SDK keeps it separate rather than under lib/intel64.
+          # Shared libraries only — the SDK dir also carries cmake/ and
+          # pkgconfig/ dev files that don't belong in a runtime bundle.
           if [ -d "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib" ]; then
-            cp -a "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib/." "$dest/lib/"
+            cp -a "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib/"lib*.so* "$dest/lib/"
           fi
           # Redistribution notices for the bundled Intel libraries. The 2026.2
           # SDK keeps them in docs/licensing; unconditional so a layout change
@@ -229,7 +231,8 @@ jobs:
           # openvino.dll + openvino_genai.dll + the device plugin DLLs.
           # (No plugins.xml since OV 2026 — plugin registration is static.)
           Copy-Item "$ov/runtime/bin/intel64/Release/*.dll" $dest/
-          Copy-Item "$ov/runtime/3rdparty/tbb/bin/*.dll" $dest/
+          # Release TBB only — the SDK ships *_debug.dll variants alongside.
+          Copy-Item "$ov/runtime/3rdparty/tbb/bin/*.dll" $dest/ -Exclude *_debug.dll
           # Redistribution notices (see the linux job) — unconditional so a
           # layout change fails the build, not silently drops them.
           Copy-Item -Recurse "$ov/docs/licensing" "$dest/openvino-licensing"
