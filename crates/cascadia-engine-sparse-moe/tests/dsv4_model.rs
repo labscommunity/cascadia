@@ -196,6 +196,8 @@ fn build_model(fx: &StFile) -> DsV4Model {
         last_hiddens: Vec::new(),
         last_attn: Vec::new(),
         last_moe_in: Vec::new(),
+        first_layer: 0,
+        ov_experts: None,
     }
 }
 

@@ -147,6 +147,13 @@ pub struct DsV4Model {
     pub last_attn: Vec<Vec<f32>>,
     /// Debug: per-layer moe input (last prefill token). Bisection only.
     pub last_moe_in: Vec<Vec<f32>>,
+    /// Global index of this stage's first layer (`layers[i]` is global layer
+    /// `first_layer + i`) — maps local layer -> the on-disk expert IR path.
+    pub first_layer: usize,
+    /// Optional OpenVINO int4 expert backend (opt-in; see [`super::ov_expert`]).
+    /// When `Some`, `moe` dispatches experts through it instead of the Rust
+    /// int4 mmap kernel.
+    pub ov_experts: Option<super::ov_expert::OvExperts>,
 }
 
 impl DsV4Model {
@@ -243,16 +250,23 @@ impl DsV4Model {
         // hash gate emits the same expert twice for a token only the last
         // occurrence's contribution survives.
         let mut y = vec![0.0f32; dim];
+        let glid = self.first_layer + li; // global layer id -> expert IR path
         for (k, &ei) in indices.iter().enumerate() {
             if indices[k + 1..].contains(&ei) {
                 continue; // a later duplicate overwrites this contribution
             }
-            let e = layer.experts[ei].forward(x, dim, self.cfg.swiglu_limit, Some(ws[k]));
+            let e = match &self.ov_experts {
+                Some(ov) => ov.routed(glid, ei, x, ws[k]),
+                None => layer.experts[ei].forward(x, dim, self.cfg.swiglu_limit, Some(ws[k])),
+            };
             for d in 0..dim {
                 y[d] += e[d];
             }
         }
-        let sh = layer.shared.forward(x, dim, self.cfg.swiglu_limit, None);
+        let sh = match &self.ov_experts {
+            Some(ov) => ov.shared(glid, x),
+            None => layer.shared.forward(x, dim, self.cfg.swiglu_limit, None),
+        };
         for d in 0..dim {
             y[d] += sh[d];
         }

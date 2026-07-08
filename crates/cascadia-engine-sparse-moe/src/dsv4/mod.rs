@@ -31,6 +31,7 @@ pub mod indexer;
 pub mod loader;
 pub mod math;
 pub mod model;
+pub mod ov_expert;
 pub mod rope;
 pub mod st;
 pub mod stage;

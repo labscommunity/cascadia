@@ -424,5 +424,7 @@ fn load_stage_inner(
         last_hiddens: Vec::new(),
         last_attn: Vec::new(),
         last_moe_in: Vec::new(),
+        first_layer: lo,
+        ov_experts: super::ov_expert::OvExperts::from_env(dir, dim),
     })
 }

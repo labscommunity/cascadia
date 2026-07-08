@@ -1,0 +1,122 @@
+//! Optional OpenVINO int4 expert backend for dsv4.
+//!
+//! Runs each routed / shared expert FFN as a compiled OV int4 IR (on GPU, CPU
+//! or NPU) instead of the Rust int4 mmap kernel. OV's int4 GEMV is markedly
+//! faster than the scalar-dequant Rust path (measured ~4.6x on CPU, ~6x on the
+//! iGPU, batch=1, RAM-resident), and int4 keeps the weights small enough to
+//! fit RAM (unlike an fp16 re-export).
+//!
+//! Enabled by `CASCADIA_DSV4_OV_EXPERTS=1`; device from
+//! `CASCADIA_DSV4_OV_DEVICE` (default `GPU`). The per-expert IRs live at
+//! `<model>/experts_ov/layer_NN/expert_EEE/openvino_model.xml` (and
+//! `expert_shared/`), produced by `tools/dsv4_expert_ov.py`. Falls back to the
+//! Rust path when the env is unset or the `experts_ov` dir is absent, so it is
+//! entirely opt-in and the default engine is unchanged.
+//!
+//! The IR bakes the dsv4 SwiGLU clamp (silu(min(w1 x, L)) * clamp(w3 x, ±L)).
+//! The routing weight is applied to the output (w2 is linear, so scaling the
+//! output equals scaling the intermediate) with the same final bf16 rounding
+//! as the Rust `Expert::forward`.
+
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+
+use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
+use lru::LruCache;
+
+use super::math::to_bf16;
+
+/// Sentinel expert id for the always-on shared expert.
+const SHARED: u32 = u32::MAX;
+
+pub struct OvExperts {
+    dir: PathBuf, // <model>/experts_ov
+    device: String,
+    plugin: PluginConfig,
+    dim: usize,
+    /// Compiled OV models, LRU-bounded ((global layer, expert) -> Runtime).
+    cache: RefCell<LruCache<(u32, u32), Runtime>>,
+}
+
+impl OvExperts {
+    /// Construct from env, or `None` to keep the Rust expert path:
+    /// requires `CASCADIA_DSV4_OV_EXPERTS` set and `<model>/experts_ov` present.
+    pub fn from_env(model_dir: &Path, dim: usize) -> Option<Self> {
+        if std::env::var("CASCADIA_DSV4_OV_EXPERTS").is_err() {
+            return None;
+        }
+        let dir = model_dir.join("experts_ov");
+        if !dir.is_dir() {
+            return None;
+        }
+        let device = std::env::var("CASCADIA_DSV4_OV_DEVICE").unwrap_or_else(|_| "GPU".into());
+        let cap = std::env::var("CASCADIA_DSV4_OV_CACHE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .and_then(NonZeroUsize::new)
+            .unwrap_or_else(|| NonZeroUsize::new(1024).unwrap());
+        let mut plugin = PluginConfig::new();
+        // Persist compiled blobs across runs so first-touch compile isn't
+        // re-paid every process start (GPU kernel JIT is expensive).
+        if let Ok(cd) = std::env::var("CASCADIA_DSV4_OV_CACHE_DIR") {
+            plugin = plugin.with("CACHE_DIR", cd);
+        }
+        Some(Self {
+            dir,
+            device,
+            plugin,
+            dim,
+            cache: RefCell::new(LruCache::new(cap)),
+        })
+    }
+
+    fn xml(&self, lid: u32, eid: u32) -> PathBuf {
+        let name = if eid == SHARED {
+            "expert_shared".to_string()
+        } else {
+            format!("expert_{eid:03}")
+        };
+        self.dir
+            .join(format!("layer_{lid:02}"))
+            .join(name)
+            .join("openvino_model.xml")
+    }
+
+    fn run(&self, lid: u32, eid: u32, x: &[f32], route_w: Option<f32>) -> Vec<f32> {
+        let key = (lid, eid);
+        let mut cache = self.cache.borrow_mut();
+        if !cache.contains(&key) {
+            let path = self.xml(lid, eid);
+            let p = path.to_str().expect("utf-8 expert path");
+            let rt = Runtime::compile(p, &self.device, &self.plugin)
+                .unwrap_or_else(|e| panic!("compile OV expert {p} on {}: {e}", self.device));
+            cache.put(key, rt);
+        }
+        let rt = cache.get_mut(&key).unwrap();
+        rt.set_input("x", DType::F32, &[1, 1, self.dim], f32_bytes(x))
+            .expect("OV expert set_input");
+        rt.infer().expect("OV expert infer");
+        let (_, _, bytes) = rt.output(0).expect("OV expert output");
+        let w = route_w.unwrap_or(1.0);
+        bytes
+            .chunks_exact(4)
+            .map(|c| to_bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * w))
+            .collect()
+    }
+
+    /// Routed expert `eid` on `x`, scaled by its routing weight.
+    pub fn routed(&self, lid: usize, eid: usize, x: &[f32], route_w: f32) -> Vec<f32> {
+        self.run(lid as u32, eid as u32, x, Some(route_w))
+    }
+
+    /// The always-on shared expert on `x`.
+    pub fn shared(&self, lid: usize, x: &[f32]) -> Vec<f32> {
+        self.run(lid as u32, SHARED, x, None)
+    }
+}
+
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no invalid bit patterns; lifetime tied to `v`.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
