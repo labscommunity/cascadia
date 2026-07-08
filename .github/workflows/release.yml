@@ -162,10 +162,10 @@ jobs:
           if [ -d "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib" ]; then
             cp -a "$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib/." "$dest/lib/"
           fi
-          # Redistribution notices for the bundled Intel libraries.
-          if [ -d "$INTEL_OPENVINO_DIR/licensing" ]; then
-            cp -a "$INTEL_OPENVINO_DIR/licensing" "$dest/openvino-licensing"
-          fi
+          # Redistribution notices for the bundled Intel libraries. The 2026.2
+          # SDK keeps them in docs/licensing; unconditional so a layout change
+          # fails the build instead of silently shipping without notices.
+          cp -a "$INTEL_OPENVINO_DIR/docs/licensing" "$dest/openvino-licensing"
           cp INSTALL.md README.md LICENSE THIRD_PARTY_NOTICES.md "$dest/"
           tar -czf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name"
           echo "asset=$RUNNER_TEMP/$name.tar.gz" >> "$GITHUB_OUTPUT"
@@ -230,9 +230,9 @@ jobs:
           # (No plugins.xml since OV 2026 — plugin registration is static.)
           Copy-Item "$ov/runtime/bin/intel64/Release/*.dll" $dest/
           Copy-Item "$ov/runtime/3rdparty/tbb/bin/*.dll" $dest/
-          if (Test-Path "$ov/licensing") {
-            Copy-Item -Recurse "$ov/licensing" "$dest/openvino-licensing"
-          }
+          # Redistribution notices (see the linux job) — unconditional so a
+          # layout change fails the build, not silently drops them.
+          Copy-Item -Recurse "$ov/docs/licensing" "$dest/openvino-licensing"
           Copy-Item INSTALL.md,README.md,LICENSE,THIRD_PARTY_NOTICES.md $dest/
           $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
           Compress-Archive -Path $dest -DestinationPath $zip -Force
