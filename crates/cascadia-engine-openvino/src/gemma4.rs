@@ -627,7 +627,7 @@ impl Gemma4Engine {
         Ok(())
     }
 
-    fn recv_token_from_downstream(&mut self) -> EngineResult<i32> {
+    fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
@@ -635,7 +635,15 @@ impl Gemma4Engine {
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                guard.recv().await
+                // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
+                // A prefill reply waits on every remaining stage's
+                // whole-prompt compute — widened budget (see
+                // `recv_tensor_reply_prefill`).
+                if prefill {
+                    guard.recv_reply_prefill().await
+                } else {
+                    guard.recv_reply().await
+                }
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
@@ -664,9 +672,12 @@ impl Gemma4Engine {
         let (pos_t, hid_t, header_t) = self
             .block_on(async {
                 let mut guard = upstream.lock().await;
+                // First frame of the step is the IDLE wait; the frames that
+                // must follow it are mid-sequence replies — deadlined so a
+                // half-sent step can't wedge the stage (Item 5).
                 let pos = guard.recv().await?.0;
-                let hid = guard.recv().await?.0;
-                let hdr = guard.recv().await?.0;
+                let hid = guard.recv_reply().await?.0;
+                let hdr = guard.recv_reply().await?.0;
                 Ok::<_, cascadia_transport::TransportError>((pos, hid, hdr))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -696,7 +707,7 @@ impl Gemma4Engine {
                 let mut guard = up2.lock().await;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
-                    v.push(guard.recv().await?.0);
+                    v.push(guard.recv_reply().await?.0);
                 }
                 Ok::<_, cascadia_transport::TransportError>(v)
             })
@@ -852,7 +863,16 @@ impl Gemma4Engine {
         let (out, shape) = self.run_first(&tokens, position)?;
         let alpha = ts.elapsed();
         self.position += tokens.len() as i64;
-        let (next_token, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+        // 1-token prompt prefill costs the same downstream as a decode step —
+        // keep the strict deadline (mirrors step_middle's shape[1] > 1) so
+        // wedge eviction stays fast.
+        let (next_token, wire) = self.resolve_next_token(
+            &out,
+            &shape,
+            single_stage,
+            position,
+            prefill && tokens.len() > 1,
+        )?;
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
@@ -871,6 +891,7 @@ impl Gemma4Engine {
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        prefill: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
             Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
@@ -878,7 +899,7 @@ impl Gemma4Engine {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
             self.send_hidden_downstream(out, s3, position)?;
-            let token = self.recv_token_from_downstream()?;
+            let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
     }
@@ -972,6 +993,9 @@ impl Gemma4Engine {
 
     fn step_middle(&mut self) -> EngineResult<()> {
         let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        // Multi-token hidden = prefill: the token reply waits on every
+        // remaining stage's whole-prompt compute — widened budget.
+        let prefill_reply = shape[1] > 1;
         if position == 0 {
             self.runtime.reset_state().map_err(map_ov_err)?;
         }
@@ -979,7 +1003,7 @@ impl Gemma4Engine {
         let s3 = to_shape3(&out_shape);
         // Forward the SAME absolute position downstream so every stage aligns.
         self.send_hidden_downstream(&out, s3, position)?;
-        let token = self.recv_token_from_downstream()?;
+        let token = self.recv_token_from_downstream(prefill_reply)?;
         self.send_token_to_upstream(token)?;
         Ok(())
     }

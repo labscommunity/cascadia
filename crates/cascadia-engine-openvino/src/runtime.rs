@@ -732,15 +732,30 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    fn recv_token_from_downstream(&mut self) -> EngineResult<i32> {
+    fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        // MID-TASK reply: we just sent a hidden state and the pipeline owes
+        // us the sampled token back. Use the deadlined `recv_reply`, NOT the
+        // idle-tolerant `recv` — a frame lost between stages (pipeline-leg
+        // reset) would otherwise block this step loop forever with the task
+        // slot held: the live-rig Item-5 wedge ("task active: 1, task done:
+        // 0" all day). On timeout the error propagates to `step_first`'s
+        // catch, which clears the active task and resets state — the slot
+        // is freed and the next submit starts fresh. A prefill reply waits
+        // on every remaining stage's whole-prompt compute, so it gets the
+        // widened budget (see `recv_tensor_reply_prefill`) — a long prompt
+        // on a slow stage must not read as a wedge.
         let (tensor, _) = self
             .block_on(async move {
                 let mut guard = downstream.lock().await;
-                guard.recv().await
+                if prefill {
+                    guard.recv_reply_prefill().await
+                } else {
+                    guard.recv_reply().await
+                }
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         if tensor.data.len() < 4 {
@@ -770,12 +785,21 @@ impl OvRuntimeEngine {
         let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
-                let pos_tensor = if want_pos {
-                    Some(guard.recv().await?.0)
+                // First frame of a task hop is an IDLE wait (bounded only by
+                // the transport's much larger frame-idle ceiling — "no next
+                // request yet" is fine). On the static path the
+                // hidden tensor that must FOLLOW the position frame is a
+                // mid-pair reply: once the pos frame arrived, the peer owes
+                // the hidden promptly — deadline it so a half-sent pair
+                // can't wedge the stage (see `recv_tensor_reply`).
+                let (pos_tensor, t) = if want_pos {
+                    let pos = guard.recv().await?.0;
+                    let (t, _) = guard.recv_reply().await?;
+                    (Some(pos), t)
                 } else {
-                    None
+                    let (t, _) = guard.recv().await?;
+                    (None, t)
                 };
-                let (t, _) = guard.recv().await?;
                 Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -939,8 +963,11 @@ impl OvRuntimeEngine {
                 let (out, shape) = self.run_first(&[t], position)?;
                 let alpha = ts.elapsed();
                 self.position += 1;
+                // Static prefill round-trips per prompt token — each reply
+                // covers one token's relay compute, so it is never a
+                // prefill-budget wait.
                 let (token, wire) =
-                    self.resolve_next_token(&out, &shape, single_stage, position)?;
+                    self.resolve_next_token(&out, &shape, single_stage, position, false)?;
                 nt = token;
                 if let Some(a) = self.active.as_mut() {
                     a.t_alpha_compute += alpha;
@@ -956,7 +983,16 @@ impl OvRuntimeEngine {
             let (out, shape) = self.run_first(&tokens, position)?;
             let alpha = ts.elapsed();
             self.position += tokens.len() as i64;
-            let (nt, wire) = self.resolve_next_token(&out, &shape, single_stage, position)?;
+            // 1-token prompt prefill costs the same downstream as a decode
+            // step — keep the strict deadline (mirrors step_middle's
+            // shape[1] > 1) so wedge eviction stays fast.
+            let (nt, wire) = self.resolve_next_token(
+                &out,
+                &shape,
+                single_stage,
+                position,
+                prefill && tokens.len() > 1,
+            )?;
             if let Some(a) = self.active.as_mut() {
                 a.t_alpha_compute += alpha;
                 a.t_wire += wire;
@@ -977,6 +1013,7 @@ impl OvRuntimeEngine {
         shape: &[usize],
         single_stage: bool,
         position: i64,
+        prefill: bool,
     ) -> EngineResult<(i32, std::time::Duration)> {
         if single_stage {
             Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
@@ -984,7 +1021,7 @@ impl OvRuntimeEngine {
             let s3 = to_shape3(shape);
             let ts = std::time::Instant::now();
             self.send_hidden_downstream(out, s3, position)?;
-            let token = self.recv_token_from_downstream()?;
+            let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
     }
@@ -1194,6 +1231,10 @@ impl OvRuntimeEngine {
 
     fn step_middle(&mut self) -> EngineResult<()> {
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        // Multi-token hidden = stateful prefill: the token reply waits on
+        // every remaining stage's whole-prompt compute (static is seq=1,
+        // so this is always false there).
+        let prefill_reply = shape[1] > 1;
         let (out, out_shape, fwd_pos) = match pos_opt {
             Some(pos) => {
                 let (o, s) = self.run_relay(&hidden, shape, pos)?;
@@ -1211,7 +1252,7 @@ impl OvRuntimeEngine {
         };
         let s3 = to_shape3(&out_shape);
         self.send_hidden_downstream(&out, s3, fwd_pos)?;
-        let token = self.recv_token_from_downstream()?;
+        let token = self.recv_token_from_downstream(prefill_reply)?;
         self.send_token_to_upstream(token)?;
         Ok(())
     }
