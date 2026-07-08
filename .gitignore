@@ -34,3 +34,4 @@ shards_cached/
 .claude/
 .swarm/
 ruvector.db
+crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_big_export/

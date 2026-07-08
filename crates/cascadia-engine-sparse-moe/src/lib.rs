@@ -37,6 +37,7 @@
 //! The expert IRs are lazy-loaded on first use into an LRU cache.
 
 pub mod dist;
+pub mod dsv4;
 pub mod engine;
 pub mod kv_prefix_cache;
 pub mod manifest;

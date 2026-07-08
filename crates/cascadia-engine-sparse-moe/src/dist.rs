@@ -91,6 +91,19 @@ pub enum FrameKind {
     Token = 0x53_4D_45_20,        // "SME\x20"
     ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
     TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
+    /// Prefill-intermediate Forward (0x06): identical body to `Forward`,
+    /// but the last rank must run its layers WITHOUT head/sample/record and
+    /// reply with a dummy `Token(-1)`. Rank 0 discards intermediate prefill
+    /// tokens anyway — but before this kind existed the last rank still
+    /// *sampled* one token per prompt token and pushed each into its
+    /// repetition/frequency/presence-penalty history, so the first real
+    /// token was sampled against a history full of phantom prompt
+    /// continuations (e.g. " Paris" is sampled after the prefix "The
+    /// capital of France is" and recorded — then the default rep-penalty
+    /// 1.05 demotes the real " Paris"). Single-stage `generate()` never
+    /// records prompt-loop samples, so only distributed runs corrupted.
+    /// Also skips the pointless vocab-width head GEMV per prompt token.
+    ForwardNoSample = 0x53_4D_45_06, // "SME\x06"
 }
 
 impl FrameKind {
@@ -101,6 +114,7 @@ impl FrameKind {
             x if x == FrameKind::Token as u32 => Some(FrameKind::Token),
             x if x == FrameKind::ForwardBatch as u32 => Some(FrameKind::ForwardBatch),
             x if x == FrameKind::TokenBatch as u32 => Some(FrameKind::TokenBatch),
+            x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
             _ => None,
         }
     }
@@ -254,17 +268,19 @@ fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
     }
 }
 
-/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
-/// SamplingConfig + hidden tensor.
-pub async fn send_forward(
+/// Send a Forward-shaped frame downstream: kind + past_seq_len (u32 BE) +
+/// SamplingConfig block + hidden tensor. Shared by [`send_forward`] and
+/// [`send_forward_nosample`] — the two kinds carry identical bodies.
+async fn send_forward_kind(
     cli: &Mutex<ActivationClient>,
+    kind: FrameKind,
     past_seq_len: u32,
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
 ) -> TransportResult<()> {
     let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES];
-    header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+    header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
@@ -274,6 +290,49 @@ pub async fn send_forward(
     guard.send_raw(&header).await?;
     guard.send(&tensor).await?;
     Ok(())
+}
+
+/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
+/// SamplingConfig + hidden tensor.
+pub async fn send_forward(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::Forward,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Send a prefill-intermediate Forward ([`FrameKind::ForwardNoSample`]):
+/// identical body to [`send_forward`], but the last rank runs its layers
+/// without head/sample/record and replies with a dummy `Token(-1)`. Rank 0
+/// sends this for every prompt token except the last, so intermediate
+/// prefill samples never pollute the last rank's penalty history.
+pub async fn send_forward_nosample(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::ForwardNoSample,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
 }
 
 /// Receive a Forward frame's body (the kind code has already been

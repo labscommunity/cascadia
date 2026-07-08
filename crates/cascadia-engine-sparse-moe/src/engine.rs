@@ -30,8 +30,8 @@ use tracing::{info, warn};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
     recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
-    send_forward_batch, send_reset, send_token_batch_upstream, send_token_upstream, FrameKind,
-    StageTransport,
+    send_forward_batch, send_forward_nosample, send_reset, send_token_batch_upstream,
+    send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -261,6 +261,9 @@ pub struct SparseMoEBuilder {
     /// Set instead of `runner` when the manifest selects the OV-IR shell
     /// backend (MiniMax-M2). Single-stage only.
     ov_runner: Option<OvMoeRunner>,
+    /// Set when the manifest's arch is "deepseek_v4" (Rust dsv4 shell +
+    /// int4 experts; its manifest schema differs from [`Manifest`]).
+    dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -273,6 +276,7 @@ impl SparseMoEBuilder {
             config,
             runner: None,
             ov_runner: None,
+            dsv4_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -355,6 +359,47 @@ impl Builder for SparseMoEBuilder {
         }
         for (key, val) in &self.config.ov_properties {
             plugin = plugin.with(key, val);
+        }
+
+        // DeepSeek-V4 (dsv4) shell backend: its manifest is a different
+        // schema, so peek the arch before the strict Manifest parse. Rust
+        // shell + int4 experts; token-by-token pipeline like the M2 path
+        // (ids never cross the wire — hash layers live on rank 0).
+        let is_dsv4 = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("deepseek_v4"))
+            .unwrap_or(false);
+        if is_dsv4 {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let runner = crate::dsv4::stage::Dsv4Runner::load_staged(
+                &self.config.model_dir,
+                crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+                rank,
+                total,
+                shard.layer_start,
+                shard.layer_end,
+            )
+            .map_err(|e| EngineError::Backend(format!("dsv4 load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — dsv4 engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.dsv4_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
+            )])));
         }
 
         // OV-IR shell backend (MiniMax-M2): the whole architecture lives in
@@ -528,6 +573,26 @@ impl Builder for SparseMoEBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(runner) = self.dsv4_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the DeepSeek-V4 API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built DeepSeek-V4 dsv4 engine");
+            return Ok(Box::new(Dsv4Engine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+            )));
+        }
         if let Some(ov) = self.ov_runner {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
@@ -1161,8 +1226,12 @@ impl SparseMoEEngine {
         );
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
+            // Only the LAST prompt step samples (its token is the first
+            // generated token); intermediates go as ForwardNoSample so
+            // their discarded tokens never enter the last rank's penalty
+            // history (see FrameKind::ForwardNoSample).
             let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
+                .forward_one_token_first(&history, cfg, downstream, i + 1 == prompt_ids.len())
                 .map_err(|e| format!("prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
                 // Last prefill step: this is the first generated token.
@@ -1179,7 +1248,7 @@ impl SparseMoEEngine {
         // Decode loop.
         for step_i in 1..max_new {
             let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
+                .forward_one_token_first(&history, cfg, downstream, true)
                 .map_err(|e| format!("decode step {step_i}: {e}"))?;
             if eos.contains(&token_back) {
                 break;
@@ -1193,12 +1262,16 @@ impl SparseMoEEngine {
 
     /// Run one (prefill or decode) step on rank 0: embed via layer 0,
     /// run my shells, send hidden state downstream, receive the
-    /// sampled token back along the same socket.
+    /// sampled token back along the same socket. `sample_back = false`
+    /// sends ForwardNoSample (prefill-intermediate): downstream state
+    /// still advances, but the last rank skips head/sample/record and
+    /// acks with a dummy Token(-1).
     fn forward_one_token_first(
         &mut self,
         history: &[i64],
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        sample_back: bool,
     ) -> Result<i64, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
         let past_seq_len: u32 = history
@@ -1225,15 +1298,27 @@ impl SparseMoEEngine {
         // Send hidden downstream and wait for token to come back.
         let wire_t0 = Instant::now();
         let result = self.block_on(async {
-            send_forward(
-                downstream,
-                past_seq_len,
-                cfg,
-                &h_after_shells,
-                [1, 1, hidden as u32],
-            )
-            .await
-            .map_err(|e| format!("send_forward: {e}"))?;
+            if sample_back {
+                send_forward(
+                    downstream,
+                    past_seq_len,
+                    cfg,
+                    &h_after_shells,
+                    [1, 1, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward: {e}"))?;
+            } else {
+                send_forward_nosample(
+                    downstream,
+                    past_seq_len,
+                    cfg,
+                    &h_after_shells,
+                    [1, 1, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_nosample: {e}"))?;
+            }
             let send_done_us = wire_t0.elapsed().as_micros() as u64;
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => {
@@ -1304,8 +1389,11 @@ impl SparseMoEEngine {
         );
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
+            // Same as the non-spec driver: only the LAST prompt step
+            // samples; intermediates go as ForwardNoSample so their
+            // discarded tokens never pollute the last rank's history.
             let token_back = self
-                .forward_one_token_first(&history, cfg, downstream)
+                .forward_one_token_first(&history, cfg, downstream, i + 1 == prompt_ids.len())
                 .map_err(|e| format!("spec prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
                 if eos.contains(&token_back) {
@@ -1333,7 +1421,7 @@ impl SparseMoEEngine {
             // No proposal → fall back to one standard forward step.
             if drafts.is_empty() {
                 let token_back = self
-                    .forward_one_token_first(&history, cfg, downstream)
+                    .forward_one_token_first(&history, cfg, downstream, true)
                     .map_err(|e| format!("spec fallback step: {e}"))?;
                 if eos.contains(&token_back) {
                     break;
@@ -1369,7 +1457,7 @@ impl SparseMoEEngine {
                 // get the next round's prev_correction. Same as the
                 // single-stage path; kept as a single-token Forward so
                 // we don't introduce a 1-token ForwardBatch frame.
-                self.forward_one_token_first(&history, cfg, downstream)
+                self.forward_one_token_first(&history, cfg, downstream, true)
                     .map_err(|e| format!("spec bonus forward (round {n_rounds}): {e}"))?
             };
 
@@ -1633,7 +1721,12 @@ impl SparseMoEEngine {
                 }
                 Ok(())
             }
-            FrameKind::Forward => {
+            k @ (FrameKind::Forward | FrameKind::ForwardNoSample) => {
+                // ForwardNoSample (prefill-intermediate): identical body and
+                // state advance, but the last rank skips head+sample+history
+                // and acks with a dummy Token(-1) — keeps phantom prefill
+                // samples out of the penalty history.
+                let sample = matches!(k, FrameKind::Forward);
                 let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
                     .block_on(recv_forward_body_server(upstream))
                     .map_err(|e| format!("recv_forward: {e}"))?;
@@ -1658,6 +1751,11 @@ impl SparseMoEEngine {
                     .map_err(|e| format!("forward_shells: {e}"))?;
 
                 if self.is_last() {
+                    if !sample {
+                        return self
+                            .block_on(send_token_upstream(upstream, -1))
+                            .map_err(|e| format!("send_token (nosample ack): {e}"));
+                    }
                     // Run head, sample with the caller's config, send
                     // TOKEN upstream. The first Forward of a session
                     // seeds our RNG so deterministic seeds reproduce
@@ -1684,15 +1782,27 @@ impl SparseMoEEngine {
                     let down =
                         downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
                     self.block_on(async {
-                        send_forward(
-                            &down,
-                            past_seq_len,
-                            &sampling_cfg,
-                            &h_after,
-                            [1, 1, hidden as u32],
-                        )
-                        .await
-                        .map_err(|e| format!("send_forward: {e}"))?;
+                        if sample {
+                            send_forward(
+                                &down,
+                                past_seq_len,
+                                &sampling_cfg,
+                                &h_after,
+                                [1, 1, hidden as u32],
+                            )
+                            .await
+                            .map_err(|e| format!("send_forward: {e}"))?;
+                        } else {
+                            send_forward_nosample(
+                                &down,
+                                past_seq_len,
+                                &sampling_cfg,
+                                &h_after,
+                                [1, 1, hidden as u32],
+                            )
+                            .await
+                            .map_err(|e| format!("send_forward_nosample: {e}"))?;
+                        }
                         let token = match recv_kind_client(&down).await {
                             Ok(Some(FrameKind::Token)) => recv_token_body_client(&down)
                                 .await
@@ -1957,12 +2067,16 @@ impl OvMoeEngine {
 
     /// Rank-0 driver: embed + run my shells, ship hidden downstream, await
     /// the sampled token back. Returns the token the last rank sampled.
+    /// `sample_back = false` sends ForwardNoSample (prefill-intermediate):
+    /// the last rank advances state but skips head/sample/record so
+    /// discarded prefill tokens never pollute its penalty history.
     fn forward_one_token_first(
         &mut self,
         token: u32,
         pos: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        sample_back: bool,
     ) -> Result<i64, String> {
         let hidden = self
             .runner
@@ -1974,9 +2088,15 @@ impl OvMoeEngine {
             .map_err(|e| format!("forward: {e}"))?;
         let h = self.runner.hidden_size() as u32;
         self.block_on(async {
-            send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
-                .await
-                .map_err(|e| format!("send_forward: {e}"))?;
+            if sample_back {
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
+            } else {
+                send_forward_nosample(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                    .await
+                    .map_err(|e| format!("send_forward_nosample: {e}"))?;
+            }
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
                     .await
@@ -2033,11 +2153,15 @@ impl OvMoeEngine {
 
         // Prefill: feed every prompt token. The sample produced after the
         // LAST prompt token is the first generated token — matching
-        // `OvMoeRunner::generate_timed`.
+        // `OvMoeRunner::generate_timed`. Intermediate steps go as
+        // ForwardNoSample so their discarded tokens never enter the last
+        // rank's penalty history (see FrameKind::ForwardNoSample).
         let mut pos = 0usize;
         let mut next: i64 = -1;
-        for &t in &prompt_ids {
-            match self.forward_one_token_first(t, pos, &cfg, &downstream) {
+        let n_prompt = prompt_ids.len();
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            let sample_back = i + 1 == n_prompt;
+            match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "prefill forward failed: {e}");
@@ -2056,7 +2180,7 @@ impl OvMoeEngine {
             if generated.len() >= max_new || eos.contains(&next_u) {
                 break;
             }
-            match self.forward_one_token_first(next_u, pos, &cfg, &downstream) {
+            match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "decode forward failed; emitting partial output: {e}");
@@ -2124,7 +2248,10 @@ impl OvMoeEngine {
                     None => Ok(()),
                 }
             }
-            FrameKind::Forward => self.handle_forward(&upstream, downstream.as_ref()),
+            FrameKind::Forward => self.handle_forward(&upstream, downstream.as_ref(), true),
+            FrameKind::ForwardNoSample => {
+                self.handle_forward(&upstream, downstream.as_ref(), false)
+            }
             other => Err(format!(
                 "worker received unsupported frame {other:?} (MiniMax-M2 has no spec-decode batching)"
             )),
@@ -2139,10 +2266,14 @@ impl OvMoeEngine {
     /// Handle one Forward frame on a worker rank: run my shells, then
     /// either (last rank) head + sample + Token upstream, or (middle rank)
     /// relay the hidden downstream and pass the returned Token back up.
+    /// `sample = false` (ForwardNoSample, prefill-intermediate): still run
+    /// my shells (state must advance), but the last rank skips
+    /// head+sample+history and returns a dummy Token(-1).
     fn handle_forward(
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        sample: bool,
     ) -> Result<(), String> {
         let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
             .block_on(recv_forward_body_server(upstream))
@@ -2153,6 +2284,11 @@ impl OvMoeEngine {
             .forward_layers(hidden_f32, pos)
             .map_err(|e| format!("forward: {e}"))?;
         if self.is_last() {
+            if !sample {
+                return self
+                    .block_on(send_token_upstream(upstream, -1))
+                    .map_err(|e| format!("send_token (nosample ack): {e}"));
+            }
             let logits = self
                 .runner
                 .head_logits(&hidden)
@@ -2175,9 +2311,15 @@ impl OvMoeEngine {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = self.runner.hidden_size() as u32;
             self.block_on(async {
-                send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
-                    .await
-                    .map_err(|e| format!("send_forward: {e}"))?;
+                if sample {
+                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
+                        .await
+                        .map_err(|e| format!("send_forward: {e}"))?;
+                } else {
+                    send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
+                        .await
+                        .map_err(|e| format!("send_forward_nosample: {e}"))?;
+                }
                 match recv_kind_client(down).await {
                     Ok(Some(FrameKind::Token)) => {
                         let t = recv_token_body_client(down)
@@ -2242,6 +2384,400 @@ impl Engine for OvMoeEngine {
         // step_first / step_worker handle their own errors terminally (the
         // driver emits a final-marker chunk; the worker latches), so there is
         // nothing to surface as Err here.
+        if self.total <= 1 {
+            return Ok(self.step_single_stage());
+        }
+        Ok(if self.rank == 0 {
+            self.step_first()
+        } else {
+            self.step_worker()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
+// DeepSeek-V4 (dsv4) engine — same pipeline shape as the MiniMax-M2
+// engine above: rank 0 tokenizes + drives one wire round-trip per token
+// (prompt included; validated equivalent to batch prefill), workers run
+// their layer slice, the last rank samples and returns the token. The
+// hidden on the wire is the flattened HC copies (hc * dim f32); token
+// ids never leave rank 0 (hash-gate layers are always in stage 0).
+// ---------------------------------------------------------------------
+
+pub struct Dsv4Engine {
+    runner: crate::dsv4::stage::Dsv4Runner,
+    tokenizer: Option<Tokenizer>,
+    pending: VecDeque<GenerationTask>,
+    transport: StageTransport,
+    runtime_handle: tokio::runtime::Handle,
+    rank: u32,
+    total: u32,
+    peer_disconnected: bool,
+    last_rank_history: Vec<i64>,
+    last_rank_rng: u64,
+    last_rank_rng_seeded: bool,
+}
+
+impl Dsv4Engine {
+    fn new(
+        runner: crate::dsv4::stage::Dsv4Runner,
+        tokenizer: Option<Tokenizer>,
+        transport: StageTransport,
+        runtime_handle: tokio::runtime::Handle,
+        rank: u32,
+        total: u32,
+    ) -> Self {
+        Self {
+            runner,
+            tokenizer,
+            pending: VecDeque::new(),
+            transport,
+            runtime_handle,
+            rank,
+            total,
+            peer_disconnected: false,
+            last_rank_history: Vec::new(),
+            last_rank_rng: 0,
+            last_rank_rng_seeded: false,
+        }
+    }
+
+    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        cascadia_runner::run_async(&self.runtime_handle, fut)
+    }
+
+    fn is_last(&self) -> bool {
+        self.transport.is_last()
+    }
+
+    fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
+        let task = match self.pending.pop_front() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let Some(tok) = self.tokenizer.as_ref() else {
+            warn!(task = %task.task_id, "dsv4 engine has no tokenizer");
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        };
+        let started = Instant::now();
+        let prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                warn!(task = %task.task_id, "tokenizer encode failed: {e}");
+                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            }
+        };
+        let max_new = task.max_tokens.max(1) as usize;
+        let sampling_cfg = sampling_from_task(&task);
+        let generated = self.runner.generate(&prompt_ids, max_new, &sampling_cfg);
+        let n_tokens = generated.len() as u32;
+        let text = tok.decode(&generated, true).unwrap_or_default();
+        let elapsed = started.elapsed().as_secs_f64();
+        info!(
+            task = %task.task_id,
+            tokens = n_tokens,
+            elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            "task done (dsv4 single-stage)"
+        );
+        let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
+        chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        vec![(task.task_id.clone(), chunk)]
+    }
+
+    /// Rank-0 driver: embed + my layers (with the token id for the hash
+    /// gates), ship hidden downstream, await the sampled token back.
+    /// `sample_back = false` sends ForwardNoSample (prefill-intermediate):
+    /// the last rank advances state but must NOT head/sample/record, so
+    /// discarded prefill tokens never pollute its penalty history.
+    fn forward_one_token_first(
+        &mut self,
+        token: u32,
+        pos: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+        sample_back: bool,
+    ) -> Result<i64, String> {
+        let hidden = self.runner.embed_token(token);
+        let hidden = self.runner.forward_layers(hidden, pos, Some(token));
+        let h = self.runner.hidden_size() as u32;
+        self.block_on(async {
+            if sample_back {
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
+            } else {
+                send_forward_nosample(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                    .await
+                    .map_err(|e| format!("send_forward_nosample: {e}"))?;
+            }
+            match recv_kind_client(downstream).await {
+                Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
+                    .await
+                    .map_err(|e| format!("recv_token: {e}")),
+                Ok(Some(other)) => Err(format!("rank 0 expected Token, got {other:?}")),
+                Ok(None) => Err("downstream closed before Token".into()),
+                Err(e) => Err(format!("recv_kind: {e}")),
+            }
+        })
+    }
+
+    fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
+        let task = match self.pending.pop_front() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let id = task.task_id.clone();
+        let Some(downstream) = self.transport.downstream.clone() else {
+            warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
+            return vec![(id.clone(), Chunk::error(id, "rank 0 missing downstream"))];
+        };
+        if self.tokenizer.is_none() {
+            warn!(task = %id, "dsv4 rank 0 has no tokenizer");
+            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+        }
+        let started = Instant::now();
+        let prompt_ids: Vec<u32> = match self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .encode(task.prompt.as_str(), true)
+        {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                warn!(task = %id, "tokenizer encode failed: {e}");
+                return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            }
+        };
+        if prompt_ids.is_empty() {
+            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+        }
+        let max_new = task.max_tokens.max(1) as usize;
+        let cfg = sampling_from_task(&task);
+        let eos = self.runner.eos_token_ids().to_vec();
+
+        self.runner.reset();
+        if let Err(e) = self.block_on(send_reset(&downstream)) {
+            warn!(task = %id, "send_reset failed: {e}");
+            return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
+        }
+
+        // Prefill: only the LAST prompt step asks the last rank to sample
+        // (that sample is the first generated token). Intermediate steps go
+        // as ForwardNoSample so their discarded tokens never enter the last
+        // rank's penalty history — recording them poisoned the first real
+        // token (rep-penalty demoted the true continuation) and was the
+        // 4-node "deterministic garbage while single-stage is coherent" bug.
+        let mut pos = 0usize;
+        let mut next: i64 = -1;
+        let n_prompt = prompt_ids.len();
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            let sample_back = i + 1 == n_prompt;
+            match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
+                Ok(tok_back) => next = tok_back,
+                Err(e) => {
+                    warn!(task = %id, "prefill forward failed: {e}");
+                    return vec![(id.clone(), Chunk::error(id, e))];
+                }
+            }
+            pos += 1;
+        }
+
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new);
+        loop {
+            let next_u = next as u32;
+            generated.push(next_u);
+            if generated.len() >= max_new || eos.contains(&next_u) {
+                break;
+            }
+            match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
+                Ok(tok_back) => next = tok_back,
+                Err(e) => {
+                    warn!(task = %id, "decode forward failed; emitting partial output: {e}");
+                    break;
+                }
+            }
+            pos += 1;
+        }
+
+        let n_tokens = generated.len() as u32;
+        let text = self
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .decode(&generated, true)
+            .unwrap_or_default();
+        let elapsed = started.elapsed().as_secs_f64();
+        info!(
+            task = %id,
+            tokens = n_tokens,
+            total = self.total,
+            elapsed_s = elapsed,
+            tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
+            "task done (dsv4 pipeline-parallel)"
+        );
+        let mut chunk = Chunk::final_marker(id.clone(), text);
+        chunk.n_tokens = Some(n_tokens);
+        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        vec![(id, chunk)]
+    }
+
+    fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
+        if self.peer_disconnected {
+            std::thread::sleep(WORKER_BACKOFF);
+            return Vec::new();
+        }
+        let Some(upstream) = self.transport.upstream.clone() else {
+            warn!("worker rank has no upstream socket");
+            std::thread::sleep(WORKER_BACKOFF);
+            return Vec::new();
+        };
+        let downstream = self.transport.downstream.clone();
+        let kind = match self.block_on(recv_kind_server(&upstream)) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                self.peer_disconnected = true;
+                return Vec::new();
+            }
+            Err(e) => {
+                warn!("worker recv_kind failed: {e}");
+                std::thread::sleep(WORKER_BACKOFF);
+                return Vec::new();
+            }
+        };
+        let res = match kind {
+            FrameKind::Reset => {
+                self.runner.reset();
+                self.last_rank_history.clear();
+                self.last_rank_rng_seeded = false;
+                match downstream.as_ref() {
+                    Some(down) => self
+                        .block_on(forward_reset(down))
+                        .map_err(|e| format!("forward_reset: {e}")),
+                    None => Ok(()),
+                }
+            }
+            FrameKind::Forward => self.handle_forward(&upstream, downstream.as_ref(), true),
+            FrameKind::ForwardNoSample => {
+                self.handle_forward(&upstream, downstream.as_ref(), false)
+            }
+            other => Err(format!(
+                "worker received unsupported frame {other:?} (dsv4 has no spec-decode batching)"
+            )),
+        };
+        if let Err(e) = res {
+            warn!("worker frame failed: {e}");
+            std::thread::sleep(WORKER_BACKOFF);
+        }
+        Vec::new()
+    }
+
+    /// `sample = false` (ForwardNoSample, prefill-intermediate): still run
+    /// my layers (KV/compressor state must advance), but the last rank
+    /// skips head+sample+history and returns a dummy Token(-1) — rank 0
+    /// discards it. Keeps phantom prefill samples out of the penalty
+    /// history and skips the vocab-width head GEMV per prompt token.
+    fn handle_forward(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        sample: bool,
+    ) -> Result<(), String> {
+        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+            .block_on(recv_forward_body_server(upstream))
+            .map_err(|e| format!("recv_forward_body: {e}"))?;
+        let pos = past_seq_len as usize;
+        let hidden = self.runner.forward_layers(hidden_f32, pos, None);
+        if self.is_last() {
+            if !sample {
+                return self
+                    .block_on(send_token_upstream(upstream, -1))
+                    .map_err(|e| format!("send_token (nosample ack): {e}"));
+            }
+            let logits = self.runner.head_logits(&hidden);
+            if !self.last_rank_rng_seeded {
+                self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+                self.last_rank_rng_seeded = true;
+            }
+            let token = crate::sampling::sample(
+                &logits,
+                &self.last_rank_history,
+                &sampling_cfg,
+                &mut self.last_rank_rng,
+            );
+            self.last_rank_history.push(token);
+            self.block_on(send_token_upstream(upstream, token))
+                .map_err(|e| format!("send_token: {e}"))?;
+            Ok(())
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let h = self.runner.hidden_size() as u32;
+            self.block_on(async {
+                if sample {
+                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
+                        .await
+                        .map_err(|e| format!("send_forward: {e}"))?;
+                } else {
+                    send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
+                        .await
+                        .map_err(|e| format!("send_forward_nosample: {e}"))?;
+                }
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::Token)) => {
+                        let t = recv_token_body_client(down)
+                            .await
+                            .map_err(|e| format!("recv_token: {e}"))?;
+                        send_token_upstream(upstream, t)
+                            .await
+                            .map_err(|e| format!("relay token: {e}"))?;
+                        Ok(())
+                    }
+                    Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
+                    Ok(None) => Err("downstream closed before Token".into()),
+                    Err(e) => Err(format!("recv_kind: {e}")),
+                }
+            })
+        }
+    }
+}
+
+impl Engine for Dsv4Engine {
+    fn warmup(&mut self) {
+        if self.total == 1 {
+            if let Some(tok) = self.tokenizer.as_ref() {
+                let ids: Vec<u32> = tok
+                    .encode("Hello", false)
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_else(|_| vec![1]);
+                let _ = self.runner.generate_argmax(&ids, 1);
+                info!("warmup: generated 1 token (dsv4)");
+            }
+        }
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.rank != 0 {
+            return Err(EngineError::InvalidConfig(
+                "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
+                    .into(),
+            ));
+        }
+        if self.pending.len() >= OV_MAX_PENDING {
+            return Err(EngineError::QueueFull {
+                queued: self.pending.len(),
+                cap: OV_MAX_PENDING,
+            });
+        }
+        self.pending.push_back(task);
+        Ok(())
+    }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        self.pending.retain(|t| &t.task_id != task_id);
+    }
+
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.total <= 1 {
             return Ok(self.step_single_stage());
         }
