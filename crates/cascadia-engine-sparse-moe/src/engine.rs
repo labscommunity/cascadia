@@ -1225,6 +1225,13 @@ impl SparseMoEEngine {
             prompt_len = prompt_ids.len(),
             "prefill (token-by-token, distributed)"
         );
+        // Streamed-prefill sync window: every N intermediate tokens go as a
+        // blocking ForwardNoSample (which acks) instead of a one-way
+        // ForwardPrefill. This bounds the number of un-acked frames in flight
+        // so rank 0's single final recv can't exceed the transport frame-idle
+        // ceiling on a very long prompt, and it surfaces a mid-prefill failure
+        // within one window rather than only at the very end.
+        const PREFILL_SYNC_EVERY: usize = 256;
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
             if i + 1 == prompt_ids.len() {
@@ -1238,6 +1245,10 @@ impl SparseMoEEngine {
                 }
                 generated.push(token_back);
                 history.push(token_back);
+            } else if (i + 1) % PREFILL_SYNC_EVERY == 0 {
+                // Periodic blocking sync (discards the dummy Token(-1) ack).
+                self.forward_one_token_first(&history, cfg, downstream, false)
+                    .map_err(|e| format!("prefill sync step {i}: {e}"))?;
             } else {
                 // Intermediate prompt tokens stream one-way (no ack) so they
                 // pipeline through the ranks — the compute overlaps instead of
@@ -1298,6 +1309,45 @@ impl SparseMoEEngine {
             [1, 1, hidden as u32],
         ))
         .map_err(|e| format!("send_forward_prefill: {e}"))
+    }
+
+    /// Body of the `ForwardPrefill` frame handler (extracted so the caller can
+    /// latch a fatal disconnect on any error — a one-way frame has no ack path,
+    /// so a recoverable failure would silently skip a KV slot). Advances KV for
+    /// the streamed prompt token; mid ranks relay it downstream one-way, the
+    /// last rank stops here (no head / sample / record).
+    fn handle_forward_prefill(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+            .block_on(recv_forward_body_server(upstream))
+            .map_err(|e| format!("recv_forward(prefill): {e}"))?;
+        let hidden = self.runner.manifest.hidden_size as usize;
+        if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
+            return Err(format!(
+                "prefill shape unexpected {:?} vs hidden {}",
+                in_shape, hidden
+            ));
+        }
+        self.maybe_rewind_to(past_seq_len as usize);
+        let h_after = self
+            .runner
+            .forward_shells(&hidden_f32, &[1, 1, hidden], past_seq_len as usize)
+            .map_err(|e| format!("forward_shells(prefill): {e}"))?;
+        if !self.is_last() {
+            let down = downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
+            self.block_on(send_forward_prefill(
+                &down,
+                past_seq_len,
+                &sampling_cfg,
+                &h_after,
+                [1, 1, hidden as u32],
+            ))
+            .map_err(|e| format!("relay forward_prefill: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Run one (prefill or decode) step on rank 0: embed via layer 0,
@@ -1762,38 +1812,18 @@ impl SparseMoEEngine {
                 Ok(())
             }
             FrameKind::ForwardPrefill => {
-                // Streamed prefill (one-way): advance KV, then mid ranks relay
-                // downstream WITHOUT waiting for a reply so the prompt tokens
-                // pipeline across ranks; the last rank stops here (no head /
-                // sample / record / ack). See FrameKind::ForwardPrefill.
-                let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
-                    .block_on(recv_forward_body_server(upstream))
-                    .map_err(|e| format!("recv_forward(prefill): {e}"))?;
-                let hidden = self.runner.manifest.hidden_size as usize;
-                if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
-                    return Err(format!(
-                        "prefill shape unexpected {:?} vs hidden {}",
-                        in_shape, hidden
-                    ));
+                // A streamed prefill frame is ONE-WAY (no ack), so a failure
+                // here has no return path: left recoverable it would be
+                // silently skipped, leaving a KV hole (wrong output for the
+                // whole generation) or hanging rank 0's final recv. Make any
+                // error fatal — latch peer_disconnected so the stage tears down
+                // and rebuilds, and rank 0's final Forward surfaces the failure
+                // instead of the run completing with corrupt state.
+                let res = self.handle_forward_prefill(upstream, downstream);
+                if res.is_err() {
+                    self.peer_disconnected = true;
                 }
-                self.maybe_rewind_to(past_seq_len as usize);
-                let h_after = self
-                    .runner
-                    .forward_shells(&hidden_f32, &[1, 1, hidden], past_seq_len as usize)
-                    .map_err(|e| format!("forward_shells(prefill): {e}"))?;
-                if !self.is_last() {
-                    let down =
-                        downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
-                    self.block_on(send_forward_prefill(
-                        &down,
-                        past_seq_len,
-                        &sampling_cfg,
-                        &h_after,
-                        [1, 1, hidden as u32],
-                    ))
-                    .map_err(|e| format!("relay forward_prefill: {e}"))?;
-                }
-                Ok(())
+                res
             }
             k @ (FrameKind::Forward | FrameKind::ForwardNoSample) => {
                 // ForwardNoSample (prefill-intermediate): identical body and

@@ -1,13 +1,15 @@
 //! Memory-mapped int4_bin expert — the production path for the real 43-layer
 //! model, where eagerly dequantizing every expert to f32 would need ~285 GB
-//! of RAM per rank. Weights stay packed on disk; each forward dequantizes
-//! only the rows it touches, one row at a time, into a scratch buffer.
+//! of RAM per rank. Weights stay packed on disk; each forward decodes the int4
+//! nibbles of the rows it touches straight into a fused SIMD dot against the
+//! activation (no f32 scratch row — see `dequant_row_dot`).
 //!
-//! Numerics are IDENTICAL to the eager [`Expert`](super::model::Expert)
-//! path: the per-row nibble decode matches `loader::dequant_int4` and the
-//! dot product accumulates in the same order as `math::linear_bf16`, so
-//! greedy token streams are bit-for-bit the same either way (validated by
-//! `dsv4_expert_mmap.rs`).
+//! Numerics match the eager [`Expert`](super::model::Expert) path within bf16
+//! tolerance, **not bitwise**: the per-row nibble decode matches
+//! `loader::dequant_int4`, but the fused dequant+dot reorders the f32 summation
+//! and fuses the multiply-add, so results differ by a few bf16 ULP.
+//! `dsv4_expert_mmap.rs` validates that tolerance plus the exact-greedy tokens.
+//! (Assumes `in_dim % 32 == 0`, guaranteed by the int4 group=32 packing.)
 
 use std::fs::File;
 use std::path::Path;
