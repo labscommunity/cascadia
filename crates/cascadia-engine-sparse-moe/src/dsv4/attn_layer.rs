@@ -164,12 +164,17 @@ impl AttentionLayer {
         }
         let gd = h * hd / groups;
         let mut mid = vec![0.0f32; groups * o_lora];
-        for g in 0..groups {
-            let og = &o[g * gd..(g + 1) * gd];
-            for r in 0..o_lora {
-                let row = &self.w.wo_a[(g * o_lora + r) * gd..(g * o_lora + r + 1) * gd];
-                mid[g * o_lora + r] = to_bf16(dot_bf16w(row, og));
-            }
+        // Rows are independent (row m uses wo_a[m*gd..] against the group's
+        // slice of o); spread them across cores. Bit-identical to the serial
+        // version — same per-row accumulation order.
+        {
+            use rayon::prelude::*;
+            mid.par_iter_mut().enumerate().for_each(|(m, mm)| {
+                let g = m / o_lora;
+                let row = &self.w.wo_a[m * gd..(m + 1) * gd];
+                let og = &o[g * gd..(g + 1) * gd];
+                *mm = to_bf16(dot_bf16w(row, og));
+            });
         }
         let mut out = vec![0.0f32; self.dim];
         linear_bf16_w(&mid, &self.w.wo_b, self.dim, groups * o_lora, &mut out);
