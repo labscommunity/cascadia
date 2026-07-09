@@ -639,7 +639,19 @@ def main():
         e = hf.get("eos_token_id")
         eos = e if isinstance(e, list) else ([e] if isinstance(e, int) else [])
     write_manifest(cfg, out, layer_ids, args.experts, eos)
-    for fn in ("tokenizer.json", "tokenizer_config.json"):
+    # Carry the tokenizer + every serving sidecar. The chat template ships as a
+    # standalone `chat_template.jinja` on modern DeepSeek checkpoints (instruct
+    # variants) rather than inside tokenizer_config.json; without it the API
+    # falls back to a generic formatter and instruct prompts degrade. Base
+    # checkpoints simply won't have the file — the `.exists()` guard skips it.
+    for fn in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+    ):
         if (md / fn).exists():
             shutil.copy(md / fn, out / fn)
     print("[done full]", flush=True)
