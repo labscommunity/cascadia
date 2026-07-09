@@ -1794,7 +1794,9 @@ def main():
         ):
             print(
                 "Detected Gemma 4 OpenVINO-IR input - dispatching to IR-surgery "
-                "exporter tools/gemma4_surgery/export_gemma4_text.py",
+                "exporter tools/gemma4_surgery/export_gemma4_text.py "
+                "(--quantization is ignored on this path: stages inherit the "
+                "source IR's weights byte-for-byte)",
                 flush=True,
             )
             # Guards BEFORE the surgery import: the module imports openvino at
