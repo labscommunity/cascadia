@@ -1763,7 +1763,20 @@ def main():
     try:
         with open(fetch_config_json(args.model)) as _f:
             _raw_cfg = json.load(_f)
-    except Exception:
+    except Exception as _cfg_exc:
+        # Tolerated for HF-id inputs (the generic flow re-fetches and reports
+        # its own errors) — but an exported OpenVINO VLM IR dir is only
+        # recognizable via config.json, so a broken one must not fall through
+        # to the generic/torch path with an error far from the cause.
+        if os.path.isdir(args.model) and os.path.exists(
+            os.path.join(args.model, "openvino_language_model.xml")
+        ):
+            raise SystemExit(
+                f"found openvino_language_model.xml in {args.model} (an "
+                f"exported OpenVINO VLM IR), but its config.json could not "
+                f"be read ({_cfg_exc}); model-type dispatch needs it — "
+                f"restore or fix config.json."
+            )
         _raw_cfg = {}
     _outer_mt = (_raw_cfg.get("model_type") or "").lower()
     _inner_mt = ((_raw_cfg.get("text_config") or {}).get("model_type") or "").lower()
