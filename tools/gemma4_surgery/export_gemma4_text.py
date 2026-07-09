@@ -814,6 +814,13 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
             idx = sink_layer_index(vid)  # fallback: un-scoped variable_id
             if idx is not None:
                 vid_parsed.append(vid)
+            else:
+                # Doubly unattributable: this Assign lands in NO stage. A
+                # genuine-KV sink dropped here still trips the orphan refusal
+                # in its owning stage, but say so instead of dropping silently.
+                log(f"  WARNING: Assign {vid!r} unattributable (no layers.N "
+                    f"scope, no digit in variable_id) — excluded from every "
+                    f"stage")
         if idx is not None and a <= idx <= b:
             sinks.append(op)
     if vid_parsed:
@@ -1057,7 +1064,9 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         if validate:
             if only_stage is not None:
                 log("  (--validate skipped: --stage exports a single shard, "
-                    "cannot chain)")
+                    "cannot chain — this also bypasses the cross-stage "
+                    "KV-ownership refusal, which fires in the SIBLING stage "
+                    "of a misattributed sink; verify against a full export)")
             else:
                 _validate(grafted_xml, out_dir, ranges, last_logits_only)
 
