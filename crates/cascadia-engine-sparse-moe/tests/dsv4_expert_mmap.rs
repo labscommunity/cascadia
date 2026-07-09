@@ -18,9 +18,12 @@ fn argmax(v: &[f32]) -> usize {
         .unwrap()
 }
 
-/// Every expert of every layer: eager forward == mmap forward, bitwise.
+/// Every expert of every layer: mmap forward ≈ eager forward. The mmap path uses
+/// a fused SIMD dequant+dot whose f32 summation order differs from the eager
+/// `linear_bf16`, so outputs are equal-or-within-a-few-bf16-ULP, not bitwise. A
+/// large divergence would signal a nibble-decode / lane-order bug, not ULP drift.
 #[test]
-fn mmap_expert_forward_bitwise_matches_eager() {
+fn mmap_expert_forward_matches_eager() {
     let dir = export_dir();
     let eager = load_model(&dir, 64).expect("eager load");
     let mmap = load_stage_mode(
@@ -43,6 +46,7 @@ fn mmap_expert_forward_bitwise_matches_eager() {
         })
         .collect();
     let limit = eager.cfg.swiglu_limit;
+    let (mut max_abs, mut max_rel, mut n_diff, mut n_tot) = (0.0f32, 0.0f32, 0usize, 0usize);
     for (li, (le, lm)) in eager.layers.iter().zip(mmap.layers.iter()).enumerate() {
         for (ei, (a, b)) in le
             .experts
@@ -53,9 +57,27 @@ fn mmap_expert_forward_bitwise_matches_eager() {
         {
             let ya = a.forward(&x, dim, limit, Some(0.7));
             let yb = b.forward(&x, dim, limit, Some(0.7));
-            assert_eq!(ya, yb, "layer {li} expert {ei}: mmap != eager");
+            for (va, vb) in ya.iter().zip(yb.iter()) {
+                n_tot += 1;
+                let d = (va - vb).abs();
+                if d != 0.0 {
+                    n_diff += 1;
+                }
+                max_abs = max_abs.max(d);
+                let denom = va.abs().max(vb.abs());
+                if denom > 1e-6 {
+                    max_rel = max_rel.max(d / denom);
+                }
+            }
+            assert!(
+                max_rel < 0.05,
+                "layer {li} expert {ei}: max_rel {max_rel} — kernel bug, not ULP drift"
+            );
         }
     }
+    eprintln!(
+        "mmap vs eager: {n_diff}/{n_tot} elems differ, max_abs={max_abs:.3e}, max_rel={max_rel:.3e}"
+    );
 }
 
 /// End-to-end greedy through mmap'd experts must match reference.json —
