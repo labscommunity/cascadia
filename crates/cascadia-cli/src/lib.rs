@@ -1660,7 +1660,7 @@ const GEMMA4_TEXT_SCRIPT: &str = include_str!(concat!(
 /// Fails fast on the one NPU constraint cheap to check here (fp16 default
 /// dtype); the exporter enforces the rest (static-seq == 1, context > seq).
 fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
-    if args.target == ShardTarget::Npu && !matches!(args.default_dtype, ShardDtype::Fp16) {
+    if args.target == ShardTarget::Npu && args.default_dtype != ShardDtype::Fp16 {
         return Err(anyhow!("--default-dtype must be fp16 for --target npu"));
     }
     let mut flags = vec![
