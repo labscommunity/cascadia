@@ -1784,13 +1784,10 @@ def main():
                 "exporter tools/gemma4_surgery/export_gemma4_text.py",
                 flush=True,
             )
-            _here = os.path.dirname(os.path.abspath(__file__))
-            # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
-            # CLI extracts the embedded scripts into
-            sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
-            sys.path.insert(0, _here)
-            from export_gemma4_text import run_export as _g4t_run_export
-
+            # Guards BEFORE the surgery import: the module imports openvino at
+            # import time, and these must fail with their own message (not an
+            # ImportError) even on an env without openvino installed.
+            #
             # The surgery tool has NO NPU static-export support: it always emits
             # a stateful/dynamic IR the NPU compiler rejects. Fail fast rather
             # than silently downgrading to a cpu-gpu shard the user didn't ask
@@ -1811,6 +1808,13 @@ def main():
                     "(it slices at even decoder-layer ranges); omit it or use "
                     "the generic exporter."
                 )
+
+            _here = os.path.dirname(os.path.abspath(__file__))
+            # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
+            # CLI extracts the embedded scripts into
+            sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+            sys.path.insert(0, _here)
+            from export_gemma4_text import run_export as _g4t_run_export
 
             _g4t_run_export(
                 model=args.model,
