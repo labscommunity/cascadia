@@ -1763,7 +1763,20 @@ def main():
     try:
         with open(fetch_config_json(args.model)) as _f:
             _raw_cfg = json.load(_f)
-    except Exception:
+    except Exception as _cfg_exc:
+        # Tolerated for HF-id inputs (the generic flow re-fetches and reports
+        # its own errors) — but an exported OpenVINO VLM IR dir is only
+        # recognizable via config.json, so a broken one must not fall through
+        # to the generic/torch path with an error far from the cause.
+        if os.path.isdir(args.model) and os.path.exists(
+            os.path.join(args.model, "openvino_language_model.xml")
+        ):
+            raise SystemExit(
+                f"found openvino_language_model.xml in {args.model} (an "
+                f"exported OpenVINO VLM IR), but its config.json could not "
+                f"be read ({_cfg_exc}); model-type dispatch needs it — "
+                f"restore or fix config.json."
+            )
         _raw_cfg = {}
     _outer_mt = (_raw_cfg.get("model_type") or "").lower()
     _inner_mt = ((_raw_cfg.get("text_config") or {}).get("model_type") or "").lower()
@@ -1771,6 +1784,62 @@ def main():
         ("gemma4" in t) or ("gemma_4" in t) or ("gemma-4" in t)
         for t in (_outer_mt, _inner_mt)
     ):
+        # An already-exported gemma-4 OpenVINO VLM IR dir (optimum-intel:
+        # openvino_language_model.xml + text_embeddings sub-IRs) routes to the
+        # IR-surgery exporter, which grafts a text-only front-end and slices at
+        # decoder boundaries WITHOUT torch / a RAM wall. Safetensors gemma-4
+        # (no such IR) falls through to the torch export_gemma4 path below.
+        if os.path.isdir(args.model) and os.path.exists(
+            os.path.join(args.model, "openvino_language_model.xml")
+        ):
+            print(
+                "Detected Gemma 4 OpenVINO-IR input - dispatching to IR-surgery "
+                "exporter tools/gemma4_surgery/export_gemma4_text.py "
+                "(--quantization is ignored on this path: stages inherit the "
+                "source IR's weights byte-for-byte)",
+                flush=True,
+            )
+            # Guards BEFORE the surgery import: the module imports openvino at
+            # import time, and these must fail with their own message (not an
+            # ImportError) even on an env without openvino installed.
+            #
+            # The surgery tool has NO NPU static-export support: it always emits
+            # a stateful/dynamic IR the NPU compiler rejects. Fail fast rather
+            # than silently downgrading to a cpu-gpu shard the user didn't ask
+            # for.
+            if args.target == "npu":
+                raise SystemExit(
+                    "gemma-4 OpenVINO-IR sharding does not yet support "
+                    "--target npu (the IR-surgery exporter emits a "
+                    "stateful/dynamic IR the NPU compiler rejects); use "
+                    "--target cpu-gpu."
+                )
+            # --layer-split is a generic-exporter feature; the surgery tool
+            # slices at even decoder-layer ranges only. Reject rather than
+            # silently ignore a user-supplied split.
+            if args.layer_split:
+                raise SystemExit(
+                    "--layer-split is not supported for gemma-4 IR surgery "
+                    "(it slices at even decoder-layer ranges); omit it or use "
+                    "the generic exporter."
+                )
+
+            _here = os.path.dirname(os.path.abspath(__file__))
+            # in-repo layout (tools/gemma4_surgery/) and the flat temp dir the
+            # CLI extracts the embedded scripts into
+            sys.path.insert(0, os.path.join(_here, "gemma4_surgery"))
+            sys.path.insert(0, _here)
+            from export_gemma4_text import run_export as _g4t_run_export
+
+            _g4t_run_export(
+                model=args.model,
+                output_dir=args.output_dir,
+                num_stages=args.num_stages,
+                quantization=args.quantization,
+                stage=args.stage,
+            )
+            return
+
         print(
             "Detected Gemma 4 - dispatching to the dedicated exporter "
             "tools/export_gemma4.py (per-layer-type attention / KV-sharing / "
