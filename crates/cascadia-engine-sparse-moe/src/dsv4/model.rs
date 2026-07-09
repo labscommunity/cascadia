@@ -160,6 +160,7 @@ impl DsV4Model {
     /// pre-mix: coefficients from the flattened copies; returns the reduced
     /// (bf16-rounded) single-stream input + (post, comb) for the post-mix.
     fn hc_pre(&self, copies: &[f32], p: &HcParams) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let _t = std::time::Instant::now();
         let (hc, dim) = (self.cfg.hc, self.cfg.dim);
         let flat = copies; // [hc*dim], f32 (holding bf16 values)
         let ms: f32 = flat.iter().map(|v| v * v).sum::<f32>() / (hc * dim) as f32;
@@ -186,11 +187,13 @@ impl DsV4Model {
             }
             *yv = to_bf16(acc);
         }
+        super::math::prof::add(super::math::prof::SINK, _t);
         (y, c.post, c.comb)
     }
 
     /// post-mix: new_copies[j] = bf16(post[j]*sub + sum_i comb[i][j]*residual[i]).
     fn hc_post(&self, sub: &[f32], residual: &[f32], post: &[f32], comb: &[f32]) -> Vec<f32> {
+        let _t = std::time::Instant::now();
         let (hc, dim) = (self.cfg.hc, self.cfg.dim);
         let mut out = vec![0.0f32; hc * dim];
         for j in 0..hc {
@@ -202,6 +205,7 @@ impl DsV4Model {
                 out[j * dim + d] = to_bf16(acc);
             }
         }
+        super::math::prof::add(super::math::prof::SINK, _t);
         out
     }
 
@@ -250,6 +254,7 @@ impl DsV4Model {
         // hash gate emits the same expert twice for a token only the last
         // occurrence's contribution survives.
         let mut y = vec![0.0f32; dim];
+        let _te = std::time::Instant::now();
         let glid = self.first_layer + li; // global layer id -> expert IR path
         for (k, &ei) in indices.iter().enumerate() {
             if indices[k + 1..].contains(&ei) {
@@ -270,6 +275,7 @@ impl DsV4Model {
         for d in 0..dim {
             y[d] += sh[d];
         }
+        super::math::prof::add(super::math::prof::EXPERTS, _te);
         for v in y.iter_mut() {
             *v = to_bf16(*v);
         }
@@ -374,13 +380,16 @@ impl DsV4Model {
     ) -> Vec<f32> {
         self.last_hiddens.clear();
         for li in 0..self.layers.len() {
+            let _tl = std::time::Instant::now();
             let (mut y, post, comb) = self.hc_pre(&copies, &self.layers[li].hc_attn);
             rmsnorm(&mut y, &self.layers[li].attn_norm_w, self.cfg.norm_eps);
             let attn_out = self.layers[li].attn.decode(&y, pos);
             copies = self.hc_post(&attn_out, &copies, &post, &comb);
             let _ = self.block_ffn_stage(li, &mut copies, id);
+            super::math::prof::add(super::math::prof::WALL, _tl);
             self.last_hiddens.push(copies.clone());
         }
+        super::math::prof::dump("decode");
         copies
     }
 

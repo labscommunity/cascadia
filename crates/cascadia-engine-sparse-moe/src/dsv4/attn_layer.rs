@@ -270,25 +270,36 @@ impl AttentionLayer {
     pub fn decode(&mut self, x: &[f32], pos: usize) -> Vec<f32> {
         let (dim, hd, win) = (self.dim, self.hd, self.win);
         assert_eq!(x.len(), dim);
+        let _tp = std::time::Instant::now();
         let qr = self.qr_row(x);
         let kv = self.kv_row(x, pos);
+        super::math::prof::add(super::math::prof::PROJ, _tp);
         let slot = pos % win;
         self.cache[slot * hd..(slot + 1) * hd].copy_from_slice(&kv);
         let mut idxs = self.window_idxs_decode(pos);
         if self.ratio > 0 {
             let offset = win as i32;
             if let Some(idx) = self.idx.as_mut() {
-                idxs.extend(idx.decode(x, &qr, pos, &self.freqs, offset));
+                let _ti = std::time::Instant::now();
+                let e = idx.decode(x, &qr, pos, &self.freqs, offset);
+                super::math::prof::add(super::math::prof::INDEXER, _ti);
+                idxs.extend(e);
             } else {
                 idxs.extend(self.compress_idxs_static((pos + 1) / self.ratio, offset));
             }
-            if let Some(row) = self.comp.as_mut().unwrap().decode(x, pos, &self.freqs) {
+            let _tc = std::time::Instant::now();
+            let crow = self.comp.as_mut().unwrap().decode(x, pos, &self.freqs);
+            super::math::prof::add(super::math::prof::COMPRESS, _tc);
+            if let Some(row) = crow {
                 let cslot = win + pos / self.ratio;
                 self.cache[cslot * hd..(cslot + 1) * hd].copy_from_slice(&row);
             }
         }
+        let _tq = std::time::Instant::now();
         let q = self.q_row(&qr, pos);
+        super::math::prof::add(super::math::prof::PROJ, _tq);
         let mut o = vec![0.0f32; self.h * hd];
+        let _ts = std::time::Instant::now();
         super::attn::sparse_attn_pos(
             &q,
             &self.cache,
@@ -299,6 +310,10 @@ impl AttentionLayer {
             self.scale,
             &mut o,
         );
-        self.o_proj(o, pos)
+        super::math::prof::add(super::math::prof::SPARSE, _ts);
+        let _to = std::time::Instant::now();
+        let out = self.o_proj(o, pos);
+        super::math::prof::add(super::math::prof::PROJ, _to);
+        out
     }
 }

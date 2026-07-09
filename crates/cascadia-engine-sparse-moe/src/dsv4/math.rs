@@ -12,6 +12,86 @@
 
 use half::bf16;
 
+/// Per-section decode profiler, gated by the `DSV4_PROFILE` env var. When the
+/// var is unset `add`/`dump` are no-ops (only a cheap cached-bool check and an
+/// unused `Instant`), so it is safe to leave wired into the hot path in
+/// release builds. Set `DSV4_PROFILE=1` to have each `forward_layers_decode`
+/// print the per-layer wall time split across the major sections — how the
+/// GPU-expert build's decode budget was diagnosed (experts vs proj vs the
+/// Sinkhorn/DSA glue). Not part of any correctness path.
+///
+/// Usage: `DSV4_PROFILE=1 cascadia worker …` → `DSV4_PROF decode wall_ms=…`
+/// lines on stderr, one dump per decoded token (cumulative).
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const PROJ: usize = 0; // attention projection GEMVs (wq_a/wq_b/wkv/wo)
+    pub const INDEXER: usize = 1; // DSA indexer top-k selection
+    pub const COMPRESS: usize = 2; // learned KV compressor
+    pub const SPARSE: usize = 3; // sparse-attention softmax
+    pub const SINK: usize = 4; // Hyper-Connections Sinkhorn mixing
+    pub const EXPERTS: usize = 5; // routed + shared expert FFNs
+    pub const WALL: usize = 6; // whole per-layer decode (denominator)
+    const N: usize = 7;
+    const NAMES: [&str; N] = [
+        "proj", "indexer", "compress", "sparse", "sinkhorn", "experts", "WALL",
+    ];
+    static NS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Cached `DSV4_PROFILE` check (read once).
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DSV4_PROFILE").is_ok())
+    }
+
+    /// Accumulate `since.elapsed()` into `bucket` (no-op when disabled).
+    #[inline]
+    pub fn add(bucket: usize, since: Instant) {
+        if enabled() {
+            NS[bucket].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Print the cumulative per-section split as a share of WALL (no-op when
+    /// disabled). Called once per decoded token; the last line before teardown
+    /// is the whole-generation total.
+    pub fn dump(tag: &str) {
+        if !enabled() {
+            return;
+        }
+        let wall = NS[WALL].load(Ordering::Relaxed).max(1);
+        let mut summed = 0u64;
+        eprintln!("DSV4_PROF {tag} wall_ms={:.1}", wall as f64 / 1e6);
+        for i in 0..WALL {
+            let v = NS[i].load(Ordering::Relaxed);
+            summed += v;
+            eprintln!(
+                "  {:9} {:9.1} ms  {:4.1}%",
+                NAMES[i],
+                v as f64 / 1e6,
+                v as f64 / wall as f64 * 100.0
+            );
+        }
+        let resid = wall.saturating_sub(summed);
+        eprintln!(
+            "  {:9} {:9.1} ms  {:4.1}%  (gate/norm/rope/misc)",
+            "other",
+            resid as f64 / 1e6,
+            resid as f64 / wall as f64 * 100.0
+        );
+    }
+}
+
 /// Round an f32 to the nearest bf16 value, returned as f32 (RNE).
 #[inline]
 pub fn to_bf16(v: f32) -> f32 {
