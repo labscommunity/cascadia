@@ -227,7 +227,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cascadia"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cascadia-cli",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bytes",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-dashboard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "cascadia-topology",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cascadia-topology",
  "cascadia-types",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-download"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "hf-hub",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cascadia-types",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-engine-mock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cascadia-engine",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-engine-openvino"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cascadia-engine",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-engine-sparse-moe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cascadia-engine",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-int4-gemm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "memmap2",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-ov-genai-shim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "thiserror 1.0.69",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-runner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "cascadia-engine",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-tests-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-topology"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "thiserror 1.0.69",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "cascadia-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
