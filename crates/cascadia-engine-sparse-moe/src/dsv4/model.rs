@@ -390,6 +390,7 @@ impl DsV4Model {
             self.last_hiddens.push(copies.clone());
         }
         super::math::prof::dump("decode");
+        super::ov_expert::stats::dump();
         copies
     }
 
