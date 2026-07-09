@@ -476,8 +476,12 @@ def save_whole(model: ov.Model, src_dir: str, out_dir: str,
     else:
         try:
             regenerate_tokenizer_bos(out_dir)
-        except Exception as e:  # noqa: BLE001
-            log(f"  WARNING: tokenizer regen failed ({e}); the copied VLM "
+        except ImportError as e:
+            # Deliberate off-node tolerance: transformers/openvino_tokenizers
+            # may be absent there; the copied VLM tokenizer may omit BOS —
+            # rerun regen on-node. Any OTHER failure is a real bug and must
+            # fail the export, not ship a BOS-less tokenizer with exit 0.
+            log(f"  WARNING: tokenizer regen skipped ({e}); the copied VLM "
                 f"tokenizer may omit BOS — rerun regen on-node")
     log("WHOLE-IR (N=1) DONE")
 
@@ -1036,8 +1040,10 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         else:
             try:
                 regenerate_tokenizer_bos(out_dir)
-            except Exception as e:  # noqa: BLE001
-                log(f"  WARNING: tokenizer regen failed ({e}); rerun on-node")
+            except ImportError as e:
+                # Off-node tolerance only (deps absent); other failures must
+                # fail the export — see the N==1 twin in save_whole.
+                log(f"  WARNING: tokenizer regen skipped ({e}); rerun on-node")
 
         # ov-runtime reads the HF tokenizer + config from a ``tokenizer/``
         # subdir (not the model root) — mirror export_shards.py. Runs after
