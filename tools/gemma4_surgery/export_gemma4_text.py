@@ -60,6 +60,7 @@ Usage (on a node with the model dir + openvino / openvino_tokenizers):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -1099,7 +1100,18 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         raise
 
     if not keep_grafted:
+        # The last extracted stage still memory-maps ``_grafted/*.bin``; on
+        # Windows a mapped file cannot be deleted, and ignore_errors turned
+        # that into a silent ~17 GB leak per export (observed on-fleet: every
+        # successful 31B slice left _grafted behind). Drop the reference,
+        # collect, and VERIFY the dir is gone — never fail the export over
+        # temp-dir hygiene, but never be silent about it either.
+        stage = None  # release the last stage model's mapping
+        gc.collect()
         shutil.rmtree(grafted_dir, ignore_errors=True)
+        if os.path.isdir(grafted_dir):
+            log(f"  WARNING: could not remove temp {grafted_dir} (files "
+                f"likely still mapped) — delete it manually to reclaim disk")
     log("SLICED (N>1) DONE")
 
 
