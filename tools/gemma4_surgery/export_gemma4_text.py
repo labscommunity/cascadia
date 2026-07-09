@@ -340,13 +340,28 @@ def copy_tokenizer_subdir(model_dir: str) -> None:
     """
     tok_dir = os.path.join(model_dir, "tokenizer")
     os.makedirs(tok_dir, exist_ok=True)
-    copied = 0
+    copied, missing = [], []
     for fn in TOKENIZER_SUBDIR_FILES:
         src = os.path.join(model_dir, fn)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(tok_dir, fn))
-            copied += 1
-    log(f"copied {copied} tokenizer file(s) into {tok_dir}")
+            copied.append(fn)
+        else:
+            missing.append(fn)
+    log(f"copied {len(copied)} tokenizer file(s) into {tok_dir}"
+        + (f" (absent: {', '.join(missing)})" if missing else ""))
+    # ov-runtime cannot load a stage tree without the HF tokenizer — fail at
+    # export time instead of at worker startup, far from the cause.
+    if "tokenizer.json" in missing:
+        raise SystemExit(
+            f"tokenizer.json is missing from {model_dir} — ov-runtime cannot "
+            f"load the stage tree without tokenizer/tokenizer.json. The "
+            f"source IR should ship it; re-download or restore it.")
+    if "chat_template.jinja" in missing:
+        log("  WARNING: chat_template.jinja absent — rank 0 falls back to "
+            "legacy 'role: content' prompt formatting, and instruction-tuned "
+            "gemma-4 DEGENERATES without its turn markers (observed: "
+            "'la la la ...'). Restore it in the source IR before serving.")
 
 
 def regenerate_tokenizer_bos(model_dir: str) -> None:
