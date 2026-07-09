@@ -930,6 +930,15 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
             f"each sharing group inside one stage.")
 
     os.makedirs(out_dir, exist_ok=True)
+    # pipeline_config.json is the "tree is complete" marker (harnesses and
+    # operators key on it), so a stale one from a previous export must never
+    # survive a failed/mixed re-export. Remove it up front; it is re-written
+    # LAST, after every stage + aux step + the optional parity gate succeeded.
+    # (--stage i incremental exports keep the existing marker untouched.)
+    marker_path = os.path.join(out_dir, "pipeline_config.json")
+    if only_stage is None and os.path.exists(marker_path):
+        os.remove(marker_path)
+        log(f"removed stale pipeline_config.json (re-export into {out_dir})")
     grafted_dir = os.path.join(out_dir, "_grafted")
     os.makedirs(grafted_dir, exist_ok=True)
     grafted_xml = os.path.join(grafted_dir, "openvino_model.xml")
@@ -964,77 +973,88 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
         "stages": [],
     }
 
-    for i, (a, b) in enumerate(ranges):
-        if only_stage is not None and i != only_stage:
-            continue
-        first, last = i == 0, i == len(ranges) - 1
-        t0 = time.time()
-        stage, state_vars, all_vids = extract_stage(
-            grafted_xml, a, b, first, last, suffix, last_logits_only)
-        sdir = os.path.join(out_dir, f"stage_{i}")
-        os.makedirs(sdir, exist_ok=True)
-        ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"),
-                      compress_to_fp16=False)
-        inputs = [p.get_friendly_name() for p in stage.get_parameters()]
-        # Keys ov-runtime's StageConfig reads (layer_start/end, has_embed,
-        # has_head, stateful, num_kv_heads, head_dim, export_version) plus
-        # gemma-4 diagnostics it ignores (stage, inputs, state_vars).
-        stage_cfg = {
-            # layer_end is HALF-OPEN (v3 contract: cascadia-types
-            # num_layers = layer_end - layer_start). stage_ranges returns an
-            # INCLUSIVE b, so write b + 1. The internal slice math keeps using
-            # the inclusive b (and b+1 for the residual cut) untouched.
-            "stage": i, "layer_start": a, "layer_end": b + 1,
-            "has_embed": first, "has_head": last, "stateful": True,
-            "num_kv_heads": num_kv_heads,
-            "head_dim": head_dim,
-            "export_version": EXPORT_VERSION,
-            "inputs": inputs,
-            "state_vars": state_vars,
-        }
-        with open(os.path.join(sdir, "stage_config.json"), "w") as f:
-            json.dump(stage_cfg, f, indent=2)
-        pipeline_config["stages"].append(stage_cfg)
-        log(f"stage_{i}: layers {a}..{b} saved in {time.time() - t0:.0f}s "
-            f"inputs={inputs} states={len(state_vars)}")
-        if i == 0:
-            log(f"  (discovered {len(all_vids)} Assign variable_ids; "
-                f"sample: {all_vids[:4]})")
+    try:
+        for i, (a, b) in enumerate(ranges):
+            if only_stage is not None and i != only_stage:
+                continue
+            first, last = i == 0, i == len(ranges) - 1
+            t0 = time.time()
+            stage, state_vars, all_vids = extract_stage(
+                grafted_xml, a, b, first, last, suffix, last_logits_only)
+            sdir = os.path.join(out_dir, f"stage_{i}")
+            os.makedirs(sdir, exist_ok=True)
+            ov.save_model(stage, os.path.join(sdir, "openvino_model.xml"),
+                          compress_to_fp16=False)
+            inputs = [p.get_friendly_name() for p in stage.get_parameters()]
+            # Keys ov-runtime's StageConfig reads (layer_start/end, has_embed,
+            # has_head, stateful, num_kv_heads, head_dim, export_version) plus
+            # gemma-4 diagnostics it ignores (stage, inputs, state_vars).
+            stage_cfg = {
+                # layer_end is HALF-OPEN (v3 contract: cascadia-types
+                # num_layers = layer_end - layer_start). stage_ranges returns an
+                # INCLUSIVE b, so write b + 1. The internal slice math keeps
+                # using the inclusive b (and b+1 for the residual cut)
+                # untouched.
+                "stage": i, "layer_start": a, "layer_end": b + 1,
+                "has_embed": first, "has_head": last, "stateful": True,
+                "num_kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "export_version": EXPORT_VERSION,
+                "inputs": inputs,
+                "state_vars": state_vars,
+            }
+            with open(os.path.join(sdir, "stage_config.json"), "w") as f:
+                json.dump(stage_cfg, f, indent=2)
+            pipeline_config["stages"].append(stage_cfg)
+            log(f"stage_{i}: layers {a}..{b} saved in {time.time() - t0:.0f}s "
+                f"inputs={inputs} states={len(state_vars)}")
+            if i == 0:
+                log(f"  (discovered {len(all_vids)} Assign variable_ids; "
+                    f"sample: {all_vids[:4]})")
 
-    # --stage i is an incremental single-stage export: don't clobber a
-    # complete pipeline_config.json (finding #5).
-    if only_stage is None:
-        with open(os.path.join(out_dir, "pipeline_config.json"), "w") as f:
-            json.dump(pipeline_config, f, indent=2)
-    else:
-        log(f"  (--stage {only_stage}: skipping pipeline_config.json write)")
-
-    # tokenizer/detokenizer/config alongside the stages (single-dir UX), same
-    # as qwen36 — plus the proven BOS regen + config flatten.
-    copy_aux(src_dir, out_dir)
-    flatten_config(os.path.join(out_dir, "config.json"))
-    if skip_tokenizer_regen:
-        log("skipping BOS tokenizer regen (--skip-tokenizer-regen)")
-    else:
-        try:
-            regenerate_tokenizer_bos(out_dir)
-        except Exception as e:  # noqa: BLE001
-            log(f"  WARNING: tokenizer regen failed ({e}); rerun on-node")
-
-    # ov-runtime reads the HF tokenizer + config from a ``tokenizer/`` subdir
-    # (not the model root) — mirror export_shards.py. Runs after flatten_config
-    # + regen so the shipped tokenizer/ has the flat text-gen config.json and
-    # the coerced tokenizer_config.json. N==1 (ov-genai) reads root, untouched.
-    copy_tokenizer_subdir(out_dir)
-
-    # Parity gate (on-node): chained stages vs the grafted whole IR. Run before
-    # the temp grafted IR is removed. Can't chain a partial export.
-    if validate:
-        if only_stage is not None:
-            log("  (--validate skipped: --stage exports a single shard, "
-                "cannot chain)")
+        # tokenizer/detokenizer/config alongside the stages (single-dir UX),
+        # same as qwen36 — plus the proven BOS regen + config flatten.
+        copy_aux(src_dir, out_dir)
+        flatten_config(os.path.join(out_dir, "config.json"))
+        if skip_tokenizer_regen:
+            log("skipping BOS tokenizer regen (--skip-tokenizer-regen)")
         else:
-            _validate(grafted_xml, out_dir, ranges, last_logits_only)
+            try:
+                regenerate_tokenizer_bos(out_dir)
+            except Exception as e:  # noqa: BLE001
+                log(f"  WARNING: tokenizer regen failed ({e}); rerun on-node")
+
+        # ov-runtime reads the HF tokenizer + config from a ``tokenizer/``
+        # subdir (not the model root) — mirror export_shards.py. Runs after
+        # flatten_config + regen so the shipped tokenizer/ has the flat
+        # text-gen config.json and the coerced tokenizer_config.json. N==1
+        # (ov-genai) reads root, untouched.
+        copy_tokenizer_subdir(out_dir)
+
+        # Parity gate (on-node): chained stages vs the grafted whole IR. Run
+        # before the temp grafted IR is removed. Can't chain a partial export.
+        if validate:
+            if only_stage is not None:
+                log("  (--validate skipped: --stage exports a single shard, "
+                    "cannot chain)")
+            else:
+                _validate(grafted_xml, out_dir, ranges, last_logits_only)
+
+        # Completion marker LAST: a tree carrying pipeline_config.json has by
+        # construction finished every stage, aux step, and (if requested) the
+        # parity gate. --stage i is an incremental single-stage export: don't
+        # clobber a complete pipeline_config.json.
+        if only_stage is None:
+            with open(marker_path, "w") as f:
+                json.dump(pipeline_config, f, indent=2)
+        else:
+            log(f"  (--stage {only_stage}: skipping pipeline_config.json "
+                f"write)")
+    except BaseException:
+        log(f"  ERROR: export failed — PARTIAL tree left at {out_dir} "
+            f"(no pipeline_config.json written; _grafted/ retained for "
+            f"debugging). Delete the tree before use.")
+        raise
 
     if not keep_grafted:
         shutil.rmtree(grafted_dir, ignore_errors=True)
