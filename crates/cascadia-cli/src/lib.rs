@@ -2075,6 +2075,52 @@ mod tests {
         assert!(!flags.iter().any(|f| f == "--static-context"));
     }
 
+    /// Golden vector: pins VALUES (not just flag presence), `--quantization`
+    /// forwarding, and flag/value adjacency for the whole NPU argv — a bug
+    /// that pushes a default instead of the user's value passes every
+    /// presence-only assertion and exports a wrong-shape shard silently.
+    #[test]
+    fn shard_flags_npu_golden_vector() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--quantization",
+            "int8",
+            "--target",
+            "npu",
+            "--static-context",
+            "2048",
+        ]);
+        let expected: Vec<String> = [
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "2",
+            "--quantization",
+            "int8",
+            "--target",
+            "npu",
+            "--default-dtype",
+            "fp16",
+            "--static-seq",
+            "1",
+            "--static-context",
+            "2048",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(shard_exporter_flags(&args).expect("npu golden"), expected);
+    }
+
     /// `--layer-split`/`--stage` are forwarded when present.
     #[test]
     fn shard_flags_forwards_layer_split_and_stage() {
