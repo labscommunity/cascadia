@@ -24,8 +24,9 @@ N > 1   (sliced stages, for the ov-runtime distributed engine)
     N per-stage stateful shards in the v3 on-disk layout the ov-runtime
     engine loads (``crates/cascadia-engine-openvino/src/runtime.rs``): a root
     ``pipeline_config.json`` + per-stage ``stage_{i}/openvino_model.xml`` +
-    ``stage_{i}/stage_config.json`` — byte-for-key identical to what
-    ``tools/export_shards.py`` writes. The boundary + sink-ownership algorithm
+    ``stage_{i}/stage_config.json`` — carrying every key ov-runtime's
+    ``read_pipeline_config`` / ``read_stage_config`` deserialize (the full
+    key sets otherwise differ from ``tools/export_shards.py``'s). The boundary + sink-ownership algorithm
     mirrors ``tools/qwen36_surgery/export_qwen36_moe.py``, so a gemma-4 too big
     for one node (31B) runs pipeline-parallel. Stage 0 keeps the grafted
     ``input_ids -> embeddings`` front-end; the last stage keeps the ``logits``
@@ -218,8 +219,9 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
 
     # --- neutralize VLM-only token_type_ids (present in 31B / transformers>=5
     #     exports; absent on E2B). Text-only => every token is text (type 0).
-    #     Feed a dynamic all-zeros i64 tensor shaped like input_ids so the
-    #     Parameter can be DROPPED (ov-genai LLMPipeline never feeds it). ---
+    #     Feed a dynamic all-zeros tensor (in the Parameter's own element
+    #     type) shaped like input_ids so the Parameter can be DROPPED
+    #     (ov-genai LLMPipeline never feeds it). ---
     p_tok_type = find_param(lm, "token_type_ids")
     if p_tok_type is not None:
         import numpy as _np
@@ -316,9 +318,11 @@ TOKENIZER_SUBDIR_FILES = (
     "generation_config.json",
     "added_tokens.json",
     # ov-runtime's chat formatter (cascadia-api::load_chat_template_config)
-    # looks for the gemma turn-marker template at ``tokenizer/chat_template.jinja``
-    # (or a ``chat_template`` field in ``tokenizer/tokenizer_config.json``, which
-    # gemma-4 does NOT embed). Without it rank 0 falls back to legacy
+    # checks the ``chat_template`` field in ``tokenizer/tokenizer_config.json``
+    # FIRST (gemma-4 does NOT embed one), then falls back to
+    # ``tokenizer/chat_template.jinja`` — and considers the jinja only when
+    # ``tokenizer/tokenizer_config.json`` is present and parsable, which is why
+    # that file must also ship in this list. Without a template rank 0 uses legacy
     # "role: content" formatting and the instruction-tuned model degenerates
     # (observed: "la la la ..." instead of a coherent answer). Ship the jinja
     # into the subdir so the turn markers are applied.
@@ -330,8 +334,8 @@ def copy_tokenizer_subdir(model_dir: str) -> None:
     """Populate ``<model_dir>/tokenizer/`` from the finalized root files.
 
     ov-runtime (the N>1 engine) expects the HF tokenizer + config under a
-    ``tokenizer/`` subdir, NOT at the model root (runtime.rs:1556 joins
-    ``pipeline_dir/tokenizer`` first). Run AFTER ``flatten_config`` and
+    ``tokenizer/`` subdir, NOT at the model root (ov-runtime's ``load()``
+    joins ``pipeline_dir/tokenizer`` first). Run AFTER ``flatten_config`` and
     ``regenerate_tokenizer_bos`` so the flat text-gen ``config.json`` and the
     BOS/transformers-5-coerced ``tokenizer_config.json`` are the versions that
     ship. Root files are left in place (N==1 ov-genai + the regen step read
@@ -491,8 +495,9 @@ def save_whole(model: ov.Model, src_dir: str, out_dir: str,
 # ===========================================================================
 
 # variable_id patterns for per-layer KV state (optimum VLM IR + gemma4
-# present.N/past_key_values.N naming). Permissive on purpose; the discovered
-# (variable_id -> layer) map is logged so the on-node operator can verify.
+# present.N/past_key_values.N naming). Permissive on purpose; a sample of the
+# discovered variable_ids (and of any fallback attributions) is logged so the
+# on-node operator can spot-check.
 _LAYER_RE = re.compile(
     r"(?:past_key_values|present|past|layers?|blocks?|decoder)[._](\d+)")
 # Cache kind (key/value/conv/ssm) taken as the delimited token immediately
@@ -502,7 +507,13 @@ _KIND_RE = re.compile(r"[._]\d+[._](value|key|conv|ssm)")
 
 
 def sink_layer_index(variable_id: str):
-    """Global decoder-layer index owning a KV Assign/ReadValue, or None."""
+    """Layer number embedded in a KV Assign/ReadValue variable_id, or None.
+
+    NOTE: optimum may sequence this number per ATTENTION TYPE, not per global
+    layer (see the GLOBAL-LAYER attribution block below) — callers use it only
+    as the fallback when no ``layers.{idx}`` op scope is reachable, where it is
+    empirically correct.
+    """
     m = _LAYER_RE.search(variable_id)
     if m:
         return int(m.group(1))
@@ -578,7 +589,9 @@ def find_output_by_name(model: ov.Model, name: str):
 # 26B --num-stages 2 crash). Attributing each Assign to the ``layers.{idx}``
 # scope of the ops that FEED it keeps the pair together in the SAME index space
 # the boundary uses — the same globally-indexed contract qwen36 encodes with its
-# explicit per-layer variable_id map (layer_state_vids).
+# explicit per-layer variable_id map (layer_state_vids). For the few sinks the
+# bounded scope-BFS cannot reach, the variable_id number is the fallback, and
+# is empirically correct there (see ``_nearest_scope_layer``).
 _LAYER_SCOPE_RE = re.compile(r"layers\.(\d+)")
 
 
@@ -650,7 +663,7 @@ def _feeds_attention_concat(rv_op) -> bool:
 
 
 def _shapes_compatible(ps_a, ps_b) -> bool:
-    """KV-cache PartialShape compatibility for orphan substitution: same rank
+    """KV-cache PartialShape compatibility for orphan substitution: mergeable rank
     and, on every axis where BOTH dims are static, equal length. The dynamic
     sequence axis is a wildcard; the static head-count and head-dim axes must
     match, so a global-layer cache ([?,2,?,512]) can never be substituted onto a
@@ -681,11 +694,11 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
                 f"stage input boundary not found: layers.{a}.{suffix} "
                 f"(override with --boundary-suffix; check op names on-node)")
         # ov-runtime feeds the inter-stage activation as f16 under the tensor
-        # name ``hidden_states`` (runtime.rs:17 wire-format doc, :608
-        # ``input_named("hidden_states")``, :623/:1733 F16 feed) — the exact
-        # contract ``tools/export_shards.py`` emits (its whole model is traced
-        # at torch.float16, so its non-first ``hidden_states`` Parameter is
-        # f16; runtime.rs:1355 names it ``hidden_states``). Match BOTH: name
+        # name ``hidden_states`` (runtime.rs wire-format doc,
+        # ``input_named("hidden_states")``, the ShimDType::F16 ``set_input``
+        # feed) — the exact contract ``tools/export_shards.py`` emits (its
+        # whole model is traced at torch.float16, and it names the non-first
+        # stage's Parameter ``hidden_states``). Match BOTH: name
         # the Parameter ``hidden_states`` and give it element type f16 so the
         # F16 feed is accepted. The grafted residual-stream boundary may be a
         # wider dtype (the graft is saved compress_to_fp16=False), so insert a
@@ -801,8 +814,9 @@ def extract_stage(grafted_xml: str, a: int, b: int, first: bool, last: bool,
     # inside the variable_id, which optimum may sequence per attention-type for
     # gemma-4's heterogeneous sliding/global KV. This keeps each layer's key AND
     # value ReadValue<->Assign pair on the same side of the boundary, so a
-    # num_kv_shared_layers==0 model has NO genuine-KV orphans (only shape-only
-    # bookkeeping reads get rewired below).
+    # num_kv_shared_layers==0 model is expected to have NO genuine-KV orphans
+    # (an empirical result — the ``_feeds_attention_concat`` refusal below
+    # backstops it; only shape-only bookkeeping reads get rewired).
     sinks, all_vids, vid_parsed = [], [], []
     for op in model.get_ops():
         if op.get_type_name() != "Assign":
@@ -940,8 +954,6 @@ def slice_stages(grafted: ov.Model, src_dir: str, out_dir: str,
     (mmap, no RAM wall) — mirroring qwen36's ``extract_stage(xml_path, ...)``.
     ``num_kv_heads`` / ``head_dim`` are best-effort per-model defaults carried
     into each ``stage_config.json`` as the ``Option`` hints StageConfig reads.
-    The graft/slice ALGORITHM is unchanged — only the emitted filenames + JSON
-    keys differ from the earlier qwen36-family layout.
     """
     # HARD guard: KV-sharing severed across a stage boundary silently rewires
     # an orphan ReadValue to the WRONG cache -> silent garbage. This tool emits
@@ -1100,7 +1112,8 @@ def _validate(grafted_xml: str, out_dir: str, ranges, last_logits_only: bool,
     prompt, feeding each stage's output as the next stage's ``hidden_states``
     input (the tiling contract). Assert last-position top-1 logit agreement,
     top-5 overlap, and bounded relative drift. Also asserts mid/last stages
-    carry NO ``input_ids`` (finding #4). Prints EXPORT_VALIDATE_OK/FAIL and
+    carry NO ``input_ids`` (a leaked ``input_ids`` means the embedding-drop
+    rewire failed). Prints EXPORT_VALIDATE_OK/FAIL and
     exits non-zero on failure so it can gate a script.
     """
     import numpy as np
@@ -1215,10 +1228,10 @@ def run_export(model, output_dir, num_stages=1, quantization="int4",
     ``output_dir``, ``num_stages``, ``quantization``. ``quantization`` is
     accepted for CLI symmetry but IGNORED — the surgery inherits the source
     int4 IR's quantized weights byte-for-byte (never re-quantizes). ``**_ignored``
-    absorbs generic-exporter kwargs that do not apply here (``layer_split``,
-    ``target``, ``default_dtype``, ``static_seq``, ``static_context``, …) so the
-    dispatcher can forward them harmlessly. The graft/slice ALGORITHM and every
-    guard below are unchanged from the original ``main()``.
+    is forward-compat for kwargs that are genuinely no-ops here
+    (``default_dtype``, ``static_seq``, ``static_context``, …); the dispatcher
+    REJECTS ``--target npu`` and ``--layer-split`` before calling, because
+    silently ignoring those would not be harmless.
     """
     if num_stages < 1:
         raise SystemExit("--num-stages must be >= 1")

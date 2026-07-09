@@ -1652,13 +1652,16 @@ const GEMMA4_TEXT_SCRIPT: &str = include_str!(concat!(
 
 /// Assemble the flag list passed to the embedded Python exporter (the args
 /// after `python -u <script>`). Pure + side-effect-free so it's unit-testable
-/// without spawning Python. Order mirrors `export_shards.py`'s argparse:
-/// `--model --output-dir --num-stages --quantization --target --default-dtype`,
-/// then `--static-seq/--static-context` (NPU only — the exporter warns if they
-/// appear on the cpu-gpu path), then `--layer-split`/`--stage` when set.
+/// without spawning Python. Emits `--model --output-dir --num-stages
+/// --quantization --target --default-dtype`, then `--static-seq` /
+/// `--static-context` (NPU path only — on cpu-gpu they are simply not
+/// forwarded; `cmd_shard` warns about the ignore), then `--layer-split` /
+/// `--stage` when set.
 ///
-/// Fails fast on the one NPU constraint cheap to check here (fp16 default
-/// dtype); the exporter enforces the rest (static-seq == 1, context > seq).
+/// Fails fast on the stable wire-format rule (NPU feeds KV as f16, so the
+/// default dtype must be fp16); the exporter owns the static-shape rules
+/// (static-seq == 1, context > seq) since it may relax them (e.g. chunked
+/// prefill) without a CLI change.
 fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
     if args.target == ShardTarget::Npu && args.default_dtype != ShardDtype::Fp16 {
         return Err(anyhow!("--default-dtype must be fp16 for --target npu"));
