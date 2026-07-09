@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Gemma-4 multimodal VLM (OpenVINO int4 IR) -> cascadia text-only artifacts.
 
-Productionizes the proven ``_gemma4_spike`` scripts (pawan-01,
-``C:\\cascadia\\_gemma4_spike\\``) that took a gemma-4-E2B VLM int4 IR ->
-grafted text-only LM -> cascadia ov-genai -> coherent "Paris" @ ~14 tok/s.
+Productionizes a validated prototype pipeline that took a gemma-4-E2B VLM
+int4 IR -> grafted text-only LM -> cascadia ov-genai -> coherent "Paris"
+@ ~14 tok/s on a Lunar Lake iGPU.
 
 No torch. No RAM wall: everything is OpenVINO graph surgery on memory-mapped
 IR (``core.read_model`` / ``ov.save_model``); model weights are never
@@ -38,11 +38,10 @@ N > 1   (sliced stages, for the ov-runtime distributed engine)
     sharing group inside one stage.
 
 The graft (``graft_text_frontend``) and the N==1 aux steps
-(``regenerate_tokenizer_bos``, ``flatten_config``) are faithful ports of the
-proven spike scripts (``step1_surgery.py`` / ``step1_surgery_26b.py`` /
-``regen_tok.py`` / ``flatten_config.py``). The N>1 slice
-(``slice_stages`` / ``extract_stage`` / ``_validate``) is NEW code, adapted
-from the qwen36 surgery; run ``--validate`` on-node to gate it.
+(``regenerate_tokenizer_bos``, ``flatten_config``) are faithful ports of that
+validated prototype (graft, tokenizer-BOS regen, config flatten). The N>1
+slice (``slice_stages`` / ``extract_stage`` / ``_validate``) is NEW code,
+adapted from the qwen36 surgery; run ``--validate`` on-node to gate it.
 
 Usage (on a node with the model dir + openvino / openvino_tokenizers):
 
@@ -71,7 +70,7 @@ import openvino as ov
 from openvino import opset13 as ops
 
 # Files copied verbatim from the source VLM IR dir into the text output dir.
-# (Same list the proven spike scripts copy, minus the sub-IRs we graft away.)
+# (Same list the validated prototype copies, minus the sub-IRs we graft away.)
 AUX_COPY = [
     "openvino_tokenizer.xml", "openvino_tokenizer.bin",
     "openvino_detokenizer.xml", "openvino_detokenizer.bin",
@@ -127,7 +126,7 @@ def rewire_param_to_source(param, new_source_output, label: str) -> int:
 
 
 def maybe_convert(src_out, want_type, label: str):
-    """Insert a Convert if source element-type != target (spike behavior)."""
+    """Insert a Convert if source element-type != target (prototype behavior)."""
     if src_out.get_element_type() != want_type:
         log(f"  [{label}] element-type mismatch: {src_out.get_element_type()} "
             f"-> {want_type}; inserting Convert")
@@ -150,7 +149,7 @@ def graft_text_frontend(src_dir: str, tag_inputs_embeds: bool = False):
     ``tag_inputs_embeds`` (set only by the N>1 slice path) stamps the grafted
     inputs_embeds Output with ``GRAFTED_EMBEDS_NAME`` so the slicer can drop it
     from mid stages. It is left False for N==1 so that path's serialized IR
-    stays byte-identical to the proven spike output.
+    stays byte-identical to the validated prototype output.
 
     Returns ``(grafted_model, info)`` where ``info`` records
     ``per_layer_dropped`` and the surviving input names.
