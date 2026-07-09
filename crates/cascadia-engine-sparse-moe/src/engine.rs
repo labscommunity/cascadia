@@ -30,7 +30,8 @@ use tracing::{info, warn};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
     recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
-    send_forward_batch, send_forward_nosample, send_reset, send_token_batch_upstream,
+    send_forward_batch, send_forward_nosample, send_forward_prefill, send_reset,
+    send_token_batch_upstream,
     send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
@@ -1226,23 +1227,24 @@ impl SparseMoEEngine {
         );
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
-            // Only the LAST prompt step samples (its token is the first
-            // generated token); intermediates go as ForwardNoSample so
-            // their discarded tokens never enter the last rank's penalty
-            // history (see FrameKind::ForwardNoSample).
-            let token_back = self
-                .forward_one_token_first(&history, cfg, downstream, i + 1 == prompt_ids.len())
-                .map_err(|e| format!("prefill step {i}: {e}"))?;
             if i + 1 == prompt_ids.len() {
-                // Last prefill step: this is the first generated token.
+                // Last prompt token: a sampling Forward; the token it returns
+                // is the first generated token.
+                let token_back = self
+                    .forward_one_token_first(&history, cfg, downstream, true)
+                    .map_err(|e| format!("prefill final step {i}: {e}"))?;
                 if eos.contains(&token_back) {
                     return Ok(generated);
                 }
                 generated.push(token_back);
                 history.push(token_back);
+            } else {
+                // Intermediate prompt tokens stream one-way (no ack) so they
+                // pipeline through the ranks — the compute overlaps instead of
+                // one blocking round-trip each. See FrameKind::ForwardPrefill.
+                self.forward_prefill_step_first(&history, cfg, downstream)
+                    .map_err(|e| format!("prefill stream step {i}: {e}"))?;
             }
-            // Otherwise discard (intermediate prefill samples are stale).
-            let _ = token_back;
         }
 
         // Decode loop.
@@ -1258,6 +1260,44 @@ impl SparseMoEEngine {
         }
         let _ = hidden;
         Ok(generated)
+    }
+
+    /// Rank-0 streamed-prefill step: embed + run my shells on the most
+    /// recently appended history token, then fire the hidden downstream as a
+    /// one-way `ForwardPrefill` and return WITHOUT waiting for a reply. Used
+    /// for every prompt token except the last, so the prompt pipelines through
+    /// the ranks instead of one blocking round-trip per token.
+    fn forward_prefill_step_first(
+        &mut self,
+        history: &[i64],
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+    ) -> Result<(), String> {
+        let hidden = self.runner.manifest.hidden_size as usize;
+        let past_seq_len: u32 = history
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "forward_prefill_step_first: empty history".to_string())?
+            as u32;
+        let last_id = *history
+            .last()
+            .ok_or_else(|| "forward_prefill_step_first: empty history".to_string())?;
+        let h_tail = self
+            .runner
+            .forward_layer0_step(last_id)
+            .map_err(|e| format!("layer0_step: {e}"))?;
+        let h_after_shells = self
+            .runner
+            .forward_shells(&h_tail, &[1, 1, hidden], past_seq_len as usize)
+            .map_err(|e| format!("forward_shells: {e}"))?;
+        self.block_on(send_forward_prefill(
+            downstream,
+            past_seq_len,
+            cfg,
+            &h_after_shells,
+            [1, 1, hidden as u32],
+        ))
+        .map_err(|e| format!("send_forward_prefill: {e}"))
     }
 
     /// Run one (prefill or decode) step on rank 0: embed via layer 0,
@@ -1718,6 +1758,40 @@ impl SparseMoEEngine {
                 if let Some(down) = downstream.as_ref() {
                     self.block_on(forward_reset(down))
                         .map_err(|e| format!("forward_reset: {e}"))?;
+                }
+                Ok(())
+            }
+            FrameKind::ForwardPrefill => {
+                // Streamed prefill (one-way): advance KV, then mid ranks relay
+                // downstream WITHOUT waiting for a reply so the prompt tokens
+                // pipeline across ranks; the last rank stops here (no head /
+                // sample / record / ack). See FrameKind::ForwardPrefill.
+                let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+                    .block_on(recv_forward_body_server(upstream))
+                    .map_err(|e| format!("recv_forward(prefill): {e}"))?;
+                let hidden = self.runner.manifest.hidden_size as usize;
+                if in_shape[0] != 1 || in_shape[1] != 1 || in_shape[2] as usize != hidden {
+                    return Err(format!(
+                        "prefill shape unexpected {:?} vs hidden {}",
+                        in_shape, hidden
+                    ));
+                }
+                self.maybe_rewind_to(past_seq_len as usize);
+                let h_after = self
+                    .runner
+                    .forward_shells(&hidden_f32, &[1, 1, hidden], past_seq_len as usize)
+                    .map_err(|e| format!("forward_shells(prefill): {e}"))?;
+                if !self.is_last() {
+                    let down =
+                        downstream.ok_or_else(|| "mid rank missing downstream".to_string())?;
+                    self.block_on(send_forward_prefill(
+                        &down,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &h_after,
+                        [1, 1, hidden as u32],
+                    ))
+                    .map_err(|e| format!("relay forward_prefill: {e}"))?;
                 }
                 Ok(())
             }

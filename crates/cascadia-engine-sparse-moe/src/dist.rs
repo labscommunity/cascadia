@@ -104,6 +104,15 @@ pub enum FrameKind {
     /// records prompt-loop samples, so only distributed runs corrupted.
     /// Also skips the pointless vocab-width head GEMV per prompt token.
     ForwardNoSample = 0x53_4D_45_06, // "SME\x06"
+    /// Streamed prefill Forward (0x07): identical body to `ForwardNoSample`
+    /// (the receiver advances KV but skips head/sample/record), except it is
+    /// **one-way** — no `Token(-1)` ack. Rank 0 fires one per prompt token
+    /// (except the last) WITHOUT blocking, and mid ranks relay downstream
+    /// without waiting for a reply, so the prompt tokens pipeline through the
+    /// ranks (per-rank compute overlaps) instead of one blocking 6-hop
+    /// round-trip each. The final prompt token still goes as a sampling
+    /// `Forward`, whose returned token is the first generated token.
+    ForwardPrefill = 0x53_4D_45_07, // "SME\x07"
 }
 
 impl FrameKind {
@@ -115,6 +124,7 @@ impl FrameKind {
             x if x == FrameKind::ForwardBatch as u32 => Some(FrameKind::ForwardBatch),
             x if x == FrameKind::TokenBatch as u32 => Some(FrameKind::TokenBatch),
             x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
+            x if x == FrameKind::ForwardPrefill as u32 => Some(FrameKind::ForwardPrefill),
             _ => None,
         }
     }
@@ -327,6 +337,28 @@ pub async fn send_forward_nosample(
     send_forward_kind(
         cli,
         FrameKind::ForwardNoSample,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Send a STREAMED prefill Forward ([`FrameKind::ForwardPrefill`]): identical
+/// body to [`send_forward_nosample`], but one-way — the receiver advances KV
+/// and does NOT reply. Rank 0 fires these back-to-back for the prompt tokens
+/// (except the last) so they pipeline through the ranks.
+pub async fn send_forward_prefill(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::ForwardPrefill,
         past_seq_len,
         sampling,
         hidden_f32,
