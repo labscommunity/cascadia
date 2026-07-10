@@ -27,10 +27,19 @@ const IDX_D: usize = 32;
 const IDX_TOPK: usize = 4;
 const RATIOS: [usize; 4] = [0, 4, 16, 4];
 
-fn fixtures() -> StFile {
-    let p =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsv4/fixtures.safetensors");
-    StFile::open(&p).expect("open fixtures (run gen_fixtures.py)")
+/// Open the gen_fixtures.py output, or SKIP the test (return early) when it is
+/// absent. The *.safetensors fixtures are gitignored, so a fresh CI checkout
+/// (stub mode) does not have them; they exist after running gen_fixtures.py.
+macro_rules! fixtures {
+    () => {{
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dsv4/fixtures.safetensors");
+        if !p.exists() {
+            eprintln!("SKIP: {} absent (run gen_fixtures.py)", p.display());
+            return;
+        }
+        StFile::open(&p).expect("open fixtures")
+    }};
 }
 
 fn assert_close(name: &str, got: &[f32], want: &[f32], atol: f32, rtol: f32) {
@@ -120,7 +129,7 @@ fn build_layer(fx: &StFile, li: usize) -> AttentionLayer {
 }
 
 fn run_layer(li: usize, atol: f32, rtol: f32) {
-    let fx = fixtures();
+    let fx = fixtures!();
     let mut layer = build_layer(&fx, li);
 
     let (_, x) = fx.f32(&format!("int.L{li}.attn.prefill.in")).unwrap();
