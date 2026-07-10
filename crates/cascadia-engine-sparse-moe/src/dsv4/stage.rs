@@ -22,7 +22,8 @@ pub const DSV4_DEFAULT_MAX_SEQ: usize = 4096;
 pub struct Dsv4Runner {
     model: DsV4Model,
     eos: Vec<u32>,
-    hidden: usize, // hc * dim (wire width)
+    hidden: usize,  // hc * dim (wire width)
+    max_seq: usize, // context budget the caches were sized for
     pub rank: u32,
     pub total: u32,
 }
@@ -77,6 +78,7 @@ impl Dsv4Runner {
             model,
             eos,
             hidden,
+            max_seq,
             rank,
             total,
         })
@@ -85,6 +87,13 @@ impl Dsv4Runner {
     /// Wire hidden width: hc * dim.
     pub fn hidden_size(&self) -> usize {
         self.hidden
+    }
+
+    /// Context budget the caches were sized for. The driver must not forward a
+    /// token at an absolute position >= this: the rope table, KV, compressed
+    /// and indexer caches all have exactly this many rows.
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
     }
 
     pub fn eos_token_ids(&self) -> &[u32] {
@@ -121,22 +130,41 @@ impl Dsv4Runner {
     /// so). Prompt tokens drive the same per-token path as decode.
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, cfg: &SamplingConfig) -> Vec<u32> {
         self.reset();
+        if prompt.is_empty() {
+            return Vec::new();
+        }
+        let max_seq = self.max_seq;
         let mut rng = init_rng(cfg.seed);
         let mut history: Vec<i64> = Vec::new();
-        let mut next: i64 = -1;
+        // Prefill: forward each prompt token at its absolute position, keeping
+        // only the LAST forwarded token's logits. We sample exactly once, after
+        // prefill — mirroring the pipeline, where intermediate prompt tokens go
+        // as ForwardNoSample and only the last one seeds+draws, so seeded
+        // temperature>0 output is identical single-stage vs pipelined. (Greedy
+        // is unchanged: sample() returns the argmax of these same last logits
+        // without touching the RNG.) A prompt longer than the context budget is
+        // truncated to its first max_seq tokens — raise CASCADIA_DSV4_MAX_SEQ.
+        let mut last_logits: Vec<f32> = Vec::new();
         for (pos, &t) in prompt.iter().enumerate() {
+            if pos >= max_seq {
+                break;
+            }
             let h = self.embed_token(t);
             let h = self.forward_layers(h, pos, Some(t));
-            let logits = self.head_logits(&h);
-            next = sample(&logits, &history, cfg, &mut rng);
+            last_logits = self.head_logits(&h);
         }
+        let mut next = sample(&last_logits, &history, cfg, &mut rng);
         let mut out = Vec::with_capacity(max_new);
-        let mut pos = prompt.len();
+        let mut pos = prompt.len().min(max_seq);
         loop {
             let tok = next as u32;
             out.push(tok);
             history.push(next);
-            if out.len() >= max_new || self.eos.contains(&tok) {
+            // Stop before forwarding at an absolute position the caches can't
+            // hold (== max_seq): that write would index past the rope/KV/
+            // compressed/indexer rows. Checked after the push so the token
+            // sampled from the last in-range position is still emitted.
+            if out.len() >= max_new || self.eos.contains(&tok) || pos >= max_seq {
                 break;
             }
             let h = self.embed_token(tok);

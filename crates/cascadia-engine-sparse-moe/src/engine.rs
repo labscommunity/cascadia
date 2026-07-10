@@ -373,9 +373,24 @@ impl Builder for SparseMoEBuilder {
         if is_dsv4 {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
+            // Context budget sizes the rope table + KV/compressed/indexer
+            // caches (memory scales with it). Overridable for long-context
+            // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
+            // a missing, unparseable, or zero value.
+            let max_seq = std::env::var("CASCADIA_DSV4_MAX_SEQ")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ);
+            if max_seq > 131072 {
+                warn!(
+                    max_seq,
+                    "CASCADIA_DSV4_MAX_SEQ is large; per-layer caches scale with it"
+                );
+            }
             let runner = crate::dsv4::stage::Dsv4Runner::load_staged(
                 &self.config.model_dir,
-                crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+                max_seq,
                 rank,
                 total,
                 shard.layer_start,
@@ -2516,6 +2531,7 @@ pub struct Dsv4Engine {
     rank: u32,
     total: u32,
     peer_disconnected: bool,
+    disconnect_reported: bool,
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
@@ -2539,6 +2555,7 @@ impl Dsv4Engine {
             rank,
             total,
             peer_disconnected: false,
+            disconnect_reported: false,
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
@@ -2570,6 +2587,9 @@ impl Dsv4Engine {
                 return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
             }
         };
+        if prompt_ids.is_empty() {
+            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+        }
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
         let generated = self.runner.generate(&prompt_ids, max_new, &sampling_cfg);
@@ -2672,11 +2692,16 @@ impl Dsv4Engine {
         // rank's penalty history — recording them poisoned the first real
         // token (rep-penalty demoted the true continuation) and was the
         // 4-node "deterministic garbage while single-stage is coherent" bug.
+        let max_seq = self.runner.max_seq();
         let mut pos = 0usize;
         let mut next: i64 = -1;
         let n_prompt = prompt_ids.len();
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            let sample_back = i + 1 == n_prompt;
+        // Truncate an over-long prompt to the context budget; the last forwarded
+        // token is the one that asks the last rank to sample (its sampled result
+        // is the first generated token).
+        let n_prefill = n_prompt.min(max_seq);
+        for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
+            let sample_back = i + 1 == n_prefill;
             match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
@@ -2691,7 +2716,10 @@ impl Dsv4Engine {
         loop {
             let next_u = next as u32;
             generated.push(next_u);
-            if generated.len() >= max_new || eos.contains(&next_u) {
+            // Also stop before forwarding at pos == max_seq (the caches can't
+            // hold that absolute position). Checked after the push so the token
+            // sampled from the last in-range position is still emitted.
+            if generated.len() >= max_new || eos.contains(&next_u) || pos >= max_seq {
                 break;
             }
             match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
@@ -2791,6 +2819,28 @@ impl Dsv4Engine {
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
+        // A malformed or over-range frame is a protocol violation we cannot
+        // serve: forwarding a wrong-width hidden, or one at a position the
+        // caches can't hold, would panic (OOB) mid-pipeline. Latch the peer as
+        // disconnected and return Err so step() surfaces a connection-fatal
+        // error — the relay loop tears the stage down and rebuilds, and rank 0
+        // unblocks on the closed socket. Do NOT reply a token here: an ack of
+        // -1 would OOB-panic rank 0's embed, and staying silent would hang it.
+        let expect_w = self.runner.hidden_size();
+        if hidden_f32.len() != expect_w {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "forward frame hidden width {} != expected {expect_w}",
+                hidden_f32.len()
+            ));
+        }
+        if pos >= self.runner.max_seq() {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "forward position {pos} exceeds context budget {}",
+                self.runner.max_seq()
+            ));
+        }
         let hidden = self.runner.forward_layers(hidden_f32, pos, None);
         if self.is_last() {
             if !sample {
@@ -2884,11 +2934,23 @@ impl Engine for Dsv4Engine {
         if self.total <= 1 {
             return Ok(self.step_single_stage());
         }
-        Ok(if self.rank == 0 {
-            self.step_first()
-        } else {
-            self.step_worker()
-        })
+        // step_first handles its own errors terminally (final-marker/error
+        // chunk on the driver), so rank 0 never surfaces an Err here.
+        if self.rank == 0 {
+            return Ok(self.step_first());
+        }
+        // Worker rank. step_worker returns empty once an upstream disconnect (or
+        // a protocol violation escalated to one in handle_forward) latches
+        // peer_disconnected. The upstream socket can only be re-accepted by a
+        // rebuild, so surface a connection-fatal Err to run_relay_loop (its only
+        // driver) exactly once — mirroring SparseMoEEngine::step — so the stage
+        // tears down and rebuilds instead of backing off Ok(empty) forever.
+        let produced = self.step_worker();
+        if worker_should_report_disconnect(self.peer_disconnected, self.disconnect_reported) {
+            self.disconnect_reported = true;
+            return Err(EngineError::NotConnected);
+        }
+        Ok(produced)
     }
 }
 
