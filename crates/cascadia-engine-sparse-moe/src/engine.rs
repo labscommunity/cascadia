@@ -31,8 +31,7 @@ use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
     recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
     send_forward_batch, send_forward_nosample, send_forward_prefill, send_reset,
-    send_token_batch_upstream,
-    send_token_upstream, FrameKind, StageTransport,
+    send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;

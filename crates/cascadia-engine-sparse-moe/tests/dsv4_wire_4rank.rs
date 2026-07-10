@@ -49,7 +49,10 @@ async fn relay_forward(
     up: &Arc<Mutex<ActivationServer>>,
     down: &Arc<Mutex<ActivationClient>>,
 ) {
-    assert_eq!(recv_kind_server(up).await.unwrap(), Some(FrameKind::Forward));
+    assert_eq!(
+        recv_kind_server(up).await.unwrap(),
+        Some(FrameKind::Forward)
+    );
     let (_p, _c, hw, _s) = recv_forward_body_server(up).await.unwrap();
     let hmid = r.forward_layers(hw, pos, None);
     let downb = down.clone();

@@ -16,9 +16,7 @@
 
 use super::compress::Compressor;
 use super::indexer::Indexer;
-use super::math::{
-    act_quant_sim, dot_bf16w, linear_bf16_w, rms_normalize, rmsnorm, to_bf16,
-};
+use super::math::{act_quant_sim, dot_bf16w, linear_bf16_w, rms_normalize, rmsnorm, to_bf16};
 use super::rope::{apply_rope_row, Freqs};
 
 pub struct AttnWeights {
