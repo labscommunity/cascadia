@@ -37,7 +37,7 @@ Usage:
 
     # full model from a local checkout (run on a big-RAM box):
     python export_deepseek_v4.py --model /path/to/DeepSeek-V4-Flash \
-        --out /path/to/export [--layers 0-3] [--experts int4_bin|ov_ir]
+        --out /path/to/export [--layers 0-3]
 """
 import argparse
 import json
@@ -197,8 +197,7 @@ def save_safetensors(path: Path, tensors: dict):
 # --------------------------------------------------------------------------
 # Export core (shared by tiny + full)
 # --------------------------------------------------------------------------
-def export_all(src, cfg: dict, out: Path, layer_ids, experts_format: str,
-               ov_expert_quant: str = "int4"):
+def export_all(src, cfg: dict, out: Path, layer_ids):
     ratios = cfg["compress_ratios"]
 
     # embed
@@ -236,64 +235,15 @@ def export_all(src, cfg: dict, out: Path, layer_ids, experts_format: str,
         jobs += [(f"{base}.experts.{ei}", edir / f"expert_{ei:03d}")
                  for ei in range(cfg["n_routed_experts"])]
         for wbase, dst in jobs:
-            if experts_format == "int4_bin":
-                binp = dst.with_suffix(".bin")
-                if binp.exists() and binp.stat().st_size > 0:
-                    continue
-                w1 = src.get(wbase + ".w1.weight").numpy()
-                w3 = src.get(wbase + ".w3.weight").numpy()
-                w2 = src.get(wbase + ".w2.weight").numpy()
-                export_expert_bin(w1, w3, w2, binp)
-            else:  # ov_ir
-                xml = dst / "openvino_model.xml"
-                if xml.exists() and xml.stat().st_size > 0:
-                    continue
-                _export_expert_ov(src, wbase, cfg, xml, ov_expert_quant)
+            binp = dst.with_suffix(".bin")
+            if binp.exists() and binp.stat().st_size > 0:
+                continue
+            w1 = src.get(wbase + ".w1.weight").numpy()
+            w3 = src.get(wbase + ".w3.weight").numpy()
+            w2 = src.get(wbase + ".w2.weight").numpy()
+            export_expert_bin(w1, w3, w2, binp)
         print(f"[layer {li}] shell + {cfg['n_routed_experts']}+shared experts done",
               flush=True)
-
-
-def _export_expert_ov(src, wbase, cfg, xml: Path, quant: str):
-    """Trace one V4 expert (SwiGLU with the ±swiglu_limit clamps) to OV IR."""
-    import torch.nn as nn
-    import torch.nn.functional as Fn
-
-    class V4Expert(nn.Module):
-        def __init__(self, w1, w3, w2, limit):
-            super().__init__()
-            self.g = nn.Linear(w1.shape[1], w1.shape[0], bias=False)
-            self.u = nn.Linear(w3.shape[1], w3.shape[0], bias=False)
-            self.d = nn.Linear(w2.shape[1], w2.shape[0], bias=False)
-            with torch.no_grad():
-                self.g.weight.copy_(w1)
-                self.u.weight.copy_(w3)
-                self.d.weight.copy_(w2)
-            self.limit = limit
-
-        def forward(self, x):
-            gate = self.g(x)
-            up = self.u(x)
-            if self.limit > 0:
-                up = torch.clamp(up, -self.limit, self.limit)
-                gate = torch.clamp(gate, max=self.limit)
-            return self.d(Fn.silu(gate) * up)
-
-    wrapper = V4Expert(src.get(wbase + ".w1.weight"), src.get(wbase + ".w3.weight"),
-                       src.get(wbase + ".w2.weight"), cfg["swiglu_limit"]).eval()
-    import openvino as ov
-    with torch.no_grad():
-        traced = torch.jit.trace(wrapper, (torch.zeros(1, 1, cfg["hidden_size"]),),
-                                 check_trace=False)
-    m = ov.convert_model(traced, example_input=(torch.zeros(1, 1, cfg["hidden_size"]),))
-    if quant and quant != "none":
-        import nncf
-        mode = {"int4": nncf.CompressWeightsMode.INT4_SYM,
-                "int8": nncf.CompressWeightsMode.INT8_SYM,
-                "nf4": nncf.CompressWeightsMode.NF4}[quant]
-        kw = {} if quant == "int8" else {"group_size": 32, "ratio": 1.0}
-        m = nncf.compress_weights(m, mode=mode, **kw)
-    xml.parent.mkdir(parents=True, exist_ok=True)
-    ov.save_model(m, str(xml), compress_to_fp16=False)
 
 
 def write_manifest(cfg: dict, out: Path, layer_ids, experts_format: str, eos):
@@ -546,9 +496,10 @@ def main():
                          "across 8 layers (4-rank splittable)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="", help="subset e.g. 0-3; default all")
-    ap.add_argument("--experts", choices=["int4_bin", "ov_ir"], default="int4_bin")
-    ap.add_argument("--ov-expert-quant", choices=["int4", "int8", "nf4", "none"],
-                    default="int4")
+    ap.add_argument("--experts", choices=["int4_bin"], default="int4_bin",
+                    help="dsv4 experts are always int4_bin; OV expert "
+                         "acceleration is the optional experts_ov/ overlay built "
+                         "separately (consumed by OvExperts::from_env)")
     ap.add_argument("--ref-prompt", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18",
                     help="comma token ids for the --tiny reference run")
     ap.add_argument("--ref-gen", type=int, default=8)
@@ -568,7 +519,7 @@ def main():
         cfg = cfg_from_args_obj(a)
         layer_ids = parse_layers(args.layers, cfg["n_layers"])
         src = RefSource(model)
-        export_all(src, cfg, out, layer_ids, args.experts, args.ov_expert_quant)
+        export_all(src, cfg, out, layer_ids)
         write_manifest(cfg, out, layer_ids, args.experts, eos=[cfg["vocab_size"] - 1])
         prompt = [int(x) for x in args.ref_prompt.split(",")]
         gen, snaps = tiny_reference_run(model, prompt, args.ref_gen)
@@ -629,7 +580,7 @@ def main():
           flush=True)
     layer_ids = parse_layers(args.layers, cfg["n_layers"])
     src = CkptSource(md)
-    export_all(src, cfg, out, layer_ids, args.experts, args.ov_expert_quant)
+    export_all(src, cfg, out, layer_ids)
     eos = []
     gc = md / "generation_config.json"
     if gc.exists():
