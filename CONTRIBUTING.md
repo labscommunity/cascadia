@@ -12,8 +12,8 @@ touch the OpenVINO stack. For real inference, **[INSTALL.md](INSTALL.md)**
 covers the OpenVINO SDK + GPU runtime.
 
 ```bash
-cargo build --release -p cascadia    # stub mode
-cascadia doctor                       # sanity-check your environment
+cargo build --release -p cascadia     # stub mode
+./target/release/cascadia doctor      # sanity-check your environment
 ```
 
 ## Repo layout

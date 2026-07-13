@@ -10,9 +10,15 @@ Wraps Intel's `openvino_genai.LLMPipeline` to expose **FastDraft speculative dec
 
 ## Shard format
 
-A single-directory OpenVINO IR exported by `optimum-cli`:
+A single-directory OpenVINO IR: the model graph (`openvino_model.xml`/`.bin`, or `openvino_language_model.xml` for the VLM-style exports of Qwen3.5/3.6 and Gemma 4) **plus** `openvino_tokenizer.xml` and `openvino_detokenizer.xml`. `ov::genai::LLMPipeline` loads the tokenizer as an OpenVINO model, so an IR missing those two starts and then generates empty strings (`completion_tokens: 0`) rather than failing loudly.
+
+`cascadia shard` does not produce this layout — it emits per-stage IRs for `ov-runtime`. Either download a pre-exported IR (Intel publishes INT4 IRs for many models under the [OpenVINO](https://huggingface.co/OpenVINO) org) or build one with Intel's exporter:
 
 ```bash
+# The [openvino] extra pulls openvino, nncf, AND openvino-tokenizers — without
+# openvino-tokenizers the export silently omits the two tokenizer IRs.
+pip install "optimum-intel[openvino]"
+
 optimum-cli export openvino \
     --model unsloth/Meta-Llama-3.1-8B-Instruct \
     --weight-format int4 \

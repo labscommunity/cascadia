@@ -1915,7 +1915,7 @@ def main():
     if torch is None:
         parser.error(
             "torch is required for this model's export path. "
-            "Install: pip install torch transformers safetensors nncf"
+            "Install: pip install -r tools/requirements.txt  (or run `cascadia doctor`, which prints the pins)"
         )
     from transformers import AutoConfig
 

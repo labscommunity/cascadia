@@ -97,7 +97,7 @@ Steps to reproduce the pipeline-parallel run:
 
    ```bash
    ssh <export-host> "source ~/.venv/export/bin/activate && \
-     python ~/cascadia/tools/export_shards.py \
+     cascadia shard \
        --model r1-distill-qwen-1.5b \
        --output-dir /tmp/r1_int4 \
        --num-stages 2 --quantization int4"

@@ -22,6 +22,10 @@ Environment=CASCADIA_LISTEN=:9100
 Environment=CASCADIA_DEVICE=GPU
 Environment=CASCADIA_ENGINE=ov-runtime
 
+# Rank 0 serves the API. Without --api the worker reads stdin, gets EOF under
+# systemd and exits 0 — inactive, and Restart=on-failure won't fire.
+Environment=CASCADIA_API=:8000
+
 # %i is the instance suffix (use `cascadia-worker@0.service`, `@1.service`, ...).
 ExecStart=/usr/bin/env cascadia worker \
     --rank %i --total ${CASCADIA_TOTAL} \
@@ -29,6 +33,7 @@ ExecStart=/usr/bin/env cascadia worker \
     --model ${CASCADIA_SHARDS} \
     --listen ${CASCADIA_LISTEN} \
     --next ${CASCADIA_NEXT} \
+    --api ${CASCADIA_API} \
     --log-level info
 
 # Cascadia handles SIGTERM cleanly: runner.close() then exit 0.
