@@ -120,6 +120,36 @@ impl OvGenaiBuilder {
     }
 }
 
+/// ov::genai builds its tokenizer from OpenVINO IRs in the model dir. Without
+/// them the pipeline still constructs, then every request returns an empty
+/// string with no error — reject the directory instead of serving silence.
+fn check_tokenizer_irs(dir: &str) -> EngineResult<()> {
+    let d = PathBuf::from(dir);
+    let missing: Vec<&str> = ["openvino_tokenizer.xml", "openvino_detokenizer.xml"]
+        .into_iter()
+        .filter(|f| !d.join(f).exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    // A `cascadia shard` tree is a common mistake here: it has no tokenizer IRs
+    // because the staged engines tokenize in Rust. Say so rather than telling
+    // the user to re-export a model they already exported.
+    if d.join("pipeline_config.json").exists() {
+        return Err(EngineError::InvalidConfig(format!(
+            "{dir} is a `cascadia shard` tree, which ov-genai cannot serve. \
+             Use --engine ov-runtime."
+        )));
+    }
+    Err(EngineError::InvalidConfig(format!(
+        "{} missing from {dir}. ov-genai needs the tokenizer IRs beside the model IR; \
+         an export without them generates empty output. Re-export with \
+         `pip install \"optimum-intel[openvino]\"` + `optimum-cli export openvino`, \
+         or download a pre-exported IR.",
+        missing.join(" + "),
+    )))
+}
+
 #[async_trait]
 impl Builder for OvGenaiBuilder {
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
@@ -152,6 +182,11 @@ impl Builder for OvGenaiBuilder {
             if !PathBuf::from(dpath).exists() {
                 return Err(EngineError::ModelNotFound(dpath.clone()));
             }
+        }
+
+        check_tokenizer_irs(&self.model_path)?;
+        if let Some(draft) = &self.draft_model_path {
+            check_tokenizer_irs(draft)?;
         }
 
         let mut progress = vec![LoadProgress::message(format!(
