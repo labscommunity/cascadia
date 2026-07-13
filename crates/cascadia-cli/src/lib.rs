@@ -591,8 +591,9 @@ const DEFAULT_STATIC_CONTEXT: u32 = 1024;
 
 #[derive(Parser, Debug, Clone)]
 pub struct ShardArgs {
-    /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct)
-    /// or path to a local directory containing safetensors + config.json.
+    /// HuggingFace repo id (e.g. unsloth/Meta-Llama-3.1-8B-Instruct), a local
+    /// directory with safetensors + config.json, or — for the Gemma-4 / Qwen3.6
+    /// surgery paths — an already-exported OpenVINO IR directory.
     #[arg(long)]
     pub model: String,
 
@@ -965,51 +966,64 @@ fn model_stem(model: &str) -> String {
         .to_string()
 }
 
-/// True when the string looks like a filesystem path the user meant literally
-/// (`./x`, `/x`, `C:\x`, `~/x`) rather than an HF repo id (`org/name`).
-fn looks_like_path(model: &str) -> bool {
-    let p = std::path::Path::new(model);
-    p.is_absolute()
-        || model.starts_with('.')
-        || model.starts_with('~')
-        || model.contains('\\')
-        || model.matches('/').count() != 1
-}
-
-/// Why a `--model` was rejected, and what to do instead. Engines load a
-/// pre-exported model from a directory; only `cascadia shard` downloads.
-fn missing_model_error(model: &str, engine: EngineKind) -> anyhow::Error {
-    if looks_like_path(model) {
-        return anyhow!("no model directory at {model} (path does not exist)");
-    }
-    // Looks like an HF repo id: the old docs told people to pass one, and it can
-    // never work, so say what to run instead.
+/// How to produce a model this engine can serve.
+fn export_hint(model: &str, engine: EngineKind) -> String {
     let stem = model_stem(model);
-    let serve = match engine {
-        EngineKind::OvGenai => format!(
-            "  ov-genai serves a whole-model OpenVINO IR — export one with `optimum-cli export\n  \
-             openvino`, or download a pre-exported *-int4-ov directory, then:\n    \
+    match engine {
+        // Whole-model IR from Intel's exporter; `cascadia shard` can't make one.
+        EngineKind::OvGenai => "  download a pre-exported *-int4-ov directory, or export one with\n  \
+             `optimum-cli export openvino` (see docs/engines/ov-genai.md), then:\n    \
              cascadia run <ir-dir>"
+            .to_string(),
+        // Staged engines read a `cascadia shard` tree; the exporter picks the
+        // per-family path, so name the engine that matches this tree.
+        EngineKind::Gemma4 => format!(
+            "  cascadia shard --model {model} --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia worker --engine gemma4 --model ./{stem}-2stage ..."
+        ),
+        EngineKind::Qwen36Moe => format!(
+            "  cascadia shard --model <qwen3.6 int4-ov dir> --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia run ./{stem}-2stage --engine qwen36-moe"
+        ),
+        // sparse-moe consumes a manifest.json expert tree, not a shard tree.
+        EngineKind::SparseMoe => {
+            "  sparse-moe needs a manifest.json + per-expert tree — see\n  \
+             docs/architectures/moe.md (e.g. tools/export_minimax_m2.py)."
+                .to_string()
+        }
+        EngineKind::OvDistSpec => format!(
+            "  cascadia shard --model {model} --output-dir ./{stem}-2stage --num-stages 2\n    \
+             cascadia worker --engine ov-dist-spec --model ./{stem}-2stage --draft-model <ir-dir> ..."
         ),
         _ => format!(
             "  cascadia shard --model {model} --output-dir ./{stem}-1stage --num-stages 1\n    \
              cascadia run ./{stem}-1stage --engine ov-runtime"
         ),
-    };
+    }
+}
+
+/// Why a `--model` was rejected, and what to do instead. Engines load a
+/// pre-exported model from a directory; only `cascadia shard` downloads.
+///
+/// `org/name` is ambiguous — it is a valid HF repo id *and* a valid relative
+/// path — so don't guess: say both, and give the export command either way.
+fn missing_model_error(model: &str, engine: EngineKind) -> anyhow::Error {
+    let hint = export_hint(model, engine);
     anyhow!(
         "no model directory at {model}\n\
          \n\
-         Engines load a pre-exported model from disk; the worker does not download\n\
-         or convert models. Export first:\n\
+         If that is a path, it does not exist. If it is a HuggingFace repo id:\n\
+         engines load a pre-exported model from disk and never download or convert\n\
+         one. Export first:\n\
          \n\
-         {serve}"
+         {hint}"
     )
 }
 
-/// Reject a `--model` (or `--draft-model`) that names nothing on disk, with the
-/// command to run instead. Without this an HF repo id — which the old docs told
-/// people to pass — surfaces as a bare "model not found", which reads like a
-/// missing file rather than a missing export.
+/// Reject a `--model` (or, where the engine uses it, a `--draft-model`) that
+/// names nothing on disk, with the command to run instead. Without this an HF
+/// repo id — which the old docs told people to pass — surfaces as a bare "model
+/// not found", which reads like a missing file rather than a missing export.
 fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
     if matches!(args.engine, EngineKind::Mock) {
         return Ok(());
@@ -1017,15 +1031,23 @@ fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
     if !std::path::Path::new(&args.model).exists() {
         return Err(missing_model_error(&args.model, args.engine));
     }
-    // The draft model is a whole OpenVINO IR dir too, and ov::genai builds a
-    // tokenizer from it — an HF id there fails the same way.
-    if let Some(draft) = &args.draft_model {
-        if !std::path::Path::new(draft).exists() {
-            return Err(anyhow!(
-                "no draft-model directory at {draft}\n\
-                 --draft-model takes a local OpenVINO IR directory (e.g. a FastDraft\n\
-                 *-int8-ov download), not an HF repo id."
-            ));
+    // Only these read --draft-model, and ov-dist-spec only on the driver (rank 0)
+    // — a relay rank launched from the same argv must not be rejected for a draft
+    // IR it never opens.
+    let uses_draft = match args.engine {
+        EngineKind::OvGenai => true,
+        EngineKind::OvDistSpec => args.rank == 0,
+        _ => false,
+    };
+    if uses_draft {
+        if let Some(draft) = &args.draft_model {
+            if !std::path::Path::new(draft).exists() {
+                return Err(anyhow!(
+                    "no draft-model directory at {draft}\n\
+                     --draft-model takes a local OpenVINO IR directory (e.g. a FastDraft\n\
+                     *-int8-ov download), not an HF repo id."
+                ));
+            }
         }
     }
     Ok(())
@@ -1432,7 +1454,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // --api passed to them (one systemd template covers every rank) must not be
     // advertised as an endpoint the dashboard can't reach.
     let api_port = is_first
-        .then(|| args.api.as_deref())
+        .then_some(args.api.as_deref())
         .flatten()
         .and_then(|a| parse_addr(a, "0.0.0.0").ok())
         .map(|(_, p)| p);
@@ -1729,10 +1751,12 @@ pub(crate) fn export_pip_install_line(python: &str) -> String {
         .filter(|l| !l.is_empty())
         .map(|p| format!("\"{p}\""))
         .collect();
-    let py = if python.contains(char::is_whitespace) {
-        format!("\"{python}\"")
-    } else {
-        python.to_string()
+    // A quoted path at the start of a PowerShell line is a string expression, not
+    // a command — it needs the call operator. Elsewhere (and unquoted) it's fine.
+    let py = match (python.contains(char::is_whitespace), cfg!(windows)) {
+        (true, true) => format!("& \"{python}\""),
+        (true, false) => format!("\"{python}\""),
+        (false, _) => python.to_string(),
     };
     format!("{py} -m pip install {}", pkgs.join(" "))
 }
@@ -2056,12 +2080,17 @@ mod python_tests {
         assert!(line.contains("\"safetensors\""), "{line}");
         // Comments and blank lines from requirements.txt never leak through.
         assert!(!line.contains('#'), "{line}");
-        // An interpreter path with spaces stays one argument.
+        // An interpreter path with spaces stays one argument — and on Windows it
+        // gets PowerShell's call operator, since a quoted string alone is not a
+        // command there.
         let q = export_pip_install_line("C:\\Program Files\\Python\\python.exe");
         assert!(
-            q.starts_with("\"C:\\Program Files\\Python\\python.exe\" -m pip"),
+            q.contains("\"C:\\Program Files\\Python\\python.exe\" -m pip"),
             "{q}"
         );
+        if cfg!(windows) {
+            assert!(q.starts_with("& \""), "{q}");
+        }
     }
 
     #[test]
@@ -2089,15 +2118,53 @@ mod python_tests {
     }
 
     #[test]
-    fn preflight_says_path_not_found_for_a_path_like_model() {
-        let err = preflight_model_path(&worker("./no-such-dir", EngineKind::OvRuntime))
+    fn preflight_covers_both_a_missing_path_and_an_hf_id() {
+        // `out/llama-1stage` is a valid relative path AND shaped like a repo id,
+        // so the message must not guess — it says both.
+        let err = preflight_model_path(&worker("out/llama-1stage", EngineKind::OvRuntime))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("path does not exist"), "{err}");
         assert!(
-            !err.contains("cascadia shard --model ./no-such-dir"),
+            err.contains("If that is a path, it does not exist"),
             "{err}"
         );
+        assert!(err.contains("HuggingFace repo id"), "{err}");
+    }
+
+    #[test]
+    fn preflight_advice_matches_the_engine() {
+        // Each engine reads a different tree; don't send them all to ov-runtime.
+        for (engine, needle) in [
+            (EngineKind::Gemma4, "--engine gemma4"),
+            (EngineKind::Qwen36Moe, "--engine qwen36-moe"),
+            (EngineKind::SparseMoe, "manifest.json"),
+            (EngineKind::OvGenai, "optimum-cli"),
+            (EngineKind::OvRuntime, "--engine ov-runtime"),
+        ] {
+            let err = preflight_model_path(&worker("org/name", engine))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{engine:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn preflight_ignores_a_draft_model_the_engine_never_reads() {
+        // A relay rank launched from the same argv must not be rejected for a
+        // draft IR it never opens.
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = worker(&dir.path().to_string_lossy(), EngineKind::OvRuntime);
+        args.draft_model = Some("unsloth/Llama-3.2-1B-Instruct".into());
+        assert!(preflight_model_path(&args).is_ok());
+
+        let mut relay = worker(&dir.path().to_string_lossy(), EngineKind::OvDistSpec);
+        relay.draft_model = Some("unsloth/Llama-3.2-1B-Instruct".into());
+        relay.rank = 1;
+        relay.total = 2;
+        assert!(preflight_model_path(&relay).is_ok());
+        // …but the driver (rank 0) does read it.
+        relay.rank = 0;
+        assert!(preflight_model_path(&relay).is_err());
     }
 
     #[test]

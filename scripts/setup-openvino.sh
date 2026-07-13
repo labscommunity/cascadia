@@ -22,7 +22,7 @@ fi
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "This script uses apt-get (Ubuntu/Debian). For other distros, install the"
   echo "equivalents of: intel-opencl-icd, ocl-icd-libopencl1, and the Level-Zero"
-  echo "driver + loader (Ubuntu 24.04: libze-intel-gpu1 + libze1)."
+  echo "driver + loader (Intel's Ubuntu repo names them libze-intel-gpu1 + libze1)."
   echo "Then add your user to the 'render' group. See INSTALL.md."
   exit 1
 fi
@@ -39,6 +39,10 @@ UBUNTU_SUITE="${UBUNTU_CODENAME:-}"
 if [[ "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *ubuntu* ]]; then UBUNTU_SUITE=""; fi
 
 INTEL_LIST=/etc/apt/sources.list.d/intel-gpu.list
+# Intel's graphics signing keys (production, and the 2024 predecessor). Pinning
+# the fingerprint means a hijacked key/URL cannot become an apt trust anchor.
+INTEL_KEY_FPR="E0258B57D9C442D5DB1855C271740E4DE392BFE3"
+INTEL_KEY_FPR_OLD="4E9EFCDEF82800256C1E7C64B02DB9BD8C321DCB"
 
 echo "==> Installing Intel GPU runtime packages (OpenCL + Level-Zero + Compute Runtime)"
 $SUDO apt-get update
@@ -46,11 +50,28 @@ $SUDO apt-get update
 if [[ -n "$UBUNTU_SUITE" ]]; then
   # Prefer Intel's repo, not the distro's: Ubuntu 24.04 ships Compute Runtime
   # 23.43, which predates Lunar Lake and Arc B — the hardware cascadia targets.
+  # `unified` carries 25.18; `client` is stuck on 24.39, which is older than
+  # Battlemage support (24.48).
   echo "==> Adding Intel's graphics repo (${UBUNTU_SUITE})"
   $SUDO apt-get install -y --no-install-recommends ca-certificates gnupg wget
-  wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-    | $SUDO gpg --yes --dearmor -o /usr/share/keyrings/intel-graphics.gpg
-  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_SUITE} client" \
+
+  # Dearmor to a temp file and check the fingerprint before installing it: a
+  # failed fetch must not truncate an existing keyring (gpg -o opens for write
+  # before it reads), which would leave apt unable to verify the repo.
+  KEY_TMP="$(mktemp)"
+  trap 'rm -f "$KEY_TMP"' EXIT
+  if ! wget -qO- https://repositories.intel.com/gpu/intel-graphics.key | gpg --dearmor > "$KEY_TMP"; then
+    echo "ERROR: could not fetch Intel's graphics key. Nothing was changed."
+    exit 1
+  fi
+  if ! gpg --show-keys --with-colons "$KEY_TMP" | awk -F: '/^fpr:/{print $10}' \
+       | grep -qx -e "$INTEL_KEY_FPR" -e "$INTEL_KEY_FPR_OLD"; then
+    echo "ERROR: Intel's graphics key does not match a known fingerprint. Refusing to trust it."
+    exit 1
+  fi
+  $SUDO install -m 0644 "$KEY_TMP" /usr/share/keyrings/intel-graphics.gpg
+
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${UBUNTU_SUITE} unified" \
     | $SUDO tee "$INTEL_LIST" >/dev/null
   # If the suite doesn't exist, remove the source again rather than leaving a
   # broken entry that fails every future `apt-get update` on this machine.

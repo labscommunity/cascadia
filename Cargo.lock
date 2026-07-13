@@ -374,6 +374,7 @@ dependencies = [
  "half",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokenizers",
  "tokio",

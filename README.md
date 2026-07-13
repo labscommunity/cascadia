@@ -101,7 +101,7 @@ Prerequisites:
 Cascadia serves models from a local directory — it does not download or convert at run time. Only `cascadia shard` fetches from HuggingFace (caching under `~/.cache/cascadia/models/`). Export once, then serve:
 
 ```bash
-# Export to a 1-stage INT4 shard (export deps: see Installation below).
+# Export to a 1-stage INT4 shard (export deps: see Installation above).
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
              --output-dir ~/cascadia/llama-8b-1stage \
              --num-stages 1 --quantization int4
@@ -155,7 +155,7 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 Not sure of a node's address? `cascadia discover` lists Cascadia peers on the LAN and the `host:port` to pass to `--next`.
 
-Add `--engine ov-dist-spec --draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` on rank 0 (the draft is a local OpenVINO IR directory, not an HF id) for distributed speculative decoding ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
+For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
 
 ### Engines
 
@@ -209,7 +209,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 
 **`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
 
-**`could not connect to … within 30s`**: start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
+**`could not connect to downstream peer within timeout`** (engines wait 60 s): start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
 **Worker dies silently when SSH session closes**: on Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production.
 

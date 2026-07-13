@@ -30,3 +30,4 @@ half = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }

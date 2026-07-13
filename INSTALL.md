@@ -96,7 +96,7 @@ sudo apt-get install -y ocl-icd-libopencl1 intel-opencl-icd libze-intel-gpu1 lib
 sudo usermod -a -G render "$USER"   # then LOG OUT/IN — group changes don't apply to the current shell
 ```
 
-Intel publishes that repo for Ubuntu only. On other distros install the equivalents by hand; older Compute Runtimes may not enumerate recent Intel GPUs.
+The same package names work on 22.04 (jammy) and 24.04 (noble) from Intel's repo. Intel publishes it for Ubuntu only; on other distros install the equivalents by hand, and note that older Compute Runtimes may not enumerate recent Intel GPUs.
 
 On **Windows** the OpenCL runtime ships inside the Intel graphics driver, so just install the latest driver and reboot. `scripts/setup-openvino.ps1` (source checkout) checks your driver, MSVC, and SDK env.
 

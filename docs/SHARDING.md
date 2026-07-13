@@ -11,7 +11,8 @@ the embedding + (on the last stage) the final norm + lm_head.
 ## Quick start
 
 ```bash
-# One-time pip install (export-time only, not needed at runtime):
+# One-time pip install (export-time only, not needed at runtime). From a source
+# checkout; from a release bundle run `cascadia doctor`, which prints the pins:
 pip install -r tools/requirements.txt
 
 # Two-stage shard from HF:
@@ -45,7 +46,7 @@ network).
 
 | Flag | Meaning |
 |------|---------|
-| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`) OR local path to a directory with `config.json` + `*.safetensors`. HF repos auto-download into `~/.cache/cascadia/models/`. |
+| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`), a local dir with `config.json` + `*.safetensors`, or (Gemma-4 / Qwen3.6 only) an exported OpenVINO IR dir. HF repos auto-download into `~/.cache/cascadia/models/`. |
 | `-o`, `--output-dir` | Where to write the shard tree. |
 | `--num-stages N` | Pipeline stages to split into. 2 is the common case for 2-machine setups; use 3+ for larger clusters. |
 | `--quantization` | `int4` (default — typical), `int4_asym`, `int8`, or `fp16`. INT4 needs nncf installed. |

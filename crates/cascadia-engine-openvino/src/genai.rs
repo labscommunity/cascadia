@@ -133,12 +133,26 @@ fn check_tokenizer_irs(dir: &str) -> EngineResult<()> {
         return Ok(());
     }
     // A `cascadia shard` tree is a common mistake here: it has no tokenizer IRs
-    // because the staged engines tokenize in Rust. Say so rather than telling
-    // the user to re-export a model they already exported.
-    if d.join("pipeline_config.json").exists() {
+    // because the staged engines tokenize in Rust. Say so — and name the engine
+    // that matches this tree — rather than telling the user to re-export a model
+    // they already exported.
+    let pipeline_cfg = d.join("pipeline_config.json");
+    if pipeline_cfg.exists() {
+        let export_version = std::fs::read_to_string(&pipeline_cfg)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v["export_version"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let engine = if export_version.starts_with("gemma4") {
+            "gemma4"
+        } else if export_version.contains("qwen3_5") {
+            "qwen36-moe"
+        } else {
+            "ov-runtime"
+        };
         return Err(EngineError::InvalidConfig(format!(
             "{dir} is a `cascadia shard` tree, which ov-genai cannot serve. \
-             Use --engine ov-runtime."
+             Use --engine {engine}."
         )));
     }
     Err(EngineError::InvalidConfig(format!(
@@ -544,5 +558,43 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+
+    #[test]
+    fn tokenizer_irs_are_required() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("openvino_model.xml"), "").unwrap();
+        // Model IR present, tokenizer IRs absent: this used to serve empty strings.
+        let err = check_tokenizer_irs(&dir.path().to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("openvino_tokenizer.xml"), "{err}");
+        assert!(err.contains("openvino_detokenizer.xml"), "{err}");
+
+        for f in ["openvino_tokenizer.xml", "openvino_detokenizer.xml"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        assert!(check_tokenizer_irs(&dir.path().to_string_lossy()).is_ok());
+    }
+
+    #[test]
+    fn a_shard_tree_names_the_engine_that_can_serve_it() {
+        for (export_version, engine) in [
+            ("v5_canonical_inputs", "ov-runtime"),
+            ("gemma4_cached_v1", "gemma4"),
+            ("qwen3_5_moe_surgery", "qwen36-moe"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("pipeline_config.json"),
+                format!("{{\"export_version\": \"{export_version}\"}}"),
+            )
+            .unwrap();
+            let err = check_tokenizer_irs(&dir.path().to_string_lossy())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("shard` tree"), "{err}");
+            assert!(err.contains(&format!("--engine {engine}")), "{err}");
+        }
     }
 }

@@ -159,8 +159,10 @@ fn check_python(r: &mut Report) {
                     "torch/openvino/transformers present",
                 ),
                 None => {
+                    // Export-only, like rustc/g++ above: a worker never needs
+                    // Python, so this must not fail `--strict` on a bundle host.
                     r.line(
-                        Level::Warn,
+                        Level::Info,
                         "Export packages",
                         "missing (only needed for `cascadia shard`)",
                     );
@@ -170,7 +172,7 @@ fn check_python(r: &mut Report) {
         }
         Err(_) => {
             r.line(
-                Level::Warn,
+                Level::Info,
                 "Python (export-time)",
                 "no python3/python on PATH (only needed for `cascadia shard`)",
             );
@@ -258,9 +260,9 @@ fn check_ov_devices(r: &mut Report) {
                 r.note("    (then log out/in — group changes don't apply to the current shell)");
                 r.note("  • install the GPU runtime packages: intel-opencl-icd,");
                 r.note(
-                    "    libze-intel-gpu1, libze1  (Ubuntu 24.04+; on 22.04 these come from \
-                     Intel's apt repo as intel-level-zero-gpu / level-zero — \
-                     `scripts/setup-openvino.sh` in a source checkout does this for you)",
+                    "    libze-intel-gpu1, libze1 + intel-opencl-icd, from Intel's graphics repo \
+                     (`scripts/setup-openvino.sh` in a source checkout does this for you; \
+                     the distro's own packages are too old for recent Intel GPUs)",
                 );
                 r.note("On Windows: install the latest Intel graphics driver, then reboot.");
             }

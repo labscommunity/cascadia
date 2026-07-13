@@ -75,21 +75,27 @@ FROM ubuntu:24.04 AS openvino
 #
 # From Intel's repo, not the distro: Ubuntu ships Compute Runtime 23.43 and
 # Debian 22.43, both older than the hardware cascadia targets (Lunar Lake, Arc
-# B). Intel publishes that repo for Ubuntu only — hence the Ubuntu base.
+# B). Use the `unified` component — `client` is stuck on 24.39, older than
+# Battlemage support (24.48). Intel publishes for Ubuntu only: hence this base.
+ARG INTEL_KEY_FPR=E0258B57D9C442D5DB1855C271740E4DE392BFE3
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates gnupg wget \
+    # Verify the key's fingerprint before trusting it as an apt anchor.
     && wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
-         | gpg --yes --dearmor -o /usr/share/keyrings/intel-graphics.gpg \
+         | gpg --dearmor > /tmp/intel.gpg \
+    && gpg --show-keys --with-colons /tmp/intel.gpg | awk -F: '/^fpr:/{print $10}' \
+         | grep -qx "$INTEL_KEY_FPR" \
+    && install -m 0644 /tmp/intel.gpg /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble client" \
+https://repositories.intel.com/gpu/ubuntu noble unified" \
          > /etc/apt/sources.list.d/intel-gpu.list \
     && apt-get update && apt-get install -y --no-install-recommends \
         ocl-icd-libopencl1 intel-opencl-icd libze-intel-gpu1 libze1 \
     # Don't leave Intel's repo (or the tools that added it) in the shipped image:
     # anything built FROM this would silently inherit it as a trusted apt source.
     && apt-get purge -y --auto-remove gnupg wget \
-    && rm -f /etc/apt/sources.list.d/intel-gpu.list \
+    && rm -f /etc/apt/sources.list.d/intel-gpu.list /usr/share/keyrings/intel-graphics.gpg /tmp/intel.gpg \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-openvino /opt/intel/openvino/runtime/lib/intel64 /opt/intel/openvino/runtime/lib/intel64
 # TBB ships beside the runtime, not inside it — copy the SDK's own build rather
