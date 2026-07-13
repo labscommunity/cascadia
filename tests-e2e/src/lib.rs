@@ -42,7 +42,8 @@ pub fn binary_path() -> PathBuf {
         } else {
             "release"
         })
-        .join("cascadia")
+        // EXE_SUFFIX or the path misses `cascadia.exe` on Windows.
+        .join(format!("cascadia{}", std::env::consts::EXE_SUFFIX))
 }
 
 pub struct CascadiaProc {
