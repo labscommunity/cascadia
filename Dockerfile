@@ -77,15 +77,18 @@ FROM ubuntu:24.04 AS openvino
 # Debian 22.43, both older than the hardware cascadia targets (Lunar Lake, Arc
 # B). Use the `unified` component — `client` is stuck on 24.39, older than
 # Battlemage support (24.48). Intel publishes for Ubuntu only: hence this base.
-ARG INTEL_KEY_FPR=E0258B57D9C442D5DB1855C271740E4DE392BFE3
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates gnupg wget \
-    # Verify the key's fingerprint before trusting it as an apt anchor.
     && wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
          | gpg --dearmor > /tmp/intel.gpg \
-    && gpg --show-keys --with-colons /tmp/intel.gpg | awk -F: '/^fpr:/{print $10}' \
-         | grep -qx "$INTEL_KEY_FPR" \
+    # Pin the exact SET of primary keys Intel ships (current + its 2024
+    # predecessor). Asking only whether the keyring CONTAINS a pinned key is not
+    # enough: a keyring is a concatenation, so whoever controls the URL could
+    # append their own key and apt would trust that one too.
+    && [ "$(gpg --show-keys --with-colons /tmp/intel.gpg \
+              | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}' | sort | tr '\n' ' ')" \
+         = "4E9EFCDEF82800256C1E7C64B02DB9BD8C321DCB E0258B57D9C442D5DB1855C271740E4DE392BFE3 " ] \
     && install -m 0644 /tmp/intel.gpg /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
 https://repositories.intel.com/gpu/ubuntu noble unified" \

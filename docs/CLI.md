@@ -7,8 +7,8 @@ which is always authoritative — run it if this page and the binary disagree.
 cascadia [--log-level <LEVEL>] <COMMAND>
 ```
 
-`--log-level` is global (default `info`, overrides `RUST_LOG`). `--version` and
-`--help` work everywhere.
+`--log-level` is global (default `info`, overrides `RUST_LOG`) and `--help` works
+on every subcommand. `--version` is only accepted on the top-level command.
 
 > **Security.** The HTTP API and the inter-stage TCP relay are plaintext and
 > unauthenticated. Bind them to trusted networks only, or put TLS + auth on a
@@ -133,11 +133,15 @@ a few each. MiniMax-M2 `sparse-moe` only.
 | `--ov-allow-auto-batching` | off | Allow GPU-plugin internal auto-batching. |
 | `--ov-execution-mode <MODE>` | — | `ACCURACY` / `PERFORMANCE`. |
 
-**`--ov-cache-dir` is on by default and matters.** Unset, it defaults to
+**`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
+`gemma4` and `sparse-moe`, leaving it unset defaults to
 `<user-cache>/cascadia/ov-cache` (`~/.cache` on Linux, `~/Library/Caches` on
 macOS, `%LOCALAPPDATA%` on Windows). This turns a ~20 s cold GPU compile into a
 ~1 s warm load on every later run — the single biggest latency win on the
 `ov-genai` path. Pass `--ov-cache-dir ""` to disable.
+
+Two engines don't get that default: `ov-dist-spec` uses the flag verbatim (so it
+is off unless you pass a path), and `qwen36-moe` ignores it entirely.
 
 On **Xe2 / Battlemage** GPUs, set `--ov-inference-precision f16` explicitly: f16
 and bf16 share XMX throughput, but the default can silently fall back to f32.
@@ -150,9 +154,9 @@ and bf16 share XMX throughput, but the default can silently fall back to f32.
 | `--npu-max-prompt-len <TOKS>` | `MAX_PROMPT_LEN` — static-shape constraint. |
 | `--npu-min-response-len <TOKS>` | `MIN_RESPONSE_LEN` — static-shape constraint. |
 
-All three apply **only** with `--engine ov-genai` on an NPU device, and are
-silently dropped otherwise — only `ov-genai` routes them through an
-`ov::genai::LLMPipeline`.
+All three apply **only** with `--engine ov-genai` on an NPU device — only that
+engine routes them through an `ov::genai::LLMPipeline`. Anywhere else they are
+dropped, with a warning in the log.
 
 ### Speculative decode
 
@@ -260,8 +264,10 @@ Discovery is informational: workers still need explicit `--rank` / `--total` /
 ## Heterogeneous placement
 
 A four-step pipeline that measures your hardware, then solves which device each
-stage should run on. Steps 1–3 need a real OpenVINO build; a stub binary will
-refuse. Background: [perf/THREE_TIER_PLACEMENT.md](perf/THREE_TIER_PLACEMENT.md).
+stage should run on. Only the measuring steps (`profile-stages`, `profile-devices`)
+need a real OpenVINO build — a stub binary refuses them. `place` is a pure solver
+and `run-placement --dry-run` only prints commands, so both run anywhere.
+Background: [perf/THREE_TIER_PLACEMENT.md](perf/THREE_TIER_PLACEMENT.md).
 
 ```
 shard --target npu  →  profile-stages  →  place  →  run-placement
@@ -397,7 +403,7 @@ OpenVINO GPU plugin can see.
 | `ov-runtime` | `cascadia shard` tree | The staged pipeline engine. |
 | `ov-dist-spec` | `cascadia shard` tree | Distributed speculative decode. Every rank must use it. |
 | `gemma4` | `gemma4_cached_v1` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap. |
-| `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. Single-stage, CPU. |
+| `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. CPU-targeted; single-stage or pipeline-parallel (`--total >= 2`). |
 | `qwen36-moe` | Qwen3.6 surgery output | Greedy-only, batch=1. CPU-targeted decode. |
 
 Per-engine deep dives: [engines/](engines/). Per-family export notes:

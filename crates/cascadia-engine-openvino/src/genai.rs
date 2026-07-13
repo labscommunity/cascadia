@@ -132,27 +132,30 @@ fn check_tokenizer_irs(dir: &str) -> EngineResult<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    // A `cascadia shard` tree is a common mistake here: it has no tokenizer IRs
-    // because the staged engines tokenize in Rust. Say so — and name the engine
-    // that matches this tree — rather than telling the user to re-export a model
-    // they already exported.
-    let pipeline_cfg = d.join("pipeline_config.json");
-    if pipeline_cfg.exists() {
-        let export_version = std::fs::read_to_string(&pipeline_cfg)
+    // A staged tree is a common mistake here: it has no tokenizer IRs because the
+    // staged engines tokenize in Rust. Say so — and name the engine that matches
+    // this tree — rather than telling the user to re-export a model they already
+    // exported. Two tree shapes exist: export_shards.py / the gemma4 exporters
+    // write pipeline_config.json, while the surgery exporters write manifest.json.
+    let read_key = |file: &str, key: &str| -> Option<String> {
+        std::fs::read_to_string(d.join(file))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| v["export_version"].as_str().map(str::to_owned))
-            .unwrap_or_default();
-        let engine = if export_version.starts_with("gemma4") {
-            "gemma4"
-        } else if export_version.contains("qwen3_5") {
-            "qwen36-moe"
-        } else {
-            "ov-runtime"
-        };
+            .and_then(|v| v[key].as_str().map(str::to_owned))
+    };
+    let engine = match (
+        read_key("pipeline_config.json", "export_version"),
+        read_key("manifest.json", "arch"),
+    ) {
+        (Some(v), _) if v.starts_with("gemma4") => Some("gemma4"),
+        (Some(_), _) => Some("ov-runtime"),
+        (_, Some(a)) if a == "qwen3_5_moe" => Some("qwen36-moe"),
+        (_, Some(_)) => Some("sparse-moe"),
+        _ => None,
+    };
+    if let Some(engine) = engine {
         return Err(EngineError::InvalidConfig(format!(
-            "{dir} is a `cascadia shard` tree, which ov-genai cannot serve. \
-             Use --engine {engine}."
+            "{dir} is a staged tree, which ov-genai cannot serve. Use --engine {engine}."
         )));
     }
     Err(EngineError::InvalidConfig(format!(
@@ -578,22 +581,32 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_tree_names_the_engine_that_can_serve_it() {
-        for (export_version, engine) in [
-            ("v5_canonical_inputs", "ov-runtime"),
-            ("gemma4_cached_v1", "gemma4"),
-            ("qwen3_5_moe_surgery", "qwen36-moe"),
+    fn a_staged_tree_names_the_engine_that_can_serve_it() {
+        // The (file, key, value) triples each exporter actually writes — not a
+        // fabricated combination. export_shards.py and the gemma4 exporters write
+        // pipeline_config.json; the surgery exporters write manifest.json only.
+        for (file, key, value, engine) in [
+            (
+                "pipeline_config.json",
+                "export_version",
+                "v5_canonical_inputs",
+                "ov-runtime",
+            ),
+            (
+                "pipeline_config.json",
+                "export_version",
+                "gemma4_cached_v1",
+                "gemma4",
+            ),
+            ("manifest.json", "arch", "qwen3_5_moe", "qwen36-moe"),
+            ("manifest.json", "arch", "minimax_m2", "sparse-moe"),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(
-                dir.path().join("pipeline_config.json"),
-                format!("{{\"export_version\": \"{export_version}\"}}"),
-            )
-            .unwrap();
+            std::fs::write(dir.path().join(file), format!("{{\"{key}\": \"{value}\"}}")).unwrap();
             let err = check_tokenizer_irs(&dir.path().to_string_lossy())
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("shard` tree"), "{err}");
+            assert!(err.contains("staged tree"), "{err}");
             assert!(err.contains(&format!("--engine {engine}")), "{err}");
         }
     }

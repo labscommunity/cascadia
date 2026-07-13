@@ -39,10 +39,12 @@ UBUNTU_SUITE="${UBUNTU_CODENAME:-}"
 if [[ "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *ubuntu* ]]; then UBUNTU_SUITE=""; fi
 
 INTEL_LIST=/etc/apt/sources.list.d/intel-gpu.list
-# Intel's graphics signing keys (production, and the 2024 predecessor). Pinning
-# the fingerprint means a hijacked key/URL cannot become an apt trust anchor.
-INTEL_KEY_FPR="E0258B57D9C442D5DB1855C271740E4DE392BFE3"
-INTEL_KEY_FPR_OLD="4E9EFCDEF82800256C1E7C64B02DB9BD8C321DCB"
+# The exact set of primary keys Intel ships (current signing key + its 2024
+# predecessor), sorted. Checking only that the keyring CONTAINS one of these is
+# not enough: a keyring is a concatenation, so whoever controls the key URL
+# could append their own and apt would trust that one too.
+INTEL_KEY_FPRS="4E9EFCDEF82800256C1E7C64B02DB9BD8C321DCB
+E0258B57D9C442D5DB1855C271740E4DE392BFE3"
 
 echo "==> Installing Intel GPU runtime packages (OpenCL + Level-Zero + Compute Runtime)"
 $SUDO apt-get update
@@ -64,9 +66,11 @@ if [[ -n "$UBUNTU_SUITE" ]]; then
     echo "ERROR: could not fetch Intel's graphics key. Nothing was changed."
     exit 1
   fi
-  if ! gpg --show-keys --with-colons "$KEY_TMP" | awk -F: '/^fpr:/{print $10}' \
-       | grep -qx -e "$INTEL_KEY_FPR" -e "$INTEL_KEY_FPR_OLD"; then
-    echo "ERROR: Intel's graphics key does not match a known fingerprint. Refusing to trust it."
+  KEY_PRIMARIES="$(gpg --show-keys --with-colons "$KEY_TMP" \
+    | awk -F: '$1=="pub"{p=1;next} $1=="fpr"&&p{print $10;p=0}' | sort)"
+  if [[ "$KEY_PRIMARIES" != "$(printf '%s\n' "$INTEL_KEY_FPRS" | sort)" ]]; then
+    echo "ERROR: Intel's graphics key is not the expected set of keys. Refusing to trust it."
+    echo "       Nothing was changed."
     exit 1
   fi
   $SUDO install -m 0644 "$KEY_TMP" /usr/share/keyrings/intel-graphics.gpg

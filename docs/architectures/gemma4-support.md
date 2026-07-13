@@ -53,7 +53,7 @@ GEMMA 4 EXPORT COMPLETE  Total: 9596 MB
 
 Each stage compiles to an OpenVINO IR that runs through
 `openvino.Core().compile_model()` and returns logits of correct shape
-on prefill + decode. The pre-existing `--quantization {int4,int4_asym,
+on prefill + decode. The pre-existing `--quantization {int4,int4-asym,
 int8}` knobs are wired through (nncf compress_weights), though INT4
 on the per-layer-scalar buffers sometimes fails — start with `fp16`
 and try INT4 once you've confirmed parity.

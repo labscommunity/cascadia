@@ -334,20 +334,23 @@ pub struct WorkerArgs {
     pub ov_execution_mode: Option<OvExecutionMode>,
 
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
-    /// Applied only with --engine ov-genai on an NPU device; silently dropped
-    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    /// Applied only with --engine ov-genai on an NPU device; dropped with a
+    /// warning otherwise (only ov-genai routes it through an ov::genai
+    /// LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_prefill_chunk_size: Option<u32>,
 
     /// NPU max prompt length (MAX_PROMPT_LEN, static-shape constraint).
-    /// Applied only with --engine ov-genai on an NPU device; silently dropped
-    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    /// Applied only with --engine ov-genai on an NPU device; dropped with a
+    /// warning otherwise (only ov-genai routes it through an ov::genai
+    /// LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_max_prompt_len: Option<u32>,
 
     /// NPU min response length (MIN_RESPONSE_LEN, static-shape constraint).
-    /// Applied only with --engine ov-genai on an NPU device; silently dropped
-    /// otherwise (only ov-genai routes it through an ov::genai LLMPipeline).
+    /// Applied only with --engine ov-genai on an NPU device; dropped with a
+    /// warning otherwise (only ov-genai routes it through an ov::genai
+    /// LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_min_response_len: Option<u32>,
 
@@ -1757,12 +1760,14 @@ pub(crate) fn export_pip_install_line(python: &str) -> String {
         .filter(|l| !l.is_empty())
         .map(|p| format!("\"{p}\""))
         .collect();
-    // A quoted path at the start of a PowerShell line is a string expression, not
-    // a command — it needs the call operator. Elsewhere (and unquoted) it's fine.
-    let py = match (python.contains(char::is_whitespace), cfg!(windows)) {
-        (true, true) => format!("& \"{python}\""),
-        (true, false) => format!("\"{python}\""),
-        (false, _) => python.to_string(),
+    // Quote the interpreter only when it needs it. No PowerShell `&` call
+    // operator: `cfg!(windows)` is the build target, not the shell the user is
+    // in, and `&` is a syntax error in cmd.exe and Git Bash. PowerShell users
+    // with a spaced path add their own `&`; every other shell takes this as-is.
+    let py = if python.contains(char::is_whitespace) {
+        format!("\"{python}\"")
+    } else {
+        python.to_string()
     };
     format!("{py} -m pip install {}", pkgs.join(" "))
 }
@@ -2083,20 +2088,18 @@ mod python_tests {
         assert!(line.starts_with("python3 -m pip install "), "{line}");
         // Double quotes: the only form valid in sh, zsh, PowerShell and cmd.exe.
         assert!(line.contains("\"transformers>=5.2,<5.5\""), "{line}");
-        assert!(line.contains("\"safetensors\""), "{line}");
+        assert!(line.contains("\"safetensors>=0.4\""), "{line}");
         // Comments and blank lines from requirements.txt never leak through.
         assert!(!line.contains('#'), "{line}");
-        // An interpreter path with spaces stays one argument — and on Windows it
-        // gets PowerShell's call operator, since a quoted string alone is not a
-        // command there.
+        // An interpreter path with spaces stays one argument, and the line starts
+        // with the path itself: a leading `&` would be PowerShell-only and a
+        // syntax error in cmd.exe and Git Bash, which are the same target.
         let q = export_pip_install_line("C:\\Program Files\\Python\\python.exe");
         assert!(
-            q.contains("\"C:\\Program Files\\Python\\python.exe\" -m pip"),
+            q.starts_with("\"C:\\Program Files\\Python\\python.exe\" -m pip"),
             "{q}"
         );
-        if cfg!(windows) {
-            assert!(q.starts_with("& \""), "{q}");
-        }
+        assert!(!q.starts_with('&'), "{q}");
     }
 
     #[test]

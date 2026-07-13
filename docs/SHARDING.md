@@ -49,7 +49,7 @@ network).
 | `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`), a local dir with `config.json` + `*.safetensors`, or (Gemma-4 / Qwen3.6 only) an exported OpenVINO IR dir. HF repos auto-download into `~/.cache/cascadia/models/`. |
 | `-o`, `--output-dir` | Where to write the shard tree. |
 | `--num-stages N` | Pipeline stages to split into. 2 is the common case for 2-machine setups; use 3+ for larger clusters. |
-| `--quantization` | `int4` (default — typical), `int4_asym`, `int8`, or `fp16`. INT4 needs nncf installed. |
+| `--quantization` | `int4` (default — typical), `int4-asym`, `int8`, or `fp16`. INT4 needs nncf installed. |
 | `--layer-split a,b,...` | Override the uniform split. With `--num-stages 3 --layer-split 16,24` on a 32-layer model: stage 0 = layers 0..15, stage 1 = 16..23, stage 2 = 24..31. Useful for asymmetric hardware (e.g. give the bigger node more layers). |
 | `--stage N` | Re-export only stage N (debugging). |
 | `--target cpu-gpu\|npu` | Deployment target. `npu` emits a stateless static-shape shard — see [NPU_SHARDING.md](NPU_SHARDING.md). |
@@ -170,7 +170,7 @@ There's a per-stage overhead (network round-trip + OV plugin init), so
 | Mode | Weight bits | Quality loss | Speed | Recommended for |
 |------|------------:|--------------|-------|-----------------|
 | `int4` | 4 (sym, group=128) | ~1-2% on standard benchmarks | fastest | **Default.** Almost always the right choice. |
-| `int4_asym` | 4 (asym, group=128) | similar to int4 | similar | When INT4 sym shows numerical issues on a specific model. |
+| `int4-asym` | 4 (asym, group=128) | similar to int4 | similar | When INT4 sym shows numerical issues on a specific model. |
 | `int8` | 8 (asym, per-channel) | ~0.5% | slower than int4 | When int4 quality is unacceptable. |
 | `fp16` | 16 | none | slowest, biggest | Debugging or when nncf isn't installed. |
 
