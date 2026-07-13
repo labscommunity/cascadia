@@ -14,3 +14,7 @@ openvino>=2026.2
 optimum-intel>=1.27
 nncf>=2.18
 torch>=2.6
+# Imported directly by export_shards.py and by the `cascadia shard` dependency
+# probe; today they only arrive transitively via transformers.
+safetensors
+huggingface_hub

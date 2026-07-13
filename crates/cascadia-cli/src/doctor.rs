@@ -94,8 +94,14 @@ fn check_rust(r: &mut Report) {
     match first_line_of("rustc", "--version") {
         Some(v) => r.line(Level::Ok, "Rust toolchain", &v),
         None => {
-            r.line(Level::Fail, "Rust toolchain", "rustc not found on PATH");
-            r.note("Install via https://rustup.rs then `rustup default stable` (need 1.75+).");
+            // Informational, not a warning: a release bundle runs with no Rust
+            // toolchain at all, and `--strict` must still pass on such a host.
+            r.line(
+                Level::Info,
+                "Rust toolchain",
+                "rustc not found on PATH (only needed to build from source)",
+            );
+            r.note("Install via https://rustup.rs then `rustup default stable` (need 1.89+).");
         }
     }
 }
@@ -121,8 +127,9 @@ fn check_cpp(r: &mut Report) {
             );
         }
         None => {
+            // Build-only, like rustc above: a release bundle needs no compiler.
             r.line(
-                Level::Warn,
+                Level::Info,
                 "C++ compiler",
                 "no g++/clang++ on PATH (needed only for --features openvino)",
             );
@@ -132,48 +139,45 @@ fn check_cpp(r: &mut Report) {
 }
 
 fn check_python(r: &mut Report) {
-    // Python is an EXPORT-time dependency (`cascadia shard`), not a
-    // runtime one. Surface it here so users discover it before they hit
-    // sharding, but a miss is only a warning.
-    let py = ["python3", "python"]
-        .into_iter()
-        .find_map(|p| first_line_of(p, "--version").map(|v| (p, v)));
-    match py {
-        Some((p, v)) => {
-            r.line(Level::Ok, "Python (export-time)", &v);
-            // Probe the export packages so the warning is specific.
-            let probe = Command::new(p)
-                .args([
-                    "-c",
-                    "import torch, openvino, transformers, safetensors, huggingface_hub",
-                ])
-                .output();
-            match probe {
-                Ok(o) if o.status.success() => {
-                    r.line(
-                        Level::Ok,
-                        "Export packages",
-                        "torch/openvino/transformers present",
-                    );
-                }
-                _ => {
+    // Python is an EXPORT-time dependency (`cascadia shard`), not a runtime one.
+    // Surface it here so users discover it before they hit sharding, but a miss
+    // is only a warning. Resolve the interpreter the same way `cascadia shard`
+    // does — one that can import the deps, not the first that answers --version.
+    // `resolve_python` already probed the imports; don't pay for that twice.
+    match crate::resolve_python(None, true) {
+        Ok(env) => {
+            let version = first_line_of(&env.path, "--version").unwrap_or_default();
+            r.line(
+                Level::Ok,
+                "Python (export-time)",
+                &format!("{version} ({})", env.path),
+            );
+            match env.deps {
+                Some(_) => r.line(
+                    Level::Ok,
+                    "Export packages",
+                    "torch/openvino/transformers present",
+                ),
+                None => {
                     r.line(
                         Level::Warn,
                         "Export packages",
                         "missing (only needed for `cascadia shard`)",
                     );
-                    r.note(
-                        "pip install torch transformers openvino safetensors huggingface_hub nncf",
-                    );
+                    r.note(&crate::export_pip_install_line(&env.path));
                 }
             }
         }
-        None => {
+        Err(_) => {
             r.line(
                 Level::Warn,
                 "Python (export-time)",
                 "no python3/python on PATH (only needed for `cascadia shard`)",
             );
+            // Print the pins anyway: a bundle user has no tools/requirements.txt
+            // to read, and this is the only place they can learn them.
+            r.note("Install Python 3.10+, then:");
+            r.note(&crate::export_pip_install_line("python"));
         }
     }
 }
@@ -254,7 +258,9 @@ fn check_ov_devices(r: &mut Report) {
                 r.note("    (then log out/in — group changes don't apply to the current shell)");
                 r.note("  • install the GPU runtime packages: intel-opencl-icd,");
                 r.note(
-                    "    intel-level-zero-gpu, level-zero  (see INSTALL.md / setup-openvino.sh)",
+                    "    libze-intel-gpu1, libze1  (Ubuntu 24.04+; on 22.04 these come from \
+                     Intel's apt repo as intel-level-zero-gpu / level-zero — \
+                     `scripts/setup-openvino.sh` in a source checkout does this for you)",
                 );
                 r.note("On Windows: install the latest Intel graphics driver, then reboot.");
             }
@@ -287,7 +293,7 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!();
     match r.worst {
         Level::Ok | Level::Info => {
-            println!("All good. Try:  cascadia run <hf-model-id-or-path>");
+            println!("All good. Try:  cascadia run <model-dir>   (export one first: cascadia shard --help)");
         }
         Level::Warn => {
             println!("Mostly OK with warnings above — see the remediation notes.");

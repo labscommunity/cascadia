@@ -157,8 +157,9 @@ pub enum Command {
     /// that otherwise shows up as mysterious slowness. See `cascadia
     /// doctor --help`.
     Doctor(DoctorArgs),
-    /// Run a model on a single machine (sugar for a one-stage worker
-    /// with an OpenAI API). See `cascadia run --help`.
+    /// Run a model on a single machine (sugar for a one-stage worker with an
+    /// OpenAI API). Takes a local model directory — a whole-model OpenVINO IR,
+    /// or a `cascadia shard` tree. See `cascadia run --help`.
     Run(RunArgs),
     /// Run a pipeline-stage worker.
     Worker(WorkerArgs),
@@ -240,7 +241,9 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub layer_end: u32,
 
-    /// HF model id or local model directory.
+    /// Local model directory: a whole-model OpenVINO IR for ov-genai, or a
+    /// `cascadia shard` tree for the staged engines. NOT an HF repo id — the
+    /// worker never downloads or converts models; only `cascadia shard` does.
     #[arg(long)]
     pub model: String,
 
@@ -503,8 +506,9 @@ pub struct WorkerArgs {
 /// parallelism, use `cascadia worker` directly.
 #[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
-    /// HF model id (e.g. `unsloth/Meta-Llama-3.1-8B-Instruct`) or a
-    /// local model / shard directory.
+    /// Local model directory: a whole-model OpenVINO IR (`optimum-cli export
+    /// openvino`, or a pre-exported `*-int4-ov` download) or a `cascadia shard`
+    /// tree. Not an HF repo id — `run` does not download or convert models.
     pub model: String,
 
     /// Device hint: GPU / CPU / NPU. Defaults to GPU — run `cascadia
@@ -514,8 +518,8 @@ pub struct RunArgs {
     #[arg(long, default_value = "GPU")]
     pub device: String,
 
-    /// Inference engine. Defaults to `ov-genai` (single-stage, auto-
-    /// exports from an HF id).
+    /// Inference engine. Defaults to `ov-genai` (single-stage, whole-model
+    /// OpenVINO IR). Use `--engine ov-runtime` for a `cascadia shard` tree.
     #[arg(long, value_enum, default_value_t = EngineKind::OvGenai)]
     pub engine: EngineKind,
 
@@ -951,6 +955,82 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
     }
 }
 
+/// Last path/repo segment of a model id, for the example commands below.
+fn model_stem(model: &str) -> String {
+    model
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model")
+        .to_string()
+}
+
+/// True when the string looks like a filesystem path the user meant literally
+/// (`./x`, `/x`, `C:\x`, `~/x`) rather than an HF repo id (`org/name`).
+fn looks_like_path(model: &str) -> bool {
+    let p = std::path::Path::new(model);
+    p.is_absolute()
+        || model.starts_with('.')
+        || model.starts_with('~')
+        || model.contains('\\')
+        || model.matches('/').count() != 1
+}
+
+/// Why a `--model` was rejected, and what to do instead. Engines load a
+/// pre-exported model from a directory; only `cascadia shard` downloads.
+fn missing_model_error(model: &str, engine: EngineKind) -> anyhow::Error {
+    if looks_like_path(model) {
+        return anyhow!("no model directory at {model} (path does not exist)");
+    }
+    // Looks like an HF repo id: the old docs told people to pass one, and it can
+    // never work, so say what to run instead.
+    let stem = model_stem(model);
+    let serve = match engine {
+        EngineKind::OvGenai => format!(
+            "  ov-genai serves a whole-model OpenVINO IR — export one with `optimum-cli export\n  \
+             openvino`, or download a pre-exported *-int4-ov directory, then:\n    \
+             cascadia run <ir-dir>"
+        ),
+        _ => format!(
+            "  cascadia shard --model {model} --output-dir ./{stem}-1stage --num-stages 1\n    \
+             cascadia run ./{stem}-1stage --engine ov-runtime"
+        ),
+    };
+    anyhow!(
+        "no model directory at {model}\n\
+         \n\
+         Engines load a pre-exported model from disk; the worker does not download\n\
+         or convert models. Export first:\n\
+         \n\
+         {serve}"
+    )
+}
+
+/// Reject a `--model` (or `--draft-model`) that names nothing on disk, with the
+/// command to run instead. Without this an HF repo id — which the old docs told
+/// people to pass — surfaces as a bare "model not found", which reads like a
+/// missing file rather than a missing export.
+fn preflight_model_path(args: &WorkerArgs) -> Result<()> {
+    if matches!(args.engine, EngineKind::Mock) {
+        return Ok(());
+    }
+    if !std::path::Path::new(&args.model).exists() {
+        return Err(missing_model_error(&args.model, args.engine));
+    }
+    // The draft model is a whole OpenVINO IR dir too, and ov::genai builds a
+    // tokenizer from it — an HF id there fails the same way.
+    if let Some(draft) = &args.draft_model {
+        if !std::path::Path::new(draft).exists() {
+            return Err(anyhow!(
+                "no draft-model directory at {draft}\n\
+                 --draft-model takes a local OpenVINO IR directory (e.g. a FastDraft\n\
+                 *-int8-ov download), not an HF repo id."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
     warn_ignored_ov_perf_flags(args);
     match args.engine {
@@ -1276,6 +1356,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         tp_rank: 0,
     };
 
+    preflight_model_path(&args)?;
     let builder = build_builder(&args)?;
     let runner = Arc::new(Runner::new(builder));
     let listen = if !is_first {
@@ -1347,9 +1428,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // Advertise the API/dashboard port separately from the relay port so
     // the dashboard can show a node's reachable address (the relay `port`
     // isn't an HTTP endpoint). None for relay-only stages.
-    let api_port = args
-        .api
-        .as_deref()
+    // Only rank 0 serves an API; relay ranks return before the API block, so a
+    // --api passed to them (one systemd template covers every rank) must not be
+    // advertised as an endpoint the dashboard can't reach.
+    let api_port = is_first
+        .then(|| args.api.as_deref())
+        .flatten()
         .and_then(|a| parse_addr(a, "0.0.0.0").ok())
         .map(|(_, p)| p);
     let self_node = cascadia_topology::NodeInfo {
@@ -1624,6 +1708,35 @@ const EXPORT_SCRIPT: &str = include_str!(concat!(
     "/../../tools/export_shards.py"
 ));
 
+/// The exporter's pinned deps, compiled in beside the exporter itself so the
+/// pins we print always match the exporter in *this* binary — a release bundle
+/// carries no requirements.txt to point at.
+const EXPORT_REQUIREMENTS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/requirements.txt"
+));
+
+/// `pip install` line for the exporter deps, rendered from EXPORT_REQUIREMENTS
+/// and aimed at `python`'s own pip — installing into whatever `pip` happens to
+/// be on PATH is how you end up with the deps in the wrong interpreter.
+///
+/// Every entry is double-quoted: `>=`/`<`/`[extras]` need quoting, and double
+/// quotes are the only form that survives sh, zsh, PowerShell and cmd.exe alike.
+pub(crate) fn export_pip_install_line(python: &str) -> String {
+    let pkgs: Vec<String> = EXPORT_REQUIREMENTS
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim()) // drop comments
+        .filter(|l| !l.is_empty())
+        .map(|p| format!("\"{p}\""))
+        .collect();
+    let py = if python.contains(char::is_whitespace) {
+        format!("\"{python}\"")
+    } else {
+        python.to_string()
+    };
+    format!("{py} -m pip install {}", pkgs.join(" "))
+}
+
 /// Sibling modules the exporter imports at runtime: the dedicated Gemma-4
 /// exporter (dispatched for gemma4 models) and the short-alias registry.
 /// They must be written next to export_shards.py in the temp dir so its
@@ -1697,6 +1810,83 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
     Ok(flags)
 }
 
+/// The imports the bundled exporter needs. Shared with `cascadia doctor` so the
+/// two can't disagree about what "export packages present" means.
+pub(crate) const EXPORT_IMPORTS: &str =
+    "import torch, openvino, transformers, safetensors, huggingface_hub";
+
+/// A Python interpreter and what it can do.
+#[derive(Debug)]
+pub(crate) struct PythonEnv {
+    pub path: String,
+    /// Version summary from the dependency probe; `None` if the imports failed
+    /// (or `check_deps` was false), so callers can skip probing a second time.
+    pub deps: Option<String>,
+}
+
+/// True only if the interpreter runs AND exits 0. Spawning is not enough: the
+/// Windows Store `python3.exe` alias spawns, prints "Python was not found" and
+/// exits 9009 — treating that as an interpreter is the very bug we're fixing.
+fn python_runs(p: &str) -> bool {
+    std::process::Command::new(p)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Import the exporter's deps and report their versions. `None` if the imports
+/// fail — that interpreter can't run the exporter.
+fn probe_export_deps(p: &str) -> Option<String> {
+    let code = format!(
+        "{EXPORT_IMPORTS}; import sys; \
+         print('python', sys.version.split()[0]); \
+         print('torch', torch.__version__); \
+         print('openvino', openvino.__version__); \
+         print('transformers', transformers.__version__)"
+    );
+    let out = std::process::Command::new(p)
+        .args(["-c", &code])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Resolve the interpreter to run the embedded exporter with: prefer one that
+/// can import the deps, since on Windows `python3` is often a stub with no
+/// packages while `python` is the real install. Falls back to any interpreter
+/// that runs, so the caller can still surface the real `ModuleNotFoundError`.
+pub(crate) fn resolve_python(explicit: Option<&str>, check_deps: bool) -> Result<PythonEnv> {
+    let candidates: Vec<String> = match explicit {
+        Some(p) => vec![p.to_string()],
+        None => vec!["python3".to_string(), "python".to_string()],
+    };
+    let mut runnable: Option<String> = None;
+    for p in &candidates {
+        if check_deps {
+            if let Some(deps) = probe_export_deps(p) {
+                return Ok(PythonEnv {
+                    path: p.clone(),
+                    deps: Some(deps),
+                });
+            }
+        }
+        if runnable.is_none() && python_runs(p) {
+            runnable = Some(p.clone());
+        }
+    }
+    match (runnable, explicit) {
+        (Some(path), _) => Ok(PythonEnv { path, deps: None }),
+        (None, Some(p)) => Err(anyhow!(
+            "cannot run the interpreter passed to --python: {p:?}"
+        )),
+        (None, None) => Err(anyhow!(
+            "no Python interpreter found on PATH. Install Python 3.10+ or pass --python <path>."
+        )),
+    }
+}
+
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
     use std::process::{Command, Stdio};
 
@@ -1712,39 +1902,16 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         eprintln!("warning: --static-seq/--static-context are ignored without --target npu");
     }
 
-    let python = if let Some(p) = args.python.as_deref() {
-        p.to_string()
-    } else {
-        // Try `python3` then `python`. clap doesn't run them — we just pick one.
-        if Command::new("python3").arg("--version").output().is_ok() {
-            "python3".into()
-        } else if Command::new("python").arg("--version").output().is_ok() {
-            "python".into()
-        } else {
-            return Err(anyhow!(
-                "no Python interpreter found on PATH. Install Python 3.10+ or pass --python <path>."
-            ));
-        }
-    };
+    // `--skip-check` means exactly that: don't import the deps just to pick an
+    // interpreter (importing torch costs seconds).
+    let env = resolve_python(args.python.as_deref(), !args.skip_check)?;
+    let python = env.path.clone();
 
     if !args.skip_check {
         eprintln!("Checking Python environment for required packages...");
-        let probe = Command::new(&python)
-            .args([
-                "-c",
-                "import torch, openvino, transformers, safetensors, huggingface_hub; \
-                 print('python', __import__('sys').version.split()[0]); \
-                 print('torch', torch.__version__); \
-                 print('openvino', openvino.__version__); \
-                 print('transformers', transformers.__version__);",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        match probe {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
+        match env.deps {
+            Some(versions) => {
+                for line in versions.lines() {
                     eprintln!("  {line}");
                 }
                 // NNCF is optional but warn if missing for INT4 quant.
@@ -1765,17 +1932,24 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                     }
                 }
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
+            // The chosen interpreter runs but can't import the deps: re-run the
+            // import so the user sees the real ModuleNotFoundError.
+            None => {
+                let out = Command::new(&python)
+                    .args(["-c", EXPORT_IMPORTS])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output();
+                let stderr = out
+                    .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                    .unwrap_or_default();
                 return Err(anyhow!(
-                    "python environment check failed:\n{}\n\
-                     Install: pip install torch openvino transformers safetensors \
-                     huggingface_hub nncf",
-                    stderr.trim()
+                    "python environment check failed for interpreter {python:?}:\n{}\n\
+                     Install: {}\n\
+                     (or point at another interpreter with --python <path>)",
+                    stderr.trim(),
+                    export_pip_install_line(&python)
                 ));
-            }
-            Err(e) => {
-                return Err(anyhow!("couldn't run python interpreter {python:?}: {e}"));
             }
         }
     }
@@ -1835,6 +2009,13 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
              --engine qwen36-moe --device CPU --api :8000",
             args.output_dir, args.output_dir
         );
+    } else if args.num_stages == 1 {
+        // Single stage: rank 0 is also the last stage, so there is no --next.
+        eprintln!(
+            "\nShard tree written to {}. Run with:\n  cascadia run {} \
+             --engine ov-runtime --device GPU",
+            args.output_dir, args.output_dir
+        );
     } else {
         eprintln!(
             "\nShard tree written to {}. Run with:\n  cascadia worker --rank 0 --total {} \
@@ -1844,6 +2025,97 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod python_tests {
+    use super::*;
+
+    fn worker(model: &str, engine: EngineKind) -> WorkerArgs {
+        let mut a = WorkerArgs::single_node(model.into(), "GPU".into(), engine, ":8000".into());
+        a.engine = engine;
+        a
+    }
+
+    #[test]
+    fn explicit_interpreter_that_cannot_run_names_the_path() {
+        // Must not tell the user to "pass --python" — they just did.
+        let err = resolve_python(Some("cascadia-no-such-python"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cascadia-no-such-python"), "{err}");
+        assert!(!err.contains("on PATH"), "{err}");
+    }
+
+    #[test]
+    fn pip_line_quotes_every_specifier_and_targets_the_interpreter() {
+        let line = export_pip_install_line("python3");
+        assert!(line.starts_with("python3 -m pip install "), "{line}");
+        // Double quotes: the only form valid in sh, zsh, PowerShell and cmd.exe.
+        assert!(line.contains("\"transformers>=5.2,<5.5\""), "{line}");
+        assert!(line.contains("\"safetensors\""), "{line}");
+        // Comments and blank lines from requirements.txt never leak through.
+        assert!(!line.contains('#'), "{line}");
+        // An interpreter path with spaces stays one argument.
+        let q = export_pip_install_line("C:\\Program Files\\Python\\python.exe");
+        assert!(
+            q.starts_with("\"C:\\Program Files\\Python\\python.exe\" -m pip"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn model_stem_handles_paths_and_repo_ids() {
+        assert_eq!(model_stem("unsloth/Meta-Llama-3.1-8B"), "Meta-Llama-3.1-8B");
+        assert_eq!(model_stem("C:\\models\\foo"), "foo");
+        assert_eq!(model_stem("foo/"), "model");
+        assert_eq!(model_stem(""), "model");
+    }
+
+    #[test]
+    fn preflight_rejects_an_hf_id_with_the_command_to_run() {
+        let err = preflight_model_path(&worker(
+            "unsloth/Meta-Llama-3.1-8B-Instruct",
+            EngineKind::OvRuntime,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cascadia shard"), "{err}");
+        // ov-genai cannot be fed a shard tree, so it gets different advice.
+        let genai = preflight_model_path(&worker("org/name", EngineKind::OvGenai))
+            .unwrap_err()
+            .to_string();
+        assert!(genai.contains("optimum-cli"), "{genai}");
+    }
+
+    #[test]
+    fn preflight_says_path_not_found_for_a_path_like_model() {
+        let err = preflight_model_path(&worker("./no-such-dir", EngineKind::OvRuntime))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("path does not exist"), "{err}");
+        assert!(
+            !err.contains("cascadia shard --model ./no-such-dir"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_an_existing_dir_and_the_mock_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        assert!(preflight_model_path(&worker(&path, EngineKind::OvRuntime)).is_ok());
+        assert!(preflight_model_path(&worker("mock-model", EngineKind::Mock)).is_ok());
+    }
+
+    #[test]
+    fn preflight_rejects_a_draft_model_that_is_not_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = worker(&dir.path().to_string_lossy(), EngineKind::OvGenai);
+        args.draft_model = Some("unsloth/Llama-3.2-1B-Instruct".into());
+        let err = preflight_model_path(&args).unwrap_err().to_string();
+        assert!(err.contains("draft-model"), "{err}");
+    }
 }
 
 #[cfg(test)]

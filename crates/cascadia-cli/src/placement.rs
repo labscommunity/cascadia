@@ -1,7 +1,7 @@
 //! Three-tier {iGPU, NPU, CPU} placement solver — step 2 of issue #41.
 //!
 //! Takes a per-(stage, device) cost profile (latency + memory + op-support,
-//! produced by `profile-devices --per-stage`) and assigns each pipeline stage
+//! produced by `profile-stages`) and assigns each pipeline stage
 //! to exactly one device so as to **minimise total forward latency subject to
 //! each device's memory budget**. This is the offline ILP of PowerInfer §6.3
 //! adapted to Intel UMA — see `docs/perf/THREE_TIER_PLACEMENT.md`.
