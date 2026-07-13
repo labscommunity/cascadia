@@ -3,6 +3,7 @@ name = "cascadia-types"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Engine-agnostic core types: generation tasks, chunks, shards, peer layout."

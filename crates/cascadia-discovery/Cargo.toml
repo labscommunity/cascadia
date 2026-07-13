@@ -3,6 +3,7 @@ name = "cascadia-discovery"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Zero-config mDNS peer discovery for cascadia; populates a cascadia_topology::Topology."

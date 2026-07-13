@@ -3,6 +3,7 @@ name = "cascadia-engine-sparse-moe"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Sparse-MoE engine for Kimi K2.6 style models. Runs per-layer shells (Rust by default, OV IR optional) and dispatches only the top-k experts the router selects, instead of running all 384 every step."

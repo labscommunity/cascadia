@@ -3,6 +3,7 @@ name = "cascadia-ov-genai-shim"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "C++ FFI shim around openvino-genai for the missing pieces (draft_model, Tokenizer, prompt_lookup property)."

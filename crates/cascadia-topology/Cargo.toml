@@ -3,6 +3,7 @@ name = "cascadia-topology"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Cluster topology graph: nodes + measured edges (latency, bandwidth)."

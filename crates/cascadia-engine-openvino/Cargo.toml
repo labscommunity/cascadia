@@ -3,6 +3,7 @@ name = "cascadia-engine-openvino"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "OpenVINO-backed engines for cascadia — wraps cascadia-ov-genai-shim into the Engine + Builder traits."
