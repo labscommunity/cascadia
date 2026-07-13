@@ -20,7 +20,7 @@ use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 pub mod discover;
@@ -271,7 +271,7 @@ pub struct WorkerArgs {
     ///   BATCH:GPU                 auto-batch (throughput-favored)
     ///
     /// Run `cascadia doctor` to see which devices OpenVINO can see on this host.
-    #[arg(long, default_value = "CPU")]
+    #[arg(long, default_value = "CPU", verbatim_doc_comment)]
     pub device: String,
 
     /// Inference engine.
@@ -1334,6 +1334,12 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     }
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
+
+    // Only rank 0 reaches the API bind; every other rank returns from the
+    // relay loop first. Say so rather than dropping the flag silently.
+    if args.api.is_some() && !is_first {
+        warn!(rank = args.rank, "--api is ignored on ranks other than 0");
+    }
 
     info!(
         engine = ?args.engine,

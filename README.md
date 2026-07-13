@@ -96,6 +96,8 @@ Prerequisites:
 
 ## Usage
 
+Every command and flag is catalogued in [docs/CLI.md](docs/CLI.md).
+
 ### Single machine
 
 Cascadia serves models from a local directory — it does not download or convert at run time. Only `cascadia shard` fetches from HuggingFace (caching under `~/.cache/cascadia/models/`). Export once, then serve:
@@ -221,6 +223,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | 5-minute stub run → real inference |
 | [INSTALL.md](INSTALL.md) | Full setup: OpenVINO SDK, GPU runtime, Docker |
+| [docs/CLI.md](docs/CLI.md) | Every command and flag |
 | [docs/SHARDING.md](docs/SHARDING.md) | Sharding flow + per-model-family support table |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions + crate responsibilities |
 | [docs/engines/](docs/engines/) | Per-engine deep dives |

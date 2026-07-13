@@ -47,7 +47,7 @@ pub struct StageCost {
     pub lat_ms: BTreeMap<String, f64>,
 }
 
-/// The solver input — written by `profile-devices --per-stage`.
+/// The solver input — written by `cascadia profile-stages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementProfile {
     pub model: String,
@@ -292,7 +292,7 @@ impl Placement {
 #[derive(Args, Debug)]
 pub struct PlaceArgs {
     /// Path to the `placement_profile.json` produced by
-    /// `profile-devices --per-stage`.
+    /// `cascadia profile-stages`.
     #[arg(long)]
     pub profile: PathBuf,
 

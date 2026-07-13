@@ -835,7 +835,7 @@ impl Runtime {
     }
 
     /// Input tensor `idx`'s shape — concrete dims for a static (NPU-export)
-    /// model. Used by `profile-devices --per-stage` to size the zeroed
+    /// model. Used by `cascadia profile-stages` to size the zeroed
     /// inputs it feeds when timing a stage.
     pub fn input_shape(&self, idx: usize) -> Result<Vec<usize>> {
         #[cfg(not(feature = "openvino"))]

@@ -102,6 +102,7 @@ node. Use `cascadia discover` to find peers' addresses on your LAN.
 ## Where to go next
 
 - **[INSTALL.md](INSTALL.md)** — full setup, OpenVINO, Docker.
+- **[docs/CLI.md](docs/CLI.md)** — every command and flag.
 - **[docs/SHARDING.md](docs/SHARDING.md)** — supported models, picking stage counts.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — building, testing, the crate layout.
 - `cascadia <command> --help` — every command is self-documenting.

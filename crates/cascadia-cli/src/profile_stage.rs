@@ -1,4 +1,4 @@
-//! `profile-devices --per-stage` — build the per-(stage, device) cost table
+//! `cascadia profile-stages` — build the per-(stage, device) cost table
 //! the #41 placement ILP consumes (step 1.5, between `profile-devices` and
 //! `cascadia place`).
 //!
@@ -184,7 +184,7 @@ pub fn cmd_profile_per_stage(args: PerStageArgs) -> Result<()> {
     {
         let _ = args;
         bail!(
-            "`profile-devices --per-stage` needs a real OpenVINO runtime; this \
+            "`cascadia profile-stages` needs a real OpenVINO runtime; this \
              binary was built without the `openvino` feature (stub). Rebuild \
              with `--features openvino` on an Intel host."
         );
