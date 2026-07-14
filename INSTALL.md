@@ -89,7 +89,7 @@ wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
   | sudo gpg --yes --dearmor -o /usr/share/keyrings/intel-graphics.gpg
 . /etc/os-release   # noble on 24.04, jammy on 22.04
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu $UBUNTU_CODENAME client" \
+https://repositories.intel.com/gpu/ubuntu $UBUNTU_CODENAME unified" \
   | sudo tee /etc/apt/sources.list.d/intel-gpu.list
 sudo apt-get update
 sudo apt-get install -y ocl-icd-libopencl1 intel-opencl-icd libze-intel-gpu1 libze1
