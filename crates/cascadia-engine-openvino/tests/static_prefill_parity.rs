@@ -104,6 +104,16 @@ async fn run_tasks(
     if let Ok(cache) = std::env::var("CASCADIA_OV_CACHE") {
         builder = builder.with_cache_dir(cache);
     }
+    // CASCADIA_GEMV_OFFLOAD=1: run the NON-baseline legs' decode through the
+    // CascadiaInt4Gemv extension op (weights from the .bin mmap). The
+    // tokenwise baseline (disable_chunk) stays on the stock kernel, so the
+    // parity asserts become the cross-kernel check: offloaded decode vs
+    // oneDNN decode. Accumulation order differs, so a greedy divergence here
+    // is DATA about kernel rounding, not necessarily a bug — investigate
+    // before loosening.
+    if std::env::var("CASCADIA_GEMV_OFFLOAD").is_ok_and(|v| v == "1") && !disable_chunk {
+        builder = builder.with_gemv_offload(true);
+    }
     builder
         .connect(PeerLayout::single_stage())
         .await

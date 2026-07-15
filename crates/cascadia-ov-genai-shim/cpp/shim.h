@@ -149,6 +149,21 @@ int32_t cascadia_runtime_compile(
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle);
 
+/// Compile like cascadia_runtime_compile, but first rewrite every NNCF
+/// sym-INT4 decompress→MatMul into the CascadiaInt4Gemv extension op whose
+/// weights stay backed by the read_model mmap of the original .bin — the
+/// CPU plugin never makes its own resident repacked copy. CPU-class devices
+/// only (the op executes via the evaluate() fallback). Do not pass CACHE_DIR
+/// (the custom op's member tensors don't survive blob serialization).
+/// `out_offloaded` (optional) receives the number of MatMuls rewritten.
+int32_t cascadia_runtime_compile_gemv_offload(
+    const char* model_xml_path,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    uint32_t* out_offloaded,
+    cascadia_runtime_t** out_handle);
+
 /// Reset stateful KV-cache nodes to their initial value. No-op on
 /// stateless models.
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);

@@ -2261,6 +2261,12 @@ pub struct OvRuntimeBuilder {
     /// the two-model split) and re-create it on the next prefill from the
     /// blob cache. For memory-tight stages; costs a per-task reload.
     pub park_prefill: bool,
+    /// `--gemv-offload` (SPIKE): compile the decode model with the
+    /// CascadiaInt4Gemv extension pass — sym-INT4 weight matmuls execute
+    /// straight from the mmapped .bin through a custom op instead of a
+    /// plugin-repacked resident copy (~1x steady-state decode weights).
+    /// Stateless static exports on a CPU device only.
+    pub gemv_offload: bool,
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
@@ -2314,6 +2320,11 @@ impl OvRuntimeBuilder {
     /// Park the prefill model between prefills (see `park_prefill`).
     pub fn with_prefill_parking(mut self, park: bool) -> Self {
         self.park_prefill = park;
+        self
+    }
+    /// Decode-side INT4 GEMV offload (see `gemv_offload`).
+    pub fn with_gemv_offload(mut self, offload: bool) -> Self {
+        self.gemv_offload = offload;
         self
     }
     /// Skip the export's chunked-prefill variant (prefill one token per step).
@@ -2469,6 +2480,26 @@ impl Builder for OvRuntimeBuilder {
             }
             _ => None,
         };
+        // --gemv-offload (spike): the offloaded matmuls run on the CPU
+        // plugin's evaluate() fallback, and the rewrite targets the stateless
+        // static IR's sym-INT4 pattern — gate both up front.
+        if self.gemv_offload {
+            if stage_cfg.stateful {
+                return Err(EngineError::ShardRejected(
+                    "--gemv-offload requires a stateless static export \
+                     (tools/export_shards.py --target npu)"
+                        .into(),
+                ));
+            }
+            if !self.device.trim().to_ascii_uppercase().starts_with("CPU") {
+                return Err(EngineError::ShardRejected(format!(
+                    "--gemv-offload executes offloaded matmuls on the CPU evaluate() \
+                     fallback — --device must be CPU (got {})",
+                    self.device
+                )));
+            }
+        }
+
         if (self.prefill_device.is_some() || self.park_prefill)
             && self.static_prefill_params.is_none()
         {
@@ -2552,9 +2583,39 @@ impl Builder for OvRuntimeBuilder {
         )));
         let plugin = self.plugin();
         let xml_path = stage_dir.join("openvino_model.xml");
-        let runtime =
+        let runtime = if self.gemv_offload {
+            // The custom op's member tensors don't survive blob
+            // serialization — strip CACHE_DIR for THIS compile only (the
+            // prefill compile below still caches; CPU compiles are fast).
+            let mut p = self.plugin();
+            if self.cache_dir.is_some() {
+                p.entries.retain(|(k, _)| k != "CACHE_DIR");
+                warn!(
+                    "--gemv-offload: decode compile skips CACHE_DIR (custom-op weights \
+                     don't survive blob serialization); the prefill compile still caches"
+                );
+            }
+            let (rt, offloaded) = OvRuntime::compile_gemv_offload(
+                xml_path.to_str().unwrap_or_default(),
+                &self.device,
+                &p,
+            )
+            .map_err(map_ov_err)?;
+            events.push(LoadProgress::message(format!(
+                "gemv-offload: {offloaded} sym-INT4 matmuls execute from the .bin mmap \
+                 (no plugin-resident weight copy)"
+            )));
+            if offloaded == 0 {
+                warn!(
+                    "--gemv-offload matched 0 matmuls — the IR does not carry the \
+                     expected NNCF sym-INT4 pattern; decode runs fully stock"
+                );
+            }
+            rt
+        } else {
             OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
-                .map_err(map_ov_err)?;
+                .map_err(map_ov_err)?
+        };
         self.input_names = runtime.input_names().map_err(map_ov_err)?;
         self.runtime = Some(runtime);
 
@@ -3133,6 +3194,40 @@ mod tests {
             .err()
             .expect("advertised variant without the IR file must be rejected");
         assert!(err.to_string().contains("missing"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gemv_offload_on_stateful_shard_rejected() {
+        let dir = write_stage_dir(
+            "gemv-stateful",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,"stateful":true}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU").with_gemv_offload(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("stateful + --gemv-offload must be rejected");
+        assert!(err.to_string().contains("--gemv-offload"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gemv_offload_on_non_cpu_device_rejected() {
+        let dir = write_stage_dir(
+            "gemv-npu",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,
+                "stateful":false,"static_seq":1,"static_context":8,
+                "num_kv_heads":2,"head_dim":4}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "NPU").with_gemv_offload(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "NPU"))
+            .await
+            .err()
+            .expect("non-CPU device + --gemv-offload must be rejected");
+        assert!(err.to_string().contains("CPU"), "got: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

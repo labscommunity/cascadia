@@ -59,6 +59,7 @@ fn main() {
         .cpp(true)
         .std("c++17")
         .file("cpp/shim.cpp")
+        .file("cpp/gemv_offload.cpp")
         .include(&runtime_include)
         .include(&genai_include)
         .compile("cascadia_ov_genai_shim");
@@ -69,5 +70,7 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=openvino");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.h");
+    println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");
+    println!("cargo:rerun-if-changed=cpp/gemv_offload.hpp");
     println!("cargo:rerun-if-env-changed=INTEL_OPENVINO_DIR");
 }

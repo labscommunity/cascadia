@@ -389,6 +389,16 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = false)]
     pub park_prefill: bool,
 
+    /// SPIKE: execute the decode model's sym-INT4 weight matmuls through the
+    /// CascadiaInt4Gemv extension op straight from the mmapped IR .bin — the
+    /// CPU plugin never makes its own resident repacked weight copy, so a
+    /// hybrid stage's decode side costs ~0 extra weight RAM. ov-runtime,
+    /// stateless static exports, --device CPU only. Numeric note: the op's
+    /// accumulation order differs from oneDNN's, so output parity vs the
+    /// stock kernel is validated empirically, not guaranteed bit-for-bit.
+    #[arg(long, default_value_t = false)]
+    pub gemv_offload: bool,
+
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
     pub draft_model: Option<String>,
@@ -607,6 +617,7 @@ impl WorkerArgs {
             prefill_device: None,
             no_chunked_prefill: false,
             park_prefill: false,
+            gemv_offload: false,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -1148,6 +1159,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
             b = b.with_prefill_parking(args.park_prefill);
+            b = b.with_gemv_offload(args.gemv_offload);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1388,12 +1400,15 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     }
     // Fail loud, not silent: the phase-split flags are load-bearing when
     // given, and only the ov-runtime engine implements them.
-    if (args.prefill_device.is_some() || args.no_chunked_prefill || args.park_prefill)
+    if (args.prefill_device.is_some()
+        || args.no_chunked_prefill
+        || args.park_prefill
+        || args.gemv_offload)
         && args.engine != EngineKind::OvRuntime
     {
         return Err(anyhow!(
-            "--prefill-device / --no-chunked-prefill / --park-prefill require \
-             --engine ov-runtime (the chunked-prefill phase split lives in the \
+            "--prefill-device / --no-chunked-prefill / --park-prefill / --gemv-offload \
+             require --engine ov-runtime (the chunked-prefill phase split lives in the \
              static-KV runtime path)"
         ));
     }

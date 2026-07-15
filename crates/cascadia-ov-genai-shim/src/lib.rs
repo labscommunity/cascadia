@@ -157,6 +157,15 @@ mod sys {
             out_handle: *mut *mut cascadia_runtime_t,
         ) -> c_int;
 
+        pub fn cascadia_runtime_compile_gemv_offload(
+            model_xml_path: *const c_char,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_offloaded: *mut u32,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
 
@@ -634,6 +643,62 @@ impl Runtime {
             return Err(Error::Native(last_native_error()));
         }
         Ok(Self { handle })
+    }
+
+    /// Compile with the CascadiaInt4Gemv offload pass: NNCF sym-INT4
+    /// decompress→MatMul chains execute from the read_model mmap through the
+    /// extension op instead of a plugin-repacked resident weight copy.
+    /// Returns the runtime plus the number of MatMuls offloaded. CPU-class
+    /// devices only (the op runs via the evaluate() fallback); do not pass
+    /// CACHE_DIR (op member tensors don't survive blob serialization).
+    pub fn compile_gemv_offload(
+        model_xml_path: &str,
+        device: &str,
+        plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        Self::do_compile_gemv_offload(model_xml_path, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_compile_gemv_offload(
+        _path: &str,
+        _device: &str,
+        _plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_compile_gemv_offload(
+        model_xml_path: &str,
+        device: &str,
+        plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        let path_c = cstr(model_xml_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+        let mut offloaded: u32 = 0;
+        let rc = unsafe {
+            sys::cascadia_runtime_compile_gemv_offload(
+                path_c.as_ptr(),
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut offloaded,
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok((Self { handle }, offloaded))
     }
 
     pub fn reset_state(&mut self) -> Result<()> {

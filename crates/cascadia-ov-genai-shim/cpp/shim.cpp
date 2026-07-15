@@ -5,6 +5,8 @@
 
 #include "shim.h"
 
+#include "gemv_offload.hpp"
+
 #include <cstring>
 #include <map>
 #include <memory>
@@ -485,6 +487,58 @@ int32_t cascadia_runtime_compile(
 }
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle) { delete handle; }
+
+int32_t cascadia_runtime_compile_gemv_offload(
+    const char* model_xml_path, const char* device,
+    const char* const* properties_kv, size_t properties_count,
+    uint32_t* out_offloaded,
+    cascadia_runtime_t** out_handle) {
+    if (!model_xml_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_compile_gemv_offload"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+        // read_model keeps the .bin mmapped; the offload pass moves the
+        // sym-INT4 weight constants into CascadiaInt4Gemv op members so the
+        // plugin compile below never repacks them into a resident copy.
+        auto model = handle->core.read_model(std::string(model_xml_path));
+        const uint32_t offloaded = cascadia_gemv::offload_int4_gemv(handle->core, model);
+        if (out_offloaded) *out_offloaded = offloaded;
+        auto compiled = handle->core.compile_model(model, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_compile_gemv_offload"); return 1;
+    }
+}
 
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) {
