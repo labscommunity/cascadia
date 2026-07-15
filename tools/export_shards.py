@@ -1497,6 +1497,15 @@ def export_single_stage(
     # 9. Save.
     stage_dir = os.path.join(output_dir, f"stage_{stage_idx}")
     os.makedirs(stage_dir, exist_ok=True)
+    # Remove any prefill variant from a previous export of this stage dir
+    # up front: re-exporting without --static-prefill-seq (or with different
+    # static dims) must not leave a stale, shape-mismatched variant beside a
+    # fresh decode IR (step 9b re-emits it when requested).
+    for stale in ("openvino_prefill_model.xml", "openvino_prefill_model.bin"):
+        stale_path = os.path.join(stage_dir, stale)
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+            print(f"  removed stale {stale}", flush=True)
     xml_path = os.path.join(stage_dir, "openvino_model.xml")
     print("  Saving model...", flush=True)
     ov.save_model(ov_model, xml_path, compress_to_fp16=True)
@@ -1512,6 +1521,11 @@ def export_single_stage(
     # StaticKv). Reshaping static->static reuses the exact shape-propagation
     # path the seq=1 pin already exercised; one trace + one NNCF pass covers
     # both variants (costs a second .bin on disk).
+    #
+    # ORDERING: the reshape mutates ov_model IN PLACE (a clone would double
+    # peak export RAM for large stages), so the seq=1 save above MUST stay
+    # before this block, and nothing below may serialize ov_model expecting
+    # seq=1. Add post-processing above this line, not after it.
     static_prefill_context = 0
     if npu and static_prefill_seq and static_prefill_seq > 1:
         c = static_prefill_seq
@@ -1780,8 +1794,9 @@ def main():
 
     # The NPU runtime decodes one token per step and derives past-KV length as
     # static_context - 1, so reject configs it cannot load (fail fast — the
-    # export takes minutes). chunked prefill (static_seq > 1) is not yet wired
-    # into the runtime.
+    # export takes minutes). Chunked prefill is wired via a SEPARATE seq=N
+    # variant (--static-prefill-seq, step 9b), not by widening static_seq:
+    # the decode model stays seq=1.
     if args.target == "npu":
         if args.static_seq != 1:
             parser.error(
