@@ -104,13 +104,24 @@ release build, 2026-07-14. Every row produced token-identical output
 | tokenwise `[NPU]` (old static path) | 1279.6 ms | 24.74 | 1.2× |
 | chunked `[NPU]` (all-NPU) | 203.1 ms | 21.49 | 7.6× |
 
-**Long prompt (~435 tokens → 7 chunks), CPU decode:**
+**Long prompt (~435 tokens → 7 chunks), CPU decode** (post-review-fix run —
+the skip-unused-logits + buffer-reuse fixes cut hybrid TTFT a further ~27%):
 
 | Config | TTFT | Decode tok/s | TTFT vs tokenwise |
 |---|---|---|---|
-| tokenwise `[CPU]` | 22,628 ms | 18.95 | 1× |
-| chunked `[CPU]` | 1,929 ms | 18.30 | 11.7× |
-| **hybrid `[NPU prefill + CPU decode]`** | **942 ms** | 18.76 | **24.0×** |
+| tokenwise `[CPU]` | 22,923 ms | 18.89 | 1× |
+| chunked `[CPU]` | 1,629 ms | 19.12 | 14.1× |
+| **hybrid `[NPU prefill + CPU decode]`** | **687 ms** | 18.80 | **33.4×** |
+
+**Over-window prompt (~1200 tokens > the 1023-slot window)** — the parity-cap
+regime: the first 1023 rows chunk, the ~177-token tail steps tokenwise, and
+all three configs stay token-identical (this leg diverged before the cap):
+
+| Config | TTFT | Decode tok/s | TTFT vs tokenwise |
+|---|---|---|---|
+| tokenwise `[CPU]` | 63,782 ms | 18.02 | 1× |
+| chunked `[CPU]` | 13,521 ms | 17.59 | 4.7× |
+| **hybrid `[NPU prefill + CPU decode]`** | **11,045 ms** | 17.91 | **5.8×** |
 
 Free RAM on the box moved 26.4 → 26.3 GB across a full three-leg run —
 the 1B model's two variants cost ~1.3 GB resident plus transients.
@@ -119,10 +130,12 @@ the 1B model's two variants cost ~1.3 GB resident plus transients.
 `--device CPU --prefill-device NPU`):** chunked `[1, r, hidden]` frames +
 position frames crossing the wire, each stage's NPU prefill absorbing into
 its own ring. 40-token prompt through `/v1/chat/completions`: warm request
-end-to-end 0.51 s with `prefill_ms=132`, decode 18.5 tok/s, correct greedy
-output, clean teardown. (A pipeline's first-ever request can additionally
-wait on downstream stages still finishing their one-time NPU compile —
-health reflects stage 0 only; subsequent requests are steady-state.)
+end-to-end 0.48 s with `prefill_ms=109`, decode ~19 tok/s, correct greedy
+output, clean teardown. Warmup now exercises both compiled models on every
+stage (including relays), so the first request no longer pays one-time NPU
+graph init (0.69 s vs 0.88 s pre-fix; a cold pipeline's first request can
+still wait on downstream stages' one-time model COMPILE — health reflects
+stage 0 only).
 
 ## What the numbers say
 
