@@ -1,7 +1,8 @@
 # Hybrid NPU+CPU execution — chunked prefill on one device, decode on another
 
-**Status:** shipped behind `--prefill-device` / `--static-prefill-seq` (PR TBD).
-TCP/static-path only (`--engine ov-runtime`, `--target npu` exports).
+**Status:** shipped behind `--prefill-device` / `--static-prefill-seq`
+([PR #107](https://github.com/labscommunity/cascadia/pull/107)).
+Static-path only (`--engine ov-runtime`, `--target npu` exports).
 
 ## What this is
 
