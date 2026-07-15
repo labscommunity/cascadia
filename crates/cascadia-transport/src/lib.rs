@@ -210,13 +210,18 @@ pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor,
 }
 
 /// A PREFILL reply is owed only after every remaining downstream stage has
-/// run whole-prompt inference sequentially — the wait scales with prompt
-/// length × pipeline depth, not with a single frame transfer (which is what
-/// the base recv timeout was sized for). Budget: this factor × the base
-/// recv timeout, sized to comfortably cover whole-prompt compute across the
-/// deepest pipelines we run; decode replies (sub-second when healthy) keep
-/// the strict [`recv_tensor_reply`] deadline so wedge eviction stays fast
-/// where it matters.
+/// run multi-token inference sequentially — a stateful stage's whole prompt,
+/// or one prefill CHUNK on the static chunked path (≤ the export's
+/// `--static-prefill-seq` tokens per wait, several waits per long prompt) —
+/// so the wait scales with tokens-per-frame × pipeline depth, not with a
+/// single frame transfer (which is what the base recv timeout was sized
+/// for). Budget: this factor × the base recv timeout, sized to comfortably
+/// cover the WORST case (whole-prompt stateful compute across the deepest
+/// pipelines we run; per-chunk static waits are strictly smaller — do not
+/// shrink this factor to a per-chunk bound, the stateful path still needs
+/// it). Decode replies (sub-second when healthy) keep the strict
+/// [`recv_tensor_reply`] deadline so wedge eviction stays fast where it
+/// matters.
 pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
 
 /// [`recv_tensor_reply`] with the widened prefill budget. Use for the token

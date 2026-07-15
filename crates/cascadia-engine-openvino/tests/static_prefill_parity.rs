@@ -129,6 +129,23 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
+    // Guard against a vacuous pass: without a chunked-prefill variant, the
+    // "chunked" and "hybrid" runs silently take the identical tokenwise path
+    // and the parity assertions prove nothing. Require the export to
+    // advertise one before proceeding.
+    let stage_cfg: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(std::path::Path::new(&shards).join("stage_0/stage_config.json"))
+            .expect("read stage_0/stage_config.json"),
+    )
+    .expect("parse stage_config.json");
+    let pseq = stage_cfg["static_prefill_seq"].as_u64().unwrap_or(0);
+    assert!(
+        pseq >= 2,
+        "CASCADIA_STATIC_SHARDS export has no chunked-prefill variant \
+         (static_prefill_seq={pseq}) — the chunked/hybrid legs would pass vacuously. \
+         Re-export with --static-prefill-seq N."
+    );
+
     // Baseline: legacy one-token-per-step static prefill on the decode device.
     let base = run_once(&shards, &device, None, true, &prompt, max_new).await;
     report(&format!("tokenwise [{device}]"), &base);
