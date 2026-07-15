@@ -152,10 +152,27 @@ health reflects stage 0 only; subsequent requests are steady-state.)
   state, which cannot be shared across two compiled models without new FFI
   (`VariableState::set_state`) — so no stateful phase split yet.
 - Greedy sampling only (inherited from the static path).
-- Chunk width ≤ `static_context − 1`; the sliding-window semantics under
-  prompt overflow match the seq=1 path (unit-tested equivalence).
+- Chunks are capped at the KV window: only rows whose absolute position stays
+  ≤ `static_context − 1` run chunked; an over-window prompt tail steps
+  tokenwise through the decode model (a chunk-wide mask cannot express
+  per-token eviction), keeping chunked output token-identical to the seq=1
+  path in every regime. So the chunked speedup applies to the first
+  `static_context − 1` prompt tokens — size `--static-context` to your
+  prompts.
+- Very short prompts (≲ C/8 tokens) may not gain: they pay one padded C-wide
+  forward (incl. C vocab projections on head stages) versus a handful of
+  cheap seq=1 steps. Measured 31-token prompts still won 5.8–7.7×; a
+  3-token prompt may not. `--no-chunked-prefill` is the lever if a workload
+  is dominated by tiny prompts.
 - Heterogeneous pipelines degrade gracefully: a stage without the prefill
-  variant consumes incoming chunks token-by-token (correct, just unamortized).
+  variant consumes incoming chunks token-by-token (correct, just
+  unamortized), and a stage with a NARROWER window than an upstream sender
+  sub-chunks the incoming frame instead of erroring.
+- `profile-stages` counts both IR variants' bytes into a stage's memory —
+  accurate for the default single-device chunked runtime (both models
+  resident), conservative (over-counted) for `--no-chunked-prefill` or the
+  hybrid split; the placement pipeline does not yet model the phase split at
+  all (see follow-ups).
 - Follow-ups: phase-aware placement (per-device prefill_ms + decode_ms in
   `profile-stages`, two-device assignments in `place`), zero-copy shim
   tensors (4 KB-aligned host buffers import into Level-Zero on UMA),

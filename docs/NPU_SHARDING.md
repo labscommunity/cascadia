@@ -90,12 +90,19 @@ DRAM and (multi-stage) round-trips the whole pipeline.
 ### Chunked prefill + the NPU+CPU phase split
 
 When the export ships the `--static-prefill-seq C` variant, the engine compiles
-it as a **second model** and consumes the prompt `C` tokens per forward:
+it as a **second model** and consumes the prompt up to `C` tokens per forward:
 weights stream once per chunk instead of once per token (~`C`× less prefill
 weight traffic), and prefill becomes wide, compute-bound matmuls instead of `C`
 GEMVs. Pad handling: the tail chunk is padded to `C`; pad queries are masked,
 their outputs discarded, their KV never absorbed (`write_prefill_mask` /
-`absorb_layer_multi` — unit-tested byte-equivalent to the sequential path).
+`absorb_layer_multi` — ring-state unit-tested byte-equivalent to the
+sequential path). **Chunks are capped at the KV window** (`chunk_take`): a
+single chunk-wide mask cannot express the per-token eviction the seq=1
+sliding window performs, so any prompt tail whose rows would sit past
+position `static_context − 1` steps one token at a time through the decode
+model. Chunked output is therefore token-identical to the tokenwise path in
+every regime, including prompts longer than the window (which degrade to the
+same warned sliding-window behavior either way).
 
 The prefill variant compiles on **`--prefill-device`** when given — this is the
 hybrid split (see `docs/perf/HYBRID_NPU_CPU.md`):
