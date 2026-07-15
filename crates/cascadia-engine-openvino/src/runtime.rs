@@ -1553,7 +1553,11 @@ impl OvRuntimeEngine {
         };
         let hid = if use_hidden {
             let row = real * per_tok;
-            let h = if row == 0 { 0 } else { in_bytes_real.len() / row };
+            let h = if row == 0 {
+                0
+            } else {
+                in_bytes_real.len() / row
+            };
             if h == 0 || in_bytes_real.len() != row * h {
                 return Err(EngineError::Backend(format!(
                     "chunk hidden bytes {} not divisible by {real} rows",
