@@ -92,6 +92,12 @@ async fn run_tasks(
     if let Some(pd) = prefill_device {
         builder = builder.with_prefill_device(pd);
     }
+    // CASCADIA_OV_CACHE: compiled-blob cache dir. Load-bearing for the
+    // parking leg — without it a parked model's reload is a full cold
+    // compile (~minutes on NPU) instead of a cache import.
+    if let Ok(cache) = std::env::var("CASCADIA_OV_CACHE") {
+        builder = builder.with_cache_dir(cache);
+    }
     builder
         .connect(PeerLayout::single_stage())
         .await

@@ -2589,6 +2589,13 @@ impl Builder for OvRuntimeBuilder {
                     EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
                 })?;
             self.prefill_runtime = Some(prt);
+            if self.park_prefill && self.cache_dir.is_none() {
+                warn!(
+                    "--park-prefill without --ov-cache-dir: every reload is a full \
+                     cold compile (measured ~minutes on NPU) instead of a blob-cache \
+                     import — set --ov-cache-dir"
+                );
+            }
             // Everything a parked model needs to come back (--park-prefill);
             // the PREFILL device's plugin entries so a reload both hits the
             // compile cache and never re-introduces decode-device tuning.
