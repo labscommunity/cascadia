@@ -300,6 +300,29 @@ on-box NPU compile (or move the compile off-box / behind NPUW folding), and
    Yi-9B under memory pressure) never arises single-stage. Measure per
    model; the knobs compose every way.
 
+## Weight residency: `--park-prefill`
+
+The split's structural memory cost is the second resident copy of stage
+weights (each compiled model owns its own device-format copy; OpenVINO has
+no cross-device weight sharing — verified against plugin sources, see
+`docs/rfcs/openvino-inplace-int4-gemv.md`). `--park-prefill` drops the
+prefill CompiledModel after each task's prefill and re-creates it from the
+compile cache at the next prefill, freeing the prefill variant's weights
+between requests (~0.64 GB at 1B; scales with stage size):
+
+```bash
+cascadia worker ... --prefill-device NPU --park-prefill \
+  --ov-cache-dir /path/to/ov-cache   # REQUIRED for parking to make sense
+```
+
+Measured (~435-token prompt, parity asserted across two sequential tasks):
+unparked hybrid TTFT 717 ms; parked tasks 1323 / 1396 ms **with** the blob
+cache; **292 s** without it (a cold NPU recompile — the engine warns if
+parking is enabled with no cache dir). Use it on memory-tight stages; skip
+it where the ~0.7 s TTFT tax outweighs the freed memory. The NPUW
+weights-bank alternative for all-NPU configs was probed and is functionally
+viable but memory-unproven (`experiments/npuw-bank-probe/NOTES.md`).
+
 ## Constraints & follow-ups
 
 - Static path only. The stateful (`cpu-gpu`) path keeps KV inside OpenVINO
