@@ -124,20 +124,35 @@ int32_t dot_group_vnni(const uint8_t* gw, const int8_t* qa, size_t gsize) {
     const __m128i xor8 = _mm_set1_epi8(8);
     const __m128i mask4 = _mm_set1_epi8(0x0F);
     size_t j = 0;
+    for (; j + 32 <= gsize / 2; j += 32) {
+        _mm_prefetch(reinterpret_cast<const char*>(gw + j + 128), _MM_HINT_T0);
+        const __m128i raw0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
+        const __m128i raw1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j + 16));
+        const __m128i lo0 = _mm_and_si128(raw0, mask4);
+        const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(raw0, 4), mask4);
+        const __m128i lo1 = _mm_and_si128(raw1, mask4);
+        const __m128i hi1 = _mm_and_si128(_mm_srli_epi16(raw1, 4), mask4);
+        const __m256i w0 = _mm256_set_m128i(
+            _mm_xor_si128(_mm_unpackhi_epi8(lo0, hi0), xor8),
+            _mm_xor_si128(_mm_unpacklo_epi8(lo0, hi0), xor8));
+        const __m256i w1 = _mm256_set_m128i(
+            _mm_xor_si128(_mm_unpackhi_epi8(lo1, hi1), xor8),
+            _mm_xor_si128(_mm_unpacklo_epi8(lo1, hi1), xor8));
+        acc0 = _mm256_dpbusd_avx_epi32(
+            acc0, w0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa + 2 * j)));
+        acc1 = _mm256_dpbusd_avx_epi32(
+            acc1, w1,
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa + 2 * j + 32)));
+    }
     for (; j + 16 <= gsize / 2; j += 16) {
         const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
         const __m128i lo = _mm_and_si128(raw, mask4);
         const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
-        const __m128i a = _mm_xor_si128(_mm_unpacklo_epi8(lo, hi), xor8);
-        const __m128i b = _mm_xor_si128(_mm_unpackhi_epi8(lo, hi), xor8);
-        const __m256i w = _mm256_set_m128i(b, a);  // 32 u8 weights, in order
-        const __m256i q =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa + 2 * j));
-        if ((j / 16) & 1) {
-            acc1 = _mm256_dpbusd_avx_epi32(acc1, w, q);
-        } else {
-            acc0 = _mm256_dpbusd_avx_epi32(acc0, w, q);
-        }
+        const __m256i w = _mm256_set_m128i(
+            _mm_xor_si128(_mm_unpackhi_epi8(lo, hi), xor8),
+            _mm_xor_si128(_mm_unpacklo_epi8(lo, hi), xor8));
+        acc0 = _mm256_dpbusd_avx_epi32(
+            acc0, w, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa + 2 * j)));
     }
     __m256i acc = _mm256_add_epi32(acc0, acc1);
     __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
@@ -153,30 +168,23 @@ int32_t dot_group_vnni(const uint8_t* gw, const int8_t* qa, size_t gsize) {
     return dot;
 }
 
-// AVX2 grouped sym-INT4 dot. Nibble decode via (x ^ 8) - 8 sign trick;
-// _mm_unpacklo/hi_epi8(lo, hi) restores the low-nibble-first element order
-// for free. FOUR independent accumulator chains: a single accumulator
-// serializes on FMA latency (~4-5 cycles) and was the dominant kernel stall;
-// with group_size=128 (64 packed bytes) a group is exactly one unrolled
-// iteration.
-static inline __m256 dot16_lo(const __m128i raw, const __m128i mask4, const __m128i bias,
-                              const float* base, __m256 acc, __m256 acc2, __m256* acc2_out) {
-    const __m128i lo = _mm_and_si128(raw, mask4);
-    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
-    __m128i a = _mm_unpacklo_epi8(lo, hi);
-    __m128i b = _mm_unpackhi_epi8(lo, hi);
-    a = _mm_sub_epi8(_mm_xor_si128(a, bias), bias);
-    b = _mm_sub_epi8(_mm_xor_si128(b, bias), bias);
-    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(a)),
-                          _mm256_loadu_ps(base + 0), acc);
-    acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(a, 8))),
-                           _mm256_loadu_ps(base + 8), acc2);
-    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)),
-                          _mm256_loadu_ps(base + 16), acc);
-    acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b, 8))),
-                           _mm256_loadu_ps(base + 24), acc2);
-    *acc2_out = acc2;
-    return acc;
+// AVX2 grouped sym-INT4 dots — FLAT loops, no helper calls: MSVC refuses
+// to inline SIMD helpers taking/returning __m256 by value and spills vector
+// registers to stack per 16-byte step, capping a core at ~5.7 GB/s (the
+// measured wall that VNNI, fusion, and 2-row blocking all failed to move).
+// Nibble decode via (x ^ 8) - 8; unpacklo/hi restores low-first order.
+
+#if defined(_MSC_VER)
+#define CASCADIA_INLINE __forceinline
+#else
+#define CASCADIA_INLINE inline __attribute__((always_inline))
+#endif
+
+CASCADIA_INLINE float hsum8(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
 }
 
 float dot_group_avx2(const uint8_t* gw, const float* ga, size_t gsize) {
@@ -187,21 +195,28 @@ float dot_group_avx2(const uint8_t* gw, const float* ga, size_t gsize) {
     const __m128i mask4 = _mm_set1_epi8(0x0F);
     const __m128i bias = _mm_set1_epi8(8);
     size_t j = 0;
-    for (; j + 32 <= gsize / 2; j += 32) {
-        const __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
-        const __m128i r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j + 16));
-        acc0 = dot16_lo(r0, mask4, bias, ga + 2 * j, acc0, acc1, &acc1);
-        acc2 = dot16_lo(r1, mask4, bias, ga + 2 * j + 32, acc2, acc3, &acc3);
-    }
     for (; j + 16 <= gsize / 2; j += 16) {
-        const __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
-        acc0 = dot16_lo(r0, mask4, bias, ga + 2 * j, acc0, acc1, &acc1);
+        _mm_prefetch(reinterpret_cast<const char*>(gw + j + 128), _MM_HINT_T0);
+        const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
+        const __m128i lo = _mm_and_si128(raw, mask4);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
+        __m128i a = _mm_unpacklo_epi8(lo, hi);
+        __m128i b = _mm_unpackhi_epi8(lo, hi);
+        a = _mm_sub_epi8(_mm_xor_si128(a, bias), bias);
+        b = _mm_sub_epi8(_mm_xor_si128(b, bias), bias);
+        const float* base = ga + 2 * j;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(a)),
+                               _mm256_loadu_ps(base + 0), acc0);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(a, 8))),
+            _mm256_loadu_ps(base + 8), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)),
+                               _mm256_loadu_ps(base + 16), acc2);
+        acc3 = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b, 8))),
+            _mm256_loadu_ps(base + 24), acc3);
     }
-    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-    s = _mm_hadd_ps(s, s);
-    s = _mm_hadd_ps(s, s);
-    float dot = _mm_cvtss_f32(s);
+    float dot = hsum8(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
     for (; j < gsize / 2; ++j) {
         const uint8_t v = gw[j];
         const int lo = static_cast<int8_t>(static_cast<uint8_t>(v << 4)) >> 4;
@@ -210,6 +225,62 @@ float dot_group_avx2(const uint8_t* gw, const float* ga, size_t gsize) {
         dot += static_cast<float>(hi) * ga[2 * j + 1];
     }
     return dot;
+}
+
+// Two rows per pass against one activation read; fully flat.
+void dot_group_avx2_x2(const uint8_t* gw0, const uint8_t* gw1, const float* ga, size_t gsize,
+                       float* d0, float* d1) {
+    __m256 r0a = _mm256_setzero_ps(), r0b = _mm256_setzero_ps();
+    __m256 r1a = _mm256_setzero_ps(), r1b = _mm256_setzero_ps();
+    const __m128i mask4 = _mm_set1_epi8(0x0F);
+    const __m128i bias = _mm_set1_epi8(8);
+    size_t j = 0;
+    for (; j + 16 <= gsize / 2; j += 16) {
+        _mm_prefetch(reinterpret_cast<const char*>(gw0 + j + 128), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(gw1 + j + 128), _MM_HINT_T0);
+        const float* base = ga + 2 * j;
+        const __m256 v0 = _mm256_loadu_ps(base + 0);
+        const __m256 v1 = _mm256_loadu_ps(base + 8);
+        const __m256 v2 = _mm256_loadu_ps(base + 16);
+        const __m256 v3 = _mm256_loadu_ps(base + 24);
+
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw0 + j));
+        __m128i l0 = _mm_and_si128(q0, mask4);
+        __m128i h0 = _mm_and_si128(_mm_srli_epi16(q0, 4), mask4);
+        __m128i a0 = _mm_sub_epi8(_mm_xor_si128(_mm_unpacklo_epi8(l0, h0), bias), bias);
+        __m128i b0 = _mm_sub_epi8(_mm_xor_si128(_mm_unpackhi_epi8(l0, h0), bias), bias);
+        r0a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(a0)), v0, r0a);
+        r0b = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(a0, 8))), v1, r0b);
+        r0a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), v2, r0a);
+        r0b = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0, 8))), v3, r0b);
+
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw1 + j));
+        __m128i l1 = _mm_and_si128(q1, mask4);
+        __m128i h1 = _mm_and_si128(_mm_srli_epi16(q1, 4), mask4);
+        __m128i a1 = _mm_sub_epi8(_mm_xor_si128(_mm_unpacklo_epi8(l1, h1), bias), bias);
+        __m128i b1 = _mm_sub_epi8(_mm_xor_si128(_mm_unpackhi_epi8(l1, h1), bias), bias);
+        r1a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(a1)), v0, r1a);
+        r1b = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(a1, 8))), v1, r1b);
+        r1a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), v2, r1a);
+        r1b = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1, 8))), v3, r1b);
+    }
+    float f0 = hsum8(_mm256_add_ps(r0a, r0b));
+    float f1 = hsum8(_mm256_add_ps(r1a, r1b));
+    for (; j < gsize / 2; ++j) {
+        const uint8_t v0 = gw0[j], v1 = gw1[j];
+        f0 += static_cast<float>(static_cast<int8_t>(static_cast<uint8_t>(v0 << 4)) >> 4) *
+                  ga[2 * j] +
+              static_cast<float>(static_cast<int8_t>(v0) >> 4) * ga[2 * j + 1];
+        f1 += static_cast<float>(static_cast<int8_t>(static_cast<uint8_t>(v1 << 4)) >> 4) *
+                  ga[2 * j] +
+              static_cast<float>(static_cast<int8_t>(v1) >> 4) * ga[2 * j + 1];
+    }
+    *d0 = f0;
+    *d1 = f1;
 }
 #endif  // CASCADIA_GEMV_X86
 
@@ -403,11 +474,43 @@ public:
                     q_sum[gi] = sum;
                 }
             }
+            const auto emit = [&](size_t row, float acc) {
+                if (out_f16) {
+                    out16[r * n + row] = ov::float16(acc);
+                } else {
+                    out32[r * n + row] = acc;
+                }
+            };
             const std::function<void(size_t, size_t)> rows_fn = [&](size_t rb, size_t re) {
                 size_t si = 0;
                 while (segp[si].end <= rb) ++si;
-                for (size_t row = rb; row < re; ++row) {
+                size_t row = rb;
+                while (row < re) {
                     while (segp[si].end <= row) ++si;
+#ifdef CASCADIA_GEMV_X86
+                    // Fast path: TWO rows of the same segment per pass — one
+                    // activation read feeds both weight streams (see
+                    // dot_group_avx2_x2). f32 path only; VNNI keeps 1-row.
+                    if (use_avx2 && !use_vnni && row + 1 < re && row + 1 < segp[si].end) {
+                        const size_t local = row - segp[si].start;
+                        const uint8_t* w0 = segp[si].w + local * (k / 2);
+                        const uint8_t* w1 = w0 + (k / 2);
+                        const ov::float16* s0 = segp[si].s + local * groups;
+                        const ov::float16* s1 = s0 + groups;
+                        float acc0 = 0.f, acc1 = 0.f;
+                        for (size_t gi = 0; gi < groups; ++gi) {
+                            float d0, d1;
+                            dot_group_avx2_x2(w0 + gi * (gsize / 2), w1 + gi * (gsize / 2),
+                                              a + gi * gsize, gsize, &d0, &d1);
+                            acc0 += static_cast<float>(s0[gi]) * d0;
+                            acc1 += static_cast<float>(s1[gi]) * d1;
+                        }
+                        emit(row, acc0);
+                        emit(row + 1, acc1);
+                        row += 2;
+                        continue;
+                    }
+#endif
                     const size_t local = row - segp[si].start;
                     const uint8_t* wrow = segp[si].w + local * (k / 2);
                     const ov::float16* srow = segp[si].s + local * groups;
@@ -438,11 +541,8 @@ public:
                         }
                         acc += static_cast<float>(srow[gi]) * dot;
                     }
-                    if (out_f16) {
-                        out16[r * n + row] = ov::float16(acc);
-                    } else {
-                        out32[r * n + row] = acc;
-                    }
+                    emit(row, acc);
+                    ++row;
                 }
             };
             if (sequential) {

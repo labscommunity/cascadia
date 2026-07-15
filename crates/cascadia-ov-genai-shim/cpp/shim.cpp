@@ -558,6 +558,36 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     }
 }
 
+int32_t cascadia_runtime_profiling(
+    cascadia_runtime_t* handle, char* out_buf, size_t buf_cap, size_t* out_len) {
+    if (!handle || !handle->request || !out_buf || !out_len) {
+        set_last_error("null arg in runtime_profiling"); return 1;
+    }
+    try {
+        std::string acc;
+        for (const auto& pi : handle->request->get_profiling_info()) {
+            acc += pi.node_name;
+            acc += '\t';
+            acc += pi.node_type;
+            acc += '\t';
+            acc += pi.exec_type;
+            acc += '\t';
+            acc += std::to_string(pi.real_time.count());
+            acc += '\t';
+            acc += std::to_string(pi.cpu_time.count());
+            acc += '\n';
+        }
+        const size_t len = acc.size() < buf_cap ? acc.size() : buf_cap;
+        std::memcpy(out_buf, acc.data(), len);
+        *out_len = len;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_profiling"); return 1;
+    }
+}
+
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle) {
     return handle ? handle->input_names.size() : 0;
 }

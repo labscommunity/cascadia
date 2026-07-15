@@ -164,6 +164,13 @@ int32_t cascadia_runtime_compile_gemv_offload(
     uint32_t* out_offloaded,
     cascadia_runtime_t** out_handle);
 
+/// Serialize the last inference's per-node profiling info (requires the
+/// model to have been compiled with the PERF_COUNT=YES plugin property) as
+/// TSV lines "node_name\tnode_type\texec_type\treal_us\tcpu_us\n" into
+/// `out_buf` (truncating at `buf_cap`); `out_len` receives the byte count.
+int32_t cascadia_runtime_profiling(
+    cascadia_runtime_t* handle, char* out_buf, size_t buf_cap, size_t* out_len);
+
 /// Reset stateful KV-cache nodes to their initial value. No-op on
 /// stateless models.
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);

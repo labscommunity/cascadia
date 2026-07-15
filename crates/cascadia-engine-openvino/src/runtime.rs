@@ -1597,6 +1597,9 @@ impl OvRuntimeEngine {
                 other_ms,
                 "ov-runtime task done"
             );
+            if std::env::var("CASCADIA_PERF_DUMP").is_ok_and(|v| v == "1") {
+                dump_decode_profile(&self.runtime);
+            }
             self.active = None;
         }
 
@@ -2126,6 +2129,62 @@ impl Engine for OvRuntimeEngine {
             // prefill completes.
             self.park_prefill_model();
         }
+    }
+}
+
+/// CASCADIA_PERF_DUMP=1 (spike diagnostics): after a task finishes, print an
+/// aggregated per-node profile of the decode model's LAST inference — one
+/// representative decode token. Needs the model compiled with PERF_COUNT=YES
+/// (pass it via the plugin properties). Times inflate under profiling; use
+/// for ATTRIBUTION between node kinds, not absolute tok/s math.
+fn dump_decode_profile(runtime: &OvRuntime) {
+    let raw = match runtime.profiling() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("perf-dump unavailable: {e} (compile with PERF_COUNT=YES)");
+            return;
+        }
+    };
+    let mut by_type: std::collections::HashMap<String, (u64, u64, u32)> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<(String, String, u64)> = Vec::new();
+    let mut total_us = 0u64;
+    for line in raw.lines() {
+        let mut it = line.split('\t');
+        let (name, ntype, etype, real) = (
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+            it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        );
+        let cpu = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        total_us += real;
+        let e = by_type.entry(ntype.to_string()).or_default();
+        e.0 += real;
+        e.1 += cpu;
+        e.2 += 1;
+        if real > 0 {
+            nodes.push((name.to_string(), format!("{ntype}/{etype}"), real));
+        }
+    }
+    let mut rows: Vec<_> = by_type.into_iter().collect();
+    rows.sort_by_key(|(_, (real, _, _))| std::cmp::Reverse(*real));
+    eprintln!("perf-dump: decode-infer total {total_us} us by node type:");
+    for (ntype, (real, cpu, count)) in rows.iter().take(14) {
+        eprintln!("  {ntype:<28} real {real:>8} us  cpu {cpu:>8} us  x{count}");
+    }
+    nodes.sort_by_key(|(_, _, real)| std::cmp::Reverse(*real));
+    eprintln!("perf-dump: top nodes:");
+    for (name, kind, real) in nodes.iter().take(10) {
+        let short: String = name
+            .chars()
+            .rev()
+            .take(48)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .collect();
+        eprintln!("  {real:>8} us  {kind:<28} ...{short}");
     }
 }
 

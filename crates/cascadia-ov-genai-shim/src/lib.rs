@@ -168,6 +168,12 @@ mod sys {
 
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
+        pub fn cascadia_runtime_profiling(
+            handle: *mut cascadia_runtime_t,
+            out_buf: *mut c_char,
+            buf_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
 
         pub fn cascadia_runtime_input_count(handle: *mut cascadia_runtime_t) -> usize;
         pub fn cascadia_runtime_output_count(handle: *mut cascadia_runtime_t) -> usize;
@@ -699,6 +705,32 @@ impl Runtime {
             return Err(Error::Native(last_native_error()));
         }
         Ok((Self { handle }, offloaded))
+    }
+
+    /// Per-node profiling of the last inference as TSV lines
+    /// `node_name\tnode_type\texec_type\treal_us\tcpu_us` — requires the
+    /// model compiled with the `PERF_COUNT=YES` plugin property.
+    pub fn profiling(&self) -> Result<String> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        {
+            let mut buf = vec![0u8; 1 << 20];
+            let mut len: usize = 0;
+            let rc = unsafe {
+                sys::cascadia_runtime_profiling(
+                    self.handle,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                    &mut len,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            buf.truncate(len);
+            String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+        }
     }
 
     pub fn reset_state(&mut self) -> Result<()> {
