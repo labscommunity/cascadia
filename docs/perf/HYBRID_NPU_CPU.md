@@ -114,6 +114,15 @@ release build, 2026-07-14. Every row produced token-identical output
 Free RAM on the box moved 26.4 → 26.3 GB across a full three-leg run —
 the 1B model's two variants cost ~1.3 GB resident plus transients.
 
+**2-stage pipeline smoke (same box, loopback, both stages
+`--device CPU --prefill-device NPU`):** chunked `[1, r, hidden]` frames +
+position frames crossing the wire, each stage's NPU prefill absorbing into
+its own ring. 40-token prompt through `/v1/chat/completions`: warm request
+end-to-end 0.51 s with `prefill_ms=132`, decode 18.5 tok/s, correct greedy
+output, clean teardown. (A pipeline's first-ever request can additionally
+wait on downstream stages still finishing their one-time NPU compile —
+health reflects stage 0 only; subsequent requests are steady-state.)
+
 ## What the numbers say
 
 1. **Chunked prefill is the first-order win** (5.8–11.7× TTFT on a single
