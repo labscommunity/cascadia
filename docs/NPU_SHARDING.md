@@ -23,10 +23,10 @@ the host at runtime.
 
 ## Half 1 — Export: static, stateless, per-stage IRs
 
-`cascadia shard --target npu` emits one IR per stage (the CLI forwards
-`--target` / `--static-seq` / `--static-context` to the bundled exporter, which
-needs `torch`, `transformers`, `nncf`, `safetensors`,
-`openvino`). Per stage (`export_shards.py` sections 5-10, ~lines 1348-1538):
+`cascadia shard --target npu` emits one IR per stage — the CLI forwards
+`--target` / `--static-seq` / `--static-context` / `--static-prefill-seq` to the
+bundled `export_shards.py` (which needs `torch`, `transformers`, `nncf`,
+`safetensors`, `openvino`). Per stage (`export_shards.py` sections 5-10):
 
 - **Layer split.** Stage 0 owns the embedding + first layer slice
   (`has_embed = true`); the last stage owns the final layers + LM head
@@ -55,6 +55,16 @@ needs `torch`, `transformers`, `nncf`, `safetensors`,
   `stateful=false, target="npu", static_seq, static_context, layer_start/end,
   has_embed, has_head, num_kv_heads, head_dim, ...`; plus the shared
   `pipeline_config.json` and `tokenizer/`.
+- **Chunked-prefill variant (optional, `--static-prefill-seq C`)**: after the
+  seq=1 decode IR is saved, the same compressed graph is reshaped to a fixed
+  seq=`C` query window with context `(static_context - 1) + C` and saved as
+  `openvino_prefill_model.xml` beside it. The context arithmetic pins the
+  prefill variant's past-KV length to **exactly** the decode variant's
+  (`static_context - 1`), so the two compiled models consume byte-identical
+  `past_key_values.*` tensors and can share one host KV ring at runtime. One
+  trace + one NNCF pass covers both variants; the cost is a second `.bin` on
+  disk. `stage_config.json` records `static_prefill_seq` /
+  `static_prefill_context`.
 
 ## Half 2 — Runtime: a host-side KV ring per stage
 
@@ -73,8 +83,41 @@ left-aligned in `past_len`-slot buffers. Per decoded token:
 4. `absorb_layer()` — copy the new token's K/V from `present[past_len]` into the
    ring: append at `valid`, or slide the window (drop oldest) once full.
 
-`seq=1` means there is no chunked prefill — the prompt is fed one token at a time
-through this same path.
+Without a prefill variant, `seq=1` means the prompt is fed one token at a time
+through this same path — every prompt token streams the full stage weights from
+DRAM and (multi-stage) round-trips the whole pipeline.
+
+### Chunked prefill + the NPU+CPU phase split
+
+When the export ships the `--static-prefill-seq C` variant, the engine compiles
+it as a **second model** and consumes the prompt `C` tokens per forward:
+weights stream once per chunk instead of once per token (~`C`× less prefill
+weight traffic), and prefill becomes wide, compute-bound matmuls instead of `C`
+GEMVs. Pad handling: the tail chunk is padded to `C`; pad queries are masked,
+their outputs discarded, their KV never absorbed (`write_prefill_mask` /
+`absorb_layer_multi` — unit-tested byte-equivalent to the sequential path).
+
+The prefill variant compiles on **`--prefill-device`** when given — this is the
+hybrid split (see `docs/perf/HYBRID_NPU_CPU.md`):
+
+```bash
+cascadia worker --engine ov-runtime --model <static-shard-dir> \
+  --device CPU --prefill-device NPU ...
+```
+
+runs the compute-bound prefill on the NPU (48 peak TOPS on Lunar Lake vs ~5 on
+the CPU cluster) and the bandwidth-bound seq=1 decode on the CPU. Both
+compilations read and write the **same host `StaticKv` ring**, so the
+prefill→decode handoff costs nothing and KV lives once in host DRAM no matter
+which device computed it. Two compiled models do mean **two resident copies of
+the stage weights** (~2× weight RSS when the devices differ) — KV is not
+duplicated. `--no-chunked-prefill` is the escape hatch / A-B baseline knob.
+
+Intel's own NPUW `StaticLLMPipeline` uses the same two-model architecture
+(prefill model + kvcache model, host-side KV copies between them), and AMD
+ships the equivalent split ("prefill … on the NPU … decode … is memory
+intensive") as Ryzen AI hybrid mode — this is that pattern, applied per
+pipeline stage and made device-configurable.
 
 ## The sharding part — keeping pipeline stages in lockstep
 
@@ -115,7 +158,10 @@ issue #41):
 
 - **Context fixed at export time** (`--static-context`, default 1024); usable
   past = `context - 1`. Re-export for a longer window.
-- **`seq=1` only** — one token per forward pass; no chunked prefill yet.
+- **Decode is `seq=1`** — one token per forward pass. Prefill is chunked only
+  when the export ships a `--static-prefill-seq` variant (chunk ≤
+  `static_context - 1`, so a chunk can't evict its own tokens); without one,
+  prefill is token-at-a-time.
 - **FP16 KV** on the ring and the wire; `--default-dtype` must be `fp16` for
   `--target npu`.
 - **batch = 1** (single sequence).
