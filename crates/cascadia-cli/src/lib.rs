@@ -379,6 +379,16 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = false)]
     pub no_chunked_prefill: bool,
 
+    /// Park the chunked-prefill model between prefills (ov-runtime static
+    /// path only): after each task's prefill phase the prefill CompiledModel
+    /// is dropped — freeing its resident stage-weight copy, the structural
+    /// memory cost of the two-model split — and re-created from the compile
+    /// cache at the next prefill. Trades a per-task reload (logged as
+    /// reload_ms) for ~1x steady-state weight residency; for memory-tight
+    /// stages. Composes with --prefill-device.
+    #[arg(long, default_value_t = false)]
+    pub park_prefill: bool,
+
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
     pub draft_model: Option<String>,
@@ -596,6 +606,7 @@ impl WorkerArgs {
             npu_min_response_len: None,
             prefill_device: None,
             no_chunked_prefill: false,
+            park_prefill: false,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -1136,6 +1147,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 b = b.with_prefill_device(dev);
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
+            b = b.with_prefill_parking(args.park_prefill);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1376,17 +1388,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     }
     // Fail loud, not silent: the phase-split flags are load-bearing when
     // given, and only the ov-runtime engine implements them.
-    if (args.prefill_device.is_some() || args.no_chunked_prefill)
+    if (args.prefill_device.is_some() || args.no_chunked_prefill || args.park_prefill)
         && args.engine != EngineKind::OvRuntime
     {
         return Err(anyhow!(
-            "--prefill-device / --no-chunked-prefill require --engine ov-runtime \
-             (the chunked-prefill phase split lives in the static-KV runtime path)"
+            "--prefill-device / --no-chunked-prefill / --park-prefill require \
+             --engine ov-runtime (the chunked-prefill phase split lives in the \
+             static-KV runtime path)"
         ));
     }
-    if args.prefill_device.is_some() && args.no_chunked_prefill {
+    if (args.prefill_device.is_some() || args.park_prefill) && args.no_chunked_prefill {
         return Err(anyhow!(
-            "--prefill-device conflicts with --no-chunked-prefill"
+            "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
     }
     let is_first = args.rank == 0;

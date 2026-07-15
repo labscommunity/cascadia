@@ -57,8 +57,38 @@ async fn run_once(
     prompt: &str,
     max_new: u32,
 ) -> RunOut {
-    let mut builder =
-        OvRuntimeBuilder::new(shards, 0, 1, device).with_chunked_prefill_disabled(disable_chunk);
+    run_tasks(
+        shards,
+        device,
+        prefill_device,
+        disable_chunk,
+        false,
+        prompt,
+        max_new,
+        1,
+    )
+    .await
+    .remove(0)
+}
+
+/// Drive `tasks` sequential generations through one engine instance. With
+/// `park` the prefill model is dropped after each task's prefill and
+/// reloaded on the next — task 2's TTFT includes the reload, which is the
+/// number `--park-prefill` trades for ~1x steady-state weight residency.
+#[allow(clippy::too_many_arguments)]
+async fn run_tasks(
+    shards: &str,
+    device: &str,
+    prefill_device: Option<&str>,
+    disable_chunk: bool,
+    park: bool,
+    prompt: &str,
+    max_new: u32,
+    tasks: usize,
+) -> Vec<RunOut> {
+    let mut builder = OvRuntimeBuilder::new(shards, 0, 1, device)
+        .with_chunked_prefill_disabled(disable_chunk)
+        .with_prefill_parking(park);
     if let Some(pd) = prefill_device {
         builder = builder.with_prefill_device(pd);
     }
@@ -74,36 +104,41 @@ async fn run_once(
     while load.next().await.is_some() {}
     let mut engine = Box::new(builder).build().expect("build");
 
-    let task = GenerationTask::new("static-prefill-parity", prompt).with_max_tokens(max_new);
-    engine.submit(task).expect("submit");
+    let mut outs = Vec::new();
+    for n in 0..tasks {
+        let task = GenerationTask::new(format!("static-prefill-parity-{n}"), prompt)
+            .with_max_tokens(max_new);
+        engine.submit(task).expect("submit");
 
-    let started = Instant::now();
-    let mut ttft = None;
-    let mut ids = Vec::new();
-    let mut text = String::new();
-    loop {
-        let chunks = engine.step().expect("step");
-        let mut done = false;
-        for (_, c) in chunks {
-            if ttft.is_none() {
-                ttft = Some(started.elapsed());
+        let started = Instant::now();
+        let mut ttft = None;
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        loop {
+            let chunks = engine.step().expect("step");
+            let mut done = false;
+            for (_, c) in chunks {
+                if ttft.is_none() {
+                    ttft = Some(started.elapsed());
+                }
+                ids.push(c.token_id);
+                text.push_str(&c.text);
+                if c.is_final {
+                    done = true;
+                }
             }
-            ids.push(c.token_id);
-            text.push_str(&c.text);
-            if c.is_final {
-                done = true;
+            if done {
+                break;
             }
         }
-        if done {
-            break;
-        }
+        outs.push(RunOut {
+            ids,
+            text,
+            ttft: ttft.unwrap_or_default(),
+            total: started.elapsed(),
+        });
     }
-    RunOut {
-        ids,
-        text,
-        ttft: ttft.unwrap_or_default(),
-        total: started.elapsed(),
-    }
+    outs
 }
 
 fn report(name: &str, r: &RunOut) {
@@ -296,5 +331,26 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         );
     } else {
         eprintln!("CASCADIA_PREFILL_DEVICE not set; hybrid leg skipped");
+    }
+
+    // Parking (CASCADIA_PARK=1): two sequential tasks through one engine
+    // with --park-prefill semantics — task 1 parks after prefill, task 2
+    // pays the reload (visible in its TTFT). Both must stay token-identical
+    // to the baseline.
+    if std::env::var("CASCADIA_PARK").is_ok_and(|v| v == "1") {
+        let pd = prefill_device.as_deref();
+        let outs = run_tasks(&shards, &device, pd, false, true, &prompt, max_new, 2).await;
+        let label = pd.unwrap_or(&device).to_string();
+        report(&format!("parked#1  [{label}+{device}]"), &outs[0]);
+        report(&format!("parked#2  [{label}+{device}]"), &outs[1]);
+        for (n, o) in outs.iter().enumerate() {
+            assert_eq!(
+                base.ids, o.ids,
+                "parked task {n} diverged from tokenwise (text: {:?})",
+                o.text
+            );
+        }
+    } else {
+        eprintln!("CASCADIA_PARK not set; parking leg skipped");
     }
 }
