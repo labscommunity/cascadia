@@ -32,6 +32,10 @@
 #endif
 #endif
 
+#ifdef CASCADIA_HAVE_DNNL
+#include <oneapi/dnnl/dnnl.hpp>
+#endif
+
 #include <openvino/core/parallel.hpp>
 #include <openvino/openvino.hpp>
 #include <openvino/op/constant.hpp>
@@ -49,6 +53,30 @@ namespace cascadia_gemv {
 namespace {
 
 using ov::op::v0::Constant;
+
+#ifdef CASCADIA_HAVE_DNNL
+// The endgame path: a dnnl matmul primitive with INT4 weights-decompression
+// executing DIRECTLY over the op's mmapped weight bytes. Our packed-i4
+// [N, K] rows are exactly dnnl's plain `ba` layout for weights dims [K, N]
+// (zero weight copy); only the scales transpose into a small resident
+// [G, N] f16 buffer (~4 MB across a 1B model). fpmath_mode(f16, apply_to_
+// int=true) selects the same weights-decompression brgemm family the OV CPU
+// plugin uses (measured ~51 GB/s vs our loop's ~22). TBB-runtime dnnl build
+// shares the plugin's tbb12, so its threads come from the existing pool.
+struct DnnlSegExec {
+    dnnl::matmul prim;
+    dnnl::memory w_mem, sc_mem, src_mem, dst_mem;
+    size_t out_off = 0;
+    size_t n = 0;
+    std::vector<uint16_t> scales_gn;  // f16 bits, [G, N]
+};
+struct DnnlState {
+    bool ok = false;
+    dnnl::engine eng;
+    dnnl::stream strm;
+    std::vector<DnnlSegExec> segs;
+};
+#endif
 
 // CASCADIA_GEMV_STATS=1: accumulate evaluate() wall time across all op
 // instances and print a summary at process exit — splits kernel time from
@@ -423,6 +451,9 @@ public:
         std::vector<int8_t> act_q;
         std::vector<float> q_scale;
         std::vector<int32_t> q_sum;
+#ifdef CASCADIA_HAVE_DNNL
+        std::vector<float> dnnl_dst;
+#endif
 #ifdef CASCADIA_GEMV_X86
         const bool use_avx2 = cpu_has_avx2_fma();
         // CASCADIA_GEMV_VNNI=1: dynamically-quantized int8 activations via
@@ -449,6 +480,52 @@ public:
                 act_f32[i] = in_f16 ? static_cast<float>(act16[r * k + i]) : act32[r * k + i];
             }
             const float* a = act_f32.data();
+#ifdef CASCADIA_HAVE_DNNL
+            // CASCADIA_GEMV_DNNL=1: run this row through dnnl int4-
+            // decompression matmuls over the SAME mmapped weights. Falls
+            // back permanently to the built-in kernels on any failure.
+            static const bool want_dnnl = [] {
+                const char* v = std::getenv("CASCADIA_GEMV_DNNL");
+                return v && (*v == '1' || *v == '2');
+            }();
+            if (want_dnnl) {
+                auto st = dnnl_state();
+                if (st->ok) {
+                    bool done = true;
+                    try {
+                        if (out_f16) dnnl_dst.resize(n);
+                        for (auto& ex : st->segs) {
+                            ex.src_mem.set_data_handle(
+                                const_cast<float*>(a));
+                            float* dst_ptr = out_f16
+                                                 ? dnnl_dst.data() + ex.out_off
+                                                 : out32 + r * n + ex.out_off;
+                            ex.dst_mem.set_data_handle(dst_ptr);
+                            ex.prim.execute(
+                                st->strm,
+                                {{DNNL_ARG_SRC, ex.src_mem},
+                                 {DNNL_ARG_WEIGHTS, ex.w_mem},
+                                 {DNNL_ARG_DST, ex.dst_mem},
+                                 {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+                                  ex.sc_mem}});
+                        }
+                        st->strm.wait();
+                        if (out_f16) {
+                            for (size_t i = 0; i < n; ++i) {
+                                out16[r * n + i] = ov::float16(dnnl_dst[i]);
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        fprintf(stderr,
+                                "gemv-dnnl: execute failed (%s) — disabling\n",
+                                e.what());
+                        st->ok = false;
+                        done = false;
+                    }
+                    if (done) continue;
+                }
+            }
+#endif
             if (use_vnni) {
                 act_q.resize(k);
                 q_scale.resize(groups);
@@ -573,6 +650,100 @@ public:
     }
 
 private:
+#ifdef CASCADIA_HAVE_DNNL
+    // Lazily-built per executing instance (clones start empty). ok=false
+    // after any failure -> permanent fallback to the built-in kernels.
+    std::shared_ptr<DnnlState> dnnl_state() const {
+        std::lock_guard<std::mutex> lk(m_dnnl_mu);
+        if (m_dnnl) return m_dnnl;
+        auto st = std::make_shared<DnnlState>();
+        try {
+            st->eng = dnnl::engine(dnnl::engine::kind::cpu, 0);
+            st->strm = dnnl::stream(st->eng);
+            const int64_t k = m_k, groups = m_groups, gsize = m_gsize;
+            size_t off = 0;
+            for (const auto& seg : m_segs) {
+                DnnlSegExec ex;
+                ex.n = static_cast<size_t>(seg.n);
+                ex.out_off = off;
+                off += ex.n;
+                // scales [N, G] f16 -> [G, N] (dnnl expects K-groups major)
+                const auto* sc =
+                    static_cast<const uint16_t*>(seg.s->get_data_ptr());
+                ex.scales_gn.resize(static_cast<size_t>(groups) * ex.n);
+                for (size_t n_i = 0; n_i < ex.n; ++n_i) {
+                    for (int64_t g = 0; g < groups; ++g) {
+                        ex.scales_gn[static_cast<size_t>(g) * ex.n + n_i] =
+                            sc[n_i * static_cast<size_t>(groups) +
+                               static_cast<size_t>(g)];
+                    }
+                }
+                using dt = dnnl::memory::data_type;
+                using tag = dnnl::memory::format_tag;
+                // Mode 1 (CASCADIA_GEMV_DNNL=1): weights in OUR plain
+                // ba layout, zero-copy from the mmap. Mode 2 (=2): let dnnl
+                // pick its preferred layout (format_tag::any) and reorder
+                // ONCE into a resident repacked buffer — measures upstream
+                // brgemm's ceiling at the cost of the residency goal.
+                static const bool pick_any = [] {
+                    const char* v = std::getenv("CASCADIA_GEMV_DNNL");
+                    return v && *v == '2';
+                }();
+                dnnl::memory::desc src_md({1, k}, dt::f32, tag::ab);
+                dnnl::memory::desc w_plain({k, static_cast<int64_t>(ex.n)},
+                                           dt::s4, tag::ba);
+                dnnl::memory::desc w_md =
+                    pick_any ? dnnl::memory::desc({k, static_cast<int64_t>(ex.n)},
+                                                  dt::s4, tag::any)
+                             : w_plain;
+                dnnl::memory::desc dst_md({1, static_cast<int64_t>(ex.n)}, dt::f32,
+                                          tag::ab);
+                dnnl::primitive_attr attr;
+                attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+                attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1),
+                                {gsize, 1}, dt::f16);
+                dnnl::matmul::primitive_desc pd(st->eng, src_md, w_md, dst_md,
+                                                attr);
+                ex.prim = dnnl::matmul(pd);
+                if (st->segs.empty()) {
+                    fprintf(stderr, "gemv-dnnl impl: %s (mode %d)\n",
+                            pd.impl_info_str(), pick_any ? 2 : 1);
+                }
+                if (pick_any) {
+                    dnnl::memory plain_mem(
+                        w_plain, st->eng,
+                        const_cast<void*>(seg.w->get_data_ptr()));
+                    ex.w_mem = dnnl::memory(pd.weights_desc(), st->eng);
+                    dnnl::reorder(plain_mem, ex.w_mem)
+                        .execute(st->strm, plain_mem, ex.w_mem);
+                    st->strm.wait();
+                } else {
+                    ex.w_mem = dnnl::memory(
+                        w_md, st->eng,
+                        const_cast<void*>(seg.w->get_data_ptr()));
+                }
+                dnnl::memory::desc sc_md(
+                    {groups, static_cast<int64_t>(ex.n)}, dt::f16, tag::ab);
+                ex.sc_mem = dnnl::memory(sc_md, st->eng, ex.scales_gn.data());
+                ex.src_mem = dnnl::memory(src_md, st->eng, DNNL_MEMORY_NONE);
+                ex.dst_mem = dnnl::memory(dst_md, st->eng, DNNL_MEMORY_NONE);
+                st->segs.push_back(std::move(ex));
+            }
+            st->ok = true;
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                    "gemv-dnnl: primitive creation failed (%s) — falling back "
+                    "to built-in kernels\n",
+                    e.what());
+            st->ok = false;
+            st->segs.clear();
+        }
+        m_dnnl = st;
+        return m_dnnl;
+    }
+    mutable std::shared_ptr<DnnlState> m_dnnl;
+    mutable std::mutex m_dnnl_mu;
+#endif
     std::vector<Segment> m_segs;
     int64_t m_n = 0, m_k = 0, m_groups = 0, m_gsize = 0;
     std::string m_tag;

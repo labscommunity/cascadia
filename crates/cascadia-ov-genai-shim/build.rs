@@ -58,15 +58,29 @@ fn main() {
     let runtime_lib_root = format!("{ov_root}/runtime/lib/intel64");
     let runtime_lib_release = format!("{ov_root}/runtime/lib/intel64/Release");
 
-    cc::Build::new()
+    // Optional oneDNN embedding for the gemv-offload op (the spike's
+    // parity-throughput endgame): point DNNL_DIR at an extracted oneDNN
+    // install (include/ + lib/dnnl.lib + bin/dnnl.dll — use a TBB-runtime
+    // build so dnnl threads share the OV plugin's tbb12). Absent = the op
+    // keeps its own kernels only.
+    let dnnl_dir = std::env::var("DNNL_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
         .std("c++17")
         .file("cpp/shim.cpp")
         .file("cpp/gemv_offload.cpp")
         .include(&runtime_include)
         .include(&genai_include)
-        .include(&tbb_include)
-        .compile("cascadia_ov_genai_shim");
+        .include(&tbb_include);
+    if let Some(d) = &dnnl_dir {
+        build.include(format!("{d}/include"));
+        build.define("CASCADIA_HAVE_DNNL", None);
+    }
+    build.compile("cascadia_ov_genai_shim");
 
     println!("cargo:rustc-link-search=native={runtime_lib_release}");
     println!("cargo:rustc-link-search=native={runtime_lib_root}");
@@ -78,6 +92,11 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=openvino_genai");
     println!("cargo:rustc-link-lib=dylib=openvino");
     println!("cargo:rustc-link-lib=dylib=tbb12");
+    if let Some(d) = &dnnl_dir {
+        println!("cargo:rustc-link-search=native={d}/lib");
+        println!("cargo:rustc-link-lib=dylib=dnnl");
+    }
+    println!("cargo:rerun-if-env-changed=DNNL_DIR");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.h");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");

@@ -77,6 +77,19 @@ steady state for this IR (steady private 0.11 GB; the big private cost is a
 2. eliminate the compile-time private peak for these constants,
 rather than proposing a wholly new no-repack mode.
 
+## Upstream-gap evidence (2026-07-15, second spike round)
+
+Embedding upstream oneDNN 3.12 inside our extension op (matmul with s4
+weights + grouped f16 decompression scales, `fpmath_mode(f16,
+apply_to_int)`) produced numerically correct output but selected `ref:any`
+even with `format_tag::any` — **upstream oneDNN has no optimized kernel for
+this shape at all**. The ~51 GB/s `FullyConnectedCompressed` path measured
+in the CPU plugin therefore lives in the openvinotoolkit/oneDNN fork /
+OV-internal kernels only. This sharpens the ask: the capability exists and
+is Intel-maintained; exposing it (as a documented plugin behavior or via
+upstreaming the kernels) is the only way third parties can reach it without
+forking.
+
 ## Open questions
 
 1. Does oneDNN's `weights_decompression` brgemm path accept an external
