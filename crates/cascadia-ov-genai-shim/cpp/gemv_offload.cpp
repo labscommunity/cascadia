@@ -16,7 +16,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -38,6 +40,7 @@
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/op.hpp>
 #include <openvino/op/reshape.hpp>
+#include <openvino/op/variadic_split.hpp>
 #include <openvino/pass/graph_rewrite.hpp>
 #include <openvino/pass/manager.hpp>
 #include <openvino/pass/pattern/op/wrap_type.hpp>
@@ -220,21 +223,34 @@ public:
 
     CascadiaInt4Gemv() = default;
 
-    CascadiaInt4Gemv(const ov::Output<ov::Node>& act,
-                     std::shared_ptr<Constant> weights_i4,
-                     std::shared_ptr<Constant> scales_f16,
-                     int64_t n, int64_t k, int64_t groups, int64_t group_size,
-                     std::string tag)
+    /// One fused GEMV over `segments` weight/scale pairs sharing the same
+    /// activation and K/groups/group_size — output rows are the segments
+    /// concatenated in order (a VariadicSplit downstream routes them back to
+    /// the original consumers). A single-projection op is the 1-segment case.
+    struct Segment {
+        std::shared_ptr<Constant> w;
+        std::shared_ptr<Constant> s;
+        int64_t n = 0;
+    };
+
+    CascadiaInt4Gemv(const ov::Output<ov::Node>& act, std::vector<Segment> segments,
+                     int64_t k, int64_t groups, int64_t group_size, std::string tag)
         : ov::op::Op({act}),
-          m_w(std::move(weights_i4)),
-          m_s(std::move(scales_f16)),
-          m_n(n),
+          m_segs(std::move(segments)),
           m_k(k),
           m_groups(groups),
           m_gsize(group_size),
           m_tag(std::move(tag)) {
+        m_n = 0;
+        for (const auto& seg : m_segs) m_n += seg.n;
         constructor_validate_and_infer_types();
     }
+
+    const std::vector<Segment>& segments() const { return m_segs; }
+    int64_t k() const { return m_k; }
+    int64_t groups() const { return m_groups; }
+    int64_t group_size() const { return m_gsize; }
+    const std::string& tag() const { return m_tag; }
 
     void validate_and_infer_types() override {
         auto shape = get_input_partial_shape(0);
@@ -253,8 +269,8 @@ public:
     }
 
     std::shared_ptr<ov::Node> clone_with_new_inputs(const ov::OutputVector& args) const override {
-        return std::make_shared<CascadiaInt4Gemv>(args.at(0), m_w, m_s, m_n, m_k, m_groups,
-                                                  m_gsize, m_tag);
+        return std::make_shared<CascadiaInt4Gemv>(args.at(0), m_segs, m_k, m_groups, m_gsize,
+                                                  m_tag);
     }
 
     bool visit_attributes(ov::AttributeVisitor& visitor) override {
@@ -274,7 +290,10 @@ public:
     bool has_evaluate() const override { return true; }
 
     bool evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const override {
-        if (!m_w || !m_s) return false;
+        if (m_segs.empty()) return false;
+        for (const auto& seg : m_segs) {
+            if (!seg.w || !seg.s) return false;
+        }
         auto& stats = GemvStats::get();
         const auto t0 = stats.enabled ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -299,9 +318,28 @@ public:
         auto* out32 = out_f16 ? nullptr : out.data<float>();
 
         // i4 packed two-per-byte, element 0 in the LOW nibble; row-major
-        // [N, G, g] => per-output-row stride k/2 bytes.
-        const auto* wbytes = static_cast<const uint8_t*>(m_w->get_data_ptr());
-        const auto* sc16 = static_cast<const ov::float16*>(m_s->get_data_ptr());
+        // [N, G, g] => per-output-row stride k/2 bytes. Global output row ->
+        // (segment base, local row) via the prefix table below; blocks scan
+        // it linearly (<= a handful of segments).
+        struct SegPtrs {
+            const uint8_t* w;
+            const ov::float16* s;
+            size_t start, end;
+        };
+        std::vector<SegPtrs> segp;
+        segp.reserve(m_segs.size());
+        {
+            size_t off = 0;
+            for (const auto& seg : m_segs) {
+                SegPtrs sp;
+                sp.w = static_cast<const uint8_t*>(seg.w->get_data_ptr());
+                sp.s = static_cast<const ov::float16*>(seg.s->get_data_ptr());
+                sp.start = off;
+                off += static_cast<size_t>(seg.n);
+                sp.end = off;
+                segp.push_back(sp);
+            }
+        }
 
         // Scratch (per-call LOCALS, not thread_local: ov::parallel_for
         // blocks this thread and TBB work-steals other ready tasks onto it —
@@ -366,9 +404,13 @@ public:
                 }
             }
             const std::function<void(size_t, size_t)> rows_fn = [&](size_t rb, size_t re) {
+                size_t si = 0;
+                while (segp[si].end <= rb) ++si;
                 for (size_t row = rb; row < re; ++row) {
-                    const uint8_t* wrow = wbytes + row * (k / 2);
-                    const ov::float16* srow = sc16 + row * groups;
+                    while (segp[si].end <= row) ++si;
+                    const size_t local = row - segp[si].start;
+                    const uint8_t* wrow = segp[si].w + local * (k / 2);
+                    const ov::float16* srow = segp[si].s + local * groups;
                     float acc = 0.f;
                     for (size_t gi = 0; gi < groups; ++gi) {
                         const uint8_t* gw = wrow + gi * (gsize / 2);
@@ -431,8 +473,7 @@ public:
     }
 
 private:
-    std::shared_ptr<Constant> m_w;
-    std::shared_ptr<Constant> m_s;
+    std::vector<Segment> m_segs;
     int64_t m_n = 0, m_k = 0, m_groups = 0, m_gsize = 0;
     std::string m_tag;
 };
@@ -502,9 +543,10 @@ public:
             const auto& act_out = matmul->input_value(0);
             if (act_out.get_element_type() != ov::element::f16) return false;
 
-            auto gemv = std::make_shared<CascadiaInt4Gemv>(act_out, wconst, sconst, n, k,
-                                                           groups, gsize,
-                                                           matmul->get_friendly_name());
+            std::vector<CascadiaInt4Gemv::Segment> segs;
+            segs.push_back({wconst, sconst, n});
+            auto gemv = std::make_shared<CascadiaInt4Gemv>(act_out, std::move(segs), k, groups,
+                                                           gsize, matmul->get_friendly_name());
             gemv->set_friendly_name(matmul->get_friendly_name());
             ov::copy_runtime_info(matmul, gemv);
             ov::replace_node(matmul, gemv);
@@ -529,12 +571,86 @@ public:
 
 }  // namespace
 
+// Stage 2: fuse sibling GEMVs. Ops sharing the SAME activation output and
+// (K, groups, gsize, seq-shape) — a layer's q/k/v, or gate/up — become ONE
+// op whose output rows are the segments concatenated, plus a VariadicSplit
+// routing each slice back to the original consumers. Halves the per-token
+// node count (113 -> ~65 on Llama-1B) and doubles the mean GEMV size, which
+// is what amortizes the measured per-node fork-join floor.
+uint32_t fuse_sibling_gemvs(const std::shared_ptr<ov::Model>& model) {
+    // Group in deterministic topological order.
+    struct Group {
+        std::vector<std::shared_ptr<CascadiaInt4Gemv>> ops;
+    };
+    std::map<std::string, Group> groups;
+    std::vector<std::string> order;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto gemv = ov::as_type_ptr<CascadiaInt4Gemv>(node);
+        if (!gemv || gemv->get_output_target_inputs(0).empty()) continue;
+        const auto& in = gemv->input_value(0);
+        char key[256];
+        snprintf(key, sizeof(key), "%p:%zu:%lld:%lld:%lld", // NOLINT
+                 static_cast<void*>(in.get_node()), in.get_index(),
+                 static_cast<long long>(gemv->k()), static_cast<long long>(gemv->groups()),
+                 static_cast<long long>(gemv->group_size()));
+        auto it = groups.find(key);
+        if (it == groups.end()) order.push_back(key);
+        groups[key].ops.push_back(gemv);
+    }
+
+    uint32_t fused = 0;
+    for (const auto& key : order) {
+        auto& grp = groups[key].ops;
+        if (grp.size() < 2) continue;
+        std::vector<CascadiaInt4Gemv::Segment> segs;
+        std::vector<int64_t> lengths;
+        std::string tag;
+        for (const auto& op : grp) {
+            for (const auto& seg : op->segments()) {
+                segs.push_back(seg);
+                lengths.push_back(seg.n);
+            }
+            if (!tag.empty()) tag += "+";
+            tag += op->tag();
+        }
+        auto fused_op = std::make_shared<CascadiaInt4Gemv>(
+            grp[0]->input_value(0), std::move(segs), grp[0]->k(), grp[0]->groups(),
+            grp[0]->group_size(), tag);
+        fused_op->set_friendly_name(grp[0]->get_friendly_name() + "_fused");
+        auto axis = Constant::create(ov::element::i64, ov::Shape{}, {-1});
+        auto lens = Constant::create(ov::element::i64, ov::Shape{lengths.size()}, lengths);
+        auto split = std::make_shared<ov::op::v1::VariadicSplit>(fused_op, axis, lens);
+        split->set_friendly_name(fused_op->get_friendly_name() + "_split");
+        for (size_t i = 0; i < grp.size(); ++i) {
+            ov::copy_runtime_info(grp[i], {fused_op, split});
+            grp[i]->output(0).replace(split->output(i));
+        }
+        ++fused;
+        fprintf(stderr, "gemv-fuse: %zu siblings -> %s (N=%lld)\n", grp.size(),
+                fused_op->get_friendly_name().c_str(),
+                static_cast<long long>(
+                    std::accumulate(lengths.begin(), lengths.end(), int64_t{0})));
+    }
+    return fused;
+}
+
 uint32_t offload_int4_gemv(ov::Core& core, const std::shared_ptr<ov::Model>& model) {
     core.add_extension(std::make_shared<ov::OpExtension<CascadiaInt4Gemv>>());
     auto counter = std::make_shared<std::atomic<uint32_t>>(0);
     ov::pass::Manager manager;
     manager.register_pass<OffloadInt4GemvPass>(counter);
     manager.run_passes(model);
+    // CASCADIA_GEMV_NOFUSE=1: A/B knob for the sibling fusion (spike-only).
+    static const bool nofuse = [] {
+        const char* v = std::getenv("CASCADIA_GEMV_NOFUSE");
+        return v && *v == '1';
+    }();
+    if (!nofuse && counter->load(std::memory_order_relaxed) > 0) {
+        const uint32_t fused = fuse_sibling_gemvs(model);
+        if (fused > 0) {
+            model->validate_nodes_and_infer_types();
+        }
+    }
     return counter->load(std::memory_order_relaxed);
 }
 
