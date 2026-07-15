@@ -88,6 +88,16 @@ struct StageConfig {
     static_seq: Option<u32>,
     #[serde(default)]
     static_context: Option<u32>,
+    /// Chunked-prefill IR variant (openvino_prefill_model.xml) query-window
+    /// width, exported via `--static-prefill-seq`. Absent/None on decode-only
+    /// static exports and on all stateful exports.
+    #[serde(default)]
+    static_prefill_seq: Option<u32>,
+    /// Total context of the prefill variant; its past-KV length
+    /// (`static_prefill_context - static_prefill_seq`) must equal the decode
+    /// variant's (`static_context - 1`) so both share one host KV ring.
+    #[serde(default)]
+    static_prefill_context: Option<u32>,
     #[serde(default)]
     num_kv_heads: Option<u32>,
     #[serde(default)]
@@ -245,6 +255,30 @@ fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
     Ok(argmax_last_row(logits, vocab))
 }
 
+/// Argmax over row `row` of a `[.., seq, vocab]` logits output. The chunked
+/// prefill path needs the LAST REAL row (`real - 1`), not the last row —
+/// rows `real..seq` of a padded chunk are garbage pad-query outputs.
+fn argmax_logits_row(logits: &[f32], shape: &[usize], row: usize) -> EngineResult<i32> {
+    let vocab = match shape.last() {
+        Some(&v) if v > 0 => v,
+        _ => {
+            return Err(EngineError::Backend(format!(
+                "logits output has empty/zero last dim: shape={shape:?}"
+            )))
+        }
+    };
+    let end = (row + 1)
+        .checked_mul(vocab)
+        .filter(|&e| e <= logits.len())
+        .ok_or_else(|| {
+            EngineError::Backend(format!(
+                "logits row {row} out of range: len {} vocab {vocab} (shape={shape:?})",
+                logits.len()
+            ))
+        })?;
+    Ok(argmax_last_row(&logits[..end], vocab))
+}
+
 /// Normalize an output shape to a 3D `[batch, seq, hidden]` for the wire.
 fn to_shape3(shape: &[usize]) -> [usize; 3] {
     match shape.len() {
@@ -371,22 +405,40 @@ impl StaticKv {
     /// full. Selects `key_buf[li]` or `val_buf[li]` internally so callers can
     /// hold `&mut self` without aliasing the buffer field.
     fn absorb_layer(&mut self, li: usize, is_value: bool, present: &[u8]) {
+        let (present_ctx, past_len, valid) = (self.context, self.past_len, self.valid);
+        self.absorb_one(li, is_value, present, present_ctx, past_len, valid);
+    }
+
+    /// Core single-token absorb, parameterized so the seq=1 decode variant
+    /// (`present` rows are `context` slots, new token at slot `past_len`) and
+    /// the chunked-prefill variant (rows are `present_ctx` slots, token t of
+    /// the chunk at slot `past_len + t`) share one slide/append
+    /// implementation. `valid_now` is the number of real past tokens visible
+    /// to the absorbed token (drives append-at vs slide-drop-oldest).
+    fn absorb_one(
+        &mut self,
+        li: usize,
+        is_value: bool,
+        present: &[u8],
+        present_ctx: usize,
+        src_slot: usize,
+        valid_now: usize,
+    ) {
         // Read scalar fields into locals before borrowing the buffer field,
         // so the mutable buffer borrow stays disjoint from these reads.
         let slot = self.head_dim * self.elem_bytes;
-        let present_row = self.context * slot; // per-head stride in present
+        let present_row = present_ctx * slot; // per-head stride in present
         let buf_row = self.past_len * slot; // per-head stride in the ring
-        let full = self.valid >= self.past_len;
+        let full = valid_now >= self.past_len;
         let kv_heads = self.kv_heads;
         let past_len = self.past_len;
-        let valid = self.valid;
         let buf: &mut [u8] = if is_value {
             &mut self.val_buf[li]
         } else {
             &mut self.key_buf[li]
         };
         for h in 0..kv_heads {
-            let src = h * present_row + past_len * slot;
+            let src = h * present_row + src_slot * slot;
             let new = &present[src..src + slot];
             let base = h * buf_row;
             if full {
@@ -394,11 +446,78 @@ impl StaticKv {
                 let dst = base + (past_len - 1) * slot;
                 buf[dst..dst + slot].copy_from_slice(new);
             } else {
-                let dst = base + valid * slot;
+                let dst = base + valid_now * slot;
                 buf[dst..dst + slot].copy_from_slice(new);
             }
         }
     }
+
+    /// Absorb `real` new tokens' K/V from a chunked-prefill `present` output
+    /// (per-head rows of `present_ctx` slots; chunk token t sits at slot
+    /// `past_len + t`). Byte-for-byte equivalent to `real` sequential
+    /// seq=1 `absorb_layer` calls at positions `first_position..+real`
+    /// (unit-tested), including the slide-drop-oldest once the window fills.
+    /// Does not mutate `valid` — like `absorb_layer`, callers realign via
+    /// `begin_token` before the next inference.
+    fn absorb_layer_multi(
+        &mut self,
+        li: usize,
+        is_value: bool,
+        present: &[u8],
+        present_ctx: usize,
+        first_position: usize,
+        real: usize,
+    ) {
+        for t in 0..real {
+            let valid_t = (first_position + t).min(self.past_len);
+            self.absorb_one(li, is_value, present, present_ctx, self.past_len + t, valid_t);
+        }
+    }
+
+    /// Write a chunked-prefill attention mask into `buf` (i64 LE,
+    /// `prefill_ctx` slots): 1 for the `valid` left-aligned real past slots,
+    /// 1 for the first `real` slots of the query window (slots
+    /// `past_len..past_len+real`), 0 elsewhere (past padding + chunk-tail
+    /// padding). The pad queries' outputs are garbage by construction; they
+    /// are never absorbed or forwarded, and the causal triangle inside the IR
+    /// keeps real queries from attending to them.
+    fn write_prefill_mask(&self, buf: &mut Vec<u8>, prefill_ctx: usize, real: usize) {
+        buf.clear();
+        buf.resize(prefill_ctx * 8, 0);
+        for i in 0..prefill_ctx {
+            let in_past = i < self.valid;
+            let in_chunk = i >= self.past_len && i < self.past_len + real;
+            let v: i64 = if in_past || in_chunk { 1 } else { 0 };
+            buf[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Chunked-prefill sibling of a stateless static-shape shard: the same stage
+/// graph reshaped to a fixed seq=`seq` query window (exported via
+/// `--static-prefill-seq`), compiled separately — possibly on a different
+/// device (`--prefill-device`, e.g. NPU while `--device CPU` decodes). Both
+/// variants take identical `[1, kv_heads, past_len, head_dim]` past tensors
+/// (the exporter pins `prefill context = past_len + seq`), so this runtime
+/// reads and feeds the SAME host `StaticKv` ring as the decode model: the
+/// prefill→decode handoff is zero-cost by construction, and the two devices
+/// never hold KV — only weights — so DRAM keeps a single KV copy.
+struct StaticPrefill {
+    runtime: OvRuntime,
+    /// Fixed query-window width C of the prefill IR.
+    seq: usize,
+    /// Fixed total context of the prefill IR (= ring past_len + seq).
+    context: usize,
+    ids_in: Option<String>,
+    hidden_in: Option<String>,
+    attn_in: String,
+    pos_in: String,
+    layers: Vec<StaticKvLayer>,
+    /// Reusable buffers (mask: i64 LE context*8; primary: padded chunk input;
+    /// pos: i64 LE seq*8) so the chunk loop does no per-chunk allocation.
+    mask_bytes: Vec<u8>,
+    primary_buf: Vec<u8>,
+    pos_buf: Vec<u8>,
 }
 
 // -------- Engine --------
@@ -418,6 +537,10 @@ struct ActiveTask {
     /// Cumulative time inside `send_hidden_downstream` +
     /// `recv_token_from_downstream` — i.e. wire send + downstream wait + recv.
     t_wire: std::time::Duration,
+    /// Wall-clock spent in the prefill phase (whole-prompt consumption up to
+    /// and including the first generated token). TTFT proxy for the task-done
+    /// log; also splits decode tok/s out of the blended rate.
+    t_prefill: std::time::Duration,
 }
 
 pub struct OvRuntimeEngine {
@@ -444,6 +567,10 @@ pub struct OvRuntimeEngine {
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
+    /// Chunked-prefill variant (static path only): a second compiled model —
+    /// possibly on a different device — that consumes the prompt `seq` tokens
+    /// per inference, sharing `static_kv`'s ring with the decode model.
+    prefill: Option<StaticPrefill>,
     step_warn: StepWarnLimiter,
 }
 
@@ -672,8 +799,12 @@ impl OvRuntimeEngine {
         position: i64,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
         // Stateless static (NPU): feed the upstream hidden state + the
-        // host-side KV ring for this stage's layers.
+        // host-side KV ring for this stage's layers. A multi-token frame is a
+        // prefill chunk from a chunk-capable upstream stage.
         if self.static_kv.is_some() {
+            if shape[1] > 1 {
+                return self.run_relay_chunk(hidden, shape, position);
+            }
             let hs_bytes = f32_to_f16_bytes(hidden);
             let (dtype, out_shape, bytes) =
                 self.static_infer(true, ShimDType::F16, &shape, &hs_bytes, position)?;
@@ -683,6 +814,77 @@ impl OvRuntimeEngine {
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, out_shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
         Ok((bytes_to_f32(dtype, &bytes)?, out_shape))
+    }
+
+    /// Relay/head handling of a multi-token prefill chunk `[1, r, hidden]` on
+    /// the static path. With a chunked-prefill variant compiled, one wide
+    /// inference covers the whole chunk (weights stream once per chunk);
+    /// without one — a decode-only static export downstream of a
+    /// chunk-capable stage — fall back to r sequential seq=1 inferences: same
+    /// math and ring state, just without the amortization. Either way the
+    /// returned rows are exactly the r real tokens (`[1, r, X]`; pad-query
+    /// garbage never leaves the stage) and the ring has absorbed r tokens, so
+    /// the downstream frame keeps the upstream chunking and the 1-frame-in /
+    /// 1-frame-out reply flow holds pipeline-wide.
+    fn run_relay_chunk(
+        &mut self,
+        hidden: &[f32],
+        shape: [usize; 3],
+        position: i64,
+    ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
+        let r = shape[1];
+        let h = shape[2];
+        if h == 0 || hidden.len() != shape[0] * r * h {
+            return Err(EngineError::Backend(format!(
+                "chunk hidden len {} does not match shape {shape:?}",
+                hidden.len()
+            )));
+        }
+        if self.prefill.is_some() {
+            let hs_bytes = f32_to_f16_bytes(hidden);
+            let (dtype, oshape, bytes) = self.static_infer_chunk(true, &hs_bytes, r, position)?;
+            let out = bytes_to_f32(dtype, &bytes)?;
+            let x = *oshape.last().unwrap_or(&0);
+            if x == 0 || out.len() < r * x {
+                return Err(EngineError::Backend(format!(
+                    "prefill chunk output too small: len {} shape {oshape:?} real {r}",
+                    out.len()
+                )));
+            }
+            return Ok((out[..r * x].to_vec(), vec![1, r, x]));
+        }
+        // Fallback: no prefill variant on this stage — consume the chunk one
+        // token at a time through the seq=1 decode model.
+        let mut rows: Vec<f32> = Vec::new();
+        let mut x = 0usize;
+        for t in 0..r {
+            let row = f32_to_f16_bytes(&hidden[t * h..(t + 1) * h]);
+            let (dt, os, by) =
+                self.static_infer(true, ShimDType::F16, &[1, 1, h], &row, position + t as i64)?;
+            let o = bytes_to_f32(dt, &by)?;
+            x = *os.last().unwrap_or(&0);
+            if x == 0 || o.len() < x {
+                return Err(EngineError::Backend(format!(
+                    "static output too small: len {} shape {os:?}",
+                    o.len()
+                )));
+            }
+            rows.extend_from_slice(&o[o.len() - x..]);
+        }
+        Ok((rows, vec![1, r, x]))
+    }
+
+    /// Chunked-prefill first-stage inference: `chunk` prompt ids in one wide
+    /// forward on the prefill runtime. Returns the f32 primary output with
+    /// shape `[1, C, X]` — rows `0..chunk.len()` are the real tokens.
+    fn run_first_chunk(
+        &mut self,
+        chunk: &[i64],
+        position: i64,
+    ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
+        let (dtype, shape, bytes) =
+            self.static_infer_chunk(false, &i64_to_bytes(chunk), chunk.len(), position)?;
+        Ok((bytes_to_f32(dtype, &bytes)?, shape))
     }
 
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -875,6 +1077,7 @@ impl OvRuntimeEngine {
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
+                t_prefill: std::time::Duration::ZERO,
             });
         }
 
@@ -956,22 +1159,65 @@ impl OvRuntimeEngine {
                     }
                 }
             }
-            let mut nt = 0i32;
-            for &t in &tokens {
-                let position = self.position;
-                let ts = std::time::Instant::now();
-                let (out, shape) = self.run_first(&[t], position)?;
-                let alpha = ts.elapsed();
-                self.position += 1;
-                // Static prefill round-trips per prompt token — each reply
-                // covers one token's relay compute, so it is never a
-                // prefill-budget wait.
-                let (token, wire) =
-                    self.resolve_next_token(&out, &shape, single_stage, position, false)?;
-                nt = token;
+            let nt = if prefill && self.prefill.is_some() {
+                // Chunked prefill: C prompt tokens per inference instead of
+                // one — stage weights stream from DRAM once per chunk (a ~C×
+                // cut in prefill weight traffic), and the wide compute-bound
+                // matmuls run on the prefill device (`--prefill-device`, e.g.
+                // the NPU) while `--device` keeps the bandwidth-lean seq=1
+                // decode loop. The token argmaxed from the final chunk's last
+                // real row is the first generated token, exactly as in the
+                // seq=1 path.
+                let c = self.prefill.as_ref().map(|p| p.seq).unwrap_or(1);
+                let mut nt = 0i32;
+                let mut idx = 0usize;
+                while idx < tokens.len() {
+                    let take = c.min(tokens.len() - idx);
+                    let chunk_start = self.position;
+                    let ts = std::time::Instant::now();
+                    let (out, shape) =
+                        self.run_first_chunk(&tokens[idx..idx + take], chunk_start)?;
+                    let alpha = ts.elapsed();
+                    self.position += take as i64;
+                    idx += take;
+                    let (token, wire) = self.resolve_next_token_chunk(
+                        &out,
+                        &shape,
+                        take,
+                        single_stage,
+                        chunk_start,
+                    )?;
+                    nt = token;
+                    if let Some(a) = self.active.as_mut() {
+                        a.t_alpha_compute += alpha;
+                        a.t_wire += wire;
+                    }
+                }
+                nt
+            } else {
+                let mut nt = 0i32;
+                for &t in &tokens {
+                    let position = self.position;
+                    let ts = std::time::Instant::now();
+                    let (out, shape) = self.run_first(&[t], position)?;
+                    let alpha = ts.elapsed();
+                    self.position += 1;
+                    // Static prefill round-trips per prompt token — each reply
+                    // covers one token's relay compute, so it is never a
+                    // prefill-budget wait.
+                    let (token, wire) =
+                        self.resolve_next_token(&out, &shape, single_stage, position, false)?;
+                    nt = token;
+                    if let Some(a) = self.active.as_mut() {
+                        a.t_alpha_compute += alpha;
+                        a.t_wire += wire;
+                    }
+                }
+                nt
+            };
+            if prefill {
                 if let Some(a) = self.active.as_mut() {
-                    a.t_alpha_compute += alpha;
-                    a.t_wire += wire;
+                    a.t_prefill = a.started.elapsed();
                 }
             }
             nt
@@ -996,11 +1242,47 @@ impl OvRuntimeEngine {
             if let Some(a) = self.active.as_mut() {
                 a.t_alpha_compute += alpha;
                 a.t_wire += wire;
+                if prefill {
+                    a.t_prefill = a.started.elapsed();
+                }
             }
             nt
         };
 
         self.emit_token(next_token)
+    }
+
+    /// Chunk analog of `resolve_next_token`: argmax the LAST REAL row locally
+    /// when single-stage (rows `take..C` are pad-query garbage), otherwise
+    /// forward only the real rows `[1, take, X]` downstream — preceded by the
+    /// chunk-start position frame — and await the token. A chunk reply waits
+    /// on whole-chunk compute across every remaining stage, so it gets the
+    /// widened prefill budget when take > 1.
+    fn resolve_next_token_chunk(
+        &mut self,
+        out: &[f32],
+        shape: &[usize],
+        take: usize,
+        single_stage: bool,
+        chunk_start: i64,
+    ) -> EngineResult<(i32, std::time::Duration)> {
+        if single_stage {
+            return Ok((
+                argmax_logits_row(out, shape, take - 1)?,
+                std::time::Duration::ZERO,
+            ));
+        }
+        let x = *shape.last().unwrap_or(&0);
+        if x == 0 || out.len() < take * x {
+            return Err(EngineError::Backend(format!(
+                "chunk output too small: len {} shape {shape:?} take {take}",
+                out.len()
+            )));
+        }
+        let ts = std::time::Instant::now();
+        self.send_hidden_downstream(&out[..take * x], [1, take, x], chunk_start)?;
+        let token = self.recv_token_from_downstream(take > 1)?;
+        Ok((token, ts.elapsed()))
     }
 
     /// From a first-stage output, produce the next token: argmax locally when
@@ -1086,11 +1368,23 @@ impl OvRuntimeEngine {
             let wire_ms = active.t_wire.as_millis() as u64;
             let total_ms = elapsed.as_millis() as u64;
             let other_ms = total_ms.saturating_sub(alpha_ms).saturating_sub(wire_ms);
+            // prefill_ms ~ TTFT (prompt consumption through the first
+            // generated token); decode_tok_s excludes it so the two phases —
+            // which may run on different devices — are visible separately.
+            let prefill_ms = active.t_prefill.as_millis() as u64;
+            let decode_s = elapsed.saturating_sub(active.t_prefill).as_secs_f64();
+            let decode_tok_s = if active.generated.len() > 1 && decode_s > 0.0 {
+                (active.generated.len() - 1) as f64 / decode_s
+            } else {
+                tok_s
+            };
             info!(
                 task = %task_id,
                 tokens = active.generated.len(),
                 elapsed_s = elapsed.as_secs_f64(),
                 tok_s,
+                prefill_ms,
+                decode_tok_s,
                 alpha_ms,
                 wire_ms,
                 other_ms,
@@ -1204,6 +1498,140 @@ impl OvRuntimeEngine {
             let sk = self.static_kv.as_mut().unwrap();
             sk.absorb_layer(li, false, &kpres);
             sk.absorb_layer(li, true, &vpres);
+        }
+        Ok((odt, oshape, obytes))
+    }
+
+    /// One chunked-prefill inference covering `real` (<= C) tokens starting at
+    /// absolute `position`, on the prefill runtime (`--prefill-device`). Pads
+    /// the primary input to the fixed C-window, masks the padding, feeds the
+    /// SAME host KV ring the decode model uses, absorbs the `real` new
+    /// tokens' K/V, and returns output 0 (`[1, C, X]`; rows `real..C` are
+    /// pad-query garbage the caller must never use). The ring is the whole
+    /// prefill→decode handoff: KV lives once in host DRAM regardless of which
+    /// device computed it.
+    fn static_infer_chunk(
+        &mut self,
+        use_hidden: bool,
+        in_bytes_real: &[u8],
+        real: usize,
+        position: i64,
+    ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
+        // Split-borrow the ring and the prefill model: disjoint fields of
+        // self, so ring buffers feed the prefill runtime with no staging copy
+        // (beyond the shim's own per-input memcpy, common to every path).
+        let (sk, pf) = match (self.static_kv.as_mut(), self.prefill.as_mut()) {
+            (Some(sk), Some(pf)) => (sk, pf),
+            _ => {
+                return Err(EngineError::Backend(
+                    "static_infer_chunk requires the static ring + a prefill variant".into(),
+                ))
+            }
+        };
+        if real == 0 || real > pf.seq {
+            return Err(EngineError::Backend(format!(
+                "chunk of {real} real tokens does not fit the prefill window (seq={})",
+                pf.seq
+            )));
+        }
+        sk.begin_token(position as usize);
+        sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
+
+        // Primary input, padded from `real` tokens to the fixed C-window
+        // (zeros: masked out of attention, outputs unused, KV never absorbed).
+        let (in_dtype, per_tok) = if use_hidden {
+            (ShimDType::F16, 2usize)
+        } else {
+            (ShimDType::I64, 8usize)
+        };
+        let hid = if use_hidden {
+            let row = real * per_tok;
+            if row == 0 || in_bytes_real.len() % row != 0 {
+                return Err(EngineError::Backend(format!(
+                    "chunk hidden bytes {} not divisible by {real} rows",
+                    in_bytes_real.len()
+                )));
+            }
+            in_bytes_real.len() / row
+        } else {
+            if in_bytes_real.len() != real * per_tok {
+                return Err(EngineError::Backend(format!(
+                    "chunk ids bytes {} != {real} i64 tokens",
+                    in_bytes_real.len()
+                )));
+            }
+            0
+        };
+        pf.primary_buf.clear();
+        pf.primary_buf.extend_from_slice(in_bytes_real);
+        pf.primary_buf
+            .resize(pf.seq * per_tok * if use_hidden { hid } else { 1 }, 0);
+
+        // position_ids [1, C] = position..position+C; the pad tail continues
+        // past the real tokens (masked + never absorbed, value irrelevant).
+        pf.pos_buf.clear();
+        for p in position..position + pf.seq as i64 {
+            pf.pos_buf.extend_from_slice(&p.to_le_bytes());
+        }
+
+        let in_main = if use_hidden {
+            pf.hidden_in.as_deref()
+        } else {
+            pf.ids_in.as_deref()
+        }
+        .ok_or_else(|| EngineError::Backend("prefill IR missing primary input".into()))?;
+        if use_hidden {
+            pf.runtime
+                .set_input(in_main, in_dtype, &[1, pf.seq, hid], &pf.primary_buf)
+                .map_err(map_ov_err)?;
+        } else {
+            pf.runtime
+                .set_input(in_main, in_dtype, &[1, pf.seq], &pf.primary_buf)
+                .map_err(map_ov_err)?;
+        }
+        pf.runtime
+            .set_input(&pf.attn_in, ShimDType::I64, &[1, pf.context], &pf.mask_bytes)
+            .map_err(map_ov_err)?;
+        pf.runtime
+            .set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
+            .map_err(map_ov_err)?;
+        let kv_shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
+        for (li, layer) in pf.layers.iter().enumerate() {
+            pf.runtime
+                .set_input(&layer.key_in, sk.kv_dtype, &kv_shape, &sk.key_buf[li])
+                .map_err(map_ov_err)?;
+            pf.runtime
+                .set_input(&layer.val_in, sk.kv_dtype, &kv_shape, &sk.val_buf[li])
+                .map_err(map_ov_err)?;
+        }
+        pf.runtime.infer().map_err(map_ov_err)?;
+
+        let (odt, oshape, obytes) = pf.runtime.output(0).map_err(map_ov_err)?;
+
+        // Absorb the `real` new tokens' K/V from each present.* (rows of
+        // pf.context slots; chunk token t at slot past_len + t). Validate
+        // length AND shape first, as the seq=1 path does.
+        let expect = sk.kv_heads * pf.context * sk.head_dim * sk.elem_bytes;
+        let want_shape = [1usize, sk.kv_heads, pf.context, sk.head_dim];
+        for li in 0..pf.layers.len() {
+            let (ko, vo) = (pf.layers[li].key_out, pf.layers[li].val_out);
+            let (_, kshape, kpres) = pf.runtime.output(ko).map_err(map_ov_err)?;
+            let (_, vshape, vpres) = pf.runtime.output(vo).map_err(map_ov_err)?;
+            if kpres.len() != expect
+                || vpres.len() != expect
+                || kshape != want_shape
+                || vshape != want_shape
+            {
+                return Err(EngineError::Backend(format!(
+                    "prefill present.{li} mismatch: key shape={kshape:?} len={} val shape={vshape:?} \
+                     len={}; expected shape {want_shape:?} ({expect} bytes f16). Check \
+                     static_prefill_seq/static_prefill_context in stage_config.",
+                    kpres.len(),
+                    vpres.len(),
+                )));
+            }
+            sk.absorb_layer_multi(li, false, &kpres, pf.context, position as usize, real);
+            sk.absorb_layer_multi(li, true, &vpres, pf.context, position as usize, real);
         }
         Ok((odt, oshape, obytes))
     }
@@ -1383,6 +1811,114 @@ impl Engine for OvRuntimeEngine {
     }
 }
 
+/// Resolve canonical input-port names ("input_ids", "attention_mask", ...)
+/// of a compiled runtime via its alias lists. v5 IRs export ports under
+/// conventional names but the IR's primary name is sometimes an internal node
+/// id; the alias list carries the canonical name. Shared by the decode and
+/// chunked-prefill compilations (same stage graph → same port names).
+fn resolve_canonical_inputs(
+    runtime: &OvRuntime,
+) -> EngineResult<std::collections::HashMap<String, String>> {
+    let mut canonical_inputs = std::collections::HashMap::new();
+    let n_inputs = runtime.input_count();
+    for canonical in [
+        "input_ids",
+        "hidden_states",
+        "attention_mask",
+        "position_ids",
+        "beam_idx",
+    ] {
+        for idx in 0..n_inputs {
+            let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
+            let primary = runtime.input_name(idx).map_err(map_ov_err)?;
+            if aliases
+                .iter()
+                .any(|a| a == canonical || a.contains(canonical))
+            {
+                canonical_inputs.insert(canonical.to_string(), primary);
+                break;
+            }
+        }
+    }
+    Ok(canonical_inputs)
+}
+
+/// Resolve a stateless static compilation's explicit `past_key_values.*`
+/// input ports + `present.*` output indices, discovered contiguously from
+/// layer 0, with a cross-check so a gap / renamed / folded port is a hard
+/// error instead of silently building fewer layers. `what` labels errors
+/// ("static shard" / "chunked-prefill variant").
+fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<StaticKvLayer>> {
+    let n_inputs = runtime.input_count();
+    let n_out = runtime.output_count();
+    let mut layers: Vec<StaticKvLayer> = Vec::new();
+    loop {
+        let l = layers.len();
+        let kin_s = format!("past_key_values.{l}.key");
+        let vin_s = format!("past_key_values.{l}.value");
+        let kout_s = format!("present.{l}.key");
+        let vout_s = format!("present.{l}.value");
+        let (mut key_in, mut val_in) = (None, None);
+        for idx in 0..n_inputs {
+            let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
+            if al.iter().any(|a| a.contains(&kin_s)) {
+                key_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
+            } else if al.iter().any(|a| a.contains(&vin_s)) {
+                val_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
+            }
+        }
+        let (key_in, val_in) = match (key_in, val_in) {
+            (Some(k), Some(v)) => (k, v),
+            _ => break,
+        };
+        let (mut key_out, mut val_out) = (None, None);
+        for idx in 0..n_out {
+            let al = runtime.output_aliases(idx).map_err(map_ov_err)?;
+            if al.iter().any(|a| a.contains(&kout_s)) {
+                key_out = Some(idx);
+            } else if al.iter().any(|a| a.contains(&vout_s)) {
+                val_out = Some(idx);
+            }
+        }
+        let key_out = key_out
+            .ok_or_else(|| EngineError::Backend(format!("{what} missing {kout_s}")))?;
+        let val_out = val_out
+            .ok_or_else(|| EngineError::Backend(format!("{what} missing {vout_s}")))?;
+        layers.push(StaticKvLayer {
+            key_in,
+            val_in,
+            key_out,
+            val_out,
+        });
+    }
+    if layers.is_empty() {
+        return Err(EngineError::Backend(format!(
+            "{what}: no past_key_values.* inputs found"
+        )));
+    }
+    // Cross-check: the contiguous-from-0 discovery above stops at the
+    // first missing index. Compare against the total number of
+    // past_key_values.* input ports so a gap / renamed / folded port is
+    // a hard error instead of silently building fewer layers.
+    let mut kv_input_ports = 0usize;
+    for idx in 0..n_inputs {
+        let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
+        if al.iter().any(|a| a.contains("past_key_values.")) {
+            kv_input_ports += 1;
+        }
+    }
+    if kv_input_ports != layers.len() * 2 {
+        return Err(EngineError::Backend(format!(
+            "{what}: resolved {} contiguous KV layers ({} ports) but the IR has \
+             {kv_input_ports} past_key_values.* input ports — a layer port is missing or \
+             misnamed (gap in the past_key_values.N sequence)",
+            layers.len(),
+            layers.len() * 2,
+        )));
+    }
+    Ok(layers)
+}
+
 // -------- Builder --------
 
 #[derive(Default)]
@@ -1391,12 +1927,23 @@ pub struct OvRuntimeBuilder {
     pub rank: u32,
     pub total: u32,
     pub device: String,
+    /// Device for the chunked-prefill IR variant (static shards only): the
+    /// phase split — e.g. `NPU` here with `--device CPU` runs the wide
+    /// compute-bound prefill on the NPU and the bandwidth-bound seq=1 decode
+    /// on the CPU, sharing one host KV ring. Default (None) compiles the
+    /// prefill variant (when the export has one) on `device`, which still
+    /// buys the ~C× prefill weight-stream amortization on a single device.
+    pub prefill_device: Option<String>,
+    /// Ignore the export's chunked-prefill variant and prefill one token per
+    /// step (the pre-variant behavior); conflicts with `prefill_device`.
+    pub disable_chunked_prefill: bool,
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
     /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
     pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
+    prefill_runtime: Option<OvRuntime>,
     spec: Option<ShardSpec>,
     rotary: Option<Rotary>,
     hidden_size: usize,
@@ -1411,6 +1958,9 @@ pub struct OvRuntimeBuilder {
     /// None for the stateful path. static_seq is validated == 1 at load and not
     /// stored (the ring math assumes one token per step).
     static_params: Option<(u32, u32, u32)>,
+    /// (seq, context) of the chunked-prefill IR variant, when the stage
+    /// exports one (stage_config.static_prefill_*) and it isn't disabled.
+    static_prefill_params: Option<(u32, u32)>,
 }
 
 impl OvRuntimeBuilder {
@@ -1430,6 +1980,17 @@ impl OvRuntimeBuilder {
         }
     }
 
+    /// Compile the chunked-prefill variant on a different device than
+    /// `device` — the NPU+CPU (or GPU+CPU) phase split.
+    pub fn with_prefill_device(mut self, device: impl Into<String>) -> Self {
+        self.prefill_device = Some(device.into());
+        self
+    }
+    /// Skip the export's chunked-prefill variant (prefill one token per step).
+    pub fn with_chunked_prefill_disabled(mut self, disabled: bool) -> Self {
+        self.disable_chunked_prefill = disabled;
+        self
+    }
     pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -1547,6 +2108,52 @@ impl Builder for OvRuntimeBuilder {
             None
         };
 
+        // Chunked-prefill variant: validate coherence at load, not first
+        // inference. The variant is usable only when its past-KV length
+        // equals the decode variant's (context - 1) — that identity is what
+        // lets both compiled models share one host KV ring.
+        let prefill_xml = stage_dir.join("openvino_prefill_model.xml");
+        self.static_prefill_params = match (self.static_params, stage_cfg.static_prefill_seq) {
+            (Some((ctx, _, _)), Some(pseq)) if !self.disable_chunked_prefill => {
+                let pctx = stage_cfg.static_prefill_context.unwrap_or(0);
+                if pseq < 2 || pctx != ctx - 1 + pseq {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "static_prefill_seq={pseq} / static_prefill_context={pctx} inconsistent: \
+                         need seq >= 2 and context = (static_context - 1) + seq = {} so the \
+                         prefill and decode variants share one past-KV shape — re-export with \
+                         --static-prefill-seq",
+                        ctx - 1 + pseq
+                    )));
+                }
+                if !prefill_xml.exists() {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "stage_config advertises a chunked-prefill variant \
+                         (static_prefill_seq={pseq}) but {} is missing — re-export the stage",
+                        prefill_xml.display()
+                    )));
+                }
+                events.push(LoadProgress::message(format!(
+                    "chunked-prefill variant: seq={pseq} context={pctx}"
+                )));
+                Some((pseq, pctx))
+            }
+            _ => None,
+        };
+        if self.prefill_device.is_some() && self.static_prefill_params.is_none() {
+            return Err(EngineError::ShardRejected(if stage_cfg.stateful {
+                "--prefill-device requires a stateless static export: re-export with \
+                 tools/export_shards.py --target npu --static-prefill-seq N (the stateful \
+                 path keeps KV inside OV state, which two devices cannot share)"
+                    .into()
+            } else if self.disable_chunked_prefill {
+                "--prefill-device conflicts with --no-chunked-prefill".into()
+            } else {
+                "--prefill-device requires a chunked-prefill IR variant: re-export this \
+                 pipeline with --static-prefill-seq N"
+                    .into()
+            }));
+        }
+
         // A pipeline must be homogeneous: the static path carries a wire
         // position frame the stateful path does not, so a mixed pipeline would
         // desync. Fail fast when sibling stage configs are present locally
@@ -1596,6 +2203,28 @@ impl Builder for OvRuntimeBuilder {
                 .map_err(map_ov_err)?;
         self.input_names = runtime.input_names().map_err(map_ov_err)?;
         self.runtime = Some(runtime);
+
+        // Second compilation for the chunked-prefill variant — on
+        // --prefill-device when given (the NPU+CPU phase split), else on
+        // --device (single-device chunked prefill). Note this holds a second
+        // copy of the stage weights resident (a compiled model owns its own
+        // weight allocation per device) — the price of the split; KV is NOT
+        // duplicated (the host ring is shared).
+        if let Some((pseq, pctx)) = self.static_prefill_params {
+            let pdev = self
+                .prefill_device
+                .clone()
+                .unwrap_or_else(|| self.device.clone());
+            events.push(LoadProgress::message(format!(
+                "compiling chunked-prefill variant (seq={pseq}, context={pctx}) on {pdev}"
+            )));
+            let prt = OvRuntime::compile(prefill_xml.to_str().unwrap_or_default(), &pdev, &plugin)
+                .map_err(map_ov_err)
+                .map_err(|e| {
+                    EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
+                })?;
+            self.prefill_runtime = Some(prt);
+        }
 
         events.push(LoadProgress::message(
             "loading rotary + tokenizer".to_string(),
@@ -1656,101 +2285,14 @@ impl Builder for OvRuntimeBuilder {
         // input ports under conventional names ("input_ids", "attention_mask",
         // ...) but the IR's "primary" name is sometimes an internal node id;
         // the alias list is what carries the canonical name.
-        let mut canonical_inputs = std::collections::HashMap::new();
-        let n_inputs = runtime.input_count();
-        for canonical in [
-            "input_ids",
-            "hidden_states",
-            "attention_mask",
-            "position_ids",
-            "beam_idx",
-        ] {
-            for idx in 0..n_inputs {
-                let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
-                let primary = runtime.input_name(idx).map_err(map_ov_err)?;
-                if aliases
-                    .iter()
-                    .any(|a| a == canonical || a.contains(canonical))
-                {
-                    canonical_inputs.insert(canonical.to_string(), primary);
-                    break;
-                }
-            }
-        }
+        let canonical_inputs = resolve_canonical_inputs(&runtime)?;
 
         // Stateless static-shape (NPU) shards: resolve the explicit
         // past_key_values.* inputs + present.* outputs and allocate the
         // host-side KV ring. The primary output (logits on the head stage,
         // hidden_states otherwise) is output index 0 — no alias guess needed.
         let static_kv = if let Some((ctx, kvh, hd)) = self.static_params {
-            let n_out = runtime.output_count();
-            let mut layers: Vec<StaticKvLayer> = Vec::new();
-            loop {
-                let l = layers.len();
-                let kin_s = format!("past_key_values.{l}.key");
-                let vin_s = format!("past_key_values.{l}.value");
-                let kout_s = format!("present.{l}.key");
-                let vout_s = format!("present.{l}.value");
-                let (mut key_in, mut val_in) = (None, None);
-                for idx in 0..n_inputs {
-                    let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
-                    if al.iter().any(|a| a.contains(&kin_s)) {
-                        key_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
-                    } else if al.iter().any(|a| a.contains(&vin_s)) {
-                        val_in = Some(runtime.input_name(idx).map_err(map_ov_err)?);
-                    }
-                }
-                let (key_in, val_in) = match (key_in, val_in) {
-                    (Some(k), Some(v)) => (k, v),
-                    _ => break,
-                };
-                let (mut key_out, mut val_out) = (None, None);
-                for idx in 0..n_out {
-                    let al = runtime.output_aliases(idx).map_err(map_ov_err)?;
-                    if al.iter().any(|a| a.contains(&kout_s)) {
-                        key_out = Some(idx);
-                    } else if al.iter().any(|a| a.contains(&vout_s)) {
-                        val_out = Some(idx);
-                    }
-                }
-                let key_out = key_out.ok_or_else(|| {
-                    EngineError::Backend(format!("static shard missing {kout_s}"))
-                })?;
-                let val_out = val_out.ok_or_else(|| {
-                    EngineError::Backend(format!("static shard missing {vout_s}"))
-                })?;
-                layers.push(StaticKvLayer {
-                    key_in,
-                    val_in,
-                    key_out,
-                    val_out,
-                });
-            }
-            if layers.is_empty() {
-                return Err(EngineError::Backend(
-                    "static shard: no past_key_values.* inputs found".into(),
-                ));
-            }
-            // Cross-check: the contiguous-from-0 discovery above stops at the
-            // first missing index. Compare against the total number of
-            // past_key_values.* input ports so a gap / renamed / folded port is
-            // a hard error instead of silently building fewer layers.
-            let mut kv_input_ports = 0usize;
-            for idx in 0..n_inputs {
-                let al = runtime.input_aliases(idx).map_err(map_ov_err)?;
-                if al.iter().any(|a| a.contains("past_key_values.")) {
-                    kv_input_ports += 1;
-                }
-            }
-            if kv_input_ports != layers.len() * 2 {
-                return Err(EngineError::Backend(format!(
-                    "static shard: resolved {} contiguous KV layers ({} ports) but the IR has \
-                     {kv_input_ports} past_key_values.* input ports — a layer port is missing or \
-                     misnamed (gap in the past_key_values.N sequence)",
-                    layers.len(),
-                    layers.len() * 2,
-                )));
-            }
+            let layers = resolve_static_layers(&runtime, "static shard")?;
             let (kvh, hd) = (kvh as usize, hd as usize);
             let past_len = (ctx - 1) as usize;
             // KV activations are f16 in the static export; derive elem_bytes
@@ -1808,6 +2350,58 @@ impl Builder for OvRuntimeBuilder {
             None
         };
 
+        // Chunked-prefill variant: a second compiled model (possibly on a
+        // different device) with its own port wiring, sharing the ring above.
+        // Wiring is re-resolved against the prefill compilation rather than
+        // assumed identical, so a divergent variant fails loud at build.
+        let prefill = match (self.prefill_runtime, &static_kv, self.static_prefill_params) {
+            (Some(prt), Some(sk), Some((pseq, pctx))) => {
+                let pcanon = resolve_canonical_inputs(&prt)?;
+                let players = resolve_static_layers(&prt, "chunked-prefill variant")?;
+                if players.len() != sk.layers.len() {
+                    return Err(EngineError::Backend(format!(
+                        "chunked-prefill variant has {} KV layers but the decode variant has \
+                         {} — the two IRs are not siblings of one export",
+                        players.len(),
+                        sk.layers.len()
+                    )));
+                }
+                let attn_in = pcanon.get("attention_mask").cloned().ok_or_else(|| {
+                    EngineError::Backend("prefill IR missing attention_mask input".into())
+                })?;
+                let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
+                    EngineError::Backend("prefill IR missing position_ids input".into())
+                })?;
+                let ids_in = pcanon.get("input_ids").cloned();
+                let hidden_in = pcanon.get("hidden_states").cloned();
+                if ids_in.is_none() && hidden_in.is_none() {
+                    return Err(EngineError::Backend(
+                        "prefill IR has neither input_ids nor hidden_states input".into(),
+                    ));
+                }
+                Some(StaticPrefill {
+                    runtime: prt,
+                    seq: pseq as usize,
+                    context: pctx as usize,
+                    ids_in,
+                    hidden_in,
+                    attn_in,
+                    pos_in,
+                    layers: players,
+                    mask_bytes: vec![0u8; pctx as usize * 8],
+                    primary_buf: Vec::new(),
+                    pos_buf: Vec::with_capacity(pseq as usize * 8),
+                })
+            }
+            (None, _, _) => None,
+            _ => {
+                return Err(EngineError::Backend(
+                    "inconsistent builder state: prefill runtime without static ring/params"
+                        .into(),
+                ))
+            }
+        };
+
         Ok(Box::new(OvRuntimeEngine {
             spec,
             runtime,
@@ -1824,6 +2418,7 @@ impl Builder for OvRuntimeBuilder {
             pending: Vec::new(),
             active: None,
             static_kv,
+            prefill,
             step_warn: StepWarnLimiter::default(),
         }))
     }
