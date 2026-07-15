@@ -49,6 +49,9 @@ fn main() {
 
     let runtime_include = format!("{ov_root}/runtime/include");
     let genai_include = format!("{ov_root}/runtime/include/openvino/genai");
+    // openvino/core/parallel.hpp (used by the gemv-offload extension op)
+    // includes TBB headers; the SDK ships them under runtime/3rdparty.
+    let tbb_include = format!("{ov_root}/runtime/3rdparty/tbb/include");
     // OpenVINO 2026.x Windows ships .lib files under lib/intel64/Release
     // (and lib/intel64/Debug); Linux ships them directly under
     // lib/intel64. Add both paths; the linker picks whichever resolves.
@@ -62,12 +65,19 @@ fn main() {
         .file("cpp/gemv_offload.cpp")
         .include(&runtime_include)
         .include(&genai_include)
+        .include(&tbb_include)
         .compile("cascadia_ov_genai_shim");
 
     println!("cargo:rustc-link-search=native={runtime_lib_release}");
     println!("cargo:rustc-link-search=native={runtime_lib_root}");
+    // ov::parallel_for (gemv-offload extension) inlines TBB calls; the SDK
+    // ships the import libs under runtime/3rdparty/tbb/lib (Windows) and the
+    // shared objects under .../tbb/lib/intel64 (Linux archives).
+    println!("cargo:rustc-link-search=native={ov_root}/runtime/3rdparty/tbb/lib");
+    println!("cargo:rustc-link-search=native={ov_root}/runtime/3rdparty/tbb/lib/intel64");
     println!("cargo:rustc-link-lib=dylib=openvino_genai");
     println!("cargo:rustc-link-lib=dylib=openvino");
+    println!("cargo:rustc-link-lib=dylib=tbb12");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
     println!("cargo:rerun-if-changed=cpp/shim.h");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");

@@ -123,7 +123,16 @@ async fn run_tasks(
         .await
         .expect("load");
     use futures::StreamExt;
-    while load.next().await.is_some() {}
+    // Surface load progress when the gemv-offload leg runs: the offloaded
+    // MatMul count printed here is the proof the extension pass actually
+    // fired (0 matches silently degrades to stock and would make the parity
+    // assertion vacuous for the offload).
+    let show_load = std::env::var("CASCADIA_GEMV_OFFLOAD").is_ok_and(|v| v == "1");
+    while let Some(ev) = load.next().await {
+        if show_load {
+            eprintln!("load: {ev:?}");
+        }
+    }
     let mut engine = Box::new(builder).build().expect("build");
 
     let mut outs = Vec::new();
