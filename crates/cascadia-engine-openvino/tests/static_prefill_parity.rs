@@ -114,6 +114,19 @@ async fn run_tasks(
     if std::env::var("CASCADIA_GEMV_OFFLOAD").is_ok_and(|v| v == "1") && !disable_chunk {
         builder = builder.with_gemv_offload(true);
     }
+    // CASCADIA_OV_PROPS="K=V,K=V": raw plugin properties for perf probing
+    // (e.g. INFERENCE_NUM_THREADS=8 — the LATENCY hint pins LNL to its 4
+    // P-cores, halving the custom op's row parallelism).
+    if let Ok(props) = std::env::var("CASCADIA_OV_PROPS") {
+        let kv: Vec<(String, String)> = props
+            .split(',')
+            .filter_map(|p| {
+                p.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        builder = builder.with_ov_properties(kv);
+    }
     builder
         .connect(PeerLayout::single_stage())
         .await

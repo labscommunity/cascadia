@@ -10,11 +10,16 @@
 #include "gemv_offload.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
@@ -42,6 +47,35 @@ namespace {
 
 using ov::op::v0::Constant;
 
+// CASCADIA_GEMV_STATS=1: accumulate evaluate() wall time across all op
+// instances and print a summary at process exit — splits kernel time from
+// framework overhead when chasing the throughput gap. Spike-only.
+struct GemvStats {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> ns{0};
+    std::atomic<uint64_t> weight_bytes{0};
+    bool enabled = false;
+    GemvStats() {
+        const char* v = std::getenv("CASCADIA_GEMV_STATS");
+        enabled = v && *v == '1';
+        if (enabled) std::atexit(&GemvStats::print);
+    }
+    static GemvStats& get() {
+        static GemvStats s;
+        return s;
+    }
+    static void print() {
+        auto& s = get();
+        const uint64_t c = s.calls.load(), n = s.ns.load(), b = s.weight_bytes.load();
+        if (c == 0) return;
+        fprintf(stderr,
+                "gemv-stats: calls=%llu total_ms=%.1f avg_us=%.1f weight_GB=%.2f "
+                "eff_GBps=%.1f\n",
+                static_cast<unsigned long long>(c), n / 1e6, n / 1e3 / c, b / 1e9,
+                b / (n / 1e9) / 1e9);
+    }
+};
+
 #ifdef CASCADIA_GEMV_X86
 bool cpu_has_avx2_fma() {
     static const bool ok = [] {
@@ -61,33 +95,106 @@ bool cpu_has_avx2_fma() {
     return ok;
 }
 
-// AVX2 grouped sym-INT4 dot: 16 packed bytes = 32 weights per iteration.
-// Nibble decode via (x ^ 8) - 8 sign trick; _mm_unpacklo/hi_epi8(lo, hi)
-// restores the low-nibble-first element order for free.
-float dot_group_avx2(const uint8_t* gw, const float* ga, size_t gsize) {
-    __m256 acc = _mm256_setzero_ps();
+bool cpu_has_avx_vnni() {
+    static const bool ok = [] {
+        if (!cpu_has_avx2_fma()) return false;
+#if defined(_MSC_VER)
+        int r[4] = {0};
+        __cpuidex(r, 7, 1);  // leaf 7 subleaf 1: EAX bit 4 = AVX-VNNI
+        return (r[0] & (1 << 4)) != 0;
+#else
+        return __builtin_cpu_supports("avxvnni");
+#endif
+    }();
+    return ok;
+}
+
+// AVX-VNNI grouped dot with dynamically-quantized int8 activations.
+// Weights become unsigned in ONE op (w_i4 + 8 == nibble ^ 8, since
+// (x^8)-8 is the sign decode); dpbusd(u8 = w+8, s8 = act_q) accumulates
+// Σ(w+8)·q exactly in i32 (4 products per lane, no i16 saturation stage),
+// and the +8 bias is removed once per group via the precomputed Σq:
+// Σw·q = acc − 8·Σq. Caller dequantizes with act_scale × weight_scale.
+int32_t dot_group_vnni(const uint8_t* gw, const int8_t* qa, size_t gsize) {
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    const __m128i xor8 = _mm_set1_epi8(8);
     const __m128i mask4 = _mm_set1_epi8(0x0F);
-    const __m128i bias = _mm_set1_epi8(8);
     size_t j = 0;
     for (; j + 16 <= gsize / 2; j += 16) {
         const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
         const __m128i lo = _mm_and_si128(raw, mask4);
         const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
-        // interleave -> element order e0,e1,e2,... then sign-extend 4->8 bit
-        __m128i a = _mm_unpacklo_epi8(lo, hi);
-        __m128i b = _mm_unpackhi_epi8(lo, hi);
-        a = _mm_sub_epi8(_mm_xor_si128(a, bias), bias);
-        b = _mm_sub_epi8(_mm_xor_si128(b, bias), bias);
-        const float* base = ga + 2 * j;
-        const __m256i w0 = _mm256_cvtepi8_epi32(a);
-        const __m256i w1 = _mm256_cvtepi8_epi32(_mm_srli_si128(a, 8));
-        const __m256i w2 = _mm256_cvtepi8_epi32(b);
-        const __m256i w3 = _mm256_cvtepi8_epi32(_mm_srli_si128(b, 8));
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(w0), _mm256_loadu_ps(base + 0), acc);
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(w1), _mm256_loadu_ps(base + 8), acc);
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(w2), _mm256_loadu_ps(base + 16), acc);
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(w3), _mm256_loadu_ps(base + 24), acc);
+        const __m128i a = _mm_xor_si128(_mm_unpacklo_epi8(lo, hi), xor8);
+        const __m128i b = _mm_xor_si128(_mm_unpackhi_epi8(lo, hi), xor8);
+        const __m256i w = _mm256_set_m128i(b, a);  // 32 u8 weights, in order
+        const __m256i q =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qa + 2 * j));
+        if ((j / 16) & 1) {
+            acc1 = _mm256_dpbusd_avx_epi32(acc1, w, q);
+        } else {
+            acc0 = _mm256_dpbusd_avx_epi32(acc0, w, q);
+        }
     }
+    __m256i acc = _mm256_add_epi32(acc0, acc1);
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    int32_t dot = _mm_cvtsi128_si32(s);
+    for (; j < gsize / 2; ++j) {
+        const uint8_t v = gw[j];
+        const int lo = (v & 0xF) ^ 8;  // w + 8, matching the SIMD lanes
+        const int hi = ((v >> 4) & 0xF) ^ 8;
+        dot += lo * qa[2 * j] + hi * qa[2 * j + 1];
+    }
+    return dot;
+}
+
+// AVX2 grouped sym-INT4 dot. Nibble decode via (x ^ 8) - 8 sign trick;
+// _mm_unpacklo/hi_epi8(lo, hi) restores the low-nibble-first element order
+// for free. FOUR independent accumulator chains: a single accumulator
+// serializes on FMA latency (~4-5 cycles) and was the dominant kernel stall;
+// with group_size=128 (64 packed bytes) a group is exactly one unrolled
+// iteration.
+static inline __m256 dot16_lo(const __m128i raw, const __m128i mask4, const __m128i bias,
+                              const float* base, __m256 acc, __m256 acc2, __m256* acc2_out) {
+    const __m128i lo = _mm_and_si128(raw, mask4);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
+    __m128i a = _mm_unpacklo_epi8(lo, hi);
+    __m128i b = _mm_unpackhi_epi8(lo, hi);
+    a = _mm_sub_epi8(_mm_xor_si128(a, bias), bias);
+    b = _mm_sub_epi8(_mm_xor_si128(b, bias), bias);
+    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(a)),
+                          _mm256_loadu_ps(base + 0), acc);
+    acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(a, 8))),
+                           _mm256_loadu_ps(base + 8), acc2);
+    acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b)),
+                          _mm256_loadu_ps(base + 16), acc);
+    acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b, 8))),
+                           _mm256_loadu_ps(base + 24), acc2);
+    *acc2_out = acc2;
+    return acc;
+}
+
+float dot_group_avx2(const uint8_t* gw, const float* ga, size_t gsize) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    const __m128i mask4 = _mm_set1_epi8(0x0F);
+    const __m128i bias = _mm_set1_epi8(8);
+    size_t j = 0;
+    for (; j + 32 <= gsize / 2; j += 32) {
+        const __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
+        const __m128i r1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j + 16));
+        acc0 = dot16_lo(r0, mask4, bias, ga + 2 * j, acc0, acc1, &acc1);
+        acc2 = dot16_lo(r1, mask4, bias, ga + 2 * j + 32, acc2, acc3, &acc3);
+    }
+    for (; j + 16 <= gsize / 2; j += 16) {
+        const __m128i r0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(gw + j));
+        acc0 = dot16_lo(r0, mask4, bias, ga + 2 * j, acc0, acc1, &acc1);
+    }
+    const __m256 acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
@@ -168,6 +275,9 @@ public:
 
     bool evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const override {
         if (!m_w || !m_s) return false;
+        auto& stats = GemvStats::get();
+        const auto t0 = stats.enabled ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         const auto& act = inputs[0];
         auto& out = outputs[0];
         const size_t k = static_cast<size_t>(m_k);
@@ -193,55 +303,129 @@ public:
         const auto* wbytes = static_cast<const uint8_t*>(m_w->get_data_ptr());
         const auto* sc16 = static_cast<const ov::float16*>(m_s->get_data_ptr());
 
-        // f32 scratch of the activation row: read once, reused across N.
-        // Deliberately a per-call LOCAL, not thread_local: ov::parallel_for
+        // Scratch (per-call LOCALS, not thread_local: ov::parallel_for
         // blocks this thread and TBB work-steals other ready tasks onto it —
         // including another instance's evaluate(), which would clobber a
-        // shared thread_local while our row lambdas still read it.
+        // shared thread_local while our row lambdas still read it):
+        // f32 activation row, and — on the VNNI path — its per-group int8
+        // quantization + (scale, Σq) pairs, all computed ONCE per row and
+        // reused across all N outputs.
         std::vector<float> act_f32;
+        std::vector<int8_t> act_q;
+        std::vector<float> q_scale;
+        std::vector<int32_t> q_sum;
+#ifdef CASCADIA_GEMV_X86
+        const bool use_avx2 = cpu_has_avx2_fma();
+        // CASCADIA_GEMV_VNNI=1: dynamically-quantized int8 activations via
+        // AVX-VNNI dpbusd (~3x per-core over the f32-convert chain). This is
+        // dynamic quantization — output parity vs the stock f16/f32 kernel
+        // must be re-validated whenever it's enabled. Spike knob.
+        static const bool want_vnni = [] {
+            const char* v = std::getenv("CASCADIA_GEMV_VNNI");
+            return v && *v == '1';
+        }();
+        const bool use_vnni = want_vnni && cpu_has_avx_vnni();
+#else
+        const bool use_avx2 = false;
+        const bool use_vnni = false;
+#endif
+        // CASCADIA_GEMV_SEQ=1: single-thread A/B knob (spike-only).
+        static const bool sequential = [] {
+            const char* v = std::getenv("CASCADIA_GEMV_SEQ");
+            return v && *v == '1';
+        }();
         for (size_t r = 0; r < rows; ++r) {
             act_f32.resize(k);
             for (size_t i = 0; i < k; ++i) {
                 act_f32[i] = in_f16 ? static_cast<float>(act16[r * k + i]) : act32[r * k + i];
             }
             const float* a = act_f32.data();
-#ifdef CASCADIA_GEMV_X86
-            const bool use_avx2 = cpu_has_avx2_fma();
-#else
-            const bool use_avx2 = false;
-#endif
-            ov::parallel_for(n, [&](size_t row) {
-                const uint8_t* wrow = wbytes + row * (k / 2);
-                const ov::float16* srow = sc16 + row * groups;
-                float acc = 0.f;
+            if (use_vnni) {
+                act_q.resize(k);
+                q_scale.resize(groups);
+                q_sum.resize(groups);
                 for (size_t gi = 0; gi < groups; ++gi) {
-                    const uint8_t* gw = wrow + gi * (gsize / 2);
                     const float* ga = a + gi * gsize;
-                    float dot;
-#ifdef CASCADIA_GEMV_X86
-                    if (use_avx2) {
-                        dot = dot_group_avx2(gw, ga, gsize);
-                    } else
-#endif
-                    {
-                        dot = 0.f;
-                        for (size_t j = 0; j < gsize / 2; ++j) {
-                            const uint8_t b = gw[j];
-                            const int lo =
-                                static_cast<int8_t>(static_cast<uint8_t>(b << 4)) >> 4;
-                            const int hi = static_cast<int8_t>(b) >> 4;
-                            dot += static_cast<float>(lo) * ga[2 * j];
-                            dot += static_cast<float>(hi) * ga[2 * j + 1];
-                        }
+                    float amax = 0.f;
+                    for (size_t i = 0; i < gsize; ++i) {
+                        const float v = ga[i] < 0 ? -ga[i] : ga[i];
+                        if (v > amax) amax = v;
                     }
-                    acc += static_cast<float>(srow[gi]) * dot;
+                    const float s = amax > 0.f ? amax / 127.f : 1.f;
+                    const float inv = 1.f / s;
+                    int32_t sum = 0;
+                    for (size_t i = 0; i < gsize; ++i) {
+                        int q = static_cast<int>(ga[i] * inv + (ga[i] >= 0 ? 0.5f : -0.5f));
+                        if (q > 127) q = 127;
+                        if (q < -127) q = -127;
+                        act_q[gi * gsize + i] = static_cast<int8_t>(q);
+                        sum += q;
+                    }
+                    q_scale[gi] = s;
+                    q_sum[gi] = sum;
                 }
-                if (out_f16) {
-                    out16[r * n + row] = ov::float16(acc);
-                } else {
-                    out32[r * n + row] = acc;
+            }
+            const std::function<void(size_t, size_t)> rows_fn = [&](size_t rb, size_t re) {
+                for (size_t row = rb; row < re; ++row) {
+                    const uint8_t* wrow = wbytes + row * (k / 2);
+                    const ov::float16* srow = sc16 + row * groups;
+                    float acc = 0.f;
+                    for (size_t gi = 0; gi < groups; ++gi) {
+                        const uint8_t* gw = wrow + gi * (gsize / 2);
+                        float dot;
+#ifdef CASCADIA_GEMV_X86
+                        if (use_vnni) {
+                            const int32_t dq =
+                                dot_group_vnni(gw, act_q.data() + gi * gsize, gsize);
+                            dot = q_scale[gi] * static_cast<float>(dq - 8 * q_sum[gi]);
+                        } else if (use_avx2) {
+                            dot = dot_group_avx2(gw, a + gi * gsize, gsize);
+                        } else
+#endif
+                        {
+                            const float* ga = a + gi * gsize;
+                            dot = 0.f;
+                            for (size_t j = 0; j < gsize / 2; ++j) {
+                                const uint8_t b = gw[j];
+                                const int lo =
+                                    static_cast<int8_t>(static_cast<uint8_t>(b << 4)) >> 4;
+                                const int hi = static_cast<int8_t>(b) >> 4;
+                                dot += static_cast<float>(lo) * ga[2 * j];
+                                dot += static_cast<float>(hi) * ga[2 * j + 1];
+                            }
+                        }
+                        acc += static_cast<float>(srow[gi]) * dot;
+                    }
+                    if (out_f16) {
+                        out16[r * n + row] = ov::float16(acc);
+                    } else {
+                        out32[r * n + row] = acc;
+                    }
                 }
-            });
+            };
+            if (sequential) {
+                rows_fn(0, n);
+            } else {
+                // Blocked ov::parallel_for: fewer, larger tasks than
+                // per-row dispatch (measured better than both per-row and a
+                // private TBB-independent pool, which loses to wake latency
+                // + oversubscription against the plugin's own threads).
+                const size_t block = 32;
+                const size_t nblocks = (n + block - 1) / block;
+                ov::parallel_for(nblocks, [&](size_t bi) {
+                    const size_t b = bi * block;
+                    const size_t e = b + block < n ? b + block : n;
+                    rows_fn(b, e);
+                });
+            }
+        }
+        if (stats.enabled) {
+            stats.calls.fetch_add(1, std::memory_order_relaxed);
+            stats.ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count(),
+                               std::memory_order_relaxed);
+            stats.weight_bytes.fetch_add(rows * n * (k / 2), std::memory_order_relaxed);
         }
         return true;
     }
