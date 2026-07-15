@@ -470,7 +470,14 @@ impl StaticKv {
     ) {
         for t in 0..real {
             let valid_t = (first_position + t).min(self.past_len);
-            self.absorb_one(li, is_value, present, present_ctx, self.past_len + t, valid_t);
+            self.absorb_one(
+                li,
+                is_value,
+                present,
+                present_ctx,
+                self.past_len + t,
+                valid_t,
+            );
         }
     }
 
@@ -1546,13 +1553,14 @@ impl OvRuntimeEngine {
         };
         let hid = if use_hidden {
             let row = real * per_tok;
-            if row == 0 || in_bytes_real.len() % row != 0 {
+            let h = if row == 0 { 0 } else { in_bytes_real.len() / row };
+            if h == 0 || in_bytes_real.len() != row * h {
                 return Err(EngineError::Backend(format!(
                     "chunk hidden bytes {} not divisible by {real} rows",
                     in_bytes_real.len()
                 )));
             }
-            in_bytes_real.len() / row
+            h
         } else {
             if in_bytes_real.len() != real * per_tok {
                 return Err(EngineError::Backend(format!(
@@ -1590,7 +1598,12 @@ impl OvRuntimeEngine {
                 .map_err(map_ov_err)?;
         }
         pf.runtime
-            .set_input(&pf.attn_in, ShimDType::I64, &[1, pf.context], &pf.mask_bytes)
+            .set_input(
+                &pf.attn_in,
+                ShimDType::I64,
+                &[1, pf.context],
+                &pf.mask_bytes,
+            )
             .map_err(map_ov_err)?;
         pf.runtime
             .set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
@@ -1880,10 +1893,10 @@ fn resolve_static_layers(runtime: &OvRuntime, what: &str) -> EngineResult<Vec<St
                 val_out = Some(idx);
             }
         }
-        let key_out = key_out
-            .ok_or_else(|| EngineError::Backend(format!("{what} missing {kout_s}")))?;
-        let val_out = val_out
-            .ok_or_else(|| EngineError::Backend(format!("{what} missing {vout_s}")))?;
+        let key_out =
+            key_out.ok_or_else(|| EngineError::Backend(format!("{what} missing {kout_s}")))?;
+        let val_out =
+            val_out.ok_or_else(|| EngineError::Backend(format!("{what} missing {vout_s}")))?;
         layers.push(StaticKvLayer {
             key_in,
             val_in,
@@ -2396,8 +2409,7 @@ impl Builder for OvRuntimeBuilder {
             (None, _, _) => None,
             _ => {
                 return Err(EngineError::Backend(
-                    "inconsistent builder state: prefill runtime without static ring/params"
-                        .into(),
+                    "inconsistent builder state: prefill runtime without static ring/params".into(),
                 ))
             }
         };
@@ -2446,5 +2458,277 @@ mod tests {
     async fn connect_no_peers_is_noop_for_single_stage() {
         let mut b = OvRuntimeBuilder::new("/x", 0, 1, "CPU");
         b.connect(PeerLayout::single_stage()).await.unwrap();
+    }
+
+    // ---- chunked-prefill ring math ----
+
+    fn test_ring(past_len: usize, kv_heads: usize, head_dim: usize, layers: usize) -> StaticKv {
+        let elem = 2usize;
+        let layer_bytes = kv_heads * past_len * head_dim * elem;
+        StaticKv {
+            past_len,
+            context: past_len + 1,
+            kv_heads,
+            head_dim,
+            elem_bytes: elem,
+            kv_dtype: ShimDType::F16,
+            ids_in: Some("input_ids".into()),
+            hidden_in: None,
+            attn_in: "attention_mask".into(),
+            pos_in: "position_ids".into(),
+            layers: (0..layers)
+                .map(|_| StaticKvLayer {
+                    key_in: "k".into(),
+                    val_in: "v".into(),
+                    key_out: 1,
+                    val_out: 2,
+                })
+                .collect(),
+            key_buf: vec![vec![0u8; layer_bytes]; layers],
+            val_buf: vec![vec![0u8; layer_bytes]; layers],
+            valid: 0,
+            mask_bytes: vec![0u8; (past_len + 1) * 8],
+        }
+    }
+
+    /// Deterministic per-byte KV pattern for token `tok` (distinct per head
+    /// byte offset and per k/v so a wrong-slot or crossed read shows up).
+    fn tok_byte(tok: usize, h: usize, b: usize, is_value: bool) -> u8 {
+        ((tok * 31 + h * 7 + b * 3 + if is_value { 131 } else { 0 }) % 251) as u8
+    }
+
+    /// A seq=1 `present` buffer (rows of `past_len+1` slots): token `tok`'s
+    /// KV at slot `past_len`, poison elsewhere (a wrong-slot read would
+    /// import poison and fail the equivalence check).
+    fn present_seq1(ring: &StaticKv, tok: usize, is_value: bool) -> Vec<u8> {
+        let slot = ring.head_dim * ring.elem_bytes;
+        let ctx = ring.past_len + 1;
+        let mut p = vec![0xEEu8; ring.kv_heads * ctx * slot];
+        for h in 0..ring.kv_heads {
+            let base = h * ctx * slot + ring.past_len * slot;
+            for b in 0..slot {
+                p[base + b] = tok_byte(tok, h, b, is_value);
+            }
+        }
+        p
+    }
+
+    /// A chunk `present` buffer (rows of `past_len+c` slots): chunk tokens
+    /// `start..start+real` at slots `past_len..past_len+real`, poison
+    /// elsewhere (including the pad-token slots `real..c`).
+    fn present_chunk(
+        ring: &StaticKv,
+        c: usize,
+        start: usize,
+        real: usize,
+        is_value: bool,
+    ) -> Vec<u8> {
+        let slot = ring.head_dim * ring.elem_bytes;
+        let ctx = ring.past_len + c;
+        let mut p = vec![0xEEu8; ring.kv_heads * ctx * slot];
+        for h in 0..ring.kv_heads {
+            for t in 0..real {
+                let base = h * ctx * slot + (ring.past_len + t) * slot;
+                for b in 0..slot {
+                    p[base + b] = tok_byte(start + t, h, b, is_value);
+                }
+            }
+        }
+        p
+    }
+
+    /// The load-bearing equivalence: absorbing a prompt through
+    /// `absorb_layer_multi` in chunks of C must leave the ring byte-identical
+    /// to absorbing it one token at a time through `absorb_layer`, including
+    /// after the window fills and slides. This is what makes the chunked
+    /// (possibly other-device) prefill hand exactly the same KV state to the
+    /// seq=1 decode loop as the legacy path.
+    #[test]
+    fn chunked_absorb_matches_sequential() {
+        // past_len=4 forces sliding early; prompt=11 with C=3 exercises a
+        // full chunk before the slide, chunks straddling the slide boundary,
+        // and a partial tail chunk (11 = 3+3+3+2).
+        for (past_len, c, n) in [(4usize, 3usize, 11usize), (8, 4, 6), (5, 2, 5), (6, 6, 13)] {
+            let layers = 2;
+            let mut seq = test_ring(past_len, 2, 3, layers);
+            for t in 0..n {
+                seq.begin_token(t);
+                for li in 0..layers {
+                    let k = present_seq1(&seq, t, false);
+                    let v = present_seq1(&seq, t, true);
+                    seq.absorb_layer(li, false, &k);
+                    seq.absorb_layer(li, true, &v);
+                }
+            }
+
+            let mut chk = test_ring(past_len, 2, 3, layers);
+            let mut pos = 0usize;
+            while pos < n {
+                let take = c.min(n - pos);
+                chk.begin_token(pos);
+                for li in 0..layers {
+                    let k = present_chunk(&chk, c, pos, take, false);
+                    let v = present_chunk(&chk, c, pos, take, true);
+                    chk.absorb_layer_multi(li, false, &k, past_len + c, pos, take);
+                    chk.absorb_layer_multi(li, true, &v, past_len + c, pos, take);
+                }
+                pos += take;
+            }
+
+            assert_eq!(
+                seq.key_buf, chk.key_buf,
+                "key ring diverged (past_len={past_len} c={c} n={n})"
+            );
+            assert_eq!(
+                seq.val_buf, chk.val_buf,
+                "value ring diverged (past_len={past_len} c={c} n={n})"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_mask_layout() {
+        let mut ring = test_ring(6, 1, 2, 1);
+        let c = 4;
+        let pctx = ring.past_len + c;
+        let mut buf = Vec::new();
+
+        let read = |buf: &[u8]| -> Vec<i64> {
+            buf.chunks_exact(8)
+                .map(|ch| i64::from_le_bytes(ch.try_into().unwrap()))
+                .collect()
+        };
+
+        // Empty ring, 2 real tokens of a 4-wide chunk: only chunk slots 0..2.
+        ring.begin_token(0);
+        ring.write_prefill_mask(&mut buf, pctx, 2);
+        assert_eq!(read(&buf), [0, 0, 0, 0, 0, 0, 1, 1, 0, 0]);
+
+        // 3 past tokens visible, full chunk: past 0..3 + all 4 chunk slots.
+        ring.begin_token(3);
+        ring.write_prefill_mask(&mut buf, pctx, 4);
+        assert_eq!(read(&buf), [1, 1, 1, 0, 0, 0, 1, 1, 1, 1]);
+
+        // Overflowed position clamps to past_len (window full).
+        ring.begin_token(9);
+        ring.write_prefill_mask(&mut buf, pctx, 1);
+        assert_eq!(read(&buf), [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn argmax_row_selects_requested_row() {
+        // 3 rows of vocab 4; best of row 1 is index 2; row 2 (pad garbage)
+        // would pick index 3 — the chunk path must not read it.
+        let logits = [
+            0.0, 9.0, 0.0, 0.0, // row 0
+            0.0, 0.0, 7.0, 0.0, // row 1
+            0.0, 0.0, 0.0, 8.0, // row 2
+        ];
+        let shape = [1usize, 3, 4];
+        assert_eq!(argmax_logits_row(&logits, &shape, 0).unwrap(), 1);
+        assert_eq!(argmax_logits_row(&logits, &shape, 1).unwrap(), 2);
+        assert_eq!(argmax_logits_row(&logits, &shape, 2).unwrap(), 3);
+        assert!(argmax_logits_row(&logits, &shape, 3).is_err());
+    }
+
+    // ---- load-time validation of the prefill variant ----
+
+    fn write_stage_dir(tag: &str, stage_cfg: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cascadia-prefill-test-{}-{tag}",
+            std::process::id()
+        ));
+        let stage = dir.join("stage_0");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            dir.join("pipeline_config.json"),
+            r#"{"model_id":"m","num_stages":1,"num_layers":2,"hidden_size":8}"#,
+        )
+        .unwrap();
+        std::fs::write(stage.join("stage_config.json"), stage_cfg).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn prefill_device_on_stateful_shard_rejected() {
+        let dir = write_stage_dir(
+            "stateful",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,"stateful":true}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU").with_prefill_device("NPU");
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("stateful + --prefill-device must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("--prefill-device"), "got: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn inconsistent_prefill_context_rejected() {
+        // static_context=8 → decode past_len=7; seq=4 needs context 11, not 12.
+        let dir = write_stage_dir(
+            "badctx",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,
+                "stateful":false,"static_seq":1,"static_context":8,
+                "static_prefill_seq":4,"static_prefill_context":12,
+                "num_kv_heads":2,"head_dim":4}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU");
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("mismatched prefill context must be rejected");
+        assert!(err.to_string().contains("static_prefill"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn advertised_prefill_variant_missing_file_rejected() {
+        let dir = write_stage_dir(
+            "nofile",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,
+                "stateful":false,"static_seq":1,"static_context":8,
+                "static_prefill_seq":4,"static_prefill_context":11,
+                "num_kv_heads":2,"head_dim":4}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU");
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("advertised variant without the IR file must be rejected");
+        assert!(err.to_string().contains("missing"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn disable_chunked_prefill_skips_variant() {
+        // Same config as above (variant advertised, file missing) but with
+        // chunked prefill disabled: validation must not fire; the load then
+        // proceeds to the decode-model compile, which errs (stub / no IR) —
+        // proving the prefill variant was skipped, not rejected.
+        let dir = write_stage_dir(
+            "disabled",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,
+                "stateful":false,"static_seq":1,"static_context":8,
+                "static_prefill_seq":4,"static_prefill_context":11,
+                "num_kv_heads":2,"head_dim":4}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU").with_chunked_prefill_disabled(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("load still fails later (no real IR/OV in stub tests)");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("static_prefill") && !msg.contains("missing —"),
+            "prefill validation should be skipped when disabled; got: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
