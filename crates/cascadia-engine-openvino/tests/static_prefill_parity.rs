@@ -21,7 +21,10 @@
 //! Env knobs: `CASCADIA_STATIC_DEVICE` (decode device, default CPU),
 //! `CASCADIA_PREFILL_DEVICE` (prefill device for the chunked run — set NPU
 //! on an AI PC for the hybrid split; default = decode device),
-//! `CASCADIA_STATIC_PROMPT`, `CASCADIA_STATIC_MAX_NEW` (default 32).
+//! `CASCADIA_STATIC_PROMPT`, `CASCADIA_STATIC_MAX_NEW` (default 32),
+//! `CASCADIA_PARITY_SOFT=1` (report a token divergence instead of failing —
+//! for GPU / cross-device perf sweeps where greedy near-ties legitimately
+//! fork; see `assert_parity`).
 //! Unset `CASCADIA_STATIC_SHARDS` ⇒ skip-pass (stub CI stays green).
 //! Multi-stage pipelines are exercised on hardware via `cascadia worker`
 //! (`--prefill-device`), not here.
@@ -115,6 +118,42 @@ fn report(name: &str, r: &RunOut) {
     );
 }
 
+/// Greedy-token parity against the tokenwise baseline. Same-device CPU and
+/// NPU runs are byte-stable across the seq=1/seq=64 graph variants and stay
+/// HARD-asserted. On GPU the two variants compile to different kernel /
+/// accumulation choices, and a cross-device hybrid prefill hands decode
+/// KV computed with another device's rounding — either can flip a genuine
+/// argmax near-tie and fork the greedy text (both branches coherent; observed
+/// fork rate grows with model size: 0 at 1B same-device CPU/NPU, ~half of
+/// GPU/hybrid runs by 3B). `CASCADIA_PARITY_SOFT=1` downgrades the mismatch
+/// to a loud report with the fork index so perf sweeps on those configs still
+/// print every leg. Never set it for CPU/NPU validation runs; CI is
+/// unaffected (no `CASCADIA_STATIC_SHARDS` there).
+fn assert_parity(what: &str, base: &RunOut, other: &RunOut) {
+    if base.ids == other.ids {
+        return;
+    }
+    if std::env::var("CASCADIA_PARITY_SOFT").is_ok_and(|v| v == "1") {
+        let fork = base
+            .ids
+            .iter()
+            .zip(&other.ids)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| base.ids.len().min(other.ids.len()));
+        eprintln!(
+            "PARITY-SOFT: {what} diverged from tokenwise at token {fork} \
+             (tolerated as a near-tie fork; baseline text: {:?}, other text: {:?})",
+            base.text, other.text
+        );
+        return;
+    }
+    panic!(
+        "{what} diverged from tokenwise \
+         (baseline text: {:?}, other text: {:?})",
+        base.text, other.text
+    );
+}
+
 #[tokio::test]
 async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
     let Ok(shards) = std::env::var("CASCADIA_STATIC_SHARDS") else {
@@ -154,22 +193,16 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
     // Chunked prefill, same device (weight-stream amortization only).
     let chunked = run_once(&shards, &device, None, false, &prompt, max_new).await;
     report(&format!("chunked   [{device}]"), &chunked);
-    assert_eq!(
-        base.ids, chunked.ids,
-        "chunked prefill diverged from tokenwise on {device} \
-         (baseline text: {:?}, chunked text: {:?})",
-        base.text, chunked.text
-    );
+    assert_parity(&format!("chunked prefill on {device}"), &base, &chunked);
 
     // Hybrid: chunked prefill on another device, decode unchanged.
     if let Some(pd) = prefill_device.as_deref() {
         let hybrid = run_once(&shards, &device, Some(pd), false, &prompt, max_new).await;
         report(&format!("hybrid    [{pd}+{device}]"), &hybrid);
-        assert_eq!(
-            base.ids, hybrid.ids,
-            "hybrid ({pd} prefill + {device} decode) diverged from tokenwise \
-             (baseline text: {:?}, hybrid text: {:?})",
-            base.text, hybrid.text
+        assert_parity(
+            &format!("hybrid ({pd} prefill + {device} decode)"),
+            &base,
+            &hybrid,
         );
     } else {
         eprintln!("CASCADIA_PREFILL_DEVICE not set; hybrid leg skipped");
