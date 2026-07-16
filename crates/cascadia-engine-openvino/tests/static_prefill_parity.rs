@@ -24,6 +24,9 @@
 //! `CASCADIA_PREFILL_DEVICE` (prefill device for the chunked run — set NPU
 //! on an AI PC for the hybrid split; default = decode device),
 //! `CASCADIA_STATIC_PROMPT`, `CASCADIA_STATIC_MAX_NEW` (default 32),
+//! `CASCADIA_STATIC_TASKS=N` (sequential requests per chunked/hybrid engine —
+//! request 2+ is steady-state TTFT, without the ~300 ms first-infer init a
+//! cache-imported NPU blob defers),
 //! `CASCADIA_PARITY_SOFT=1` (tolerate even an EARLY fork — one within the first
 //! `NEAR_TIE_MIN_PREFIX` decoded tokens, which otherwise hard-fails as suspect
 //! corruption; late near-tie forks are already tolerated by default. For pure
@@ -298,6 +301,16 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    // CASCADIA_STATIC_TASKS=N (default 1): drive N sequential requests
+    // through the chunked/hybrid engines and report each. Request 1 through
+    // a cache-imported NPU blob pays ~300 ms of driver init the import
+    // deferred (a cold in-process compile does not); request 2+ is the
+    // steady-state TTFT a long-lived worker sees.
+    let bench_tasks: usize = std::env::var("CASCADIA_STATIC_TASKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
 
     // Guard against a vacuous pass: without a chunked-prefill variant, the
     // "chunked" and "hybrid" runs silently take the identical tokenwise path
@@ -322,19 +335,36 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
     assert!(!base.ids.is_empty(), "baseline generated no tokens");
 
     // Chunked prefill, same device (weight-stream amortization only).
-    let chunked = run_once(&shards, &device, None, false, &prompt, max_new).await;
-    report(&format!("chunked   [{device}]"), &chunked);
-    assert_parity(&format!("chunked prefill on {device}"), &base, &chunked);
+    let chunked_runs =
+        run_tasks(&shards, &device, None, false, false, &prompt, max_new, bench_tasks).await;
+    for (i, c) in chunked_runs.iter().enumerate() {
+        let label = if bench_tasks == 1 {
+            format!("chunked   [{device}]")
+        } else {
+            format!("chunked#{}  [{device}]", i + 1)
+        };
+        report(&label, c);
+        assert_parity(&format!("chunked prefill on {device} (task {i})"), &base, c);
+    }
 
     // Hybrid: chunked prefill on another device, decode unchanged.
     if let Some(pd) = prefill_device.as_deref() {
-        let hybrid = run_once(&shards, &device, Some(pd), false, &prompt, max_new).await;
-        report(&format!("hybrid    [{pd}+{device}]"), &hybrid);
-        assert_parity(
-            &format!("hybrid ({pd} prefill + {device} decode)"),
-            &base,
-            &hybrid,
-        );
+        let hybrid_runs =
+            run_tasks(&shards, &device, Some(pd), false, false, &prompt, max_new, bench_tasks)
+                .await;
+        for (i, h) in hybrid_runs.iter().enumerate() {
+            let label = if bench_tasks == 1 {
+                format!("hybrid    [{pd}+{device}]")
+            } else {
+                format!("hybrid#{}  [{pd}+{device}]", i + 1)
+            };
+            report(&label, h);
+            assert_parity(
+                &format!("hybrid ({pd} prefill + {device} decode, task {i})"),
+                &base,
+                h,
+            );
+        }
     } else {
         eprintln!("CASCADIA_PREFILL_DEVICE not set; hybrid leg skipped");
     }
