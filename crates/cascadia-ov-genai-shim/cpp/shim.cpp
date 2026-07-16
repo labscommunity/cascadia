@@ -8,6 +8,7 @@
 #include "gemv_offload.hpp"
 
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <new>
@@ -487,6 +488,70 @@ int32_t cascadia_runtime_compile(
 }
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle) { delete handle; }
+
+int32_t cascadia_runtime_import_blob(
+    const char* blob_path, const char* device,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_runtime_t** out_handle) {
+    if (!blob_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_import_blob"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+
+        std::ifstream f(blob_path, std::ios::binary | std::ios::ate);
+        if (!f) {
+            set_last_error(std::string("cannot open blob: ") + blob_path);
+            return 1;
+        }
+        const auto size = static_cast<size_t>(f.tellg());
+        f.seekg(0);
+        ov::Tensor blob(ov::element::u8, ov::Shape{size});
+        if (!f.read(reinterpret_cast<char*>(blob.data()),
+                    static_cast<std::streamsize>(size))) {
+            set_last_error(std::string("short read on blob: ") + blob_path);
+            return 1;
+        }
+        f.close();
+
+        auto compiled =
+            handle->core.import_model(blob, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_import_blob"); return 1;
+    }
+}
 
 int32_t cascadia_runtime_compile_gemv_offload(
     const char* model_xml_path, const char* device,

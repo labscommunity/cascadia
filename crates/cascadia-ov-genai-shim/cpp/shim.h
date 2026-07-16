@@ -164,6 +164,19 @@ int32_t cascadia_runtime_compile_gemv_offload(
     uint32_t* out_offloaded,
     cascadia_runtime_t** out_handle);
 
+/// Import a precompiled blob (produced by ov::CompiledModel::export_model,
+/// e.g. an AOT cross-compile on a big-RAM host with NPU_PLATFORM set) instead
+/// of compiling from IR. Skips the compiler entirely — the NPU compile
+/// transient (~5.5x INT4 bytes host RAM) never happens on this box; peak is
+/// ~the blob size. Same handle contract as cascadia_runtime_compile (the
+/// infer request is created eagerly, which forces device weight load).
+int32_t cascadia_runtime_import_blob(
+    const char* blob_path,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_runtime_t** out_handle);
+
 /// Serialize the last inference's per-node profiling info (requires the
 /// model to have been compiled with the PERF_COUNT=YES plugin property) as
 /// TSV lines "node_name\tnode_type\texec_type\treal_us\tcpu_us\n" into

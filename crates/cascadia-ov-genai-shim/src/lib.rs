@@ -166,6 +166,14 @@ mod sys {
             out_handle: *mut *mut cascadia_runtime_t,
         ) -> c_int;
 
+        pub fn cascadia_runtime_import_blob(
+            blob_path: *const c_char,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
         pub fn cascadia_runtime_profiling(
@@ -638,6 +646,46 @@ impl Runtime {
         let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
         let rc = unsafe {
             sys::cascadia_runtime_compile(
+                path_c.as_ptr(),
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self { handle })
+    }
+
+    /// Import a precompiled blob (from `ov::CompiledModel::export_model`,
+    /// e.g. an AOT cross-compile on a big-RAM host with `NPU_PLATFORM` set)
+    /// instead of compiling from IR — the compiler (and its ~5.5x-INT4-bytes
+    /// host-RAM transient) never runs on this box.
+    pub fn import_blob(blob_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        Self::do_import_blob(blob_path, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_import_blob(_path: &str, _device: &str, _plugin: &PluginConfig) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_import_blob(blob_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        let path_c = cstr(blob_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::cascadia_runtime_import_blob(
                 path_c.as_ptr(),
                 device_c.as_ptr(),
                 ptrs.as_ptr(),
