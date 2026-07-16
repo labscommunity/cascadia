@@ -350,11 +350,7 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         report(&format!("parked#1  [{label}+{device}]"), &outs[0]);
         report(&format!("parked#2  [{label}+{device}]"), &outs[1]);
         for (n, o) in outs.iter().enumerate() {
-            assert_eq!(
-                base.ids, o.ids,
-                "parked task {n} diverged from tokenwise (text: {:?})",
-                o.text
-            );
+            assert_parity(&format!("parked task {n}"), &base, o);
         }
     } else {
         eprintln!("CASCADIA_PARK not set; parking leg skipped");
