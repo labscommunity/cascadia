@@ -502,7 +502,7 @@ int32_t cascadia_runtime_import_blob(
 
         std::ifstream f(blob_path, std::ios::binary | std::ios::ate);
         if (!f) {
-            set_last_error(std::string("cannot open blob: ") + blob_path);
+            set_last_error((std::string("cannot open blob: ") + blob_path).c_str());
             return 1;
         }
         const auto size = static_cast<size_t>(f.tellg());
@@ -510,7 +510,7 @@ int32_t cascadia_runtime_import_blob(
         ov::Tensor blob(ov::element::u8, ov::Shape{size});
         if (!f.read(reinterpret_cast<char*>(blob.data()),
                     static_cast<std::streamsize>(size))) {
-            set_last_error(std::string("short read on blob: ") + blob_path);
+            set_last_error((std::string("short read on blob: ") + blob_path).c_str());
             return 1;
         }
         f.close();
