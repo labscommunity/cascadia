@@ -137,27 +137,98 @@ graph init (0.69 s vs 0.88 s pre-fix; a cold pipeline's first request can
 still wait on downstream stages' one-time model COMPILE — health reflects
 stage 0 only).
 
+## Device × model-size matrix (2026-07-16)
+
+Same box/SDK/flags; Llama-3.2-1B, Llama-3.2-3B, Llama-3.1-8B INT4
+single-stage static shards (context 1024, prefill chunk 64). TTFT in ms as
+short (~31-token) / long (~435-token) prompt. **steady** = request 2+ of a
+warm process (`CASCADIA_STATIC_TASKS=2`); a compiled NPU model IMPORTED from
+the blob cache defers ~300–430 ms of driver init to its first inference, so
+request-1-through-cache TTFTs read that much high (a cold in-process compile
+does not pay it — earlier ~500 ms short-prompt hybrid readings were this
+artifact, not the prefill).
+
+| Config | 1B short/long | 3B short/long | 8B short/long |
+|---|---|---|---|
+| tokenwise `[CPU]` | 1,543 / 22,787 | 4,526 / 63,559 | 7,458 / 94,589 |
+| chunked `[CPU]` steady | 240 / 1,654 | 649 / 4,360 | 1,582 / 9,161¹ |
+| **hybrid `[NPU→CPU]` steady** | **129 / 644** | **321 / 1,582** | — ² |
+| tokenwise `[GPU]` | 1,312 / 20,575 | 4,473 / 54,623 | 4,847 / 67,273 |
+| chunked `[GPU]` | 74 / 391 | 226 / 1,228 | 357 / 1,410 |
+| hybrid `[NPU→GPU]` ³ | 493 / 948 | 734 / 2,009 | — ² |
+| tokenwise `[NPU]` | 1,295 / 17,967 | 4,412 / 49,142 | — ² |
+| chunked `[NPU]` (all-NPU) | 205 / 1,002³ | 393 / 1,965³ | — ² |
+
+¹ 8B first-request numbers (single runs; steady not probed at 8B).
+² Any NPU compile of the 8B stage is infeasible on this 32 GB box: the NPU
+compiler's host-side transient exceeded ~23 GB with NOTHING else resident
+(free RAM 26.9 → 3.6 GB, run killed by a safety watchdog; the hybrid attempt
+with the CPU decode model already resident hit 0.7 GB free). Matches Intel's
+">16 GB RAM for >7B models" NPU guidance. The transient scales with stage
+weight bytes, so the viable 8B-on-NPU route is pipeline-parallel (2+ stages
+≈ 3B-class bytes per stage) — not yet measured.
+³ First request after a cache import (subtract ~300–430 ms for steady; e.g.
+cold-compiled all-NPU long measured 687 ms at 1B).
+
+Decode tok/s across the same runs — the ladder flips with model size:
+
+| Model | NPU | GPU | CPU |
+|---|---|---|---|
+| 1B | **24.3–25.6** | 20.0–22.6 | 18.4–19.2 |
+| 3B | **8.7–9.0** | 7.1–8.2 | 5.4–7.0 |
+| 8B | n/a² | **5.8–6.5** | 4.0–4.4 |
+
+Matrix takeaways:
+
+- **GPU is the fastest prefill device at every size** (74–357 ms short,
+  391–1,410 ms long) — the phase-split mechanism is device-agnostic, and
+  `--prefill-device GPU` (or all-GPU chunked) is the raw-TTFT winner when the
+  iGPU is free.
+- **Steady NPU prefill beats chunked-CPU prefill 1.9–2.8×**, growing with
+  prompt length and model size (1B short 240→129; 3B long 4,360→1,582) — at
+  identical decode, since the CPU never sees the prefill.
+- **NPU decode stays FASTEST up to 3B on this silicon** (24.5 → 9.0 tok/s
+  ladder-topping at 1B and 3B). The "NPU decode ~1.5× slower than CPU" regime
+  from three-tier placement (Yi-9B class) is unreachable single-stage on a
+  32 GB LNL box — the NPU compile envelope excludes those models first.
+- **Greedy parity across kernels/devices**: same-device CPU and NPU legs are
+  token-exact at every size (hard-asserted). GPU legs (seq=64 vs seq=1
+  compile to different kernel/accumulation choices) and cross-device hybrid
+  legs can fork at a genuine argmax near-tie — deterministic per config,
+  observed more often as model size grows, both branches usually coherent
+  (one 3B NPU→GPU short-prompt fork read distinctly worse). Perf sweeps on
+  those configs run with `CASCADIA_PARITY_SOFT=1`, which reports the fork
+  index + both texts instead of aborting; CPU/NPU validation never sets it.
+
 ## What the numbers say
 
 1. **Chunked prefill is the first-order win** (5.8–11.7× TTFT on a single
    device): it converts prefill from `P` weight-streaming GEMV passes into
    `⌈P/C⌉` wide GEMM passes. This lands even with no second device.
-2. **The NPU compounds it on real prompts.** At one chunk the NPU's edge
-   over CPU is modest (265 → 202 ms; per-run setup dominates). At 7 chunks
-   the NPU prefills **2.05× faster than the CPU** (1929 → 942 ms) and 24×
-   faster than the shipping tokenwise path — the compute-bound phase
-   belongs on the 48-TOPS engine, and the gap widens with prompt length.
+2. **The NPU compounds it on real prompts.** Steady-state (request 2+ of a
+   warm process — see the matrix section's import-init note) the NPU
+   prefills **1.9–2.8× faster than the chunked CPU** at both 1B and 3B,
+   the edge growing with prompt length and model size, up to **35–40× over
+   the shipping tokenwise path** — the compute-bound phase belongs on the
+   48-TOPS engine.
 3. **Decode is untouched** (18–19 tok/s in every CPU-decode config): the
    phase boundary costs nothing observable — the shared host ring means no
    KV transfer step exists to pay for.
-4. **Honest nuance:** on THIS 1B model the NPU's own decode (24.7 tok/s
-   tokenwise) beats CPU decode — small-model decode on NPU4 is fine, and
-   all-NPU chunked (`--device NPU`, no `--prefill-device`) is a legitimate
-   config at 7.6× TTFT. The CPU-decode split matters for the cases
-   three-tier placement measured (larger models under memory pressure,
-   NPU decode ~1.5× slower than CPU, THREE_TIER_PLACEMENT.md) and when the
-   NPU should stay free between requests. Measure per model; the knobs
-   compose either way.
+4. **Honest nuance (revised by the device matrix above):** NPU decode is
+   the FASTEST decode on this silicon up to 3B, and all-NPU chunked
+   (`--device NPU`, no `--prefill-device`) or all-GPU chunked are legitimate
+   single-device configs — all-GPU wins raw TTFT outright. What the
+   NPU→CPU split uniquely buys is the best CPU-decode TTFT while leaving
+   BOTH accelerators idle between phases: prefill borrows the NPU for
+   ~130 ms–1.6 s and decode taxes only the CPU — the right shape when the
+   iGPU is busy (demos, display, another model), when the NPU must stay
+   available (system AI), for multi-tenant boxes, or for battery (the NPU
+   is the lowest-power engine for the compute burst). At 8B-class the
+   matrix is blunter: no NPU config compiles on 32 GB (envelope note
+   above), so the accelerated configs are GPU-chunked or CPU-chunked, and
+   the "NPU decode slower at big models" regime (three-tier placement,
+   Yi-9B under memory pressure) never arises single-stage. Measure per
+   model; the knobs compose every way.
 
 ## Constraints & follow-ups
 
