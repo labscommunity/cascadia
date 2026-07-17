@@ -13,7 +13,6 @@ use std::path::Path;
 
 use super::loader::{load_stage_mode, ExpertsMode, LoadError, Manifest};
 use super::model::DsV4Model;
-use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Default context budget for cache sizing when the caller doesn't pass one
 /// (the checkpoint itself allows up to 1M; caches scale with this).
@@ -125,78 +124,40 @@ impl Dsv4Runner {
     pub fn head_logits(&self, hidden: &[f32]) -> Vec<f32> {
         self.model.logits(hidden)
     }
+}
 
-    /// Single-stage generation with sampling (greedy when the config says
-    /// so). Prompt tokens drive the same per-token path as decode.
-    pub fn generate(&mut self, prompt: &[u32], max_new: usize, cfg: &SamplingConfig) -> Vec<u32> {
-        self.generate_reason(prompt, max_new, cfg).0
+/// The engine-facing staged surface. Single-stage `generate`/`generate_argmax`
+/// come from the trait defaults (identical loop to the former inherent ones,
+/// gated by `dsv4_sampling_parity`); the 7 required methods delegate to the
+/// model. The inherent accessors above are kept for the wire tests that drive
+/// the runner directly.
+impl crate::staged::StagedRunner for Dsv4Runner {
+    fn arch_name(&self) -> &'static str {
+        "dsv4"
     }
-
-    /// Like [`Self::generate`], but also reports whether decode stopped because
-    /// the context window filled (`pos == max_seq`) rather than by the token cap
-    /// or an EOS. The caller needs this to set the OpenAI `finish_reason`: a run
-    /// cut off by the window is `length`, not `stop`, even below `max_new`.
-    pub fn generate_reason(
-        &mut self,
-        prompt: &[u32],
-        max_new: usize,
-        cfg: &SamplingConfig,
-    ) -> (Vec<u32>, bool) {
-        self.reset();
-        if prompt.is_empty() {
-            return (Vec::new(), false);
-        }
-        let max_seq = self.max_seq;
-        let mut rng = init_rng(cfg.seed);
-        let mut history: Vec<i64> = Vec::new();
-        // Prefill: forward each prompt token at its absolute position, keeping
-        // only the LAST forwarded token's logits. We sample exactly once, after
-        // prefill — mirroring the pipeline, where intermediate prompt tokens go
-        // as ForwardNoSample and only the last one seeds+draws, so seeded
-        // temperature>0 output is identical single-stage vs pipelined. (Greedy
-        // is unchanged: sample() returns the argmax of these same last logits
-        // without touching the RNG.) A prompt longer than the context budget is
-        // truncated to its first max_seq tokens — raise CASCADIA_DSV4_MAX_SEQ.
-        let mut last_logits: Vec<f32> = Vec::new();
-        for (pos, &t) in prompt.iter().enumerate() {
-            if pos >= max_seq {
-                break;
-            }
-            let h = self.embed_token(t);
-            let h = self.forward_layers(h, pos, Some(t));
-            last_logits = self.head_logits(&h);
-        }
-        let mut next = sample(&last_logits, &history, cfg, &mut rng);
-        let mut out = Vec::with_capacity(max_new);
-        let mut pos = prompt.len().min(max_seq);
-        let mut hit_context_cap = false;
-        loop {
-            let tok = next as u32;
-            out.push(tok);
-            history.push(next);
-            if out.len() >= max_new || self.eos.contains(&tok) {
-                break;
-            }
-            // Stop before forwarding at an absolute position the caches can't
-            // hold (== max_seq): that write would index past the rope/KV/
-            // compressed/indexer rows. Checked after the push so the token
-            // sampled from the last in-range position is still emitted. This is
-            // a truncation, not a natural stop -> the caller reports `length`.
-            if pos >= max_seq {
-                hit_context_cap = true;
-                break;
-            }
-            let h = self.embed_token(tok);
-            let h = self.forward_layers(h, pos, Some(tok));
-            let logits = self.head_logits(&h);
-            next = sample(&logits, &history, cfg, &mut rng);
-            pos += 1;
-        }
-        (out, hit_context_cap)
+    fn hidden_size(&self) -> usize {
+        self.hidden
     }
-
-    /// Single-stage greedy convenience (warmup / tests).
-    pub fn generate_argmax(&mut self, prompt: &[u32], max_new: usize) -> Vec<u32> {
-        self.generate(prompt, max_new, &SamplingConfig::default())
+    fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+    fn eos_token_ids(&self) -> &[u32] {
+        &self.eos
+    }
+    fn reset(&mut self) {
+        self.model.reset();
+    }
+    fn embed_token(&self, token: u32) -> Vec<f32> {
+        self.model
+            .embed_ids(&[token as usize])
+            .pop()
+            .expect("embed_ids returns one entry per id")
+    }
+    fn forward_layers(&mut self, hidden: Vec<f32>, pos: usize, token: Option<u32>) -> Vec<f32> {
+        self.model
+            .forward_layers_decode(hidden, pos, token.map(|t| t as usize))
+    }
+    fn head_logits(&self, hidden: &[f32]) -> Vec<f32> {
+        self.model.logits(hidden)
     }
 }
