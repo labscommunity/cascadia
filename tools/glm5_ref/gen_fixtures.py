@@ -19,8 +19,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
-                                  moe_gate, moe_ref, precompute_freqs_cis,
-                                  swiglu_ref)
+                                  layer_ref, moe_gate, moe_ref,
+                                  precompute_freqs_cis, swiglu_ref)
 
 FX = {}
 META = {}
@@ -162,6 +162,49 @@ def main():
     put("moe.out", m_out)
     META["moe"] = {"hidden": MHID, "n_experts": MEXP, "top_k": MTOPK,
                    "moe_inter": MINT, "scale": MSCALE, "rows": MROWS}
+
+    # ---- 7. full transformer layer: norms + attn + residual + MoE + residual ----
+    lcfg = {"hidden": 32, "n_heads": 3, "qk_nope": 6, "qk_rope": 4, "v_head": 6,
+            "kv_lora": 8, "q_lora": 16, "eps": 1e-5, "theta": 8.0e6}
+    lH, lhid, lnope, lrp = lcfg["n_heads"], lcfg["hidden"], lcfg["qk_nope"], lcfg["qk_rope"]
+    lvh, lkvl, lql = lcfg["v_head"], lcfg["kv_lora"], lcfg["q_lora"]
+    lqk = lnope + lrp
+    lE, lTOPK, lINT, lSCALE, lSEQ = 4, 2, 10, 2.5, 5
+
+    def norm_w(n):
+        return (1.0 + 0.05 * torch.randn(n, generator=g)).to(torch.bfloat16).to(torch.float32)
+
+    l_in_ln, l_post_ln = norm_w(lhid), norm_w(lhid)
+    l_aw = {
+        "wq_a": wbf(lql, lhid), "q_a_ln": norm_w(lql), "wq_b": wbf(lH * lqk, lql),
+        "wkv_a": wbf(lkvl + lrp, lhid), "kv_a_ln": norm_w(lkvl),
+        "wkv_b": wbf(lH * (lnope + lvh), lkvl), "wo": wbf(lhid, lH * lvh),
+    }
+    l_rw, l_rb = wbf(lE, lhid), (0.3 * torch.randn(lE, generator=g)).to(torch.bfloat16).to(torch.float32)
+    l_experts = [(wbf(lINT, lhid), wbf(lINT, lhid), wbf(lhid, lINT)) for _ in range(lE)]
+    l_shared = (wbf(lINT, lhid), wbf(lINT, lhid), wbf(lhid, lINT))
+    lx = (0.5 * torch.randn(lSEQ, lhid, generator=g)).to(torch.bfloat16).to(torch.float32)
+    l_out, l_hmid = layer_ref(lx, l_in_ln, l_post_ln, l_aw, lcfg,
+                              (l_rw, l_rb, l_experts, l_shared), (lTOPK, lSCALE), lcfg["eps"])
+    put("layer.h_mid", l_hmid)
+
+    put("layer.in_ln", l_in_ln)
+    put("layer.post_ln", l_post_ln)
+    for k, v in l_aw.items():
+        put(f"layer.attn.{k}", v)
+    put("layer.moe.router_w", l_rw)
+    put("layer.moe.router_bias", l_rb)
+    for e in range(lE):
+        put(f"layer.moe.e{e}.wg", l_experts[e][0])
+        put(f"layer.moe.e{e}.wu", l_experts[e][1])
+        put(f"layer.moe.e{e}.wd", l_experts[e][2])
+    put("layer.moe.sh.wg", l_shared[0])
+    put("layer.moe.sh.wu", l_shared[1])
+    put("layer.moe.sh.wd", l_shared[2])
+    put("layer.x", lx)
+    put("layer.out", l_out)
+    META["layer"] = {**{k: lcfg[k] for k in lcfg}, "n_experts": lE, "top_k": lTOPK,
+                     "moe_inter": lINT, "scale": lSCALE, "seq": lSEQ}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
