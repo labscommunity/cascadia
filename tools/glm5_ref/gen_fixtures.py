@@ -18,8 +18,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, moe_gate,
-                                  precompute_freqs_cis)
+from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
+                                  moe_gate, precompute_freqs_cis)
 
 FX = {}
 META = {}
@@ -97,6 +97,30 @@ def main():
     put("attn.x", ax)
     put("attn.out", aout)
     META["attn"] = {**{k: acfg[k] for k in acfg}, "seq": NS}
+
+    # ---- 4. DSA lightning indexer: score causal keys, select top-k ----
+    icfg = {"hidden": 32, "q_lora": 16, "index_nh": 2, "index_hd": 8,
+            "qk_rope": 4, "ln_eps": 1e-6, "theta": 8.0e6}
+    inh, ihd, ird, iql, ihid = (icfg["index_nh"], icfg["index_hd"], icfg["qk_rope"],
+                                icfg["q_lora"], icfg["hidden"])
+    ISEQ, IQPOS, ITOPK = 6, 5, 3  # nk=6 > topk=3 -> selection active
+    iw = {
+        "ix_wq": wbf(inh * ihd, iql),
+        "ix_wk": wbf(ihd, ihid),
+        "ix_wp": wbf(inh, ihid),
+        "k_norm_w": (1.0 + 0.05 * torch.randn(ihd, generator=g)).to(torch.bfloat16).to(torch.float32),
+        "k_norm_b": (0.1 * torch.randn(ihd, generator=g)).to(torch.bfloat16).to(torch.float32),
+    }
+    ix = (0.5 * torch.randn(ISEQ, ihid, generator=g)).to(torch.bfloat16).to(torch.float32)
+    iqr = (0.5 * torch.randn(ISEQ, iql, generator=g)).to(torch.bfloat16).to(torch.float32)
+    isc, isel = indexer_ref(ix, iqr[IQPOS], iw, icfg, IQPOS, ITOPK)
+    for k, v in iw.items():
+        put(f"idx.{k}", v)
+    put("idx.x", ix)
+    put("idx.qr", iqr)
+    put("idx.isc", isc)
+    put_i32("idx.sel", isel)
+    META["idx"] = {**{k: icfg[k] for k in icfg}, "seq": ISEQ, "query_pos": IQPOS, "topk": ITOPK}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
