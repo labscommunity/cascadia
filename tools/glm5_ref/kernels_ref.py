@@ -69,6 +69,21 @@ def moe_ref(x, rw, rb, experts, shared, top_k, scale):
     return out
 
 
+def layer_ref(x, in_ln, post_ln, aw, acfg, moe, mcfg, eps):
+    """One GLM transformer layer (pre-norm):
+        h   = x + attention(rmsnorm(x, input_layernorm))
+        out = h + mlp(rmsnorm(h, post_attention_layernorm))
+    `mlp` is the MoE block here. `moe = (router_w, router_bias, experts,
+    shared)`, `mcfg = (top_k, scale)`. RMSNorm eps = rms_norm_eps."""
+    nrm = _rms(x, in_ln, eps)
+    h = x.to(torch.float32) + attention_ref_absorbed(nrm, aw, acfg)
+    nrm2 = _rms(h, post_ln, eps)
+    rw, rb, experts, shared = moe
+    top_k, scale = mcfg
+    out = h + moe_ref(nrm2, rw, rb, experts, shared, top_k, scale)
+    return out, h  # h = post-attention residual (diagnostic)
+
+
 def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
     """Classic LayerNorm (mean + population variance, weight + bias),
     bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""
@@ -203,6 +218,46 @@ def attention_ref(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dict) -> tor
             ctx[s, h] = (p.unsqueeze(-1) * value[: s + 1, h]).sum(0)
 
     return _lin(ctx.reshape(S, H * vh), w["wo"])                 # [S, hidden]
+
+
+def attention_ref_absorbed(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dict) -> torch.Tensor:
+    """GLM-5.2 MLA attention, ABSORBED-latent form — mirrors the Rust shell's
+    decode path operand-for-operand (differs from `attention_ref` only in
+    accumulation order, ULP). Use this when composing a full layer so the
+    attention output matches the shell tightly and doesn't perturb the router;
+    `attention_ref` (naive) remains the independent check that absorbed==naive.
+    """
+    H, nope, rope = cfg["n_heads"], cfg["qk_nope"], cfg["qk_rope"]
+    vh, kvl, eps, theta = cfg["v_head"], cfg["kv_lora"], cfg["eps"], cfg["theta"]
+    qk = nope + rope
+    S = x.shape[0]
+    scale = 1.0 / math.sqrt(qk)
+    fc = precompute_freqs_cis(rope, S, theta)
+
+    qr = _rms(_lin(x, w["wq_a"]), w["q_a_ln"], eps)
+    q = _lin(qr, w["wq_b"]).reshape(S, H, qk)
+    comp = _lin(x, w["wkv_a"])
+    lat = _rms(comp[:, :kvl], w["kv_a_ln"], eps)                 # Lc [S,kvl]
+    kpe = apply_rotary_emb(comp[:, kvl:], fc)                    # Rc [S,rope]
+    qpe = apply_rotary_emb(q[:, :, nope:qk], fc.unsqueeze(1))    # [S,H,rope]
+    qnope = q[:, :, :nope]                                       # [S,H,nope]
+    wkv_b = w["wkv_b"].to(torch.float32)                         # [H*(nope+vh), kvl]
+
+    ctx = torch.zeros(S, H, vh, dtype=torch.float32)
+    for s in range(S):
+        for h in range(H):
+            rbase = h * (nope + vh)
+            w_uk = wkv_b[rbase:rbase + nope, :]                  # [nope, kvl]
+            w_uv = wkv_b[rbase + nope:rbase + nope + vh, :]      # [vh, kvl]
+            qabs = qnope[s, h] @ w_uk                            # [kvl]
+            sc = torch.empty(s + 1, dtype=torch.float32)
+            for t in range(s + 1):
+                sc[t] = (torch.dot(qabs, lat[t]) + torch.dot(qpe[s, h], kpe[t])) * scale
+            p = torch.softmax(sc, dim=0)
+            clat = (p.unsqueeze(-1) * lat[: s + 1]).sum(0)       # [kvl]
+            ctx[s, h] = w_uv @ clat                              # [vh]
+
+    return _lin(ctx.reshape(S, H * vh), w["wo"])
 
 
 def _rope_first(v: torch.Tensor, fc_pos: torch.Tensor, rd: int) -> torch.Tensor:

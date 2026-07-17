@@ -22,5 +22,6 @@ pub mod attn;
 pub mod ffn;
 pub mod gate;
 pub mod indexer;
+pub mod model;
 pub mod moe;
 pub mod rope;
