@@ -49,6 +49,26 @@ import torch
 
 from deepseek_v4_ref.kernels_ref import e8m0_to_f32, dequant_fp4_weight
 
+# R1-family chat template emitted when the source checkpoint ships no
+# chat_template.jinja (V4-Flash carries a Python encoder instead). Mirrors
+# the DeepSeek-V3-0324 instruct template: bos + <｜User｜>/<｜Assistant｜>
+# turn markers, <｜end▁of▁sentence｜> after each assistant turn, and a bare
+# <｜Assistant｜> generation prompt (no forced think token). bos_token is
+# supplied by the API's jinja render context.
+DSV4_CHAT_TEMPLATE = (
+    "{% if not add_generation_prompt is defined %}"
+    "{% set add_generation_prompt = false %}{% endif %}"
+    "{{ bos_token }}"
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}{{ message['content'] }}"
+    "{% elif message['role'] == 'user' %}"
+    "{{ '<｜User｜>' + message['content'] }}"
+    "{% elif message['role'] == 'assistant' %}"
+    "{{ '<｜Assistant｜>' + message['content'] + '<｜end▁of▁sentence｜>' }}"
+    "{% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% endif %}"
+)
+
 # --------------------------------------------------------------------------
 # int4_bin packing — same layout as tools/export_minimax_m2.py (validated by
 # the Rust test int4_bin_expert_matches_fp32_within_tolerance). Duplicated
@@ -605,6 +625,16 @@ def main():
     ):
         if (md / fn).exists():
             shutil.copy(md / fn, out / fn)
+    # DeepSeek-V4-Flash ships its chat format as a Python encoder
+    # (encoding_dsv4.py), not a jinja template, so the copy above finds no
+    # chat_template.jinja and the API would fall back to a generic
+    # "role: content" join that degrades this instruct model. Emit the
+    # R1-family template (the <｜User｜>/<｜Assistant｜> markers the model
+    # was aligned on) so /v1/chat/completions renders instruct prompts
+    # correctly. bos_token is injected by the API render context.
+    ct = out / "chat_template.jinja"
+    if not ct.exists():
+        ct.write_text(DSV4_CHAT_TEMPLATE, encoding="utf-8")
     print("[done full]", flush=True)
 
 

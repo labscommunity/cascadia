@@ -1795,6 +1795,95 @@ mod tests {
         assert_eq!(chunk_token_count(&c), 1);
     }
 
+    // The R1-family chat template the exporter (tools/export_deepseek_v4.py,
+    // DSV4_CHAT_TEMPLATE) writes for DeepSeek-V4-Flash, which ships no jinja
+    // template of its own. Kept byte-identical here so this test guards the
+    // exact string that reaches production.
+    const DSV4_CHAT_TEMPLATE: &str = concat!(
+        "{% if not add_generation_prompt is defined %}",
+        "{% set add_generation_prompt = false %}{% endif %}",
+        "{{ bos_token }}",
+        "{% for message in messages %}",
+        "{% if message['role'] == 'system' %}{{ message['content'] }}",
+        "{% elif message['role'] == 'user' %}",
+        "{{ '<｜User｜>' + message['content'] }}",
+        "{% elif message['role'] == 'assistant' %}",
+        "{{ '<｜Assistant｜>' + message['content'] + '<｜end▁of▁sentence｜>' }}",
+        "{% endif %}{% endfor %}",
+        "{% if add_generation_prompt %}{{ '<｜Assistant｜>' }}{% endif %}",
+    );
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    // Proves the dsv4 chat fix at the render boundary: WITHOUT a template the
+    // API degenerates an instruct model into a "role: content" join; WITH the
+    // R1 template it emits the <｜User｜>/<｜Assistant｜> markers the model was
+    // aligned on. Same messages through both paths — the diff is the fix.
+    #[test]
+    fn dsv4_chat_template_renders_r1_format_not_legacy_join() {
+        let msgs = [
+            msg("user", "What is 2+2?"),
+            msg("assistant", "4"),
+            msg("user", "And 3+3?"),
+        ];
+
+        // No template (a dsv4 export before the fix): generic formatter, no
+        // R1 turn markers — the state that degrades instruct chat.
+        let legacy = ChatPromptRenderer::new(&ChatTemplateConfig::default()).render(&msgs);
+        assert!(
+            !legacy.contains("<｜User｜>") && !legacy.contains("<｜Assistant｜>"),
+            "legacy formatter must NOT emit R1 markers, got: {legacy}"
+        );
+
+        // With the R1 template + the model's real bos/eos tokens.
+        let cfg = ChatTemplateConfig {
+            template: Some(DSV4_CHAT_TEMPLATE.to_string()),
+            bos_token: Some("<｜begin▁of▁sentence｜>".to_string()),
+            eos_token: Some("<｜end▁of▁sentence｜>".to_string()),
+        };
+        let r1 = ChatPromptRenderer::new(&cfg).render(&msgs);
+        let want = "<｜begin▁of▁sentence｜><｜User｜>What is 2+2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3+3?<｜Assistant｜>";
+        assert_eq!(r1, want, "R1 render mismatch");
+    }
+
+    // Proves the CLI's sparse-moe root-layout path (load_chat_template_config_at,
+    // which the SparseMoe arm now uses) resolves the template the exporter
+    // writes to the model root, and extracts bos/eos from the AddedToken object
+    // shape dsv4's tokenizer_config uses.
+    #[test]
+    fn load_chat_template_at_reads_root_jinja_and_addedtoken_tokens() {
+        let dir = std::env::temp_dir().join(format!("dsv4_tpl_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // dsv4 export layout: tokenizer_config.json with AddedToken bos/eos and
+        // NO inline chat_template, plus a sibling chat_template.jinja.
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"add_bos_token":false,"bos_token":{"__type":"AddedToken","content":"<｜begin▁of▁sentence｜>"},"eos_token":{"__type":"AddedToken","content":"<｜end▁of▁sentence｜>"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), DSV4_CHAT_TEMPLATE).unwrap();
+
+        let cfg = load_chat_template_config_at(&dir);
+        assert!(cfg.template.is_some(), "template must load from root jinja");
+        assert_eq!(cfg.bos_token.as_deref(), Some("<｜begin▁of▁sentence｜>"));
+        assert_eq!(cfg.eos_token.as_deref(), Some("<｜end▁of▁sentence｜>"));
+
+        // ...and it renders end-to-end through the same public renderer.
+        let out = ChatPromptRenderer::new(&cfg).render(&[msg("user", "hi")]);
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜>");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn make_app() -> Router {
         let mut runner = Runner::new(Box::new(MockBuilder::new()));
         runner

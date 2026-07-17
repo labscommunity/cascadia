@@ -1588,6 +1588,20 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::Qwen36Moe => {
                 cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
             }
+            // sparse-moe exports (dsv4) keep the tokenizer files and
+            // chat_template.jinja at the model root, not in a tokenizer/
+            // subdir. Read the root first; fall back to the subdir layout so
+            // other sparse-moe models (MiniMax-M2) that ship a tokenizer/
+            // subdir still resolve their template.
+            EngineKind::SparseMoe => {
+                let root =
+                    cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model));
+                if root.template.is_some() {
+                    root
+                } else {
+                    cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
+                }
+            }
             _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
         };
         if chat_template.template.is_some() {
