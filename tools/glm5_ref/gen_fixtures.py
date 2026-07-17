@@ -332,6 +332,16 @@ def main():
     total = sum(t.numel() * t.element_size() for t in FX.values())
     print(f"[glm5 fixtures] {len(FX)} tensors, {total/1e6:.3f} MB -> {out}")
 
+    # ---- 10. loader round-trip: write a tiny export, generate via the export
+    #          reader (the Rust glm::loader must reproduce these greedy tokens) ----
+    import export_glm5
+    from glm5_ref.load_export import load_export_and_generate
+    export_dir = out.parent / "glm5_export"
+    export_glm5.export_tiny(export_dir)
+    rt_prompt, rt_ngen = [1, 2, 3, 4], 4
+    rt_greedy = load_export_and_generate(export_dir, rt_prompt, rt_ngen)
+    print(f"[loader round-trip] export {export_dir} prompt {rt_prompt} greedy {rt_greedy}")
+
 
 if __name__ == "__main__":
     main()

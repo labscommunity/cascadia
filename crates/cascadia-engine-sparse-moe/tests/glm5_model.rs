@@ -66,7 +66,7 @@ fn model_greedy_matches_reference() {
         let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, eps, aw, freqs);
 
         let mlp = if li < first_dense {
-            LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")), inter: dense_inter }
+            LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")).into(), inter: dense_inter }
         } else {
             let experts: Vec<AnyExpert> = (0..n_experts)
                 .map(|e| load_expert(&format!("{lp}.moe.e{e}")).into())
