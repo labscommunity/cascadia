@@ -106,6 +106,26 @@ impl MmapExpert {
         self.gemv(w2_off, dim, inter, &h, &mut out);
         out
     }
+
+    /// SwiGLU section GEMVs exposed for shells with a different activation
+    /// contract (the glm5 shell applies f32 `silu·up`, no clamp, route outside).
+    /// Each returns the bf16-rounded fused int4 dequant-dot (same kernel as
+    /// [`Self::forward`]). `dim`/`inter` are the ones passed to `open`.
+    pub fn gemv_gate(&self, x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; self.inter];
+        self.gemv(0, self.inter, self.dim, x, &mut y);
+        y
+    }
+    pub fn gemv_up(&self, x: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; self.inter];
+        self.gemv(section_bytes(self.inter, self.dim), self.inter, self.dim, x, &mut y);
+        y
+    }
+    pub fn gemv_down(&self, h: &[f32]) -> Vec<f32> {
+        let mut y = vec![0.0f32; self.dim];
+        self.gemv(2 * section_bytes(self.inter, self.dim), self.dim, self.inter, h, &mut y);
+        y
+    }
 }
 
 /// Fused int4 dequant + dot for one output row: `Σ_k (nibble_k - 8) * scale(g(k)) * x[k]`,

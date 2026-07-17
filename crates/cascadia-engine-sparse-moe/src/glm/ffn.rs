@@ -6,6 +6,7 @@
 //! `tools/glm5_ref::swiglu_ref`): bf16 after each linear; the `silu·up` product
 //! stays f32 (`silu(g)·u`).
 
+use crate::dsv4::expert_mmap::MmapExpert;
 use crate::dsv4::math::{linear_bf16, linear_bf16_w};
 
 /// SiLU / swish: `x·sigmoid(x)`.
@@ -54,4 +55,17 @@ pub fn swiglu_f32w(x: &[f32], wg: &[f32], wu: &[f32], wd: &[f32], hidden: usize,
     let mut y = vec![0.0f32; hidden];
     linear_bf16(&g, wd, hidden, inter, &mut y);
     y
+}
+
+/// SwiGLU FFN for an mmap'd int4 expert: the same contract as [`swiglu_f32w`]
+/// (bf16 after each GEMV, `silu·up` in f32), but each projection is the fused
+/// int4 dequant-dot from disk. Agrees with the eager path within a few bf16 ULP
+/// (the fused kernel reorders the f32 summation).
+pub fn swiglu_mmap(m: &MmapExpert, x: &[f32]) -> Vec<f32> {
+    let mut h = m.gemv_gate(x);
+    let u = m.gemv_up(x);
+    for (hi, &ui) in h.iter_mut().zip(&u) {
+        *hi = silu(*hi) * ui;
+    }
+    m.gemv_down(&h)
 }
