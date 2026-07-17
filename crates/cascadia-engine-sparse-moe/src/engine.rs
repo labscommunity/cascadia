@@ -2574,8 +2574,17 @@ impl Engine for OvMoeEngine {
 // ids never leave rank 0 (hash-gate layers are always in stage 0).
 // ---------------------------------------------------------------------
 
-pub struct Dsv4Engine {
-    runner: crate::dsv4::stage::Dsv4Runner,
+use crate::staged::StagedRunner;
+
+/// dsv4's concrete engine (historical name kept for its tests + build()).
+pub type Dsv4Engine = PipelineEngine<crate::dsv4::stage::Dsv4Runner>;
+
+/// Arch-agnostic pipeline engine over a [`StagedRunner`]: rank 0 tokenizes +
+/// drives one wire round-trip per token (prompt included), workers run their
+/// layer slice, the last rank samples. Shared by the dsv4 and glm5 Rust shells
+/// (minimax keeps its own engine — different disconnect semantics).
+pub struct PipelineEngine<R: StagedRunner> {
+    runner: R,
     tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
@@ -2589,9 +2598,9 @@ pub struct Dsv4Engine {
     last_rank_rng_seeded: bool,
 }
 
-impl Dsv4Engine {
+impl<R: StagedRunner> PipelineEngine<R> {
     fn new(
-        runner: crate::dsv4::stage::Dsv4Runner,
+        runner: R,
         tokenizer: Option<Tokenizer>,
         transport: StageTransport,
         runtime_handle: tokio::runtime::Handle,
@@ -3026,7 +3035,7 @@ impl Dsv4Engine {
     }
 }
 
-impl Engine for Dsv4Engine {
+impl<R: StagedRunner> Engine for PipelineEngine<R> {
     fn warmup(&mut self) {
         if self.total == 1 {
             if let Some(tok) = self.tokenizer.as_ref() {

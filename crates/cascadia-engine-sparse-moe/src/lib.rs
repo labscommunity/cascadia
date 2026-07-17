@@ -47,6 +47,7 @@ pub mod ov_moe;
 pub mod runner;
 pub mod sampling;
 pub mod spec_decode;
+pub mod staged;
 pub mod tensors;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
