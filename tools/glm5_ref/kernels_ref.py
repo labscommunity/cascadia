@@ -29,6 +29,18 @@ def _lin(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return _bf16(x.to(torch.float32) @ w.to(torch.float32).t())
 
 
+def swiglu_ref(x: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor,
+               wd: torch.Tensor) -> torch.Tensor:
+    """GLM/DeepSeek SwiGLU FFN: down(silu(gate·x) * up·x), no bias — used by
+    routed experts, the shared expert, and the dense first-k layers
+    (`silu(g)·u` then down). bf16 after each linear; the
+    silu*up product stays f32."""
+    g = _lin(x, wg)
+    u = _lin(x, wu)
+    h = torch.nn.functional.silu(g) * u
+    return _lin(h, wd)
+
+
 def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
     """Classic LayerNorm (mean + population variance, weight + bias),
     bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""
