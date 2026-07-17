@@ -19,3 +19,4 @@
 //!   4. engine/manifest wiring (`shell_backend = "rust_glm"`)
 
 pub mod gate;
+pub mod rope;

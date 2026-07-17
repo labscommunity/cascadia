@@ -10,6 +10,33 @@ from typing import Tuple
 import torch
 
 
+def precompute_freqs_cis(dim: int, seqlen: int, base: float) -> torch.Tensor:
+    """GLM-5.2 rope frequency table. `rope_type="default"` -> NO YaRN, so this
+    is the plain inverse-frequency table (unlike the V4 reference which blends
+    YaRN when original_seq_len > 0).
+
+    freqs[i] = base^-(2i/dim); returns the complex cis of shape
+    [seqlen, dim/2]. Computed in fp32 to match the Rust `precompute_freqs`.
+    """
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    t = torch.arange(seqlen, dtype=torch.float32)
+    ang = torch.outer(t, freqs)                          # [seqlen, dim/2]
+    return torch.polar(torch.ones_like(ang), ang)
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Interleaved partial RoPE (`rope_interleave=True`): adjacent (even, odd)
+    pairs of the last dim are rotated as one complex number by `freqs_cis` —
+    NOT rotate-half. `x[..., -1]` must be `2 * freqs_cis.shape[-1]`.
+
+    Output is bf16-rounded to match the Rust `apply_rope_row` write-back.
+    """
+    shape = x.shape
+    xc = torch.view_as_complex(x.to(torch.float32).reshape(*shape[:-1], -1, 2))
+    out = torch.view_as_real(xc * freqs_cis).reshape(shape)
+    return out.to(torch.bfloat16)
+
+
 def moe_gate(
     logits: torch.Tensor,
     bias: torch.Tensor,

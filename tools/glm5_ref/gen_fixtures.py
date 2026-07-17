@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from glm5_ref.kernels_ref import moe_gate
+from glm5_ref.kernels_ref import apply_rotary_emb, moe_gate, precompute_freqs_cis
 
 FX = {}
 META = {}
@@ -53,6 +53,18 @@ def main():
     put_i32("gate.idx", idx)
     put("gate.weight", weight)
     META["gate"] = {"T": T, "E": E, "top_k": TOP_K, "scale": SCALE, "norm_topk": True}
+
+    # ---- 2. rope: interleaved partial RoPE, dim 64, theta 8e6, no YaRN ----
+    # (GLM's qk_rope_head_dim = 64; rope_theta = 8e6; rope_type "default".)
+    ROPE_DIM, ROPE_THETA = 64, 8.0e6
+    SEQ, HEADS = 16, 2
+    fc = precompute_freqs_cis(ROPE_DIM, SEQ, ROPE_THETA)      # [SEQ, 32] complex
+    put("rope.freqs", torch.view_as_real(fc))                # [SEQ, 32, 2]
+    xr = (0.5 * torch.randn(6, HEADS, ROPE_DIM, generator=g)).to(torch.bfloat16)
+    put("rope.apply.in", xr)
+    yr = apply_rotary_emb(xr, fc[:6].unsqueeze(1))           # broadcast over heads
+    put("rope.apply.out", yr)
+    META["rope"] = {"dim": ROPE_DIM, "theta": ROPE_THETA, "seq": SEQ, "heads": HEADS}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
