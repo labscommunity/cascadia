@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
-                                  moe_gate, precompute_freqs_cis)
+                                  moe_gate, precompute_freqs_cis, swiglu_ref)
 
 FX = {}
 META = {}
@@ -121,6 +121,19 @@ def main():
     put("idx.isc", isc)
     put_i32("idx.sel", isel)
     META["idx"] = {**{k: icfg[k] for k in icfg}, "seq": ISEQ, "query_pos": IQPOS, "topk": ITOPK}
+
+    # ---- 5. SwiGLU FFN (expert / shared / dense MLP building block) ----
+    FHID, FINT, FROWS = 32, 20, 4
+    fwg, fwu = wbf(FINT, FHID), wbf(FINT, FHID)
+    fwd = wbf(FHID, FINT)
+    fx = (0.5 * torch.randn(FROWS, FHID, generator=g)).to(torch.bfloat16).to(torch.float32)
+    fy = swiglu_ref(fx, fwg, fwu, fwd)
+    put("ffn.wg", fwg)
+    put("ffn.wu", fwu)
+    put("ffn.wd", fwd)
+    put("ffn.x", fx)
+    put("ffn.out", fy)
+    META["ffn"] = {"hidden": FHID, "inter": FINT, "rows": FROWS}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
