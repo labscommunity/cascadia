@@ -18,7 +18,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from glm5_ref.kernels_ref import apply_rotary_emb, moe_gate, precompute_freqs_cis
+from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, moe_gate,
+                                  precompute_freqs_cis)
 
 FX = {}
 META = {}
@@ -65,6 +66,37 @@ def main():
     yr = apply_rotary_emb(xr, fc[:6].unsqueeze(1))           # broadcast over heads
     put("rope.apply.out", yr)
     META["rope"] = {"dim": ROPE_DIM, "theta": ROPE_THETA, "seq": SEQ, "heads": HEADS}
+
+    # ---- 3. MLA attention: tiny but structurally faithful (nope/pe/v split,
+    #         q/kv LoRA, kv_a/q_a RMSNorms, absorbed-vs-naive equivalence) ----
+    acfg = {
+        "hidden": 32, "n_heads": 3, "qk_nope": 6, "qk_rope": 4, "v_head": 6,
+        "kv_lora": 8, "q_lora": 16, "eps": 1e-5, "theta": 8.0e6,
+    }
+    H, hid, nope, rp = acfg["n_heads"], acfg["hidden"], acfg["qk_nope"], acfg["qk_rope"]
+    vh, kvl, ql = acfg["v_head"], acfg["kv_lora"], acfg["q_lora"]
+    qk = nope + rp
+    NS = 6  # sequence length (prefill + decode positions)
+
+    def wbf(*shape, s=0.3):
+        return (s * torch.randn(*shape, generator=g)).to(torch.bfloat16).to(torch.float32)
+
+    aw = {
+        "wq_a": wbf(ql, hid),
+        "q_a_ln": (1.0 + 0.05 * torch.randn(ql, generator=g)).to(torch.bfloat16).to(torch.float32),
+        "wq_b": wbf(H * qk, ql),
+        "wkv_a": wbf(kvl + rp, hid),
+        "kv_a_ln": (1.0 + 0.05 * torch.randn(kvl, generator=g)).to(torch.bfloat16).to(torch.float32),
+        "wkv_b": wbf(H * (nope + vh), kvl),
+        "wo": wbf(hid, H * vh),
+    }
+    ax = (0.5 * torch.randn(NS, hid, generator=g)).to(torch.bfloat16).to(torch.float32)
+    aout = attention_ref(ax, aw, acfg)
+    for k, v in aw.items():
+        put(f"attn.{k}", v)
+    put("attn.x", ax)
+    put("attn.out", aout)
+    META["attn"] = {**{k: acfg[k] for k in acfg}, "seq": NS}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
