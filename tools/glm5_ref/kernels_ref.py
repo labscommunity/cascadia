@@ -29,6 +29,14 @@ def _lin(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return _bf16(x.to(torch.float32) @ w.to(torch.float32).t())
 
 
+def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
+    """Classic LayerNorm (mean + population variance, weight + bias),
+    bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""
+    mu = x.to(torch.float32).mean(dim=-1, keepdim=True)
+    var = ((x.to(torch.float32) - mu) ** 2).mean(dim=-1, keepdim=True)
+    return _bf16((x.to(torch.float32) - mu) * torch.rsqrt(var + eps) * w + b)
+
+
 def precompute_freqs_cis(dim: int, seqlen: int, base: float) -> torch.Tensor:
     """GLM-5.2 rope frequency table. `rope_type="default"` -> NO YaRN, so this
     is the plain inverse-frequency table (unlike the V4 reference which blends
@@ -155,3 +163,61 @@ def attention_ref(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dict) -> tor
             ctx[s, h] = (p.unsqueeze(-1) * value[: s + 1, h]).sum(0)
 
     return _lin(ctx.reshape(S, H * vh), w["wo"])                 # [S, hidden]
+
+
+def _rope_first(v: torch.Tensor, fc_pos: torch.Tensor, rd: int) -> torch.Tensor:
+    """Rope only the FIRST `rd` dims of `v`'s last axis (the indexer ropes the
+    qk_rope prefix of each head's index_head_dim), leaving the rest untouched.
+    `fc_pos` is the [rd/2] complex table row for this position."""
+    head = apply_rotary_emb(v[..., :rd], fc_pos)
+    return torch.cat([head, v[..., rd:]], dim=-1)
+
+
+def indexer_ref(x, qr_q, w, cfg, query_pos: int, topk: int):
+    """GLM-5.2 DSA lightning indexer — score all causal keys for one query and
+    return the top-`keep` selection (raw positions).
+
+    Per key t: kd = rope_first(layernorm(ix_wk·x[t], eps=1e-6), qk_rope).
+    Query: qi = rope_first(ix_wq·qr_q, qk_rope) per index head; w32 = ix_wp·x[q].
+    Score: isc[t] = (1/sqrt(nh))·Σ_h w32[h]·ReLU((1/sqrt(hd))·qi[h]·kd[t]).
+    Select keep = min(query_pos+1, topk): threshold = keep-th largest, emit t in
+    ASCENDING position order (>thr first, then ==thr) — the two-pass form.
+
+    x:[S,hidden], qr_q:[q_lora] (the RMSNorm'd q_a residual at the query pos).
+    Numeric contract matches the Rust shell: bf16 after each linear/LN/rope; the
+    score dots/ReLU/scale stay f32. Returns (isc:[query_pos+1], sel:[keep] i32).
+    """
+    nh, hd, rd = cfg["index_nh"], cfg["index_hd"], cfg["qk_rope"]
+    eps, theta = cfg["ln_eps"], cfg["theta"]
+    S = x.shape[0]
+    fc = precompute_freqs_cis(rd, S, theta)                      # [S, rd/2]
+
+    ic = torch.zeros(S, hd, dtype=torch.float32)
+    for t in range(S):
+        kd = _layernorm(_lin(x[t], w["ix_wk"]), w["k_norm_w"], w["k_norm_b"], eps)
+        ic[t] = _rope_first(kd, fc[t], rd)
+
+    qi = _rope_first(_lin(qr_q, w["ix_wq"]).reshape(nh, hd), fc[query_pos], rd)  # [nh,hd]
+    w32 = _lin(x[query_pos], w["ix_wp"])                         # [nh]
+
+    nk = query_pos + 1
+    wsc, rs = 1.0 / math.sqrt(nh), 1.0 / math.sqrt(hd)
+    isc = torch.zeros(nk, dtype=torch.float32)
+    for t in range(nk):
+        a = 0.0
+        for h in range(nh):
+            d0 = float(torch.dot(qi[h], ic[t])) * rs
+            if d0 > 0.0:
+                a += float(w32[h]) * d0
+        isc[t] = a * wsc
+
+    keep = min(nk, topk)
+    thr = torch.sort(isc, descending=True).values[keep - 1]
+    sel = []
+    for t in range(nk):
+        if isc[t] > thr and len(sel) < keep:
+            sel.append(t)
+    for t in range(nk):
+        if isc[t] == thr and len(sel) < keep:
+            sel.append(t)
+    return isc, torch.tensor(sel, dtype=torch.int32)

@@ -20,4 +20,5 @@
 
 pub mod attn;
 pub mod gate;
+pub mod indexer;
 pub mod rope;
