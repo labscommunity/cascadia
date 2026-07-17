@@ -264,6 +264,8 @@ pub struct SparseMoEBuilder {
     /// Set when the manifest's arch is "deepseek_v4" (Rust dsv4 shell +
     /// int4 experts; its manifest schema differs from [`Manifest`]).
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
+    /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
+    glm_runner: Option<crate::glm::stage::GlmRunner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -277,6 +279,7 @@ impl SparseMoEBuilder {
             runner: None,
             ov_runner: None,
             dsv4_runner: None,
+            glm_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -424,6 +427,51 @@ impl Builder for SparseMoEBuilder {
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
+            )])));
+        }
+
+        // glm5 shell backend: like dsv4, its manifest schema differs from the
+        // strict Manifest, so peek the arch first. Rust MLA+DSA shell + int4
+        // experts; 1x-width hidden on the same dist wire (no HC copies, no
+        // input_ids past rank 0).
+        let is_glm = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("glm5"))
+            .unwrap_or(false);
+        if is_glm {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = std::env::var("CASCADIA_GLM5_MAX_SEQ")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::glm::stage::GLM5_DEFAULT_MAX_SEQ);
+            let runner = crate::glm::stage::GlmRunner::load_staged(
+                &self.config.model_dir,
+                max_seq,
+                rank,
+                total,
+                shard.layer_start,
+                shard.layer_end,
+            )
+            .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer = Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                        EngineError::Backend(format!("load tokenizer.json: {e}"))
+                    })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — glm5 engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.glm_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded glm5 stage (glm5 Rust shell)",
             )])));
         }
 
@@ -610,6 +658,26 @@ impl Builder for SparseMoEBuilder {
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
             info!(rank, total, "built DeepSeek-V4 dsv4 engine");
             return Ok(Box::new(Dsv4Engine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+            )));
+        }
+        if let Some(runner) = self.glm_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the glm5 API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built glm5 engine");
+            return Ok(Box::new(PipelineEngine::new(
                 runner,
                 self.tokenizer,
                 self.transport,
