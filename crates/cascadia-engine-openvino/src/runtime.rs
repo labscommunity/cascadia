@@ -595,11 +595,37 @@ struct StaticPrefill {
 /// Everything needed to re-create a parked prefill compilation: the variant's
 /// IR path, its device, and the plugin properties the original compile used
 /// (CACHE_DIR etc., so a reload hits the OV blob/UMD cache instead of a cold
-/// compile).
+/// compile). `blob` short-circuits the reload to an AOT blob import.
 struct PrefillReload {
     xml: String,
     device: String,
     plugin_entries: Vec<(String, String)>,
+    blob: Option<String>,
+}
+
+/// Path of a precompiled AOT blob to IMPORT instead of compiling, when the
+/// target device is the NPU and a `.blob` sibling of the IR exists (same
+/// basename: `openvino_model.xml` → `openvino_model.blob`). Blobs come from
+/// `ov::CompiledModel::export_model` — typically cross-compiled on a big-RAM
+/// host with `NPU_PLATFORM` set — and importing skips the NPU compiler's
+/// ~6–9×-INT4-bytes host-RAM transient entirely (measured ~7 s / no visible
+/// RAM movement for an 8B variant, vs a >23 GB on-box compile). NPU only:
+/// blobs are device- and driver-specific, and CPU/GPU compiles are cheap.
+fn npu_aot_blob(xml_path: &std::path::Path, device: &str) -> Option<std::path::PathBuf> {
+    if !device.trim().to_ascii_uppercase().starts_with("NPU") {
+        return None;
+    }
+    let blob = xml_path.with_extension("blob");
+    blob.exists().then_some(blob)
+}
+
+/// Plugin config for a blob import: the compile-time properties minus
+/// CACHE_DIR (an import never writes the compile cache, and core-level cache
+/// properties on `import_model` risk an unsupported-property error).
+fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
+    let mut p = plugin.clone();
+    p.entries.retain(|(k, _)| k != "CACHE_DIR");
+    p
 }
 
 // -------- Engine --------
@@ -1727,9 +1753,19 @@ impl OvRuntimeEngine {
         let plugin = PluginConfig {
             entries: src.plugin_entries.clone(),
         };
-        let prt = OvRuntime::compile(&src.xml, &src.device, &plugin)
-            .map_err(map_ov_err)
-            .map_err(|e| EngineError::Backend(format!("prefill reload on {}: {e}", src.device)))?;
+        let prt = if let Some(blob) = &src.blob {
+            OvRuntime::import_blob(blob, &src.device, &import_plugin(&plugin))
+                .map_err(map_ov_err)
+                .map_err(|e| {
+                    EngineError::Backend(format!("prefill blob re-import on {}: {e}", src.device))
+                })?
+        } else {
+            OvRuntime::compile(&src.xml, &src.device, &plugin)
+                .map_err(map_ov_err)
+                .map_err(|e| {
+                    EngineError::Backend(format!("prefill reload on {}: {e}", src.device))
+                })?
+        };
         if let Some(pf) = self.prefill.as_mut() {
             pf.runtime = Some(prt);
         }
@@ -2671,6 +2707,17 @@ impl Builder for OvRuntimeBuilder {
                 );
             }
             rt
+        } else if let Some(blob) = npu_aot_blob(&xml_path, &self.device) {
+            events.push(LoadProgress::message(format!(
+                "importing precompiled NPU blob (AOT, no on-box compile): {}",
+                blob.display()
+            )));
+            OvRuntime::import_blob(
+                blob.to_str().unwrap_or_default(),
+                &self.device,
+                &import_plugin(&plugin),
+            )
+            .map_err(map_ov_err)?
         } else {
             OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
                 .map_err(map_ov_err)?
@@ -2712,11 +2759,28 @@ impl Builder for OvRuntimeBuilder {
                 }
             };
             let pxml = prefill_xml.to_str().unwrap_or_default().to_string();
-            let prt = OvRuntime::compile(&pxml, &pdev, &pplugin)
+            let pblob = npu_aot_blob(&prefill_xml, &pdev);
+            let prt = if let Some(blob) = &pblob {
+                events.push(LoadProgress::message(format!(
+                    "importing precompiled NPU prefill blob (AOT): {}",
+                    blob.display()
+                )));
+                OvRuntime::import_blob(
+                    blob.to_str().unwrap_or_default(),
+                    &pdev,
+                    &import_plugin(&pplugin),
+                )
                 .map_err(map_ov_err)
                 .map_err(|e| {
-                    EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
-                })?;
+                    EngineError::Backend(format!("prefill blob import on {pdev}: {e}"))
+                })?
+            } else {
+                OvRuntime::compile(&pxml, &pdev, &pplugin)
+                    .map_err(map_ov_err)
+                    .map_err(|e| {
+                        EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
+                    })?
+            };
             self.prefill_runtime = Some(prt);
             if self.park_prefill && self.cache_dir.is_none() {
                 warn!(
@@ -2732,6 +2796,7 @@ impl Builder for OvRuntimeBuilder {
                 xml: pxml,
                 device: pdev,
                 plugin_entries: pplugin.entries.clone(),
+                blob: pblob.map(|b| b.to_string_lossy().into_owned()),
             });
         }
 
@@ -3164,6 +3229,31 @@ mod tests {
         // Past the boundary: no chunk rows — caller steps tokenwise.
         assert_eq!(chunk_take(4, 100, 9, past_len), 0);
         assert_eq!(chunk_take(4, 100, 1000, past_len), 0);
+    }
+
+    /// AOT blob import triggers ONLY for the NPU device and only when a
+    /// `.blob` sibling of the IR exists — CPU/GPU always compile (blobs are
+    /// device-specific), and an absent blob falls back to the compiler.
+    #[test]
+    fn npu_aot_blob_selects_only_npu_with_blob_present() {
+        let dir = std::env::temp_dir().join(format!("aot-blob-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("openvino_model.xml");
+        std::fs::write(&xml, "x").unwrap();
+
+        // No blob on disk: never selected.
+        assert_eq!(npu_aot_blob(&xml, "NPU"), None);
+
+        let blob = dir.join("openvino_model.blob");
+        std::fs::write(&blob, "b").unwrap();
+        // Blob present: NPU (any casing/config suffix) imports it.
+        assert_eq!(npu_aot_blob(&xml, "NPU"), Some(blob.clone()));
+        assert_eq!(npu_aot_blob(&xml, " npu "), Some(blob.clone()));
+        // Non-NPU devices always compile.
+        assert_eq!(npu_aot_blob(&xml, "CPU"), None);
+        assert_eq!(npu_aot_blob(&xml, "GPU"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
