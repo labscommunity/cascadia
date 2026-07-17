@@ -84,6 +84,43 @@ def layer_ref(x, in_ln, post_ln, aw, acfg, moe, mcfg, eps):
     return out, h  # h = post-attention residual (diagnostic)
 
 
+def model_ref(cfg, w, prompt, n_gen):
+    """Full GLM-5.2 tiny model, greedy generation — the parity target for the
+    Rust `GlmModel`. Stateless full-sequence recompute per step (equivalent to
+    incremental KV decode since absorbed attention == naive causal).
+
+    cfg: attention dims (n_heads, qk_nope, qk_rope, v_head, kv_lora, q_lora,
+    eps, theta) + top_k, scale. w: {'embed'[V,H], 'final_norm'[H], 'lm_head'
+    [V,H], 'layers': [ {in_ln, post_ln, attn(dict), kind:'dense'|'moe', mlp} ]}
+    where dense mlp = (wg,wu,wd) and moe mlp = (router_w, router_bias, experts,
+    shared). lm_head logits are f32 (argmax). Returns the `n_gen` greedy ids."""
+    eps, top_k, scale = cfg["eps"], cfg["top_k"], cfg["scale"]
+
+    def forward_seq(tokens):
+        x = w["embed"][torch.tensor(tokens, dtype=torch.long)].to(torch.float32)  # [S,H]
+        for L in w["layers"]:
+            nrm = _rms(x, L["in_ln"], eps)
+            x = x + attention_ref_absorbed(nrm, L["attn"], cfg)
+            nrm2 = _rms(x, L["post_ln"], eps)
+            if L["kind"] == "dense":
+                wg, wu, wd = L["mlp"]
+                x = x + swiglu_ref(nrm2, wg, wu, wd)
+            else:
+                rw, rb, experts, shared = L["mlp"]
+                x = x + moe_ref(nrm2, rw, rb, experts, shared, top_k, scale)
+        x = _rms(x, w["final_norm"], eps)
+        return _lin_f32(x, w["lm_head"])                     # [S, vocab]
+
+    tokens = list(prompt)
+    gen = []
+    for _ in range(n_gen):
+        logits = forward_seq(tokens)
+        nxt = int(logits[-1].argmax())
+        tokens.append(nxt)
+        gen.append(nxt)
+    return gen
+
+
 def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
     """Classic LayerNorm (mean + population variance, weight + bias),
     bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""
