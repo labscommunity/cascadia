@@ -63,7 +63,7 @@ fn one_f32() -> f32 {
     1.0
 }
 
-fn read_manifest(dir: &Path) -> Result<GlmManifest, LoadError> {
+pub fn read_manifest(dir: &Path) -> Result<GlmManifest, LoadError> {
     let m: GlmManifest =
         serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)
             .map_err(|e| LoadError::Manifest(e.to_string()))?;
@@ -125,78 +125,129 @@ fn load_expert_bin(path: &Path, hidden: usize, inter: usize) -> Result<AnyExpert
     Ok(AnyExpert::EagerF32 { wg, wu, wd })
 }
 
-/// Load a full single-stage model. `max_seq` sizes the attention KV caches.
-pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
-    let m = read_manifest(dir)?;
+/// Build one transformer layer `li` from its shell safetensors + expert bins.
+fn load_layer(dir: &Path, m: &GlmManifest, li: usize, max_seq: usize) -> Result<GlmLayer, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
     let (h, nope, rope) = (m.num_attention_heads, m.qk_nope_head_dim, m.qk_rope_head_dim);
     let (vh, kvl, ql) = (m.v_head_dim, m.kv_lora_rank, m.q_lora_rank);
     let moe_inter = m.expert_intermediate;
-    let shared_inter = moe_inter * m.n_shared_experts;
 
-    let embed = StFile::open(&dir.join("embed.safetensors"))?
-        .f32("embed.weight")?
-        .1;
-    let head = StFile::open(&dir.join("head.safetensors"))?;
-    let final_norm = head.f32("norm.weight")?.1;
-    let lm_head = head.f32("head.weight")?.1;
+    let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
+    let g = |n: &str| st.f32(n).map(|t| t.1);
+    // Projection weights held as bf16 bits (half the batch-1 traffic).
+    let gb = |n: &str| -> Result<Vec<u16>, LoadError> {
+        Ok(g(n)?.iter().map(|v| bf16::from_f32(*v).to_bits()).collect())
+    };
+    let aw = AttnWeights {
+        wq_a: gb("self_attn.wq_a.weight")?,
+        q_a_ln: g("self_attn.q_a_layernorm.weight")?,
+        wq_b: gb("self_attn.wq_b.weight")?,
+        wkv_a: gb("self_attn.wkv_a.weight")?,
+        kv_a_ln: g("self_attn.kv_a_layernorm.weight")?,
+        wkv_b: gb("self_attn.wkv_b.weight")?,
+        wo: gb("self_attn.o_proj.weight")?,
+    };
+    let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
+    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, eps, aw, freqs);
 
-    let mut layers = Vec::with_capacity(m.num_layers);
-    for li in 0..m.num_layers {
-        let st = StFile::open(&dir.join(format!("shells/layer_{li:02}.safetensors")))?;
-        let g = |n: &str| st.f32(n).map(|t| t.1);
-        // Projection weights held as bf16 bits (half the batch-1 traffic).
-        let gb = |n: &str| -> Result<Vec<u16>, LoadError> {
-            Ok(g(n)?.iter().map(|v| bf16::from_f32(*v).to_bits()).collect())
+    let edir = dir.join("experts").join(format!("layer_{li:02}"));
+    let mlp = if m.dense_layers.contains(&li) {
+        let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate)?;
+        LayerMlp::Dense { w, inter: m.dense_intermediate }
+    } else {
+        let mut experts = Vec::with_capacity(m.num_experts);
+        for e in 0..m.num_experts {
+            experts.push(load_expert_bin(&edir.join(format!("expert_{e:03}.bin")), hidden, moe_inter)?);
+        }
+        let shared = load_expert_bin(&edir.join("expert_shared.bin"), hidden, moe_inter)?;
+        let mw = MoeWeights {
+            router_w: g("mlp.gate.weight")?,
+            router_bias: g("mlp.gate.e_score_correction_bias")?,
+            experts,
+            shared,
         };
-        let aw = AttnWeights {
-            wq_a: gb("self_attn.wq_a.weight")?,
-            q_a_ln: g("self_attn.q_a_layernorm.weight")?,
-            wq_b: gb("self_attn.wq_b.weight")?,
-            wkv_a: gb("self_attn.wkv_a.weight")?,
-            kv_a_ln: g("self_attn.kv_a_layernorm.weight")?,
-            wkv_b: gb("self_attn.wkv_b.weight")?,
-            wo: gb("self_attn.o_proj.weight")?,
-        };
-        let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
-        let attn =
-            AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, eps, aw, freqs);
-
-        let edir = dir.join("experts").join(format!("layer_{li:02}"));
-        let mlp = if m.dense_layers.contains(&li) {
-            let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate)?;
-            LayerMlp::Dense { w, inter: m.dense_intermediate }
-        } else {
-            let mut experts = Vec::with_capacity(m.num_experts);
-            for e in 0..m.num_experts {
-                experts.push(load_expert_bin(&edir.join(format!("expert_{e:03}.bin")), hidden, moe_inter)?);
-            }
-            let shared = load_expert_bin(&edir.join("expert_shared.bin"), hidden, moe_inter)?;
-            let mw = MoeWeights {
-                router_w: g("mlp.gate.weight")?,
-                router_bias: g("mlp.gate.e_score_correction_bias")?,
-                experts,
-                shared,
-            };
-            LayerMlp::Moe(MoeLayer::new(
-                hidden,
-                m.num_experts,
-                m.top_k,
-                moe_inter,
-                shared_inter,
-                m.routed_scaling_factor,
-                mw,
-            ))
-        };
-        layers.push(GlmLayer::new(
+        LayerMlp::Moe(MoeLayer::new(
             hidden,
-            eps,
-            g("input_layernorm.weight")?,
-            g("post_attention_layernorm.weight")?,
-            attn,
-            mlp,
-        ));
-    }
+            m.num_experts,
+            m.top_k,
+            moe_inter,
+            moe_inter * m.n_shared_experts,
+            m.routed_scaling_factor,
+            mw,
+        ))
+    };
+    Ok(GlmLayer::new(
+        hidden,
+        eps,
+        g("input_layernorm.weight")?,
+        g("post_attention_layernorm.weight")?,
+        attn,
+        mlp,
+    ))
+}
 
-    Ok(GlmModel::new(hidden, m.vocab_size, eps, embed, layers, final_norm, lm_head))
+/// One pipeline stage: `embed` present iff this rank owns layer 0 (`first`),
+/// `head` (final_norm, lm_head) present iff it owns the last layer (`last`),
+/// and the layer slice `[lo, hi)`.
+pub struct GlmStage {
+    pub embed: Option<Vec<f32>>,
+    pub layers: Vec<GlmLayer>,
+    pub head: Option<(Vec<f32>, Vec<f32>)>,
+    pub hidden: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    pub eos: Vec<u32>,
+}
+
+/// Load the layer slice `[lo, hi)` of a model. Reads embed only when `first`,
+/// head only when `last`. `max_seq` sizes the attention KV caches.
+pub fn load_stage(
+    dir: &Path,
+    max_seq: usize,
+    lo: usize,
+    hi: usize,
+    first: bool,
+    last: bool,
+) -> Result<GlmStage, LoadError> {
+    let m = read_manifest(dir)?;
+    let embed = if first {
+        Some(StFile::open(&dir.join("embed.safetensors"))?.f32("embed.weight")?.1)
+    } else {
+        None
+    };
+    let head = if last {
+        let h = StFile::open(&dir.join("head.safetensors"))?;
+        Some((h.f32("norm.weight")?.1, h.f32("head.weight")?.1))
+    } else {
+        None
+    };
+    let mut layers = Vec::with_capacity(hi - lo);
+    for li in lo..hi {
+        layers.push(load_layer(dir, &m, li, max_seq)?);
+    }
+    Ok(GlmStage {
+        embed,
+        layers,
+        head,
+        hidden: m.hidden_size,
+        vocab: m.vocab_size,
+        eps: m.rms_norm_eps,
+        eos: m.eos_token_ids,
+    })
+}
+
+/// Load a full single-stage model. `max_seq` sizes the attention KV caches.
+pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
+    let n = read_manifest(dir)?.num_layers;
+    let s = load_stage(dir, max_seq, 0, n, true, true)?;
+    let (final_norm, lm_head) = s.head.expect("full model has a head");
+    Ok(GlmModel::new(
+        s.hidden,
+        s.vocab,
+        s.eps,
+        s.embed.expect("full model has an embed"),
+        s.layers,
+        final_norm,
+        lm_head,
+    ))
 }
