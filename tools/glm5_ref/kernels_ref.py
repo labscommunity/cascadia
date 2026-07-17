@@ -268,7 +268,7 @@ def attention_ref(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dict) -> tor
     scale = 1.0 / math.sqrt(qk)
     fc = precompute_freqs_cis(rope, S, theta)                    # [S, rope/2]
 
-    qr = _rms(_lin(x, w["wq_a"]), w["q_a_ln"], eps)              # [S, qlora]
+    qr = _rms(_lin(x, w["wq_a"]), w["q_a_ln"], 1e-6)  # MLA latent norm: HF default eps 1e-6              # [S, qlora]
     q = _lin(qr, w["wq_b"]).reshape(S, H, qk)                    # [S,H,qk]
     comp = _lin(x, w["wkv_a"])                                   # [S, kvl+rope]
     lat = _rms(comp[:, :kvl], w["kv_a_ln"], eps)                 # [S, kvl]  (Lc)
@@ -312,10 +312,10 @@ def attention_ref_absorbed(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dic
     scale = 1.0 / math.sqrt(qk)
     fc = precompute_freqs_cis(rope, S, theta)
 
-    qr = _rms(_lin(x, w["wq_a"]), w["q_a_ln"], eps)
+    qr = _rms(_lin(x, w["wq_a"]), w["q_a_ln"], 1e-6)  # MLA latent norm: HF default eps 1e-6
     q = _lin(qr, w["wq_b"]).reshape(S, H, qk)
     comp = _lin(x, w["wkv_a"])
-    lat = _rms(comp[:, :kvl], w["kv_a_ln"], eps)                 # Lc [S,kvl]
+    lat = _rms(comp[:, :kvl], w["kv_a_ln"], 1e-6)               # Lc: HF default eps 1e-6
     kpe = apply_rotary_emb(comp[:, kvl:], fc)                    # Rc [S,rope]
     qpe = apply_rotary_emb(q[:, :, nope:qk], fc.unsqueeze(1))    # [S,H,rope]
     qnope = q[:, :, :nope]                                       # [S,H,nope]

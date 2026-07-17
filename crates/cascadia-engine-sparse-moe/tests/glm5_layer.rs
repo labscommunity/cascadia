@@ -67,7 +67,7 @@ fn layer_attn_stage_matches_reference() {
         wo: bits(&fx.f32("layer.attn.wo").unwrap().1),
     };
     let freqs = precompute_freqs(rope, seq, 0, theta, 1.0, 32.0, 1.0);
-    let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, eps, aw, freqs);
+    let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, aw, freqs);
     let in_ln = fx.f32("layer.in_ln").unwrap().1;
     let (_, want) = fx.f32("layer.h_mid").unwrap();
     let mut got = vec![0.0f32; seq * hidden];
@@ -145,7 +145,7 @@ fn transformer_layer_matches_reference() {
         wo: bits(&fx.f32("layer.attn.wo").unwrap().1),
     };
     let freqs = precompute_freqs(rope, seq, 0, theta, 1.0, 32.0, 1.0);
-    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, eps, aw, freqs);
+    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, aw, freqs);
 
     let load_expert = |p: &str| ExpertW {
         wg: bits(&fx.f32(&format!("{p}.wg")).unwrap().1),

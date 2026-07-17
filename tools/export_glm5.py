@@ -267,6 +267,9 @@ class CkptSource:
             s = self._raw(sk).to(torch.float32)              # [ceil(O/128), ceil(I/128)]
             o, i = w.shape
             s = s.repeat_interleave(128, 0).repeat_interleave(128, 1)[:o, :i]
+            # non-128-divisible dims (e.g. kv_a_proj_with_mqa [576,6144]) MUST
+            # clip cleanly; a wrong-axis expand would corrupt silently.
+            assert s.shape == w.shape, f"fp8 scale expand mismatch for {name}: {tuple(s.shape)} vs {tuple(w.shape)}"
             return w * s                                     # dequant = fp8 * scale_inv
         return t.to(torch.float32)
 

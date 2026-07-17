@@ -162,7 +162,7 @@ fn load_layer(
         wo: gb("self_attn.o_proj.weight")?,
     };
     let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
-    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, eps, aw, freqs);
+    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
 
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mlp = if m.dense_layers.contains(&li) {

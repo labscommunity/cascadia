@@ -72,7 +72,7 @@ fn mla_attention_matches_reference() {
     };
     let freqs = precompute_freqs(rope, seq, 0, theta, 1.0, 32.0, 1.0);
     let mut layer =
-        AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, eps, w, freqs);
+        AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, w, freqs);
 
     let (_, want) = fx.f32("attn.out").unwrap();
     let mut got = vec![0.0f32; seq * hidden];
