@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
-                                  layer_ref, moe_gate, moe_ref,
+                                  layer_ref, model_ref, moe_gate, moe_ref,
                                   precompute_freqs_cis, swiglu_ref)
 
 FX = {}
@@ -205,6 +205,81 @@ def main():
     put("layer.out", l_out)
     META["layer"] = {**{k: lcfg[k] for k in lcfg}, "n_experts": lE, "top_k": lTOPK,
                      "moe_inter": lINT, "scale": lSCALE, "seq": lSEQ}
+
+    # ---- 8. full tiny model: embed -> layers (dense + MoE) -> norm -> lm_head,
+    #         greedy generation (token-exact parity target) ----
+    mcfg = {"n_heads": 3, "qk_nope": 6, "qk_rope": 4, "v_head": 6, "kv_lora": 8,
+            "q_lora": 16, "eps": 1e-5, "theta": 8.0e6, "top_k": 2, "scale": 2.5}
+    mH, mhH = mcfg["n_heads"], 32                            # heads, hidden
+    mnope, mrp, mvh = mcfg["qk_nope"], mcfg["qk_rope"], mcfg["v_head"]
+    mkvl, mql = mcfg["kv_lora"], mcfg["q_lora"]
+    mqk = mnope + mrp
+    VOCAB, NLAYERS, FIRST_DENSE, DINT = 16, 3, 1, 12
+    mE, mINT = 4, 10
+    PROMPT, NGEN = [1, 2, 3, 4], 4
+
+    def attn_w():
+        return {
+            "wq_a": wbf(mql, mhH), "q_a_ln": norm_w(mql), "wq_b": wbf(mH * mqk, mql),
+            "wkv_a": wbf(mkvl + mrp, mhH), "kv_a_ln": norm_w(mkvl),
+            "wkv_b": wbf(mH * (mnope + mvh), mkvl), "wo": wbf(mhH, mH * mvh),
+        }
+
+    def dense_w():
+        return (wbf(DINT, mhH), wbf(DINT, mhH), wbf(mhH, DINT))
+
+    def moe_w():
+        rw = wbf(mE, mhH)
+        rb = (0.3 * torch.randn(mE, generator=g)).to(torch.bfloat16).to(torch.float32)
+        exps = [(wbf(mINT, mhH), wbf(mINT, mhH), wbf(mhH, mINT)) for _ in range(mE)]
+        sh = (wbf(mINT, mhH), wbf(mINT, mhH), wbf(mhH, mINT))
+        return (rw, rb, exps, sh)
+
+    m_embed = wbf(VOCAB, mhH)
+    m_final_norm = norm_w(mhH)
+    m_lm_head = wbf(VOCAB, mhH)
+    m_layers = []
+    for li in range(NLAYERS):
+        aw = attn_w()
+        if li < FIRST_DENSE:
+            m_layers.append({"in_ln": norm_w(mhH), "post_ln": norm_w(mhH),
+                             "attn": aw, "kind": "dense", "mlp": dense_w()})
+        else:
+            m_layers.append({"in_ln": norm_w(mhH), "post_ln": norm_w(mhH),
+                             "attn": aw, "kind": "moe", "mlp": moe_w()})
+    greedy = model_ref(mcfg,
+                       {"embed": m_embed, "final_norm": m_final_norm,
+                        "lm_head": m_lm_head, "layers": m_layers},
+                       PROMPT, NGEN)
+
+    put("model.embed", m_embed)
+    put("model.final_norm", m_final_norm)
+    put("model.lm_head", m_lm_head)
+    for li, L in enumerate(m_layers):
+        put(f"model.L{li}.in_ln", L["in_ln"])
+        put(f"model.L{li}.post_ln", L["post_ln"])
+        for k, v in L["attn"].items():
+            put(f"model.L{li}.attn.{k}", v)
+        if L["kind"] == "dense":
+            wg, wu, wd = L["mlp"]
+            put(f"model.L{li}.dense.wg", wg)
+            put(f"model.L{li}.dense.wu", wu)
+            put(f"model.L{li}.dense.wd", wd)
+        else:
+            rw, rb, exps, sh = L["mlp"]
+            put(f"model.L{li}.moe.router_w", rw)
+            put(f"model.L{li}.moe.router_bias", rb)
+            for e in range(mE):
+                put(f"model.L{li}.moe.e{e}.wg", exps[e][0])
+                put(f"model.L{li}.moe.e{e}.wu", exps[e][1])
+                put(f"model.L{li}.moe.e{e}.wd", exps[e][2])
+            put(f"model.L{li}.moe.sh.wg", sh[0])
+            put(f"model.L{li}.moe.sh.wu", sh[1])
+            put(f"model.L{li}.moe.sh.wd", sh[2])
+    META["model"] = {**{k: mcfg[k] for k in mcfg}, "vocab": VOCAB, "hidden": mhH,
+                     "n_layers": NLAYERS, "first_dense": FIRST_DENSE, "dense_inter": DINT,
+                     "n_experts": mE, "moe_inter": mINT, "prompt": PROMPT,
+                     "n_gen": NGEN, "greedy": greedy}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))

@@ -10,7 +10,7 @@
 use super::attn::AttentionLayer;
 use super::ffn::swiglu;
 use super::moe::{ExpertW, MoeLayer};
-use crate::dsv4::math::rmsnorm;
+use crate::dsv4::math::{linear_f32, rmsnorm};
 
 /// The per-layer feed-forward: routed MoE, or a dense SwiGLU (first-k layers).
 pub enum LayerMlp {
@@ -69,4 +69,86 @@ impl GlmLayer {
         }
         h
     }
+}
+
+/// Full GLM-5.2 model: embed → layers → final RMSNorm → lm_head. Single-stream
+/// incremental decode (each `forward_token` advances the per-layer KV caches);
+/// `lm_head` logits are f32 (argmax). Pipeline-parallel sharding is layered on
+/// later at the engine level.
+pub struct GlmModel {
+    pub hidden: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    embed: Vec<f32>,      // [vocab, hidden]
+    layers: Vec<GlmLayer>,
+    final_norm: Vec<f32>, // [hidden]
+    lm_head: Vec<f32>,    // [vocab, hidden] (f32 -> f32 logits)
+}
+
+impl GlmModel {
+    pub fn new(
+        hidden: usize,
+        vocab: usize,
+        eps: f32,
+        embed: Vec<f32>,
+        layers: Vec<GlmLayer>,
+        final_norm: Vec<f32>,
+        lm_head: Vec<f32>,
+    ) -> Self {
+        assert_eq!(embed.len(), vocab * hidden);
+        assert_eq!(final_norm.len(), hidden);
+        assert_eq!(lm_head.len(), vocab * hidden);
+        Self { hidden, vocab, eps, embed, layers, final_norm, lm_head }
+    }
+
+    /// Clear all layer KV caches (new sequence).
+    pub fn reset(&mut self) {
+        for l in &mut self.layers {
+            l.reset();
+        }
+    }
+
+    /// Embed `token`, run all layers + final norm + lm_head; returns logits
+    /// `[vocab]` at this position and advances the KV caches.
+    pub fn forward_token(&mut self, token: u32) -> Vec<f32> {
+        let t = token as usize;
+        assert!(t < self.vocab, "token {t} >= vocab {}", self.vocab);
+        let mut x = self.embed[t * self.hidden..(t + 1) * self.hidden].to_vec();
+        for l in &mut self.layers {
+            x = l.forward_token(&x);
+        }
+        rmsnorm(&mut x, &self.final_norm, self.eps);
+        let mut logits = vec![0.0f32; self.vocab];
+        linear_f32(&x, &self.lm_head, self.vocab, self.hidden, &mut logits);
+        logits
+    }
+
+    /// Greedy generation: prefill `prompt`, then emit `n_gen` argmax tokens.
+    pub fn generate(&mut self, prompt: &[u32], n_gen: usize) -> Vec<u32> {
+        self.reset();
+        let mut logits = Vec::new();
+        for &tok in prompt {
+            logits = self.forward_token(tok);
+        }
+        let mut gen = Vec::with_capacity(n_gen);
+        for _ in 0..n_gen {
+            let nxt = argmax(&logits) as u32;
+            gen.push(nxt);
+            logits = self.forward_token(nxt);
+        }
+        gen
+    }
+}
+
+/// Index of the first maximum (ties -> lowest index, matching `torch.argmax`).
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut bv = v[0];
+    for (i, &x) in v.iter().enumerate().skip(1) {
+        if x > bv {
+            bv = x;
+            best = i;
+        }
+    }
+    best
 }
