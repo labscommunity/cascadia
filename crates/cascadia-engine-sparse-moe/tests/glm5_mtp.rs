@@ -12,7 +12,7 @@ use cascadia_engine_sparse_moe::dsv4::rope::precompute_freqs;
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::glm::attn::{AttentionLayer, AttnWeights};
 use cascadia_engine_sparse_moe::glm::model::{GlmLayer, LayerMlp};
-use cascadia_engine_sparse_moe::glm::moe::{ExpertW, MoeLayer, MoeWeights};
+use cascadia_engine_sparse_moe::glm::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
 use cascadia_engine_sparse_moe::glm::mtp::MtpHead;
 
 macro_rules! fixtures {
@@ -59,14 +59,14 @@ fn mtp_draft_matches_reference() {
         wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
         wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
     };
-    let experts: Vec<ExpertW> = (0..n_experts)
-        .map(|e| load_expert(&format!("mtp.block.moe.e{e}")))
+    let experts: Vec<AnyExpert> = (0..n_experts)
+        .map(|e| load_expert(&format!("mtp.block.moe.e{e}")).into())
         .collect();
     let mw = MoeWeights {
         router_w: fx.f32("mtp.block.moe.router_w").unwrap().1,
         router_bias: fx.f32("mtp.block.moe.router_bias").unwrap().1,
         experts,
-        shared: load_expert("mtp.block.moe.sh"),
+        shared: load_expert("mtp.block.moe.sh").into(),
     };
     let moe = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw);
     let block = GlmLayer::new(

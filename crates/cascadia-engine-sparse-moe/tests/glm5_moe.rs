@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
-use cascadia_engine_sparse_moe::glm::moe::{ExpertW, MoeLayer, MoeWeights};
+use cascadia_engine_sparse_moe::glm::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
 
 macro_rules! fixtures {
     () => {{
@@ -55,12 +55,14 @@ fn moe_block_matches_reference() {
         wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
         wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
     };
-    let experts: Vec<ExpertW> = (0..n_experts).map(|e| load_expert(&format!("moe.e{e}"))).collect();
+    let experts: Vec<AnyExpert> = (0..n_experts)
+        .map(|e| load_expert(&format!("moe.e{e}")).into())
+        .collect();
     let w = MoeWeights {
         router_w: fx.f32("moe.router_w").unwrap().1,
         router_bias: fx.f32("moe.router_bias").unwrap().1,
         experts,
-        shared: load_expert("moe.sh"),
+        shared: load_expert("moe.sh").into(),
     };
     // shared_inter == moe_inter * n_shared (n_shared = 1 here).
     let layer = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, w);

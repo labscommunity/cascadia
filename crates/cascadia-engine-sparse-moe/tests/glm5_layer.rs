@@ -13,7 +13,7 @@ use cascadia_engine_sparse_moe::dsv4::rope::precompute_freqs;
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::glm::attn::{AttentionLayer, AttnWeights};
 use cascadia_engine_sparse_moe::glm::model::{GlmLayer, LayerMlp};
-use cascadia_engine_sparse_moe::glm::moe::{ExpertW, MoeLayer, MoeWeights};
+use cascadia_engine_sparse_moe::glm::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
 
 macro_rules! fixtures {
     () => {{
@@ -100,14 +100,14 @@ fn layer_moe_stage_on_ref_h_matches_reference() {
         wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
         wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
     };
-    let experts: Vec<ExpertW> = (0..n_experts)
-        .map(|e| load_expert(&format!("layer.moe.e{e}")))
+    let experts: Vec<AnyExpert> = (0..n_experts)
+        .map(|e| load_expert(&format!("layer.moe.e{e}")).into())
         .collect();
     let mw = MoeWeights {
         router_w: fx.f32("layer.moe.router_w").unwrap().1,
         router_bias: fx.f32("layer.moe.router_bias").unwrap().1,
         experts,
-        shared: load_expert("layer.moe.sh"),
+        shared: load_expert("layer.moe.sh").into(),
     };
     let moe = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw);
     let post_ln = fx.f32("layer.post_ln").unwrap().1;
@@ -152,14 +152,14 @@ fn transformer_layer_matches_reference() {
         wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
         wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
     };
-    let experts: Vec<ExpertW> = (0..n_experts)
-        .map(|e| load_expert(&format!("layer.moe.e{e}")))
+    let experts: Vec<AnyExpert> = (0..n_experts)
+        .map(|e| load_expert(&format!("layer.moe.e{e}")).into())
         .collect();
     let mw = MoeWeights {
         router_w: fx.f32("layer.moe.router_w").unwrap().1,
         router_bias: fx.f32("layer.moe.router_bias").unwrap().1,
         experts,
-        shared: load_expert("layer.moe.sh"),
+        shared: load_expert("layer.moe.sh").into(),
     };
     let moe = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw);
 
