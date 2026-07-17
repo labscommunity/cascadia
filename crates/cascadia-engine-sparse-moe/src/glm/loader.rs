@@ -20,7 +20,8 @@ use serde::Deserialize;
 use super::attn::{AttentionLayer, AttnWeights};
 use super::model::{GlmLayer, GlmModel, LayerMlp};
 use super::moe::{AnyExpert, MoeLayer, MoeWeights};
-use crate::dsv4::loader::LoadError;
+use crate::dsv4::expert_mmap::MmapExpert;
+use crate::dsv4::loader::{ExpertsMode, LoadError};
 use crate::dsv4::rope::precompute_freqs;
 use crate::dsv4::st::StFile;
 
@@ -115,18 +116,31 @@ fn dequant_int4(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> R
 }
 
 /// Load one `expert_*.bin` / `dense.bin`: gate `[inter,hidden]`, up
-/// `[inter,hidden]`, down `[hidden,inter]` → an eager f32 expert.
-fn load_expert_bin(path: &Path, hidden: usize, inter: usize) -> Result<AnyExpert, LoadError> {
-    let buf = std::fs::read(path)?;
-    let mut off = 0usize;
-    let wg = dequant_int4(&buf, &mut off, inter, hidden)?;
-    let wu = dequant_int4(&buf, &mut off, inter, hidden)?;
-    let wd = dequant_int4(&buf, &mut off, hidden, inter)?;
-    Ok(AnyExpert::EagerF32 { wg, wu, wd })
+/// `[inter,hidden]`, down `[hidden,inter]`. `Eager` dequantizes to f32 (fast,
+/// tiny/dev); `Mmap` keeps it packed on disk and dequantizes rows on the fly
+/// (the only mode that fits the real model).
+fn load_expert_bin(path: &Path, hidden: usize, inter: usize, mode: ExpertsMode) -> Result<AnyExpert, LoadError> {
+    match mode {
+        ExpertsMode::Eager => {
+            let buf = std::fs::read(path)?;
+            let mut off = 0usize;
+            let wg = dequant_int4(&buf, &mut off, inter, hidden)?;
+            let wu = dequant_int4(&buf, &mut off, inter, hidden)?;
+            let wd = dequant_int4(&buf, &mut off, hidden, inter)?;
+            Ok(AnyExpert::EagerF32 { wg, wu, wd })
+        }
+        ExpertsMode::Mmap => Ok(AnyExpert::Mmap(MmapExpert::open(path, hidden, inter)?)),
+    }
 }
 
 /// Build one transformer layer `li` from its shell safetensors + expert bins.
-fn load_layer(dir: &Path, m: &GlmManifest, li: usize, max_seq: usize) -> Result<GlmLayer, LoadError> {
+fn load_layer(
+    dir: &Path,
+    m: &GlmManifest,
+    li: usize,
+    max_seq: usize,
+    mode: ExpertsMode,
+) -> Result<GlmLayer, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
     let (h, nope, rope) = (m.num_attention_heads, m.qk_nope_head_dim, m.qk_rope_head_dim);
     let (vh, kvl, ql) = (m.v_head_dim, m.kv_lora_rank, m.q_lora_rank);
@@ -152,14 +166,14 @@ fn load_layer(dir: &Path, m: &GlmManifest, li: usize, max_seq: usize) -> Result<
 
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mlp = if m.dense_layers.contains(&li) {
-        let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate)?;
+        let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate, mode)?;
         LayerMlp::Dense { w, inter: m.dense_intermediate }
     } else {
         let mut experts = Vec::with_capacity(m.num_experts);
         for e in 0..m.num_experts {
-            experts.push(load_expert_bin(&edir.join(format!("expert_{e:03}.bin")), hidden, moe_inter)?);
+            experts.push(load_expert_bin(&edir.join(format!("expert_{e:03}.bin")), hidden, moe_inter, mode)?);
         }
-        let shared = load_expert_bin(&edir.join("expert_shared.bin"), hidden, moe_inter)?;
+        let shared = load_expert_bin(&edir.join("expert_shared.bin"), hidden, moe_inter, mode)?;
         let mw = MoeWeights {
             router_w: g("mlp.gate.weight")?,
             router_bias: g("mlp.gate.e_score_correction_bias")?,
@@ -208,6 +222,7 @@ pub fn load_stage(
     hi: usize,
     first: bool,
     last: bool,
+    mode: ExpertsMode,
 ) -> Result<GlmStage, LoadError> {
     let m = read_manifest(dir)?;
     let embed = if first {
@@ -223,7 +238,7 @@ pub fn load_stage(
     };
     let mut layers = Vec::with_capacity(hi - lo);
     for li in lo..hi {
-        layers.push(load_layer(dir, &m, li, max_seq)?);
+        layers.push(load_layer(dir, &m, li, max_seq, mode)?);
     }
     Ok(GlmStage {
         embed,
@@ -239,7 +254,7 @@ pub fn load_stage(
 /// Load a full single-stage model. `max_seq` sizes the attention KV caches.
 pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
     let n = read_manifest(dir)?.num_layers;
-    let s = load_stage(dir, max_seq, 0, n, true, true)?;
+    let s = load_stage(dir, max_seq, 0, n, true, true, ExpertsMode::Eager)?;
     let (final_norm, lm_head) = s.head.expect("full model has a head");
     Ok(GlmModel::new(
         s.hidden,

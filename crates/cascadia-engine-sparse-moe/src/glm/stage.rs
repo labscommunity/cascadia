@@ -12,7 +12,7 @@ use std::path::Path;
 
 use super::loader::{load_stage, read_manifest};
 use super::model::GlmLayer;
-use crate::dsv4::loader::LoadError;
+use crate::dsv4::loader::{ExpertsMode, LoadError};
 use crate::dsv4::math::{linear_f32, rmsnorm};
 use crate::dsv4::stage::even_layer_split;
 use crate::staged::StagedRunner;
@@ -57,7 +57,15 @@ impl GlmRunner {
         };
         let first = rank == 0;
         let last = rank == total - 1;
-        let s = load_stage(dir, max_seq, lo, hi, first, last)?;
+        // Real-model expert sets can't be held dequantized; tiny/dev ones are
+        // faster eager. CASCADIA_GLM5_EXPERTS=eager|mmap overrides.
+        let mode = match std::env::var("CASCADIA_GLM5_EXPERTS").as_deref() {
+            Ok("eager") => ExpertsMode::Eager,
+            Ok("mmap") => ExpertsMode::Mmap,
+            _ if m.num_experts > 32 => ExpertsMode::Mmap,
+            _ => ExpertsMode::Eager,
+        };
+        let s = load_stage(dir, max_seq, lo, hi, first, last, mode)?;
         Ok(Self {
             embed: s.embed,
             layers: s.layers,

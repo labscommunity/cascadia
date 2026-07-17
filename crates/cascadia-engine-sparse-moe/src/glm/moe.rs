@@ -10,8 +10,9 @@
 //! The first `first_k_dense_replace` (3) layers are dense (no routing) — that
 //! path just calls `ffn::swiglu` directly and does not use this module.
 
-use super::ffn::{swiglu, swiglu_f32w};
+use super::ffn::{swiglu, swiglu_f32w, swiglu_mmap};
 use super::gate::moe_gate;
+use crate::dsv4::expert_mmap::MmapExpert;
 use crate::dsv4::math::linear_f32;
 
 /// One expert's SwiGLU weights (bf16 bits) — the synthetic-golden / shell path.
@@ -30,6 +31,9 @@ pub struct ExpertW {
 pub enum AnyExpert {
     Bf16(ExpertW),
     EagerF32 { wg: Vec<f32>, wu: Vec<f32>, wd: Vec<f32> },
+    /// mmap'd int4 bin, rows dequantized on the fly — the only mode that fits
+    /// the real model (eager f32 experts would be hundreds of GB per rank).
+    Mmap(MmapExpert),
 }
 
 impl AnyExpert {
@@ -39,6 +43,7 @@ impl AnyExpert {
         match self {
             AnyExpert::Bf16(e) => swiglu(x, &e.wg, &e.wu, &e.wd, hidden, inter),
             AnyExpert::EagerF32 { wg, wu, wd } => swiglu_f32w(x, wg, wu, wd, hidden, inter),
+            AnyExpert::Mmap(m) => swiglu_mmap(m, x),
         }
     }
 }
