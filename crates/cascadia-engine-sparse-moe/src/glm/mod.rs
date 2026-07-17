@@ -18,5 +18,6 @@
 //!   3. dense/MoE block + full model greedy parity
 //!   4. engine/manifest wiring (`shell_backend = "rust_glm"`)
 
+pub mod attn;
 pub mod gate;
 pub mod rope;
