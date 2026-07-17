@@ -166,7 +166,8 @@ compiler's host-side transient exceeded ~23 GB with NOTHING else resident
 with the CPU decode model already resident hit 0.7 GB free). Matches Intel's
 ">16 GB RAM for >7B models" NPU guidance. The transient scales with stage
 weight bytes, so the viable 8B-on-NPU route is pipeline-parallel (2+ stages
-≈ 3B-class bytes per stage) — not yet measured.
+≈ 3B-class bytes per stage) — measured working, plus three more routes: see
+"Big-model NPU routes" below.
 ³ First request after a cache import (subtract ~300–430 ms for steady; e.g.
 cold-compiled all-NPU long measured 687 ms at 1B).
 
@@ -199,6 +200,63 @@ Matrix takeaways:
   (one 3B NPU→GPU short-prompt fork read distinctly worse). Perf sweeps on
   those configs run with `CASCADIA_PARITY_SOFT=1`, which reports the fork
   index + both texts instead of aborting; CPU/NPU validation never sets it.
+
+## Big-model NPU routes (2026-07-16, second session)
+
+The matrix's 8B single-stage NPU cells were memory-infeasible: the NPU
+compiler's host transient measured **~6–9× the stage's INT4 bytes**
+(8B variants: 23.8–37.9 GB; 3B: ~17 GB python-RSS incl. held objects). Four
+routes around it — the first three measured on pawan-01 (32 GB LNL):
+
+1. **Pipeline-parallel stages + sequential cache warm (measured, works).**
+   A 2-stage 8B export (2.07 GB INT4/stage) compiles per-stage ON-BOX when
+   the compiles are serialized: `tests/compile_warm_probe.rs` compiles each
+   IR one-at-a-time into `--ov-cache-dir` (~490 s each, floor 7.7 GB free),
+   then the pipeline starts all ranks concurrently as pure blob imports.
+   Measured warm e2e (24 new tokens): all-NPU **2.0 s** short / **7.9 s**
+   long (~435-tok); hybrid NPU→CPU 2.3 s / 8.9 s; steady residency ~12 GB
+   (all-NPU) / ~16 GB (hybrid); zero watchdog events. Do NOT serialize
+   worker *startup* instead — a non-first rank blocks in transport accept
+   before engine load, deadlocking the bring-up; warm the cache.
+2. **AOT cross-compile + blob import (measured; removes the on-box spike
+   entirely).** The NPU compiler is a userspace library that runs WITHOUT an
+   NPU: drop `libnpu_driver_compiler.so` (from the `intel-driver-compiler-npu`
+   deb in intel/linux-npu-driver releases) into the OpenVINO package libs as
+   `libopenvino_intel_npu_compiler.so`, compile with `NPU_PLATFORM=4000` on
+   any big-RAM Linux box, `export_model` (the Python binding needs an
+   `io.BytesIO`), ship the blob (~5.8 GB = **1.4×** INT4), import via
+   `Runtime::import_blob` (`tests/blob_import_probe.rs`): **6.9–7.5 s import
+   on the 32 GB box, free RAM unmoved.** The Linux-VCL→Windows-driver
+   handshake passed with OV pinned 2026.1 on both sides. Caveats: CACHE_DIR
+   entries are NOT portable (the hash bakes in absolute path + mtime) — use
+   export/import; cache *loads* also miss without a device present, so
+   export blobs rather than shipping cache dirs; Intel documents offline
+   blobs as dev-only (pin versions; `ov::compatibility_check` pre-validates).
+3. **NPUW function folding (measured; monolithic 8B compiles on-box).**
+   Passing `NPU_USE_NPUW=YES, NPUW_FOLD=YES, NPUW_FUNCALL_FOR_ALL=YES,
+   NPUW_ONLINE_PIPELINE=REP, NPUW_DCOFF_TYPE=f16, NPUW_DCOFF_SCALE=YES,
+   NPUW_WEIGHTS_BANK=bank0, NPUW_HOST_GATHER=YES` at compile makes NPUW
+   detect the 32 repeated decoder blocks and compile ONE function body:
+   the monolithic 8B compiled on-box at ~21.5 GB peak (floor 5.4 GB free),
+   token-exact parity, chunked NPU prefill TTFT **1.71 s** (short prompt).
+   Decode through the folded/DCOFF model is only **1.16–1.19 tok/s** (DCOFF
+   expands weights to f16 → 2× decode bytes, plus per-layer funcall
+   overhead) — so use folding for PREFILL and decode on CPU/GPU (needs
+   per-device plugin-props plumbing, follow-up), or evaluate the
+   `NPUW_DQ=YES` INT4-resident path (newer-compiler-gated, unmeasured here).
+   These `NPUW_*` keys are internal/unstable — pin the OV version.
+4. **Research-validated, unbuilt:** hetero-split prefill (attention on
+   CPU/iGPU, FFN-only subgraphs on NPU → only one block ever compiles;
+   HeteroLLM measured 8B prefill 247.9 tok/s on a phone-class UMA SoC,
+   arXiv 2501.14794); prefix/system-prompt KV caching seeded into the host
+   ring (2.2–3.3× TTFT, zero compile cost, chunk-aligned); speculative
+   prefill (up to 7.66× TTFT, draft on CPU/iGPU, static shapes preserved,
+   arXiv 2502.02789); weightless blobs (`CACHE_MODE=OPTIMIZE_SIZE` +
+   `WEIGHTS_PATH` at import — smaller artifact, leaner import, 2025.3+).
+
+Sizing rule: budget **~6–9× a stage's INT4 bytes** of free host RAM for any
+on-box NPU compile (or move the compile off-box / behind NPUW folding), and
+**~1.4×** for a blob import.
 
 ## What the numbers say
 
