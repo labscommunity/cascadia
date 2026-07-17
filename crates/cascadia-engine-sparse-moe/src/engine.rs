@@ -330,8 +330,18 @@ impl Builder for SparseMoEBuilder {
 
         if let Some(down) = peers.downstream.as_ref() {
             let mut client = ActivationClient::new(down.host.clone(), down.port);
+            // Cold pipeline start: a downstream rank only begins listening after
+            // it has loaded its multi-GB slice, so this connect must out-wait the
+            // slowest cold load. 60s was too short for the dsv4 ~30GB/rank load
+            // off a cold page cache — the upstream gave up and the chain never
+            // formed. Default 300s; override with CASCADIA_CONNECT_TIMEOUT_SECS.
+            let connect_secs = std::env::var("CASCADIA_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(300);
             client
-                .connect_with_timeout(std::time::Duration::from_secs(60))
+                .connect_with_timeout(std::time::Duration::from_secs(connect_secs))
                 .await
                 .map_err(|e| {
                     EngineError::Backend(format!("connect to {}:{}: {}", down.host, down.port, e))
