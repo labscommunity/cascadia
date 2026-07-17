@@ -12,7 +12,7 @@ use cascadia_engine_sparse_moe::dsv4::rope::precompute_freqs;
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::glm::attn::{AttentionLayer, AttnWeights};
 use cascadia_engine_sparse_moe::glm::model::{GlmLayer, GlmModel, LayerMlp};
-use cascadia_engine_sparse_moe::glm::moe::{ExpertW, MoeLayer, MoeWeights};
+use cascadia_engine_sparse_moe::glm::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
 
 macro_rules! fixtures {
     () => {{
@@ -68,14 +68,14 @@ fn model_greedy_matches_reference() {
         let mlp = if li < first_dense {
             LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")), inter: dense_inter }
         } else {
-            let experts: Vec<ExpertW> = (0..n_experts)
-                .map(|e| load_expert(&format!("{lp}.moe.e{e}")))
+            let experts: Vec<AnyExpert> = (0..n_experts)
+                .map(|e| load_expert(&format!("{lp}.moe.e{e}")).into())
                 .collect();
             let mw = MoeWeights {
                 router_w: fx.f32(&format!("{lp}.moe.router_w")).unwrap().1,
                 router_bias: fx.f32(&format!("{lp}.moe.router_bias")).unwrap().1,
                 experts,
-                shared: load_expert(&format!("{lp}.moe.sh")),
+                shared: load_expert(&format!("{lp}.moe.sh")).into(),
             };
             LayerMlp::Moe(MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw))
         };

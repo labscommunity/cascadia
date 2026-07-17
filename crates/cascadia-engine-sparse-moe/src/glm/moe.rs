@@ -10,15 +10,43 @@
 //! The first `first_k_dense_replace` (3) layers are dense (no routing) — that
 //! path just calls `ffn::swiglu` directly and does not use this module.
 
-use super::ffn::swiglu;
+use super::ffn::{swiglu, swiglu_f32w};
 use super::gate::moe_gate;
 use crate::dsv4::math::linear_f32;
 
-/// One expert's SwiGLU weights (bf16 bits).
+/// One expert's SwiGLU weights (bf16 bits) — the synthetic-golden / shell path.
 pub struct ExpertW {
     pub wg: Vec<u16>, // [inter, hidden]
     pub wu: Vec<u16>, // [inter, hidden]
     pub wd: Vec<u16>, // [hidden, inter]
+}
+
+/// How an expert's weights are held, per its numeric contract:
+/// - `Bf16`: bf16-bit weights (goldens; the shell's native dtype).
+/// - `EagerF32`: int4-dequantized f32 weights (the on-disk `int4_bin` path).
+///   int4 values are not exactly bf16-representable, so they stay f32 and run
+///   through [`swiglu_f32w`] (same op order / bf16 activation boundaries as
+///   `swiglu`, only the weight dtype differs).
+pub enum AnyExpert {
+    Bf16(ExpertW),
+    EagerF32 { wg: Vec<f32>, wu: Vec<f32>, wd: Vec<f32> },
+}
+
+impl AnyExpert {
+    /// One expert's SwiGLU FFN for token `x`. `inter` is this expert's
+    /// intermediate width (routed = `moe_inter`, shared = `moe_inter·n_shared`).
+    pub fn forward(&self, x: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+        match self {
+            AnyExpert::Bf16(e) => swiglu(x, &e.wg, &e.wu, &e.wd, hidden, inter),
+            AnyExpert::EagerF32 { wg, wu, wd } => swiglu_f32w(x, wg, wu, wd, hidden, inter),
+        }
+    }
+}
+
+impl From<ExpertW> for AnyExpert {
+    fn from(e: ExpertW) -> Self {
+        AnyExpert::Bf16(e)
+    }
 }
 
 pub struct MoeWeights {
@@ -28,9 +56,9 @@ pub struct MoeWeights {
     /// `e_score_correction_bias` `[n_experts]`.
     pub router_bias: Vec<f32>,
     /// `n_experts` routed experts, each `moe_inter`-wide.
-    pub experts: Vec<ExpertW>,
+    pub experts: Vec<AnyExpert>,
     /// The shared expert (`moe_inter · n_shared`-wide).
-    pub shared: ExpertW,
+    pub shared: AnyExpert,
 }
 
 pub struct MoeLayer {
@@ -79,14 +107,12 @@ impl MoeLayer {
         // routed experts in gate order, then the shared expert.
         let mut out = vec![0.0f32; self.hidden];
         for (&e, &wj) in gate.idx.iter().zip(&gate.weight) {
-            let ex = &self.w.experts[e as usize];
-            let y = swiglu(x, &ex.wg, &ex.wu, &ex.wd, self.hidden, self.moe_inter);
+            let y = self.w.experts[e as usize].forward(x, self.hidden, self.moe_inter);
             for (o, &yi) in out.iter_mut().zip(&y) {
                 *o += wj * yi;
             }
         }
-        let sh = &self.w.shared;
-        let s = swiglu(x, &sh.wg, &sh.wu, &sh.wd, self.hidden, self.shared_inter);
+        let s = self.w.shared.forward(x, self.hidden, self.shared_inter);
         for (o, &si) in out.iter_mut().zip(&s) {
             *o += si;
         }
