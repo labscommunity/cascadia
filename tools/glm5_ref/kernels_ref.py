@@ -41,6 +41,34 @@ def swiglu_ref(x: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor,
     return _lin(h, wd)
 
 
+def _lin_f32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """y = x @ w^T with f32 output (no bf16 round) — the router path (a plain
+    f32 matmul for the gate logits, `dsv4::math::linear_f32`)."""
+    return x.to(torch.float32) @ w.to(torch.float32).t()
+
+
+def moe_ref(x, rw, rb, experts, shared, top_k, scale):
+    """GLM MoE block: out = sum_{i in topk} w_i * expert_i(x) + shared(x).
+    Router logits are f32 (no bf16), gate is sigmoid + noaux_tc (`moe_gate`);
+    routed weights already carry `routed_scaling_factor`. Accumulation order:
+    routed experts in gate order, then the shared expert.
+
+    x:[S,hidden]; rw:[E,hidden]; rb:[E]; experts: list of (wg,wu,wd);
+    shared: (wg,wu,wd). Returns [S,hidden]."""
+    S = x.shape[0]
+    logits = _lin_f32(x, rw)                                 # [S, E]
+    idx, w = moe_gate(logits, rb, top_k, scale, norm_topk=True)
+    out = torch.zeros_like(x.to(torch.float32))
+    for s in range(S):
+        acc = torch.zeros(x.shape[1], dtype=torch.float32)
+        for j in range(top_k):
+            e = int(idx[s, j])
+            acc = acc + float(w[s, j]) * swiglu_ref(x[s], *experts[e])
+        acc = acc + swiglu_ref(x[s], *shared)
+        out[s] = acc
+    return out
+
+
 def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
     """Classic LayerNorm (mean + population variance, weight + bias),
     bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""

@@ -1,0 +1,78 @@
+//! Golden test for the GLM-5.2 MoE block (router + top-k experts + shared)
+//! against the CPU reference (`tools/glm5_ref::moe_ref`).
+//!
+//! Regenerate fixtures:
+//!   python tools/glm5_ref/gen_fixtures.py \
+//!       --out crates/cascadia-engine-sparse-moe/tests/fixtures/glm5
+
+use std::path::PathBuf;
+
+use cascadia_engine_sparse_moe::dsv4::st::StFile;
+use cascadia_engine_sparse_moe::glm::moe::{ExpertW, MoeLayer, MoeWeights};
+
+macro_rules! fixtures {
+    () => {{
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/glm5/fixtures.safetensors");
+        if !p.exists() {
+            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            return;
+        }
+        StFile::open(&p).expect("open fixtures")
+    }};
+}
+
+fn assert_close(name: &str, got: &[f32], want: &[f32], atol: f32, rtol: f32) {
+    assert_eq!(got.len(), want.len(), "{name}: length mismatch");
+    let mut worst = (0usize, 0.0f32, 0.0f32, 0.0f32);
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let d = (g - w).abs();
+        if d > atol + rtol * w.abs() && d > worst.1 {
+            worst = (i, d, g, w);
+        }
+    }
+    assert!(
+        worst.1 == 0.0,
+        "{name}: worst diff {} at [{}]: got {} want {} (atol {atol} rtol {rtol})",
+        worst.1,
+        worst.0,
+        worst.2,
+        worst.3
+    );
+}
+
+fn bits(f: &[f32]) -> Vec<u16> {
+    f.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()
+}
+
+#[test]
+fn moe_block_matches_reference() {
+    let fx = fixtures!();
+    let (hidden, n_experts, top_k, moe_inter, scale) = (32usize, 4usize, 2usize, 10usize, 2.5f32);
+
+    let load_expert = |p: &str| ExpertW {
+        wg: bits(&fx.f32(&format!("{p}.wg")).unwrap().1),
+        wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
+        wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
+    };
+    let experts: Vec<ExpertW> = (0..n_experts).map(|e| load_expert(&format!("moe.e{e}"))).collect();
+    let w = MoeWeights {
+        router_w: fx.f32("moe.router_w").unwrap().1,
+        router_bias: fx.f32("moe.router_bias").unwrap().1,
+        experts,
+        shared: load_expert("moe.sh"),
+    };
+    // shared_inter == moe_inter * n_shared (n_shared = 1 here).
+    let layer = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, w);
+
+    let (xshape, x) = fx.f32("moe.x").unwrap(); // [rows, hidden]
+    let (_, want) = fx.f32("moe.out").unwrap();
+    let rows = xshape[0];
+
+    let mut got = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let y = layer.forward_token(&x[r * hidden..(r + 1) * hidden]);
+        got[r * hidden..(r + 1) * hidden].copy_from_slice(&y);
+    }
+    assert_close("moe.out", &got, &want, 2e-3, 1e-2);
+}
