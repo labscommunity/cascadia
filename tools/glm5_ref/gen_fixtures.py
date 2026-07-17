@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
                                   layer_ref, model_ref, moe_gate, moe_ref,
-                                  precompute_freqs_cis, swiglu_ref)
+                                  mtp_draft_ref, precompute_freqs_cis, swiglu_ref)
 
 FX = {}
 META = {}
@@ -280,6 +280,51 @@ def main():
                      "n_layers": NLAYERS, "first_dense": FIRST_DENSE, "dense_inter": DINT,
                      "n_experts": mE, "moe_inter": mINT, "prompt": PROMPT,
                      "n_gen": NGEN, "greedy": greedy}
+
+    # ---- 9. MTP head: DeepSeek-V3 draft chain (embed+norms+eh_proj+block+lm_head) ----
+    G_MTP, MTP_TOK = 3, 5
+    mtp_hlast = (0.5 * torch.randn(mhH, generator=g)).to(torch.bfloat16).to(torch.float32)
+    mtp_embed = wbf(VOCAB, mhH)
+    mtp_lm_head = wbf(VOCAB, mhH)
+    mtp_eh_proj = wbf(mhH, 2 * mhH)
+    mtp_enorm, mtp_hnorm = norm_w(mhH), norm_w(mhH)
+    mtp_final_norm, mtp_mtp_norm = norm_w(mhH), norm_w(mhH)
+    mtp_attn = attn_w()
+    mtp_rw = wbf(mE, mhH)
+    mtp_rb = (0.3 * torch.randn(mE, generator=g)).to(torch.bfloat16).to(torch.float32)
+    mtp_exps = [(wbf(mINT, mhH), wbf(mINT, mhH), wbf(mhH, mINT)) for _ in range(mE)]
+    mtp_sh = (wbf(mINT, mhH), wbf(mINT, mhH), wbf(mhH, mINT))
+    mtp_in_ln, mtp_post_ln = norm_w(mhH), norm_w(mhH)
+    mtp_block = {"in_ln": mtp_in_ln, "post_ln": mtp_post_ln, "attn": mtp_attn,
+                 "rw": mtp_rw, "rb": mtp_rb, "experts": mtp_exps, "shared": mtp_sh}
+    mtp_w = {"embed": mtp_embed, "enorm": mtp_enorm, "hnorm": mtp_hnorm,
+             "final_norm": mtp_final_norm, "mtp_norm": mtp_mtp_norm,
+             "eh_proj": mtp_eh_proj, "lm_head": mtp_lm_head, "mtp_block": mtp_block}
+    mtp_drafts = mtp_draft_ref(mtp_hlast, MTP_TOK, G_MTP, mtp_w, mcfg)
+
+    put("mtp.hlast", mtp_hlast)
+    put("mtp.embed", mtp_embed)
+    put("mtp.lm_head", mtp_lm_head)
+    put("mtp.eh_proj", mtp_eh_proj)
+    put("mtp.enorm", mtp_enorm)
+    put("mtp.hnorm", mtp_hnorm)
+    put("mtp.final_norm", mtp_final_norm)
+    put("mtp.mtp_norm", mtp_mtp_norm)
+    put("mtp.block.in_ln", mtp_in_ln)
+    put("mtp.block.post_ln", mtp_post_ln)
+    for k, v in mtp_attn.items():
+        put(f"mtp.block.attn.{k}", v)
+    put("mtp.block.moe.router_w", mtp_rw)
+    put("mtp.block.moe.router_bias", mtp_rb)
+    for e in range(mE):
+        put(f"mtp.block.moe.e{e}.wg", mtp_exps[e][0])
+        put(f"mtp.block.moe.e{e}.wu", mtp_exps[e][1])
+        put(f"mtp.block.moe.e{e}.wd", mtp_exps[e][2])
+    put("mtp.block.moe.sh.wg", mtp_sh[0])
+    put("mtp.block.moe.sh.wu", mtp_sh[1])
+    put("mtp.block.moe.sh.wd", mtp_sh[2])
+    META["mtp"] = {"next_tok": MTP_TOK, "g": G_MTP, "drafts": mtp_drafts,
+                   "vocab": VOCAB, "hidden": mhH}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
