@@ -342,6 +342,11 @@ def main():
     rt_greedy = load_export_and_generate(export_dir, rt_prompt, rt_ngen)
     print(f"[loader round-trip] export {export_dir} prompt {rt_prompt} greedy {rt_greedy}")
 
+    # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
+    from glm5_ref.fp8_roundtrip import roundtrip
+    fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)
+    print(f"[fp8 round-trip] export {fp8_export} greedy {fp8_greedy}")
+
 
 if __name__ == "__main__":
     main()
