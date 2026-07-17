@@ -142,6 +142,17 @@ def build_manifest(cfg: dict) -> dict:
         "experts_format": "int4_bin",
         "shell_backend": "rust_glm",
         "expert_intermediate": cfg["moe_inter"],
+        # glm5 shell dims (beyond the dsv4-shared subset) the loader needs:
+        "num_attention_heads": cfg["num_heads"],
+        "q_lora_rank": cfg["q_lora"],
+        "kv_lora_rank": cfg["kv_lora"],
+        "qk_nope_head_dim": cfg["qk_nope"],
+        "qk_rope_head_dim": cfg["qk_rope"],
+        "dense_intermediate": cfg["dense_inter"],
+        "n_shared_experts": cfg["n_shared"],
+        "routed_scaling_factor": cfg["routed_scale"],
+        "rope_theta": cfg["rope_theta"],
+        "rms_norm_eps": cfg["eps"],
     }
 
 

@@ -8,14 +8,15 @@
 //! `rms_norm_eps` (1e-5).
 
 use super::attn::AttentionLayer;
-use super::ffn::swiglu;
-use super::moe::{ExpertW, MoeLayer};
+use super::moe::{AnyExpert, MoeLayer};
 use crate::dsv4::math::{linear_f32, rmsnorm};
 
 /// The per-layer feed-forward: routed MoE, or a dense SwiGLU (first-k layers).
+/// The dense MLP is a single SwiGLU FFN — stored as an [`AnyExpert`] so it
+/// shares the Bf16/int4 storage dispatch with the routed experts.
 pub enum LayerMlp {
     Moe(MoeLayer),
-    Dense { w: ExpertW, inter: usize },
+    Dense { w: AnyExpert, inter: usize },
 }
 
 pub struct GlmLayer {
@@ -60,9 +61,7 @@ impl GlmLayer {
         rmsnorm(&mut nrm2, &self.post_ln, self.eps);
         let f = match &self.mlp {
             LayerMlp::Moe(m) => m.forward_token(&nrm2),
-            LayerMlp::Dense { w, inter } => {
-                swiglu(&nrm2, &w.wg, &w.wu, &w.wd, self.hidden, *inter)
-            }
+            LayerMlp::Dense { w, inter } => w.forward(&nrm2, self.hidden, *inter),
         };
         for (hi, &fi) in h.iter_mut().zip(&f) {
             *hi += fi;
