@@ -19,7 +19,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
-                                  moe_gate, precompute_freqs_cis, swiglu_ref)
+                                  moe_gate, moe_ref, precompute_freqs_cis,
+                                  swiglu_ref)
 
 FX = {}
 META = {}
@@ -134,6 +135,33 @@ def main():
     put("ffn.x", fx)
     put("ffn.out", fy)
     META["ffn"] = {"hidden": FHID, "inter": FINT, "rows": FROWS}
+
+    # ---- 6. MoE block: router (sigmoid+noaux_tc) + top-k experts + shared ----
+    MHID, MEXP, MTOPK, MINT, MSCALE, MROWS = 32, 4, 2, 10, 2.5, 3
+    m_rw = wbf(MEXP, MHID)                                    # router weight
+    m_rb = (0.3 * torch.randn(MEXP, generator=g)).to(torch.bfloat16).to(torch.float32)
+
+    def expert_w():
+        return (wbf(MINT, MHID), wbf(MINT, MHID), wbf(MHID, MINT))
+
+    m_experts = [expert_w() for _ in range(MEXP)]
+    m_shared = expert_w()
+    mx = (0.5 * torch.randn(MROWS, MHID, generator=g)).to(torch.bfloat16).to(torch.float32)
+    m_out = moe_ref(mx, m_rw, m_rb, m_experts, m_shared, MTOPK, MSCALE)
+
+    put("moe.router_w", m_rw)
+    put("moe.router_bias", m_rb)
+    for e in range(MEXP):
+        put(f"moe.e{e}.wg", m_experts[e][0])
+        put(f"moe.e{e}.wu", m_experts[e][1])
+        put(f"moe.e{e}.wd", m_experts[e][2])
+    put("moe.sh.wg", m_shared[0])
+    put("moe.sh.wu", m_shared[1])
+    put("moe.sh.wd", m_shared[2])
+    put("moe.x", mx)
+    put("moe.out", m_out)
+    META["moe"] = {"hidden": MHID, "n_experts": MEXP, "top_k": MTOPK,
+                   "moe_inter": MINT, "scale": MSCALE, "rows": MROWS}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
