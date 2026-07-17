@@ -121,6 +121,47 @@ def model_ref(cfg, w, prompt, n_gen):
     return gen
 
 
+def mtp_draft_ref(hlast, next_tok, G, w, cfg):
+    """GLM-5.2 MTP (multi-token-prediction) head — DeepSeek-V3 draft chain.
+    Given the true pre-norm hidden `hlast` at the last position
+    and the just-emitted `next_tok`, propose `G` greedy draft tokens:
+
+        x  = rmsnorm(embed[tok], enorm)
+        h  = rmsnorm(final_norm(hlast) if g==0 else h_prev, hnorm)
+        hx = eh_proj @ [x ; h]                    # [2H] -> [H], block input
+        hx = MTP_block(hx)                        # full transformer layer, own causal KV
+        draft = argmax(lm_head @ rmsnorm(hx, mtp_norm)); tok = draft; h = hx
+
+    `w` keys: embed[V,H], enorm[H], hnorm[H], final_norm[H], mtp_norm[H],
+    eh_proj[H,2H], lm_head[V,H], and `mtp_block` = {in_ln, post_ln, attn(dict),
+    rw, rb, experts, shared}. `cfg` = attention dims + top_k, scale, eps.
+    The block is recomputed over the growing draft sequence (causal-equivalent
+    to the incremental KV the Rust head uses). Returns the `G` draft ids."""
+    eps, top_k, scale = cfg["eps"], cfg["top_k"], cfg["scale"]
+    blk = w["mtp_block"]
+    h = hlast.to(torch.float32).clone()
+    tok = next_tok
+    drafts, hx_seq = [], []
+    for g in range(G):
+        x = _rms(w["embed"][tok].to(torch.float32).unsqueeze(0), w["enorm"], eps).squeeze(0)
+        if g == 0:
+            h = _rms(h.unsqueeze(0), w["final_norm"], eps).squeeze(0)
+        h = _rms(h.unsqueeze(0), w["hnorm"], eps).squeeze(0)
+        hx = _lin(torch.cat([x, h]).unsqueeze(0), w["eh_proj"]).squeeze(0)   # [H]
+        hx_seq.append(hx)
+        out, _ = layer_ref(torch.stack(hx_seq), blk["in_ln"], blk["post_ln"],
+                           blk["attn"], cfg, (blk["rw"], blk["rb"], blk["experts"], blk["shared"]),
+                           (top_k, scale), eps)
+        hx_post = out[-1]
+        row = _rms(hx_post.unsqueeze(0), w["mtp_norm"], eps).squeeze(0)
+        logit = _lin_f32(row.unsqueeze(0), w["lm_head"]).squeeze(0)
+        d = int(logit.argmax())
+        drafts.append(d)
+        tok = d
+        h = hx_post
+    return drafts
+
+
 def _layernorm(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
     """Classic LayerNorm (mean + population variance, weight + bias),
     bf16-rounded output. Used by the DSA indexer's k-norm (eps 1e-6)."""
