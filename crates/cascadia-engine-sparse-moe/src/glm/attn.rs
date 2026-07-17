@@ -36,6 +36,12 @@ fn widen(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// MLA latent-norm eps. HF runs `q_a_layernorm` / `kv_a_layernorm` at the
+/// `GlmMoeDsaRMSNorm` default (1e-6) — NOT `rms_norm_eps` (1e-5, which applies
+/// only to input/post-attention/final norms). Verified against
+/// `modeling_glm_moe_dsa.py`.
+pub const MLA_LATENT_EPS: f32 = 1e-6;
+
 /// Attention projection weights. GEMV weights are stored as bf16 bits (`u16`) —
 /// batch-1 projections are bandwidth-bound and the model is bf16-native, so
 /// halving the streamed bytes ~halves the projection cost. RMSNorm weights stay
@@ -58,7 +64,6 @@ pub struct AttentionLayer {
     pub v_head: usize,
     pub kv_lora: usize,
     pub q_lora: usize,
-    pub eps: f32,
     qk_head: usize, // qk_nope + qk_rope
     kv_out: usize,  // qk_nope + v_head (kv_b rows per head)
     scale: f32,
@@ -80,7 +85,6 @@ impl AttentionLayer {
         kv_lora: usize,
         q_lora: usize,
         max_seq: usize,
-        eps: f32,
         w: AttnWeights,
         freqs: Freqs,
     ) -> Self {
@@ -101,7 +105,6 @@ impl AttentionLayer {
             v_head,
             kv_lora,
             q_lora,
-            eps,
             qk_head,
             kv_out,
             scale: (qk_head as f32).powf(-0.5),
@@ -132,7 +135,7 @@ impl AttentionLayer {
         // q = wq_b · rmsnorm(wq_a · x), rope on each head's pe tail.
         let mut qr = vec![0.0f32; self.q_lora];
         linear_bf16_w(x, &self.w.wq_a, self.q_lora, self.hidden, &mut qr);
-        rmsnorm(&mut qr, &self.w.q_a_ln, self.eps);
+        rmsnorm(&mut qr, &self.w.q_a_ln, MLA_LATENT_EPS);
         let mut q = vec![0.0f32; h * qk];
         linear_bf16_w(&qr, &self.w.wq_b, h * qk, self.q_lora, &mut q);
         for hi in 0..h {
@@ -143,7 +146,7 @@ impl AttentionLayer {
         let mut comp = vec![0.0f32; kvl + rope];
         linear_bf16_w(x, &self.w.wkv_a, kvl + rope, self.hidden, &mut comp);
         let mut lat = comp[..kvl].to_vec();
-        rmsnorm(&mut lat, &self.w.kv_a_ln, self.eps);
+        rmsnorm(&mut lat, &self.w.kv_a_ln, MLA_LATENT_EPS);
         self.lc[pos * kvl..(pos + 1) * kvl].copy_from_slice(&lat);
         let mut kpe = comp[kvl..].to_vec();
         apply_rope_row(&mut kpe, &self.freqs, pos, rope, false);

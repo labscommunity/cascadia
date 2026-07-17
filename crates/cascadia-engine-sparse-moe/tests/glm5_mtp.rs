@@ -52,7 +52,7 @@ fn mtp_draft_matches_reference() {
         wo: bits(&fx.f32("mtp.block.attn.wo").unwrap().1),
     };
     let freqs = precompute_freqs(rope, g_steps, 0, theta, 1.0, 32.0, 1.0);
-    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, g_steps, eps, aw, freqs);
+    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, g_steps, aw, freqs);
 
     let load_expert = |p: &str| ExpertW {
         wg: bits(&fx.f32(&format!("{p}.wg")).unwrap().1),

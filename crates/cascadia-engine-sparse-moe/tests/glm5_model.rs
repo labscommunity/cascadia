@@ -63,7 +63,7 @@ fn model_greedy_matches_reference() {
             wo: bits(&fx.f32(&format!("{lp}.attn.wo")).unwrap().1),
         };
         let freqs = precompute_freqs(rope, max_seq, 0, theta, 1.0, 32.0, 1.0);
-        let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, eps, aw, freqs);
+        let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
 
         let mlp = if li < first_dense {
             LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")).into(), inter: dense_inter }
