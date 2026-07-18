@@ -1,10 +1,9 @@
 # NPU TTFT at scale: the 1B→70B tier benchmarks
 
-**Status:** tiers 1B/3B/8B/14B measured; 32B (3-box) and 70B (6-box) pipeline
-tiers in flight — this doc snapshots method + results so far and will be
-finalized with the fleet numbers. Companion to
-docs/perf/HYBRID_NPU_CPU.md (the device × model-size matrix and the
-big-model NPU routes live there).
+**Status:** tiers 1B/3B/8B/14B/32B measured end-to-end; 70B validated to
+full six-box pipeline health with request execution blocked by two isolated,
+documented constraints (below). Companion to docs/perf/HYBRID_NPU_CPU.md
+(the device × model-size matrix and the big-model NPU routes live there).
 
 ## The question
 
@@ -37,8 +36,21 @@ it cost in memory and deployment complexity?
 | 14B tokenwise GPU | 9.1 s | 114.4 s | 3.4–3.8 |
 | **14B chunked GPU** | **603 ms** | **2.79 s** | 3.4–3.5 |
 | 14B tokenwise NPU (from AOT blob) | 9.0 s | 125.0 s | 3.5 |
-| 32B 3-box all-NPU pipeline | pending | pending | — |
-| 70B 6-box all-NPU pipeline | pending | pending | — |
+| **32B 3-box pipeline** (iGPU stage-0 + 2 NPU stages, warm e2e w/ 24-tok decode) | **6.0 s** | **27.4–27.8 s** | correct + stable |
+| 70B 6-box pipeline | health ✓, requests blocked¹ | — | — |
+
+¹ 70B: all six ranks load from cross-compiled blobs and reach full pipeline
+health in every configuration (≈53 GB of NPU blobs resident across the
+fleet, ~11–16 GB free per box). Request execution is blocked at stage-0 on
+the rank-0 box by isolated causes: (a) both stage-0 blobs resident = 19.4 GB
+L0 → execute-time `ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY`; (b) single-blob +
+`--no-chunked-prefill` = tokenwise stage-0 prefill starves downstream links
+past the transport's 60 s data-frame timeout; (c) stage-0 on iGPU from bins
+= first inference exceeded the 600 s relay timeout (unresolved; suspect
+first-infer UMA behavior with 2×6.9 GB freshly-compiled GPU models — next
+investigation lead). Fix candidates: park-style sequential phase residency
+for pipeline stages, a keep-alive/progress frame in the transport, or a
+64 GB-class rank-0 box.
 
 14B speedups: chunked-GPU is **15× short / 41× long** vs the tokenwise
 static-graph baseline on the same device.
@@ -104,6 +116,17 @@ The *mechanism* is prior art; the *measurement direction* is not:
    generations pinned together.
 5. Tailscale DERP relays are fine for pipeline hops (16 ms box↔box) but
    slow for bulk (~1–5 MB/s/stream); parallel part-streams aggregate.
+6. **A pipeline stage that prefills tokenwise starves its downstream links**:
+   the transport's data-frame recv timeout (60 s) fires while a big stage
+   grinds seq=1 steps, collapsing the pipeline. Graceful degradation
+   (`--no-chunked-prefill`, missing prefill variants) is therefore only safe
+   for stages small/fast enough to emit within the timeout — or the
+   transport needs progress keep-alives (follow-up).
+7. **Mixed Windows shell defaults make inline ssh commands non-portable**
+   (cmd vs PowerShell hosts parse quoting differently; `-File` arg parsing
+   treats single quotes as literal). The only robust remote-orchestration
+   pattern found: ship per-host `.ps1` files with values baked in, invoke
+   argument-free, verify the process actually exists afterward.
 
 ## Reproduction
 
