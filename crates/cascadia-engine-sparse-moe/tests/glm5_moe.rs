@@ -6,9 +6,11 @@
 //!       --out crates/cascadia-engine-sparse-moe/tests/fixtures/glm5
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::glm::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
+use cascadia_engine_sparse_moe::glm::residency::UsageStats;
 
 macro_rules! fixtures {
     () => {{
@@ -77,4 +79,44 @@ fn moe_block_matches_reference() {
         got[r * hidden..(r + 1) * hidden].copy_from_slice(&y);
     }
     assert_close("moe.out", &got, &want, 2e-3, 1e-2);
+}
+
+/// The learned-pin recorder: once a usage sink is attached, every routed
+/// selection lands in the histogram keyed by this layer's global index. No
+/// fixtures — zero weights are enough since we only assert routing bookkeeping.
+#[test]
+fn moe_records_routing_into_usage() {
+    let (hidden, n_experts, top_k, inter) = (8usize, 4usize, 2usize, 4usize);
+    let zero_expert = || {
+        AnyExpert::from(ExpertW {
+            wg: vec![0u16; inter * hidden],
+            wu: vec![0u16; inter * hidden],
+            wd: vec![0u16; hidden * inter],
+        })
+    };
+    let w = MoeWeights {
+        router_w: vec![0.0f32; n_experts * hidden], // equal logits -> deterministic top-k
+        router_bias: vec![0.0f32; n_experts],
+        experts: (0..n_experts).map(|_| zero_expert()).collect(),
+        shared: zero_expert(),
+    };
+    let mut layer = MoeLayer::new(hidden, n_experts, top_k, inter, inter, 2.5, w);
+
+    // Unattached: forward records nothing.
+    let x = vec![0.1f32; hidden];
+    let _ = layer.forward_token(&x);
+
+    let usage = Arc::new(Mutex::new(UsageStats::new()));
+    layer.attach_usage(7, Arc::clone(&usage));
+    for _ in 0..3 {
+        let _ = layer.forward_token(&x);
+    }
+
+    let u = usage.lock().unwrap();
+    // Only the 3 post-attach tokens count: top_k selections each.
+    assert_eq!(u.total, (top_k * 3) as u64);
+    // Constant input -> the same top_k experts every token; all keyed to layer 7.
+    let hot = u.hottest(n_experts);
+    assert_eq!(hot.len(), top_k, "exactly top_k distinct experts fired");
+    assert!(hot.iter().all(|&(l, _)| l == 7), "all recorded at global layer 7");
 }

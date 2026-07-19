@@ -47,6 +47,22 @@ impl GlmLayer {
         self.attn.reset();
     }
 
+    /// This layer's MoE block, if it is a sparse (non-dense) layer — for the
+    /// learned-pin machinery to enumerate/attach.
+    pub fn moe(&self) -> Option<&MoeLayer> {
+        match &self.mlp {
+            LayerMlp::Moe(m) => Some(m),
+            LayerMlp::Dense { .. } => None,
+        }
+    }
+
+    pub fn moe_mut(&mut self) -> Option<&mut MoeLayer> {
+        match &mut self.mlp {
+            LayerMlp::Moe(m) => Some(m),
+            LayerMlp::Dense { .. } => None,
+        }
+    }
+
     /// Process one token at the next cached position. `x` is the residual-stream
     /// hidden `[hidden]`; returns the updated hidden after this layer.
     pub fn forward_token(&mut self, x: &[f32]) -> Vec<f32> {

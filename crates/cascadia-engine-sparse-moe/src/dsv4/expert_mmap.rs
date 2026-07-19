@@ -107,6 +107,13 @@ impl MmapExpert {
         out
     }
 
+    /// `mlock` the mapped range so the OS never evicts it (hot-expert pinning).
+    /// Best-effort: returns the error (e.g. `RLIMIT_MEMLOCK` exceeded) so the
+    /// caller can fall back to the OS page cache for this expert.
+    pub fn pin(&self) -> std::io::Result<()> {
+        self.mmap.lock()
+    }
+
     /// SwiGLU section GEMVs exposed for shells with a different activation
     /// contract (the glm5 shell applies f32 `silu·up`, no clamp, route outside).
     /// Each returns the bf16-rounded fused int4 dequant-dot (same kernel as
