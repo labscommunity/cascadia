@@ -40,17 +40,23 @@ it cost in memory and deployment complexity?
 | 70B 6-box pipeline | health ✓, requests blocked¹ | — | — |
 
 ¹ 70B: all six ranks load from cross-compiled blobs and reach full pipeline
-health in every configuration (≈53 GB of NPU blobs resident across the
-fleet, ~11–16 GB free per box). Request execution is blocked at stage-0 on
-the rank-0 box by isolated causes: (a) both stage-0 blobs resident = 19.4 GB
-L0 → execute-time `ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY`; (b) single-blob +
-`--no-chunked-prefill` = tokenwise stage-0 prefill starves downstream links
-past the transport's 60 s data-frame timeout; (c) stage-0 on iGPU from bins
-= first inference exceeded the 600 s relay timeout (unresolved; suspect
-first-infer UMA behavior with 2×6.9 GB freshly-compiled GPU models — next
-investigation lead). Fix candidates: park-style sequential phase residency
-for pipeline stages, a keep-alive/progress frame in the transport, or a
-64 GB-class rank-0 box.
+health in every configuration (≈53 GB of NPU blobs fleet-wide). Two
+memory-envelope blockers were fixed en route (dual-blob 19.4 GB L0
+execute-OOM on stage-0; tokenwise-fallback transport starvation — timeout
+is env-tunable via `CASCADIA_ACTIVATION_TIMEOUT_SECS`). The remaining
+blocker, hop-by-hop traced with debug builds on ranks 0/1: **inter-stage
+hidden-state frames (~750 KB at hidden=8192) intermittently black-hole on
+DERP-relayed tailscale links** — the 32-byte position frame arrives, the
+hidden frame following it never does, on a varying link per run (0→1 in
+early runs; 1→2 after). Ruled out empirically: the stage graphs (0.2 s
+infers in isolation AND via in-pipeline warmups), every rank-0 device
+config, disk pressure (pawan-01 had silently hit 0 bytes free — fixed),
+stale tailscale sessions (restarting all daemons changed nothing), and
+send-side burst pacing (`CASCADIA_SEND_BURST_BYTES` knob, no effect).
+The 32B pipeline (~470 KB frames, 3 hops, same boxes/links) re-validated
+clean the same day. Next steps: packet capture on a black-holed link,
+direct WireGuard (needs Tiber UDP), or per-frame ack/segmentation in the
+transport protocol.
 
 14B speedups: chunked-GPU is **15× short / 41× long** vs the tokenwise
 static-graph baseline on the same device.
