@@ -253,6 +253,15 @@ fn argmax_logits(logits: &[f32], shape: &[usize]) -> EngineResult<i32> {
             logits.len()
         )));
     }
+    // A length that isn't a whole number of rows means the producer handed
+    // us a truncated/corrupted buffer — fail loud instead of confidently
+    // argmaxing a start-aligned window and silently dropping the tail.
+    if logits.len() % vocab != 0 {
+        return Err(EngineError::Backend(format!(
+            "logits len {} is not a multiple of vocab {vocab} (shape={shape:?})",
+            logits.len()
+        )));
+    }
     argmax_logits_row(logits, shape, rows - 1)
 }
 
@@ -2391,6 +2400,21 @@ impl Builder for OvRuntimeBuilder {
                         self.rank, stage_cfg.stateful, cfg.stateful
                     )));
                 }
+                // The chunk path also couples stages GEOMETRICALLY: each
+                // stage derives its KV window (past_len) and the in-window /
+                // tokenwise-fallback decision from its OWN static_context. A
+                // pipeline stitched from different exports would silently
+                // apply different sliding windows per stage — corrupted
+                // output, no error. Fail fast instead. (Differing
+                // static_prefill_seq alone is fine — relays sub-chunk.)
+                if cfg.static_context != stage_cfg.static_context {
+                    return Err(EngineError::ShardRejected(format!(
+                        "pipeline is not homogeneous: stage_{} static_context={:?} but \
+                         stage_{r} static_context={:?} — stages from different exports \
+                         apply different KV windows (re-export the whole pipeline)",
+                        self.rank, stage_cfg.static_context, cfg.static_context
+                    )));
+                }
             }
         }
 
@@ -2436,7 +2460,26 @@ impl Builder for OvRuntimeBuilder {
             events.push(LoadProgress::message(format!(
                 "compiling chunked-prefill variant (seq={pseq}, context={pctx}) on {pdev}"
             )));
-            let prt = OvRuntime::compile(prefill_xml.to_str().unwrap_or_default(), &pdev, &plugin)
+            // Same-device chunked prefill shares the full decode plugin
+            // config. When the phase split targets a DIFFERENT device, only
+            // CACHE_DIR carries over: every other entry (KV_CACHE_PRECISION,
+            // DYNAMIC_QUANTIZATION_GROUP_SIZE, --ov-property keys) is decode-
+            // device tuning — a foreign plugin either rejects the key at
+            // compile_model (failing the whole load) or silently mis-tunes
+            // the prefill graph.
+            let pplugin = if pdev == self.device {
+                plugin.clone()
+            } else {
+                PluginConfig {
+                    entries: plugin
+                        .entries
+                        .iter()
+                        .filter(|(k, _)| k == "CACHE_DIR")
+                        .cloned()
+                        .collect(),
+                }
+            };
+            let prt = OvRuntime::compile(prefill_xml.to_str().unwrap_or_default(), &pdev, &pplugin)
                 .map_err(map_ov_err)
                 .map_err(|e| {
                     EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
