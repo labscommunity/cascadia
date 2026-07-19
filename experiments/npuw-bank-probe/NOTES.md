@@ -22,7 +22,7 @@ ingest. This is an undocumented surface; treat any behavior as unsupported.
 `crates/cascadia-engine-openvino/tests/npuw_bank_probe.rs` (env-gated):
 compiles BOTH variants on `NPU` (`--prefill-device NPU` equivalent), runs an
 8-token sanity generation, then holds the process alive while
-`run_npuw_probe.ps1` samples peak working set. Two modes:
+`a sysfoot wrapper (run_npuw_probe.ps1 — NOT committed; lost in a session restart; re-derive: poll `(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory` at 5 s intervals around the PROBE-HOLD window)` samples peak working set. Two modes:
 
 - `baseline` — plain NPU compiles (the shipping all-NPU config).
 - `npuw` — adds `NPU_USE_NPUW=YES` + `NPUW_WEIGHTS_BANK=cascadia-bank-probe`
@@ -51,7 +51,7 @@ decompressing INT4→f16 host-side). Peaks are dominated by compiler
 transients. So: the bank likely dedups, but DCOFF expansion may make total
 residency WORSE than plain-path INT4 for compressed models. A system-wide
 free-memory-delta measurement (captures driver allocations) was scripted
-(`run_npuw_probe.ps1` sysfoot columns) but a bastion network outage
+(`a sysfoot wrapper (run_npuw_probe.ps1 — NOT committed; lost in a session restart; re-derive: poll `(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory` at 5 s intervals around the PROBE-HOLD window)` sysfoot columns) but a bastion network outage
 interrupted the run; re-run it when the fleet path is stable before drawing
 a memory conclusion.
 

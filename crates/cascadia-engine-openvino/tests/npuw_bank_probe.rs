@@ -81,11 +81,25 @@ async fn npuw_bank_probe() {
 
     // Sanity generation so the probe also reports whether NPUW-compiled
     // variants still produce sane output through the ring.
+    // Infer-time failures are probe DATA on this explicitly-unsupported
+    // NPUW surface — print a PROBE-RESULT line instead of panicking so the
+    // external sampling wrapper still gets its hold window.
     let task = GenerationTask::new("npuw-probe", "The capital of France is").with_max_tokens(8);
-    engine.submit(task).expect("submit");
+    let mut gen_failed = false;
+    if let Err(e) = engine.submit(task) {
+        eprintln!("PROBE-RESULT submit-failed: {e}");
+        gen_failed = true;
+    }
     let mut text = String::new();
-    loop {
-        let chunks = engine.step().expect("step");
+    while !gen_failed {
+        let chunks = match engine.step() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("PROBE-RESULT infer-failed: {e}");
+                gen_failed = true;
+                break;
+            }
+        };
         let mut done = false;
         for (_, c) in chunks {
             text.push_str(&c.text);
@@ -97,8 +111,12 @@ async fn npuw_bank_probe() {
             break;
         }
     }
-    eprintln!("PROBE-GEN {text:?}");
+    if !gen_failed {
+        eprintln!("PROBE-GEN {text:?}");
+    }
     eprintln!("PROBE-HOLD {hold_s}s (sample this process's working set now)");
     std::thread::sleep(std::time::Duration::from_secs(hold_s));
-    eprintln!("PROBE-RESULT ok");
+    if !gen_failed {
+        eprintln!("PROBE-RESULT ok");
+    }
 }

@@ -31,6 +31,9 @@
 //! `NEAR_TIE_MIN_PREFIX` decoded tokens, which otherwise hard-fails as suspect
 //! corruption; late near-tie forks are already tolerated by default. For pure
 //! timing sweeps; see `assert_parity`).
+//! NOTE: `CASCADIA_OV_CACHE` applies to EVERY leg's compiles (not only the
+//! parking leg) — cached-NPU legs pay the ~300-430 ms first-infer import
+//! init, so compare like-for-like when A/B-ing against cacheless runs.
 //! Unset `CASCADIA_STATIC_SHARDS` ⇒ skip-pass (stub CI stays green).
 //! Multi-stage pipelines are exercised on hardware via `cascadia worker`
 //! (`--prefill-device`), not here.
@@ -344,7 +347,7 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
             format!("chunked#{}  [{device}]", i + 1)
         };
         report(&label, c);
-        assert_parity(&format!("chunked prefill on {device} (task {i})"), &base, c);
+        assert_parity(&format!("chunked prefill on {device} (task {})", i + 1), &base, c);
     }
 
     // Hybrid: chunked prefill on another device, decode unchanged.
@@ -360,7 +363,7 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
             };
             report(&label, h);
             assert_parity(
-                &format!("hybrid ({pd} prefill + {device} decode, task {i})"),
+                &format!("hybrid ({pd} prefill + {device} decode, task {})", i + 1),
                 &base,
                 h,
             );
@@ -380,7 +383,7 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         report(&format!("parked#1  [{label}+{device}]"), &outs[0]);
         report(&format!("parked#2  [{label}+{device}]"), &outs[1]);
         for (n, o) in outs.iter().enumerate() {
-            assert_parity(&format!("parked task {n}"), &base, o);
+            assert_parity(&format!("parked task {}", n + 1), &base, o);
         }
     } else {
         eprintln!("CASCADIA_PARK not set; parking leg skipped");

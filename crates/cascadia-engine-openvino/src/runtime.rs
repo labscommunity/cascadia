@@ -1272,6 +1272,9 @@ impl OvRuntimeEngine {
                 sk.reset();
             }
             self.position = 0;
+            // Failure recovery is also a going-idle transition: release the
+            // prefill weight copy (no-op unless --park-prefill).
+            self.park_prefill_model();
             res = Err(match failed {
                 Some(id) => e.for_task(id),
                 None => e,
@@ -1706,14 +1709,6 @@ impl OvRuntimeEngine {
         Ok((odt, oshape, obytes))
     }
 
-    /// One chunked-prefill inference covering `real` (<= C) tokens starting at
-    /// absolute `position`, on the prefill runtime (`--prefill-device`). Pads
-    /// the primary input to the fixed C-window, masks the padding, feeds the
-    /// SAME host KV ring the decode model uses, absorbs the `real` new
-    /// tokens' K/V, and returns output 0 (`[1, C, X]`; rows `real..C` are
-    /// pad-query garbage the caller must never use). The ring is the whole
-    /// prefill→decode handoff: KV lives once in host DRAM regardless of which
-    /// device computed it.
     /// Re-create a parked prefill compilation (no-op while loaded or without
     /// a variant). Reload cost is logged; with a CACHE_DIR-backed compile the
     /// reload comes from the OV blob/UMD cache rather than a cold compile.
@@ -1791,13 +1786,16 @@ impl OvRuntimeEngine {
                 "negative chunk position {position}"
             )));
         }
-        sk.begin_token(position as usize);
-        sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
+        // Parked check FIRST: begin_token/write_prefill_mask mutate ring
+        // state — advancing the cursor for a token whose K/V is never
+        // absorbed would desync the ring if this error ever fires.
         let prt = pf.runtime.as_mut().ok_or_else(|| {
             EngineError::Backend(
                 "prefill model is parked — callers must ensure_prefill_loaded first".into(),
             )
         })?;
+        sk.begin_token(position as usize);
+        sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
 
         // Primary input, converted/padded straight into the reusable
         // `primary_buf` (zero pads: masked out of attention, outputs unused,
@@ -2017,7 +2015,13 @@ impl Engine for OvRuntimeEngine {
                 // inflates the first real request's TTFT — the very metric
                 // the phase split exists to improve.
                 if self.prefill.is_some() && !warm.is_empty() {
-                    if let Err(e) = self.run_first_chunk(warm, 0, true) {
+                    // Ensure covers a future re-warm with --park-prefill:
+                    // today warmup precedes any park, but that ordering is
+                    // an invariant nothing else enforces.
+                    if let Err(e) = self
+                        .ensure_prefill_loaded()
+                        .and_then(|_| self.run_first_chunk(warm, 0, true).map(|_| ()))
+                    {
                         warn!(error = %e, "ov-runtime warmup (prefill model) failed");
                     }
                 }
@@ -2116,6 +2120,11 @@ impl Engine for OvRuntimeEngine {
                 sk.reset();
             }
             self.position = 0;
+            // Cancel is a "task over, going idle" transition — exactly what
+            // --park-prefill exists for. Without this, a cancelled task
+            // leaves the second weight copy resident until the NEXT task's
+            // prefill completes.
+            self.park_prefill_model();
         }
     }
 }
@@ -2302,12 +2311,12 @@ impl OvRuntimeBuilder {
         self.prefill_device = Some(device.into());
         self
     }
-    /// Skip the export's chunked-prefill variant (prefill one token per step).
     /// Park the prefill model between prefills (see `park_prefill`).
     pub fn with_prefill_parking(mut self, park: bool) -> Self {
         self.park_prefill = park;
         self
     }
+    /// Skip the export's chunked-prefill variant (prefill one token per step).
     pub fn with_chunked_prefill_disabled(mut self, disabled: bool) -> Self {
         self.disable_chunked_prefill = disabled;
         self
