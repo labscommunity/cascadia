@@ -29,16 +29,35 @@ fn warms_blob_cache_sequentially() {
         plugin.entries.push(("CACHE_DIR".into(), cache));
     }
 
+    // CASCADIA_WARM_INFER=1: after each compile, run ONE inference with the
+    // request's default (zeroed) input tensors and time it — isolates
+    // graph-specific first-inference pathologies (observed: a 70B
+    // embed-carrying stage hangs its first infer on iGPU/NPU while smaller
+    // stages run fine) without any pipeline machinery around them.
+    let do_infer = std::env::var("CASCADIA_WARM_INFER").is_ok_and(|v| v == "1");
+
     for xml in xmls.split(';').filter(|s| !s.trim().is_empty()) {
         let t0 = Instant::now();
         match Runtime::compile(xml, &device, &plugin) {
-            Ok(_rt) => eprintln!(
-                "WARM OK [{device}] {xml}: {:.0}s (blob cached; runtime dropped)",
-                t0.elapsed().as_secs_f64()
-            ),
+            Ok(mut rt) => {
+                eprintln!(
+                    "WARM OK [{device}] {xml}: {:.0}s",
+                    t0.elapsed().as_secs_f64()
+                );
+                if do_infer {
+                    let ti = Instant::now();
+                    match rt.infer() {
+                        Ok(()) => eprintln!(
+                            "INFER OK [{device}] {xml}: {:.1}s",
+                            ti.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => eprintln!("INFER FAILED [{device}] {xml}: {e}"),
+                    }
+                }
+            }
             Err(e) => panic!("WARM FAILED [{device}] {xml}: {e}"),
         }
-        // _rt drops here — the transient and the compiled model are gone
+        // rt drops here — the transient and the compiled model are gone
         // before the next compile starts.
     }
 }
