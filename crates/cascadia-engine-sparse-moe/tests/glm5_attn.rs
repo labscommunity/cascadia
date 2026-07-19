@@ -57,7 +57,7 @@ fn mla_attention_matches_reference() {
 
     // dims match tools/glm5_ref/gen_fixtures.py::acfg
     let (hidden, h, nope, rope, vh, kvl, ql) = (32usize, 3, 6, 4, 6, 8, 16);
-    let (eps, theta) = (1e-5f32, 8.0e6f32);
+    let theta = 8.0e6f32;
     let seq = xshape[0];
     assert_eq!(xshape[1], hidden);
 

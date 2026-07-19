@@ -26,5 +26,6 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod mtp;
+pub mod residency;
 pub mod rope;
 pub mod stage;
