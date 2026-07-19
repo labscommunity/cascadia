@@ -1177,6 +1177,7 @@ impl OvRuntimeEngine {
         // hidden activation (see send_hidden_downstream). Each frame's payload
         // must match its shape*dtype, so we recv two separate tensors here.
         let want_pos = self.static_kv.is_some();
+        debug!(want_pos, "upstream recv: waiting");
         let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
@@ -1189,6 +1190,7 @@ impl OvRuntimeEngine {
                 // can't wedge the stage (see `recv_tensor_reply`).
                 let (pos_tensor, t) = if want_pos {
                     let pos = guard.recv().await?.0;
+                    tracing::debug!("upstream recv: position frame arrived");
                     let (t, _) = guard.recv_reply().await?;
                     (Some(pos), t)
                 } else {
@@ -1198,6 +1200,7 @@ impl OvRuntimeEngine {
                 Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        debug!("upstream recv: frames arrived");
         // Decode + strictly validate the position frame outside the transport
         // closure (so a bad frame yields a clear EngineError, not a desync).
         let position = match pos_tensor {
