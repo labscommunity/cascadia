@@ -111,8 +111,11 @@ def roundtrip(work: Path, prompt, n_gen):
     import export_glm5
     from glm5_ref.load_export import load_export_and_generate
 
+    import shutil
+
     ckpt = work / "glm5_fp8_ckpt"
     export = work / "glm5_fp8_export"
     build_synthetic_fp8_ckpt(ckpt)
+    shutil.rmtree(export, ignore_errors=True)  # fixture: always a fresh export (no stale .done skips)
     export_glm5.export_real(ckpt, export)
     return export, load_export_and_generate(export, prompt, n_gen)

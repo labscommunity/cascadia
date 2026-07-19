@@ -274,10 +274,48 @@ class CkptSource:
         return t.to(torch.float32)
 
 
+def _int4_bin_bytes(hidden: int, inter: int) -> int:
+    """Byte size of one int4 expert/dense bin (gate+up+down, group-32)."""
+    def sec(o, i):
+        return o * i // 2 + o * (i // _INT4_GROUP) * 2
+    return 2 * sec(inter, hidden) + sec(hidden, inter)
+
+
+def check_space(out: Path, cfg: dict):
+    """Pre-flight: estimate the export size and refuse to start if the disk
+    can't hold it (a 386 GB export that runs out of space at layer 60 is an
+    expensive failure). Override with GLM5_SKIP_SPACE_CHECK=1."""
+    import shutil
+
+    h = cfg["hidden"]
+    n_dense = cfg["first_dense"]
+    n_moe = cfg["num_layers"] - n_dense
+    experts = n_moe * (cfg["n_routed"] + cfg["n_shared"]) * _int4_bin_bytes(h, cfg["moe_inter"])
+    dense = n_dense * _int4_bin_bytes(h, cfg["dense_inter"])
+    attn_params = (
+        cfg["q_lora"] * h + cfg["num_heads"] * cfg["qk_head"] * cfg["q_lora"]
+        + (cfg["kv_lora"] + cfg["qk_rope"]) * h
+        + cfg["num_heads"] * (cfg["qk_nope"] + cfg["v_head"]) * cfg["kv_lora"]
+        + h * cfg["num_heads"] * cfg["v_head"]
+    )
+    shell = cfg["num_layers"] * attn_params * 2 + 2 * cfg["vocab"] * h * 2  # bf16
+    est = experts + dense + shell
+    free = shutil.disk_usage(out).free
+    print(f"[check_space] estimated output ~{est / 1e9:.1f} GB, free ~{free / 1e9:.1f} GB", flush=True)
+    if free < est * 1.05 and os.environ.get("GLM5_SKIP_SPACE_CHECK") != "1":
+        raise SystemExit(
+            f"[export_glm5] insufficient disk: need ~{est / 1e9:.1f} GB (+5% margin), "
+            f"have ~{free / 1e9:.1f} GB. Set GLM5_SKIP_SPACE_CHECK=1 to override."
+        )
+
+
 def export_real(model_dir: Path, out: Path):
     """Convert a local GLM-5.2-FP8 checkpoint to the engine layout: bf16 shell
     safetensors + int4 expert/dense bins + manifest. Maps HF names to the shell
-    names the loader reads (q_a_proj->wq_a, kv_a_proj_with_mqa->wkv_a, ...)."""
+    names the loader reads (q_a_proj->wq_a, kv_a_proj_with_mqa->wkv_a, ...).
+
+    Resumable: writes a `.layer_NN.done` marker after each layer and skips
+    completed layers on re-run, so a crash/OOM mid-export restarts cheaply."""
     import torch
     from safetensors.torch import save_file
 
@@ -285,6 +323,7 @@ def export_real(model_dir: Path, out: Path):
     src = CkptSource(model_dir)
     write_manifest(cfg, out)
     (out / "shells").mkdir(parents=True, exist_ok=True)
+    check_space(out, cfg)
 
     def bf16(name):
         return src.get(name).to(torch.bfloat16)
@@ -292,13 +331,22 @@ def export_real(model_dir: Path, out: Path):
     def npy(name):
         return src.get(name).to(torch.float32).numpy()
 
-    save_file({"embed.weight": bf16("model.embed_tokens.weight")}, str(out / "embed.safetensors"))
-    save_file(
-        {"head.weight": bf16("lm_head.weight"), "norm.weight": bf16("model.norm.weight")},
-        str(out / "head.safetensors"),
-    )
+    head_done = out / ".head.done"
+    if head_done.exists():
+        print("[head] skip (done)", flush=True)
+    else:
+        save_file({"embed.weight": bf16("model.embed_tokens.weight")}, str(out / "embed.safetensors"))
+        save_file(
+            {"head.weight": bf16("lm_head.weight"), "norm.weight": bf16("model.norm.weight")},
+            str(out / "head.safetensors"),
+        )
+        head_done.touch()
 
     for li in range(cfg["num_layers"]):
+        marker = out / f".layer_{li:02d}.done"
+        if marker.exists():
+            print(f"[layer {li:2d}/{cfg['num_layers']}] skip (done)", flush=True)
+            continue
         p = f"model.layers.{li}."
         shell = {
             "input_layernorm.weight": bf16(p + "input_layernorm.weight"),
@@ -333,6 +381,7 @@ def export_real(model_dir: Path, out: Path):
                 npy(sp + "down_proj.weight"), edir / "expert_shared.bin",
             )
         save_file(shell, str(out / "shells" / f"layer_{li:02d}.safetensors"))
+        marker.touch()  # layer fully written -> resumable checkpoint
         print(f"[layer {li:2d}/{cfg['num_layers']}] shell + experts written", flush=True)
 
     # Note: DSA indexer + MTP weights are not exported yet (the shell runs
