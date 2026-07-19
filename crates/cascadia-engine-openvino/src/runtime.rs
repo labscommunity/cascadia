@@ -43,7 +43,7 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
@@ -1057,8 +1057,10 @@ impl OvRuntimeEngine {
         want_output: bool,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
         let take = chunk.len();
+        debug!(take, position, "first-stage chunk: infer start");
         let (dtype, shape, bytes) =
             self.static_infer_chunk(ChunkInput::Ids(chunk), take, position, want_output)?;
+        debug!(take, position, "first-stage chunk: infer+absorb done");
         if !want_output {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -1092,6 +1094,7 @@ impl OvRuntimeEngine {
         shape: [usize; 3],
         position: i64,
     ) -> EngineResult<()> {
+        debug!(?shape, position, "downstream send: start");
         let downstream = self
             .downstream
             .clone()
@@ -1120,6 +1123,7 @@ impl OvRuntimeEngine {
             guard.send(&hid).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
+        debug!(position, "downstream send: done");
         Ok(())
     }
 
