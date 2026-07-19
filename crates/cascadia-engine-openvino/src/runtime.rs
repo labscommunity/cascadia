@@ -616,7 +616,26 @@ fn npu_aot_blob(xml_path: &std::path::Path, device: &str) -> Option<std::path::P
         return None;
     }
     let blob = xml_path.with_extension("blob");
-    blob.exists().then_some(blob)
+    if !blob.exists() {
+        return None;
+    }
+    // Refuse a blob older than its IR: silently serving a stale compile's
+    // weights is the worst failure mode. The fallthrough recompiles (slow,
+    // and on small-RAM boxes possibly OOM) — but loudly and correctly.
+    if let (Ok(bm), Ok(xm)) = (
+        blob.metadata().and_then(|m| m.modified()),
+        xml_path.metadata().and_then(|m| m.modified()),
+    ) {
+        if bm < xm {
+            tracing::error!(
+                blob = %blob.display(),
+                "AOT blob is OLDER than its IR — ignoring it (re-export or delete \
+                 the stale blob); falling back to on-box compile"
+            );
+            return None;
+        }
+    }
+    Some(blob)
 }
 
 /// Plugin config for a blob import: the compile-time properties minus
@@ -2690,7 +2709,8 @@ impl Builder for OvRuntimeBuilder {
             // serialization — strip CACHE_DIR for THIS compile only (the
             // prefill compile below still caches; CPU compiles are fast).
             let mut p = self.plugin();
-            if self.cache_dir.is_some() {
+            let had_cache = p.entries.iter().any(|(k, _)| k == "CACHE_DIR");
+            if had_cache {
                 p.entries.retain(|(k, _)| k != "CACHE_DIR");
                 warn!(
                     "--gemv-offload: decode compile skips CACHE_DIR (custom-op weights \

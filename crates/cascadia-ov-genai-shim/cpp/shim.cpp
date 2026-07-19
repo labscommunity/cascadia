@@ -505,7 +505,13 @@ int32_t cascadia_runtime_import_blob(
             set_last_error((std::string("cannot open blob: ") + blob_path).c_str());
             return 1;
         }
-        const auto size = static_cast<size_t>(f.tellg());
+        const auto pos = f.tellg();
+        if (pos < 0 || pos == std::ifstream::pos_type(0)) {
+            set_last_error(
+                (std::string("cannot size blob (empty or unreadable): ") + blob_path).c_str());
+            return 1;
+        }
+        const auto size = static_cast<size_t>(pos);
         f.seekg(0);
         ov::Tensor blob(ov::element::u8, ov::Shape{size});
         if (!f.read(reinterpret_cast<char*>(blob.data()),

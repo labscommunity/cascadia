@@ -776,8 +776,16 @@ impl Runtime {
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
             }
+            // The shim truncates at buf_cap, possibly mid-line or mid-UTF-8:
+            // decode lossily and flag the cut instead of erroring out or
+            // silently dropping tail nodes from the attribution.
+            let truncated = len >= buf.len();
             buf.truncate(len);
-            String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+            let mut s = String::from_utf8_lossy(&buf).into_owned();
+            if truncated {
+                s.push_str("\n[PROFILING OUTPUT TRUNCATED AT 1 MiB BUFFER CAP]\n");
+            }
+            Ok(s)
         }
     }
 

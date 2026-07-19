@@ -183,10 +183,17 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
     if burst == 0 || tensor.data.len() <= burst {
         sock.write_all(&tensor.data).await?;
     } else {
-        for part in tensor.data.chunks(burst) {
+        // No sleep after the FINAL part, and the receiver's whole-frame
+        // recv deadline still applies: total pacing delay must stay far
+        // below recv_timeout (burst is clamped >= 64 KiB so a 256 MiB
+        // frame adds at most ~8 s of sleeps).
+        let mut parts = tensor.data.chunks(burst).peekable();
+        while let Some(part) = parts.next() {
             sock.write_all(part).await?;
             sock.flush().await?;
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            if parts.peek().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
         }
     }
     sock.flush().await?;
@@ -207,6 +214,7 @@ fn send_burst_bytes() -> usize {
         std::env::var("CASCADIA_SEND_BURST_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
+            .map(|v: usize| if v == 0 { 0 } else { v.max(64 * 1024) })
             .unwrap_or(0)
     })
 }

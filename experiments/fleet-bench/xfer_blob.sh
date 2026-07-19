@@ -20,14 +20,20 @@ send_part() {
   done
   echo "PART_FAILED $pn"; return 1
 }
+# NOTE: runs on the Linux blob host (stat -c%s is GNU; not macOS-portable).
 FAIL=0
 i=0
+PIDS=""
 for p in $TMP/part_*; do
   send_part $p &
+  PIDS="$PIDS $!"
   i=$((i+1))
-  [ $((i % 4)) = 0 ] && { wait || FAIL=1; }
+  if [ $((i % 4)) = 0 ]; then
+    for pid in $PIDS; do wait $pid || FAIL=1; done
+    PIDS=""
+  fi
 done
-wait || FAIL=1
+for pid in $PIDS; do wait $pid || FAIL=1; done
 [ $FAIL = 0 ] || { echo "XFER_PARTS_FAILED $(basename $F)"; rm -rf $TMP; exit 1; }
 PLIST=$(for p in $TMP/part_*; do echo "$RD\\$(basename $p)"; done | paste -sd+ -)
 ssh $SSHOPTS "devcloud@$IP" "cmd /c copy /b $PLIST \"$DESTW\"" >/dev/null

@@ -70,7 +70,15 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .std("c++17")
+        .std("c++17");
+    // gemv_offload.cpp uses AVX2/FMA + AVX-VNNI intrinsics behind a runtime
+    // guard; GCC/Clang additionally need the target flags at COMPILE time
+    // (MSVC compiles intrinsics without arch flags). GCC >= 11 for -mavxvnni.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("x86_64") && !target.contains("msvc") {
+        build.flag("-mavx2").flag("-mfma").flag("-mavxvnni");
+    }
+    build
         .file("cpp/shim.cpp")
         .file("cpp/gemv_offload.cpp")
         .include(&runtime_include)
@@ -91,7 +99,13 @@ fn main() {
     println!("cargo:rustc-link-search=native={ov_root}/runtime/3rdparty/tbb/lib/intel64");
     println!("cargo:rustc-link-lib=dylib=openvino_genai");
     println!("cargo:rustc-link-lib=dylib=openvino");
-    println!("cargo:rustc-link-lib=dylib=tbb12");
+    // Windows SDKs ship tbb12.lib; Linux OV archives ship libtbb.so.12
+    // (linker name `tbb`).
+    if std::env::var("TARGET").unwrap_or_default().contains("windows") {
+        println!("cargo:rustc-link-lib=dylib=tbb12");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=tbb");
+    }
     if let Some(d) = &dnnl_dir {
         println!("cargo:rustc-link-search=native={d}/lib");
         println!("cargo:rustc-link-lib=dylib=dnnl");

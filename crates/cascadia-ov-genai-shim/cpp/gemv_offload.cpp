@@ -70,6 +70,12 @@ struct DnnlSegExec {
     size_t n = 0;
     std::vector<uint16_t> scales_gn;  // f16 bits, [G, N]
 };
+// NOTE (review finding, accepted): evaluate() mutates the shared DnnlState
+// (set_data_handle on shared memory objects) without per-call locking — safe
+// under the engine's single-infer-request usage, UNSAFE if the same node
+// instance ever executes from two infer requests concurrently. The dnnl path
+// is a default-off probe (CASCADIA_GEMV_DNNL); lock or clone per-call before
+// any multi-request use.
 struct DnnlState {
     bool ok = false;
     dnnl::engine eng;
@@ -811,6 +817,19 @@ public:
             const int64_t gsize = static_cast<int64_t>(ws[2]);
             if (gsize % 2 != 0) return false;
             const int64_t k = groups * gsize;
+            // The Reshape between decompress and MatMul must be the plain
+            // [N,G,g] -> [N,K] flatten. A chain that re-factorizes dims
+            // would otherwise be rewritten into a shape-inconsistent op and
+            // fail the WHOLE model validation, instead of staying on the
+            // stock path as the "anything deviant is left alone" contract
+            // promises.
+            const auto rsh_node = map.at(rsh).get_node_shared_ptr();
+            const auto& rshape = rsh_node->get_output_partial_shape(0);
+            if (rshape.rank().is_dynamic() || rshape.rank().get_length() != 2 ||
+                rshape[0].is_dynamic() || rshape[1].is_dynamic() ||
+                rshape[0].get_length() != n || rshape[1].get_length() != k) {
+                return false;
+            }
             const auto& act_out = matmul->input_value(0);
             if (act_out.get_element_type() != ov::element::f16) return false;
 
@@ -858,6 +877,11 @@ uint32_t fuse_sibling_gemvs(const std::shared_ptr<ov::Model>& model) {
     for (const auto& node : model->get_ordered_ops()) {
         auto gemv = ov::as_type_ptr<CascadiaInt4Gemv>(node);
         if (!gemv || gemv->get_output_target_inputs(0).empty()) continue;
+        // Only single-segment ops fuse: downstream rewiring maps split
+        // output i to grp[i]'s single consumer — an already-fused op
+        // (multi-segment) in the group would misalign lengths vs outputs
+        // and route one projection's rows into another's consumer.
+        if (gemv->segments().size() != 1) continue;
         const auto& in = gemv->input_value(0);
         char key[256];
         snprintf(key, sizeof(key), "%p:%zu:%lld:%lld:%lld", // NOLINT
