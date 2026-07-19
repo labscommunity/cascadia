@@ -197,8 +197,9 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
     })
 }
 
-/// Payload burst size for paced sends (bytes). Env-tunable; default 256 KB;
-/// 0 disables pacing entirely.
+/// Payload burst size for paced sends (bytes). Env-tunable via
+/// CASCADIA_SEND_BURST_BYTES; default 0 = pacing OFF (it did not resolve the
+/// observed DERP frame loss — kept as an experiment knob).
 fn send_burst_bytes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -206,7 +207,7 @@ fn send_burst_bytes() -> usize {
         std::env::var("CASCADIA_SEND_BURST_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(256 * 1024)
+            .unwrap_or(0)
     })
 }
 
