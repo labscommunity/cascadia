@@ -173,12 +173,40 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
     header[16..20].copy_from_slice(&tensor.shape[2].to_be_bytes());
 
     sock.write_all(&header).await?;
-    sock.write_all(&tensor.data).await?;
+    // Large single bursts (~750 KB hidden frames at 70B scale) were observed
+    // to intermittently vanish inside DERP-relayed tailscale paths while the
+    // 20-byte header and ≤500 KB frames always arrived (2026-07-19 fleet
+    // debugging, hop-by-hop traced). Pace big payloads into bounded bursts
+    // with explicit flushes; harmless on healthy paths (same total bytes,
+    // one extra flush per 256 KB). Opt out with CASCADIA_SEND_BURST_BYTES=0.
+    let burst = send_burst_bytes();
+    if burst == 0 || tensor.data.len() <= burst {
+        sock.write_all(&tensor.data).await?;
+    } else {
+        for part in tensor.data.chunks(burst) {
+            sock.write_all(part).await?;
+            sock.flush().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
     sock.flush().await?;
 
     Ok(TransferStats {
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         bytes: HEADER_SIZE + tensor.data.len(),
+    })
+}
+
+/// Payload burst size for paced sends (bytes). Env-tunable; default 256 KB;
+/// 0 disables pacing entirely.
+fn send_burst_bytes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CASCADIA_SEND_BURST_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256 * 1024)
     })
 }
 
