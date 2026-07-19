@@ -32,6 +32,35 @@ pub const AUTOPIN_MIN_SELECTIONS: u64 = 5_000;
 /// AUTOPIN confidence reaches 1.0 at this many selections.
 pub const AUTOPIN_FULL_SELECTIONS: f64 = 200_000.0;
 
+/// MemAvailable in bytes. Linux reads `/proc/meminfo`; other platforms (and an
+/// unreadable file) fall back to a conservative 8 GB.
+pub fn mem_available() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    if let Some(kb) = rest.trim().split_whitespace().next() {
+                        if let Ok(kb) = kb.parse::<u64>() {
+                            return kb * 1024;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    8_000_000_000
+}
+
+/// Byte size of one int4 expert bin (gate+up+down, group-32) — the `eb` used in
+/// the budget arithmetic. Matches `export_glm5._int4_bin_bytes`.
+pub fn int4_expert_bytes(hidden: usize, inter: usize) -> u64 {
+    const G: u64 = 32;
+    let sec = |o: u64, i: u64| o * i / 2 + o * (i / G) * 2;
+    let (h, i) = (hidden as u64, inter as u64);
+    2 * sec(i, h) + sec(h, i)
+}
+
 /// How many int4 experts this node may `mlock`, after reserving the dense
 /// resident set (`resident`), the KV pools (`kv_bytes`), the batch-union
 /// working set, activations, and the page-cache reserve. Returns 0 when nothing fits (the caller

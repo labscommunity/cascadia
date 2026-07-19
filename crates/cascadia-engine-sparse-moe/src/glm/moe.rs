@@ -10,8 +10,11 @@
 //! The first `first_k_dense_replace` (3) layers are dense (no routing) — that
 //! path just calls `ffn::swiglu` directly and does not use this module.
 
+use std::sync::{Arc, Mutex};
+
 use super::ffn::{swiglu, swiglu_f32w, swiglu_mmap};
 use super::gate::moe_gate;
+use super::residency::UsageStats;
 use crate::dsv4::expert_mmap::MmapExpert;
 use crate::dsv4::math::linear_f32;
 
@@ -48,6 +51,16 @@ impl AnyExpert {
     }
 }
 
+impl AnyExpert {
+    /// The mmap'd int4 expert, if this is the `Mmap` variant (for pinning).
+    pub fn as_mmap(&self) -> Option<&MmapExpert> {
+        match self {
+            AnyExpert::Mmap(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
 impl From<ExpertW> for AnyExpert {
     fn from(e: ExpertW) -> Self {
         AnyExpert::Bf16(e)
@@ -74,6 +87,10 @@ pub struct MoeLayer {
     pub shared_inter: usize,
     pub scale: f32, // routed_scaling_factor
     w: MoeWeights,
+    /// Optional routing recorder (learned-pin). None on the golden path.
+    usage: Option<Arc<Mutex<UsageStats>>>,
+    /// This layer's GLOBAL index (for the usage histogram key).
+    layer_idx: u32,
 }
 
 impl MoeLayer {
@@ -98,7 +115,25 @@ impl MoeLayer {
             shared_inter,
             scale,
             w,
+            usage: None,
+            layer_idx: 0,
         }
+    }
+
+    /// Attach the learned-pin routing recorder + this layer's global index.
+    pub fn attach_usage(&mut self, layer_idx: u32, usage: Arc<Mutex<UsageStats>>) {
+        self.layer_idx = layer_idx;
+        self.usage = Some(usage);
+    }
+
+    /// The routed experts (for pinning enumeration).
+    pub fn experts(&self) -> &[AnyExpert] {
+        &self.w.experts
+    }
+
+    /// The shared expert (always active — a top pin candidate).
+    pub fn shared(&self) -> &AnyExpert {
+        &self.w.shared
     }
 
     /// MoE for one token `x` (`[hidden]`). Returns `[hidden]`.
@@ -108,6 +143,14 @@ impl MoeLayer {
         let mut logits = vec![0.0f32; self.n_experts];
         linear_f32(x, &self.w.router_w, self.n_experts, self.hidden, &mut logits);
         let gate = moe_gate(&logits, &self.w.router_bias, self.top_k, self.scale, true);
+        // record the routing for learned-pin (no-op when no recorder attached).
+        if let Some(u) = &self.usage {
+            if let Ok(mut g) = u.lock() {
+                for &e in &gate.idx {
+                    g.record(self.layer_idx, e);
+                }
+            }
+        }
 
         // routed experts in gate order, then the shared expert.
         let mut out = vec![0.0f32; self.hidden];
