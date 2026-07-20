@@ -160,11 +160,12 @@ impl MmapExpert {
     /// `ys = [rows, out_dim]`. Parallelized over output rows (each owns a column
     /// of a transposed scratch, then scattered into row-major `ys`).
     ///
-    /// Scalar dequant+dot in strict column order — bit-identical to the scalar
-    /// [`dequant_row_dot`] the single-token [`Self::gemv`] uses, so on the scalar
-    /// path `forward_batch` equals per-row `forward` exactly. (The AVX2 fused
-    /// kernel accumulates in a different lane order; a matching AVX2 batch kernel
-    /// is a follow-up for on-node throughput + on-node bit-exactness.)
+    /// Bit-identical to the single-token [`Self::gemv`] on the SAME target: the
+    /// AVX2 path (nodes) reproduces `dequant_row_dot_avx2`'s lane/group order and
+    /// the scalar path reproduces `dequant_row_dot_scalar`'s column order — so
+    /// `forward_batch` equals per-row `forward` bit-for-bit on either (see
+    /// `row_batch_dot`). Each output row's int4 weights are dequantized ONCE and
+    /// reused across all `rows` inputs.
     fn gemv_batch(
         &self,
         sec_off: usize,
@@ -188,16 +189,7 @@ impl MmapExpert {
         yt.par_chunks_mut(rows).enumerate().for_each(|(o, ycol)| {
             let prow = &packed[o * row_bytes..(o + 1) * row_bytes];
             let srow = &scales[o * ng * 2..(o + 1) * ng * 2];
-            let wrow = dequant_row_f32(prow, srow, in_dim); // unpack ONCE
-            for r in 0..rows {
-                let x = &xs[r * in_dim..(r + 1) * in_dim];
-                // strict column-order dot == dequant_row_dot_scalar's order.
-                let mut acc = 0.0f32;
-                for k in 0..in_dim {
-                    acc += wrow[k] * x[k];
-                }
-                ycol[r] = to_bf16(acc);
-            }
+            row_batch_dot(prow, srow, xs, rows, in_dim, ycol);
         });
         for o in 0..out_dim {
             for r in 0..rows {
@@ -225,6 +217,130 @@ fn dequant_row_f32(packed_row: &[u8], scales_row: &[u8], in_dim: usize) -> Vec<f
         }
     }
     out
+}
+
+/// Fill `ycol[r] = to_bf16(W_row · xs[r])` for all `rows`, dequantizing the
+/// packed int4 weight row ONCE and reusing it across the rows (the batch win).
+/// The AVX2+FMA path (nodes) reproduces `dequant_row_dot_avx2`'s accumulation
+/// exactly; the scalar path reproduces `dequant_row_dot_scalar` — so the batched
+/// output equals the single-token [`MmapExpert::gemv`] bit-for-bit on either.
+fn row_batch_dot(
+    prow: &[u8],
+    srow: &[u8],
+    xs: &[f32],
+    rows: usize,
+    in_dim: usize,
+    ycol: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2+fma detected at runtime. `dequant_row_f32_avx2` writes
+            // exactly in_dim floats into `w`; `dot_f32_avx2` reads in_dim from `w`
+            // and from each `xs` row (both in_dim-sized, in_dim % 32 == 0).
+            unsafe {
+                let mut w = vec![0.0f32; in_dim];
+                dequant_row_f32_avx2(prow, srow, in_dim, &mut w);
+                for r in 0..rows {
+                    let x = &xs[r * in_dim..(r + 1) * in_dim];
+                    ycol[r] = to_bf16(dot_f32_avx2(&w, x, in_dim));
+                }
+            }
+            return;
+        }
+    }
+    let wrow = dequant_row_f32(prow, srow, in_dim);
+    for r in 0..rows {
+        let x = &xs[r * in_dim..(r + 1) * in_dim];
+        // strict column order == dequant_row_dot_scalar.
+        let mut acc = 0.0f32;
+        for k in 0..in_dim {
+            acc += wrow[k] * x[k];
+        }
+        ycol[r] = to_bf16(acc);
+    }
+}
+
+/// AVX2 unpack of one int4 weight row into f32 column order with the per-32
+/// scale folded: `out[k] = round((nibble_k - 8) * scale)`. Same intermediate as
+/// `dequant_row_dot_avx2`'s `mul(cvt(nibble), sv)`, so a grouped dot of `out`
+/// (see [`dot_f32_avx2`]) reproduces that fused kernel bit-for-bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dequant_row_f32_avx2(
+    packed_row: &[u8],
+    scales_row: &[u8],
+    in_dim: usize,
+    out: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    let ng = in_dim / G;
+    let lo_mask = _mm_set1_epi8(0x0F);
+    let bias = _mm_set1_epi8(8);
+    for g in 0..ng {
+        let s = half::bf16::from_le_bytes([scales_row[g * 2], scales_row[g * 2 + 1]]).to_f32();
+        let sv = _mm256_set1_ps(s);
+        let pk = _mm_loadu_si128(packed_row.as_ptr().add(g * (G / 2)) as *const __m128i);
+        let low = _mm_and_si128(pk, lo_mask);
+        let high = _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask);
+        let low_s = _mm_sub_epi8(low, bias);
+        let high_s = _mm_sub_epi8(high, bias);
+        let il = _mm_unpacklo_epi8(low_s, high_s);
+        let ih = _mm_unpackhi_epi8(low_s, high_s);
+        let c0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il));
+        let c1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(il)));
+        let c2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(ih));
+        let c3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(ih)));
+        let base = g * G;
+        _mm256_storeu_ps(out.as_mut_ptr().add(base), _mm256_mul_ps(c0, sv));
+        _mm256_storeu_ps(out.as_mut_ptr().add(base + 8), _mm256_mul_ps(c1, sv));
+        _mm256_storeu_ps(out.as_mut_ptr().add(base + 16), _mm256_mul_ps(c2, sv));
+        _mm256_storeu_ps(out.as_mut_ptr().add(base + 24), _mm256_mul_ps(c3, sv));
+    }
+}
+
+/// AVX2 dot of a pre-dequantized f32 weight row against `x`, accumulating in the
+/// SAME 8-wide lanes / group order + horizontal sum as `dequant_row_dot_avx2` —
+/// so `dot_f32_avx2(dequant_row_f32_avx2(row), x) == dequant_row_dot_avx2(row, x)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(w: &[f32], x: &[f32], in_dim: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let ng = in_dim / G;
+    let mut acc = _mm256_setzero_ps();
+    let wp = w.as_ptr();
+    let xp = x.as_ptr();
+    for g in 0..ng {
+        let base = g * G;
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(wp.add(base)),
+            _mm256_loadu_ps(xp.add(base)),
+            acc,
+        );
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(wp.add(base + 8)),
+            _mm256_loadu_ps(xp.add(base + 8)),
+            acc,
+        );
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(wp.add(base + 16)),
+            _mm256_loadu_ps(xp.add(base + 16)),
+            acc,
+        );
+        acc = _mm256_fmadd_ps(
+            _mm256_loadu_ps(wp.add(base + 24)),
+            _mm256_loadu_ps(xp.add(base + 24)),
+            acc,
+        );
+    }
+    let lo128 = _mm256_castps256_ps128(acc);
+    let hi128 = _mm256_extractf128_ps::<1>(acc);
+    let s128 = _mm_add_ps(lo128, hi128);
+    let shuf = _mm_movehdup_ps(s128);
+    let sums = _mm_add_ps(s128, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let sums2 = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(sums2)
 }
 
 /// Fused int4 dequant + dot for one output row: `Σ_k (nibble_k - 8) * scale(g(k)) * x[k]`,
@@ -419,5 +535,46 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// On the nodes (x86 AVX2), the batch kernel must equal the fused single-token
+    /// kernel bit-for-bit: `dot_f32_avx2(dequant_row_f32_avx2(row)) ==
+    /// dequant_row_dot_avx2(row)`. Runs only where AVX2+FMA are present (CI x86);
+    /// a no-op skip elsewhere. This is the on-node half of the bit-exactness that
+    /// `forward_batch_matches_per_token` asserts end-to-end.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_batch_dot_matches_fused_per_token() {
+        use super::{dequant_row_dot_avx2, dequant_row_f32_avx2, dot_f32_avx2};
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            eprintln!("SKIP: no avx2/fma on this host");
+            return;
+        }
+        let in_dim = 256usize;
+        let ng = in_dim / G;
+        let mut packed = vec![0u8; in_dim / 2];
+        let mut scales = vec![0u8; ng * 2];
+        let mut x = vec![0f32; in_dim];
+        for (i, b) in packed.iter_mut().enumerate() {
+            *b = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        for g in 0..ng {
+            let s = half::bf16::from_f32(0.05 + 0.013 * g as f32).to_le_bytes();
+            scales[g * 2] = s[0];
+            scales[g * 2 + 1] = s[1];
+        }
+        for (i, xi) in x.iter_mut().enumerate() {
+            *xi = ((i as f32) * 0.13).sin() * 0.5;
+        }
+        // SAFETY: avx2+fma just detected.
+        let fused = unsafe { dequant_row_dot_avx2(&packed, &scales, &x, in_dim) };
+        let mut w = vec![0f32; in_dim];
+        unsafe { dequant_row_f32_avx2(&packed, &scales, in_dim, &mut w) };
+        let split = unsafe { dot_f32_avx2(&w, &x, in_dim) };
+        assert_eq!(
+            fused.to_bits(),
+            split.to_bits(),
+            "avx2 batch dot {split} != fused per-token {fused}"
+        );
     }
 }
