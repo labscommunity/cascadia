@@ -203,6 +203,9 @@ impl StagedRunner for GlmRunner {
     fn eos_token_ids(&self) -> &[u32] {
         &self.eos
     }
+    fn supports_batched_prefill(&self) -> bool {
+        true // glm layers ignore the token id; batch-union prefill is bit-exact
+    }
     fn reset(&mut self) {
         self.pos = 0;
         for l in &mut self.layers {

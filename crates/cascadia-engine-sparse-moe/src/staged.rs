@@ -52,6 +52,15 @@ pub trait StagedRunner: Send + 'static {
         out
     }
 
+    /// Whether [`Self::generate`] may prefill the prompt as one batch via
+    /// [`Self::forward_layers_batch`] (dedup expert loads, one head GEMV). Off by
+    /// default — a backend must opt in, and only when its batched path needs no
+    /// per-position token id (e.g. dsv4 hash gates require the id, so it stays
+    /// per-token). Bit-exact either way.
+    fn supports_batched_prefill(&self) -> bool {
+        false
+    }
+
     /// Last-rank only: logits from the final hidden.
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32>;
 
@@ -80,15 +89,29 @@ pub trait StagedRunner: Send + 'static {
         let max_seq = self.max_seq();
         let mut rng = init_rng(cfg.seed);
         let mut history: Vec<i64> = Vec::new();
-        let mut last_logits: Vec<f32> = Vec::new();
-        for (pos, &t) in prompt.iter().enumerate() {
-            if pos >= max_seq {
-                break;
+        let rows = prompt.len().min(max_seq);
+        let last_logits: Vec<f32> = if self.supports_batched_prefill() {
+            // Batch-union prefill: embed all rows, run the layers once as a batch,
+            // and take the head only at the final position. Bit-identical to the
+            // per-token loop; the batched MoE just loads overlapping experts once.
+            let hs = self.hidden_size();
+            let mut batch = vec![0.0f32; rows * hs];
+            for (r, &t) in prompt[..rows].iter().enumerate() {
+                batch[r * hs..(r + 1) * hs].copy_from_slice(&self.embed_token(t));
             }
-            let h = self.embed_token(t);
-            let h = self.forward_layers(h, pos, Some(t));
-            last_logits = self.head_logits(&h);
-        }
+            let h = self.forward_layers_batch(batch, 0, rows);
+            self.head_logits(&h[(rows - 1) * hs..rows * hs])
+        } else {
+            // Per-token prefill (backends whose layers need the position's token
+            // id, e.g. dsv4 hash gates).
+            let mut ll = Vec::new();
+            for (pos, &t) in prompt.iter().take(rows).enumerate() {
+                let h = self.embed_token(t);
+                let h = self.forward_layers(h, pos, Some(t));
+                ll = self.head_logits(&h);
+            }
+            ll
+        };
         let mut next = sample(&last_logits, &history, cfg, &mut rng);
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len().min(max_seq);
