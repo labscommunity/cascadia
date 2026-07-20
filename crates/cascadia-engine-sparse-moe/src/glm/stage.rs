@@ -24,6 +24,10 @@ use crate::staged::StagedRunner;
 /// to 1M; the KV caches scale with this).
 pub const GLM5_DEFAULT_MAX_SEQ: usize = 4096;
 
+/// How many of a layer's hottest routed experts to prefetch ahead (plus its
+/// always-active shared expert). ~4x top_k covers the common routes.
+const PREFETCH_EXPERTS: usize = 32;
+
 /// Split `n` layers across `total` ranks so each rank's first layer is a `"full"`
 /// IndexShare layer (owns an indexer / computes its own top-k). Boundaries are
 /// the `"full"` positions nearest the even split, kept strictly increasing so
@@ -75,6 +79,8 @@ pub struct GlmRunner {
     usage: Arc<Mutex<UsageStats>>,
     /// Where [`Self::save_usage`] persists the histogram (`<dir>/.coli_usage`).
     usage_path: PathBuf,
+    /// Router-lookahead prefetch enabled (CASCADIA_GLM5_PREFETCH).
+    prefetch: bool,
 }
 
 impl GlmRunner {
@@ -170,6 +176,7 @@ impl GlmRunner {
             total,
             usage,
             usage_path,
+            prefetch: std::env::var("CASCADIA_GLM5_PREFETCH").is_ok(),
         })
     }
 
@@ -269,8 +276,21 @@ impl StagedRunner for GlmRunner {
         // selection — is the not-yet-wired distributed case; it falls back to
         // full causal, correct for a single-rank run.)
         let mut carry: Option<Vec<usize>> = None;
-        for l in &mut self.layers {
-            x = l.forward_token(&x, &mut carry);
+        // Router-lookahead prefetch (opt-in, CASCADIA_GLM5_PREFETCH): while layer
+        // i computes, madvise(WILLNEED) layer i+1's likely experts (shared + the
+        // learned-pin hottest) so the NVMe read overlaps compute. Hint-only — the
+        // output is identical whether or not it fires.
+        let n = self.layers.len();
+        for i in 0..n {
+            if self.prefetch && i + 1 < n {
+                let (head, tail) = self.layers.split_at_mut(i + 1);
+                if let Some(m) = tail[0].moe() {
+                    m.prefetch_hot(PREFETCH_EXPERTS);
+                }
+                x = head[i].forward_token(&x, &mut carry);
+            } else {
+                x = self.layers[i].forward_token(&x, &mut carry);
+            }
         }
         self.pos += 1;
         x

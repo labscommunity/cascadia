@@ -114,6 +114,15 @@ impl MmapExpert {
         self.mmap.lock()
     }
 
+    /// `madvise(WILLNEED)` — ask the OS to start reading this expert's pages into
+    /// the cache without blocking. Issued for the *next* layer's likely experts
+    /// while the current layer computes, so the NVMe read overlaps compute
+    /// instead of stalling the GEMV. Best-effort hint; a failure is ignored.
+    #[inline]
+    pub fn prefetch(&self) {
+        let _ = self.mmap.advise(memmap2::Advice::WillNeed);
+    }
+
     /// SwiGLU section GEMVs exposed for shells with a different activation
     /// contract (the glm5 shell applies f32 `silu·up`, no clamp, route outside).
     /// Each returns the bf16-rounded fused int4 dequant-dot (same kernel as

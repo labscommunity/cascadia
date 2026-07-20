@@ -154,6 +154,20 @@ impl UsageStats {
     pub fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
+
+    /// The `n` hottest routed-expert ids for one layer, most-used first (ties ->
+    /// lower id). Used to prefetch a layer's likely experts ahead of compute.
+    pub fn hottest_for(&self, layer: u32, n: usize) -> Vec<u32> {
+        let mut v: Vec<(u32, u64)> = self
+            .counts
+            .iter()
+            .filter(|(&(l, _), _)| l == layer)
+            .map(|(&(_, e), &c)| (e, c))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(n);
+        v.into_iter().map(|(e, _)| e).collect()
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +207,10 @@ mod tests {
         u.record(4, 0);
         assert_eq!(u.total, 16);
         assert_eq!(u.hottest(2), vec![(3, 7), (3, 2)]);
+        // per-layer hottest (the prefetch policy): layer 3's experts, hottest first.
+        assert_eq!(u.hottest_for(3, 2), vec![7, 2]);
+        assert_eq!(u.hottest_for(4, 5), vec![0]); // only expert 0 seen at layer 4
+        assert!(u.hottest_for(9, 3).is_empty()); // unseen layer
 
         let dir = std::env::temp_dir().join(format!("glm5_usage_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
