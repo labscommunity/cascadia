@@ -102,6 +102,14 @@ impl Indexer {
         self.len = 0;
     }
 
+    /// Roll the key cache back to `len` positions (speculative-decode reject).
+    /// O(1): stale slots `[len, old_len)` are overwritten on the next
+    /// [`Self::append_key`]. `len` must not exceed the current length.
+    pub fn truncate(&mut self, len: usize) {
+        debug_assert!(len <= self.len, "indexer truncate {len} > len {}", self.len);
+        self.len = len;
+    }
+
     /// Number of cached keys.
     pub fn len(&self) -> usize {
         self.len
