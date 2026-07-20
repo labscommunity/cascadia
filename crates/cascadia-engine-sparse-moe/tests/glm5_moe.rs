@@ -81,6 +81,45 @@ fn moe_block_matches_reference() {
     assert_close("moe.out", &got, &want, 2e-3, 1e-2);
 }
 
+/// Batch-union MoE must be BIT-IDENTICAL to per-token routing: the dedup only
+/// reorders which expert is loaded when, never the per-row accumulation. Uses
+/// the same fixture as the golden above, driving several rows at once.
+#[test]
+fn moe_batch_union_bit_exact_vs_per_token() {
+    let fx = fixtures!();
+    let (hidden, n_experts, top_k, moe_inter, scale) = (32usize, 4usize, 2usize, 10usize, 2.5f32);
+
+    let load_expert = |p: &str| ExpertW {
+        wg: bits(&fx.f32(&format!("{p}.wg")).unwrap().1),
+        wu: bits(&fx.f32(&format!("{p}.wu")).unwrap().1),
+        wd: bits(&fx.f32(&format!("{p}.wd")).unwrap().1),
+    };
+    let experts: Vec<AnyExpert> = (0..n_experts)
+        .map(|e| load_expert(&format!("moe.e{e}")).into())
+        .collect();
+    let w = MoeWeights {
+        router_w: fx.f32("moe.router_w").unwrap().1,
+        router_bias: fx.f32("moe.router_bias").unwrap().1,
+        experts,
+        shared: load_expert("moe.sh").into(),
+    };
+    let layer = MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, w);
+
+    let (xshape, x) = fx.f32("moe.x").unwrap();
+    let rows = xshape[0];
+
+    // Per-token reference (the established golden path).
+    let mut per_token = vec![0.0f32; rows * hidden];
+    for r in 0..rows {
+        let y = layer.forward_token(&x[r * hidden..(r + 1) * hidden]);
+        per_token[r * hidden..(r + 1) * hidden].copy_from_slice(&y);
+    }
+
+    // Batch-union over all rows must match bit-for-bit.
+    let batched = layer.forward_batch(&x, rows);
+    assert_eq!(batched, per_token, "batch-union diverged from per-token routing");
+}
+
 /// The learned-pin recorder: once a usage sink is attached, every routed
 /// selection lands in the histogram keyed by this layer's global index. No
 /// fixtures — zero weights are enough since we only assert routing bookkeeping.
