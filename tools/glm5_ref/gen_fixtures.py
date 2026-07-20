@@ -342,6 +342,13 @@ def main():
     rt_greedy = load_export_and_generate(export_dir, rt_prompt, rt_ngen)
     print(f"[loader round-trip] export {export_dir} prompt {rt_prompt} greedy {rt_greedy}")
 
+    # 8-layer variant for the M-rank pipeline dry-run (glm5_pipeline_ml): needs
+    # ≥4 layers so a 4-rank split has middle-relay ranks. Its first 3 layers are
+    # byte-identical to glm5_export (sequential RNG), so no separate reference.
+    ml_dir = out.parent / "glm5_export_ml"
+    export_glm5.export_tiny(ml_dir, num_layers=8)
+    print(f"[pipeline fixture] export {ml_dir} (8 layers)")
+
     # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
     from glm5_ref.fp8_roundtrip import roundtrip
     fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)

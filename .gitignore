@@ -39,5 +39,6 @@ shards_cached/
 ruvector.db
 crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_big_export/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_ml/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_ckpt/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_export/
