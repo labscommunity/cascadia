@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cascadia_engine_sparse_moe::dist::{
-    recv_forward_batch_body_server, recv_kind_server, send_forward_batch, FrameKind,
+    recv_forward_batch_body_server, recv_kind_server, send_forward_batch_prefill, FrameKind,
 };
 use cascadia_engine_sparse_moe::glm::loader::load_model;
 use cascadia_engine_sparse_moe::glm::stage::GlmRunner;
@@ -76,12 +76,12 @@ async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) 
         let hsend = h;
         let rows32 = rows as u32;
         let send = tokio::spawn(async move {
-            send_forward_batch(&client, 0, rows32, &cfg2, &hsend, [1, rows32, hsz])
+            send_forward_batch_prefill(&client, 0, rows32, &cfg2, &hsend, [1, rows32, hsz])
                 .await
                 .unwrap();
         });
         let k = recv_kind_server(&servers[i]).await.unwrap();
-        assert_eq!(k, Some(FrameKind::ForwardBatch), "relay {i}: expected ForwardBatch");
+        assert_eq!(k, Some(FrameKind::ForwardBatchPrefill), "relay {i}: expected ForwardBatchPrefill");
         let (_start, count, _s, hw, _shape) =
             recv_forward_batch_body_server(&servers[i]).await.unwrap();
         assert_eq!(count as usize, rows);
