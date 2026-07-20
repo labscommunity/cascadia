@@ -22,10 +22,14 @@
 //! absorb core (qabs / score / softmax / clat / ctx) stays in f32.
 //!
 //! This is the decode path used for every position. Batched-naive prefill is a
-//! later perf addition (M4); it is mathematically identical by linearity. DSA
-//! sparsity (top-2048 gather) is layered on in a later slice — here attention
-//! is over the full causal range `0..=pos`.
+//! later perf addition (M4); it is mathematically identical by linearity.
+//!
+//! DSA sparsity: with a [`Indexer`] attached ([`AttentionLayer::attach_indexer`]),
+//! once the cached length exceeds `index_topk` the query attends only to the
+//! indexer's top-`index_topk` positions (one set shared by all heads). At or
+//! below the budget it is the full causal range — bit-identical to dense.
 
+use super::indexer::Indexer;
 use super::rope::apply_rope_row;
 use crate::dsv4::math::{dot, dot_bf16w, linear_bf16_w, rmsnorm};
 use crate::dsv4::rope::Freqs;
@@ -72,6 +76,11 @@ pub struct AttentionLayer {
     lc: Vec<f32>, // [max_seq, kv_lora]
     rc: Vec<f32>, // [max_seq, qk_rope]
     len: usize,   // cached positions
+    /// DSA lightning indexer. When attached and the cached length exceeds
+    /// `index_topk`, the query attends only to the indexer's top-`index_topk`
+    /// positions; otherwise attention is over the full causal range.
+    indexer: Option<Indexer>,
+    index_topk: usize,
 }
 
 impl AttentionLayer {
@@ -113,14 +122,27 @@ impl AttentionLayer {
             lc: vec![0.0; max_seq * kv_lora],
             rc: vec![0.0; max_seq * qk_rope],
             len: 0,
+            indexer: None,
+            index_topk: usize::MAX,
         }
     }
 
-    /// Clear the KV cache.
+    /// Attach the DSA lightning indexer (with its `index_topk` budget). Without
+    /// this the layer runs dense causal attention (correct for ctx ≤ index_topk).
+    pub fn attach_indexer(&mut self, indexer: Indexer, index_topk: usize) {
+        assert!(index_topk > 0, "index_topk must be positive");
+        self.indexer = Some(indexer);
+        self.index_topk = index_topk;
+    }
+
+    /// Clear the KV cache (and the indexer's key cache, if attached).
     pub fn reset(&mut self) {
         self.lc.fill(0.0);
         self.rc.fill(0.0);
         self.len = 0;
+        if let Some(ix) = self.indexer.as_mut() {
+            ix.reset();
+        }
     }
 
     /// Attend one token `x` (`[hidden]`) at absolute position `self.len`,
@@ -154,10 +176,30 @@ impl AttentionLayer {
         self.len += 1;
         let n = self.len; // cached tokens, includes self (causal)
 
-        // Absorbed attention, per head, over all cached tokens 0..n.
+        // DSA: the lightning indexer picks which cached positions this query
+        // attends to (top-`index_topk`, one set shared by all heads). Every token
+        // still appends its key to the indexer cache. At or below the budget — or
+        // with no indexer — `sel` is the full causal range `0..n`, so the result
+        // is bit-identical to dense attention (existing goldens unaffected).
+        let sel: Vec<usize> = if let Some(ix) = self.indexer.as_mut() {
+            ix.append_key(x);
+            if n > self.index_topk {
+                ix.select(&qr, x, n - 1, self.index_topk)
+                    .into_iter()
+                    .map(|t| t as usize)
+                    .collect()
+            } else {
+                (0..n).collect()
+            }
+        } else {
+            (0..n).collect()
+        };
+        let m = sel.len();
+
+        // Absorbed attention, per head, over the selected tokens.
         let mut ctx = vec![0.0f32; h * vh];
         let mut qabs = vec![0.0f32; kvl];
-        let mut score = vec![0.0f32; n];
+        let mut score = vec![0.0f32; m];
         let mut clat = vec![0.0f32; kvl];
         for hi in 0..h {
             let qh = &q[hi * qk..(hi + 1) * qk];
@@ -174,32 +216,32 @@ impl AttentionLayer {
                 }
             }
 
-            // scores over cached latents; softmax (f32).
+            // scores over the selected latents; softmax (f32).
             let mut smax = f32::NEG_INFINITY;
-            for t in 0..n {
+            for (j, &t) in sel.iter().enumerate() {
                 let sn = dot(&qabs, &self.lc[t * kvl..(t + 1) * kvl]);
                 let sp = dot(qpe, &self.rc[t * rope..(t + 1) * rope]);
                 let s = (sn + sp) * self.scale;
-                score[t] = s;
+                score[j] = s;
                 smax = smax.max(s);
             }
             let mut denom = 0.0f32;
-            for s in score[..n].iter_mut() {
+            for s in score[..m].iter_mut() {
                 *s = (*s - smax).exp();
                 denom += *s;
             }
 
-            // clat = Σ_t p[t]·Lc[t]; ctx_h = W_UV_h · clat.
+            // clat = Σ_j p[j]·Lc[sel[j]]; ctx_h = W_UV_h · clat.
             clat.iter_mut().for_each(|v| *v = 0.0);
-            for t in 0..n {
-                let p = score[t] / denom;
+            for (j, &t) in sel.iter().enumerate() {
+                let p = score[j] / denom;
                 for (c, &l) in clat.iter_mut().zip(&self.lc[t * kvl..(t + 1) * kvl]) {
                     *c += p * l;
                 }
             }
             let ctx_h = &mut ctx[hi * vh..(hi + 1) * vh];
-            for (j, o) in ctx_h.iter_mut().enumerate() {
-                let row = &self.w.wkv_b[(rbase + nope + j) * kvl..(rbase + nope + j + 1) * kvl];
+            for (jj, o) in ctx_h.iter_mut().enumerate() {
+                let row = &self.w.wkv_b[(rbase + nope + jj) * kvl..(rbase + nope + jj + 1) * kvl];
                 *o = dot_bf16w(row, &clat);
             }
         }

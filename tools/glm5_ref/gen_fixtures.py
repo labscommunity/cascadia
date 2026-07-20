@@ -18,9 +18,10 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref, indexer_ref,
-                                  layer_ref, model_ref, moe_gate, moe_ref,
-                                  mtp_draft_ref, precompute_freqs_cis, swiglu_ref)
+from glm5_ref.kernels_ref import (apply_rotary_emb, attention_ref,
+                                  attention_ref_dsa, indexer_ref, layer_ref,
+                                  model_ref, moe_gate, moe_ref, mtp_draft_ref,
+                                  precompute_freqs_cis, swiglu_ref)
 
 FX = {}
 META = {}
@@ -325,6 +326,31 @@ def main():
     put("mtp.block.moe.sh.wd", mtp_sh[2])
     META["mtp"] = {"next_tok": MTP_TOK, "g": G_MTP, "drafts": mtp_drafts,
                    "vocab": VOCAB, "hidden": mhH}
+
+    # ---- 12. DSA-gated attention: indexer selection drives the MLA gather ----
+    # Appended last so blocks 1–11 keep their exact RNG draws. Same attention
+    # dims as (3); the indexer shares hidden/q_lora/qk_rope and is fed the
+    # attention's own hidden `dx` + derived q_a residual. DTOPK < NS, so positions
+    # >= DTOPK prune keys — the sparse path against the Rust absorbed DSA decode.
+    dnh, dhd, DTOPK = 2, 8, 3
+    diw = {
+        "ix_wq": wbf(dnh * dhd, ql),
+        "ix_wk": wbf(dhd, hid),
+        "ix_wp": wbf(dnh, hid),
+        "k_norm_w": (1.0 + 0.05 * torch.randn(dhd, generator=g)).to(torch.bfloat16).to(torch.float32),
+        "k_norm_b": (0.1 * torch.randn(dhd, generator=g)).to(torch.bfloat16).to(torch.float32),
+    }
+    dx = (0.5 * torch.randn(NS, hid, generator=g)).to(torch.bfloat16).to(torch.float32)
+    dicfg = {"index_nh": dnh, "index_hd": dhd, "qk_rope": rp, "ln_eps": 1e-6, "theta": acfg["theta"]}
+    dout = attention_ref_dsa(dx, aw, diw, acfg, dicfg, DTOPK)
+    for k, v in aw.items():
+        put(f"dsa.{k}", v.clone())  # distinct storage from attn.* (safetensors)
+    for k, v in diw.items():
+        put(f"dsa.{k}", v)
+    put("dsa.x", dx)
+    put("dsa.out", dout)
+    META["dsa"] = {**{k: acfg[k] for k in acfg}, "index_nh": dnh, "index_hd": dhd,
+                   "seq": NS, "topk": DTOPK}
 
     from safetensors.torch import save_file
     save_file(FX, str(out / "fixtures.safetensors"))
