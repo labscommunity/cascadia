@@ -59,6 +59,14 @@ impl AnyExpert {
             _ => None,
         }
     }
+
+    /// `madvise(WILLNEED)` hint (mmap experts only; no-op otherwise).
+    #[inline]
+    pub fn prefetch(&self) {
+        if let AnyExpert::Mmap(m) = self {
+            m.prefetch();
+        }
+    }
 }
 
 impl From<ExpertW> for AnyExpert {
@@ -139,6 +147,24 @@ impl MoeLayer {
     /// The shared expert (always active — a top pin candidate).
     pub fn shared(&self) -> &AnyExpert {
         &self.w.shared
+    }
+
+    /// Prefetch the experts this layer is most likely to fire next — the shared
+    /// expert (always active) + the `n` hottest routed experts from the
+    /// learned-pin histogram (if attached). Best-effort `madvise(WILLNEED)`; no
+    /// effect on output. Issued for the NEXT layer while the current one
+    /// computes, so the expert reads overlap compute instead of stalling.
+    pub fn prefetch_hot(&self, n: usize) {
+        self.w.shared.prefetch();
+        if let Some(u) = &self.usage {
+            if let Ok(g) = u.lock() {
+                for e in g.hottest_for(self.layer_idx, n) {
+                    if let Some(exp) = self.w.experts.get(e as usize) {
+                        exp.prefetch();
+                    }
+                }
+            }
+        }
     }
 
     /// MoE for one token `x` (`[hidden]`). Returns `[hidden]`.
