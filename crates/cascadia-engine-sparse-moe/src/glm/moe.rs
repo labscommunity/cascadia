@@ -94,6 +94,11 @@ pub struct MoeLayer {
 }
 
 impl MoeLayer {
+    /// Rows per batch-union block. Bounds the intermediate expert-output storage
+    /// (`ROW_BLOCK · top_k · hidden` f32) while keeping enough rows per block for
+    /// heavy expert overlap. Correctness is independent of this value.
+    const ROW_BLOCK: usize = 128;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         hidden: usize,
@@ -165,5 +170,92 @@ impl MoeLayer {
             *o += si;
         }
         out
+    }
+
+    /// Batch-union MoE for `rows` tokens (`xs` is `[rows, hidden]`), returning
+    /// `[rows, hidden]`. **Bit-identical** to calling [`Self::forward_token`] per
+    /// row — same router, same per-row gate-order accumulation — but each unique
+    /// routed expert is visited once and computes all of its assigned rows back
+    /// to back, so its int4 weights (an mmap page fault or a dequant) are paid
+    /// for once and stay hot. This is the prefill / batched-verify path; at high
+    /// node counts it cuts the NVMe traffic that dominates, since a prompt's
+    /// tokens route to heavily overlapping experts. Rows are processed in blocks
+    /// so the intermediate storage stays bounded (dedup is within a block).
+    pub fn forward_batch(&self, xs: &[f32], rows: usize) -> Vec<f32> {
+        assert_eq!(xs.len(), rows * self.hidden);
+        let mut out = vec![0.0f32; rows * self.hidden];
+        let mut lo = 0;
+        while lo < rows {
+            let hi = (lo + Self::ROW_BLOCK).min(rows);
+            self.forward_block(xs, lo, hi, &mut out);
+            lo = hi;
+        }
+        out
+    }
+
+    /// Batch-union over rows `[lo, hi)`, writing into `out[lo..hi]`.
+    fn forward_block(&self, xs: &[f32], lo: usize, hi: usize, out: &mut [f32]) {
+        let (hidden, k) = (self.hidden, self.top_k);
+        let nblk = hi - lo;
+
+        // 1. Route every row in the block; record the (expert -> occurrences)
+        //    map and the per-slot expert/weight, exactly as forward_token would.
+        let mut slot_e = vec![0u32; nblk * k]; // expert id per (blockrow, slot)
+        let mut slot_w = vec![0.0f32; nblk * k]; // gate weight per (blockrow, slot)
+        let mut occ: Vec<Vec<u32>> = vec![Vec::new(); self.n_experts]; // expert -> [blockrow*k+slot]
+        let mut logits = vec![0.0f32; self.n_experts];
+        for br in 0..nblk {
+            let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+            logits.iter_mut().for_each(|v| *v = 0.0);
+            linear_f32(x, &self.w.router_w, self.n_experts, hidden, &mut logits);
+            let gate = moe_gate(&logits, &self.w.router_bias, k, self.scale, true);
+            if let Some(u) = &self.usage {
+                if let Ok(mut g) = u.lock() {
+                    for &e in &gate.idx {
+                        g.record(self.layer_idx, e);
+                    }
+                }
+            }
+            for (slot, (&e, &wj)) in gate.idx.iter().zip(&gate.weight).enumerate() {
+                let s = br * k + slot;
+                slot_e[s] = e;
+                slot_w[s] = wj;
+                occ[e as usize].push(s as u32);
+            }
+        }
+
+        // 2. Dedup compute: one visit per unique routed expert, its rows hot.
+        let mut ey = vec![0.0f32; nblk * k * hidden]; // expert output per (blockrow, slot)
+        for (e, slots) in occ.iter().enumerate() {
+            if slots.is_empty() {
+                continue;
+            }
+            let exp = &self.w.experts[e];
+            for &s in slots {
+                let br = (s as usize) / k;
+                let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+                let y = exp.forward(x, hidden, self.moe_inter);
+                ey[s as usize * hidden..(s as usize + 1) * hidden].copy_from_slice(&y);
+            }
+        }
+
+        // 3. Per row: accumulate experts in gate order, then shared — the exact
+        //    op order of forward_token, so the result is bit-for-bit identical.
+        for br in 0..nblk {
+            let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
+            let o = &mut out[(lo + br) * hidden..(lo + br + 1) * hidden];
+            for slot in 0..k {
+                let s = br * k + slot;
+                let wj = slot_w[s];
+                let y = &ey[s * hidden..(s + 1) * hidden];
+                for (oo, &yi) in o.iter_mut().zip(y) {
+                    *oo += wj * yi;
+                }
+            }
+            let sh = self.w.shared.forward(x, hidden, self.shared_inter);
+            for (oo, &si) in o.iter_mut().zip(&sh) {
+                *oo += si;
+            }
+        }
     }
 }
