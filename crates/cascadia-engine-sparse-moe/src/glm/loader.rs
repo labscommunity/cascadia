@@ -18,6 +18,7 @@ use half::bf16;
 use serde::Deserialize;
 
 use super::attn::{AttentionLayer, AttnWeights};
+use super::indexer::{Indexer, IndexerWeights};
 use super::model::{GlmLayer, GlmModel, LayerMlp};
 use super::moe::{AnyExpert, MoeLayer, MoeWeights};
 use crate::dsv4::expert_mmap::MmapExpert;
@@ -55,6 +56,14 @@ pub struct GlmManifest {
     pub rms_norm_eps: f32,
     #[serde(default)]
     pub eos_token_ids: Vec<u32>,
+    /// DSA lightning indexer. `index_n_heads == 0` (the default) means no indexer
+    /// was exported → dense causal attention (correct for ctx ≤ index_topk).
+    #[serde(default)]
+    pub index_topk: usize,
+    #[serde(default)]
+    pub index_n_heads: usize,
+    #[serde(default)]
+    pub index_head_dim: usize,
 }
 
 fn one() -> usize {
@@ -162,7 +171,34 @@ fn load_layer(
         wo: gb("self_attn.o_proj.weight")?,
     };
     let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
-    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+    let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+
+    // DSA lightning indexer (when exported): restricts long-context attention to
+    // the top-`index_topk` keys. The indexer ropes the qk_rope prefix at the same
+    // positions, so it shares the attention rope config.
+    if m.index_n_heads > 0 {
+        let iw = IndexerWeights {
+            ix_wq: gb("self_attn.indexer.wq.weight")?,
+            ix_wk: gb("self_attn.indexer.wk.weight")?,
+            ix_wp: gb("self_attn.indexer.weights_proj.weight")?,
+            k_norm_w: g("self_attn.indexer.k_norm.weight")?,
+            k_norm_b: g("self_attn.indexer.k_norm.bias")?,
+        };
+        let ifreqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
+        let indexer = Indexer::new(
+            hidden,
+            ql,
+            m.index_n_heads,
+            m.index_head_dim,
+            rope,
+            max_seq,
+            crate::glm::attn::MLA_LATENT_EPS,
+            iw,
+            ifreqs,
+        );
+        let topk = if m.index_topk > 0 { m.index_topk } else { usize::MAX };
+        attn.attach_indexer(indexer, topk);
+    }
 
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mlp = if m.dense_layers.contains(&li) {

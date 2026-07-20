@@ -114,6 +114,12 @@ def load_and_validate_config(path: Path) -> dict:
         eps=float(c.get("rms_norm_eps", 1e-5)),
         n_mtp=int(c.get("num_nextn_predict_layers", 0)),
         eos=c.get("eos_token_id", []),
+        # DSA lightning indexer (GLM-5.2 / deepseek_v32). Optional here so a
+        # non-DSA config still exports (dense); when present the weights are
+        # emitted and a missing tensor fails loudly in export_real.
+        index_topk=int(c.get("index_topk", 0)),
+        index_n_heads=int(c.get("index_n_heads", 0)),
+        index_head_dim=int(c.get("index_head_dim", 0)),
     )
     _require(cfg["qk_head"] > 0 and cfg["kv_lora"] > 0, "bad MLA dims")
     _require(cfg["hidden"] % _INT4_GROUP == 0 and cfg["moe_inter"] % _INT4_GROUP == 0,
@@ -153,6 +159,10 @@ def build_manifest(cfg: dict) -> dict:
         "routed_scaling_factor": cfg["routed_scale"],
         "rope_theta": cfg["rope_theta"],
         "rms_norm_eps": cfg["eps"],
+        # DSA lightning indexer (0 = not exported -> dense causal attention).
+        "index_topk": cfg.get("index_topk", 0),
+        "index_n_heads": cfg.get("index_n_heads", 0),
+        "index_head_dim": cfg.get("index_head_dim", 0),
     }
 
 
@@ -165,17 +175,24 @@ def write_manifest(cfg: dict, out: Path):
 # --------------------------------------------------------------------------
 # --tiny: deterministic tiny model in the engine layout (smoke / M3 loader dev)
 # --------------------------------------------------------------------------
-def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1):
+def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
+                index_n_heads: int = 0, index_head_dim: int = 8, index_topk: int = 0):
     import torch
     from safetensors.torch import save_file
 
     gen = torch.Generator().manual_seed(7)
+    # Indexer weights are drawn from an INDEPENDENT stream so enabling DSA leaves
+    # every other weight — and therefore the dense greedy tokens — untouched.
+    geni = torch.Generator().manual_seed(11)
 
     def rf(*shape, s=0.3):
         return (s * torch.randn(*shape, generator=gen)).to(torch.bfloat16)
 
     def nf(n):
         return (1.0 + 0.05 * torch.randn(n, generator=gen)).to(torch.bfloat16)
+
+    def rfi(*shape, s=0.3):
+        return (s * torch.randn(*shape, generator=geni)).to(torch.bfloat16)
 
     # num_layers/first_dense are parametric so multi-rank pipeline fixtures (≥4
     # layers, for a middle-relay split) can be generated; the RNG stream is
@@ -186,6 +203,7 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1):
         qk_nope=6, qk_rope=4, qk_head=10, v_head=6, n_routed=4, n_shared=1,
         top_k=2, moe_inter=32, dense_inter=64, first_dense=first_dense, routed_scale=2.5,
         rope_theta=8.0e6, eps=1e-5, n_mtp=1, eos=[0],
+        index_n_heads=index_n_heads, index_head_dim=index_head_dim, index_topk=index_topk,
     )
     H, E, MI, DI = cfg["hidden"], cfg["n_routed"], cfg["moe_inter"], cfg["dense_inter"]
     write_manifest(cfg, out)
@@ -198,7 +216,7 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1):
     def attn_shell(li):
         h, qk, nope, vh = cfg["num_heads"], cfg["qk_head"], cfg["qk_nope"], cfg["v_head"]
         kvl, ql = cfg["kv_lora"], cfg["q_lora"]
-        return {
+        shell = {
             "input_layernorm.weight": nf(H), "post_attention_layernorm.weight": nf(H),
             "self_attn.wq_a.weight": rf(ql, H), "self_attn.q_a_layernorm.weight": nf(ql),
             "self_attn.wq_b.weight": rf(h * qk, ql),
@@ -207,6 +225,16 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1):
             "self_attn.wkv_b.weight": rf(h * (nope + vh), kvl),
             "self_attn.o_proj.weight": rf(H, h * vh),
         }
+        if index_n_heads > 0:
+            inh, ihd = index_n_heads, index_head_dim
+            shell.update({
+                "self_attn.indexer.wq.weight": rfi(inh * ihd, ql),
+                "self_attn.indexer.wk.weight": rfi(ihd, H),
+                "self_attn.indexer.weights_proj.weight": rfi(inh, H),
+                "self_attn.indexer.k_norm.weight": (1.0 + 0.05 * torch.randn(ihd, generator=geni)).to(torch.bfloat16),
+                "self_attn.indexer.k_norm.bias": (0.1 * torch.randn(ihd, generator=geni)).to(torch.bfloat16),
+            })
+        return shell
 
     def npy(t):
         return t.to(torch.float32).numpy()
@@ -363,6 +391,18 @@ def export_real(model_dir: Path, out: Path):
             "self_attn.wkv_b.weight": bf16(p + "self_attn.kv_b_proj.weight"),
             "self_attn.o_proj.weight": bf16(p + "self_attn.o_proj.weight"),
         }
+        # DSA lightning indexer weights (bf16 shell), mapped to the loader's
+        # names. HF layout mirrors deepseek_v32: self_attn.indexer.{wq,wk,
+        # weights_proj,k_norm}. Fail loudly if the config declares DSA but a
+        # tensor is absent/renamed rather than silently exporting a dense shell.
+        if cfg["index_n_heads"] > 0:
+            ip = p + "self_attn.indexer."
+            for name in ("wq.weight", "wk.weight", "weights_proj.weight",
+                         "k_norm.weight", "k_norm.bias"):
+                _require(src.has(ip + name),
+                         f"index_n_heads>0 but indexer tensor '{ip + name}' is missing "
+                         f"— check the checkpoint's DSA indexer parameter names")
+                shell["self_attn.indexer." + name] = bf16(ip + name)
         edir = out / "experts" / f"layer_{li:02d}"
         if li < cfg["first_dense"]:
             export_expert_bin(
@@ -388,8 +428,8 @@ def export_real(model_dir: Path, out: Path):
         marker.touch()  # layer fully written -> resumable checkpoint
         print(f"[layer {li:2d}/{cfg['num_layers']}] shell + experts written", flush=True)
 
-    # Note: DSA indexer + MTP weights are not exported yet (the shell runs
-    # full-causal attention, correct for ctx <= index_topk; DSA/MTP are M4).
+    # Note: MTP head weights are not exported yet (single-token decode only;
+    # spec-decode is a later slice). The DSA indexer is exported above.
     print(f"[export] done -> {out}", flush=True)
 
 

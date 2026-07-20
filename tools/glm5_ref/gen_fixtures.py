@@ -375,6 +375,15 @@ def main():
     export_glm5.export_tiny(ml_dir, num_layers=8)
     print(f"[pipeline fixture] export {ml_dir} (8 layers)")
 
+    # DSA end-to-end fixtures: identical weights (independent indexer RNG), a
+    # sparse variant (index_topk=2 -> prunes past pos 1) and a dense twin
+    # (index_topk huge -> selection is every key). The loaded model must differ
+    # between them, proving the indexer is wired and active through the loader.
+    for tag, tk in (("glm5_export_dsa", 2), ("glm5_export_dsa_dense", 10_000)):
+        d = out.parent / tag
+        export_glm5.export_tiny(d, num_layers=4, index_n_heads=2, index_head_dim=8, index_topk=tk)
+        print(f"[dsa fixture] export {d} (index_topk={tk})")
+
     # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
     from glm5_ref.fp8_roundtrip import roundtrip
     fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)
