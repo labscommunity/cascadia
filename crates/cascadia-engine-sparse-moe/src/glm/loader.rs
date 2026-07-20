@@ -64,6 +64,11 @@ pub struct GlmManifest {
     pub index_n_heads: usize,
     #[serde(default)]
     pub index_head_dim: usize,
+    /// Per-layer IndexShare topology: `"full"` (owns an indexer) | `"shared"`
+    /// (reuses the previous full layer's top-k). Empty = every layer is its own
+    /// indexer (tiny/dev default).
+    #[serde(default)]
+    pub indexer_types: Vec<String>,
 }
 
 fn one() -> usize {
@@ -178,7 +183,7 @@ fn load_layer(
     // positions, so it shares the attention rope config.
     if m.index_n_heads > 0 {
         let iw = IndexerWeights {
-            ix_wq: gb("self_attn.indexer.wq.weight")?,
+            ix_wq: gb("self_attn.indexer.wq_b.weight")?,
             ix_wk: gb("self_attn.indexer.wk.weight")?,
             ix_wp: gb("self_attn.indexer.weights_proj.weight")?,
             k_norm_w: g("self_attn.indexer.k_norm.weight")?,

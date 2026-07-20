@@ -120,6 +120,10 @@ def load_and_validate_config(path: Path) -> dict:
         index_topk=int(c.get("index_topk", 0)),
         index_n_heads=int(c.get("index_n_heads", 0)),
         index_head_dim=int(c.get("index_head_dim", 0)),
+        # IndexShare topology: per-layer "full" (owns an indexer) | "shared"
+        # (reuses the previous full layer's top-k). Absent -> every attention
+        # layer is its own indexer (the tiny/dev default).
+        indexer_types=list(c.get("indexer_types", [])),
     )
     _require(cfg["qk_head"] > 0 and cfg["kv_lora"] > 0, "bad MLA dims")
     _require(cfg["hidden"] % _INT4_GROUP == 0 and cfg["moe_inter"] % _INT4_GROUP == 0,
@@ -163,6 +167,11 @@ def build_manifest(cfg: dict) -> dict:
         "index_topk": cfg.get("index_topk", 0),
         "index_n_heads": cfg.get("index_n_heads", 0),
         "index_head_dim": cfg.get("index_head_dim", 0),
+        # Per-layer IndexShare topology. Default (absent): every layer is "full"
+        # when an indexer is present. "shared" layers reuse the previous full
+        # layer's top-k selection.
+        "indexer_types": (cfg.get("indexer_types")
+                          or (["full"] * cfg["num_layers"] if cfg.get("index_n_heads", 0) > 0 else [])),
     }
 
 
@@ -228,7 +237,7 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
         if index_n_heads > 0:
             inh, ihd = index_n_heads, index_head_dim
             shell.update({
-                "self_attn.indexer.wq.weight": rfi(inh * ihd, ql),
+                "self_attn.indexer.wq_b.weight": rfi(inh * ihd, ql),
                 "self_attn.indexer.wk.weight": rfi(ihd, H),
                 "self_attn.indexer.weights_proj.weight": rfi(inh, H),
                 "self_attn.indexer.k_norm.weight": (1.0 + 0.05 * torch.randn(ihd, generator=geni)).to(torch.bfloat16),
@@ -391,16 +400,19 @@ def export_real(model_dir: Path, out: Path):
             "self_attn.wkv_b.weight": bf16(p + "self_attn.kv_b_proj.weight"),
             "self_attn.o_proj.weight": bf16(p + "self_attn.o_proj.weight"),
         }
-        # DSA lightning indexer weights (bf16 shell), mapped to the loader's
-        # names. HF layout mirrors deepseek_v32: self_attn.indexer.{wq,wk,
-        # weights_proj,k_norm}. Fail loudly if the config declares DSA but a
-        # tensor is absent/renamed rather than silently exporting a dense shell.
-        if cfg["index_n_heads"] > 0:
+        # DSA lightning indexer weights (bf16 shell). IndexShare: only "full"
+        # layers own an indexer; "shared" layers reuse the previous full layer's
+        # top-k (no tensors). Real GLM names: self_attn.indexer.{wq_b,wk,
+        # weights_proj,k_norm}. Fail loudly if a "full" layer's tensor is absent.
+        itypes = cfg.get("indexer_types") or []
+        is_full = (cfg["index_n_heads"] > 0
+                   and (li >= len(itypes) or itypes[li] == "full"))
+        if is_full and cfg["index_n_heads"] > 0:
             ip = p + "self_attn.indexer."
-            for name in ("wq.weight", "wk.weight", "weights_proj.weight",
+            for name in ("wq_b.weight", "wk.weight", "weights_proj.weight",
                          "k_norm.weight", "k_norm.bias"):
                 _require(src.has(ip + name),
-                         f"index_n_heads>0 but indexer tensor '{ip + name}' is missing "
+                         f"'full' indexer layer {li} missing tensor '{ip + name}' "
                          f"— check the checkpoint's DSA indexer parameter names")
                 shell["self_attn.indexer." + name] = bf16(ip + name)
         edir = out / "experts" / f"layer_{li:02d}"

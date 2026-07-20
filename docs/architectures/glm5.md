@@ -23,7 +23,7 @@ parity-tested across N ranks over the real loopback transport. Not yet run on th
 | experts | 256 routed + 1 shared, **top-8**, `moe_intermediate=2048`; `n_group=1, topk_group=1` (NO grouped/node-limited routing) |
 | routing | `scoring_func="sigmoid"` + `noaux_tc` bias, norm-topk, `routed_scaling_factor=2.5` |
 | attention | **classic V3 MLA**: `q_lora_rank=2048`, `kv_lora_rank=512`, 64 heads (no GQA), `qk_nope=192` + `qk_rope=64` (qk_head_dim 256), `v_head_dim=256`; KV latent = 512 + 64 rope = **576 f/tok** |
-| sparse attn | **DSA / IndexShare**: lightning indexer scores **raw** positions → top-`index_topk` (2048) causal keys per layer; `index_n_heads=64`, `index_head_dim=128` |
+| sparse attn | **DSA / IndexShare**: lightning indexer scores **raw** positions → top-`index_topk` (2048) causal keys; `index_n_heads=32`, `index_head_dim=128`. **IndexShare**: only `"full"` layers (`config.indexer_types`, 22 of 79 — layers 0,1,2 then every 4th) own an indexer; `"shared"` layers reuse the previous full layer's top-k (carry-forward). Indexer query proj = `wq_b`; interleaved rope; weights FP8 |
 | residual | plain `[b, s, 6144]` — no Hyper-Connections |
 | rope | `rope_theta=8e6`, interleaved, `rope_type="default"` (**no YaRN**), `max_position=1,048,576` (1M ctx) |
 | quant | int4 experts (per-row scales, group-32), FP8 block-128 source; MTP head int8 (int4 collapses accept) |
