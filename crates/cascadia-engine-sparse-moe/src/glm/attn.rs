@@ -81,6 +81,9 @@ pub struct AttentionLayer {
     /// positions; otherwise attention is over the full causal range.
     indexer: Option<Indexer>,
     index_topk: usize,
+    /// IndexShare `"shared"` layer: owns no indexer and reuses the top-k
+    /// selection carried from the most recent `"full"` layer.
+    is_shared: bool,
 }
 
 impl AttentionLayer {
@@ -124,6 +127,7 @@ impl AttentionLayer {
             len: 0,
             indexer: None,
             index_topk: usize::MAX,
+            is_shared: false,
         }
     }
 
@@ -132,6 +136,13 @@ impl AttentionLayer {
     pub fn attach_indexer(&mut self, indexer: Indexer, index_topk: usize) {
         assert!(index_topk > 0, "index_topk must be positive");
         self.indexer = Some(indexer);
+        self.index_topk = index_topk;
+    }
+
+    /// Mark this as an IndexShare `"shared"` layer: it owns no indexer and reuses
+    /// the top-k selection carried from the most recent `"full"` layer.
+    pub fn mark_shared(&mut self, index_topk: usize) {
+        self.is_shared = true;
         self.index_topk = index_topk;
     }
 
@@ -148,7 +159,12 @@ impl AttentionLayer {
     /// Attend one token `x` (`[hidden]`) at absolute position `self.len`,
     /// appending its latent/k_pe to the cache. Returns `out` (`[hidden]`).
     /// Positions must be fed in order starting from 0.
-    pub fn forward_token(&mut self, x: &[f32]) -> Vec<f32> {
+    ///
+    /// `carry` is the IndexShare selection channel: a `"full"` layer (has an
+    /// indexer) computes this query's top-k and writes it into `carry`; a
+    /// `"shared"` layer reads it back. Pass `&mut None` for a plain layer / the
+    /// first token.
+    pub fn forward_token(&mut self, x: &[f32], carry: &mut Option<Vec<usize>>) -> Vec<f32> {
         assert_eq!(x.len(), self.hidden);
         let (h, nope, rope) = (self.h, self.qk_nope, self.qk_rope);
         let (vh, kvl, qk) = (self.v_head, self.kv_lora, self.qk_head);
@@ -182,15 +198,24 @@ impl AttentionLayer {
         // with no indexer — `sel` is the full causal range `0..n`, so the result
         // is bit-identical to dense attention (existing goldens unaffected).
         let sel: Vec<usize> = if let Some(ix) = self.indexer.as_mut() {
+            // "full" layer: compute this query's top-k and publish it so the
+            // subsequent "shared" layers reuse the same selection.
             ix.append_key(x);
-            if n > self.index_topk {
+            let s: Vec<usize> = if n > self.index_topk {
                 ix.select(&qr, x, n - 1, self.index_topk)
                     .into_iter()
                     .map(|t| t as usize)
                     .collect()
             } else {
                 (0..n).collect()
-            }
+            };
+            *carry = Some(s.clone());
+            s
+        } else if self.is_shared {
+            // "shared" layer: reuse the most recent full layer's selection
+            // (carry is always set by then; None only in the not-yet-wired
+            // cross-rank case, where we fall back to full causal).
+            carry.clone().unwrap_or_else(|| (0..n).collect())
         } else {
             (0..n).collect()
         };

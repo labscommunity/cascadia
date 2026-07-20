@@ -185,7 +185,8 @@ def write_manifest(cfg: dict, out: Path):
 # --tiny: deterministic tiny model in the engine layout (smoke / M3 loader dev)
 # --------------------------------------------------------------------------
 def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
-                index_n_heads: int = 0, index_head_dim: int = 8, index_topk: int = 0):
+                index_n_heads: int = 0, index_head_dim: int = 8, index_topk: int = 0,
+                indexer_types: "list | None" = None):
     import torch
     from safetensors.torch import save_file
 
@@ -213,6 +214,8 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
         top_k=2, moe_inter=32, dense_inter=64, first_dense=first_dense, routed_scale=2.5,
         rope_theta=8.0e6, eps=1e-5, n_mtp=1, eos=[0],
         index_n_heads=index_n_heads, index_head_dim=index_head_dim, index_topk=index_topk,
+        indexer_types=(indexer_types
+                       or (["full"] * num_layers if index_n_heads > 0 else [])),
     )
     H, E, MI, DI = cfg["hidden"], cfg["n_routed"], cfg["moe_inter"], cfg["dense_inter"]
     write_manifest(cfg, out)
@@ -234,7 +237,8 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
             "self_attn.wkv_b.weight": rf(h * (nope + vh), kvl),
             "self_attn.o_proj.weight": rf(H, h * vh),
         }
-        if index_n_heads > 0:
+        # IndexShare: emit indexer weights only for "full" layers.
+        if index_n_heads > 0 and cfg["indexer_types"][li] == "full":
             inh, ihd = index_n_heads, index_head_dim
             shell.update({
                 "self_attn.indexer.wq_b.weight": rfi(inh * ihd, ql),

@@ -92,7 +92,7 @@ fn dsa_gated_attention_matches_reference() {
     let (_, want) = fx.f32("dsa.out").unwrap();
     let mut got = vec![0.0f32; seq * hidden];
     for s in 0..seq {
-        let o = layer.forward_token(&x[s * hidden..(s + 1) * hidden]);
+        let o = layer.forward_token(&x[s * hidden..(s + 1) * hidden], &mut None);
         got[s * hidden..(s + 1) * hidden].copy_from_slice(&o);
     }
     assert_close("dsa.out", &got, &want, 2e-2, 1e-2);

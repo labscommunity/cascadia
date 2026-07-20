@@ -178,31 +178,42 @@ fn load_layer(
     let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
     let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
 
-    // DSA lightning indexer (when exported): restricts long-context attention to
-    // the top-`index_topk` keys. The indexer ropes the qk_rope prefix at the same
+    // DSA / IndexShare (when exported): a "full" layer owns an indexer and
+    // publishes its top-`index_topk` selection; a "shared" layer reuses the
+    // previous full layer's selection. `indexer_types` empty (tiny/dev) => every
+    // layer is "full". The indexer ropes the qk_rope prefix at the attention's
     // positions, so it shares the attention rope config.
     if m.index_n_heads > 0 {
-        let iw = IndexerWeights {
-            ix_wq: gb("self_attn.indexer.wq_b.weight")?,
-            ix_wk: gb("self_attn.indexer.wk.weight")?,
-            ix_wp: gb("self_attn.indexer.weights_proj.weight")?,
-            k_norm_w: g("self_attn.indexer.k_norm.weight")?,
-            k_norm_b: g("self_attn.indexer.k_norm.bias")?,
-        };
-        let ifreqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
-        let indexer = Indexer::new(
-            hidden,
-            ql,
-            m.index_n_heads,
-            m.index_head_dim,
-            rope,
-            max_seq,
-            crate::glm::attn::MLA_LATENT_EPS,
-            iw,
-            ifreqs,
-        );
         let topk = if m.index_topk > 0 { m.index_topk } else { usize::MAX };
-        attn.attach_indexer(indexer, topk);
+        let is_full = m
+            .indexer_types
+            .get(li)
+            .map(|t| t == "full")
+            .unwrap_or(true); // absent/short -> full
+        if is_full {
+            let iw = IndexerWeights {
+                ix_wq: gb("self_attn.indexer.wq_b.weight")?,
+                ix_wk: gb("self_attn.indexer.wk.weight")?,
+                ix_wp: gb("self_attn.indexer.weights_proj.weight")?,
+                k_norm_w: g("self_attn.indexer.k_norm.weight")?,
+                k_norm_b: g("self_attn.indexer.k_norm.bias")?,
+            };
+            let ifreqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
+            let indexer = Indexer::new(
+                hidden,
+                ql,
+                m.index_n_heads,
+                m.index_head_dim,
+                rope,
+                max_seq,
+                crate::glm::attn::MLA_LATENT_EPS,
+                iw,
+                ifreqs,
+            );
+            attn.attach_indexer(indexer, topk);
+        } else {
+            attn.mark_shared(topk);
+        }
     }
 
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
