@@ -20,7 +20,8 @@ use serde::Deserialize;
 use super::attn::{AttentionLayer, AttnWeights};
 use super::indexer::{Indexer, IndexerWeights};
 use super::model::{GlmLayer, GlmModel, LayerMlp};
-use super::moe::{AnyExpert, MoeLayer, MoeWeights};
+use super::moe::{AnyExpert, ExpertW, MoeLayer, MoeWeights};
+use super::mtp::MtpHead;
 use crate::dsv4::expert_mmap::MmapExpert;
 use crate::dsv4::loader::{ExpertsMode, LoadError};
 use crate::dsv4::rope::precompute_freqs;
@@ -69,6 +70,10 @@ pub struct GlmManifest {
     /// indexer (tiny/dev default).
     #[serde(default)]
     pub indexer_types: Vec<String>,
+    /// Whether an MTP draft head was exported to `<dir>/mtp.safetensors` (enables
+    /// speculative decode). Absent/false → single-token decode only.
+    #[serde(default)]
+    pub has_mtp: bool,
 }
 
 fn one() -> usize {
@@ -252,6 +257,84 @@ fn load_layer(
     ))
 }
 
+/// Build the MTP draft head from `<dir>/mtp.safetensors` (present iff
+/// `manifest.has_mtp`). The block is a normal attn + MoE layer with NO indexer
+/// (the draft window is far below `index_topk`, so attention is full causal);
+/// its experts are stored bf16 in the safetensors ([`AnyExpert::Bf16`]).
+/// `max_seq` sizes the block's KV cache (it resets and consumes ≤ g positions
+/// per draft round).
+fn load_mtp(dir: &Path, m: &GlmManifest, max_seq: usize) -> Result<MtpHead, LoadError> {
+    let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
+    let (h, nope, rope) = (m.num_attention_heads, m.qk_nope_head_dim, m.qk_rope_head_dim);
+    let (vh, kvl, ql) = (m.v_head_dim, m.kv_lora_rank, m.q_lora_rank);
+    let moe_inter = m.expert_intermediate;
+
+    let st = StFile::open(&dir.join("mtp.safetensors"))?;
+    let g = |n: &str| st.f32(n).map(|t| t.1);
+    let gb = |n: &str| -> Result<Vec<u16>, LoadError> {
+        Ok(g(n)?.iter().map(|v| bf16::from_f32(*v).to_bits()).collect())
+    };
+    // bf16 expert (gate/up/down) held as bf16 bits — the shell's native dtype.
+    let bexp = |p: &str| -> Result<AnyExpert, LoadError> {
+        Ok(AnyExpert::Bf16(ExpertW {
+            wg: gb(&format!("{p}.gate.weight"))?,
+            wu: gb(&format!("{p}.up.weight"))?,
+            wd: gb(&format!("{p}.down.weight"))?,
+        }))
+    };
+
+    let aw = AttnWeights {
+        wq_a: gb("mtp.block.self_attn.wq_a.weight")?,
+        q_a_ln: g("mtp.block.self_attn.q_a_layernorm.weight")?,
+        wq_b: gb("mtp.block.self_attn.wq_b.weight")?,
+        wkv_a: gb("mtp.block.self_attn.wkv_a.weight")?,
+        kv_a_ln: g("mtp.block.self_attn.kv_a_layernorm.weight")?,
+        wkv_b: gb("mtp.block.self_attn.wkv_b.weight")?,
+        wo: gb("mtp.block.self_attn.o_proj.weight")?,
+    };
+    let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
+    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+
+    let mut experts = Vec::with_capacity(m.num_experts);
+    for e in 0..m.num_experts {
+        experts.push(bexp(&format!("mtp.block.mlp.experts.{e}"))?);
+    }
+    let mw = MoeWeights {
+        router_w: g("mtp.block.mlp.gate.weight")?,
+        router_bias: g("mtp.block.mlp.gate.e_score_correction_bias")?,
+        experts,
+        shared: bexp("mtp.block.mlp.shared")?,
+    };
+    let moe = MoeLayer::new(
+        hidden,
+        m.num_experts,
+        m.top_k,
+        moe_inter,
+        moe_inter * m.n_shared_experts,
+        m.routed_scaling_factor,
+        mw,
+    );
+    let block = GlmLayer::new(
+        hidden,
+        eps,
+        g("mtp.block.input_layernorm.weight")?,
+        g("mtp.block.post_attention_layernorm.weight")?,
+        attn,
+        LayerMlp::Moe(moe),
+    );
+
+    Ok(MtpHead::new(
+        hidden,
+        m.vocab_size,
+        eps,
+        g("mtp.enorm.weight")?,
+        g("mtp.hnorm.weight")?,
+        g("mtp.norm.weight")?,
+        gb("mtp.eh_proj.weight")?,
+        block,
+    ))
+}
+
 /// One pipeline stage: `embed` present iff this rank owns layer 0 (`first`),
 /// `head` (final_norm, lm_head) present iff it owns the last layer (`last`),
 /// and the layer slice `[lo, hi)`.
@@ -305,10 +388,10 @@ pub fn load_stage(
 
 /// Load a full single-stage model. `max_seq` sizes the attention KV caches.
 pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
-    let n = read_manifest(dir)?.num_layers;
-    let s = load_stage(dir, max_seq, 0, n, true, true, ExpertsMode::Eager)?;
+    let m = read_manifest(dir)?;
+    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, ExpertsMode::Eager)?;
     let (final_norm, lm_head) = s.head.expect("full model has a head");
-    Ok(GlmModel::new(
+    let mut model = GlmModel::new(
         s.hidden,
         s.vocab,
         s.eps,
@@ -316,5 +399,10 @@ pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
         s.layers,
         final_norm,
         lm_head,
-    ))
+    );
+    // Attach the MTP draft head (speculative decode) when the export carries one.
+    if m.has_mtp {
+        model.set_mtp(load_mtp(dir, &m, max_seq)?);
+    }
+    Ok(model)
 }
