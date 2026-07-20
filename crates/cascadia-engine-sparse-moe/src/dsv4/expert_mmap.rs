@@ -144,6 +144,17 @@ impl MmapExpert {
 fn dequant_row_dot(packed_row: &[u8], scales_row: &[u8], x: &[f32], in_dim: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX-512 (16-wide) where available — ~2x the AVX2 lane count on the
+        // Xeon export host + AVX-512 nodes; the Lunar Lake AI-PCs have no
+        // AVX-512 and fall through to the AVX2 path.
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: avx512{f,bw,vl} detected; loads stay within packed_row
+            // (in_dim/2 B), scales_row (in_dim/G*2 B) and x (in_dim).
+            return unsafe { dequant_row_dot_avx512(packed_row, scales_row, x, in_dim) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: avx2+fma detected at runtime; every load stays within
             // packed_row (in_dim/2 bytes), scales_row (in_dim/G*2 bytes) and x (in_dim).
@@ -151,6 +162,47 @@ fn dequant_row_dot(packed_row: &[u8], scales_row: &[u8], x: &[f32], in_dim: usiz
         }
     }
     dequant_row_dot_scalar(packed_row, scales_row, x, in_dim)
+}
+
+/// AVX-512 fused dequant+dot — the AVX2 strategy at 512-bit: per 32-col group,
+/// decode 16 packed bytes to 32 int8, interleave to column order, sign-extend to
+/// 2×16-wide f32, scale, and FMA against x into one 16-wide accumulator. Same
+/// value as the scalar/AVX2 paths within f32 lane-order ULP (the caller rounds
+/// to bf16).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn dequant_row_dot_avx512(
+    packed_row: &[u8],
+    scales_row: &[u8],
+    x: &[f32],
+    in_dim: usize,
+) -> f32 {
+    use core::arch::x86_64::*;
+    let ng = in_dim / G;
+    let lo_mask = _mm_set1_epi8(0x0F);
+    let bias = _mm_set1_epi8(8);
+    let mut acc = _mm512_setzero_ps();
+    let xp = x.as_ptr();
+    for g in 0..ng {
+        let s = half::bf16::from_le_bytes([scales_row[g * 2], scales_row[g * 2 + 1]]).to_f32();
+        let sv = _mm512_set1_ps(s);
+        let pk = _mm_loadu_si128(packed_row.as_ptr().add(g * (G / 2)) as *const __m128i);
+        let low = _mm_and_si128(pk, lo_mask);
+        let high = _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask);
+        let low_s = _mm_sub_epi8(low, bias);
+        let high_s = _mm_sub_epi8(high, bias);
+        // low/high nibble of byte i = cols 2i, 2i+1 -> interleave to column order.
+        let il = _mm_unpacklo_epi8(low_s, high_s); // cols 0..15  (16 int8)
+        let ih = _mm_unpackhi_epi8(low_s, high_s); // cols 16..31
+        let c0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(il)); // 16 f32
+        let c1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(ih));
+        let base = g * G;
+        let x0 = _mm512_loadu_ps(xp.add(base));
+        let x1 = _mm512_loadu_ps(xp.add(base + 16));
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(c0, sv), x0, acc);
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(c1, sv), x1, acc);
+    }
+    _mm512_reduce_add_ps(acc)
 }
 
 /// Scalar reference for `dequant_row_dot` (non-x86 / no-AVX2). Same nibble decode
