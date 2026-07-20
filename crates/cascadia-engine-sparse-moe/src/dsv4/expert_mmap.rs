@@ -106,6 +106,125 @@ impl MmapExpert {
         self.gemv(w2_off, dim, inter, &h, &mut out);
         out
     }
+
+    /// Batched mirror of [`Self::forward`] for `rows` activation rows
+    /// (`xs = [rows, dim]`) that all routed to THIS expert. Each int4 weight
+    /// row is dequantized ONCE and reused across every activation row, so the
+    /// nibble unpack — the decode hot path's dominant cost — is paid per weight
+    /// instead of per (weight, token). `route_ws[r]` scales row r (as `route_w`
+    /// scales the single-token path). Returns `[rows, dim]`, bit-identical to
+    /// calling [`Self::forward`] on each row (scalar path; see `gemv_batch`).
+    pub fn forward_batch(
+        &self,
+        xs: &[f32],
+        rows: usize,
+        dim: usize,
+        limit: f32,
+        route_ws: &[f32],
+    ) -> Vec<f32> {
+        debug_assert_eq!(dim, self.dim);
+        debug_assert_eq!(xs.len(), rows * dim);
+        debug_assert_eq!(route_ws.len(), rows);
+        let inter = self.inter;
+        let w1_off = 0;
+        let w3_off = section_bytes(inter, dim);
+        let w2_off = 2 * section_bytes(inter, dim);
+        let mut gate = vec![0.0f32; rows * inter];
+        let mut up = vec![0.0f32; rows * inter];
+        self.gemv_batch(w1_off, inter, dim, xs, rows, &mut gate);
+        self.gemv_batch(w3_off, inter, dim, xs, rows, &mut up);
+        let mut h = vec![0.0f32; rows * inter];
+        for r in 0..rows {
+            let rw = route_ws[r];
+            for i in 0..inter {
+                let mut g = gate[r * inter + i];
+                let mut u = up[r * inter + i];
+                if limit > 0.0 {
+                    u = u.clamp(-limit, limit);
+                    g = g.min(limit);
+                }
+                let s = g / (1.0 + (-g).exp()); // silu
+                                                // rw == 1.0 for the shared/no-route case is an exact f32 no-op,
+                                                // so this matches `forward`'s `route_w: None` path bit-for-bit.
+                let v = s * u * rw;
+                h[r * inter + i] = to_bf16(v);
+            }
+        }
+        let mut out = vec![0.0f32; rows * dim];
+        self.gemv_batch(w2_off, dim, inter, &h, rows, &mut out);
+        out
+    }
+
+    /// Batched `gemv`: `ys[r] = W xs[r]` for every row, with W dequantized ONCE
+    /// per output row and reused across all `rows` inputs. `xs = [rows, in_dim]`,
+    /// `ys = [rows, out_dim]`. Parallelized over output rows (each owns a column
+    /// of a transposed scratch, then scattered into row-major `ys`).
+    ///
+    /// Scalar dequant+dot in strict column order — bit-identical to the scalar
+    /// [`dequant_row_dot`] the single-token [`Self::gemv`] uses, so on the scalar
+    /// path `forward_batch` equals per-row `forward` exactly. (The AVX2 fused
+    /// kernel accumulates in a different lane order; a matching AVX2 batch kernel
+    /// is a follow-up for on-node throughput + on-node bit-exactness.)
+    fn gemv_batch(
+        &self,
+        sec_off: usize,
+        out_dim: usize,
+        in_dim: usize,
+        xs: &[f32],
+        rows: usize,
+        ys: &mut [f32],
+    ) {
+        use rayon::prelude::*;
+        debug_assert_eq!(xs.len(), rows * in_dim);
+        debug_assert_eq!(ys.len(), rows * out_dim);
+        let ng = in_dim / G;
+        let packed = &self.mmap[sec_off..sec_off + out_dim * in_dim / 2];
+        let scales = &self.mmap
+            [sec_off + out_dim * in_dim / 2..sec_off + out_dim * in_dim / 2 + out_dim * ng * 2];
+        let row_bytes = in_dim / 2;
+        // Transposed output [out_dim, rows] so each output row `o` owns a
+        // contiguous `[rows]` slice (no aliasing under rayon); transpose after.
+        let mut yt = vec![0.0f32; out_dim * rows];
+        yt.par_chunks_mut(rows).enumerate().for_each(|(o, ycol)| {
+            let prow = &packed[o * row_bytes..(o + 1) * row_bytes];
+            let srow = &scales[o * ng * 2..(o + 1) * ng * 2];
+            let wrow = dequant_row_f32(prow, srow, in_dim); // unpack ONCE
+            for r in 0..rows {
+                let x = &xs[r * in_dim..(r + 1) * in_dim];
+                // strict column-order dot == dequant_row_dot_scalar's order.
+                let mut acc = 0.0f32;
+                for k in 0..in_dim {
+                    acc += wrow[k] * x[k];
+                }
+                ycol[r] = to_bf16(acc);
+            }
+        });
+        for o in 0..out_dim {
+            for r in 0..rows {
+                ys[r * out_dim + o] = yt[o * rows + r];
+            }
+        }
+    }
+}
+
+/// Dequantize one packed int4 weight row into f32 column order, folding the
+/// per-32-group bf16 scale: `out[k] = (nibble_k - 8) * scale(g(k))`. Matches the
+/// element decode in [`dequant_row_dot_scalar`], so a strict column-order dot of
+/// the result reproduces that kernel's summation exactly.
+fn dequant_row_f32(packed_row: &[u8], scales_row: &[u8], in_dim: usize) -> Vec<f32> {
+    let ng = in_dim / G;
+    let mut out = vec![0.0f32; in_dim];
+    for g in 0..ng {
+        let s = bf16::from_le_bytes([scales_row[g * 2], scales_row[g * 2 + 1]]).to_f32();
+        for i in 0..G / 2 {
+            let byte = packed_row[g * (G / 2) + i];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            out[g * G + 2 * i] = lo as f32 * s;
+            out[g * G + 2 * i + 1] = hi as f32 * s;
+        }
+    }
+    out
 }
 
 /// Fused int4 dequant + dot for one output row: `Σ_k (nibble_k - 8) * scale(g(k)) * x[k]`,
@@ -202,7 +321,7 @@ unsafe fn dequant_row_dot_avx2(
 
 #[cfg(test)]
 mod tests {
-    use super::{dequant_row_dot, G};
+    use super::{dequant_row_dot, MmapExpert, G};
 
     /// The active `dequant_row_dot` (AVX2 on x86, scalar elsewhere) must match a
     /// straightforward dequant-then-dot reference within f32 rounding — a wrong
@@ -241,5 +360,64 @@ mod tests {
         let got = dequant_row_dot(&packed, &scales, &x, in_dim) as f64;
         let rel = (got - refv).abs() / refv.abs().max(1e-6);
         assert!(rel < 1e-4, "fused={got} ref={refv} rel={rel}");
+    }
+
+    /// `forward_batch` over N rows must equal calling `forward` on each row —
+    /// exactly, bit-for-bit, on the scalar path (this machine). Guards the
+    /// batch-union prefill kernel: dequant-once-reuse-across-rows preserves the
+    /// per-token summation order. Builds a deterministic int4_bin on disk and
+    /// mmaps it through the real `MmapExpert::open`.
+    #[test]
+    fn forward_batch_matches_per_token() {
+        use std::io::Write;
+        let (dim, inter) = (64usize, 128usize);
+        // int4_bin layout (exporter contract): w1[inter,dim], w3[inter,dim],
+        // w2[dim,inter], each = packed nibbles then bf16-LE per-32 scales.
+        let mut buf = Vec::new();
+        let mut push_section = |out_dim: usize, in_dim: usize, seed: u64| {
+            let ng = in_dim / G;
+            for k in 0..(out_dim * in_dim / 2) {
+                buf.push(((k as u64 * 131 + seed * 7 + 17) & 0xFF) as u8);
+            }
+            for j in 0..(out_dim * ng) {
+                let s = half::bf16::from_f32(0.03 + 0.001 * ((j as u64 + seed) % 40) as f32)
+                    .to_le_bytes();
+                buf.push(s[0]);
+                buf.push(s[1]);
+            }
+        };
+        push_section(inter, dim, 1); // w1
+        push_section(inter, dim, 2); // w3
+        push_section(dim, inter, 3); // w2
+
+        let path = std::env::temp_dir().join(format!("dsv4_fb_{}.int4bin", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let e = MmapExpert::open(&path, dim, inter).unwrap();
+
+        let rows = 5usize;
+        let mut xs = vec![0f32; rows * dim];
+        for (i, v) in xs.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.017).sin() * 0.7;
+        }
+        let route_ws: Vec<f32> = (0..rows).map(|r| 0.5 + 0.1 * r as f32).collect();
+        let limit = 7.0f32;
+
+        let batch = e.forward_batch(&xs, rows, dim, limit, &route_ws);
+        for r in 0..rows {
+            let single = e.forward(&xs[r * dim..(r + 1) * dim], dim, limit, Some(route_ws[r]));
+            for c in 0..dim {
+                assert_eq!(
+                    batch[r * dim + c].to_bits(),
+                    single[c].to_bits(),
+                    "row {r} col {c}: batch {} != single {}",
+                    batch[r * dim + c],
+                    single[c]
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
