@@ -34,6 +34,24 @@ pub trait StagedRunner: Send + 'static {
     /// rank 0); other backends/ranks ignore it.
     fn forward_layers(&mut self, hidden: Vec<f32>, pos: usize, token: Option<u32>) -> Vec<f32>;
 
+    /// Run `rows` contiguous positions (`base..base+rows`) through this stage's
+    /// layers as a batch — the prefill path. `hidden` is `[rows, hidden_size]`;
+    /// returns `[rows, hidden_size]`. The default loops [`Self::forward_layers`]
+    /// per row (bit-exact, correct for any runner); a backend may override to
+    /// batch its MoE so overlapping experts are loaded once. Advances the same
+    /// KV state as `rows` sequential `forward_layers` calls.
+    fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
+        let hs = self.hidden_size();
+        assert_eq!(hidden.len(), rows * hs, "forward_layers_batch: bad hidden length");
+        let mut out = vec![0.0f32; rows * hs];
+        for r in 0..rows {
+            let h = hidden[r * hs..(r + 1) * hs].to_vec();
+            let o = self.forward_layers(h, base + r, None);
+            out[r * hs..(r + 1) * hs].copy_from_slice(&o);
+        }
+        out
+    }
+
     /// Last-rank only: logits from the final hidden.
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32>;
 
