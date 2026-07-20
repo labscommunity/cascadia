@@ -172,6 +172,11 @@ def build_manifest(cfg: dict) -> dict:
         # layer's top-k selection.
         "indexer_types": (cfg.get("indexer_types")
                           or (["full"] * cfg["num_layers"] if cfg.get("index_n_heads", 0) > 0 else [])),
+        # MTP draft head (layer `num_layers`, DeepSeek-V3 nextn) for speculative
+        # decode. True only when the head's weights were actually emitted to
+        # <dir>/mtp.safetensors (block experts are bf16). export_real does not
+        # emit it yet, so it stays false there.
+        "has_mtp": bool(cfg.get("mtp_emitted", False)),
     }
 
 
@@ -218,6 +223,7 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
                        or (["full"] * num_layers if index_n_heads > 0 else [])),
     )
     H, E, MI, DI = cfg["hidden"], cfg["n_routed"], cfg["moe_inter"], cfg["dense_inter"]
+    cfg["mtp_emitted"] = cfg["n_mtp"] > 0  # tiny always emits the MTP head below
     write_manifest(cfg, out)
     (out / "shells").mkdir(parents=True, exist_ok=True)
 
@@ -266,6 +272,40 @@ def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
             export_expert_bin(npy(rf(MI, H)), npy(rf(MI, H)), npy(rf(H, MI)),
                               edir / "expert_shared.bin")
         save_file({k: v for k, v in shell.items()}, str(out / "shells" / f"layer_{li:02d}.safetensors"))
+
+    # MTP draft head (DeepSeek-V3 nextn). Emitted LAST so the per-layer RNG
+    # stream above is unchanged (pipeline fixtures stay byte-reproducible). The
+    # block is a normal attn+MoE layer with NO indexer (draft window g ≪
+    # index_topk ⇒ full causal anyway); its experts are stored bf16 (the shell's
+    # native dtype), so tiny and the real bf16 head share one loader path.
+    if cfg["n_mtp"] > 0:
+        h, qk, nope, vh = cfg["num_heads"], cfg["qk_head"], cfg["qk_nope"], cfg["v_head"]
+        kvl, ql = cfg["kv_lora"], cfg["q_lora"]
+        mtp = {
+            "mtp.enorm.weight": nf(H),
+            "mtp.hnorm.weight": nf(H),
+            "mtp.norm.weight": nf(H),          # shared_head.norm (== mtp_norm)
+            "mtp.eh_proj.weight": rf(H, 2 * H),
+            "mtp.block.input_layernorm.weight": nf(H),
+            "mtp.block.post_attention_layernorm.weight": nf(H),
+            "mtp.block.self_attn.wq_a.weight": rf(ql, H),
+            "mtp.block.self_attn.q_a_layernorm.weight": nf(ql),
+            "mtp.block.self_attn.wq_b.weight": rf(h * qk, ql),
+            "mtp.block.self_attn.wkv_a.weight": rf(kvl + cfg["qk_rope"], H),
+            "mtp.block.self_attn.kv_a_layernorm.weight": nf(kvl),
+            "mtp.block.self_attn.wkv_b.weight": rf(h * (nope + vh), kvl),
+            "mtp.block.self_attn.o_proj.weight": rf(H, h * vh),
+            "mtp.block.mlp.gate.weight": rf(E, H),
+            "mtp.block.mlp.gate.e_score_correction_bias": (0.3 * torch.randn(E, generator=gen)).to(torch.bfloat16),
+        }
+        for e in range(E):
+            mtp[f"mtp.block.mlp.experts.{e}.gate.weight"] = rf(MI, H)
+            mtp[f"mtp.block.mlp.experts.{e}.up.weight"] = rf(MI, H)
+            mtp[f"mtp.block.mlp.experts.{e}.down.weight"] = rf(H, MI)
+        mtp["mtp.block.mlp.shared.gate.weight"] = rf(MI, H)
+        mtp["mtp.block.mlp.shared.up.weight"] = rf(MI, H)
+        mtp["mtp.block.mlp.shared.down.weight"] = rf(H, MI)
+        save_file(mtp, str(out / "mtp.safetensors"))
 
     print(f"[tiny] wrote {cfg['num_layers']} layers to {out}", flush=True)
 
