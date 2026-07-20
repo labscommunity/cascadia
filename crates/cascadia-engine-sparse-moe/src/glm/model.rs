@@ -84,6 +84,45 @@ impl GlmLayer {
         }
         h
     }
+
+    /// Batched prefill for `rows` tokens (`xs` = `[rows, hidden]`). Attention runs
+    /// per position (the causal KV must grow in order); the MoE runs as one
+    /// batch-union over all rows, so overlapping experts are loaded once. Returns
+    /// `[rows, hidden]`, bit-identical to calling [`Self::forward_token`] per row.
+    pub fn forward_prefill(&mut self, xs: &[f32], rows: usize) -> Vec<f32> {
+        assert_eq!(xs.len(), rows * self.hidden);
+        let hd = self.hidden;
+        // h = x + attn(rmsnorm(x, in_ln)); nrm2 = rmsnorm(h, post_ln).  Sequential.
+        let mut h = vec![0.0f32; rows * hd];
+        let mut nrm2 = vec![0.0f32; rows * hd];
+        for r in 0..rows {
+            let x = &xs[r * hd..(r + 1) * hd];
+            let mut nrm = x.to_vec();
+            rmsnorm(&mut nrm, &self.in_ln, self.eps);
+            let a = self.attn.forward_token(&nrm);
+            let hrow: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
+            let mut n2 = hrow.clone();
+            rmsnorm(&mut n2, &self.post_ln, self.eps);
+            h[r * hd..(r + 1) * hd].copy_from_slice(&hrow);
+            nrm2[r * hd..(r + 1) * hd].copy_from_slice(&n2);
+        }
+        // out = h + mlp(nrm2): MoE batched (dedup expert loads), dense per row.
+        let f = match &self.mlp {
+            LayerMlp::Moe(m) => m.forward_batch(&nrm2, rows),
+            LayerMlp::Dense { w, inter } => {
+                let mut f = vec![0.0f32; rows * hd];
+                for r in 0..rows {
+                    let y = w.forward(&nrm2[r * hd..(r + 1) * hd], hd, *inter);
+                    f[r * hd..(r + 1) * hd].copy_from_slice(&y);
+                }
+                f
+            }
+        };
+        for (hi, &fi) in h.iter_mut().zip(&f) {
+            *hi += fi;
+        }
+        h
+    }
 }
 
 /// Full GLM-5.2 model: embed → layers → final RMSNorm → lm_head. Single-stream
@@ -138,13 +177,37 @@ impl GlmModel {
         logits
     }
 
-    /// Greedy generation: prefill `prompt`, then emit `n_gen` argmax tokens.
+    /// Batched prefill of `prompt`: embed all tokens, run every layer with
+    /// per-position attention + batch-union MoE, and return the logits at the
+    /// LAST position (the next-token distribution). Advances the KV caches, so
+    /// decode continues with [`Self::forward_token`]. Call [`Self::reset`] first
+    /// for a fresh sequence. Bit-identical to looping `forward_token` over the
+    /// prompt and keeping the last logits.
+    pub fn prefill(&mut self, prompt: &[u32]) -> Vec<f32> {
+        let rows = prompt.len();
+        assert!(rows > 0, "prefill needs a non-empty prompt");
+        let hd = self.hidden;
+        let mut xs = vec![0.0f32; rows * hd];
+        for (r, &t) in prompt.iter().enumerate() {
+            let t = t as usize;
+            assert!(t < self.vocab, "token {t} >= vocab {}", self.vocab);
+            xs[r * hd..(r + 1) * hd].copy_from_slice(&self.embed[t * hd..(t + 1) * hd]);
+        }
+        for l in &mut self.layers {
+            xs = l.forward_prefill(&xs, rows);
+        }
+        let last = (rows - 1) * hd;
+        let mut x = xs[last..last + hd].to_vec();
+        rmsnorm(&mut x, &self.final_norm, self.eps);
+        let mut logits = vec![0.0f32; self.vocab];
+        linear_f32(&x, &self.lm_head, self.vocab, self.hidden, &mut logits);
+        logits
+    }
+
+    /// Greedy generation: batched prefill of `prompt`, then `n_gen` argmax tokens.
     pub fn generate(&mut self, prompt: &[u32], n_gen: usize) -> Vec<u32> {
         self.reset();
-        let mut logits = Vec::new();
-        for &tok in prompt {
-            logits = self.forward_token(tok);
-        }
+        let mut logits = self.prefill(prompt);
         let mut gen = Vec::with_capacity(n_gen);
         for _ in 0..n_gen {
             let nxt = argmax(&logits) as u32;

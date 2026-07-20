@@ -30,19 +30,13 @@ fn bits(f: &[f32]) -> Vec<u16> {
     f.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()
 }
 
-#[test]
-fn model_greedy_matches_reference() {
-    let fx = fixtures!();
-    // dims match tools/glm5_ref/gen_fixtures.py::mcfg (model section)
+/// Build the fixture model (dims match tools/glm5_ref/gen_fixtures.py::mcfg).
+fn build_model(fx: &StFile, max_seq: usize) -> GlmModel {
     let (vocab, hidden) = (16usize, 32usize);
     let (h, nope, rope, vh, kvl, ql) = (3usize, 6, 4, 6, 8, 16);
     let (n_layers, first_dense, dense_inter) = (3usize, 1usize, 12usize);
     let (n_experts, top_k, moe_inter, scale) = (4usize, 2usize, 10usize, 2.5f32);
     let (eps, theta) = (1e-5f32, 8.0e6f32);
-    let prompt: Vec<u32> = vec![1, 2, 3, 4];
-    let n_gen = 4usize;
-    let max_seq = prompt.len() + n_gen;
-    let want: Vec<u32> = vec![0, 12, 3, 2]; // meta.model.greedy
 
     let load_expert = |p: &str| ExpertW {
         wg: bits(&fx.f32(&format!("{p}.wg")).unwrap().1),
@@ -89,7 +83,7 @@ fn model_greedy_matches_reference() {
         ));
     }
 
-    let mut model = GlmModel::new(
+    GlmModel::new(
         hidden,
         vocab,
         eps,
@@ -97,8 +91,37 @@ fn model_greedy_matches_reference() {
         layers,
         fx.f32("model.final_norm").unwrap().1,
         fx.f32("model.lm_head").unwrap().1,
-    );
+    )
+}
 
+#[test]
+fn model_greedy_matches_reference() {
+    let fx = fixtures!();
+    let prompt: Vec<u32> = vec![1, 2, 3, 4];
+    let n_gen = 4usize;
+    let want: Vec<u32> = vec![0, 12, 3, 2]; // meta.model.greedy
+    let mut model = build_model(&fx, prompt.len() + n_gen);
     let got = model.generate(&prompt, n_gen);
     assert_eq!(got, want, "greedy token mismatch");
+}
+
+/// Batched prefill must be BIT-IDENTICAL to looping forward_token over the
+/// prompt: attention is causal (unchanged per position) and the batch-union
+/// MoE is bit-exact, so the last-position logits must match exactly.
+#[test]
+fn model_prefill_bit_exact_vs_per_token() {
+    let fx = fixtures!();
+    let prompt: Vec<u32> = vec![1, 2, 3, 4];
+    let mut model = build_model(&fx, prompt.len() + 4);
+
+    model.reset();
+    let mut per_token = Vec::new();
+    for &t in &prompt {
+        per_token = model.forward_token(t);
+    }
+
+    model.reset();
+    let prefilled = model.prefill(&prompt);
+
+    assert_eq!(prefilled, per_token, "prefill last-position logits diverge from per-token");
 }
