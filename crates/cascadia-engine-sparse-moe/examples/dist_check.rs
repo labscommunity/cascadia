@@ -108,6 +108,9 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::ForwardBatch => {
                 println!("[server] FORWARD_BATCH not handled in dist_check — ignoring");
             }
+            FrameKind::ForwardBatchPrefill => {
+                println!("[server] FORWARD_BATCH_PREFILL not handled in dist_check — ignoring");
+            }
             FrameKind::TokenBatch => {
                 println!("[server] unexpected TOKEN_BATCH from upstream — ignoring");
             }

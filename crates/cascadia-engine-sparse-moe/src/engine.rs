@@ -30,8 +30,9 @@ use tracing::{info, warn};
 use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
     recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
-    send_forward_batch, send_forward_nosample, send_forward_prefill, send_reset,
-    send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    send_forward_batch, send_forward_batch_prefill, send_forward_nosample, send_forward_prefill,
+    send_reset, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    MAX_BATCH_COUNT,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -1949,6 +1950,10 @@ impl SparseMoEEngine {
                 }
             }
             FrameKind::ForwardBatch => self.handle_forward_batch_frame(upstream, downstream),
+            FrameKind::ForwardBatchPrefill => Err(format!(
+                "rank {} received ForwardBatchPrefill, unsupported by this engine",
+                self.rank
+            )),
             FrameKind::Token => Err(format!(
                 "rank {} received unexpected TOKEN from upstream",
                 self.rank
@@ -2710,16 +2715,59 @@ impl Dsv4Engine {
         // token is the one that asks the last rank to sample (its sampled result
         // is the first generated token).
         let n_prefill = n_prompt.min(max_seq);
-        for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
-            let sample_back = i + 1 == n_prefill;
-            match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
+        // Batched prefill: push the whole prompt as ONE ForwardBatchPrefill so
+        // each expert's int4 weights decode once for all its overlapping
+        // positions instead of once per token; the last rank samples only the
+        // final row (the first generated token). Used only when the prompt fits
+        // one frame (2..=MAX_BATCH_COUNT positions); otherwise fall back to the
+        // streamed per-token prefill (chunked batched prefill needs a KV-offset
+        // prefill path — follow-up).
+        let use_batched = (2..=MAX_BATCH_COUNT as usize).contains(&n_prefill);
+        if use_batched {
+            let h_batch = self.runner.prefill_batch_first(&prompt_ids[..n_prefill]);
+            let hidden_w = self.runner.hidden_size() as u32;
+            let res = self.block_on(async {
+                send_forward_batch_prefill(
+                    &downstream,
+                    0,
+                    n_prefill as u32,
+                    &cfg,
+                    &h_batch,
+                    [1, n_prefill as u32, hidden_w],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                match recv_kind_client(&downstream).await {
+                    Ok(Some(FrameKind::Token)) => recv_token_body_client(&downstream)
+                        .await
+                        .map_err(|e| format!("recv_token: {e}")),
+                    Ok(Some(other)) => Err(format!(
+                        "rank 0 expected Token after batch prefill, got {other:?}"
+                    )),
+                    Ok(None) => Err("downstream closed before Token".into()),
+                    Err(e) => Err(format!("recv_kind: {e}")),
+                }
+            });
+            match res {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
-                    warn!(task = %id, "prefill forward failed: {e}");
+                    warn!(task = %id, "batched prefill failed: {e}");
                     return vec![(id.clone(), Chunk::error(id, e))];
                 }
             }
-            pos += 1;
+            pos = n_prefill;
+        } else {
+            for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
+                let sample_back = i + 1 == n_prefill;
+                match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
+                    Ok(tok_back) => next = tok_back,
+                    Err(e) => {
+                        warn!(task = %id, "prefill forward failed: {e}");
+                        return vec![(id.clone(), Chunk::error(id, e))];
+                    }
+                }
+                pos += 1;
+            }
         }
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new);
@@ -2802,6 +2850,9 @@ impl Dsv4Engine {
             FrameKind::Forward => self.handle_forward(&upstream, downstream.as_ref(), true),
             FrameKind::ForwardNoSample => {
                 self.handle_forward(&upstream, downstream.as_ref(), false)
+            }
+            FrameKind::ForwardBatchPrefill => {
+                self.handle_forward_batch_prefill(&upstream, downstream.as_ref())
             }
             other => Err(format!(
                 "worker received unsupported frame {other:?} (dsv4 has no spec-decode batching)"
@@ -2897,6 +2948,92 @@ impl Dsv4Engine {
                         Ok(())
                     }
                     Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
+                    Ok(None) => Err("downstream closed before Token".into()),
+                    Err(e) => Err(format!("recv_kind: {e}")),
+                }
+            })
+        }
+    }
+
+    /// Worker batched-prefill handler (`ForwardBatchPrefill`): run this stage's
+    /// layers over ALL `rows` received positions at once (attention per
+    /// position, MoE batch-union so overlapping experts decode once), then on
+    /// the last rank head+sample ONLY the final row (the first generated token,
+    /// recording just it) and reply a single `Token`; on a mid rank relay the
+    /// output batch downstream and forward the returned `Token` upstream. A
+    /// malformed / over-range frame is connection-fatal (see `handle_forward`).
+    fn handle_forward_batch_prefill(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (past_seq_len_start, batch_count, sampling_cfg, hidden_f32, _shape) = self
+            .block_on(recv_forward_batch_body_server(upstream))
+            .map_err(|e| format!("recv_forward_batch_body: {e}"))?;
+        let rows = batch_count as usize;
+        let w = self.runner.hidden_size();
+        if hidden_f32.len() != rows * w {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "batch prefill hidden len {} != rows*width {}",
+                hidden_f32.len(),
+                rows * w
+            ));
+        }
+        // Batched prefill is a fresh sequence (positions past_seq_len_start..
+        // +rows); the last row's absolute position must fit the caches.
+        let last_pos = past_seq_len_start as usize + rows.saturating_sub(1);
+        if last_pos >= self.runner.max_seq() {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "batch prefill last position {last_pos} exceeds context budget {}",
+                self.runner.max_seq()
+            ));
+        }
+        let out = self.runner.forward_layers_prefill_batch(hidden_f32, rows);
+        if self.is_last() {
+            // Sample ONLY the final row -> the first generated token.
+            let last = &out[(rows - 1) * w..rows * w];
+            let logits = self.runner.head_logits(last);
+            if !self.last_rank_rng_seeded {
+                self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+                self.last_rank_rng_seeded = true;
+            }
+            let token = crate::sampling::sample(
+                &logits,
+                &self.last_rank_history,
+                &sampling_cfg,
+                &mut self.last_rank_rng,
+            );
+            self.last_rank_history.push(token);
+            self.block_on(send_token_upstream(upstream, token))
+                .map_err(|e| format!("send_token: {e}"))
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            let hw = w as u32;
+            self.block_on(async {
+                send_forward_batch_prefill(
+                    down,
+                    past_seq_len_start,
+                    batch_count,
+                    &sampling_cfg,
+                    &out,
+                    [1, batch_count, hw],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::Token)) => {
+                        let t = recv_token_body_client(down)
+                            .await
+                            .map_err(|e| format!("recv_token: {e}"))?;
+                        send_token_upstream(upstream, t)
+                            .await
+                            .map_err(|e| format!("relay token: {e}"))
+                    }
+                    Ok(Some(other)) => Err(format!(
+                        "mid rank expected Token after batch prefill, got {other:?}"
+                    )),
                     Ok(None) => Err("downstream closed before Token".into()),
                     Err(e) => Err(format!("recv_kind: {e}")),
                 }

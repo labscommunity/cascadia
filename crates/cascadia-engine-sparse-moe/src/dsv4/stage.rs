@@ -126,6 +126,32 @@ impl Dsv4Runner {
         self.model.logits(hidden)
     }
 
+    /// Rank-0 batched prefill: embed the whole prompt, run this stage's layers
+    /// over ALL positions at once (attention per position, MoE batch-union so
+    /// overlapping experts decode once), and return the flattened
+    /// `[rows * hidden]` output batch to ship downstream. Positions are
+    /// `0..prompt.len()` — call [`Self::reset`] first. Bit-identical to feeding
+    /// the prompt token-by-token through [`Self::forward_layers`].
+    pub fn prefill_batch_first(&mut self, prompt: &[u32]) -> Vec<f32> {
+        let ids: Vec<usize> = prompt.iter().map(|&t| t as usize).collect();
+        let copies = self.model.embed_ids(&ids);
+        let out = self.model.forward_layers_prefill(copies, Some(&ids));
+        out.into_iter().flatten().collect()
+    }
+
+    /// Worker batched prefill: run this stage's layers over `rows` received
+    /// hidden states (flattened `[rows * hidden]`, one `hidden`-wide HC-copy row
+    /// per prompt position), batched. Workers hold no hash-gate layers, so no
+    /// token ids. Returns the flattened `[rows * hidden]` output batch.
+    pub fn forward_layers_prefill_batch(&mut self, hiddens: Vec<f32>, rows: usize) -> Vec<f32> {
+        debug_assert_eq!(hiddens.len(), rows * self.hidden);
+        let copies: Vec<Vec<f32>> = (0..rows)
+            .map(|r| hiddens[r * self.hidden..(r + 1) * self.hidden].to_vec())
+            .collect();
+        let out = self.model.forward_layers_prefill(copies, None);
+        out.into_iter().flatten().collect()
+    }
+
     /// Single-stage generation with sampling (greedy when the config says
     /// so). Prompt tokens drive the same per-token path as decode.
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, cfg: &SamplingConfig) -> Vec<u32> {
