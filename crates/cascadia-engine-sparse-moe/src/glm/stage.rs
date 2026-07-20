@@ -227,6 +227,21 @@ impl StagedRunner for GlmRunner {
         self.pos += 1;
         x
     }
+    fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
+        assert_eq!(
+            base, self.pos,
+            "glm5 stage batch position desync (expected {}, got {base})",
+            self.pos
+        );
+        assert_eq!(hidden.len(), rows * self.hidden, "glm5 batch: bad hidden length");
+        // Each layer runs per-position attention (KV in order) + batch-union MoE.
+        let mut x = hidden;
+        for l in &mut self.layers {
+            x = l.forward_prefill(&x, rows);
+        }
+        self.pos += rows;
+        x
+    }
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32> {
         let (final_norm, lm_head) = self.head.as_ref().expect("head_logits on a non-last rank");
         let mut x = hidden.to_vec();
