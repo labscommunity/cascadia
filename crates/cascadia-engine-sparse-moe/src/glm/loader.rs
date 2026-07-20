@@ -388,8 +388,16 @@ pub fn load_stage(
 
 /// Load a full single-stage model. `max_seq` sizes the attention KV caches.
 pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
+    load_model_with(dir, max_seq, ExpertsMode::Eager)
+}
+
+/// Load a full single-stage model with an explicit experts `mode`. `Eager`
+/// dequantizes all int4 experts to f32 in RAM (tiny/dev); `Mmap` streams them
+/// from disk (the only mode that fits the real 410 GB model). The MTP draft
+/// head, when present, is always bf16 in RAM (mode-independent).
+pub fn load_model_with(dir: &Path, max_seq: usize, mode: ExpertsMode) -> Result<GlmModel, LoadError> {
     let m = read_manifest(dir)?;
-    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, ExpertsMode::Eager)?;
+    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode)?;
     let (final_norm, lm_head) = s.head.expect("full model has a head");
     let mut model = GlmModel::new(
         s.hidden,
