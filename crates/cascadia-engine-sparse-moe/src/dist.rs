@@ -113,6 +113,14 @@ pub enum FrameKind {
     /// round-trip each. The final prompt token still goes as a sampling
     /// `Forward`, whose returned token is the first generated token.
     ForwardPrefill = 0x53_4D_45_07, // "SME\x07"
+    /// Batched prefill Forward (0x08): identical body to `ForwardBatch`, but the
+    /// last rank runs its layers over ALL rows (batch-union) and samples ONLY
+    /// the final row — the first generated token — pushing just that one into
+    /// its penalty history (the earlier prompt rows must NOT be recorded, same
+    /// reason as `ForwardNoSample`). Replies with a single `Token`, not a
+    /// `TokenBatch`. Lets rank 0 push the whole prompt in one frame while the
+    /// MoE dedups overlapping experts across the prompt's positions.
+    ForwardBatchPrefill = 0x53_4D_45_08, // "SME\x08"
 }
 
 impl FrameKind {
@@ -125,6 +133,7 @@ impl FrameKind {
             x if x == FrameKind::TokenBatch as u32 => Some(FrameKind::TokenBatch),
             x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
             x if x == FrameKind::ForwardPrefill as u32 => Some(FrameKind::ForwardPrefill),
+            x if x == FrameKind::ForwardBatchPrefill as u32 => Some(FrameKind::ForwardBatchPrefill),
             _ => None,
         }
     }
@@ -481,6 +490,49 @@ pub async fn send_forward_batch(
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
 ) -> TransportResult<()> {
+    send_forward_batch_kind(
+        FrameKind::ForwardBatch,
+        cli,
+        past_seq_len_start,
+        batch_count,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Like [`send_forward_batch`], but tags the frame [`FrameKind::ForwardBatchPrefill`]
+/// so the last rank samples only the final row (prompt prefill, not spec-verify).
+pub async fn send_forward_batch_prefill(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len_start: u32,
+    batch_count: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_batch_kind(
+        FrameKind::ForwardBatchPrefill,
+        cli,
+        past_seq_len_start,
+        batch_count,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+async fn send_forward_batch_kind(
+    kind: FrameKind,
+    cli: &Mutex<ActivationClient>,
+    past_seq_len_start: u32,
+    batch_count: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
     if batch_count == 0 || batch_count > MAX_BATCH_COUNT {
         return Err(TransportError::Io(std::io::Error::other(format!(
             "send_forward_batch: batch_count {batch_count} out of range 1..={MAX_BATCH_COUNT}"
@@ -501,7 +553,7 @@ pub async fn send_forward_batch(
         ))));
     }
     let mut header = [0u8; 12 + SAMPLING_WIRE_BYTES];
-    header[0..4].copy_from_slice(&(FrameKind::ForwardBatch as u32).to_be_bytes());
+    header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len_start.to_be_bytes());
     header[8..12].copy_from_slice(&batch_count.to_be_bytes());
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
