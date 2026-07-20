@@ -21,6 +21,7 @@
 pub mod attn;
 pub mod ffn;
 pub mod gate;
+pub mod grammar;
 pub mod indexer;
 pub mod loader;
 pub mod model;

@@ -204,6 +204,47 @@ impl GlmModel {
         logits
     }
 
+    /// Grammar-constrained greedy generation with forced-run batching. Forced
+    /// tokens (grammar admits exactly one) are emitted and their KV advanced as
+    /// one batch-union forward; free positions run one forward and argmax over
+    /// the grammar-allowed set. Returns the emitted tokens and the number of
+    /// model forwards used (fewer than the token count exactly when the grammar
+    /// forced runs — the throughput win). Stops at `max_new`, or when the grammar
+    /// accepts with nothing forced.
+    pub fn generate_grammar(
+        &mut self,
+        prompt: &[u32],
+        grammar: &dyn super::grammar::Grammar,
+        max_new: usize,
+    ) -> super::grammar::GrammarOutput {
+        self.reset();
+        let mut logits = self.prefill(prompt);
+        let mut forwards = 1usize;
+        let mut out: Vec<u32> = Vec::new();
+        while out.len() < max_new {
+            let forced = grammar.forced_run(&out);
+            if !forced.is_empty() {
+                let take = forced.len().min(max_new - out.len());
+                let run = &forced[..take];
+                out.extend_from_slice(run);
+                // Advance the KV for the whole forced run in one batched forward.
+                logits = self.prefill(run);
+                forwards += 1;
+            } else if grammar.can_end(&out) {
+                break;
+            } else {
+                let tok = super::grammar::masked_argmax(&logits, grammar, &out);
+                out.push(tok);
+                if grammar.can_end(&out) || out.len() >= max_new {
+                    break;
+                }
+                logits = self.forward_token(tok);
+                forwards += 1;
+            }
+        }
+        super::grammar::GrammarOutput { tokens: out, forwards }
+    }
+
     /// Greedy generation: batched prefill of `prompt`, then `n_gen` argmax tokens.
     pub fn generate(&mut self, prompt: &[u32], n_gen: usize) -> Vec<u32> {
         self.reset();
