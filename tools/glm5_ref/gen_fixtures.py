@@ -394,6 +394,15 @@ def main():
                                 indexer_types=["full", "shared", "full", "shared"])
         print(f"[indexshare fixture] export {d} (index_topk={tk})")
 
+    # 8-layer mixed topology for the DISTRIBUTED IndexShare test: full at 0,1,2,6
+    # (mirrors GLM's "3 dense then every 4th"). A naive even N=2 split boundary
+    # (layer 4) is a "shared" layer; index_aligned_split must snap it to a full
+    # layer so the multi-rank pipeline still matches single-process at ctx>topk.
+    isml = out.parent / "glm5_export_indexshare_ml"
+    export_glm5.export_tiny(isml, num_layers=8, index_n_heads=2, index_head_dim=8, index_topk=2,
+                            indexer_types=["full", "full", "full", "shared", "shared", "shared", "full", "shared"])
+    print(f"[indexshare fixture] export {isml} (8 layers, mixed)")
+
     # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
     from glm5_ref.fp8_roundtrip import roundtrip
     fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)
