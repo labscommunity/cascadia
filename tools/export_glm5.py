@@ -165,7 +165,7 @@ def write_manifest(cfg: dict, out: Path):
 # --------------------------------------------------------------------------
 # --tiny: deterministic tiny model in the engine layout (smoke / M3 loader dev)
 # --------------------------------------------------------------------------
-def export_tiny(out: Path):
+def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1):
     import torch
     from safetensors.torch import save_file
 
@@ -177,10 +177,14 @@ def export_tiny(out: Path):
     def nf(n):
         return (1.0 + 0.05 * torch.randn(n, generator=gen)).to(torch.bfloat16)
 
+    # num_layers/first_dense are parametric so multi-rank pipeline fixtures (≥4
+    # layers, for a middle-relay split) can be generated; the RNG stream is
+    # sequential per layer, so the default (3, 1) reproduces the base fixture and
+    # an N-layer export's first 3 layers match it byte-for-byte.
     cfg = dict(
-        hidden=32, vocab=16, num_layers=3, num_heads=3, q_lora=16, kv_lora=8,
+        hidden=32, vocab=16, num_layers=num_layers, num_heads=3, q_lora=16, kv_lora=8,
         qk_nope=6, qk_rope=4, qk_head=10, v_head=6, n_routed=4, n_shared=1,
-        top_k=2, moe_inter=32, dense_inter=64, first_dense=1, routed_scale=2.5,
+        top_k=2, moe_inter=32, dense_inter=64, first_dense=first_dense, routed_scale=2.5,
         rope_theta=8.0e6, eps=1e-5, n_mtp=1, eos=[0],
     )
     H, E, MI, DI = cfg["hidden"], cfg["n_routed"], cfg["moe_inter"], cfg["dense_inter"]
