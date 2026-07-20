@@ -24,6 +24,41 @@ use crate::staged::StagedRunner;
 /// to 1M; the KV caches scale with this).
 pub const GLM5_DEFAULT_MAX_SEQ: usize = 4096;
 
+/// Split `n` layers across `total` ranks so each rank's first layer is a `"full"`
+/// IndexShare layer (owns an indexer / computes its own top-k). Boundaries are
+/// the `"full"` positions nearest the even split, kept strictly increasing so
+/// every rank is non-empty. Falls back to [`even_layer_split`] when there are
+/// fewer full layers than ranks. Deterministic (same result on every rank).
+fn index_aligned_split(n: usize, itypes: &[String], rank: u32, total: u32) -> (usize, usize) {
+    let total = (total.max(1)) as usize;
+    let is_full = |i: usize| itypes.get(i).map(|t| t == "full").unwrap_or(true);
+    let fulls: Vec<usize> = (0..n).filter(|&i| is_full(i)).collect();
+    if total <= 1 || fulls.len() < total {
+        return even_layer_split(n, rank.min(total as u32 - 1), total as u32);
+    }
+    let mut starts = Vec::with_capacity(total);
+    starts.push(fulls[0]); // 0 for GLM (layer 0 is "full")
+    let mut used = 0usize; // index into `fulls` of the last chosen start
+    for k in 1..total {
+        let target = k * n / total;
+        let max_j = fulls.len() - (total - k); // leave room for remaining starts
+        let (mut best, mut bestd) = (used + 1, usize::MAX);
+        for j in (used + 1)..=max_j {
+            let d = fulls[j].abs_diff(target);
+            if d < bestd {
+                bestd = d;
+                best = j;
+            }
+        }
+        starts.push(fulls[best]);
+        used = best;
+    }
+    let r = rank.min(total as u32 - 1) as usize;
+    let lo = starts[r];
+    let hi = if r + 1 < total { starts[r + 1] } else { n };
+    (lo, hi)
+}
+
 pub struct GlmRunner {
     embed: Option<Vec<f32>>,             // [vocab, hidden] on rank 0
     layers: Vec<GlmLayer>,               // this rank's slice
@@ -59,6 +94,11 @@ impl GlmRunner {
         let rank = rank.min(total - 1);
         let (lo, hi) = if layer_end > 0 {
             (layer_start as usize, layer_end as usize)
+        } else if !m.indexer_types.is_empty() {
+            // IndexShare: snap rank boundaries to "full" layers so every rank
+            // starts on a layer that computes its own top-k — then a "shared"
+            // layer never needs the carry from a full layer on another rank.
+            index_aligned_split(n, &m.indexer_types, rank, total)
         } else {
             even_layer_split(n, rank, total)
         };
