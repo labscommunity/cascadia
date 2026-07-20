@@ -156,6 +156,27 @@ impl AttentionLayer {
         }
     }
 
+    /// Number of cached positions.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Roll the KV (and indexer key) cache back to `len` positions — the
+    /// speculative-decode reject path. O(1): the latent/k_pe slots at
+    /// `[len, old_len)` stay allocated and are overwritten when decode resumes.
+    /// `len` must not exceed the current length.
+    pub fn truncate(&mut self, len: usize) {
+        debug_assert!(len <= self.len, "attn truncate {len} > len {}", self.len);
+        self.len = len;
+        if let Some(ix) = self.indexer.as_mut() {
+            ix.truncate(len);
+        }
+    }
+
     /// Attend one token `x` (`[hidden]`) at absolute position `self.len`,
     /// appending its latent/k_pe to the cache. Returns `out` (`[hidden]`).
     /// Positions must be fed in order starting from 0.
