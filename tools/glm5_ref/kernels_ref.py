@@ -338,6 +338,49 @@ def attention_ref_absorbed(x: torch.Tensor, w: Dict[str, torch.Tensor], cfg: dic
     return _lin(ctx.reshape(S, H * vh), w["wo"])
 
 
+def attention_ref_dsa(x, aw, iw, acfg, icfg, index_topk):
+    """MLA attention with DSA sparsity: each query attends only to the lightning
+    indexer's top-`index_topk` causal keys (one selection shared by all heads).
+    This is the naive (materialized) form of `attention_ref` with the key loop
+    restricted to `indexer_ref`'s selection — the independent ground truth for
+    the Rust absorbed DSA path. When `s+1 <= index_topk` selection is every key,
+    so it reduces exactly to dense attention. Both latent RMSNorms use eps 1e-6
+    (the shell's `MLA_LATENT_EPS`), so it matches the Rust shell operand-for-operand.
+    """
+    H, nope, rope = acfg["n_heads"], acfg["qk_nope"], acfg["qk_rope"]
+    vh, kvl, theta = acfg["v_head"], acfg["kv_lora"], acfg["theta"]
+    qk = nope + rope
+    S = x.shape[0]
+    scale = 1.0 / math.sqrt(qk)
+    fc = precompute_freqs_cis(rope, S, theta)
+
+    qr = _rms(_lin(x, aw["wq_a"]), aw["q_a_ln"], 1e-6)              # [S, q_lora]
+    q = _lin(qr, aw["wq_b"]).reshape(S, H, qk)
+    comp = _lin(x, aw["wkv_a"])
+    lat = _rms(comp[:, :kvl], aw["kv_a_ln"], 1e-6)                  # Lc [S, kvl]
+    qpe = apply_rotary_emb(q[:, :, nope:qk], fc.unsqueeze(1))       # [S,H,rope]
+    qnope = q[:, :, :nope]
+    kpe = apply_rotary_emb(comp[:, kvl:], fc)                       # [S, rope]
+    kvb = (lat @ aw["wkv_b"].to(torch.float32).t()).reshape(S, H, nope + vh)
+    knope = kvb[:, :, :nope]
+    value = kvb[:, :, nope:]
+
+    ctx = torch.zeros(S, H, vh, dtype=torch.float32)
+    for s in range(S):
+        # the indexer sees the same hidden `x` and q_a residual `qr` as attention.
+        _, isel = indexer_ref(x[: s + 1], qr[s], iw, icfg, s, index_topk)
+        sel = [int(t) for t in isel]
+        for h in range(H):
+            sc = torch.empty(len(sel), dtype=torch.float32)
+            for j, t in enumerate(sel):
+                sn = torch.dot(qnope[s, h], knope[t, h])
+                sp = torch.dot(qpe[s, h], kpe[t])
+                sc[j] = (sn + sp) * scale
+            p = torch.softmax(sc, dim=0)
+            ctx[s, h] = (p.unsqueeze(-1) * value[sel, h]).sum(0)
+    return _lin(ctx.reshape(S, H * vh), aw["wo"])
+
+
 def _rope_first(v: torch.Tensor, fc_pos: torch.Tensor, rd: int) -> torch.Tensor:
     """Rope only the FIRST `rd` dims of `v`'s last axis (the indexer ropes the
     qk_rope prefix of each head's index_head_dim), leaving the rest untouched.
