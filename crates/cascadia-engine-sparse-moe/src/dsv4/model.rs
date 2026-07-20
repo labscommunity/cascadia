@@ -74,6 +74,24 @@ impl Expert {
         linear_bf16(&h, &self.w2, dim, inter, &mut out);
         out
     }
+
+    /// Batched mirror of [`Self::forward`]. Eager experts are dev/test-only, so
+    /// this loops `forward` per row (bit-identical); `route_ws[r]` scales row r.
+    fn forward_batch(
+        &self,
+        xs: &[f32],
+        rows: usize,
+        dim: usize,
+        limit: f32,
+        route_ws: &[f32],
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; rows * dim];
+        for r in 0..rows {
+            let y = self.forward(&xs[r * dim..(r + 1) * dim], dim, limit, Some(route_ws[r]));
+            out[r * dim..(r + 1) * dim].copy_from_slice(&y);
+        }
+        out
+    }
 }
 
 /// Expert storage: eagerly-dequantized f32 (tiny fixtures / dev) or mmap'd
@@ -89,6 +107,23 @@ impl AnyExpert {
         match self {
             AnyExpert::Eager(e) => e.forward(x, dim, limit, route_w),
             AnyExpert::Mmap(e) => e.forward(x, dim, limit, route_w),
+        }
+    }
+
+    /// Batched FFN for `rows` activation rows routed to this expert; each int4
+    /// weight row is decoded once and reused across the rows. `route_ws[r]`
+    /// scales row r. See [`super::expert_mmap::MmapExpert::forward_batch`].
+    pub fn forward_batch(
+        &self,
+        xs: &[f32],
+        rows: usize,
+        dim: usize,
+        limit: f32,
+        route_ws: &[f32],
+    ) -> Vec<f32> {
+        match self {
+            AnyExpert::Eager(e) => e.forward_batch(xs, rows, dim, limit, route_ws),
+            AnyExpert::Mmap(e) => e.forward_batch(xs, rows, dim, limit, route_ws),
         }
     }
 }
@@ -282,6 +317,127 @@ impl DsV4Model {
         y
     }
 
+    /// Batched MoE over `s` tokens (`xins = [s, dim]`, ffn-normed inputs), giving
+    /// the same result as [`Self::moe`] on each token — bit-for-bit — but each
+    /// expert's int4 weights are decoded ONCE for all its routed tokens instead
+    /// of once per token (the prefill throughput win). Two phases keep the
+    /// per-token f32 accumulation order (and the hash-gate duplicate
+    /// last-write-wins quirk) identical to `moe`: phase 1 computes every
+    /// surviving (token, expert) FFN batched per expert; phase 2 sums them per
+    /// token in top-k order, then the shared expert. Falls back to the per-token
+    /// path when the OpenVINO expert backend is active (no batch entry point).
+    fn moe_batch(&self, li: usize, xins: &[f32], s: usize, ids: Option<&[usize]>) -> Vec<f32> {
+        let layer = &self.layers[li];
+        let dim = self.cfg.dim;
+        debug_assert_eq!(xins.len(), s * dim);
+        if self.ov_experts.is_some() {
+            let mut out = vec![0.0f32; s * dim];
+            for t in 0..s {
+                let y = self.moe(li, &xins[t * dim..(t + 1) * dim], ids.map(|v| v[t]));
+                out[t * dim..(t + 1) * dim].copy_from_slice(&y);
+            }
+            return out;
+        }
+        let n = layer.gate.weight.len() / dim;
+        // --- per-token routing (identical to `moe`) ---
+        let mut tok_idx: Vec<Vec<usize>> = Vec::with_capacity(s);
+        let mut tok_ws: Vec<Vec<f32>> = Vec::with_capacity(s);
+        for t in 0..s {
+            let x = &xins[t * dim..(t + 1) * dim];
+            let mut scores = vec![0.0f32; n];
+            linear_f32(x, &layer.gate.weight, n, dim, &mut scores);
+            for sc in scores.iter_mut() {
+                *sc = softplus(*sc).sqrt(); // sqrtsoftplus
+            }
+            let indices: Vec<usize> = if let Some(t2e) = &layer.gate.tid2eid {
+                let tid = ids.expect("hash-gate layer needs the token ids")[t];
+                (0..self.cfg.topk)
+                    .map(|k| t2e[tid * self.cfg.topk + k] as usize)
+                    .collect()
+            } else {
+                let bias = layer
+                    .gate
+                    .bias
+                    .as_ref()
+                    .expect("non-hash layer needs gate bias");
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| {
+                    (scores[b] + bias[b])
+                        .partial_cmp(&(scores[a] + bias[a]))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                order[..self.cfg.topk].to_vec()
+            };
+            let mut ws: Vec<f32> = indices.iter().map(|&i| scores[i]).collect();
+            let sum: f32 = ws.iter().sum();
+            for w in ws.iter_mut() {
+                *w = *w / sum * self.cfg.route_scale;
+            }
+            tok_idx.push(indices);
+            tok_ws.push(ws);
+        }
+        // --- phase 1: batched expert compute for surviving (token, expert) ---
+        let _te = std::time::Instant::now();
+        let mut per_expert: std::collections::HashMap<usize, Vec<(usize, f32)>> =
+            std::collections::HashMap::new();
+        for t in 0..s {
+            let idx = &tok_idx[t];
+            for k in 0..idx.len() {
+                let ei = idx[k];
+                if idx[k + 1..].contains(&ei) {
+                    continue; // a later duplicate overwrites this contribution
+                }
+                per_expert.entry(ei).or_default().push((t, tok_ws[t][k]));
+            }
+        }
+        let mut expert_out: std::collections::HashMap<(usize, usize), Vec<f32>> =
+            std::collections::HashMap::new();
+        for (&ei, toks) in per_expert.iter() {
+            let rows = toks.len();
+            let mut xb = vec![0.0f32; rows * dim];
+            let mut ws = vec![0.0f32; rows];
+            for (r, &(t, w)) in toks.iter().enumerate() {
+                xb[r * dim..(r + 1) * dim].copy_from_slice(&xins[t * dim..(t + 1) * dim]);
+                ws[r] = w;
+            }
+            let yb = layer.experts[ei].forward_batch(&xb, rows, dim, self.cfg.swiglu_limit, &ws);
+            for (r, &(t, _)) in toks.iter().enumerate() {
+                expert_out.insert((ei, t), yb[r * dim..(r + 1) * dim].to_vec());
+            }
+        }
+        // shared expert over ALL tokens (route_w None ≡ scale 1.0, an exact no-op).
+        let ones = vec![1.0f32; s];
+        let shared = layer
+            .shared
+            .forward_batch(xins, s, dim, self.cfg.swiglu_limit, &ones);
+        super::math::prof::add(super::math::prof::EXPERTS, _te);
+        // --- phase 2: per-token accumulate in `moe`'s exact order ---
+        let mut out = vec![0.0f32; s * dim];
+        for t in 0..s {
+            let mut y = vec![0.0f32; dim];
+            let idx = &tok_idx[t];
+            for k in 0..idx.len() {
+                let ei = idx[k];
+                if idx[k + 1..].contains(&ei) {
+                    continue;
+                }
+                let e = &expert_out[&(ei, t)];
+                for d in 0..dim {
+                    y[d] += e[d];
+                }
+            }
+            let sh = &shared[t * dim..(t + 1) * dim];
+            for d in 0..dim {
+                y[d] += sh[d];
+            }
+            for v in y.iter_mut() {
+                *v = to_bf16(*v);
+            }
+            out[t * dim..(t + 1) * dim].copy_from_slice(&y);
+        }
+        out
+    }
+
     fn block_ffn_stage(
         &self,
         li: usize,
@@ -355,16 +511,32 @@ impl DsV4Model {
                     &combs[t],
                 );
             }
-            let mut moe_in_last = Vec::new();
+            // FFN block with the MoE batched across the whole sequence: each
+            // expert's int4 weights are decoded once for all its routed tokens,
+            // not once per prompt token. hc_pre / rmsnorm / hc_post stay per
+            // token (the Sinkhorn mix is per token, like attention).
+            let mut xins = vec![0.0f32; s * dim];
+            let mut posts = Vec::with_capacity(s);
+            let mut combs = Vec::with_capacity(s);
             for t in 0..s {
-                let mut c = std::mem::take(&mut copies[t]);
-                let xin = self.block_ffn_stage(li, &mut c, ids.map(|v| v[t]));
-                if t == s - 1 {
-                    moe_in_last = xin;
-                }
-                copies[t] = c;
+                let (y, post, comb) = self.hc_pre(&copies[t], &self.layers[li].hc_ffn);
+                let mut xin = y;
+                rmsnorm(&mut xin, &self.layers[li].ffn_norm_w, self.cfg.norm_eps);
+                xins[t * dim..(t + 1) * dim].copy_from_slice(&xin);
+                posts.push(post);
+                combs.push(comb);
             }
-            self.last_moe_in.push(moe_in_last);
+            let moe_out = self.moe_batch(li, &xins, s, ids);
+            for t in 0..s {
+                let new = self.hc_post(
+                    &moe_out[t * dim..(t + 1) * dim],
+                    &copies[t],
+                    &posts[t],
+                    &combs[t],
+                );
+                copies[t] = new;
+            }
+            self.last_moe_in.push(xins[(s - 1) * dim..s * dim].to_vec());
             self.last_hiddens
                 .push(copies.iter().flatten().copied().collect());
         }
