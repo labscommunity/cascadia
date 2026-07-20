@@ -384,6 +384,16 @@ def main():
         export_glm5.export_tiny(d, num_layers=4, index_n_heads=2, index_head_dim=8, index_topk=tk)
         print(f"[dsa fixture] export {d} (index_topk={tk})")
 
+    # IndexShare topology: layers 1,3 are "shared" (no indexer, reuse the previous
+    # full layer's top-k). The sparse variant (topk=2) must prune the shared
+    # layers via the carried selection; the dense twin (topk large) does not — so
+    # the loaded models must differ, proving carry-forward reaches shared layers.
+    for tag, tk in (("glm5_export_indexshare", 2), ("glm5_export_indexshare_dense", 10_000)):
+        d = out.parent / tag
+        export_glm5.export_tiny(d, num_layers=4, index_n_heads=2, index_head_dim=8, index_topk=tk,
+                                indexer_types=["full", "shared", "full", "shared"])
+        print(f"[indexshare fixture] export {d} (index_topk={tk})")
+
     # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
     from glm5_ref.fp8_roundtrip import roundtrip
     fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)

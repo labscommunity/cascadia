@@ -79,7 +79,8 @@ impl MtpHead {
             cat[hidden..].copy_from_slice(&h);
             let mut hx = vec![0.0f32; hidden];
             linear_bf16_w(&cat, &self.eh_proj, hidden, 2 * hidden, &mut hx);
-            let hx_post = self.block.forward_token(&hx);
+            let mut carry: Option<Vec<usize>> = None; // single-block MTP head
+            let hx_post = self.block.forward_token(&hx, &mut carry);
             let mut row = hx_post.clone();
             rmsnorm(&mut row, &self.mtp_norm, self.eps);
             let mut logit = vec![0.0f32; self.vocab];

@@ -224,8 +224,13 @@ impl StagedRunner for GlmRunner {
             self.pos
         );
         let mut x = hidden;
+        // IndexShare carry threads within this rank's slice. (Cross-rank carry —
+        // a "shared" layer at a rank boundary reusing an upstream full layer's
+        // selection — is the not-yet-wired distributed case; it falls back to
+        // full causal, correct for a single-rank run.)
+        let mut carry: Option<Vec<usize>> = None;
         for l in &mut self.layers {
-            x = l.forward_token(&x);
+            x = l.forward_token(&x, &mut carry);
         }
         self.pos += 1;
         x
@@ -239,8 +244,9 @@ impl StagedRunner for GlmRunner {
         assert_eq!(hidden.len(), rows * self.hidden, "glm5 batch: bad hidden length");
         // Each layer runs per-position attention (KV in order) + batch-union MoE.
         let mut x = hidden;
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows]; // per-row IndexShare
         for l in &mut self.layers {
-            x = l.forward_prefill(&x, rows);
+            x = l.forward_prefill(&x, rows, &mut carries);
         }
         self.pos += rows;
         x

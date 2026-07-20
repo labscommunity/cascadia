@@ -75,7 +75,7 @@ fn layer_attn_stage_matches_reference() {
         let xs = &x[s * hidden..(s + 1) * hidden];
         let mut nrm = xs.to_vec();
         rmsnorm(&mut nrm, &in_ln, eps);
-        let a = attn.forward_token(&nrm);
+        let a = attn.forward_token(&nrm, &mut None);
         for j in 0..hidden {
             got[s * hidden + j] = xs[j] + a[j];
         }
@@ -175,7 +175,7 @@ fn transformer_layer_matches_reference() {
     let (_, want) = fx.f32("layer.out").unwrap();
     let mut got = vec![0.0f32; seq * hidden];
     for s in 0..seq {
-        let o = layer.forward_token(&x[s * hidden..(s + 1) * hidden]);
+        let o = layer.forward_token(&x[s * hidden..(s + 1) * hidden], &mut None);
         got[s * hidden..(s + 1) * hidden].copy_from_slice(&o);
     }
     // Propagation-bounded tolerance: attention's f32 accumulation-order makes h

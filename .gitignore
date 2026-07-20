@@ -42,5 +42,7 @@ crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_ml/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_dsa/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_dsa_dense/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_indexshare/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_indexshare_dense/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_ckpt/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_export/

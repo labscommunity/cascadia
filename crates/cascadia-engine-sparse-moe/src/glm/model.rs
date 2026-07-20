@@ -64,13 +64,14 @@ impl GlmLayer {
     }
 
     /// Process one token at the next cached position. `x` is the residual-stream
-    /// hidden `[hidden]`; returns the updated hidden after this layer.
-    pub fn forward_token(&mut self, x: &[f32]) -> Vec<f32> {
+    /// hidden `[hidden]`; returns the updated hidden after this layer. `carry`
+    /// threads the IndexShare top-k selection (full layer writes, shared reads).
+    pub fn forward_token(&mut self, x: &[f32], carry: &mut Option<Vec<usize>>) -> Vec<f32> {
         assert_eq!(x.len(), self.hidden);
         // h = x + attn(rmsnorm(x, in_ln))
         let mut nrm = x.to_vec();
         rmsnorm(&mut nrm, &self.in_ln, self.eps);
-        let a = self.attn.forward_token(&nrm);
+        let a = self.attn.forward_token(&nrm, carry);
         let mut h: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
         // out = h + mlp(rmsnorm(h, post_ln))
         let mut nrm2 = h.clone();
@@ -89,8 +90,14 @@ impl GlmLayer {
     /// per position (the causal KV must grow in order); the MoE runs as one
     /// batch-union over all rows, so overlapping experts are loaded once. Returns
     /// `[rows, hidden]`, bit-identical to calling [`Self::forward_token`] per row.
-    pub fn forward_prefill(&mut self, xs: &[f32], rows: usize) -> Vec<f32> {
+    pub fn forward_prefill(
+        &mut self,
+        xs: &[f32],
+        rows: usize,
+        carries: &mut [Option<Vec<usize>>],
+    ) -> Vec<f32> {
         assert_eq!(xs.len(), rows * self.hidden);
+        assert_eq!(carries.len(), rows, "one IndexShare carry per prompt row");
         let hd = self.hidden;
         // h = x + attn(rmsnorm(x, in_ln)); nrm2 = rmsnorm(h, post_ln).  Sequential.
         let mut h = vec![0.0f32; rows * hd];
@@ -99,7 +106,7 @@ impl GlmLayer {
             let x = &xs[r * hd..(r + 1) * hd];
             let mut nrm = x.to_vec();
             rmsnorm(&mut nrm, &self.in_ln, self.eps);
-            let a = self.attn.forward_token(&nrm);
+            let a = self.attn.forward_token(&nrm, &mut carries[r]);
             let hrow: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
             let mut n2 = hrow.clone();
             rmsnorm(&mut n2, &self.post_ln, self.eps);
@@ -168,8 +175,9 @@ impl GlmModel {
         let t = token as usize;
         assert!(t < self.vocab, "token {t} >= vocab {}", self.vocab);
         let mut x = self.embed[t * self.hidden..(t + 1) * self.hidden].to_vec();
+        let mut carry: Option<Vec<usize>> = None; // IndexShare selection, per token
         for l in &mut self.layers {
-            x = l.forward_token(&x);
+            x = l.forward_token(&x, &mut carry);
         }
         rmsnorm(&mut x, &self.final_norm, self.eps);
         let mut logits = vec![0.0f32; self.vocab];
@@ -193,8 +201,9 @@ impl GlmModel {
             assert!(t < self.vocab, "token {t} >= vocab {}", self.vocab);
             xs[r * hd..(r + 1) * hd].copy_from_slice(&self.embed[t * hd..(t + 1) * hd]);
         }
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows]; // per-row IndexShare
         for l in &mut self.layers {
-            xs = l.forward_prefill(&xs, rows);
+            xs = l.forward_prefill(&xs, rows, &mut carries);
         }
         let last = (rows - 1) * hd;
         let mut x = xs[last..last + hd].to_vec();
