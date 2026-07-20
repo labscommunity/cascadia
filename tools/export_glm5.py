@@ -406,6 +406,7 @@ def export_real(model_dir: Path, out: Path):
 
     cfg = load_and_validate_config(model_dir / "config.json")
     src = CkptSource(model_dir)
+    cfg["mtp_emitted"] = cfg["n_mtp"] > 0  # MTP draft head emitted below (bf16 block)
     write_manifest(cfg, out)
     (out / "shells").mkdir(parents=True, exist_ok=True)
     check_space(out, cfg)
@@ -484,8 +485,49 @@ def export_real(model_dir: Path, out: Path):
         marker.touch()  # layer fully written -> resumable checkpoint
         print(f"[layer {li:2d}/{cfg['num_layers']}] shell + experts written", flush=True)
 
-    # Note: MTP head weights are not exported yet (single-token decode only;
-    # spec-decode is a later slice). The DSA indexer is exported above.
+    # MTP draft head (DeepSeek-V3 nextn, layer `num_layers` == 78) for native
+    # speculative decode. The block is a full attn + MoE layer; its experts are
+    # dequantized to bf16 (the bf16-first MTP path — int4 collapses acceptance),
+    # stored directly in mtp.safetensors so tiny and real share one loader path.
+    # The block's DSA indexer is intentionally NOT exported: the draft window
+    # (g ≪ index_topk) always attends the full causal range, so the loader runs
+    # the block dense. Resumable via .mtp.done.
+    mtp_done = out / ".mtp.done"
+    if cfg["n_mtp"] > 0 and not mtp_done.exists():
+        mp = f"model.layers.{cfg['num_layers']}."
+        mtp = {
+            "mtp.enorm.weight": bf16(mp + "enorm.weight"),
+            "mtp.hnorm.weight": bf16(mp + "hnorm.weight"),
+            "mtp.norm.weight": bf16(mp + "shared_head.norm.weight"),
+            "mtp.eh_proj.weight": bf16(mp + "eh_proj.weight"),
+            "mtp.block.input_layernorm.weight": bf16(mp + "input_layernorm.weight"),
+            "mtp.block.post_attention_layernorm.weight": bf16(mp + "post_attention_layernorm.weight"),
+            "mtp.block.self_attn.wq_a.weight": bf16(mp + "self_attn.q_a_proj.weight"),
+            "mtp.block.self_attn.q_a_layernorm.weight": bf16(mp + "self_attn.q_a_layernorm.weight"),
+            "mtp.block.self_attn.wq_b.weight": bf16(mp + "self_attn.q_b_proj.weight"),
+            "mtp.block.self_attn.wkv_a.weight": bf16(mp + "self_attn.kv_a_proj_with_mqa.weight"),
+            "mtp.block.self_attn.kv_a_layernorm.weight": bf16(mp + "self_attn.kv_a_layernorm.weight"),
+            "mtp.block.self_attn.wkv_b.weight": bf16(mp + "self_attn.kv_b_proj.weight"),
+            "mtp.block.self_attn.o_proj.weight": bf16(mp + "self_attn.o_proj.weight"),
+            "mtp.block.mlp.gate.weight": bf16(mp + "mlp.gate.weight"),
+            "mtp.block.mlp.gate.e_score_correction_bias":
+                src.get(mp + "mlp.gate.e_score_correction_bias").to(torch.bfloat16),
+        }
+        for e in range(cfg["n_routed"]):
+            ep = mp + f"mlp.experts.{e}."
+            mtp[f"mtp.block.mlp.experts.{e}.gate.weight"] = bf16(ep + "gate_proj.weight")
+            mtp[f"mtp.block.mlp.experts.{e}.up.weight"] = bf16(ep + "up_proj.weight")
+            mtp[f"mtp.block.mlp.experts.{e}.down.weight"] = bf16(ep + "down_proj.weight")
+        sp = mp + "mlp.shared_experts."
+        mtp["mtp.block.mlp.shared.gate.weight"] = bf16(sp + "gate_proj.weight")
+        mtp["mtp.block.mlp.shared.up.weight"] = bf16(sp + "up_proj.weight")
+        mtp["mtp.block.mlp.shared.down.weight"] = bf16(sp + "down_proj.weight")
+        save_file(mtp, str(out / "mtp.safetensors"))
+        mtp_done.touch()
+        print(f"[mtp] draft head written ({cfg['n_routed']}+1 bf16 experts)", flush=True)
+    elif mtp_done.exists():
+        print("[mtp] skip (done)", flush=True)
+
     print(f"[export] done -> {out}", flush=True)
 
 
