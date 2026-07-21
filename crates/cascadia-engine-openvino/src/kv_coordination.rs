@@ -411,7 +411,10 @@ impl OvKvCache {
     /// under its content epoch for the paired GET. Returns `(epoch, prefix_len)`. Engine-agnostic.
     pub(crate) fn lookup(&mut self, token_ids: &[i32]) -> Option<(u64, u32)> {
         let (prefix, blob) = {
-            let e = self.longest_prefix(token_ids)?;
+            let Some(e) = self.longest_prefix(token_ids) else {
+                self.log_prefix_miss(token_ids);
+                return None;
+            };
             (e.tokens.clone(), e.blob.clone())
         };
         let len = prefix.len() as u32;
@@ -432,6 +435,31 @@ impl OvKvCache {
             .iter()
             .filter(|e| !e.tokens.is_empty() && req.starts_with(&e.tokens))
             .max_by_key(|e| e.tokens.len())
+    }
+
+    /// NEGOTIATE-miss diagnostic. A bare `None` reads the same whether nothing was captured or a
+    /// captured turn diverges from the request; telling those apart previously cost a rig run.
+    fn log_prefix_miss(&self, req: &[i32]) {
+        let Some((diverge_at, entry)) = self
+            .entries
+            .iter()
+            .filter(|e| !e.tokens.is_empty())
+            .map(|e| {
+                (
+                    e.tokens.iter().zip(req).take_while(|(a, b)| a == b).count(),
+                    e,
+                )
+            })
+            .max_by_key(|&(d, _)| d)
+        else {
+            tracing::info!(target: "cascadia::kv", event = "kv_negotiate_miss",
+                reason = "no_entries", req_len = req.len());
+            return;
+        };
+        tracing::info!(target: "cascadia::kv", event = "kv_negotiate_miss",
+            reason = "prefix_diverged", req_len = req.len(), n_entries = self.entries.len(),
+            entry_len = entry.tokens.len(), diverge_at,
+            entry_tok = ?entry.tokens.get(diverge_at), req_tok = ?req.get(diverge_at));
     }
 
     /// Consumer: take a cached blob covering a **strict** prefix of `prompt`, for warm-resume at

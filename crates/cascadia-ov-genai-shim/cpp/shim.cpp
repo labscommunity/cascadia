@@ -956,6 +956,23 @@ int32_t cascadia_runtime_profiling(
     }
 }
 
+// Drop the InferRequest and build a fresh one off the retained CompiledModel. `reset_state` only
+// calls VariableState::reset(), which is not enough after a `set_state_blob`: a restarted process
+// (fresh request) provably clears the residue, this does the same without the restart or a recompile.
+int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
+    if (!handle || !handle->compiled) {
+        set_last_error("null runtime handle"); return 1;
+    }
+    try {
+        handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_recreate_request"); return 1;
+    }
+}
+
 // ───── Issue-34: KV state export/import for warm-pull (cascadia_engine::KvCoordination on OV) ─────
 //
 // A stateful OV LLM keeps its KV cache as `VariableState`s on the InferRequest. We serialize them all
@@ -1044,6 +1061,7 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         auto get32 = [&]() { need(4); uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
         auto get64 = [&]() { need(8); uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
         uint32_t count = get32();
+        uint32_t applied = 0;
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nl = get32(); need(nl);
             std::string name(reinterpret_cast<const char*>(p), nl); p += nl;
@@ -1058,9 +1076,19 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
                 if (t.get_byte_size() == nb) {
                     std::memcpy(t.data(), p, nb);
                     it->second->set_state(t);
+                    ++applied;
                 }
             }
             p += nb;
+        }
+        // A skipped state (name absent / byte-size mismatch) leaves that variable at its CURRENT
+        // value while its siblings carry the donor's — a silent half-restore the caller then treats
+        // as a good warm resume. Fail instead so the engine falls back to a cold reprefill.
+        if (applied != count) {
+            std::ostringstream oss;
+            oss << "set_state_blob: applied " << applied << " of " << count << " states";
+            set_last_error(oss.str().c_str());
+            return 1;
         }
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }

@@ -286,6 +286,11 @@ int32_t cascadia_runtime_profiling(
 /// stateless models.
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);
 
+/// Rebuild the InferRequest from the retained CompiledModel, dropping all
+/// variable state. Stronger than `reset_state` — use after a
+/// `set_state_blob` whose residue `reset_state` does not clear.
+int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle);
+
 size_t cascadia_runtime_input_count(cascadia_runtime_t* handle);
 size_t cascadia_runtime_output_count(cascadia_runtime_t* handle);
 
