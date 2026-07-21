@@ -33,11 +33,12 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, TransportError,
+    MAX_RAW_BYTES,
 };
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const HIDDEN: usize = 2048;
 /// Prefill span per chain pass; bounds the transient [1, T, vocab]
@@ -73,6 +74,11 @@ const FRAME_CAPTURE_ACK: u32 = 9;
 const FRAME_RESTORE: u32 = 10;
 #[cfg(feature = "kv_coord")]
 const FRAME_RESTORE_ACK: u32 = 11;
+/// Ceiling on a carried RESTORE blob. `recv_raw`'s own 64 KiB cap guards control-byte reads and
+/// is far below one rank's whole-state KV (tens of MB), so the blob is read in capped chunks —
+/// this bounds what a peer can make us buffer, the job that cap was doing.
+#[cfg(feature = "kv_coord")]
+const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 /// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
 
@@ -324,6 +330,12 @@ impl Builder for Qwen36Builder {
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
+            plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            #[cfg(feature = "kv_coord")]
+            state_restored: false,
+            #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
@@ -380,6 +392,18 @@ pub struct Qwen36Engine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// Downstream ranks warm-resume over the KV plane, so the head skips the chain RESTORE and warms
+    /// rank 0 alone. Parity with ov-runtime (`runtime.rs` `plane_restore`); without it qwen36 demands
+    /// a downstream verdict nothing satisfies cross-chain and cold-resets the whole chain.
+    /// Read once from `CASCADIA_KV_PLANE_RESTORE` at build.
+    #[cfg(feature = "kv_coord")]
+    plane_restore: bool,
+    /// A `set_state_blob` has been applied to the stages and not yet cleared. `reset_state` alone
+    /// does not scrub that residue on this model (its DeltaNet recurrent states are fixed-shape, so
+    /// there is no seq dim to collapse to zero), which left every post-migration turn serving
+    /// garbage until the process restarted. Makes the next `reset_all` rebuild the InferRequest.
+    #[cfg(feature = "kv_coord")]
+    state_restored: bool,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -457,11 +481,14 @@ enum InFrame {
         tokens: Vec<i32>,
     },
     /// Issue-34 consume RESTORE: `set_state` the pulled slice stashed under `kv_epoch`. `task_epoch`
-    /// (frame header) advances `peer_epoch` exactly like RESET.
+    /// (frame header) advances `peer_epoch` exactly like RESET. `blob` is the head's inline carry for
+    /// the CROSS-chain case (this rank has no local capture for a foreign chain's epoch); empty on
+    /// the same-chain path, where the rank restores from its own CAPTURE stash.
     #[cfg(feature = "kv_coord")]
     Restore {
         task_epoch: u32,
         kv_epoch: u64,
+        blob: Vec<u8>,
     },
 }
 
@@ -567,11 +594,32 @@ impl Qwen36Engine {
     }
 
     fn reset_all(&mut self) {
+        // After a restore, `reset_state` leaves residue on this model, so rebuild the request
+        // instead — the flag keeps the ordinary turn-to-turn path on the cheap reset.
+        #[cfg(feature = "kv_coord")]
+        let recreate = self.state_restored;
+        #[cfg(not(feature = "kv_coord"))]
+        let recreate = false;
+        let mut all_ok = true;
         for st in self.stages.iter_mut() {
-            if let Err(e) = st.reset_state() {
-                warn!(error = %e, "qwen36: stage reset_state failed");
+            let r = if recreate {
+                st.recreate_request()
+            } else {
+                st.reset_state()
+            };
+            if let Err(e) = r {
+                all_ok = false;
+                // A failed scrub leaves the donor's state live — every later turn serves garbage.
+                // Loud, and the flag stays set so the next reset retries instead of silently
+                // downgrading to the cheap path that cannot clear it.
+                error!(error = %e, recreate, "qwen36: stage reset failed; state may be dirty");
             }
         }
+        #[cfg(feature = "kv_coord")]
+        if all_ok {
+            self.state_restored = false;
+        }
+        let _ = all_ok;
     }
 
     /// Finish the active task: reset state, log, emit the final marker.
@@ -869,6 +917,18 @@ impl Qwen36Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
+        // Cross-chain: the head pulled every rank's KV but can't apply a downstream rank's slice
+        // locally, so ship it inline — that rank has no CAPTURE stash for a foreign chain's epoch and
+        // would otherwise vote cold, collapsing the all-or-nothing verdict. Empty on the same-chain
+        // path (the rank restores from its own stash).
+        let blob = self.kv.take_downstream(kv_epoch).unwrap_or_default();
+        if !blob.is_empty() {
+            info!(
+                kv_epoch,
+                blob_len = blob.len(),
+                "qwen36_restore_carry_downstream"
+            );
+        }
         let h = self.handle()?;
         run_async(
             &h,
@@ -877,6 +937,10 @@ impl Qwen36Engine {
                 g.send_raw(&frame_header(FRAME_RESTORE, task_epoch, 0))
                     .await?;
                 g.send_raw(&kv_epoch.to_le_bytes()).await?;
+                g.send_raw(&(blob.len() as u32).to_be_bytes()).await?;
+                if !blob.is_empty() {
+                    g.send_raw(&blob).await?;
+                }
                 let hb = g.recv_raw(12).await?;
                 let (kind, _, verdict) = parse_header(&hb);
                 if kind != FRAME_RESTORE_ACK {
@@ -968,15 +1032,30 @@ impl Qwen36Engine {
                     match self.kv.take_warm(&prompt_i32) {
                         Some((blob, len)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                            let chain_ok = self.restore_local_stages(&blob)
-                                && self
-                                    .forward_restore_downstream(self.epoch, kv_epoch)
-                                    .unwrap_or(false);
+                            // plane_restore ⇒ downstream ranks warm-resume over the KV plane, so the
+                            // head restores its own stages and skips the chain RESTORE (parity with
+                            // ov-runtime's `multi` guard). Without this the head demands a downstream
+                            // verdict that nothing satisfies cross-chain — the rank has no CAPTURE
+                            // stash for a foreign chain's epoch — and the all-or-nothing check
+                            // cold-resets a chain whose rank 0 warmed fine.
+                            let local_ok = self.restore_local_stages(&blob);
+                            let chain_ok = local_ok
+                                && (self.plane_restore
+                                    || self
+                                        .forward_restore_downstream(self.epoch, kv_epoch)
+                                        .unwrap_or(false));
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                                 let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                    .map(|s| s.min(len))
-                                    .unwrap_or(len);
+                                    // Clamp to len-1, not len: the depth heuristic maxes shape[2]
+                                    // over rank>=3 states, and this model's fixed-shape DeltaNet ssm
+                                    // state [32,128,128] contributes a constant 128, so `.min(len)`
+                                    // returned `len` and warm-resume skipped prompt token len-1
+                                    // chain-wide. A matched prefix of `len` holds at most len-1
+                                    // depth; under-warming just re-prefills one token, over-warming
+                                    // corrupts.
+                                    .map(|s| s.min(len.saturating_sub(1)))
+                                    .unwrap_or(len.saturating_sub(1));
                                 info!(task = %task.task_id, warm_prefix = warm, matched = len, "qwen36 pipeline warm-resumed");
                                 warm
                             } else {
@@ -1130,9 +1209,30 @@ impl Qwen36Engine {
                             .try_into()
                             .map_err(|_| TransportError::SocketClosed)?,
                     );
+                    // Always length-prefixed (0 ⇒ no carry) so the frame stays self-describing.
+                    let lb = g.recv_raw(4).await?;
+                    let blob_len = u32::from_be_bytes(
+                        lb.as_slice()
+                            .try_into()
+                            .map_err(|_| TransportError::SocketClosed)?,
+                    ) as usize;
+                    let blob = if blob_len == 0 {
+                        Vec::new()
+                    } else {
+                        if blob_len > MAX_CARRY_BLOB_BYTES {
+                            return Err(TransportError::SocketClosed);
+                        }
+                        let mut buf = Vec::new();
+                        while buf.len() < blob_len {
+                            let n = (blob_len - buf.len()).min(MAX_RAW_BYTES);
+                            buf.extend_from_slice(&g.recv_raw(n).await?);
+                        }
+                        buf
+                    };
                     Ok(InFrame::Restore {
                         task_epoch: epoch,
                         kv_epoch,
+                        blob,
                     })
                 }
                 FRAME_FORWARD => {
@@ -1240,14 +1340,35 @@ impl Qwen36Engine {
             InFrame::Restore {
                 task_epoch,
                 kv_epoch,
+                blob,
             } => {
                 // Consume warm-resume: set_state this rank's pulled slice, chain RESTORE downstream,
                 // ack with the all-or-nothing verdict (local && downstream restored). A miss anywhere
                 // ⇒ verdict 0 ⇒ the head re-RESETs the chain cold (never a partial/corrupt restore).
                 self.peer_epoch = task_epoch;
-                let local_ok = match self.kv.take_capture(kv_epoch) {
-                    Some((_, blob)) => self.restore_local_stages(&blob),
-                    None => false,
+                // Carried blob wins: on a CROSS-chain move this rank has no capture under the source
+                // chain's epoch, so the local stash is empty and only the head's inline copy exists.
+                let local_ok = if !blob.is_empty() {
+                    let ok = self.restore_local_stages(&blob);
+                    // Cert marker: proves the CARRIED (cross-chain) branch ran, not the same-chain
+                    // capture fallback — the two are indistinguishable in the verdict alone. Emitted
+                    // ONLY on success, matching `ov_tail_restore_carried`, so the cert's gate counts
+                    // successes for both engines rather than attempts for one of them.
+                    if ok {
+                        info!(kv_epoch, blob_len = blob.len(), "qwen36_tail_restore_carried");
+                    } else {
+                        warn!(
+                            kv_epoch,
+                            blob_len = blob.len(),
+                            "qwen36_tail_restore_carried_failed"
+                        );
+                    }
+                    ok
+                } else {
+                    match self.kv.take_capture(kv_epoch) {
+                        Some((_, blob)) => self.restore_local_stages(&blob),
+                        None => false,
+                    }
                 };
                 let down_ok = if is_last {
                     true
@@ -1414,8 +1535,10 @@ impl Qwen36Engine {
                         Some((blob, len)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                .map(|s| s.min(len))
-                                .unwrap_or(len);
+                                // See the sibling site: the fixed-shape ssm state poisons the depth
+                                // heuristic, so clamp to len-1 rather than len.
+                                .map(|s| s.min(len.saturating_sub(1)))
+                                .unwrap_or(len.saturating_sub(1));
                             info!(
                                 warm_prefix = warm,
                                 matched = len,
@@ -1669,19 +1792,23 @@ impl Qwen36Engine {
         for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
             if let Err(e) = st.set_state_blob(part) {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
+                // A partial apply still dirtied earlier stages — make the next reset scrub properly.
+                self.state_restored = true;
                 return false;
             }
         }
+        self.state_restored = true;
         true
     }
 
-    /// Stable model+rank fingerprint: a rank only matches the identical rank on a peer chain (its
-    /// blob is its stage-span's KV, not the whole model's).
+    /// MODEL-level fingerprint (the manifest alone — identical on every rank of a tree), NOT per-rank.
+    /// A cross-chain pull asserts ONE fingerprint — the entry head's — for EVERY rank's GET, so all
+    /// ranks must share it; folding in `rank`/`total` made rank>0 GETs reject a legitimate move.
+    /// Per-rank slice selection is by the dial INDEX (rank N → that rank's holder), and a sharding
+    /// mismatch degrades safely (the opaque blob's `set_state` size-rejects ⇒ cold), so the stage span
+    /// is not needed as a guard. Mirrors `kv_coordination::kv_model_fingerprint`.
     fn kv_fingerprint(&self) -> u64 {
-        let mut buf = self.manifest_json.clone().into_bytes();
-        buf.extend_from_slice(&self.rank.to_le_bytes());
-        buf.extend_from_slice(&self.total.to_le_bytes());
-        crate::kv_coordination::fnv1a64(&buf)
+        crate::kv_coordination::fnv1a64(self.manifest_json.as_bytes())
     }
 
     /// Capture this rank's local KV under `tokens` (head/single-box token-keyed path). Called at the
@@ -1746,6 +1873,23 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         Ok(())
     }
 
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        // Without this the trait default returns Err ⇒ the head DROPS every downstream rank's pulled
+        // blob, that rank finds no capture for the foreign epoch, votes cold, and the all-or-nothing
+        // verdict collapses the whole chain to "restore incomplete; cold reset". Keyed by the content
+        // epoch so it matches the RESTORE the head sends. 2-stage today: only the head pulls all
+        // ranks, so a middle rank has nothing to carry to ITS downstream (3+ stages stay cold).
+        let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        self.kv.stash_downstream(epoch, blob);
+        Ok(())
+    }
+
     fn apply_warm_resume(&mut self, epoch: u64) -> bool {
         // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
         // restore it now. Mirrors the InFrame::Restore handler's local apply. Not on the total=1 path
@@ -1789,6 +1933,12 @@ mod tests {
             active: None,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            plane_restore: std::env::var("CASCADIA_KV_PLANE_RESTORE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            #[cfg(feature = "kv_coord")]
+            state_restored: false,
             #[cfg(feature = "kv_coord")]
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),

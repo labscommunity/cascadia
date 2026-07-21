@@ -229,6 +229,7 @@ mod sys {
             buf_cap: usize,
             out_len: *mut usize,
         ) -> c_int;
+        pub fn cascadia_runtime_recreate_request(handle: *mut cascadia_runtime_t) -> c_int;
         // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
         pub fn cascadia_runtime_get_state_blob(
             handle: *mut cascadia_runtime_t,
@@ -1319,6 +1320,22 @@ impl Runtime {
         }
     }
 
+    /// Rebuild the InferRequest from the retained CompiledModel, dropping all variable state.
+    /// Stronger than [`Runtime::reset_state`], which only calls `VariableState::reset()` — use
+    /// after a [`Runtime::set_state_blob`] whose residue `reset_state` does not clear.
+    pub fn recreate_request(&mut self) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let rc = sys::cascadia_runtime_recreate_request(self.handle);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
+    }
+
     /// Issue-34: capture all KV variable-states into one opaque blob (two-call: size then fill).
     /// The bytes are self-describing; restore on a peer engine via [`Runtime::set_state_blob`].
     pub fn get_state_blob(&mut self) -> Result<Vec<u8>> {
@@ -1348,7 +1365,12 @@ impl Runtime {
     }
 
     /// Issue-34: restore KV variable-states from a blob produced by [`Runtime::get_state_blob`] on the
-    /// same model. States are matched by name; a missing/mismatched state is skipped (defence in depth).
+    /// same model. States are matched by name; if ANY entry fails to apply the call returns `Err`
+    /// rather than silently half-restoring.
+    ///
+    /// On `Err` the request may already be **partially restored** — entries are applied as the blob
+    /// is parsed. Callers must scrub with [`Runtime::recreate_request`] (or `reset_state` where that
+    /// suffices) before the next infer.
     pub fn set_state_blob(&mut self, blob: &[u8]) -> Result<()> {
         #[cfg(not(feature = "openvino"))]
         {
