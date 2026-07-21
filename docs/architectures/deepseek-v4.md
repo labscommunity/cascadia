@@ -59,11 +59,13 @@ shorten). The default (Rust mmap expert) decode path was optimized ~2×:
   cost; ~1.8× on its own.
 - **Parallel grouped `o_proj`** — the `wo_a` mid-GEMV ran serially on one core;
   its independent rows are spread across cores (bit-identical). ~+10%.
-- **Streamed prefill** (`FrameKind::ForwardPrefill`) — one-way prefill frames
-  pipeline the prompt across ranks instead of a blocking round-trip per token;
-  a mid-prefill failure is connection-fatal so a dropped frame can't leave a
-  silent KV hole. The full pipelining benefit lands once node↔node is a direct
-  LAN rather than a relayed link.
+- **Prefill is per-token, not streamed** — `Dsv4Engine` forwards the prompt one
+  token per frame across the ranks, each a blocking round-trip with a bounded
+  reply deadline (the same wire path decode uses); a mid-prefill peer death
+  fails fast rather than leaving a silent KV hole. The one-way streamed
+  `ForwardPrefill` frame belongs to the K2.6 sparse-MoE engine and is **not**
+  wired into dsv4. The largest prefill win would be a direct node↔node LAN
+  rather than a relayed link.
 
 Evaluated and **rejected with measurement** (recorded so they aren't re-tried):
 FP8-e4m3 shell (bit-exact, but `proj` is compute- not bandwidth-bound after the
