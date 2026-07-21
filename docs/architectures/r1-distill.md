@@ -55,7 +55,7 @@ and the `192.168.1.10` / `192.168.1.20` addresses below are
 placeholders — node A is .10, node B is .20.)
 
 ```console
-$ curl http://192.168.1.10:8000/v1/chat/completions -d '{
+$ curl http://192.168.1.10:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
     "model": "r1-distill-qwen-1.5b",
     "messages": [{"role": "user", "content": "What is 17 * 23? Think step by step."}],
     "max_tokens": 96
@@ -97,7 +97,7 @@ Steps to reproduce the pipeline-parallel run:
 
    ```bash
    ssh <export-host> "source ~/.venv/export/bin/activate && \
-     python ~/cascadia/tools/export_shards.py \
+     cascadia shard \
        --model r1-distill-qwen-1.5b \
        --output-dir /tmp/r1_int4 \
        --num-stages 2 --quantization int4"
@@ -141,7 +141,7 @@ Steps to reproduce the pipeline-parallel run:
 5. From a third terminal:
 
    ```bash
-   curl http://node-a.local:8000/v1/chat/completions -d '{
+   curl http://node-a.local:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
      "model": "r1-distill-qwen-1.5b",
      "messages": [{"role": "user", "content": "What is 17 * 23?"}],
      "max_tokens": 64

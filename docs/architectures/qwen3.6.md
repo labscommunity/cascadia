@@ -35,7 +35,7 @@ layout and uses `VLMPipeline` (text-only) via the shim's
 ```bash
 # Pre-exported IR (preferred):
 #   https://huggingface.co/OpenVINO/Qwen3.6-35B-A3B-int4-ov
-cascadia run --engine ov-genai --model /path/to/Qwen3.6-35B-A3B-int4-ov --device GPU
+cascadia run /path/to/Qwen3.6-35B-A3B-int4-ov --engine ov-genai --device GPU
 ```
 
 Or export yourself with Optimum-Intel on the 2026.2 toolchain

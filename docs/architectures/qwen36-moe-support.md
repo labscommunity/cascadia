@@ -242,7 +242,7 @@ XML. Proven step by step:
   `proto_m3_decode.py` is the decode-loop reference for the Rust
   engine.
 - **Engine E2E: 5/5 API suite green**
-  (`cascadia run <shards> --engine qwen36-moe --device CPU --api`):
+  (`cascadia run <shards> --engine qwen36-moe --device CPU --api :8000`):
   /v1/models, two sequential chats (state-reset invariant), greedy
   determinism (identical 13-token outputs), 96-token generation at
   4.7-8.8 tok/s decode (matches the chain envelope). An earlier 2/5

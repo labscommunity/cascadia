@@ -3,6 +3,7 @@ name = "cascadia-dashboard"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Dashboard HTTP routes (topology, stats, SSE events) and embedded SPA for visualizing a Cascadia cluster."

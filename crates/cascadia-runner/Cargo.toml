@@ -3,6 +3,7 @@ name = "cascadia-runner"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Per-stage Runner — owns Builder/Engine, drives the generate loop and relay loop."

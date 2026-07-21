@@ -72,8 +72,8 @@ mDNS peer discovery via the `mdns-sd` crate. Advertises `_cascadia._tcp.local.` 
 
 ## `cascadia-download`
 
-Model registry plus on-demand HuggingFace pull. Registry lives at `~/.cache/cascadia/registry.json`; writes are atomic (`.tmp` + `fsync` + rename). Symlinks at the registry path are rejected to prevent path-substitution attacks.
+Model registry plus on-demand HuggingFace pull. **Not wired into the CLI** — no crate depends on it; workers never download (only `cascadia shard` fetches). Registry lives at `~/.cache/cascadia/registry.json`; writes are atomic (`.tmp` + `fsync` + rename). Symlinks at the registry path are rejected to prevent path-substitution attacks.
 
 ## `cascadia-cli` + `cascadia`
 
-`cascadia worker --rank N --total M --engine <name> --model <path|hf_id> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `completions` (shell completions), `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.
+`cascadia worker --rank N --total M --engine <name> --model <dir> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `completions` (shell completions), `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.

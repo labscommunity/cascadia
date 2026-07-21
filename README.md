@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/labscommunity/cascadia/actions/workflows/ci.yml"><img src="https://github.com/labscommunity/cascadia/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="license"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B-orange.svg" alt="rust 1.85+">
+  <img src="https://img.shields.io/badge/rust-1.89%2B-orange.svg" alt="rust 1.89+">
   <img src="https://img.shields.io/badge/status-pre--alpha-red.svg" alt="pre-alpha">
 </p>
 
@@ -32,7 +32,22 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 ## Quick start
 
-**On an Intel machine?** Grab a self-contained bundle from [Releases](https://github.com/labscommunity/cascadia/releases): OpenVINO runtime included, no build, no SDK. Unzip and run `cascadia doctor`.
+**On an Intel machine?** Grab a self-contained bundle from [Releases](https://github.com/labscommunity/cascadia/releases): OpenVINO runtime included, no build, no SDK. Unpack it and run the binary from inside — it is not installed on your PATH:
+
+```bash
+# Linux
+tar -xzf cascadia-<ver>-linux-x86_64.tar.gz && cd cascadia-<ver>-linux-x86_64
+./cascadia doctor
+```
+
+```powershell
+# Windows
+Expand-Archive cascadia-<ver>-windows-x86_64.zip -DestinationPath .
+cd cascadia-<ver>-windows-x86_64
+.\cascadia.exe doctor
+```
+
+That's the whole install: no Rust, no OpenVINO SDK, no `INTEL_OPENVINO_DIR`. Commands below are written as `cascadia …`; from a bundle use `./cascadia` (`.\cascadia.exe` on Windows), or add the directory to your PATH.
 
 Or build from source. You must have Rust installed; OpenVINO isn't required, and Cascadia will mock responses:
 
@@ -43,7 +58,9 @@ cargo build --release -p cascadia
 ```
 
 ```bash
-curl http://localhost:8000/v1/chat/completions -d '{
+curl http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
   "model": "mock-model",
   "messages": [{"role": "user", "content": "Capital of France?"}]
 }'
@@ -69,30 +86,43 @@ INTEL_OPENVINO_DIR=/path/to/openvino_genai_<platform>_2026.2.0.0 \
 ```
 
 Prerequisites: 
-- Rust 1.85+; for `--features openvino`
+- Rust 1.89+; for `--features openvino`
 - A C++ toolchain (VS 2022 Build Tools on Windows, `g++` ≥ 12 on Linux) and the OpenVINO GenAI SDK
 
-**[INSTALL.md](INSTALL.md)** has download links, the Linux GPU-runtime steps (`./scripts/setup-openvino.sh` automates them), and the Docker image.
+**[INSTALL.md](INSTALL.md)** has download links, the Linux GPU-runtime steps (`scripts/setup-openvino.sh` automates them from a source checkout), and the Docker image.
 
 > [!IMPORTANT]
 > After building, run **`cascadia doctor`**. On Intel AI PCs, the GPU can be invisible to OpenVINO even with a working driver. That failure is otherwise silent (you would just get slow CPU inference). `doctor` detects the problem and tells you how to fix it.
 
 ## Usage
 
+Every command and flag is catalogued in [docs/CLI.md](docs/CLI.md).
+
 ### Single machine
 
+Cascadia serves models from a local directory — it does not download or convert at run time. Only `cascadia shard` fetches from HuggingFace (caching under `~/.cache/cascadia/models/`). Export once, then serve:
+
 ```bash
-# `run` is single-machine sugar, picks the ov-genai engine, GPU device,
-# and an OpenAI API on :8000. The model is fetched from HuggingFace on
-# first use and cached under ~/.cache/cascadia/models/.
-cascadia run unsloth/Meta-Llama-3.1-8B-Instruct
+# Export to a 1-stage INT4 shard (export deps: see Installation above).
+cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
+             --output-dir ~/cascadia/llama-8b-1stage \
+             --num-stages 1 --quantization int4
+
+# `run` is single-machine sugar: one stage, OpenAI API on :8000.
+cascadia run ~/cascadia/llama-8b-1stage --engine ov-runtime --device GPU
+```
+
+Or serve a whole-model **OpenVINO IR** through the `ov-genai` engine, which adds FastDraft speculative decode and prompt-lookup. That layout comes from Intel's exporter, not `cascadia shard` — download a pre-exported INT4 IR (Intel publishes many under the [OpenVINO](https://huggingface.co/OpenVINO) org) or build one with `optimum-cli`, see [docs/engines/ov-genai.md](docs/engines/ov-genai.md):
+
+```bash
+cascadia run ~/models/llama-3.1-8b-int4-ov   # defaults to --engine ov-genai --device GPU
 ```
 
 For full control over engine, device, ports, and the speculative / sparsity knobs, use `cascadia worker` (`cascadia worker --help`):
 
 ```bash
 cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
-              --model unsloth/Meta-Llama-3.1-8B-Instruct \
+              --model ~/models/llama-3.1-8b-int4-ov \
               --api :8000
 ```
 
@@ -101,8 +131,9 @@ cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
 Shard once, on whichever machine has the RAM and a Python install:
 
 ```bash
-# Export-time deps (~3 GB; not needed at runtime):
-pip install torch transformers openvino safetensors huggingface_hub nncf
+# Export-time deps (~3 GB; not needed at runtime). From a source checkout:
+pip install -r tools/requirements.txt
+# From a release bundle there is no tools/ — `cascadia doctor` prints the pinned line.
 
 # Shard a HuggingFace model into 2 stages with INT4 weights:
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
@@ -126,7 +157,7 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 Not sure of a node's address? `cascadia discover` lists Cascadia peers on the LAN and the `host:port` to pass to `--next`.
 
-Add `--engine ov-dist-spec --draft-model unsloth/Llama-3.2-1B-Instruct --spec-k 4` on rank 0 for distributed speculative decoding ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
+For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
 
 ### Engines
 
@@ -141,7 +172,7 @@ $ cascadia engines
   qwen36-moe     Qwen3.6-35B-A3B staged chain (GatedDeltaNet + MoE); qwen3_5_moe IR-surgery shards
 ```
 
-`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
+`sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/minimax-m2.md](docs/architectures/minimax-m2.md) and [docs/architectures/moe.md](docs/architectures/moe.md). MiniMax-M2 is the in-repo export path (`tools/export_minimax_m2.py`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
 
 ### Supported model families
 
@@ -180,7 +211,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 
 **`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
 
-**`could not connect to … within 30s`**: start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
+**`could not connect to downstream peer within timeout`** (engines wait 60 s): start the downstream worker first; check `--listen` on the downstream matches `--next` on the upstream and that the host's firewall allows the port.
 
 **Worker dies silently when SSH session closes**: on Windows OpenSSH the child process is tied to the SSH parent. Run workers under systemd / NSSM / Task Scheduler in production.
 
@@ -192,6 +223,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | 5-minute stub run → real inference |
 | [INSTALL.md](INSTALL.md) | Full setup: OpenVINO SDK, GPU runtime, Docker |
+| [docs/CLI.md](docs/CLI.md) | Every command and flag |
 | [docs/SHARDING.md](docs/SHARDING.md) | Sharding flow + per-model-family support table |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions + crate responsibilities |
 | [docs/engines/](docs/engines/) | Per-engine deep dives |

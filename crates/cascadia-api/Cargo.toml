@@ -3,6 +3,7 @@ name = "cascadia-api"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions."

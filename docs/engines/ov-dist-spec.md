@@ -64,7 +64,7 @@ cascadia worker --rank 1 --total 2 --engine ov-dist-spec --device GPU \
 cascadia worker --rank 0 --total 2 --engine ov-dist-spec --device GPU \
               --model /shards/shards_2stage_v5_beam \
               --next 10.10.10.2:9100 --api :8000 \
-              --draft-model unsloth/Llama-3.2-1B-Instruct \
+              --draft-model /models/llama-3.2-1b-int4-ov \
               --spec-k 4
 ```
 

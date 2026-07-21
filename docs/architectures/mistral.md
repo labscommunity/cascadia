@@ -78,7 +78,7 @@ all dropped sliding window.
 Same shape as the [R1-Distill recipe](./r1-distill.md). Substitute:
 
 ```bash
-ssh <export-host> "python ~/cascadia/tools/export_shards.py \
+ssh <export-host> "cascadia shard \
   --model mistral-nemo-12b \
   --output-dir /tmp/mistral_nemo_int4 \
   --num-stages 2 --quantization int4"

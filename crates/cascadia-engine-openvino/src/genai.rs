@@ -120,6 +120,53 @@ impl OvGenaiBuilder {
     }
 }
 
+/// ov::genai builds its tokenizer from OpenVINO IRs in the model dir. Without
+/// them the pipeline still constructs, then every request returns an empty
+/// string with no error — reject the directory instead of serving silence.
+fn check_tokenizer_irs(dir: &str) -> EngineResult<()> {
+    let d = PathBuf::from(dir);
+    let missing: Vec<&str> = ["openvino_tokenizer.xml", "openvino_detokenizer.xml"]
+        .into_iter()
+        .filter(|f| !d.join(f).exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    // A staged tree is a common mistake here: it has no tokenizer IRs because the
+    // staged engines tokenize in Rust. Say so — and name the engine that matches
+    // this tree — rather than telling the user to re-export a model they already
+    // exported. Two tree shapes exist: export_shards.py / the gemma4 exporters
+    // write pipeline_config.json, while the surgery exporters write manifest.json.
+    let read_key = |file: &str, key: &str| -> Option<String> {
+        std::fs::read_to_string(d.join(file))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v[key].as_str().map(str::to_owned))
+    };
+    let engine = match (
+        read_key("pipeline_config.json", "export_version"),
+        read_key("manifest.json", "arch"),
+    ) {
+        (Some(v), _) if v.starts_with("gemma4") => Some("gemma4"),
+        (Some(_), _) => Some("ov-runtime"),
+        (_, Some(a)) if a == "qwen3_5_moe" => Some("qwen36-moe"),
+        (_, Some(_)) => Some("sparse-moe"),
+        _ => None,
+    };
+    if let Some(engine) = engine {
+        return Err(EngineError::InvalidConfig(format!(
+            "{dir} is a staged tree, which ov-genai cannot serve. Use --engine {engine}."
+        )));
+    }
+    Err(EngineError::InvalidConfig(format!(
+        "{} missing from {dir}. ov-genai needs the tokenizer IRs beside the model IR; \
+         an export without them generates empty output. Re-export with \
+         `pip install \"optimum-intel[openvino]\"` + `optimum-cli export openvino`, \
+         or download a pre-exported IR.",
+        missing.join(" + "),
+    )))
+}
+
 #[async_trait]
 impl Builder for OvGenaiBuilder {
     async fn connect(&mut self, peers: PeerLayout) -> EngineResult<()> {
@@ -152,6 +199,11 @@ impl Builder for OvGenaiBuilder {
             if !PathBuf::from(dpath).exists() {
                 return Err(EngineError::ModelNotFound(dpath.clone()));
             }
+        }
+
+        check_tokenizer_irs(&self.model_path)?;
+        if let Some(draft) = &self.draft_model_path {
+            check_tokenizer_irs(draft)?;
         }
 
         let mut progress = vec![LoadProgress::message(format!(
@@ -509,5 +561,53 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+
+    #[test]
+    fn tokenizer_irs_are_required() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("openvino_model.xml"), "").unwrap();
+        // Model IR present, tokenizer IRs absent: this used to serve empty strings.
+        let err = check_tokenizer_irs(&dir.path().to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("openvino_tokenizer.xml"), "{err}");
+        assert!(err.contains("openvino_detokenizer.xml"), "{err}");
+
+        for f in ["openvino_tokenizer.xml", "openvino_detokenizer.xml"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        assert!(check_tokenizer_irs(&dir.path().to_string_lossy()).is_ok());
+    }
+
+    #[test]
+    fn a_staged_tree_names_the_engine_that_can_serve_it() {
+        // The (file, key, value) triples each exporter actually writes — not a
+        // fabricated combination. export_shards.py and the gemma4 exporters write
+        // pipeline_config.json; the surgery exporters write manifest.json only.
+        for (file, key, value, engine) in [
+            (
+                "pipeline_config.json",
+                "export_version",
+                "v5_canonical_inputs",
+                "ov-runtime",
+            ),
+            (
+                "pipeline_config.json",
+                "export_version",
+                "gemma4_cached_v1",
+                "gemma4",
+            ),
+            ("manifest.json", "arch", "qwen3_5_moe", "qwen36-moe"),
+            ("manifest.json", "arch", "minimax_m2", "sparse-moe"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(file), format!("{{\"{key}\": \"{value}\"}}")).unwrap();
+            let err = check_tokenizer_irs(&dir.path().to_string_lossy())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("staged tree"), "{err}");
+            assert!(err.contains(&format!("--engine {engine}")), "{err}");
+        }
     }
 }

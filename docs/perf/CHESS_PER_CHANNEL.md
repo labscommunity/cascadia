@@ -86,7 +86,7 @@ Capture requires `--ffn-axpy-down` (the only path that surfaces `silu(gate)`
 to the runner; the bf16-boundary path doesn't).
 
 ```bash
-cascadia worker \
+cascadia worker --rank 0 --total 1 --engine sparse-moe --api :8000 \
   --model /path/to/k26 \
   --device CPU \
   --ffn-axpy-down \
@@ -119,7 +119,7 @@ the threshold JSON file. Wall time: seconds.
 ### Phase 3 — serve
 
 ```bash
-cascadia worker \
+cascadia worker --rank 0 --total 1 --engine sparse-moe --api :8000 \
   --model /path/to/k26 \
   --device CPU \
   --ffn-axpy-down \

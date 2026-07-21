@@ -11,8 +11,9 @@ the embedding + (on the last stage) the final norm + lm_head.
 ## Quick start
 
 ```bash
-# One-time pip install (export-time only, not needed at runtime):
-pip install torch transformers openvino safetensors huggingface_hub nncf
+# One-time pip install (export-time only, not needed at runtime). From a source
+# checkout; from a release bundle run `cascadia doctor`, which prints the pins:
+pip install -r tools/requirements.txt
 
 # Two-stage shard from HF:
 cascadia shard --model unsloth/Meta-Llama-3.1-8B-Instruct \
@@ -45,13 +46,16 @@ network).
 
 | Flag | Meaning |
 |------|---------|
-| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`) OR local path to a directory with `config.json` + `*.safetensors`. HF repos auto-download into `~/.cache/cascadia/models/`. |
+| `--model` | HF repo id (`unsloth/Meta-Llama-3.1-8B-Instruct`), a local dir with `config.json` + `*.safetensors`, or (Gemma-4 / Qwen3.6 only) an exported OpenVINO IR dir. HF repos auto-download into `~/.cache/cascadia/models/`. |
 | `-o`, `--output-dir` | Where to write the shard tree. |
 | `--num-stages N` | Pipeline stages to split into. 2 is the common case for 2-machine setups; use 3+ for larger clusters. |
-| `--quantization` | `int4` (default — typical), `int4_asym`, `int8`, or `fp16`. INT4 needs nncf installed. |
+| `--quantization` | `int4` (default — typical), `int4-asym`, `int8`, or `fp16`. INT4 needs nncf installed. |
 | `--layer-split a,b,...` | Override the uniform split. With `--num-stages 3 --layer-split 16,24` on a 32-layer model: stage 0 = layers 0..15, stage 1 = 16..23, stage 2 = 24..31. Useful for asymmetric hardware (e.g. give the bigger node more layers). |
 | `--stage N` | Re-export only stage N (debugging). |
-| `--python /path/to/python` | Override Python interpreter. Defaults to `python3` then `python`. |
+| `--target cpu-gpu\|npu` | Deployment target. `npu` emits a stateless static-shape shard — see [NPU_SHARDING.md](NPU_SHARDING.md). |
+| `--static-seq N` / `--static-context N` | NPU only: fixed query window (must be 1) and total context (default 1024). |
+| `--default-dtype fp16\|fp32` | torch dtype during export. `fp16` (default) is required for `--target npu`. |
+| `--python /path/to/python` | Override Python interpreter. By default cascadia tries `python3` then `python` and picks the first that can import the export deps — so a bare `python3` stub (common on Windows) doesn't shadow the real install. |
 | `--skip-check` | Skip the dependency probe — pass if you know your env is already set up. |
 
 ## Supported architectures
@@ -86,7 +90,8 @@ family, **Status** is one of:
 | **Qwen3 dense** | ✅ tested | Dispatches to `Qwen3DecoderLayer`; `q_norm` / `k_norm` (RMSNorm on Q/K before RoPE) are detected and applied automatically. `head_dim` is read from `config.head_dim` (Qwen3 decouples it from `hidden_size / num_heads`). |
 | **DeepSeek R1 Distills** (Qwen / Llama 7B–70B) | ✅ supported | Distills inherit their base config (`model_type: "qwen2"` or `"llama"`), so they ride the existing paths with no special handling. Short aliases (`r1-distill-qwen-7b`, …) resolve via `tools/model_aliases.py` (#49). |
 | **DeepSeek-V2-Lite** | ⚠️ best-effort / MoE | Standard attention + RoPE on the Llama path, BUT V2-Lite is itself MoE (`n_routed_experts`), so `is_moe_config` now rejects it (#60). Use the dense R1-Distills instead. |
-| **Phi-3** (Mini 4B, Medium 14B, Small 3.8B) | ✅ supported | `Phi3DecoderLayer` loads; fused `qkv_proj` is split (#58). **Partial rotary** (`partial_rotary_factor < 1.0`) is honoured (#69) — only the leading `factor·head_dim` dims rotate, the rest pass through. |
+| **Phi-3** (Mini 3.8B, Medium 14B) | ✅ supported | `Phi3DecoderLayer` loads; fused `qkv_proj` is split (#58). **Partial rotary** (`partial_rotary_factor < 1.0`) is honoured (#69) — only the leading `factor·head_dim` dims rotate, the rest pass through. |
+| **Phi-3-Small** (7B) | 🚧 rejected | A distinct **blocksparse** architecture (`Phi3SmallForCausalLM`, tiktoken tokenizer, `trust_remote_code`) — not the `Phi3DecoderLayer` path. Unrunnable on any OpenVINO stack today: no prebuilt int4-ov IR exists, `cascadia shard` fails at config-parse, and `optimum-cli export openvino` rejects `phi3small` as a custom architecture. |
 | **Phi-4** (14B, Phi-4-mini, Phi-4-reasoning) | ✅ supported (short context) | Reports `model_type: "phi3"`. **Phi-4-mini** has `partial_rotary_factor=0.75` (honoured, #69) and **LongRoPE** scaling (not modeled — soft-warned). Exact within the original context window; long-context degrades. |
 | **Gemma 1 / Gemma 2** | ✅ supported (short context) | Gemma 1 (2-norm) and Gemma 2 (4-norm + attention/final **logit softcapping** + sqrt(hidden) embed scaling) are applied (#61). Sliding-window attention (Gemma 2) is treated as full-causal — exact within the window. |
 | **Gemma 3** (1B / 4B / 12B / 27B) | 🚧 rejected | Interleaved local/global sliding-window, QK-norm, and per-layer-type RoPE bases are not modeled; `detect_architecture` rejects it up front (#69) rather than mis-exporting through the `gemma` path. |
@@ -102,8 +107,9 @@ family, **Status** is one of:
 
 For unknown architectures the script falls back to `LlamaDecoderLayer`
 and warns on stderr. If the resulting shard's outputs match the HF
-reference (you can spot-check with `cascadia worker --engine ov-genai`
-single-stage on the same model), it's good. If they diverge, file an
+reference, it's good. (To compare against a reference, serve an
+`optimum-cli`-exported IR of the same model through `--engine ov-genai`;
+ov-genai cannot read a HuggingFace checkout or a shard tree.) If they diverge, file an
 issue with the model's `model_type` and `architectures` from `config.json`.
 
 ### Architecture quirks — handled, dropped, or rejected
@@ -164,7 +170,7 @@ There's a per-stage overhead (network round-trip + OV plugin init), so
 | Mode | Weight bits | Quality loss | Speed | Recommended for |
 |------|------------:|--------------|-------|-----------------|
 | `int4` | 4 (sym, group=128) | ~1-2% on standard benchmarks | fastest | **Default.** Almost always the right choice. |
-| `int4_asym` | 4 (asym, group=128) | similar to int4 | similar | When INT4 sym shows numerical issues on a specific model. |
+| `int4-asym` | 4 (asym, group=128) | similar to int4 | similar | When INT4 sym shows numerical issues on a specific model. |
 | `int8` | 8 (asym, per-channel) | ~0.5% | slower than int4 | When int4 quality is unacceptable. |
 | `fp16` | 16 | none | slowest, biggest | Debugging or when nncf isn't installed. |
 
@@ -187,7 +193,7 @@ identical.
 ## Troubleshooting
 
 **"NNCF not installed" warning on INT4 export**: the script falls back to
-FP16 weights silently. Install nncf (`pip install nncf>=2.13`) and re-run.
+FP16 weights silently. Install nncf (`pip install "nncf>=2.18"`) and re-run.
 
 **"tied embeddings" log line on Llama 3.2 1B/3B**: not an error. Llama
 3.2 small models share `lm_head.weight` with `embed_tokens.weight`. The
@@ -202,8 +208,8 @@ int8` which doesn't hit the same path.
 **"unknown model_type, falling back to Llama" warning**: the model
 isn't in the explicit support list. The export will produce a working
 IR for any model whose layer interface matches Llama's, but you should
-verify the outputs (run `cascadia worker --engine ov-genai` against the
-same source model and compare the first 10 generated tokens).
+verify the outputs (serve an `optimum-cli`-exported IR of the same model
+through `--engine ov-genai` and compare the first 10 generated tokens).
 
 **OOM during INT4 quantization**: NNCF holds the full FP16 model in
 RAM during compression. For 70B+ models, run on a machine with ≥ 64 GB

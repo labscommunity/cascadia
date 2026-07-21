@@ -73,7 +73,7 @@ Needs a Python env with `torch`, `transformers>=4.57` (for `MiniMaxM2`),
 ## Run
 
 ```bash
-cascadia worker --engine sparse-moe --model /path/to/m2_export --device CPU
+cascadia worker --rank 0 --total 1 --engine sparse-moe --model /path/to/m2_export --device CPU --api :8000
 ```
 
 The builder reads `manifest.json`; `shell_backend: "ov_ir"` automatically

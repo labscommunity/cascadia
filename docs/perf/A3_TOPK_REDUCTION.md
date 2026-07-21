@@ -8,7 +8,7 @@ negligible quality cost.
 ## Usage
 
 ```bash
-cascadia worker --engine sparse-moe --top-k-override 4 ...
+cascadia worker --rank 0 --total 1 --engine sparse-moe --model <manifest-tree> --api :8000 --top-k-override 4
 ```
 
 Default is `None` (no behavior change — uses manifest's top_k, which
@@ -20,7 +20,7 @@ weights/ids; we just skip dispatching the tail.
 There's also a complementary flag:
 
 ```bash
-cascadia worker --engine sparse-moe --routing-threshold 0.1 ...
+cascadia worker --rank 0 --total 1 --engine sparse-moe --model <manifest-tree> --api :8000 --routing-threshold 0.1
 ```
 
 which skips experts whose router weight is below the threshold. The

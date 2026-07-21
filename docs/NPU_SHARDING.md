@@ -23,9 +23,9 @@ the host at runtime.
 
 ## Half 1 — Export: static, stateless, per-stage IRs
 
-`tools/export_shards.py --target npu` emits one IR per stage. The Rust
-`cascadia shard` CLI does **not** expose `--target`, so NPU exports run the
-Python exporter directly (needs `torch`, `transformers`, `nncf`, `safetensors`,
+`cascadia shard --target npu` emits one IR per stage (the CLI forwards
+`--target` / `--static-seq` / `--static-context` to the bundled exporter, which
+needs `torch`, `transformers`, `nncf`, `safetensors`,
 `openvino`). Per stage (`export_shards.py` sections 5-10, ~lines 1348-1538):
 
 - **Layer split.** Stage 0 owns the embedding + first layer slice
@@ -125,8 +125,8 @@ issue #41):
 ## Reproduce
 
 ```bash
-# 1. Export a 2-stage static NPU shard (run the Python exporter directly):
-python tools/export_shards.py \
+# 1. Export a 2-stage static NPU shard:
+cascadia shard \
   --model unsloth/Llama-3.2-1B-Instruct \
   --output-dir ./llama1b-npu-2stage \
   --num-stages 2 --quantization int4 \
@@ -137,7 +137,7 @@ cascadia profile-stages --shard ./llama1b-npu-2stage --devices NPU,GPU,CPU
 
 # 3. (optional) Solve + launch a heterogeneous pipeline:
 cascadia place --profile placement_profile.json --output placement.json
-cascadia run-placement --placement placement.json
+cascadia run-placement --shard ./llama1b-npu-2stage --placement placement.json
 ```
 
 A 2-stage Llama-3.2-1B NPU shard has been run end-to-end on a Meteor Lake AI PC

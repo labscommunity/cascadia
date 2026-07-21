@@ -3,6 +3,7 @@ name = "cascadia-engine-mock"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Mock engine for tests — deterministic per-token output without real model weights."

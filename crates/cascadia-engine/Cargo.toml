@@ -3,6 +3,7 @@ name = "cascadia-engine"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Engine + Builder traits — the plugin interface every inference engine implements."
