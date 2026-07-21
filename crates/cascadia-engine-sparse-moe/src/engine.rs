@@ -2757,13 +2757,22 @@ impl Dsv4Engine {
         }
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new);
+        // Set when the decode loop stops because the context window is full
+        // rather than by the token cap or an EOS. The output was cut off, so the
+        // OpenAI finish_reason must be `length` (not `stop`) even though we
+        // generated fewer than max_new tokens — clients key continuation on it.
+        let mut hit_context_cap = false;
         loop {
             let next_u = next as u32;
             generated.push(next_u);
-            // Also stop before forwarding at pos == max_seq (the caches can't
-            // hold that absolute position). Checked after the push so the token
+            if generated.len() >= max_new || eos.contains(&next_u) {
+                break;
+            }
+            // Stop before forwarding at pos == max_seq (the caches can't hold
+            // that absolute position). Checked after the push so the token
             // sampled from the last in-range position is still emitted.
-            if generated.len() >= max_new || eos.contains(&next_u) || pos >= max_seq {
+            if pos >= max_seq {
+                hit_context_cap = true;
                 break;
             }
             match self.forward_one_token_first(
@@ -2801,7 +2810,11 @@ impl Dsv4Engine {
         );
         let mut chunk = Chunk::final_marker(id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(if hit_context_cap {
+            FinishReason::Length
+        } else {
+            finish_reason_for(n_tokens as usize, max_new)
+        });
         vec![(id, chunk)]
     }
 
