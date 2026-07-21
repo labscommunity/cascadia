@@ -36,6 +36,15 @@ pub struct MmapExpert {
     pub inter: usize,
 }
 
+/// Whether to issue a whole-expert `madvise(WILLNEED)` readahead before each
+/// GEMV. On by default; set `CASCADIA_MMAP_NOADVISE=1` to fall back to the plain
+/// on-demand fault path (the A/B baseline). Read once.
+fn readahead_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("CASCADIA_MMAP_NOADVISE").is_none())
+}
+
 impl MmapExpert {
     pub fn open(path: &Path, dim: usize, inter: usize) -> Result<Self, LoadError> {
         let f = File::open(path)?;
@@ -79,6 +88,14 @@ impl MmapExpert {
     /// [* route_w] -> w2, with the same bf16 rounding points.
     pub fn forward(&self, x: &[f32], dim: usize, limit: f32, route_w: Option<f32>) -> Vec<f32> {
         debug_assert_eq!(dim, self.dim);
+        // Issue one whole-expert sequential readahead (madvise WILLNEED) before
+        // the GEMVs fault it in page-by-page. On a cold cache this turns ~4600
+        // random 4 KB faults into one streamed read; when the expert is already
+        // resident it is a cheap no-op — so, unlike a next-layer prefetch, it
+        // never evicts the hot set. Disable for an A/B with CASCADIA_MMAP_NOADVISE=1.
+        if readahead_enabled() {
+            self.prefetch();
+        }
         let inter = self.inter;
         let w1_off = 0;
         let w3_off = section_bytes(inter, dim);
