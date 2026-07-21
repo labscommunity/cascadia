@@ -24,6 +24,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+/// Tune an inter-rank pipeline socket: TCP_NODELAY (activations are latency-
+/// sensitive) plus TCP keepalive. These sockets sit idle between requests and,
+/// on a relayed tailnet, are carried over DERP — whose idle timeout drops quiet
+/// connections, surfaced as WSAECONNABORTED (os error 10053) on the next send,
+/// which breaks the whole pipeline until a restart. Keepalive emits probe
+/// traffic during idle so the relay path stays warm. Best-effort: option
+/// failures are ignored, never fatal.
+fn tune_pipeline_socket(sock: &TcpStream) {
+    sock.set_nodelay(true).ok();
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(15));
+    let _ = socket2::SockRef::from(sock).set_tcp_keepalive(&ka);
+}
+
 pub const HEADER_SIZE: usize = 20;
 pub const MAX_RANK: usize = 3;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -528,7 +543,7 @@ impl ActivationServer {
     pub async fn accept(&mut self) -> TransportResult<()> {
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
         let (sock, addr) = listener.accept().await?;
-        sock.set_nodelay(true).ok();
+        tune_pipeline_socket(&sock);
         info!(peer = %addr, "ActivationServer accepted connection");
         self.client = Some(sock);
         self.accepted_addr = Some(addr);
@@ -671,7 +686,7 @@ impl ActivationClient {
         while Instant::now() < deadline {
             match TcpStream::connect((self.host.as_str(), self.port)).await {
                 Ok(sock) => {
-                    sock.set_nodelay(true).ok();
+                    tune_pipeline_socket(&sock);
                     info!(host = %self.host, port = self.port, "ActivationClient connected");
                     self.sock = Some(sock);
                     return Ok(());

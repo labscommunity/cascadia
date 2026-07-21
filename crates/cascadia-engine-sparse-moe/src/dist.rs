@@ -91,6 +91,28 @@ pub enum FrameKind {
     Token = 0x53_4D_45_20,        // "SME\x20"
     ForwardBatch = 0x53_4D_45_05, // "SME\x05" — was 0x03; batched K-step verify
     TokenBatch = 0x53_4D_45_21,   // "SME\x21" — batched K-step response
+    /// Prefill-intermediate Forward (0x06): identical body to `Forward`,
+    /// but the last rank must run its layers WITHOUT head/sample/record and
+    /// reply with a dummy `Token(-1)`. Rank 0 discards intermediate prefill
+    /// tokens anyway — but before this kind existed the last rank still
+    /// *sampled* one token per prompt token and pushed each into its
+    /// repetition/frequency/presence-penalty history, so the first real
+    /// token was sampled against a history full of phantom prompt
+    /// continuations (e.g. " Paris" is sampled after the prefix "The
+    /// capital of France is" and recorded — then the default rep-penalty
+    /// 1.05 demotes the real " Paris"). Single-stage `generate()` never
+    /// records prompt-loop samples, so only distributed runs corrupted.
+    /// Also skips the pointless vocab-width head GEMV per prompt token.
+    ForwardNoSample = 0x53_4D_45_06, // "SME\x06"
+    /// Streamed prefill Forward (0x07): identical body to `ForwardNoSample`
+    /// (the receiver advances KV but skips head/sample/record), except it is
+    /// **one-way** — no `Token(-1)` ack. Rank 0 fires one per prompt token
+    /// (except the last) WITHOUT blocking, and mid ranks relay downstream
+    /// without waiting for a reply, so the prompt tokens pipeline through the
+    /// ranks (per-rank compute overlaps) instead of one blocking 6-hop
+    /// round-trip each. The final prompt token still goes as a sampling
+    /// `Forward`, whose returned token is the first generated token.
+    ForwardPrefill = 0x53_4D_45_07, // "SME\x07"
 }
 
 impl FrameKind {
@@ -101,6 +123,8 @@ impl FrameKind {
             x if x == FrameKind::Token as u32 => Some(FrameKind::Token),
             x if x == FrameKind::ForwardBatch as u32 => Some(FrameKind::ForwardBatch),
             x if x == FrameKind::TokenBatch as u32 => Some(FrameKind::TokenBatch),
+            x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
+            x if x == FrameKind::ForwardPrefill as u32 => Some(FrameKind::ForwardPrefill),
             _ => None,
         }
     }
@@ -254,17 +278,19 @@ fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
     }
 }
 
-/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
-/// SamplingConfig + hidden tensor.
-pub async fn send_forward(
+/// Send a Forward-shaped frame downstream: kind + past_seq_len (u32 BE) +
+/// SamplingConfig block + hidden tensor. Shared by [`send_forward`] and
+/// [`send_forward_nosample`] — the two kinds carry identical bodies.
+async fn send_forward_kind(
     cli: &Mutex<ActivationClient>,
+    kind: FrameKind,
     past_seq_len: u32,
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
 ) -> TransportResult<()> {
     let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES];
-    header[0..4].copy_from_slice(&(FrameKind::Forward as u32).to_be_bytes());
+    header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
@@ -274,6 +300,71 @@ pub async fn send_forward(
     guard.send_raw(&header).await?;
     guard.send(&tensor).await?;
     Ok(())
+}
+
+/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
+/// SamplingConfig + hidden tensor.
+pub async fn send_forward(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::Forward,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Send a prefill-intermediate Forward ([`FrameKind::ForwardNoSample`]):
+/// identical body to [`send_forward`], but the last rank runs its layers
+/// without head/sample/record and replies with a dummy `Token(-1)`. Rank 0
+/// sends this for every prompt token except the last, so intermediate
+/// prefill samples never pollute the last rank's penalty history.
+pub async fn send_forward_nosample(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::ForwardNoSample,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Send a STREAMED prefill Forward ([`FrameKind::ForwardPrefill`]): identical
+/// body to [`send_forward_nosample`], but one-way — the receiver advances KV
+/// and does NOT reply. Rank 0 fires these back-to-back for the prompt tokens
+/// (except the last) so they pipeline through the ranks.
+pub async fn send_forward_prefill(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_kind(
+        cli,
+        FrameKind::ForwardPrefill,
+        past_seq_len,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
 }
 
 /// Receive a Forward frame's body (the kind code has already been
@@ -332,6 +423,40 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
     Ok(i64::from_be_bytes([
         raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
     ]))
+}
+
+/// Await the single `Token` reply owed to a `Forward` we just sent `down`,
+/// bounded by `deadline`.
+///
+/// Design rule: a reply to in-flight work uses a strict deadline, never the
+/// idle ceiling. The underlying [`recv_kind_client`] is idle-tolerant — it
+/// waits up to the ~900 s frame-idle ceiling for the next frame to *start* so
+/// legitimately idle relays are not killed. That tolerance is exactly wrong
+/// here: the frame is already owed. A downstream that dies mid-request (killed
+/// peer, black-holed socket with no FIN/RST) would otherwise pin this recv on
+/// the idle ceiling — the task never finalizes, and every upstream rank plus
+/// the driving API request wedges behind it instead of surfacing a fast error.
+/// On timeout this returns `Err`, so the caller tears the stage down and
+/// reconnects. The caller picks `deadline` for the frame it just sent; for
+/// dsv4's token-at-a-time forwarding that is a single per-token budget
+/// ([`cascadia_transport::recv_timeout`]) whether the token is prefill or
+/// decode, since each reply carries the same single-token downstream compute.
+pub async fn recv_token_reply(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+) -> Result<i64, String> {
+    tokio::time::timeout(deadline, async {
+        match recv_kind_client(down).await {
+            Ok(Some(FrameKind::Token)) => recv_token_body_client(down)
+                .await
+                .map_err(|e| format!("recv_token: {e}")),
+            Ok(Some(other)) => Err(format!("expected Token reply, got {other:?}")),
+            Ok(None) => Err("downstream closed before Token".into()),
+            Err(e) => Err(format!("recv_kind: {e}")),
+        }
+    })
+    .await
+    .map_err(|_| format!("reply timeout after {deadline:?}: downstream silent (dead peer?)"))?
 }
 
 /// Hard cap on the number of hidden positions one ForwardBatch /

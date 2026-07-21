@@ -1,0 +1,441 @@
+//! dsv4 numeric primitives: bf16 rounding, RMSNorm, Walsh-Hadamard, and the
+//! QAT quant-dequant simulations (block FP8 e4m3 / FP4 e2m1 with power-of-2
+//! scales) that DeepSeek-V4 applies at inference time.
+//!
+//! Bit-exactness contract (vs `tools/deepseek_v4_ref/kernels_ref.py`):
+//! - `pow2_round_up` ports upstream `fast_round_scale`'s IEEE-754 bit trick
+//!   verbatim, so scales are exact.
+//! - `round_e4m3` / `round_e2m1` land exactly on the FP8/FP4 grids (RNE,
+//!   ties-to-even-mantissa), so the quant sims are bit-exact.
+//! - everything accumulates in f32 and rounds to bf16 at the same points the
+//!   bf16 reference does.
+
+use half::bf16;
+
+/// Per-section decode profiler, gated by the `DSV4_PROFILE` env var. When the
+/// var is unset `add`/`dump` are no-ops (only a cheap cached-bool check and an
+/// unused `Instant`), so it is safe to leave wired into the hot path in
+/// release builds. Set `DSV4_PROFILE=1` to have each `forward_layers_decode`
+/// print the per-layer wall time split across the major sections — how the
+/// GPU-expert build's decode budget was diagnosed (experts vs proj vs the
+/// Sinkhorn/DSA glue). Not part of any correctness path.
+///
+/// Usage: `DSV4_PROFILE=1 cascadia worker …` → `DSV4_PROF decode wall_ms=…`
+/// lines on stderr, one dump per decoded token (cumulative).
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const PROJ: usize = 0; // attention projection GEMVs (wq_a/wq_b/wkv/wo)
+    pub const INDEXER: usize = 1; // DSA indexer top-k selection
+    pub const COMPRESS: usize = 2; // learned KV compressor
+    pub const SPARSE: usize = 3; // sparse-attention softmax
+    pub const SINK: usize = 4; // Hyper-Connections Sinkhorn mixing
+    pub const EXPERTS: usize = 5; // routed + shared expert FFNs
+    pub const WALL: usize = 6; // whole per-layer decode (denominator)
+    const N: usize = 7;
+    const NAMES: [&str; N] = [
+        "proj", "indexer", "compress", "sparse", "sinkhorn", "experts", "WALL",
+    ];
+    static NS: [AtomicU64; N] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Cached `DSV4_PROFILE` check (read once).
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("DSV4_PROFILE").is_ok())
+    }
+
+    /// Accumulate `since.elapsed()` into `bucket` (no-op when disabled).
+    #[inline]
+    pub fn add(bucket: usize, since: Instant) {
+        if enabled() {
+            NS[bucket].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Print the cumulative per-section split as a share of WALL (no-op when
+    /// disabled). Called once per decoded token; the last line before teardown
+    /// is the whole-generation total.
+    pub fn dump(tag: &str) {
+        if !enabled() {
+            return;
+        }
+        let wall = NS[WALL].load(Ordering::Relaxed).max(1);
+        let mut summed = 0u64;
+        eprintln!("DSV4_PROF {tag} wall_ms={:.1}", wall as f64 / 1e6);
+        for i in 0..WALL {
+            let v = NS[i].load(Ordering::Relaxed);
+            summed += v;
+            eprintln!(
+                "  {:9} {:9.1} ms  {:4.1}%",
+                NAMES[i],
+                v as f64 / 1e6,
+                v as f64 / wall as f64 * 100.0
+            );
+        }
+        let resid = wall.saturating_sub(summed);
+        eprintln!(
+            "  {:9} {:9.1} ms  {:4.1}%  (gate/norm/rope/misc)",
+            "other",
+            resid as f64 / 1e6,
+            resid as f64 / wall as f64 * 100.0
+        );
+    }
+}
+
+/// Round an f32 to the nearest bf16 value, returned as f32 (RNE).
+#[inline]
+pub fn to_bf16(v: f32) -> f32 {
+    bf16::from_f32(v).to_f32()
+}
+
+/// In-place bf16 rounding of a whole buffer.
+pub fn round_bf16(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = to_bf16(*v);
+    }
+}
+
+/// 2^ceil(log2(x)) for positive normal x — upstream `fast_round_scale` /
+/// `fast_log2_ceil` bit tricks, ported exactly.
+#[inline]
+pub fn pow2_round_up(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x007f_ffff;
+    let e = exp - 127 + if man != 0 { 1 } else { 0 };
+    f32::from_bits((((e + 127) as u32) & 0xff) << 23)
+}
+
+/// Round-to-nearest-even onto the FP8 e4m3fn grid. Caller pre-clamps to
+/// [-448, 448] (the quant sims always do).
+#[inline]
+pub fn round_e4m3(v: f32) -> f32 {
+    if v == 0.0 {
+        return 0.0;
+    }
+    let a = v.abs();
+    let sign = if v < 0.0 { -1.0 } else { 1.0 };
+    const MIN_NORMAL: f32 = 0.015625; // 2^-6
+    if a < MIN_NORMAL {
+        // subnormal grid: multiples of 2^-9
+        let q = (a * 512.0).round_ties_even();
+        return sign * q * (1.0 / 512.0);
+    }
+    // normal: RNE of the f32 mantissa down to 3 bits
+    let bits = a.to_bits();
+    const SHIFT: u32 = 23 - 3;
+    let lsb = (bits >> SHIFT) & 1;
+    let rounded = bits + ((1u32 << (SHIFT - 1)) - 1) + lsb;
+    sign * f32::from_bits(rounded & !((1u32 << SHIFT) - 1))
+}
+
+/// e2m1 magnitude grid and RNE with ties-to-even-mantissa (grid entries with
+/// even mantissa: 0, 1, 2, 4 at indices 0, 2, 4, 6).
+const E2M1_GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+const E2M1_MID: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
+const E2M1_TIE_IDX: [usize; 7] = [0, 2, 2, 4, 4, 6, 6];
+
+/// Round-to-nearest-even onto the FP4 e2m1 grid. Caller pre-clamps to ±6.
+#[inline]
+pub fn round_e2m1(v: f32) -> f32 {
+    let a = v.abs();
+    let sign = if v < 0.0 { -1.0 } else { 1.0 };
+    let mut idx = E2M1_MID.len(); // a >= all midpoints -> top bucket
+    for (k, &m) in E2M1_MID.iter().enumerate() {
+        if a < m {
+            idx = k;
+            break;
+        }
+        if a == m {
+            return sign * E2M1_GRID[E2M1_TIE_IDX[k]];
+        }
+    }
+    sign * E2M1_GRID[idx]
+}
+
+/// Block-wise FP8 quant-dequant sim (upstream `act_quant(..., inplace=True)`
+/// with power-of-2 scales): per `block`-sized group along the last dim,
+/// s = 2^ceil(log2(max(amax, 1e-4) / 448)), x <- bf16(e4m3(clamp(x/s)) * s).
+pub fn act_quant_sim(x: &mut [f32], block: usize) {
+    assert_eq!(x.len() % block, 0, "act_quant_sim: len % block != 0");
+    for grp in x.chunks_mut(block) {
+        let amax = grp.iter().fold(0.0f32, |m, &v| m.max(v.abs())).max(1e-4);
+        let s = pow2_round_up(amax * (1.0 / 448.0));
+        for v in grp.iter_mut() {
+            let q = round_e4m3((*v / s).clamp(-448.0, 448.0));
+            *v = to_bf16(q * s);
+        }
+    }
+}
+
+/// Block-wise FP4 quant-dequant sim (upstream `fp4_act_quant(...,
+/// inplace=True)`): s = 2^ceil(log2(max(amax, 6*2^-126) / 6)),
+/// x <- bf16(e2m1(clamp(x/s, ±6)) * s).
+pub fn fp4_act_quant_sim(x: &mut [f32], block: usize) {
+    assert_eq!(x.len() % block, 0, "fp4_act_quant_sim: len % block != 0");
+    const AMAX_FLOOR: f32 = 6.0 * f32::MIN_POSITIVE * 0.5; // 6 * 2^-126 (2^-126 = MIN_POSITIVE)
+    for grp in x.chunks_mut(block) {
+        let amax = grp
+            .iter()
+            .fold(0.0f32, |m, &v| m.max(v.abs()))
+            .max(6.0 * 2.0f32.powi(-126))
+            .max(AMAX_FLOOR);
+        let s = pow2_round_up(amax * (1.0 / 6.0));
+        for v in grp.iter_mut() {
+            let q = round_e2m1((*v / s).clamp(-6.0, 6.0));
+            *v = to_bf16(q * s);
+        }
+    }
+}
+
+/// RMSNorm matching the reference: y = bf16(w * (x / sqrt(mean(x^2) + eps))),
+/// all internal math f32, one bf16 rounding at the end. `x` is [rows, dim].
+pub fn rmsnorm(x: &mut [f32], w: &[f32], eps: f32) {
+    let dim = w.len();
+    assert_eq!(x.len() % dim, 0, "rmsnorm: len % dim != 0");
+    for row in x.chunks_mut(dim) {
+        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let r = 1.0 / (ms + eps).sqrt();
+        for (v, &wi) in row.iter_mut().zip(w) {
+            *v = to_bf16(*v * r * wi);
+        }
+    }
+}
+
+/// Per-head "plain" RMS normalisation used on q (`q *= rsqrt(mean(q^2)+eps)`)
+/// — no weight, output bf16-rounded. `x` is [rows, dim].
+pub fn rms_normalize(x: &mut [f32], dim: usize, eps: f32) {
+    assert_eq!(x.len() % dim, 0);
+    for row in x.chunks_mut(dim) {
+        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+        let r = 1.0 / (ms + eps).sqrt();
+        for v in row.iter_mut() {
+            *v = to_bf16(*v * r);
+        }
+    }
+}
+
+/// Walsh-Hadamard transform along the last dim (power of 2), scaled by
+/// `scale`, f32 butterflies, output bf16-rounded (reference dtype behaviour).
+pub fn hadamard(x: &mut [f32], dim: usize, scale: f32) {
+    assert!(dim.is_power_of_two(), "hadamard: dim not a power of 2");
+    assert_eq!(x.len() % dim, 0);
+    for row in x.chunks_mut(dim) {
+        let mut h = 1;
+        while h < dim {
+            let mut base = 0;
+            while base < dim {
+                for i in 0..h {
+                    let a = row[base + i];
+                    let b = row[base + h + i];
+                    row[base + i] = a + b;
+                    row[base + h + i] = a - b;
+                }
+                base += 2 * h;
+            }
+            h *= 2;
+        }
+        for v in row.iter_mut() {
+            *v = to_bf16(*v * scale);
+        }
+    }
+}
+
+/// f32 dot product, AVX2+FMA when the CPU has it (8 lanes) else scalar.
+/// The vectorised reduction sums in a different order than the scalar
+/// left-to-right loop, so results differ by ULPs — the model tolerates that
+/// (the same arch already runs coherently under AVX-512 vs scalar). Hosts
+/// without AVX2 (e.g. arm64 dev machines) take the scalar path, so the golden
+/// tests stay bit-identical there.
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-gated at runtime; slices are the same length.
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    dot_scalar(a, b)
+}
+
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for k in 0..a.len() {
+        acc += a[k] * b[k];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    // 4 independent accumulators hide FMA latency; 32 elems/iter.
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+        acc1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 8)),
+            _mm256_loadu_ps(pb.add(i + 8)),
+            acc1,
+        );
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 16)),
+            _mm256_loadu_ps(pb.add(i + 16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 24)),
+            _mm256_loadu_ps(pb.add(i + 24)),
+            acc3,
+        );
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+        i += 8;
+    }
+    let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    // horizontal sum of the 8 lanes
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s);
+    let sums = _mm_add_ps(s, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < n {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
+/// f32 GEMV: y[o] = sum_k w[o*k_dim + k] * x[k]; output bf16-rounded
+/// (the reference's F.linear on bf16 rounds its output to bf16).
+///
+/// Output rows are independent, so we split them across cores with rayon.
+/// The per-row accumulation order is unchanged, so the result is BIT-IDENTICAL
+/// to the sequential version — this is pure throughput, no numerics change.
+/// The MoE experts + every attention projection funnel through here, so this
+/// is where the CPU time is; a single scalar thread was using 1/8 of the box.
+pub fn linear_bf16(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(w.len(), out_dim * in_dim);
+    assert_eq!(y.len(), out_dim);
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        *yy = to_bf16(dot(row, x));
+    });
+}
+
+/// Dot of bf16-bit weights `w` with f32 activations `x`. The weights are read
+/// as 2-byte bf16 — half the memory traffic of an f32 row, which is the whole
+/// point on the batch-1 attention projections (bandwidth-bound). Each weight
+/// widens to f32 by the exact `<<16` bit expansion (bf16 is the top 16 bits of
+/// an f32), then multiplies in f32. AVX2 widens 8 lanes per instruction; the
+/// scalar fallback (non-x86 dev hosts) sums left-to-right so it matches a
+/// `to_bf16`-then-`dot_scalar` weight exactly — the tiny goldens stay stable.
+pub fn dot_bf16w(w: &[u16], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-gated at runtime; both reads are bounded by `n`.
+            return unsafe { dot_bf16w_avx2(w, x) };
+        }
+    }
+    dot_bf16w_scalar(w, x)
+}
+
+#[inline]
+fn dot_bf16w_scalar(w: &[u16], x: &[f32]) -> f32 {
+    let n = w.len().min(x.len());
+    let mut acc = 0.0f32;
+    for k in 0..n {
+        acc += f32::from_bits((w[k] as u32) << 16) * x[k];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16w_avx2(w: &[u16], x: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let (pw, px) = (w.as_ptr(), x.as_ptr());
+    let widen = |p: *const u16| -> __m256 {
+        // load 8 bf16 bits -> zero-extend to u32 -> <<16 -> reinterpret f32
+        let bits = _mm_loadu_si128(p as *const __m128i);
+        _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bits), 16))
+    };
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        acc0 = _mm256_fmadd_ps(widen(pw.add(i)), _mm256_loadu_ps(px.add(i)), acc0);
+        acc1 = _mm256_fmadd_ps(widen(pw.add(i + 8)), _mm256_loadu_ps(px.add(i + 8)), acc1);
+        i += 16;
+    }
+    while i + 8 <= n {
+        acc0 = _mm256_fmadd_ps(widen(pw.add(i)), _mm256_loadu_ps(px.add(i)), acc0);
+        i += 8;
+    }
+    let acc = _mm256_add_ps(acc0, acc1);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let s = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s);
+    let sums = _mm_add_ps(s, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < n {
+        total += f32::from_bits((*pw.add(i) as u32) << 16) * *px.add(i);
+        i += 1;
+    }
+    total
+}
+
+/// [`linear_bf16`] with bf16-bit-stored weights (half the weight bandwidth).
+/// Used for the attention projections, whose f32 weights dominated decode.
+pub fn linear_bf16_w(x: &[f32], w: &[u16], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(w.len(), out_dim * in_dim);
+    assert_eq!(y.len(), out_dim);
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        *yy = to_bf16(dot_bf16w(row, x));
+    });
+}
+
+/// Same as [`linear_bf16`] but keeps the output in f32 (for the fp32 paths:
+/// gate scores, compressor wkv/wgate). Bit-identical rayon parallelisation.
+pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(w.len(), out_dim * in_dim);
+    assert_eq!(y.len(), out_dim);
+    y.par_iter_mut().enumerate().for_each(|(o, yy)| {
+        let row = &w[o * in_dim..(o + 1) * in_dim];
+        *yy = dot(row, x);
+    });
+}

@@ -29,8 +29,12 @@ models/
 *.gguf
 shards/
 shards_cached/
+# Exception: the tiny dsv4 export fixture's tensors are committed — the golden
+# tests (engine/pipeline/wire/mmap) need them and CI cannot regenerate them.
+!crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_export/**/*.safetensors
 
 # Local AI-tooling state (agent scratch, never commit)
 .claude/
 .swarm/
 ruvector.db
+crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_big_export/

@@ -1,0 +1,108 @@
+{
+  "tiny": {
+    "max_batch_size": 1,
+    "max_seq_len": 64,
+    "dtype": "bf16",
+    "vocab_size": 128,
+    "dim": 64,
+    "moe_inter_dim": 32,
+    "n_layers": 4,
+    "n_hash_layers": 1,
+    "n_mtp_layers": 1,
+    "n_heads": 4,
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "n_activated_experts": 2,
+    "score_func": "sqrtsoftplus",
+    "route_scale": 1.5,
+    "swiglu_limit": 10.0,
+    "q_lora_rank": 32,
+    "head_dim": 80,
+    "rope_head_dim": 16,
+    "o_groups": 2,
+    "o_lora_rank": 32,
+    "window_size": 8,
+    "compress_ratios": [
+      0,
+      4,
+      16,
+      4,
+      0
+    ],
+    "compress_rope_theta": 160000.0,
+    "original_seq_len": 0,
+    "rope_theta": 10000.0,
+    "index_n_heads": 2,
+    "index_head_dim": 32,
+    "index_topk": 4,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "hc_eps": 1e-06
+  },
+  "compress_fired": {
+    "comp4": [
+      [
+        "prefill",
+        4
+      ],
+      [
+        "pos19",
+        1
+      ],
+      [
+        "pos23",
+        1
+      ]
+    ],
+    "comp16": [
+      [
+        "prefill",
+        1
+      ],
+      [
+        "pos31",
+        1
+      ]
+    ],
+    "compidx": [
+      [
+        "prefill",
+        4
+      ],
+      [
+        "pos19",
+        1
+      ],
+      [
+        "pos23",
+        1
+      ]
+    ]
+  },
+  "prompt": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18
+  ],
+  "greedy_tokens": [
+    104,
+    104,
+    104
+  ],
+  "note": "integration hiddens are [b,s,hc,dim] (prefill s=18, decode s=1); attn hook in/out are the normed input / attn output of Attention.forward for each layer+phase"
+}

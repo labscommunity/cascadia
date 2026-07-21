@@ -247,6 +247,13 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub model: String,
 
+    /// Name reported by `/v1/models` and accepted as the `model` field in
+    /// requests. Defaults to the basename of `--model` (so a local path like
+    /// `C:\models\dsv4-4stage` is served as `dsv4-4stage`, not the raw path,
+    /// which is ugly and breaks clients that build request JSON naively).
+    #[arg(long)]
+    pub served_model_name: Option<String>,
+
     /// Bind address for the upstream-receiving socket (default :9100).
     #[arg(long, default_value = ":9100")]
     pub listen: String,
@@ -551,6 +558,7 @@ impl WorkerArgs {
             layer_start: 0,
             layer_end: 0,
             model,
+            served_model_name: None,
             listen: ":9100".into(),
             next: None,
             api: Some(api),
@@ -1588,6 +1596,20 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             EngineKind::Qwen36Moe => {
                 cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model))
             }
+            // sparse-moe exports (dsv4) keep the tokenizer files and
+            // chat_template.jinja at the model root, not in a tokenizer/
+            // subdir. Read the root first; fall back to the subdir layout so
+            // other sparse-moe models (MiniMax-M2) that ship a tokenizer/
+            // subdir still resolve their template.
+            EngineKind::SparseMoe => {
+                let root =
+                    cascadia_api::load_chat_template_config_at(std::path::Path::new(&args.model));
+                if root.template.is_some() {
+                    root
+                } else {
+                    cascadia_api::load_chat_template_config(std::path::Path::new(&args.model))
+                }
+            }
             _ => cascadia_api::load_chat_template_config(std::path::Path::new(&args.model)),
         };
         if chat_template.template.is_some() {
@@ -1614,9 +1636,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the dashboard's /api/stats reads them — same Arc, so the cluster
         // view updates as prompts run.
         let api_stats = Arc::new(cascadia_api::ApiStats::default());
+        // Served model name: explicit override, else the basename of --model
+        // (split on both separators so a Windows path works on any build).
+        let served_model = args.served_model_name.clone().unwrap_or_else(|| {
+            args.model
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(args.model.as_str())
+                .to_string()
+        });
         let api_router = cascadia_api::make_router_with_stats(
             runner.clone(),
-            args.model.clone(),
+            served_model,
             cfg,
             api_stats.clone(),
         );
