@@ -437,9 +437,10 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// the idle ceiling — the task never finalizes, and every upstream rank plus
 /// the driving API request wedges behind it instead of surfacing a fast error.
 /// On timeout this returns `Err`, so the caller tears the stage down and
-/// reconnects. `deadline` is [`cascadia_transport::recv_timeout`] for a decode
-/// step; a prefill reply can trail whole-prompt downstream compute, so callers
-/// widen it by [`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`].
+/// reconnects. The caller picks `deadline` for the frame it just sent; for
+/// dsv4's token-at-a-time forwarding that is a single per-token budget
+/// ([`cascadia_transport::recv_timeout`]) whether the token is prefill or
+/// decode, since each reply carries the same single-token downstream compute.
 pub async fn recv_token_reply(
     down: &Mutex<ActivationClient>,
     deadline: std::time::Duration,

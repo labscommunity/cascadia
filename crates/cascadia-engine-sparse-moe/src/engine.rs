@@ -2654,15 +2654,19 @@ impl Dsv4Engine {
         })
     }
 
-    /// Strict reply deadline for a single decode-step Token (sub-second when
-    /// healthy); a prefill reply can trail whole-prompt downstream compute, so
-    /// it gets the widened budget.
-    fn decode_reply_deadline() -> std::time::Duration {
+    /// Strict deadline for the Token reply owed to one forwarded token.
+    ///
+    /// dsv4 forwards the prompt one token at a time (no batched-prefill frame),
+    /// so a prefill reply and a decode reply carry the same single-token compute
+    /// through the chain — there is no whole-prompt tail to wait out, and hence
+    /// no reason to apply the batched `PREFILL_REPLY_TIMEOUT_FACTOR` widening
+    /// here. A healthy per-token reply lands well inside the observed TTFT
+    /// (~seconds); `recv_timeout` (default 60 s, env/config tunable) is a wide
+    /// margin over that yet short enough that a black-holed peer — one that dies
+    /// without a clean FIN/RST, the failure mode seen on this fleet — surfaces
+    /// as a fast error inside a client's request window instead of a wedge.
+    fn reply_deadline() -> std::time::Duration {
         cascadia_transport::recv_timeout()
-    }
-    fn prefill_reply_deadline() -> std::time::Duration {
-        cascadia_transport::recv_timeout()
-            .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
     }
 
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -2727,7 +2731,7 @@ impl Dsv4Engine {
                 &cfg,
                 &downstream,
                 sample_back,
-                Self::prefill_reply_deadline(),
+                Self::reply_deadline(),
             ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
@@ -2754,7 +2758,7 @@ impl Dsv4Engine {
                 &cfg,
                 &downstream,
                 true,
-                Self::decode_reply_deadline(),
+                Self::reply_deadline(),
             ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
@@ -2900,11 +2904,11 @@ impl Dsv4Engine {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = self.runner.hidden_size() as u32;
             // Same design rule as rank 0's head: the Token reply is owed to a frame
-            // we just forwarded, so bound the wait on the strict (prefill-widened)
-            // deadline. If our own downstream is dead, this relay must surface an
-            // error that tears the stage down — an unbounded recv here would wedge
-            // this rank AND every upstream rank blocked waiting on our reply.
-            let reply_deadline = Self::prefill_reply_deadline();
+            // we just forwarded, so bound the wait on the strict deadline. If our
+            // own downstream is dead, this relay must surface an error that tears
+            // the stage down — an unbounded recv here would wedge this rank AND
+            // every upstream rank blocked waiting on our reply.
+            let reply_deadline = Self::reply_deadline();
             self.block_on(async {
                 if sample {
                     send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
