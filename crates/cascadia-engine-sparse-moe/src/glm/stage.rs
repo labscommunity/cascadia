@@ -135,6 +135,31 @@ impl GlmRunner {
         }
 
         if mode == ExpertsMode::Mmap {
+            // Always-active residency: the shared expert (fires every token) and
+            // the dense-layer MLPs (first_k_dense_replace) are read on EVERY
+            // forward, so under the routed-expert churn their pages get evicted
+            // and re-faulted each token. mlock them unconditionally (~1.8 GB for
+            // the full model) so they stay resident — guaranteed hits, ~1/9 of
+            // active expert bytes. Disable for an A/B with CASCADIA_GLM5_NOPIN_ACTIVE=1.
+            if std::env::var_os("CASCADIA_GLM5_NOPIN_ACTIVE").is_none() {
+                let mut act = 0usize;
+                for layer in s.layers.iter() {
+                    let e = match (layer.moe(), layer.dense_expert()) {
+                        (Some(ml), _) => ml.shared().as_mmap(),
+                        (None, Some(d)) => d.as_mmap(),
+                        _ => None,
+                    };
+                    if let Some(mm) = e {
+                        if mm.pin().is_ok() {
+                            act += 1;
+                        }
+                    }
+                }
+                if act > 0 {
+                    eprintln!("[glm5] rank {rank}: mlock'd {act} always-active experts (shared + dense)");
+                }
+            }
+
             let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq);
             let (total, hot) = {
                 let u = usage.lock().unwrap();

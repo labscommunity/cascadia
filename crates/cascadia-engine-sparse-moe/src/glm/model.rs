@@ -69,6 +69,15 @@ impl GlmLayer {
         }
     }
 
+    /// The dense-layer MLP expert, if this is a dense (first-k) layer — for
+    /// pinning the always-active weights.
+    pub fn dense_expert(&self) -> Option<&AnyExpert> {
+        match &self.mlp {
+            LayerMlp::Dense { w, .. } => Some(w),
+            LayerMlp::Moe(_) => None,
+        }
+    }
+
     /// Process one token at the next cached position. `x` is the residual-stream
     /// hidden `[hidden]`; returns the updated hidden after this layer. `carry`
     /// threads the IndexShare top-k selection (full layer writes, shared reads).
