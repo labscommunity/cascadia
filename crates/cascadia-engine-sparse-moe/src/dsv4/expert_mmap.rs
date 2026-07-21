@@ -32,6 +32,7 @@ fn section_bytes(out_dim: usize, in_dim: usize) -> usize {
 /// each as packed nibbles followed by bf16-LE per-32 scales.
 pub struct MmapExpert {
     mmap: Mmap,
+    path: std::path::PathBuf,
     dim: usize,
     pub inter: usize,
 }
@@ -45,7 +46,34 @@ impl MmapExpert {
             return Err(LoadError::ExpertBin(path.display().to_string(), len));
         }
         let mmap = unsafe { Mmap::map(&f)? };
-        Ok(Self { mmap, dim, inter })
+        Ok(Self { mmap, path: path.to_path_buf(), dim, inter })
+    }
+
+    /// Read this expert's whole bin into an owned buffer in ONE bulk sequential
+    /// read (light-R1). Called concurrently across a layer's routed experts so
+    /// the reads happen up-front, off the compute threads, at full sequential
+    /// bandwidth — instead of faulting mmap pages in mid-GEMV. The returned bytes
+    /// are byte-identical to `self.mmap`, so [`Self::swiglu_from`] is bit-exact
+    /// vs the mmap path.
+    pub fn read_bytes(&self) -> std::io::Result<Vec<u8>> {
+        std::fs::read(&self.path)
+    }
+
+    /// SwiGLU FFN over an explicitly-read byte buffer (the R1 path). Mirrors
+    /// `crate::glm::ffn::swiglu_mmap` exactly, but reads weights from `data`
+    /// (whole-expert buffer) rather than the mmap.
+    pub fn swiglu_from(&self, data: &[u8], x: &[f32]) -> Vec<f32> {
+        let (inter, dim) = (self.inter, self.dim);
+        let mut h = vec![0.0f32; inter];
+        self.gemv_on(data, 0, inter, dim, x, &mut h);
+        let mut u = vec![0.0f32; inter];
+        self.gemv_on(data, section_bytes(inter, dim), inter, dim, x, &mut u);
+        for (hi, &ui) in h.iter_mut().zip(&u) {
+            *hi = (*hi / (1.0 + (-*hi).exp())) * ui; // silu(gate)*up — matches ffn::swiglu_mmap
+        }
+        let mut out = vec![0.0f32; dim];
+        self.gemv_on(data, 2 * section_bytes(inter, dim), dim, inter, &h, &mut out);
+        out
     }
 
     /// y = W x with W dequantized row-by-row; y[o] rounded to bf16 exactly
@@ -56,12 +84,18 @@ impl MmapExpert {
     /// (same per-row accumulation order), just spread across the CPU — this is
     /// the real-model MoE hot path (256 experts, mmap int4).
     fn gemv(&self, sec_off: usize, out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]) {
+        self.gemv_on(&self.mmap, sec_off, out_dim, in_dim, x, y);
+    }
+
+    /// `gemv` over an arbitrary byte source (`self.mmap` or an R1 read buffer).
+    /// The two are byte-identical, so the result is bitwise the same either way.
+    fn gemv_on(&self, data: &[u8], sec_off: usize, out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]) {
         use rayon::prelude::*;
         debug_assert_eq!(x.len(), in_dim);
         debug_assert_eq!(y.len(), out_dim);
         let ng = in_dim / G;
-        let packed = &self.mmap[sec_off..sec_off + out_dim * in_dim / 2];
-        let scales = &self.mmap
+        let packed = &data[sec_off..sec_off + out_dim * in_dim / 2];
+        let scales = &data
             [sec_off + out_dim * in_dim / 2..sec_off + out_dim * in_dim / 2 + out_dim * ng * 2];
         let row_bytes = in_dim / 2;
         // Each output row is an independent fused dequant+dot: the int4 nibbles
