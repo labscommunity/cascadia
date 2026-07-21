@@ -78,7 +78,9 @@ impl Expert {
 
 /// Expert storage: eagerly-dequantized f32 (tiny fixtures / dev) or mmap'd
 /// int4_bin (production — weights stay packed on disk, rows dequantized on
-/// the fly). The two paths are numerically identical (see `expert_mmap`).
+/// the fly). The two paths agree within a few bf16 ULP (not bitwise — the mmap
+/// kernel reorders the f32 sum) and produce identical greedy tokens; see
+/// `expert_mmap`.
 pub enum AnyExpert {
     Eager(Expert),
     Mmap(super::expert_mmap::MmapExpert),

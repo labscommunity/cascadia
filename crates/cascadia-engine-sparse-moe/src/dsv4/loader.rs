@@ -134,8 +134,10 @@ fn load_expert_bin(path: &Path, dim: usize, inter: usize) -> Result<Expert, Load
 /// `Eager` dequantizes every expert to f32 at load — fast forwards, but
 /// ~285 GB per rank at real-model scale. `Mmap` keeps the int4_bin files
 /// memory-mapped and dequantizes rows on the fly — the only viable mode for
-/// the 43-layer 257-expert model. Numerics are identical either way
-/// (validated bitwise by `dsv4_expert_mmap.rs`).
+/// the 43-layer 257-expert model. The two paths agree within a few bf16 ULP —
+/// the fused mmap kernel reorders the f32 summation, so it is *not* bitwise —
+/// but produce identical greedy tokens (validated to tolerance + exact greedy
+/// by `dsv4_expert_mmap.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertsMode {
     Eager,

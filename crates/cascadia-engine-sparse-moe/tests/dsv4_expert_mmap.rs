@@ -1,6 +1,8 @@
-//! Mmap'd int4 experts must be BIT-IDENTICAL to the eager f32 path — same
-//! nibble decode, same accumulation order — so the exact-greedy guarantees
-//! carry over to the production (mmap) configuration unchanged.
+//! Mmap'd int4 experts must match the eager f32 path within a few bf16 ULP —
+//! same nibble decode, but the fused SIMD kernel reorders the f32 accumulation,
+//! so outputs are equal-or-within-ULP, not bitwise — while producing identical
+//! greedy tokens, so the exact-greedy guarantees carry over to the production
+//! (mmap) configuration unchanged.
 
 use std::path::PathBuf;
 
