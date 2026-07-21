@@ -134,6 +134,87 @@ fn dequant_int4(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> R
     Ok(w)
 }
 
+/// int3 packed group size in bytes (32 values × 3 bits = 96 bits = 12 bytes).
+const INT3_GROUP_BYTES: usize = G * 3 / 8;
+
+/// Dequantize one int3 section: `[out_dim, in_dim]` group-32, 3 bits/weight as an
+/// LSB-first bitstream (32 vals → 12 bytes) then bf16-LE per-group scales.
+/// Value = `(u3 − 4) · scale`. Mirrors `export_glm5.py::_pack_int3_grouped`.
+///
+/// The int3 format foundation (A2, cold-expert mixed precision). Not yet on the
+/// load path: the format dispatch (`experts_format == "int3_bin"`) + the mmap
+/// int3 GEMV are the remaining wiring; this + its test lock the pack↔unpack
+/// contract first.
+#[allow(dead_code)]
+fn dequant_int3(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> Result<Vec<f32>, LoadError> {
+    if in_dim % G != 0 {
+        return Err(LoadError::Manifest(format!("int3 in_dim {in_dim} not divisible by group {G}")));
+    }
+    let ng = in_dim / G;
+    let packed_len = out_dim * ng * INT3_GROUP_BYTES;
+    let scale_len = out_dim * ng * 2;
+    if *off + packed_len + scale_len > buf.len() {
+        return Err(LoadError::ExpertBin("int3 section truncated".into(), buf.len()));
+    }
+    let packed = &buf[*off..*off + packed_len];
+    let scales_raw = &buf[*off + packed_len..*off + packed_len + scale_len];
+    *off += packed_len + scale_len;
+    let mut w = vec![0.0f32; out_dim * in_dim];
+    for o in 0..out_dim {
+        for gi in 0..ng {
+            let s = bf16::from_le_bytes([scales_raw[(o * ng + gi) * 2], scales_raw[(o * ng + gi) * 2 + 1]])
+                .to_f32();
+            let gp = &packed[(o * ng + gi) * INT3_GROUP_BYTES..(o * ng + gi + 1) * INT3_GROUP_BYTES];
+            for i in 0..G {
+                let bit = i * 3;
+                let b0 = gp[bit / 8] as u16;
+                let b1 = if bit / 8 + 1 < INT3_GROUP_BYTES { gp[bit / 8 + 1] as u16 } else { 0 };
+                let u3 = (((b0 | (b1 << 8)) >> (bit % 8)) & 0x7) as i32;
+                w[o * in_dim + gi * G + i] = (u3 - 4) as f32 * s;
+            }
+        }
+    }
+    Ok(w)
+}
+
+#[cfg(test)]
+mod int3_tests {
+    use super::*;
+
+    // Pack 32 u3 values (0..7) LSB-first into 12 bytes, the exact layout
+    // np.packbits(bitorder="little") produces in _pack_int3_grouped.
+    fn pack_group(u3: &[u8; 32]) -> [u8; INT3_GROUP_BYTES] {
+        let mut out = [0u8; INT3_GROUP_BYTES];
+        for (i, &v) in u3.iter().enumerate() {
+            for b in 0..3 {
+                if (v >> b) & 1 == 1 {
+                    let bit = i * 3 + b;
+                    out[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dequant_int3_matches_pack_layout() {
+        // one row, one group; scale 1.0 (bf16 0x3f80). u3[i] = i % 8.
+        let u3: [u8; 32] = std::array::from_fn(|i| (i % 8) as u8);
+        let packed = pack_group(&u3);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&bf16::from_f32(1.0).to_le_bytes());
+        let mut off = 0;
+        let w = dequant_int3(&buf, &mut off, 1, 32).unwrap();
+        assert_eq!(off, buf.len(), "consumed the whole section");
+        for i in 0..32 {
+            assert_eq!(w[i], (u3[i] as i32 - 4) as f32, "value {i} mismatch");
+        }
+        // section byte size: 12 packed + 2 scale.
+        assert_eq!(buf.len(), INT3_GROUP_BYTES + 2);
+    }
+}
+
 /// Load one `expert_*.bin` / `dense.bin`: gate `[inter,hidden]`, up
 /// `[inter,hidden]`, down `[hidden,inter]`. `Eager` dequantizes to f32 (fast,
 /// tiny/dev); `Mmap` keeps it packed on disk and dequantizes rows on the fly
