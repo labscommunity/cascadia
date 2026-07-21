@@ -323,6 +323,10 @@ impl Builder for Qwen36Builder {
             active: None,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }))
     }
 }
@@ -372,6 +376,10 @@ pub struct Qwen36Engine {
     /// Issue-34 Option C: opaque multi-stage KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 Option C: lock-free holder mirror of `kv` — the capture sites write both, and
+    /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
 }
 
 /// In-flight task state. `step()` advances one token per call so the
@@ -1208,6 +1216,11 @@ impl Qwen36Engine {
                 // RESET comes at the next admission), chain CAPTURE downstream, then ack upstream.
                 // Best-effort: a blob/chain miss degrades to no warm-pull, never breaks generation.
                 if let Some(blob) = self.blob_local_stages() {
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    self.kv_share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capture_under_epoch(kv_epoch, tokens.clone(), blob.clone());
                     self.kv.capture_under_epoch(kv_epoch, tokens.clone(), blob);
                 }
                 if !is_last {
@@ -1614,6 +1627,17 @@ impl Engine for Qwen36Engine {
         }
         Some(self)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        if self.stages.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.kv_fingerprint(),
+        }))
+    }
 }
 
 #[cfg(feature = "kv_coord")]
@@ -1667,6 +1691,11 @@ impl Qwen36Engine {
             return;
         }
         if let Some(blob) = self.blob_local_stages() {
+            // Mirror into the lock-free holder cache so a busy node serves this turn's KV unblocked.
+            self.kv_share
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .capture(tokens.clone(), blob.clone());
             self.kv.capture(tokens, blob);
         }
     }
@@ -1716,6 +1745,16 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         self.kv.insert_both(tokens, blob);
         Ok(())
     }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
+        // restore it now. Mirrors the InFrame::Restore handler's local apply. Not on the total=1 path
+        // (the head warms its own rank-0 slice via take_warm in step_first).
+        match self.kv.take_capture(epoch) {
+            Some((_, blob)) => self.restore_local_stages(&blob),
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1750,6 +1789,10 @@ mod tests {
             active: None,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }
     }
 
