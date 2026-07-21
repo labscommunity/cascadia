@@ -199,6 +199,20 @@ fn read_manifest(dir: &Path) -> Result<Manifest, LoadError> {
             m.experts_format
         )));
     }
+    // `compress_ratios` is indexed by absolute layer id in load_stage_inner; a
+    // manifest whose array is shorter than its exported layers would panic
+    // (index OOB) mid-load instead of failing cleanly here. Require it to cover
+    // every exported layer.
+    if let Some(&max_li) = m.exported_layers.iter().max() {
+        if m.compress_ratios.len() <= max_li {
+            return Err(LoadError::Manifest(format!(
+                "compress_ratios has {} entries but exported layer id {max_li} needs at \
+                 least {} — truncated or mismatched manifest?",
+                m.compress_ratios.len(),
+                max_li + 1
+            )));
+        }
+    }
     Ok(m)
 }
 
