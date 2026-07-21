@@ -425,6 +425,39 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
     ]))
 }
 
+/// Await the single `Token` reply owed to a `Forward` we just sent `down`,
+/// bounded by `deadline`.
+///
+/// Design rule: a reply to in-flight work uses a strict deadline, never the
+/// idle ceiling. The underlying [`recv_kind_client`] is idle-tolerant — it
+/// waits up to the ~900 s frame-idle ceiling for the next frame to *start* so
+/// legitimately idle relays are not killed. That tolerance is exactly wrong
+/// here: the frame is already owed. A downstream that dies mid-request (killed
+/// peer, black-holed socket with no FIN/RST) would otherwise pin this recv on
+/// the idle ceiling — the task never finalizes, and every upstream rank plus
+/// the driving API request wedges behind it instead of surfacing a fast error.
+/// On timeout this returns `Err`, so the caller tears the stage down and
+/// reconnects. `deadline` is [`cascadia_transport::recv_timeout`] for a decode
+/// step; a prefill reply can trail whole-prompt downstream compute, so callers
+/// widen it by [`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`].
+pub async fn recv_token_reply(
+    down: &Mutex<ActivationClient>,
+    deadline: std::time::Duration,
+) -> Result<i64, String> {
+    tokio::time::timeout(deadline, async {
+        match recv_kind_client(down).await {
+            Ok(Some(FrameKind::Token)) => recv_token_body_client(down)
+                .await
+                .map_err(|e| format!("recv_token: {e}")),
+            Ok(Some(other)) => Err(format!("expected Token reply, got {other:?}")),
+            Ok(None) => Err("downstream closed before Token".into()),
+            Err(e) => Err(format!("recv_kind: {e}")),
+        }
+    })
+    .await
+    .map_err(|_| format!("reply timeout after {deadline:?}: downstream silent (dead peer?)"))?
+}
+
 /// Hard cap on the number of hidden positions one ForwardBatch /
 /// TokenBatch frame can carry. Caps the worst-case allocation on the
 /// receiving side so an adversarial / corrupt peer cannot ask us to

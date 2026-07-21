@@ -2631,6 +2631,7 @@ impl Dsv4Engine {
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
         sample_back: bool,
+        reply_deadline: std::time::Duration,
     ) -> Result<i64, String> {
         let hidden = self.runner.embed_token(token);
         let hidden = self.runner.forward_layers(hidden, pos, Some(token));
@@ -2645,15 +2646,23 @@ impl Dsv4Engine {
                     .await
                     .map_err(|e| format!("send_forward_nosample: {e}"))?;
             }
-            match recv_kind_client(downstream).await {
-                Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
-                    .await
-                    .map_err(|e| format!("recv_token: {e}")),
-                Ok(Some(other)) => Err(format!("rank 0 expected Token, got {other:?}")),
-                Ok(None) => Err("downstream closed before Token".into()),
-                Err(e) => Err(format!("recv_kind: {e}")),
-            }
+            // The Token reply is owed to a frame we just sent — bound the wait on
+            // a strict deadline (never the idle ceiling) so a downstream that dies
+            // mid-request surfaces as a fast error instead of wedging the task and
+            // every upstream rank; see [`crate::dist::recv_token_reply`].
+            crate::dist::recv_token_reply(downstream, reply_deadline).await
         })
+    }
+
+    /// Strict reply deadline for a single decode-step Token (sub-second when
+    /// healthy); a prefill reply can trail whole-prompt downstream compute, so
+    /// it gets the widened budget.
+    fn decode_reply_deadline() -> std::time::Duration {
+        cascadia_transport::recv_timeout()
+    }
+    fn prefill_reply_deadline() -> std::time::Duration {
+        cascadia_transport::recv_timeout()
+            .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
     }
 
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -2712,7 +2721,14 @@ impl Dsv4Engine {
         let n_prefill = n_prompt.min(max_seq);
         for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
             let sample_back = i + 1 == n_prefill;
-            match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
+            match self.forward_one_token_first(
+                t,
+                pos,
+                &cfg,
+                &downstream,
+                sample_back,
+                Self::prefill_reply_deadline(),
+            ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "prefill forward failed: {e}");
@@ -2732,7 +2748,14 @@ impl Dsv4Engine {
             if generated.len() >= max_new || eos.contains(&next_u) || pos >= max_seq {
                 break;
             }
-            match self.forward_one_token_first(next_u, pos, &cfg, &downstream, true) {
+            match self.forward_one_token_first(
+                next_u,
+                pos,
+                &cfg,
+                &downstream,
+                true,
+                Self::decode_reply_deadline(),
+            ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "decode forward failed; emitting partial output: {e}");
@@ -2876,6 +2899,12 @@ impl Dsv4Engine {
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             let h = self.runner.hidden_size() as u32;
+            // Same design rule as rank 0's head: the Token reply is owed to a frame
+            // we just forwarded, so bound the wait on the strict (prefill-widened)
+            // deadline. If our own downstream is dead, this relay must surface an
+            // error that tears the stage down — an unbounded recv here would wedge
+            // this rank AND every upstream rank blocked waiting on our reply.
+            let reply_deadline = Self::prefill_reply_deadline();
             self.block_on(async {
                 if sample {
                     send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
@@ -2886,20 +2915,10 @@ impl Dsv4Engine {
                         .await
                         .map_err(|e| format!("send_forward_nosample: {e}"))?;
                 }
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::Token)) => {
-                        let t = recv_token_body_client(down)
-                            .await
-                            .map_err(|e| format!("recv_token: {e}"))?;
-                        send_token_upstream(upstream, t)
-                            .await
-                            .map_err(|e| format!("relay token: {e}"))?;
-                        Ok(())
-                    }
-                    Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
-                    Ok(None) => Err("downstream closed before Token".into()),
-                    Err(e) => Err(format!("recv_kind: {e}")),
-                }
+                let t = crate::dist::recv_token_reply(down, reply_deadline).await?;
+                send_token_upstream(upstream, t)
+                    .await
+                    .map_err(|e| format!("relay token: {e}"))
             })
         }
     }
