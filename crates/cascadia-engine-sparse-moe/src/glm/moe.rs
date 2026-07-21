@@ -39,6 +39,15 @@ pub enum AnyExpert {
     Mmap(MmapExpert),
 }
 
+/// Light-R1 read path: explicit concurrent whole-expert reads instead of
+/// mmap-fault-on-touch. Opt-in via `CASCADIA_GLM5_R1READ` (measured ~1.4× on
+/// NVMe; a no-op / possibly worse on slow disks). Read once.
+fn r1_read() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("CASCADIA_GLM5_R1READ").is_some())
+}
+
 impl AnyExpert {
     /// One expert's SwiGLU FFN for token `x`. `inter` is this expert's
     /// intermediate width (routed = `moe_inter`, shared = `moe_inter·n_shared`).
@@ -185,10 +194,33 @@ impl MoeLayer {
 
         // routed experts in gate order, then the shared expert.
         let mut out = vec![0.0f32; self.hidden];
-        for (&e, &wj) in gate.idx.iter().zip(&gate.weight) {
-            let y = self.w.experts[e as usize].forward(x, self.hidden, self.moe_inter);
-            for (o, &yi) in out.iter_mut().zip(&y) {
-                *o += wj * yi;
+        if r1_read() {
+            // Light-R1: read the routed experts' whole bins up-front and
+            // CONCURRENTLY (off the compute path, at full sequential bandwidth),
+            // then compute from the buffers — instead of faulting mmap pages in
+            // mid-GEMV one expert at a time. Bit-identical to the mmap path.
+            use rayon::prelude::*;
+            let bufs: Vec<Option<Vec<u8>>> = gate
+                .idx
+                .par_iter()
+                .map(|&e| self.w.experts[e as usize].as_mmap().and_then(|m| m.read_bytes().ok()))
+                .collect();
+            for (slot, (&e, &wj)) in gate.idx.iter().zip(&gate.weight).enumerate() {
+                let ex = &self.w.experts[e as usize];
+                let y = match (bufs[slot].as_ref(), ex.as_mmap()) {
+                    (Some(b), Some(m)) => m.swiglu_from(b, x),
+                    _ => ex.forward(x, self.hidden, self.moe_inter),
+                };
+                for (o, &yi) in out.iter_mut().zip(&y) {
+                    *o += wj * yi;
+                }
+            }
+        } else {
+            for (&e, &wj) in gate.idx.iter().zip(&gate.weight) {
+                let y = self.w.experts[e as usize].forward(x, self.hidden, self.moe_inter);
+                for (o, &yi) in out.iter_mut().zip(&y) {
+                    *o += wj * yi;
+                }
             }
         }
         let s = self.w.shared.forward(x, self.hidden, self.shared_inter);
