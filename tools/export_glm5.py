@@ -63,6 +63,61 @@ def export_expert_bin(wg: np.ndarray, wu: np.ndarray, wd: np.ndarray, path: Path
 
 
 # --------------------------------------------------------------------------
+# int3_bin packing — same group-32 symmetric layout as int4, but 3 bits/weight
+# (values -4..3, LSB-first bitstream: 32 values -> 12 packed bytes) + bf16
+# scales. ~22% fewer bytes than int4 (14 vs 18 bytes / 32 weights). For the cold
+# expert tail (A2); dequant speed is irrelevant in the IO-bound regime.
+# --------------------------------------------------------------------------
+_INT3_GROUP = 32
+
+
+def _pack_int3_grouped(w: np.ndarray):
+    """[out, in] fp32 -> (packed u8 [out, in*3/8], scales bf16-LE [out, in/32]).
+    Symmetric int3: s = max_abs/3, q = clip(round(w/s), -4, 3), stored q+4 in
+    [0,7], LSB-first bitstream (32 vals -> 96 bits -> 12 bytes per group)."""
+    w = np.ascontiguousarray(w, dtype=np.float32)
+    out, inn = w.shape
+    g = _INT3_GROUP
+    assert inn % g == 0, f"in_dim {inn} not divisible by int3 group {g}"
+    wg = w.reshape(out, inn // g, g)
+    max_abs = np.abs(wg).max(axis=2)
+    s = np.where(max_abs > 0, max_abs / 3.0, 1.0).astype(np.float32)
+    q = np.clip(np.round(wg / s[:, :, None]), -4, 3).astype(np.int32)
+    u3 = (q + 4).astype(np.uint8)  # [out, ng, 32] in [0,7]
+    # expand to LSB-first bits then packbits (little) -> 12 bytes/group.
+    bits = ((u3[:, :, :, None] >> np.arange(3, dtype=np.uint8)) & 1).astype(np.uint8)
+    bits = bits.reshape(out, inn // g, g * 3)  # [out, ng, 96]
+    packed = np.packbits(bits, axis=-1, bitorder="little")  # [out, ng, 12]
+    packed = packed.reshape(out, -1)  # [out, ng*12] = [out, in*3/8]
+    u = s.view(np.uint32)
+    bf = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2")  # RNE f32 -> bf16
+    return packed.tobytes(), bf.tobytes()
+
+
+def _unpack_int3_grouped(packed: bytes, scale: bytes, out: int, inn: int) -> np.ndarray:
+    """Reference inverse of `_pack_int3_grouped` (for the self-test + parity)."""
+    g = _INT3_GROUP
+    ng = inn // g
+    p = np.frombuffer(packed, dtype=np.uint8).reshape(out, ng, 12)
+    bits = np.unpackbits(p, axis=-1, bitorder="little").reshape(out, ng, g, 3)
+    u3 = (bits * (1 << np.arange(3, dtype=np.uint8))).sum(axis=-1).astype(np.int32)
+    q = u3 - 4
+    s = np.frombuffer(scale, dtype="<u2").astype(np.uint32).reshape(out, ng)
+    s = (s << 16).view(np.float32)
+    return (q * s[:, :, None]).reshape(out, inn)
+
+
+def export_expert_bin_int3(wg: np.ndarray, wu: np.ndarray, wd: np.ndarray, path: Path):
+    """int3 counterpart of export_expert_bin (gate, up, down)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        for w in (wg, wu, wd):
+            packed, scale = _pack_int3_grouped(w)
+            f.write(packed)
+            f.write(scale)
+
+
+# --------------------------------------------------------------------------
 # Config contract — hard-fail on anything the Rust shell does not implement.
 # --------------------------------------------------------------------------
 class ConfigError(SystemExit):
