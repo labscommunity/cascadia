@@ -120,3 +120,38 @@ fn seeded_temp_is_reproducible() {
     let b = r.generate(&prompt, 8, &cfg);
     assert_eq!(a, b, "same seed must give the same tokens");
 }
+
+/// `generate_reason` must distinguish a context-window truncation from a
+/// natural stop so the engine can report `finish_reason=length` vs `stop`.
+/// Greedy (deterministic) so the assertions don't depend on the RNG.
+#[test]
+fn generate_reason_reports_context_cap_vs_natural_stop() {
+    let dir = export_dir();
+    let prompt = prompt_ids();
+    let cfg = SamplingConfig::default(); // greedy
+
+    // Roomy budget, small token cap: decode stops on max_new (or an EOS) long
+    // before the window fills — never a context-cap stop.
+    let mut big = Dsv4Runner::load_staged(&dir, MAX_SEQ, 0, 1, 0, 0).unwrap();
+    let (out_big, cap_big) = big.generate_reason(&prompt, 4, &cfg);
+    assert!(out_big.len() <= 4);
+    assert!(!cap_big, "hitting max_new / EOS is not a context-cap stop");
+
+    // Tiny budget, large token cap: decode is forced to stop at pos == max_seq.
+    // Invariant the finish_reason logic relies on: an early stop that is NOT an
+    // EOS is exactly the context cap.
+    let mut tiny = Dsv4Runner::load_staged(&dir, 4, 0, 1, 0, 0).unwrap();
+    let (out_tiny, cap_tiny) = tiny.generate_reason(&prompt, 64, &cfg);
+    let last_is_eos = out_tiny
+        .last()
+        .map(|t| tiny.eos_token_ids().contains(t))
+        .unwrap_or(false);
+    assert!(
+        out_tiny.len() < 64,
+        "tiny budget must stop well before max_new"
+    );
+    assert_eq!(
+        cap_tiny, !last_is_eos,
+        "an early non-EOS stop must be reported as the context cap"
+    );
+}

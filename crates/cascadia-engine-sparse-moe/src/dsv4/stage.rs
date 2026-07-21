@@ -129,9 +129,22 @@ impl Dsv4Runner {
     /// Single-stage generation with sampling (greedy when the config says
     /// so). Prompt tokens drive the same per-token path as decode.
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, cfg: &SamplingConfig) -> Vec<u32> {
+        self.generate_reason(prompt, max_new, cfg).0
+    }
+
+    /// Like [`Self::generate`], but also reports whether decode stopped because
+    /// the context window filled (`pos == max_seq`) rather than by the token cap
+    /// or an EOS. The caller needs this to set the OpenAI `finish_reason`: a run
+    /// cut off by the window is `length`, not `stop`, even below `max_new`.
+    pub fn generate_reason(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+    ) -> (Vec<u32>, bool) {
         self.reset();
         if prompt.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let max_seq = self.max_seq;
         let mut rng = init_rng(cfg.seed);
@@ -156,15 +169,21 @@ impl Dsv4Runner {
         let mut next = sample(&last_logits, &history, cfg, &mut rng);
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len().min(max_seq);
+        let mut hit_context_cap = false;
         loop {
             let tok = next as u32;
             out.push(tok);
             history.push(next);
+            if out.len() >= max_new || self.eos.contains(&tok) {
+                break;
+            }
             // Stop before forwarding at an absolute position the caches can't
             // hold (== max_seq): that write would index past the rope/KV/
             // compressed/indexer rows. Checked after the push so the token
-            // sampled from the last in-range position is still emitted.
-            if out.len() >= max_new || self.eos.contains(&tok) || pos >= max_seq {
+            // sampled from the last in-range position is still emitted. This is
+            // a truncation, not a natural stop -> the caller reports `length`.
+            if pos >= max_seq {
+                hit_context_cap = true;
                 break;
             }
             let h = self.embed_token(tok);
@@ -173,7 +192,7 @@ impl Dsv4Runner {
             next = sample(&logits, &history, cfg, &mut rng);
             pos += 1;
         }
-        out
+        (out, hit_context_cap)
     }
 
     /// Single-stage greedy convenience (warmup / tests).

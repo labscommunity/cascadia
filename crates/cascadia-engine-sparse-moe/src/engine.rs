@@ -2602,7 +2602,22 @@ impl Dsv4Engine {
         }
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = self.runner.generate(&prompt_ids, max_new, &sampling_cfg);
+        // Mirror step_first: an over-budget prompt is truncated (head kept, tail
+        // dropped) inside generate — never silently, so log it loudly.
+        let max_seq = self.runner.max_seq();
+        if prompt_ids.len() > max_seq {
+            warn!(
+                task = %task.task_id,
+                prompt_tokens = prompt_ids.len(),
+                context_budget = max_seq,
+                dropped = prompt_ids.len() - max_seq,
+                "prompt exceeds context budget; dropping the tail (newest tokens) — \
+                 the response answers only the first {max_seq} tokens"
+            );
+        }
+        let (generated, hit_context_cap) =
+            self.runner
+                .generate_reason(&prompt_ids, max_new, &sampling_cfg);
         let n_tokens = generated.len() as u32;
         let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
@@ -2615,7 +2630,11 @@ impl Dsv4Engine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
-        chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
+        chunk.finish_reason = Some(if hit_context_cap {
+            FinishReason::Length
+        } else {
+            finish_reason_for(n_tokens as usize, max_new)
+        });
         vec![(task.task_id.clone(), chunk)]
     }
 
