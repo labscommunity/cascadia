@@ -442,6 +442,10 @@ pub struct Gemma4Engine {
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Issue-34 Option C: lock-free holder mirror of `kv` — the capture sites write both, and
+    /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
 }
 
 impl Gemma4Engine {
@@ -1069,6 +1073,12 @@ impl Gemma4Engine {
                                 warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
                             }
                         }
+                        // Mirror into the lock-free holder cache so a busy node can serve this turn's
+                        // KV to a moved peer without the engine lock.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .capture(full.clone(), blob.clone());
                         self.kv.capture(full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
@@ -1227,6 +1237,14 @@ impl Engine for Gemma4Engine {
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.kv_model_fingerprint(),
+        }))
+    }
 }
 
 // -------- Issue-34 §8 multi-stage CAPTURE/RESTORE over gemma4's frameless transport --------
@@ -1332,6 +1350,11 @@ impl Gemma4Engine {
                 let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
                     .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
                 if let Ok(blob) = self.runtime.get_state_blob() {
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    self.kv_share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capture_under_epoch(epoch, tokens.clone(), blob.clone());
                     self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
                 }
                 if !self.spec.is_last_stage {
@@ -1435,6 +1458,17 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         self.kv.insert_both(tokens, blob);
         Ok(())
+    }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // Plane path (§0(B), multi-rank downstream): the pull staged this rank's slice under `epoch`;
+        // set_state it now. Mirrors the RESTORE handler's local apply. step_first's take_warm then
+        // re-warms + sets position (idempotent double-set; gemma4 keeps no warm flag). Not on the
+        // total=1 path (the head warms its own rank-0 slice via take_warm).
+        match self.kv.take_capture(epoch) {
+            Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+            None => false,
+        }
     }
 }
 
@@ -1792,6 +1826,10 @@ impl Builder for Gemma4Builder {
             step_warn: StepWarnLimiter::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }))
     }
 }
