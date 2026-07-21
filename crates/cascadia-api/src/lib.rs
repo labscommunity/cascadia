@@ -104,6 +104,11 @@ pub struct AppState {
     /// OFF (to inject the empty `<think></think>`). Keeps the working
     /// thinking-on path byte-identical to the engine's native render.
     pub defer_template_on_thinking: bool,
+    /// Pipeline readiness for `/health`. Starts `true`; a completion that fails
+    /// with a 5xx (e.g. the distributed pipeline dropped a peer link) flips it
+    /// `false`, a success flips it back `true` — so `/health` reflects the real
+    /// state of the chain instead of always returning 200 while requests 503.
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -242,7 +247,9 @@ pub fn make_router_with_stats(
         bos_token: Arc::from(cfg.chat_template.bos_token.unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.unwrap_or_default()),
         defer_template_on_thinking: cfg.defer_template_on_thinking,
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
+    let mw_state = state.clone();
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
@@ -250,10 +257,39 @@ pub fn make_router_with_stats(
         .route("/v1/completions", post(completions))
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
+        // Flip `ready` from each completion's final status so /health tracks the
+        // pipeline (a peer-link drop fails generation with a 5xx before streaming
+        // starts, so the response status is authoritative for that case).
+        .layer(axum::middleware::from_fn_with_state(
+            mw_state,
+            track_pipeline_health,
+        ))
         // Cap the JSON body so an attacker can't OOM the server with
         // a multi-GB request. Apply at router level so it applies to
         // every route, not just chat_completions.
         .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
+}
+
+/// Response middleware: for completion routes, flip `AppState.ready` from the
+/// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
+/// the pipeline is actually serving. Non-completion routes don't touch it.
+async fn track_pipeline_health(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use std::sync::atomic::Ordering;
+    let is_completion = matches!(req.uri().path(), "/v1/chat/completions" | "/v1/completions");
+    let resp = next.run(req).await;
+    if is_completion {
+        let s = resp.status();
+        if s.is_server_error() {
+            state.ready.store(false, Ordering::Relaxed);
+        } else if s.is_success() {
+            state.ready.store(true, Ordering::Relaxed);
+        }
+    }
+    resp
 }
 
 #[derive(Serialize)]
@@ -261,8 +297,18 @@ struct HealthResponse {
     status: &'static str,
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn health(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (StatusCode, Json<HealthResponse>) {
+    use std::sync::atomic::Ordering;
+    if state.ready.load(Ordering::Relaxed) {
+        (StatusCode::OK, Json(HealthResponse { status: "ok" }))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse { status: "degraded" }),
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -2247,6 +2293,69 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn health_reflects_pipeline_and_recovers() {
+        // /health must track the pipeline, not return a hardcoded 200: a
+        // completion that fails 5xx (stand-in for a dropped peer link) degrades
+        // it; a subsequent success recovers it. The `ready` flag is shared
+        // across router clones (same AppState Arc), so sequential oneshots see
+        // each other's effect.
+        async fn health(app: Router) -> (StatusCode, Value) {
+            let r = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = r.status();
+            let b = to_bytes(r.into_body(), 1024).await.unwrap();
+            (st, serde_json::from_slice(&b).unwrap())
+        }
+        async fn chat(app: Router, content: String) -> StatusCode {
+            let payload = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": content}],
+                "stream": false,
+            });
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+
+        let app = make_app().await;
+        // fresh → ready
+        let (s, v) = health(app.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["status"], "ok");
+        // a 5xx completion → degraded
+        assert_eq!(
+            chat(app.clone(), "__engine_error__".into()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (s, v) = health(app.clone()).await;
+        assert_eq!(
+            s,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "health degrades after a 5xx"
+        );
+        assert_eq!(v["status"], "degraded");
+        // a successful completion → ready again
+        assert_eq!(chat(app.clone(), "hello".into()).await, StatusCode::OK);
+        let (s, _) = health(app.clone()).await;
+        assert_eq!(s, StatusCode::OK, "health recovers after a success");
     }
 
     #[tokio::test]
