@@ -2721,8 +2721,22 @@ impl Dsv4Engine {
         let n_prompt = prompt_ids.len();
         // Truncate an over-long prompt to the context budget; the last forwarded
         // token is the one that asks the last rank to sample (its sampled result
-        // is the first generated token).
+        // is the first generated token). take() keeps the HEAD, so truncation
+        // drops the tail — i.e. the newest turn. Never do this silently: a
+        // caller whose prompt overflowed the budget is served an answer to a
+        // prompt it did not send, so log loudly with the numbers. (A future
+        // improvement is a budget-aware trim or an explicit 4xx over budget.)
         let n_prefill = n_prompt.min(max_seq);
+        if n_prompt > max_seq {
+            warn!(
+                task = %id,
+                prompt_tokens = n_prompt,
+                context_budget = max_seq,
+                dropped = n_prompt - max_seq,
+                "prompt exceeds context budget; dropping the tail (newest tokens) — \
+                 the response answers only the first {max_seq} tokens"
+            );
+        }
         for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
             let sample_back = i + 1 == n_prefill;
             match self.forward_one_token_first(
