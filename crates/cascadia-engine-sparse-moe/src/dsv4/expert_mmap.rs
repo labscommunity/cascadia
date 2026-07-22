@@ -20,6 +20,37 @@ use memmap2::Mmap;
 use super::loader::LoadError;
 use super::math::to_bf16;
 
+/// Minimal FFI for the Win32 page-cache primitives used by [`MmapExpert::pin`]
+/// and [`MmapExpert::prefetch`] — the counterparts of `mlock`/`madvise(WILLNEED)`.
+/// Declared directly (kernel32 exports these) to keep the shim dependency-free.
+#[cfg(windows)]
+mod winmem {
+    use core::ffi::c_void;
+
+    /// `WIN32_MEMORY_RANGE_ENTRY` — a virtual-address range for `PrefetchVirtualMemory`.
+    #[repr(C)]
+    pub struct Win32MemoryRangeEntry {
+        pub virtual_address: *mut c_void,
+        pub number_of_bytes: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        /// `BOOL VirtualLock(LPVOID lpAddress, SIZE_T dwSize)` — nonzero on success.
+        pub fn VirtualLock(address: *const c_void, size: usize) -> i32;
+        /// `HANDLE GetCurrentProcess(void)` — the current-process pseudo handle.
+        pub fn GetCurrentProcess() -> isize;
+        /// `BOOL PrefetchVirtualMemory(HANDLE, ULONG_PTR NumberOfEntries,
+        /// PWIN32_MEMORY_RANGE_ENTRY, ULONG Flags)` — async read-ahead hint.
+        pub fn PrefetchVirtualMemory(
+            process: isize,
+            number_of_entries: usize,
+            addresses: *const Win32MemoryRangeEntry,
+            flags: u32,
+        ) -> i32;
+    }
+}
+
 const G: usize = 32; // int4 quant group (columns per bf16 scale)
 
 /// Byte size of one packed `[out, in]` section: nibbles then scales.
@@ -149,9 +180,25 @@ impl MmapExpert {
         self.mmap.lock()
     }
 
-    /// Non-Unix (Windows): memmap2's `Mmap::lock` (mlock) is unavailable, so this
-    /// is a no-op — callers transparently fall back to the OS page cache.
-    #[cfg(not(unix))]
+    /// Windows equivalent of `mlock`: `VirtualLock` pins the mapped range in the
+    /// process working set so it is not paged out. Bounded by the working set
+    /// (the analogue of `RLIMIT_MEMLOCK`); on failure returns the OS error so the
+    /// caller falls back to the page cache — same best-effort contract as Unix.
+    #[cfg(windows)]
+    pub fn pin(&self) -> std::io::Result<()> {
+        // SAFETY: `as_ptr()`/`len()` describe the live, valid mmap range for the
+        // lifetime of `self`; VirtualLock only reads those bounds.
+        let ok = unsafe { winmem::VirtualLock(self.mmap.as_ptr().cast(), self.mmap.len()) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Any other target (no page-locking primitive): no-op — callers fall back to
+    /// the OS page cache.
+    #[cfg(not(any(unix, windows)))]
     pub fn pin(&self) -> std::io::Result<()> {
         Ok(())
     }
@@ -160,12 +207,33 @@ impl MmapExpert {
     /// the cache without blocking. Issued for the *next* layer's likely experts
     /// while the current layer computes, so the NVMe read overlaps compute
     /// instead of stalling the GEMV. Best-effort hint; a failure is ignored.
-    /// `Mmap::advise`/`Advice` are Unix-only in memmap2; a no-op on Windows.
+    #[cfg(unix)]
     #[inline]
     pub fn prefetch(&self) {
-        #[cfg(unix)]
         let _ = self.mmap.advise(memmap2::Advice::WillNeed);
     }
+
+    /// Windows equivalent of `madvise(WILLNEED)`: `PrefetchVirtualMemory` asks the
+    /// memory manager to read the range into RAM asynchronously. Best-effort; the
+    /// result is ignored (same contract as the Unix hint).
+    #[cfg(windows)]
+    #[inline]
+    pub fn prefetch(&self) {
+        let entry = winmem::Win32MemoryRangeEntry {
+            virtual_address: self.mmap.as_ptr() as *mut core::ffi::c_void,
+            number_of_bytes: self.mmap.len(),
+        };
+        // SAFETY: `entry` describes the live mmap range; PrefetchVirtualMemory
+        // only reads it and issues an async read-ahead hint.
+        unsafe {
+            let _ = winmem::PrefetchVirtualMemory(winmem::GetCurrentProcess(), 1, &entry, 0);
+        }
+    }
+
+    /// Any other target: no prefetch hint available — no-op.
+    #[cfg(not(any(unix, windows)))]
+    #[inline]
+    pub fn prefetch(&self) {}
 
     /// SwiGLU section GEMVs exposed for shells with a different activation
     /// contract (the glm5 shell applies f32 `silu·up`, no clamp, route outside).
