@@ -195,31 +195,23 @@ impl MoeLayer {
         // routed experts in gate order, then the shared expert.
         let mut out = vec![0.0f32; self.hidden];
         if r1_read() {
-            // Light-R1 + read/compute overlap: each rayon task reads its expert's
-            // whole bin AND computes its SwiGLU. The reads (I/O-bound, drive-
-            // capped) of some experts thus overlap the GEMV compute (CPU-bound)
-            // of others, instead of the old read-all-then-serial-compute barrier
-            // which left the SSD idle during compute and the CPU idle during
-            // reads. Each task returns its `[hidden]` contribution; accumulation
-            // stays in gate order below, so the result is BIT-IDENTICAL to the
-            // mmap path (f32 add order unchanged).
+            // Light-R1: read the routed experts' whole bins up-front and
+            // CONCURRENTLY (off the compute path, at full sequential bandwidth),
+            // then compute from the buffers — instead of faulting mmap pages in
+            // mid-GEMV one expert at a time. Bit-identical to the mmap path.
             use rayon::prelude::*;
-            let ys: Vec<Vec<f32>> = gate
+            let bufs: Vec<Option<Vec<u8>>> = gate
                 .idx
                 .par_iter()
-                .map(|&e| {
-                    let ex = &self.w.experts[e as usize];
-                    match ex.as_mmap() {
-                        Some(m) => match m.read_bytes() {
-                            Ok(b) => m.swiglu_from(&b, x),
-                            Err(_) => ex.forward(x, self.hidden, self.moe_inter),
-                        },
-                        None => ex.forward(x, self.hidden, self.moe_inter),
-                    }
-                })
+                .map(|&e| self.w.experts[e as usize].as_mmap().and_then(|m| m.read_bytes().ok()))
                 .collect();
-            for (&wj, y) in gate.weight.iter().zip(&ys) {
-                for (o, &yi) in out.iter_mut().zip(y) {
+            for (slot, (&e, &wj)) in gate.idx.iter().zip(&gate.weight).enumerate() {
+                let ex = &self.w.experts[e as usize];
+                let y = match (bufs[slot].as_ref(), ex.as_mmap()) {
+                    (Some(b), Some(m)) => m.swiglu_from(b, x),
+                    _ => ex.forward(x, self.hidden, self.moe_inter),
+                };
+                for (o, &yi) in out.iter_mut().zip(&y) {
                     *o += wj * yi;
                 }
             }
