@@ -39,3 +39,4 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
+async-trait = { workspace = true }

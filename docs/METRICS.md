@@ -28,10 +28,10 @@ present from startup.
 
 | Name | Type | Labels | Description |
 |---|---|---|---|
-| `cascadia_http_requests_total` | counter | `endpoint`, `status` | Requests by **matched route template** (`/v1/cancel/:task_id`, never the raw URI — bounded cardinality) and status code. |
+| `cascadia_http_requests_total` | counter | `endpoint`, `status` | Requests by **matched route template** (`/v1/cancel/:task_id`, never the raw URI — bounded cardinality) and status code. Streaming (SSE) responses count their response HEAD: a mid-stream engine failure still shows as 200 here (it surfaces in `cascadia_tasks_failed_total`). Covers the API server's own routes; the CLI's embedded dashboard routes are merged in after router construction and are not counted. |
 | `cascadia_http_request_duration_seconds` | histogram | `endpoint` | Request latency. For streaming (SSE) responses this is time-to-response-head; full generation time is `cascadia_generation_duration_seconds`. |
 | `cascadia_inflight_tasks` | gauge | — | Generation requests currently executing (admitted past the permit gate, response not yet drained/dropped). |
-| `cascadia_api_rejected_total` | counter | `reason` | Rejections before the engine: `capacity` (503, permit gate full), `empty_prompt` (400), `prompt_too_large` (413), `multi_prompt` (400). |
+| `cascadia_api_rejected_total` | counter | `reason` | Rejections before generation started: `capacity` (503 — permit gate full, or the engine's own pending queue full), `empty_prompt` (400), `prompt_too_large` (413), `multi_prompt` (400). Rejections issued by router layers before a handler runs (body over the 64 KiB `DefaultBodyLimit`, malformed JSON) are not counted here — watch them in `cascadia_http_requests_total` by status. |
 
 There is no queued-tasks gauge: admission is `try_acquire` on the permit
 semaphore — over-capacity requests are rejected with 503 immediately, never
@@ -45,17 +45,27 @@ The `model` label is the shard's `model_id`.
 
 | Name | Type | Labels | Description |
 |---|---|---|---|
-| `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first engine chunk. |
-| `cascadia_generation_inter_token_seconds` | histogram | `model` | Gap between consecutive chunks of one generation. |
+| `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first token-bearing chunk **delivered to the consumer**. |
+| `cascadia_generation_inter_token_seconds` | histogram | `model` | Gap between consecutive token-bearing chunks of one generation, at delivery. |
 | `cascadia_generation_duration_seconds` | histogram | `model`, `finish_reason` | Submission → final chunk. `finish_reason`: `stop`, `length`, `cancelled`, `error`. |
-| `cascadia_tokens_generated_total` | counter | `model` | Model tokens emitted (uses the engine's `n_tokens` when set — spec-decode and ov-genai report multi-token chunks correctly). |
+| `cascadia_tokens_generated_total` | counter | `model` | Model tokens **delivered to clients** (uses the engine's `n_tokens` when set — spec-decode and ov-genai report multi-token chunks correctly). Tokens ground out after a client disconnected, before the cancel lands, are not counted. |
 | `cascadia_tokens_prompt_total` | counter | `model` | Prompt tokens, for engines that report them on the final chunk. |
-| `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` or client disconnect mid-stream. |
+| `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or client disconnect mid-stream. Server teardown with generations in flight is deliberately not counted. |
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
 
 Engines that deliver the whole response on a single final chunk (`ov-genai`)
 produce one TTFT sample equal to the full generation and no inter-token
 samples; per-token engines (`ov-runtime`, sparse-moe, mock) populate both.
+
+Timing caveats: chunks carry no engine-side timestamps, so TTFT and
+inter-token gaps are measured when a chunk is **delivered** to the consumer.
+For the typical single-stream case this tracks engine cadence closely; under
+concurrent serving (several streams sharing one engine) a chunk can sit in
+the cross-task buffer, so samples include that residency. Empty final
+markers never contribute timing samples. For tool-call streaming requests
+the API buffers the whole generation before responding, so
+`cascadia_http_request_duration_seconds` for those requests spans the full
+generation rather than time-to-head.
 
 ## Engine-level
 
@@ -74,10 +84,15 @@ tensors, header included) or `raw` (dist-spec control bytes).
 
 | Name | Type | Labels | Description |
 |---|---|---|---|
-| `cascadia_transport_sent_bytes_total` | counter | `kind` | Bytes sent on activation links. |
-| `cascadia_transport_recv_bytes_total` | counter | `kind` | Bytes received on activation links. |
+| `cascadia_transport_sent_bytes_total` | counter | `kind` | Bytes sent on activation links (fully-sent frames only). |
+| `cascadia_transport_recv_bytes_total` | counter | `kind` | Bytes received on activation links (fully-received frames only). |
 | `cascadia_transport_send_seconds` | histogram | — | Tensor frame send duration (write + flush). |
 | `cascadia_transport_recv_payload_seconds` | histogram | — | Tensor payload receive, **header-complete → payload-complete**. The wait for a frame to begin is excluded: idle stages legitimately sit in that wait between requests, and including it would swamp the histogram with idle time. |
+
+Byte counters record only fully-transferred frames — bytes on the wire from
+partial or failed sends/receives (e.g. a mid-frame timeout on a degraded
+link) are not counted, so `sent_bytes` on stage N and `recv_bytes` on stage
+N+1 will not reconcile exactly across a faulty link.
 
 ## Histogram buckets
 

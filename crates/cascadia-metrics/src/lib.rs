@@ -44,6 +44,11 @@ pub const TRANSPORT_BUCKETS: &[f64] = &[0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0
 // --- Request-level (bumped by cascadia-api) ------------------------------
 
 /// HTTP requests by matched route template and response status code.
+/// Counts the API server's own routes; routes merged into the app AFTER
+/// router construction (the CLI's embedded dashboard) are not covered.
+/// For streaming (SSE) responses the status is the response HEAD — a
+/// mid-stream engine failure still counts as 200 here and surfaces in
+/// `cascadia_tasks_failed_total` instead.
 pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_http_requests_total",
@@ -76,9 +81,13 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register cascadia_inflight_tasks")
 });
 
-/// Requests rejected before reaching the engine, by reason. Reasons:
-/// `capacity` (permit gate full → 503), `empty_prompt` (400),
-/// `prompt_too_large` (413), `multi_prompt` (unsupported batch form, 400).
+/// Requests rejected before generation started, by reason. Reasons:
+/// `capacity` (permit gate full OR the engine's own pending queue full —
+/// both 503), `empty_prompt` (400), `prompt_too_large` (413),
+/// `multi_prompt` (unsupported batch form, 400). Rejections issued by
+/// router layers before a handler runs (body over the DefaultBodyLimit,
+/// malformed JSON) are NOT counted here — they are visible in
+/// `cascadia_http_requests_total` by status code.
 pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_api_rejected_total",
@@ -90,7 +99,10 @@ pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 // --- Generation-level (bumped by cascadia-runner) ------------------------
 
-/// Time from task submission to the first chunk the engine produced.
+/// Time from task submission to the first TOKEN-BEARING chunk delivered
+/// to the consumer. Measured at delivery (chunks have no engine-side
+/// timestamps), so under concurrent serving it includes buffer residency;
+/// empty final markers never contribute a sample.
 pub static GENERATION_TTFT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_ttft_seconds",
@@ -101,7 +113,10 @@ pub static GENERATION_TTFT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     .expect("register cascadia_generation_ttft_seconds")
 });
 
-/// Gap between consecutive chunks of one generation.
+/// Gap between consecutive token-bearing chunks of one generation,
+/// measured at delivery to the consumer (see the TTFT caveat: buffer
+/// residency is included under concurrent serving; empty final markers
+/// are excluded).
 pub static GENERATION_INTER_TOKEN_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_inter_token_seconds",
@@ -124,11 +139,13 @@ pub static GENERATION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|
     .expect("register cascadia_generation_duration_seconds")
 });
 
-/// Model tokens emitted across all generations.
+/// Model tokens DELIVERED to consumers across all generations. Tokens an
+/// engine grinds through after its client disconnected (until the cancel
+/// lands) are not counted.
 pub static TOKENS_GENERATED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tokens_generated_total",
-        "Model tokens emitted across all generations.",
+        "Model tokens delivered to consumers across all generations.",
         &["model"]
     )
     .expect("register cascadia_tokens_generated_total")
@@ -145,8 +162,11 @@ pub static TOKENS_PROMPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_tokens_prompt_total")
 });
 
-/// Generations abandoned before completion: explicit `/v1/cancel`, or the
-/// client dropped the response stream mid-generation.
+/// Generations abandoned before completion: explicit `/v1/cancel`
+/// (including an engine acknowledging with a Cancelled final marker), or
+/// the client dropped the response stream mid-generation. Server teardown
+/// (engine slot emptied under in-flight generations) is deliberately NOT
+/// counted here — a restart is not a client cancellation.
 pub static TASKS_CANCELLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tasks_cancelled_total",
@@ -192,7 +212,9 @@ pub static ENGINE_WARMUP_DURATION_SECONDS: LazyLock<GaugeVec> = LazyLock::new(||
 // --- Transport-level (bumped by cascadia-transport) ----------------------
 
 /// Bytes sent on the inter-stage activation links (tensor frames + raw
-/// control bytes), header included.
+/// control bytes), header included. Only fully-transferred frames count —
+/// bytes from partial/failed sends are not recorded, so sent-vs-recv
+/// across a faulty link will not reconcile exactly.
 pub static TRANSPORT_SENT_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_transport_sent_bytes_total",
@@ -203,6 +225,7 @@ pub static TRANSPORT_SENT_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|
 });
 
 /// Bytes received on the inter-stage activation links, header included.
+/// Only fully-received frames count (see the sent-bytes caveat).
 pub static TRANSPORT_RECV_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_transport_recv_bytes_total",

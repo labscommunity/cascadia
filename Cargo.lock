@@ -239,6 +239,7 @@ dependencies = [
 name = "cascadia-api"
 version = "0.1.6"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "cascadia-engine",

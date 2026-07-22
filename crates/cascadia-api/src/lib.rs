@@ -52,17 +52,13 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// this whole HTTP-server crate.
 pub use cascadia_types::ApiStats;
 
-/// Tokens a chunk contributes to the cumulative counter. The engine's
-/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1;
-/// ov-genai sets it on its single final chunk so `usage` reflects the
-/// real generated count — issue #55); otherwise the per-chunk convention
-/// is "one token per non-empty chunk" (see `Chunk::n_tokens` docs). An
-/// empty chunk — the no-text final marker mock/runtime engines emit —
-/// contributes 0 so it isn't counted as a phantom token.
+/// Tokens a chunk contributes to the cumulative counter. The convention
+/// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
+/// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
+/// the dashboard counters, and the runner's Prometheus metrics can never
+/// drift apart; this alias keeps the historical call sites and tests.
 fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
-    chunk
-        .n_tokens
-        .unwrap_or(if chunk.text.is_empty() { 0 } else { 1 })
+    chunk.token_count()
 }
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
@@ -1843,6 +1839,13 @@ impl Stream for StreamWithPermit {
 
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
     use cascadia_engine::EngineError;
+    // An engine-queue-full 503 is the same "at capacity" experience as the
+    // permit-gate 503 (engines cap pending tasks BELOW the default permit
+    // count, so this path is reachable at default config) — count it under
+    // the same rejection reason or capacity pressure hides from the metric.
+    if matches!(&err, EngineError::QueueFull { .. }) {
+        count_rejected("capacity");
+    }
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
@@ -3230,6 +3233,83 @@ mod tests {
                 "cascadia_engine_warmup_duration_seconds{device=\"CPU\",model=\"metrics-probe-model\"}"
             ),
             "{text}"
+        );
+    }
+
+    /// Engine whose queue is always full: submit() fails QueueFull, the
+    /// same "at capacity" 503 the permit gate produces.
+    struct QueueFullEngine;
+
+    impl cascadia_engine::Engine for QueueFullEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            _task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Err(cascadia_engine::EngineError::QueueFull { queued: 8, cap: 8 })
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct QueueFullBuilder;
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for QueueFullBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(QueueFullEngine))
+        }
+    }
+
+    // An engine-queue-full 503 must count toward the same capacity-rejection
+    // reason as the permit-gate 503 — engines cap pending tasks below the
+    // default permit count, so this path is reachable at default config.
+    #[tokio::test]
+    async fn engine_queue_full_counts_capacity_rejection() {
+        let capacity_before = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["capacity"])
+            .get();
+        let runner = Runner::new(Box::new(QueueFullBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("queuefull-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "queuefull-model");
+        let (status, _) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "queuefull-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["capacity"])
+            .get();
+        assert!(
+            capacity_after > capacity_before,
+            "QueueFull 503 must count as a capacity rejection ({capacity_before} -> {capacity_after})"
         );
     }
 

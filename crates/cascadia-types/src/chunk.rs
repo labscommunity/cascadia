@@ -150,4 +150,16 @@ impl Chunk {
         self.n_tokens = Some(n);
         self
     }
+
+    /// Tokens this chunk contributes to a cumulative count — the ONE
+    /// convention every consumer (API `usage`, dashboard counters,
+    /// Prometheus metrics) must share. The engine's `n_tokens` is
+    /// authoritative when set (spec-decode reports 1..=K+1; ov-genai sets
+    /// it on its single final chunk — issue #55); otherwise one token per
+    /// non-empty chunk, so the empty final markers mock/runtime engines
+    /// emit contribute 0 rather than a phantom token.
+    pub fn token_count(&self) -> u32 {
+        self.n_tokens
+            .unwrap_or(if self.text.is_empty() { 0 } else { 1 })
+    }
 }

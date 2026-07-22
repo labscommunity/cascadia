@@ -368,20 +368,24 @@ impl ChunkStream {
             self.metrics_finalized = true;
             return;
         }
-        match self.last_chunk_at {
-            None => cascadia_metrics::GENERATION_TTFT_SECONDS
-                .with_label_values(&[&self.model])
-                .observe((now - self.submitted_at).as_secs_f64()),
-            Some(prev) => cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
-                .with_label_values(&[&self.model])
-                .observe((now - prev).as_secs_f64()),
-        }
-        self.last_chunk_at = Some(now);
-        // Same convention as the API's usage accounting: `n_tokens` is
-        // authoritative when set; otherwise one token per non-empty chunk
-        // (the empty final markers contribute 0).
-        let n = chunk.n_tokens.unwrap_or(u32::from(!chunk.text.is_empty()));
+        // Same convention as the API's usage accounting (Chunk::token_count):
+        // `n_tokens` is authoritative when set; otherwise one token per
+        // non-empty chunk, so the empty final markers contribute 0.
+        let n = chunk.token_count();
+        // Only token-bearing chunks are timing samples: the separate empty
+        // final marker most engines emit would otherwise add one artificial
+        // inter-token gap per generation (and a zero-token generation would
+        // record a bogus TTFT).
         if n > 0 {
+            match self.last_chunk_at {
+                None => cascadia_metrics::GENERATION_TTFT_SECONDS
+                    .with_label_values(&[&self.model])
+                    .observe((now - self.submitted_at).as_secs_f64()),
+                Some(prev) => cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                    .with_label_values(&[&self.model])
+                    .observe((now - prev).as_secs_f64()),
+            }
+            self.last_chunk_at = Some(now);
             cascadia_metrics::TOKENS_GENERATED_TOTAL
                 .with_label_values(&[&self.model])
                 .inc_by(n as u64);
@@ -393,10 +397,19 @@ impl ChunkStream {
                     .inc_by(p as u64);
             }
             // `Cancelled` is surfaced here (metrics-only per FinishReason's
-            // contract); the API maps it to "stop" on the wire.
+            // contract); the API maps it to "stop" on the wire. An engine
+            // that acknowledges a cancel with a Cancelled final marker must
+            // land in the SAME counter as the tombstone/Drop cancel paths,
+            // or the cancelled duration histogram and cancelled counter
+            // would diverge.
             let reason = match chunk.finish_reason {
                 Some(FinishReason::Length) => "length",
-                Some(FinishReason::Cancelled) => "cancelled",
+                Some(FinishReason::Cancelled) => {
+                    cascadia_metrics::TASKS_CANCELLED_TOTAL
+                        .with_label_values(&[&self.model])
+                        .inc();
+                    "cancelled"
+                }
                 Some(FinishReason::Stop) | None => "stop",
             };
             cascadia_metrics::GENERATION_DURATION_SECONDS
@@ -404,6 +417,17 @@ impl ChunkStream {
                 .observe((now - self.submitted_at).as_secs_f64());
             self.metrics_finalized = true;
         }
+    }
+
+    /// Terminal failure of OUR stream: close the buffers entry, build the
+    /// final error chunk, and record it — one place, so every error-return
+    /// site in `poll_next` gets terminal accounting by construction.
+    fn fail_stream(&mut self, reason: String) -> Poll<Option<Chunk>> {
+        self.done = true;
+        self.buffers.lock().chunks.remove(&self.task_id);
+        let chunk = Chunk::error(self.task_id.clone(), reason);
+        self.record_chunk_metrics(&chunk);
+        Poll::Ready(Some(chunk))
     }
 
     /// Record an abandoned generation: explicit cancel, or the consumer
@@ -473,6 +497,11 @@ impl Stream for ChunkStream {
                 let mut guard = this.engine.lock();
                 let Some(engine) = guard.as_mut() else {
                     this.done = true;
+                    // Server teardown (Runner::close emptied the slot), not a
+                    // client cancel: finalize with NO terminal sample so Drop
+                    // doesn't book every in-flight generation of a shutdown
+                    // as a client cancellation.
+                    this.metrics_finalized = true;
                     return Poll::Ready(None);
                 };
                 match engine.step() {
@@ -544,22 +573,15 @@ impl Stream for ChunkStream {
                         if this.consecutive_foreign_err >= MAX_CONSECUTIVE_EMPTY_STEPS {
                             // Abnormal close of a healthy stream — fail it
                             // loud (see the own-task arm below).
-                            this.done = true;
-                            this.buffers.lock().chunks.remove(&this.task_id);
                             warn!(
                                 task = %this.task_id,
                                 "engine re-failed the same foreign task for {} consecutive steps; closing stream",
                                 MAX_CONSECUTIVE_EMPTY_STEPS
                             );
-                            let chunk = Chunk::error(
-                                this.task_id.clone(),
-                                format!(
-                                    "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
-                                    MAX_CONSECUTIVE_EMPTY_STEPS
-                                ),
-                            );
-                            this.record_chunk_metrics(&chunk);
-                            return Poll::Ready(Some(chunk));
+                            return this.fail_stream(format!(
+                                "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
+                                MAX_CONSECUTIVE_EMPTY_STEPS
+                            ));
                         }
                         continue;
                     }
@@ -569,16 +591,12 @@ impl Stream for ChunkStream {
                         // finish_reason "stop" at the API layer. The error
                         // chunk routes through the existing 503 / SSE-error
                         // paths instead.
-                        this.done = true;
-                        this.buffers.lock().chunks.remove(&this.task_id);
                         warn!(
                             task = %this.task_id,
                             error = %e,
                             "engine step failed; closing stream"
                         );
-                        let chunk = Chunk::error(this.task_id.clone(), e.to_string());
-                        this.record_chunk_metrics(&chunk);
-                        return Poll::Ready(Some(chunk));
+                        return this.fail_stream(e.to_string());
                     }
                 },
             };
@@ -589,22 +607,15 @@ impl Stream for ChunkStream {
                     // An engine that wedges by stalling (Ok-empty forever)
                     // is a failure the client must see — fail loud like the
                     // step-error arms above.
-                    this.done = true;
-                    this.buffers.lock().chunks.remove(&this.task_id);
                     warn!(
                         task = %this.task_id,
                         "engine made no progress for {} consecutive steps; closing stream",
                         MAX_CONSECUTIVE_EMPTY_STEPS
                     );
-                    let chunk = Chunk::error(
-                        this.task_id.clone(),
-                        format!(
-                            "engine made no progress for {} consecutive steps",
-                            MAX_CONSECUTIVE_EMPTY_STEPS
-                        ),
-                    );
-                    this.record_chunk_metrics(&chunk);
-                    return Poll::Ready(Some(chunk));
+                    return this.fail_stream(format!(
+                        "engine made no progress for {} consecutive steps",
+                        MAX_CONSECUTIVE_EMPTY_STEPS
+                    ));
                 }
                 continue;
             }
@@ -1584,6 +1595,14 @@ mod tests {
                 .get_sample_count(),
             1
         );
+        // Two token chunks → exactly ONE inter-token gap. The separate
+        // empty final marker must not add an artificial sample.
+        assert_eq!(
+            cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            1
+        );
         assert_eq!(
             cascadia_metrics::GENERATION_DURATION_SECONDS
                 .with_label_values(&[MODEL, "length"])
@@ -1635,6 +1654,104 @@ mod tests {
                 .with_label_values(&[MODEL])
                 .get(),
             0
+        );
+    }
+
+    /// Server teardown (Runner::close with a generation in flight) must NOT
+    /// be booked as a client cancellation — the metric's contract is
+    /// "explicit cancel or client disconnect".
+    #[tokio::test]
+    async fn teardown_mid_generation_is_not_counted_cancelled() {
+        const MODEL: &str = "runner-metrics-teardown-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-td", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await;
+        runner.close(); // engine slot empties mid-generation
+        while stream.next().await.is_some() {}
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0
+        );
+    }
+
+    /// Engine that acknowledges every task with a final marker tagged
+    /// FinishReason::Cancelled — the contract-blessed way for an engine to
+    /// surface a cancel it honored.
+    struct CancelAckEngine(Vec<TaskId>);
+
+    impl Engine for CancelAckEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.0.push(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(self
+                .0
+                .pop()
+                .map(|tid| {
+                    let c = Chunk::final_marker(tid.clone(), "")
+                        .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                    (tid, c)
+                })
+                .into_iter()
+                .collect())
+        }
+    }
+
+    struct CancelAckBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for CancelAckBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(CancelAckEngine(Vec::new())))
+        }
+    }
+
+    /// An engine-acknowledged cancel (Cancelled final marker) must land in
+    /// TASKS_CANCELLED_TOTAL exactly once — same counter as the tombstone /
+    /// Drop cancel paths — so the cancelled counter and the cancelled
+    /// duration histogram never diverge.
+    #[tokio::test]
+    async fn cancel_ack_final_chunk_counts_cancelled_exactly_once() {
+        const MODEL: &str = "runner-metrics-cancelack-model";
+        let runner = Runner::new(Box::new(CancelAckBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t-ca", "x").with_max_tokens(4))
+            .unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream); // Drop must not double-count (metrics_finalized set)
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "cancelled"])
+                .get_sample_count(),
+            1
         );
     }
 
