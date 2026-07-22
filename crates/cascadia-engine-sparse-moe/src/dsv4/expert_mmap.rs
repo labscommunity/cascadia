@@ -144,16 +144,26 @@ impl MmapExpert {
     /// `mlock` the mapped range so the OS never evicts it (hot-expert pinning).
     /// Best-effort: returns the error (e.g. `RLIMIT_MEMLOCK` exceeded) so the
     /// caller can fall back to the OS page cache for this expert.
+    #[cfg(unix)]
     pub fn pin(&self) -> std::io::Result<()> {
         self.mmap.lock()
+    }
+
+    /// Non-Unix (Windows): memmap2's `Mmap::lock` (mlock) is unavailable, so this
+    /// is a no-op — callers transparently fall back to the OS page cache.
+    #[cfg(not(unix))]
+    pub fn pin(&self) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// `madvise(WILLNEED)` — ask the OS to start reading this expert's pages into
     /// the cache without blocking. Issued for the *next* layer's likely experts
     /// while the current layer computes, so the NVMe read overlaps compute
     /// instead of stalling the GEMV. Best-effort hint; a failure is ignored.
+    /// `Mmap::advise`/`Advice` are Unix-only in memmap2; a no-op on Windows.
     #[inline]
     pub fn prefetch(&self) {
+        #[cfg(unix)]
         let _ = self.mmap.advise(memmap2::Advice::WillNeed);
     }
 
