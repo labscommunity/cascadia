@@ -672,11 +672,59 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     // inference correctness — a fixed empty string is a safe stand-in.
     env.add_function("strftime_now", |_fmt: String| -> String { String::new() });
 
+    // HF templates authored for Jinja2 use the Python `.N` subscript
+    // (`m.content.0.type`) which minijinja's parser rejects as a float
+    // ("unexpected float, expected identifier or integer"). Rewrite it to the
+    // bracket form `m.content[0]` that minijinja accepts. GLM-5's tool handling
+    // hits this; without the rewrite the whole template fails to parse and the
+    // API silently drops to the legacy formatter.
+    let src = sanitize_numeric_dot_index(template_src);
+
     // add_template_owned (not add_template) so the Environment owns the source
     // and is 'static — it can then live in AppState behind an Arc.
-    env.add_template_owned("chat", template_src.to_owned())
+    env.add_template_owned("chat", src.into_owned())
         .map_err(|e| format!("template parse: {e}"))?;
     Ok(env)
+}
+
+/// Rewrite Jinja2 numeric dot-index (`foo.0`, `bar.12`) to bracket-index
+/// (`foo[0]`, `bar[12]`). Only a `.` that follows an identifier char / `]` / `)`
+/// and precedes a digit run is converted, so real float literals (`1.5`, where
+/// the `.` follows a digit) are left untouched. Byte-slice copies keep it
+/// UTF-8-safe (the `.` and digits are ASCII, always char boundaries).
+fn sanitize_numeric_dot_index(src: &str) -> std::borrow::Cow<'_, str> {
+    let b = src.as_bytes();
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut changed = false;
+    while i < b.len() {
+        if b[i] == b'.' && i > 0 {
+            let prev = b[i - 1];
+            let prev_base =
+                prev.is_ascii_alphabetic() || prev == b'_' || prev == b']' || prev == b')';
+            if prev_base && b.get(i + 1).is_some_and(|a| a.is_ascii_digit()) {
+                let mut j = i + 1;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                out.push_str(&src[last..i]);
+                out.push('[');
+                out.push_str(&src[i + 1..j]);
+                out.push(']');
+                last = j;
+                i = j;
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !changed {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    out.push_str(&src[last..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Render messages through a pre-built chat environment (see [`build_chat_env`]).
@@ -1819,6 +1867,28 @@ mod tests {
     use cascadia_types::{Chunk, PeerLayout, ShardSpec};
     use serde_json::Value;
     use tower::ServiceExt;
+
+    #[test]
+    fn sanitizes_numeric_dot_index_for_minijinja() {
+        // `.N` subscript -> `[N]`; float literals (digit before `.`) untouched.
+        assert_eq!(sanitize_numeric_dot_index("m.content.0.type"), "m.content[0].type");
+        assert_eq!(
+            sanitize_numeric_dot_index("a.content.12 is mapping"),
+            "a.content[12] is mapping"
+        );
+        assert_eq!(sanitize_numeric_dot_index("temp = 1.5 or 0.0"), "temp = 1.5 or 0.0");
+        assert_eq!(sanitize_numeric_dot_index("plain text"), "plain text");
+        // A template using the Python `.N` subscript (as GLM-5's tool handling
+        // does) must now parse instead of falling back to the legacy formatter.
+        let src = "{%- if m.content.0.type == 'x' -%}{{ m.content.0.output }}{%- endif -%}";
+        assert!(
+            build_chat_env(src).is_ok(),
+            "`.N` subscript template should parse after dot-index sanitization"
+        );
+        // minijinja rejects the raw form, proving the sanitizer is what fixes it.
+        let mut raw = minijinja::Environment::new();
+        assert!(raw.add_template_owned("t", src.to_owned()).is_err());
+    }
 
     // Guards the contract the ov-genai usage fix (#55) depends on: when an
     // engine sets `n_tokens` on a single text-bearing final chunk, that count
