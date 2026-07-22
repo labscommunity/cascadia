@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.1.2](https://github.com/labscommunity/cascadia/compare/v0.1.1...v0.1.2) (2026-07-21)
+
+
+### Features
+
+* **api:** real /health readiness (was a hardcoded 200) ([c9b6ebc](https://github.com/labscommunity/cascadia/commit/c9b6ebc9683c18bb2501f156c4106790af9f4bf3))
+* **cli:** serve a clean model name (basename of --model, or --served-model-name) ([0895c2d](https://github.com/labscommunity/cascadia/commit/0895c2d7faaa7484721b182c1c828bc278ef818f))
+* deepseek v4 support in the sparse-moe engine ([4651129](https://github.com/labscommunity/cascadia/commit/46511292414eb677b81023bcff2d9b331c40298c))
+* **dsv4:** DeepSeek-V4-Flash exporter + CPU reference model ([660e56a](https://github.com/labscommunity/cascadia/commit/660e56a761afa56d50a3b106638e210cb4902a4b))
+* **dsv4:** optional OpenVINO int4 expert backend (GPU/CPU/NPU) ([7ee21a0](https://github.com/labscommunity/cascadia/commit/7ee21a09e46168186101d8ea071d10aab4bac2d5))
+* **dsv4:** ship R1 chat_template so chat completions render instruct prompts ([8571cff](https://github.com/labscommunity/cascadia/commit/8571cffdec7a1abf277ff2c3807b3ea70c960ce5))
+* **dsv4:** sparse-MoE inference engine + distributed pipeline ([c4c9c26](https://github.com/labscommunity/cascadia/commit/c4c9c26ea68a8274766165b54d3597d771c328a1))
+
+
+### Bug Fixes
+
+* build, CLI and docs bugs found by running every documented command ([c03c68c](https://github.com/labscommunity/cascadia/commit/c03c68c041c159eec3fd89ceaad21fe439733bee))
+* **build:** enforce MSRV 1.89, and make the Dockerfile build ([a4aa45a](https://github.com/labscommunity/cascadia/commit/a4aa45a196c369654ecba8f9898ed600f4c06427))
+* **cli:** usable errors for models, python and deps ([5173325](https://github.com/labscommunity/cascadia/commit/5173325995b4e133f75feb6d9472cd7c179e627e))
+* **dsv4:** apply the finish_reason + truncation fixes to the single-stage path ([9e749d7](https://github.com/labscommunity/cascadia/commit/9e749d75d1f928e13fd61be1c70bd613fbca276f))
+* **dsv4:** bound context, fix seeded-sampling parity, and harden the worker ([061c912](https://github.com/labscommunity/cascadia/commit/061c912927f5e3c1345978b5d922ab57010bfbc1))
+* **dsv4:** bound the pipeline reply-recv so a dead peer fails fast (no wedge) ([8f197cb](https://github.com/labscommunity/cascadia/commit/8f197cbc8d83a76f69ece760a41d528d3236c93f))
+* **dsv4:** exporter carries chat_template.jinja + serving sidecars ([a35340a](https://github.com/labscommunity/cascadia/commit/a35340a8f87328462522fc783a9e4489cced257b))
+* **dsv4:** harden streamed prefill against mid-stream failure ([fe56bb6](https://github.com/labscommunity/cascadia/commit/fe56bb638bbbbb891aeb7de5fbfe53f2505f29b3))
+* **dsv4:** out-wait a cold slice load on the downstream connect ([ceb7f7f](https://github.com/labscommunity/cascadia/commit/ceb7f7f53b410f5b8abd14650be207cf83023443))
+* **dsv4:** reject a manifest whose compress_ratios can't cover its layers ([b3a9480](https://github.com/labscommunity/cascadia/commit/b3a94808ceefdfe357552ca45bfab5adec677b32))
+* **dsv4:** reject stage load when manifest exported_layers misses the range ([eb6f760](https://github.com/labscommunity/cascadia/commit/eb6f760df80c96ab6c233e2c32e7db89a18e5298))
+* **dsv4:** remove the unusable ov_ir expert export mode ([910ba4c](https://github.com/labscommunity/cascadia/commit/910ba4c54c54b8974f8df67e8d4ad817223e3370))
+* **dsv4:** report finish_reason=length when the context window caps decode ([bf637e8](https://github.com/labscommunity/cascadia/commit/bf637e8d1be9627c5665d5496eadde49181aaecf))
+* **dsv4:** use one per-token reply deadline (drop the batched-prefill x10) ([ca4df33](https://github.com/labscommunity/cascadia/commit/ca4df3342246d39bd949fde40c402302d250e411))
+* **dsv4:** warn instead of silently dropping an over-budget prompt tail ([e3f7427](https://github.com/labscommunity/cascadia/commit/e3f7427ad3c2d81969db84b89b28c8f0bb53fc79))
+* **e2e:** find cascadia.exe on Windows ([1189b5b](https://github.com/labscommunity/cascadia/commit/1189b5b06fcc5bb36ef73af053009525737ab82c))
+* **engine:** ov-genai requires the tokenizer IRs ([d37db22](https://github.com/labscommunity/cascadia/commit/d37db223ff0b0a87086f54b3ad5fc06def8a48eb))
+* pin Intel's key properly, and the bugs review found ([a13d28c](https://github.com/labscommunity/cascadia/commit/a13d28c386c10839cfdccd2ab1fc422f20df9a19))
+* review-pass follow-ups ([d0a2a73](https://github.com/labscommunity/cascadia/commit/d0a2a73a10e3ed2a20012b3e0841f8920dbdbd3b))
+* **scripts:** install Intel's current GPU drivers, safely ([c5167d7](https://github.com/labscommunity/cascadia/commit/c5167d715792843cae6a6a84bbc18e29cec38f35))
+* **transport:** TCP keepalive on inter-rank pipeline sockets ([ad6f5ea](https://github.com/labscommunity/cascadia/commit/ad6f5ea608d1bb895c9c321c18e69f032d834b1f))
+
+
+### Performance
+
+* **dsv4:** AVX2 batch expert kernel (on-node bit-exact) ([2a2604f](https://github.com/labscommunity/cascadia/commit/2a2604f22b0471f4e9fb378bda0a936e5261e014))
+* **dsv4:** AVX2+FMA dot product in GEMV, chunked mmap expert dequant ([d21c0ee](https://github.com/labscommunity/cascadia/commit/d21c0eeeb84917cb8f75c146475ff7e8b0aa210e))
+* **dsv4:** batch-union expert kernel for prefill (forward_batch) ([7e17b1d](https://github.com/labscommunity/cascadia/commit/7e17b1dc32ac79de9c3343aea00d6bfc3b5996e3))
+* **dsv4:** batch-union MoE in forward_layers_prefill ([49ea601](https://github.com/labscommunity/cascadia/commit/49ea6014bf49aa4947b3427e4e97a4e95bb90f42))
+* **dsv4:** batched prefill across the pipeline (ForwardBatchPrefill) ([9ecbf06](https://github.com/labscommunity/cascadia/commit/9ecbf06246cabd7406095167dc66be58783a585d))
+* **dsv4:** env-gated per-section decode profiler (DSV4_PROFILE) ([c5dd062](https://github.com/labscommunity/cascadia/commit/c5dd062fb31bb1fe1fed712bd1f4c1fe5d99814e))
+* **dsv4:** fused AVX2 int4 dequant-dot for mmap experts ([1520a83](https://github.com/labscommunity/cascadia/commit/1520a83080014bf5cf16c40f942988f58f7a9d77))
+* **dsv4:** parallelize GEMV across cores with rayon ([27bae87](https://github.com/labscommunity/cascadia/commit/27bae87e26a4be943b6046d5822361e08b07896e))
+* **dsv4:** parallelize the o_proj wo_a GEMV ([4913f43](https://github.com/labscommunity/cascadia/commit/4913f43bba4b5d3d98a3184ebb6a7a0493ddd332))
+* **dsv4:** store attention projections as bf16 to halve GEMV bandwidth ([37f01e9](https://github.com/labscommunity/cascadia/commit/37f01e9ff975f07e9b56ac10e175566920f3afb8))
+* **dsv4:** stream prefill one-way to pipeline it across ranks ([0375173](https://github.com/labscommunity/cascadia/commit/037517309951fd1361defcb36dec502a0e60edf6))
+
+
+### Documentation
+
+* add a CLI reference ([2a74a2f](https://github.com/labscommunity/cascadia/commit/2a74a2f3581e1b8a643a0d8db5bb3764161d5cb4))
+* **dsv4:** correct the mmap-vs-eager "bitwise" claim ([08d663e](https://github.com/labscommunity/cascadia/commit/08d663e95f45ea4671df65bee0bb6f5748f13a7e))
+* **dsv4:** fix ForwardPrefill attribution in the architecture doc ([ed23f4f](https://github.com/labscommunity/cascadia/commit/ed23f4fb2556cc96745d88ba24963da07aa0ec69))
+* **dsv4:** trim architecture doc to essentials, document decode perf ([e708d24](https://github.com/labscommunity/cascadia/commit/e708d24e309bde2eb1a4054e8b4b73e203449a0e))
+* fix the commands that don't work ([5dfb645](https://github.com/labscommunity/cascadia/commit/5dfb6455b69752a7016c64930655499c7ae0824c))
+* install from Intel's unified suite in the by-hand block ([9d29e59](https://github.com/labscommunity/cascadia/commit/9d29e590a1091c755101b3197df030e86d100a1d))
+
+
+### Testing
+
+* **dsv4:** commit the tiny export fixture tensors so CI can load it ([4b0262e](https://github.com/labscommunity/cascadia/commit/4b0262e6598752603c26b7c10b3d54bc1b9fd85e))
+* **dsv4:** skip golden tests when the gitignored fixture is absent ([33dd33d](https://github.com/labscommunity/cascadia/commit/33dd33d7e45f5706728cc2ad14285aee6da14253))
+
+
+### Miscellaneous
+
+* **deps:** bump spin off yanked 0.9.8 ([de4df2e](https://github.com/labscommunity/cascadia/commit/de4df2e9257b1354c8e6b5d7ed8c03c0a1bec716))
+
 ## [0.1.1](https://github.com/labscommunity/cascadia/compare/v0.1.0...v0.1.1) (2026-07-09)
 
 
