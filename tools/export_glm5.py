@@ -583,6 +583,26 @@ def export_real(model_dir: Path, out: Path):
     elif mtp_done.exists():
         print("[mtp] skip (done)", flush=True)
 
+    # Carry the serving sidecars from the source checkpoint. GLM-5.2 ships its
+    # chat template as a standalone `chat_template.jinja`; without it the API
+    # falls back to legacy `role: content` formatting and instruct/chat prompts
+    # degrade (cascadia-api::load_chat_template_config_at reads the model root).
+    # `.exists()` guards each — base checkpoints simply won't have some of them.
+    import shutil
+
+    for fn in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+    ):
+        s = model_dir / fn
+        if s.exists():
+            shutil.copy(s, out / fn)
+            print(f"[sidecar] {fn}", flush=True)
+
     print(f"[export] done -> {out}", flush=True)
 
 
