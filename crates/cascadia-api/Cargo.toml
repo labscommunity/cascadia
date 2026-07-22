@@ -11,6 +11,7 @@ description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-metrics = { workspace = true }
 cascadia-runner = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

@@ -11,6 +11,7 @@ description = "Per-stage Runner — owns Builder/Engine, drives the generate loo
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-metrics = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }

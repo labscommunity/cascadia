@@ -15,9 +15,10 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use cascadia_engine::{Builder, Engine, EngineError};
-use cascadia_types::{Chunk, GenerationTask, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -126,6 +127,9 @@ pub struct Runner {
     /// cleanly with [`EngineError::NotLoaded`].
     engine: Arc<Mutex<Option<Box<dyn Engine>>>>,
     buffers: Arc<Mutex<Buffers>>,
+    /// Model id captured from the [`ShardSpec`] at `start()`, used as the
+    /// `model` label on generation metrics (#16). `None` until started.
+    model: Mutex<Option<Arc<str>>>,
 }
 
 impl Runner {
@@ -134,7 +138,16 @@ impl Runner {
             builder: Mutex::new(Some(builder)),
             engine: Arc::new(Mutex::new(None)),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
         }
+    }
+
+    /// `model` label for generation metrics; "unknown" before `start()`.
+    fn model_label(&self) -> Arc<str> {
+        self.model
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Arc::from("unknown"))
     }
 
     /// Connect transports, load weights, build engine, warm up. Pass
@@ -159,6 +172,9 @@ impl Runner {
         builder.connect(peers).await?;
 
         info!("runner load");
+        let model = shard.model_id.clone();
+        let device = shard.device.clone();
+        let load_started = Instant::now();
         let mut load_stream = builder.load(shard).await?;
         // drain the load progress stream
         use futures::StreamExt;
@@ -168,10 +184,18 @@ impl Runner {
 
         info!("runner build engine");
         let mut engine = builder.build()?;
+        cascadia_metrics::ENGINE_LOAD_DURATION_SECONDS
+            .with_label_values(&[&model, &device])
+            .set(load_started.elapsed().as_secs_f64());
         info!("runner warmup");
+        let warmup_started = Instant::now();
         engine.warmup();
+        cascadia_metrics::ENGINE_WARMUP_DURATION_SECONDS
+            .with_label_values(&[&model, &device])
+            .set(warmup_started.elapsed().as_secs_f64());
         info!("runner ready");
 
+        *self.model.lock() = Some(Arc::from(model));
         *self.engine.lock() = Some(engine);
         Ok(())
     }
@@ -222,6 +246,10 @@ impl Runner {
             last_errored_task: None,
             consecutive_foreign_err: 0,
             done: false,
+            model: self.model_label(),
+            submitted_at: Instant::now(),
+            last_chunk_at: None,
+            metrics_finalized: false,
         })
     }
 
@@ -310,6 +338,88 @@ pub struct ChunkStream {
     last_errored_task: Option<TaskId>,
     consecutive_foreign_err: usize,
     done: bool,
+    /// `model` label for the generation metrics below (#16).
+    model: Arc<str>,
+    /// When the task was submitted — the zero point for TTFT and duration.
+    submitted_at: Instant,
+    /// When the previous chunk was delivered (inter-token latency).
+    last_chunk_at: Option<Instant>,
+    /// A terminal outcome (completed / failed / cancelled) has been
+    /// recorded; guards exactly-once accounting between the final-chunk
+    /// paths, the cancel path, and `Drop`.
+    metrics_finalized: bool,
+}
+
+impl ChunkStream {
+    /// Record per-chunk generation metrics for a chunk delivered to OUR
+    /// consumer (never for chunks routed to other tasks' buffers).
+    fn record_chunk_metrics(&mut self, chunk: &Chunk) {
+        if self.metrics_finalized {
+            return;
+        }
+        let now = Instant::now();
+        if chunk.error.is_some() {
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[&self.model])
+                .inc();
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[&self.model, "error"])
+                .observe((now - self.submitted_at).as_secs_f64());
+            self.metrics_finalized = true;
+            return;
+        }
+        match self.last_chunk_at {
+            None => cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[&self.model])
+                .observe((now - self.submitted_at).as_secs_f64()),
+            Some(prev) => cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                .with_label_values(&[&self.model])
+                .observe((now - prev).as_secs_f64()),
+        }
+        self.last_chunk_at = Some(now);
+        // Same convention as the API's usage accounting: `n_tokens` is
+        // authoritative when set; otherwise one token per non-empty chunk
+        // (the empty final markers contribute 0).
+        let n = chunk.n_tokens.unwrap_or(u32::from(!chunk.text.is_empty()));
+        if n > 0 {
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[&self.model])
+                .inc_by(n as u64);
+        }
+        if chunk.is_final {
+            if let Some(p) = chunk.prompt_tokens {
+                cascadia_metrics::TOKENS_PROMPT_TOTAL
+                    .with_label_values(&[&self.model])
+                    .inc_by(p as u64);
+            }
+            // `Cancelled` is surfaced here (metrics-only per FinishReason's
+            // contract); the API maps it to "stop" on the wire.
+            let reason = match chunk.finish_reason {
+                Some(FinishReason::Length) => "length",
+                Some(FinishReason::Cancelled) => "cancelled",
+                Some(FinishReason::Stop) | None => "stop",
+            };
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[&self.model, reason])
+                .observe((now - self.submitted_at).as_secs_f64());
+            self.metrics_finalized = true;
+        }
+    }
+
+    /// Record an abandoned generation: explicit cancel, or the consumer
+    /// dropped the stream before the final chunk.
+    fn record_cancelled_metrics(&mut self) {
+        if self.metrics_finalized {
+            return;
+        }
+        cascadia_metrics::TASKS_CANCELLED_TOTAL
+            .with_label_values(&[&self.model])
+            .inc();
+        cascadia_metrics::GENERATION_DURATION_SECONDS
+            .with_label_values(&[&self.model, "cancelled"])
+            .observe(self.submitted_at.elapsed().as_secs_f64());
+        self.metrics_finalized = true;
+    }
 }
 
 impl Stream for ChunkStream {
@@ -329,6 +439,8 @@ impl Stream for ChunkStream {
                     this.done = true;
                     bufs.chunks.remove(&this.task_id);
                     bufs.cancelled.remove(&this.task_id);
+                    drop(bufs);
+                    this.record_cancelled_metrics();
                     return Poll::Ready(None);
                 }
                 if let Some(buf) = bufs.chunks.get_mut(&this.task_id) {
@@ -338,6 +450,8 @@ impl Stream for ChunkStream {
                             this.done = true;
                             bufs.chunks.remove(&this.task_id);
                         }
+                        drop(bufs);
+                        this.record_chunk_metrics(&chunk);
                         return Poll::Ready(Some(chunk));
                     }
                 }
@@ -437,13 +551,15 @@ impl Stream for ChunkStream {
                                 "engine re-failed the same foreign task for {} consecutive steps; closing stream",
                                 MAX_CONSECUTIVE_EMPTY_STEPS
                             );
-                            return Poll::Ready(Some(Chunk::error(
+                            let chunk = Chunk::error(
                                 this.task_id.clone(),
                                 format!(
                                     "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
                                     MAX_CONSECUTIVE_EMPTY_STEPS
                                 ),
-                            )));
+                            );
+                            this.record_chunk_metrics(&chunk);
+                            return Poll::Ready(Some(chunk));
                         }
                         continue;
                     }
@@ -460,10 +576,9 @@ impl Stream for ChunkStream {
                             error = %e,
                             "engine step failed; closing stream"
                         );
-                        return Poll::Ready(Some(Chunk::error(
-                            this.task_id.clone(),
-                            e.to_string(),
-                        )));
+                        let chunk = Chunk::error(this.task_id.clone(), e.to_string());
+                        this.record_chunk_metrics(&chunk);
+                        return Poll::Ready(Some(chunk));
                     }
                 },
             };
@@ -481,13 +596,15 @@ impl Stream for ChunkStream {
                         "engine made no progress for {} consecutive steps; closing stream",
                         MAX_CONSECUTIVE_EMPTY_STEPS
                     );
-                    return Poll::Ready(Some(Chunk::error(
+                    let chunk = Chunk::error(
                         this.task_id.clone(),
                         format!(
                             "engine made no progress for {} consecutive steps",
                             MAX_CONSECUTIVE_EMPTY_STEPS
                         ),
-                    )));
+                    );
+                    this.record_chunk_metrics(&chunk);
+                    return Poll::Ready(Some(chunk));
                 }
                 continue;
             }
@@ -498,7 +615,8 @@ impl Stream for ChunkStream {
 
             // 3) Everything this round produced — including our own chunks —
             //    is already in its owner's buffer, so loop and let step 1 hand
-            //    ours back in FIFO order.
+            //    ours back in FIFO order. Terminal/TTFT accounting rides that
+            //    same drain, so metrics stay delivery-timed.
             //
             //    Returning our chunk straight from the step instead would jump
             //    it ahead of anything another stream buffered for us while we
@@ -514,6 +632,10 @@ impl Stream for ChunkStream {
 
 impl Drop for ChunkStream {
     fn drop(&mut self) {
+        // A stream dropped before any terminal outcome was recorded is an
+        // abandoned generation (client disconnect, or a cancel the poll
+        // loop never observed) — count it exactly once.
+        self.record_cancelled_metrics();
         // Tell the engine to abandon this task. Without this an SSE
         // client that disconnects mid-generation leaves the engine
         // grinding through max_tokens worth of chunks that no one
@@ -690,6 +812,7 @@ mod tests {
             builder: Mutex::new(None),
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
         });
 
         // Drive the relay loop on a worker thread, let it run for a window
@@ -740,6 +863,7 @@ mod tests {
             builder: Mutex::new(None),
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
         });
 
         // No external stop: the loop must terminate on its own. A timed join
@@ -787,6 +911,7 @@ mod tests {
                 builder: Mutex::new(None),
                 engine: Arc::new(Mutex::new(Some(engine))),
                 buffers: Arc::new(Mutex::new(Buffers::default())),
+                model: Mutex::new(None),
             });
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
@@ -1420,5 +1545,128 @@ mod tests {
             "healthy stream was false-closed by distinct foreign-task errors: {chunk:?}"
         );
         assert!(stream.next().await.is_none(), "stream should be complete");
+    }
+
+    /// #16: metric tests use a DEDICATED model id per test — the registry is
+    /// process-global and tests in this binary run concurrently, so exact
+    /// assertions are only safe on labels no other test touches.
+    async fn make_runner_for_model(model: &str) -> Runner {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(model, "CPU"),
+            )
+            .await
+            .unwrap();
+        runner
+    }
+
+    #[tokio::test]
+    async fn completed_generation_records_metrics() {
+        const MODEL: &str = "runner-metrics-complete-model";
+        let runner = make_runner_for_model(MODEL).await;
+        // 4-word prompt, max_tokens 2 → two 1-token chunks, then an empty
+        // final marker with finish_reason "length".
+        let task = GenerationTask::new("t-m1", "alpha bravo charlie delta").with_max_tokens(2);
+        let mut stream = runner.generate(task).unwrap();
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            2
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "length"])
+                .get_sample_count(),
+            1
+        );
+        // Load + warmup gauges were set at start() (values may be ~0 for the
+        // mock; presence of the label pair is the contract).
+        assert!(
+            cascadia_metrics::ENGINE_LOAD_DURATION_SECONDS
+                .with_label_values(&[MODEL, "CPU"])
+                .get()
+                >= 0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_counts_cancelled_exactly_once() {
+        const MODEL: &str = "runner-metrics-cancel-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-m2", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await; // one chunk, then the client goes away
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "cancelled"])
+                .get_sample_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_stream_does_not_count_cancelled() {
+        const MODEL: &str = "runner-metrics-clean-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-m3", "alpha bravo").with_max_tokens(8);
+        let mut stream = runner.generate(task).unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_generation_counts_failed_metric() {
+        const MODEL: &str = "runner-metrics-fail-model";
+        let runner = Runner::new(Box::new(FailingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t-m4", "hello").with_max_tokens(4))
+            .unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        // The failure is terminal accounting — the drop must not ALSO count
+        // it as cancelled.
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0
+        );
     }
 }

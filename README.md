@@ -185,6 +185,7 @@ Qwen3.5/3.6 hybrid MoE (`model_type: qwen3_5_moe`) is special-cased: `cascadia s
 Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` traits in `cascadia-engine` are the plugin seam. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for design rationale and per-crate responsibilities. Key crates:
 
 - `cascadia-api/`: OpenAI-compatible HTTP (axum)
+- `cascadia-metrics/`: Prometheus metric registry shared by the API, runner, and transport
 - `cascadia-runner/`: Per-stage runner; concurrent-safe chunk streaming
 - `cascadia-engine/`: `Engine` + `Builder` traits (the plugin seam)
 - `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen36-moe`)
@@ -208,6 +209,8 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 
 **Security**: the HTTP API and inter-stage TCP relay are plaintext and unauthenticated. Bind only to trusted networks (LAN, loopback) or terminate TLS + auth at a reverse proxy in front of `--api`. See [SECURITY.md](SECURITY.md) for the threat model and built-in hardening.
 
+**Monitoring**: stages started with `--api` serve Prometheus metrics at `GET /metrics` — request rate/latency, TTFT, inter-token latency, token throughput, cancellations, model load times, and inter-stage transport bytes. Metric inventory and example queries in [docs/METRICS.md](docs/METRICS.md).
+
 ## Troubleshooting
 
 **`config.json not in <model dir>`**: `ov-runtime` reads the HF model `config.json` from the shard's tokenizer dir to derive rotary parameters. Older shard exports may not bundle `config.json`; copy it from the source model's HF cache (`~/.cache/huggingface/hub/models--<repo>/snapshots/<sha>/config.json`) into the shards root. Shards produced by `cascadia shard` bundle it automatically.
@@ -227,6 +230,7 @@ Cascadia does not daemonize itself, so it needs to be run under systemd / NSSM /
 | [docs/CLI.md](docs/CLI.md) | Every command and flag |
 | [docs/SHARDING.md](docs/SHARDING.md) | Sharding flow + per-model-family support table |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions + crate responsibilities |
+| [docs/METRICS.md](docs/METRICS.md) | Prometheus `/metrics` inventory + example queries |
 | [docs/engines/](docs/engines/) | Per-engine deep dives |
 | [docs/architectures/](docs/architectures/) | Per-model-family export/support notes |
 | [docs/perf/](docs/perf/) | Performance investigations and tuning |

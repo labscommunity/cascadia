@@ -67,12 +67,15 @@ fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
 /// on drop, so the gauge is correct even on early return, client disconnect,
-/// or a mid-stream engine error.
+/// or a mid-stream engine error. Mirrors into the Prometheus
+/// `cascadia_inflight_tasks` gauge (#16) so both the dashboard and
+/// `/metrics` see the same lifecycle.
 struct InFlightGuard(Arc<ApiStats>);
 
 impl InFlightGuard {
     fn new(stats: Arc<ApiStats>) -> Self {
         stats.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        cascadia_metrics::INFLIGHT_TASKS.inc();
         InFlightGuard(stats)
     }
 }
@@ -80,7 +83,16 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+        cascadia_metrics::INFLIGHT_TASKS.dec();
     }
+}
+
+/// Count a pre-engine rejection in `cascadia_api_rejected_total`. Reasons
+/// are a closed set — see the metric's docs in `cascadia-metrics`.
+fn count_rejected(reason: &str) {
+    cascadia_metrics::API_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
 }
 
 #[derive(Clone)]
@@ -249,9 +261,13 @@ pub fn make_router_with_stats(
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
+    // Register the label-less metric families up-front so a scrape before
+    // any traffic still lists them (#16). Idempotent.
+    cascadia_metrics::init();
     let mw_state = state.clone();
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -268,6 +284,43 @@ pub fn make_router_with_stats(
         // a multi-GB request. Apply at router level so it applies to
         // every route, not just chat_completions.
         .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
+        // Outermost: request count + latency per matched route (#16), so it
+        // observes rejections from the inner layers too.
+        .layer(axum::middleware::from_fn(track_http_metrics))
+}
+
+/// Request middleware: per-route request counter + latency histogram. Uses
+/// the MATCHED route template (bounded cardinality), never the raw URI; a
+/// request that matched no route is bucketed as `other`. For streaming
+/// (SSE) responses the duration is time-to-response-head — full generation
+/// time is `cascadia_generation_duration_seconds` (see `cascadia-metrics`).
+async fn track_http_metrics(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let endpoint = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "other".to_owned());
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    cascadia_metrics::HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&[&endpoint])
+        .observe(start.elapsed().as_secs_f64());
+    cascadia_metrics::HTTP_REQUESTS_TOTAL
+        .with_label_values(&[&endpoint, resp.status().as_str()])
+        .inc();
+    resp
+}
+
+/// `GET /metrics` — Prometheus text exposition format (#16). Serves the
+/// process-global registry: request, generation, engine, and transport
+/// metrics. Only stages started with `--api` expose it (same as every
+/// other HTTP route); relay-only stages have no HTTP listener.
+async fn metrics() -> impl IntoResponse {
+    let (content_type, body) = cascadia_metrics::encode_text();
+    ([(header::CONTENT_TYPE, content_type)], body)
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
@@ -1049,6 +1102,7 @@ async fn chat_completions(
     // prompt to the engine, which would generate nothing and return a 200
     // with empty content — indistinguishable from a real failure.
     if prompt.trim().is_empty() {
+        count_rejected("empty_prompt");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1058,6 +1112,7 @@ async fn chat_completions(
             .into_response();
     }
     if prompt.len() > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
@@ -1089,6 +1144,7 @@ async fn chat_completions(
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            count_rejected("capacity");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -1246,6 +1302,7 @@ async fn completions(
     let prompt = match &req.prompt {
         PromptSpec::Single(s) => s.clone(),
         PromptSpec::Multiple(_) => {
+            count_rejected("multi_prompt");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -1257,6 +1314,7 @@ async fn completions(
     };
     let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
     if prompt.trim().is_empty() {
+        count_rejected("empty_prompt");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "no prompt content: `prompt` is empty" })),
@@ -1264,6 +1322,7 @@ async fn completions(
             .into_response();
     }
     if prompt.len() > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
@@ -1291,6 +1350,7 @@ async fn completions(
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            count_rejected("capacity");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -3064,5 +3124,129 @@ mod tests {
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    // Helper: GET /metrics, return the exposition text.
+    async fn scrape_metrics(app: Router) -> (StatusCode, String, String) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    // #16 smoke test: real requests populate the request-, generation-, and
+    // engine-level metrics, and /metrics serves them in text exposition
+    // format. Uses a DEDICATED model id — the registry is process-global and
+    // other tests in this binary run concurrently, so assertions must be
+    // isolated by label, and on counters only assert presence (not exact
+    // values shared with other tests' traffic).
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_request_and_generation_metrics() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("metrics-probe-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "metrics-probe-model");
+
+        // Before traffic: the endpoint serves and the label-less families
+        // are already registered.
+        let (status, content_type, text) = scrape_metrics(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/plain; version=0.0.4");
+        assert!(text.contains("cascadia_inflight_tasks"), "{text}");
+
+        // One real (mock-engine) chat completion.
+        let (status, _) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "metrics-probe-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie delta"}],
+                "max_tokens": 2,
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, _, text) = scrape_metrics(app).await;
+        // Request-level: counted against the MATCHED route + status. (The
+        // prometheus text encoder emits label pairs sorted by name.)
+        assert!(
+            text.contains(
+                "cascadia_http_requests_total{endpoint=\"/v1/chat/completions\",status=\"200\"}"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("cascadia_http_request_duration_seconds_count"),
+            "{text}"
+        );
+        // Generation-level: tokens + TTFT + duration under the model label.
+        assert!(
+            text.contains("cascadia_tokens_generated_total{model=\"metrics-probe-model\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cascadia_generation_ttft_seconds_count{model=\"metrics-probe-model\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cascadia_generation_duration_seconds_count{finish_reason=\"length\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+        // Engine-level: load + warmup gauges recorded by Runner::start.
+        assert!(
+            text.contains(
+                "cascadia_engine_model_load_duration_seconds{device=\"CPU\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cascadia_engine_warmup_duration_seconds{device=\"CPU\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+    }
+
+    // Rejections that never reach the engine are counted by reason.
+    #[tokio::test]
+    async fn metrics_count_pre_engine_rejections() {
+        let app = make_app().await;
+        let (status, _) = post_chat(
+            app.clone(),
+            serde_json::json!({ "model": "mock-model", "messages": [] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, _, text) = scrape_metrics(app).await;
+        assert!(
+            text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
+            "{text}"
+        );
     }
 }
