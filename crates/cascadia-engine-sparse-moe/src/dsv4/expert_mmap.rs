@@ -77,7 +77,12 @@ impl MmapExpert {
             return Err(LoadError::ExpertBin(path.display().to_string(), len));
         }
         let mmap = unsafe { Mmap::map(&f)? };
-        Ok(Self { mmap, path: path.to_path_buf(), dim, inter })
+        Ok(Self {
+            mmap,
+            path: path.to_path_buf(),
+            dim,
+            inter,
+        })
     }
 
     /// Read this expert's whole bin into an owned buffer in ONE bulk sequential
@@ -103,7 +108,14 @@ impl MmapExpert {
             *hi = (*hi / (1.0 + (-*hi).exp())) * ui; // silu(gate)*up — matches ffn::swiglu_mmap
         }
         let mut out = vec![0.0f32; dim];
-        self.gemv_on(data, 2 * section_bytes(inter, dim), dim, inter, &h, &mut out);
+        self.gemv_on(
+            data,
+            2 * section_bytes(inter, dim),
+            dim,
+            inter,
+            &h,
+            &mut out,
+        );
         out
     }
 
@@ -120,7 +132,15 @@ impl MmapExpert {
 
     /// `gemv` over an arbitrary byte source (`self.mmap` or an R1 read buffer).
     /// The two are byte-identical, so the result is bitwise the same either way.
-    fn gemv_on(&self, data: &[u8], sec_off: usize, out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]) {
+    fn gemv_on(
+        &self,
+        data: &[u8],
+        sec_off: usize,
+        out_dim: usize,
+        in_dim: usize,
+        x: &[f32],
+        y: &mut [f32],
+    ) {
         use rayon::prelude::*;
         debug_assert_eq!(x.len(), in_dim);
         debug_assert_eq!(y.len(), out_dim);
@@ -246,12 +266,24 @@ impl MmapExpert {
     }
     pub fn gemv_up(&self, x: &[f32]) -> Vec<f32> {
         let mut y = vec![0.0f32; self.inter];
-        self.gemv(section_bytes(self.inter, self.dim), self.inter, self.dim, x, &mut y);
+        self.gemv(
+            section_bytes(self.inter, self.dim),
+            self.inter,
+            self.dim,
+            x,
+            &mut y,
+        );
         y
     }
     pub fn gemv_down(&self, h: &[f32]) -> Vec<f32> {
         let mut y = vec![0.0f32; self.dim];
-        self.gemv(2 * section_bytes(self.inter, self.dim), self.dim, self.inter, h, &mut y);
+        self.gemv(
+            2 * section_bytes(self.inter, self.dim),
+            self.dim,
+            self.inter,
+            h,
+            &mut y,
+        );
         y
     }
 }

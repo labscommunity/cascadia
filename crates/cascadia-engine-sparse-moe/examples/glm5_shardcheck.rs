@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cascadia_engine_sparse_moe::dist::{recv_forward_body_server, recv_kind_server, send_forward, FrameKind};
+use cascadia_engine_sparse_moe::dist::{
+    recv_forward_body_server, recv_kind_server, send_forward, FrameKind,
+};
 use cascadia_engine_sparse_moe::glm::stage::{GlmRunner, GLM5_DEFAULT_MAX_SEQ};
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
-use tokio::sync::Mutex;
 use tokenizers::Tokenizer;
+use tokio::sync::Mutex;
 
 fn argmax(v: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -34,7 +36,13 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// Greedy generation across `m` pipeline ranks over `m-1` loopback links.
-async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32], n_gen: usize) -> Vec<u32> {
+async fn pipeline_generate(
+    dir: &Path,
+    max_seq: usize,
+    m: usize,
+    prompt: &[u32],
+    n_gen: usize,
+) -> Vec<u32> {
     let mut ranks: Vec<GlmRunner> = (0..m)
         .map(|r| GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0).expect("load rank"))
         .collect();
@@ -54,7 +62,10 @@ async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32],
         let sc = server.clone();
         let atask = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
         let mut client = ActivationClient::new("127.0.0.1", port);
-        client.connect_with_timeout(Duration::from_secs(10)).await.unwrap();
+        client
+            .connect_with_timeout(Duration::from_secs(10))
+            .await
+            .unwrap();
         atask.await.unwrap();
         clients.push(Arc::new(Mutex::new(client)));
         servers.push(server);
@@ -78,7 +89,9 @@ async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32],
             let cfg2 = cfg.clone();
             let hsend = h;
             let send = tokio::spawn(async move {
-                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz]).await.unwrap();
+                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz])
+                    .await
+                    .unwrap();
             });
             let k = recv_kind_server(&servers[i]).await.unwrap();
             assert_eq!(k, Some(FrameKind::Forward));
@@ -114,32 +127,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(&args[1]);
     let n_gen: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12);
     let m: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
-    let max_seq: usize =
-        std::env::var("CASCADIA_GLM5_MAX_SEQ").ok().and_then(|s| s.parse().ok()).unwrap_or(GLM5_DEFAULT_MAX_SEQ);
+    let max_seq: usize = std::env::var("CASCADIA_GLM5_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(GLM5_DEFAULT_MAX_SEQ);
 
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).ok();
     let prompt: Vec<u32> = match tok.as_ref() {
-        Some(t) => t.encode("The capital of France is", true).map_err(|e| e.to_string())?.get_ids().to_vec(),
+        Some(t) => t
+            .encode("The capital of France is", true)
+            .map_err(|e| e.to_string())?
+            .get_ids()
+            .to_vec(),
         None => vec![1, 2, 3, 4],
     };
-    println!("[shardcheck] dir={} max_seq={max_seq} M={m} n_gen={n_gen} prompt_ids={}", dir.display(), prompt.len());
+    println!(
+        "[shardcheck] dir={} max_seq={max_seq} M={m} n_gen={n_gen} prompt_ids={}",
+        dir.display(),
+        prompt.len()
+    );
 
     // 1) single-process baseline (total=1). Dropped before the M-rank run so peak
     //    RAM stays ~one full model.
     let want: Vec<u32> = {
         let t0 = Instant::now();
         let mut solo = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0)?;
-        println!("[shardcheck] single-process loaded in {:.0}s", t0.elapsed().as_secs_f64());
+        println!(
+            "[shardcheck] single-process loaded in {:.0}s",
+            t0.elapsed().as_secs_f64()
+        );
         let g0 = Instant::now();
         let out = solo.generate_argmax(&prompt, n_gen);
-        println!("[shardcheck] single: {out:?}  ({:.1}s)", g0.elapsed().as_secs_f64());
+        println!(
+            "[shardcheck] single: {out:?}  ({:.1}s)",
+            g0.elapsed().as_secs_f64()
+        );
         out
     };
 
     // 2) M-rank pipeline over loopback.
     let t1 = Instant::now();
     let got = pipeline_generate(&dir, max_seq, m, &prompt, n_gen).await;
-    println!("[shardcheck] {m}-rank: {got:?}  ({:.1}s)", t1.elapsed().as_secs_f64());
+    println!(
+        "[shardcheck] {m}-rank: {got:?}  ({:.1}s)",
+        t1.elapsed().as_secs_f64()
+    );
 
     if let Some(t) = tok.as_ref() {
         if let Ok(txt) = t.decode(&got, true) {
@@ -148,7 +180,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if got == want {
-        println!("[shardcheck] ✓ {m}-rank output == single-process — sharding correct on the real model");
+        println!(
+            "[shardcheck] ✓ {m}-rank output == single-process — sharding correct on the real model"
+        );
         Ok(())
     } else {
         eprintln!("[shardcheck] ✗ MISMATCH\n  single: {want:?}\n  {m}-rank: {got:?}");

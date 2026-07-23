@@ -42,7 +42,11 @@ pub trait StagedRunner: Send + 'static {
     /// KV state as `rows` sequential `forward_layers` calls.
     fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
         let hs = self.hidden_size();
-        assert_eq!(hidden.len(), rows * hs, "forward_layers_batch: bad hidden length");
+        assert_eq!(
+            hidden.len(),
+            rows * hs,
+            "forward_layers_batch: bad hidden length"
+        );
         let mut out = vec![0.0f32; rows * hs];
         for r in 0..rows {
             let h = hidden[r * hs..(r + 1) * hs].to_vec();

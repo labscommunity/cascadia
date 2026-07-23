@@ -127,7 +127,7 @@ pub enum FrameKind {
     /// current KV slice under the key after prefill. Runners without prefix
     /// caching (dsv4) treat both as no-ops.
     RestorePrefix = 0x53_4D_45_09, // "SME\x09"
-    CachePrefix = 0x53_4D_45_0A,   // "SME\x0A"
+    CachePrefix = 0x53_4D_45_0A,  // "SME\x0A"
 }
 
 impl FrameKind {

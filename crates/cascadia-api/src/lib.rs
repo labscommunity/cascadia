@@ -1967,12 +1967,18 @@ mod tests {
     #[test]
     fn sanitizes_numeric_dot_index_for_minijinja() {
         // `.N` subscript -> `[N]`; float literals (digit before `.`) untouched.
-        assert_eq!(sanitize_numeric_dot_index("m.content.0.type"), "m.content[0].type");
+        assert_eq!(
+            sanitize_numeric_dot_index("m.content.0.type"),
+            "m.content[0].type"
+        );
         assert_eq!(
             sanitize_numeric_dot_index("a.content.12 is mapping"),
             "a.content[12] is mapping"
         );
-        assert_eq!(sanitize_numeric_dot_index("temp = 1.5 or 0.0"), "temp = 1.5 or 0.0");
+        assert_eq!(
+            sanitize_numeric_dot_index("temp = 1.5 or 0.0"),
+            "temp = 1.5 or 0.0"
+        );
         assert_eq!(sanitize_numeric_dot_index("plain text"), "plain text");
         // A template using the Python `.N` subscript (as GLM-5's tool handling
         // does) must now parse instead of falling back to the legacy formatter.

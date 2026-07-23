@@ -42,7 +42,14 @@ impl GlmLayer {
     ) -> Self {
         assert_eq!(in_ln.len(), hidden);
         assert_eq!(post_ln.len(), hidden);
-        Self { hidden, eps, in_ln, post_ln, attn, mlp }
+        Self {
+            hidden,
+            eps,
+            in_ln,
+            post_ln,
+            attn,
+            mlp,
+        }
     }
 
     /// Clear the attention KV cache (new sequence).
@@ -171,7 +178,7 @@ pub struct GlmModel {
     pub hidden: usize,
     pub vocab: usize,
     pub eps: f32,
-    embed: Vec<f32>,      // [vocab, hidden]
+    embed: Vec<f32>, // [vocab, hidden]
     layers: Vec<GlmLayer>,
     final_norm: Vec<f32>, // [hidden]
     lm_head: Vec<f32>,    // [vocab, hidden] (f32 -> f32 logits)
@@ -192,7 +199,16 @@ impl GlmModel {
         assert_eq!(embed.len(), vocab * hidden);
         assert_eq!(final_norm.len(), hidden);
         assert_eq!(lm_head.len(), vocab * hidden);
-        Self { hidden, vocab, eps, embed, layers, final_norm, lm_head, mtp: None }
+        Self {
+            hidden,
+            vocab,
+            eps,
+            embed,
+            layers,
+            final_norm,
+            lm_head,
+            mtp: None,
+        }
     }
 
     /// Attach the MTP draft head, enabling [`Self::generate_spec`]. The head must
@@ -369,7 +385,14 @@ impl GlmModel {
                 len += 1;
                 continue;
             }
-            let drafts = mtp.draft(&hlast, next_tok, g, &self.embed, &self.final_norm, &self.lm_head);
+            let drafts = mtp.draft(
+                &hlast,
+                next_tok,
+                g,
+                &self.embed,
+                &self.final_norm,
+                &self.lm_head,
+            );
             drafted += g;
             // verify [next_tok, drafts…]: appends g+1 positions at [len, len+g].
             let mut verify_in = Vec::with_capacity(g + 1);
@@ -400,7 +423,12 @@ impl GlmModel {
         self.mtp = Some(mtp);
         let _ = len; // last write feeds the final truncate; silence unused-assign
         out.truncate(n_gen);
-        SpecOutput { tokens: out, forwards, drafted, accepted }
+        SpecOutput {
+            tokens: out,
+            forwards,
+            drafted,
+            accepted,
+        }
     }
 
     /// Grammar-constrained greedy generation with forced-run batching. Forced
@@ -441,7 +469,10 @@ impl GlmModel {
                 forwards += 1;
             }
         }
-        super::grammar::GrammarOutput { tokens: out, forwards }
+        super::grammar::GrammarOutput {
+            tokens: out,
+            forwards,
+        }
     }
 
     /// Greedy generation: batched prefill of `prompt`, then `n_gen` argmax tokens.
@@ -468,7 +499,10 @@ impl GlmModel {
         prompt: &[u32],
         n_gen: usize,
     ) -> (Vec<u32>, usize) {
-        assert!(!prompt.is_empty(), "generate_with_prefix_cache needs a non-empty prompt");
+        assert!(
+            !prompt.is_empty(),
+            "generate_with_prefix_cache needs a non-empty prompt"
+        );
         self.reset();
         // Restore the longest cached prefix, then prefill the suffix. We must
         // prefill at least the last prompt token to obtain its logits, so a

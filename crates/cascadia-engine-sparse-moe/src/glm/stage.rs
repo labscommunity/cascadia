@@ -66,9 +66,9 @@ fn index_aligned_split(n: usize, itypes: &[String], rank: u32, total: u32) -> (u
 }
 
 pub struct GlmRunner {
-    embed: Option<Vec<f32>>,             // [vocab, hidden] on rank 0
-    layers: Vec<GlmLayer>,               // this rank's slice
-    head: Option<(Vec<f32>, Vec<f32>)>,  // (final_norm, lm_head) on the last rank
+    embed: Option<Vec<f32>>,            // [vocab, hidden] on rank 0
+    layers: Vec<GlmLayer>,              // this rank's slice
+    head: Option<(Vec<f32>, Vec<f32>)>, // (final_norm, lm_head) on the last rank
     hidden: usize,
     vocab: usize,
     eps: f32,
@@ -129,7 +129,12 @@ impl GlmRunner {
         // index-aligned split guarantees this, but an explicit ShardSpec
         // (`layer_start`/`layer_end`) may not, so reject a bad boundary loudly
         // rather than serve silently-wrong long-context output.
-        if lo != 0 && m.indexer_types.get(lo).map(|t| t != "full").unwrap_or(false) {
+        if lo != 0
+            && m.indexer_types
+                .get(lo)
+                .map(|t| t != "full")
+                .unwrap_or(false)
+        {
             return Err(LoadError::Manifest(format!(
                 "rank {rank} starts on non-'full' IndexShare layer {lo} ('{}'): a rank \
                  boundary must land on a 'full' layer or that layer runs dense attention. \
@@ -185,21 +190,28 @@ impl GlmRunner {
                     }
                 }
                 if act > 0 {
-                    eprintln!("[glm5] rank {rank}: mlock'd {act} always-active experts (shared + dense)");
+                    eprintln!(
+                        "[glm5] rank {rank}: mlock'd {act} always-active experts (shared + dense)"
+                    );
                 }
             }
 
             let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq);
             let (total, hot) = {
                 let u = usage.lock().unwrap();
-                (u.total, u.hottest_in_range(lo, hi, residency::autopin_count(u.total, budget)))
+                (
+                    u.total,
+                    u.hottest_in_range(lo, hi, residency::autopin_count(u.total, budget)),
+                )
             };
             let n_pin = hot.len();
             let mut pinned = 0usize;
             for (gl, e) in hot {
                 let gl = gl as usize; // hottest_in_range already restricts to [lo, hi)
-                if let Some(mm) =
-                    s.layers[gl - lo].moe().and_then(|ml| ml.experts().get(e as usize)).and_then(AnyExpert::as_mmap)
+                if let Some(mm) = s.layers[gl - lo]
+                    .moe()
+                    .and_then(|ml| ml.experts().get(e as usize))
+                    .and_then(AnyExpert::as_mmap)
                 {
                     if mm.pin().is_ok() {
                         pinned += 1;
@@ -273,7 +285,12 @@ impl GlmRunner {
         // plus the DSA indexer key cache (index_head_dim f32 per token per OWNED
         // "full" layer). Both scale with max_seq — significant at agentic context.
         let full_owned = (lo..hi)
-            .filter(|li| m.indexer_types.get(*li).map(|t| t == "full").unwrap_or(true))
+            .filter(|li| {
+                m.indexer_types
+                    .get(*li)
+                    .map(|t| t == "full")
+                    .unwrap_or(true)
+            })
             .count();
         let kv = owned as u64 * max_seq as u64 * (m.kv_lora_rank + m.qk_rope_head_dim) as u64 * 4
             + full_owned as u64 * max_seq as u64 * m.index_head_dim as u64 * 4;
@@ -355,7 +372,10 @@ impl StagedRunner for GlmRunner {
         Some(len)
     }
     fn embed_token(&self, token: u32) -> Vec<f32> {
-        let e = self.embed.as_ref().expect("embed_token on a non-first rank");
+        let e = self
+            .embed
+            .as_ref()
+            .expect("embed_token on a non-first rank");
         let t = token as usize;
         e[t * self.hidden..(t + 1) * self.hidden].to_vec()
     }
@@ -399,7 +419,11 @@ impl StagedRunner for GlmRunner {
             "glm5 stage batch position desync (expected {}, got {base})",
             self.pos
         );
-        assert_eq!(hidden.len(), rows * self.hidden, "glm5 batch: bad hidden length");
+        assert_eq!(
+            hidden.len(),
+            rows * self.hidden,
+            "glm5 batch: bad hidden length"
+        );
         // Each layer runs per-position attention (KV in order) + batch-union MoE.
         let mut x = hidden;
         let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows]; // per-row IndexShare

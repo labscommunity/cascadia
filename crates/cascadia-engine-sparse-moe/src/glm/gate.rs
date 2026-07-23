@@ -21,7 +21,13 @@ pub struct GateOut {
 }
 
 /// One token's gate. `logits` and `bias` are both length `n_experts`.
-pub fn moe_gate(logits: &[f32], bias: &[f32], top_k: usize, scale: f32, norm_topk: bool) -> GateOut {
+pub fn moe_gate(
+    logits: &[f32],
+    bias: &[f32],
+    top_k: usize,
+    scale: f32,
+    norm_topk: bool,
+) -> GateOut {
     let e = logits.len();
     assert_eq!(bias.len(), e, "gate: bias/logits length mismatch");
     assert!(top_k <= e, "gate: top_k ({top_k}) > n_experts ({e})");
@@ -67,7 +73,7 @@ mod tests {
         let bias = [0.1, 0.1, 0.0, 0.0]; // ids 0 and 1 tie at choice=0.6
         let out = moe_gate(&logits, &bias, 2, 2.5, true);
         assert_eq!(out.idx, vec![0, 1]); // tie -> lower ids, in order
-        // both selected scores are 0.5 -> normalised 0.5 each -> *2.5 = 1.25
+                                         // both selected scores are 0.5 -> normalised 0.5 each -> *2.5 = 1.25
         assert!((out.weight[0] - 1.25).abs() < 1e-6);
         assert!((out.weight[1] - 1.25).abs() < 1e-6);
     }

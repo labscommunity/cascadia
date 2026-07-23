@@ -32,28 +32,55 @@ fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
 
 // Deterministic LCG so token->expert selection is reproducible without rand.
 fn lcg(state: &mut u64) -> u64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     *state >> 16
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let dir = PathBuf::from(args.get(1).expect("usage: nvme_readbench <dir> [K] [tokens]"));
+    let dir = PathBuf::from(
+        args.get(1)
+            .expect("usage: nvme_readbench <dir> [K] [tokens]"),
+    );
     let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
 
     let bins = list_bins(&dir);
-    assert!(bins.len() >= k, "need >= {k} .bin files, found {}", bins.len());
-    let total_gb: f64 = bins.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum::<u64>() as f64 / 1e9;
-    println!("[readbench] dir={} bins={} ({:.1} GB) K={k} tokens={tokens}", dir.display(), bins.len(), total_gb);
+    assert!(
+        bins.len() >= k,
+        "need >= {k} .bin files, found {}",
+        bins.len()
+    );
+    let total_gb: f64 = bins
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum::<u64>() as f64
+        / 1e9;
+    println!(
+        "[readbench] dir={} bins={} ({:.1} GB) K={k} tokens={tokens}",
+        dir.display(),
+        bins.len(),
+        total_gb
+    );
     println!("[readbench] NOTE: drop caches before each phase — `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`");
 
     // Reproducible per-token expert picks (same for both phases).
     let mut st = 0x1234_5678_9abc_def0u64;
-    let picks: Vec<Vec<usize>> =
-        (0..tokens).map(|_| (0..k).map(|_| (lcg(&mut st) as usize) % bins.len()).collect()).collect();
+    let picks: Vec<Vec<usize>> = (0..tokens)
+        .map(|_| {
+            (0..k)
+                .map(|_| (lcg(&mut st) as usize) % bins.len())
+                .collect()
+        })
+        .collect();
 
-    let bytes_of = |idxs: &[usize]| -> u64 { idxs.iter().map(|&i| std::fs::metadata(&bins[i]).unwrap().len()).sum() };
+    let bytes_of = |idxs: &[usize]| -> u64 {
+        idxs.iter()
+            .map(|&i| std::fs::metadata(&bins[i]).unwrap().len())
+            .sum()
+    };
 
     // Phase A — mmap + touch every byte, one file at a time (today's path).
     let phase = std::env::var("PHASE").unwrap_or_else(|_| "both".into());
@@ -77,7 +104,11 @@ fn main() {
         let dt = t0.elapsed().as_secs_f64();
         println!(
             "[A mmap+touch ] {:.2} GB in {:.2}s = {:.0} MB/s | {:.1} ms/token (sink {})",
-            bytes as f64 / 1e9, dt, bytes as f64 / 1e6 / dt, dt * 1e3 / tokens as f64, sink & 0xff
+            bytes as f64 / 1e9,
+            dt,
+            bytes as f64 / 1e6 / dt,
+            dt * 1e3 / tokens as f64,
+            sink & 0xff
         );
     }
 
@@ -112,7 +143,11 @@ fn main() {
         let dt = t0.elapsed().as_secs_f64();
         println!(
             "[B explicit|| ] {:.2} GB in {:.2}s = {:.0} MB/s | {:.1} ms/token (sink {})",
-            bytes as f64 / 1e9, dt, bytes as f64 / 1e6 / dt, dt * 1e3 / tokens as f64, sink & 0xff
+            bytes as f64 / 1e9,
+            dt,
+            bytes as f64 / 1e6 / dt,
+            dt * 1e3 / tokens as f64,
+            sink & 0xff
         );
     }
 }

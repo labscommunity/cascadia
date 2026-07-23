@@ -51,13 +51,13 @@ pub const MLA_LATENT_EPS: f32 = 1e-6;
 /// halving the streamed bytes ~halves the projection cost. RMSNorm weights stay
 /// f32.
 pub struct AttnWeights {
-    pub wq_a: Vec<u16>,     // [q_lora, hidden]
-    pub q_a_ln: Vec<f32>,   // [q_lora]
-    pub wq_b: Vec<u16>,     // [h*qk_head, q_lora]
-    pub wkv_a: Vec<u16>,    // [kv_lora + qk_rope, hidden]
-    pub kv_a_ln: Vec<f32>,  // [kv_lora]
-    pub wkv_b: Vec<u16>,    // [h*(qk_nope + v_head), kv_lora]
-    pub wo: Vec<u16>,       // [hidden, h*v_head]
+    pub wq_a: Vec<u16>,    // [q_lora, hidden]
+    pub q_a_ln: Vec<f32>,  // [q_lora]
+    pub wq_b: Vec<u16>,    // [h*qk_head, q_lora]
+    pub wkv_a: Vec<u16>,   // [kv_lora + qk_rope, hidden]
+    pub kv_a_ln: Vec<f32>, // [kv_lora]
+    pub wkv_b: Vec<u16>,   // [h*(qk_nope + v_head), kv_lora]
+    pub wo: Vec<u16>,      // [hidden, h*v_head]
 }
 
 pub struct AttentionLayer {
@@ -267,7 +267,13 @@ impl AttentionLayer {
         let mut q = vec![0.0f32; h * qk];
         linear_bf16_w(&qr, &self.w.wq_b, h * qk, self.q_lora, &mut q);
         for hi in 0..h {
-            apply_rope_row(&mut q[hi * qk..(hi + 1) * qk], &self.freqs, pos, rope, false);
+            apply_rope_row(
+                &mut q[hi * qk..(hi + 1) * qk],
+                &self.freqs,
+                pos,
+                rope,
+                false,
+            );
         }
 
         // comp = wkv_a · x -> [latent | k_pe]; append normed latent + roped k_pe.

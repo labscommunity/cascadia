@@ -84,9 +84,8 @@ fn one_f32() -> f32 {
 }
 
 pub fn read_manifest(dir: &Path) -> Result<GlmManifest, LoadError> {
-    let m: GlmManifest =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)
-            .map_err(|e| LoadError::Manifest(e.to_string()))?;
+    let m: GlmManifest = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)
+        .map_err(|e| LoadError::Manifest(e.to_string()))?;
     if m.arch != "glm5" {
         return Err(LoadError::Manifest(format!(
             "arch is {:?}, expected \"glm5\"",
@@ -99,7 +98,12 @@ pub fn read_manifest(dir: &Path) -> Result<GlmManifest, LoadError> {
 /// Dequantize one int4 section: `[out_dim, in_dim]` packed nibbles (2/byte,
 /// low = even col, value = nibble-8) followed by bf16-LE per-`G` scales.
 /// Advances `off`. Mirrors `export_glm5.py::_pack_int4_grouped`.
-fn dequant_int4(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> Result<Vec<f32>, LoadError> {
+fn dequant_int4(
+    buf: &[u8],
+    off: &mut usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Vec<f32>, LoadError> {
     if in_dim % G != 0 {
         return Err(LoadError::Manifest(format!(
             "int4 in_dim {in_dim} not divisible by group {G}"
@@ -109,7 +113,10 @@ fn dequant_int4(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> R
     let packed_len = out_dim * in_dim / 2;
     let scale_len = out_dim * ng * 2;
     if *off + packed_len + scale_len > buf.len() {
-        return Err(LoadError::ExpertBin("int4 section truncated".into(), buf.len()));
+        return Err(LoadError::ExpertBin(
+            "int4 section truncated".into(),
+            buf.len(),
+        ));
     }
     let packed = &buf[*off..*off + packed_len];
     let scales_raw = &buf[*off + packed_len..*off + packed_len + scale_len];
@@ -146,15 +153,25 @@ const INT3_GROUP_BYTES: usize = G * 3 / 8;
 /// int3 GEMV are the remaining wiring; this + its test lock the pack↔unpack
 /// contract first.
 #[allow(dead_code)]
-fn dequant_int3(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> Result<Vec<f32>, LoadError> {
+fn dequant_int3(
+    buf: &[u8],
+    off: &mut usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<Vec<f32>, LoadError> {
     if in_dim % G != 0 {
-        return Err(LoadError::Manifest(format!("int3 in_dim {in_dim} not divisible by group {G}")));
+        return Err(LoadError::Manifest(format!(
+            "int3 in_dim {in_dim} not divisible by group {G}"
+        )));
     }
     let ng = in_dim / G;
     let packed_len = out_dim * ng * INT3_GROUP_BYTES;
     let scale_len = out_dim * ng * 2;
     if *off + packed_len + scale_len > buf.len() {
-        return Err(LoadError::ExpertBin("int3 section truncated".into(), buf.len()));
+        return Err(LoadError::ExpertBin(
+            "int3 section truncated".into(),
+            buf.len(),
+        ));
     }
     let packed = &buf[*off..*off + packed_len];
     let scales_raw = &buf[*off + packed_len..*off + packed_len + scale_len];
@@ -162,13 +179,21 @@ fn dequant_int3(buf: &[u8], off: &mut usize, out_dim: usize, in_dim: usize) -> R
     let mut w = vec![0.0f32; out_dim * in_dim];
     for o in 0..out_dim {
         for gi in 0..ng {
-            let s = bf16::from_le_bytes([scales_raw[(o * ng + gi) * 2], scales_raw[(o * ng + gi) * 2 + 1]])
-                .to_f32();
-            let gp = &packed[(o * ng + gi) * INT3_GROUP_BYTES..(o * ng + gi + 1) * INT3_GROUP_BYTES];
+            let s = bf16::from_le_bytes([
+                scales_raw[(o * ng + gi) * 2],
+                scales_raw[(o * ng + gi) * 2 + 1],
+            ])
+            .to_f32();
+            let gp =
+                &packed[(o * ng + gi) * INT3_GROUP_BYTES..(o * ng + gi + 1) * INT3_GROUP_BYTES];
             for i in 0..G {
                 let bit = i * 3;
                 let b0 = gp[bit / 8] as u16;
-                let b1 = if bit / 8 + 1 < INT3_GROUP_BYTES { gp[bit / 8 + 1] as u16 } else { 0 };
+                let b1 = if bit / 8 + 1 < INT3_GROUP_BYTES {
+                    gp[bit / 8 + 1] as u16
+                } else {
+                    0
+                };
                 let u3 = (((b0 | (b1 << 8)) >> (bit % 8)) & 0x7) as i32;
                 w[o * in_dim + gi * G + i] = (u3 - 4) as f32 * s;
             }
@@ -219,7 +244,12 @@ mod int3_tests {
 /// `[inter,hidden]`, down `[hidden,inter]`. `Eager` dequantizes to f32 (fast,
 /// tiny/dev); `Mmap` keeps it packed on disk and dequantizes rows on the fly
 /// (the only mode that fits the real model).
-fn load_expert_bin(path: &Path, hidden: usize, inter: usize, mode: ExpertsMode) -> Result<AnyExpert, LoadError> {
+fn load_expert_bin(
+    path: &Path,
+    hidden: usize,
+    inter: usize,
+    mode: ExpertsMode,
+) -> Result<AnyExpert, LoadError> {
     match mode {
         ExpertsMode::Eager => {
             let buf = std::fs::read(path)?;
@@ -242,7 +272,11 @@ fn load_layer(
     mode: ExpertsMode,
 ) -> Result<GlmLayer, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
-    let (h, nope, rope) = (m.num_attention_heads, m.qk_nope_head_dim, m.qk_rope_head_dim);
+    let (h, nope, rope) = (
+        m.num_attention_heads,
+        m.qk_nope_head_dim,
+        m.qk_rope_head_dim,
+    );
     let (vh, kvl, ql) = (m.v_head_dim, m.kv_lora_rank, m.q_lora_rank);
     let moe_inter = m.expert_intermediate;
 
@@ -270,12 +304,12 @@ fn load_layer(
     // layer is "full". The indexer ropes the qk_rope prefix at the attention's
     // positions, so it shares the attention rope config.
     if m.index_n_heads > 0 {
-        let topk = if m.index_topk > 0 { m.index_topk } else { usize::MAX };
-        let is_full = m
-            .indexer_types
-            .get(li)
-            .map(|t| t == "full")
-            .unwrap_or(true); // absent/short -> full
+        let topk = if m.index_topk > 0 {
+            m.index_topk
+        } else {
+            usize::MAX
+        };
+        let is_full = m.indexer_types.get(li).map(|t| t == "full").unwrap_or(true); // absent/short -> full
         if is_full {
             let iw = IndexerWeights {
                 ix_wq: gb("self_attn.indexer.wq_b.weight")?,
@@ -305,11 +339,19 @@ fn load_layer(
     let edir = dir.join("experts").join(format!("layer_{li:02}"));
     let mlp = if m.dense_layers.contains(&li) {
         let w = load_expert_bin(&edir.join("dense.bin"), hidden, m.dense_intermediate, mode)?;
-        LayerMlp::Dense { w, inter: m.dense_intermediate }
+        LayerMlp::Dense {
+            w,
+            inter: m.dense_intermediate,
+        }
     } else {
         let mut experts = Vec::with_capacity(m.num_experts);
         for e in 0..m.num_experts {
-            experts.push(load_expert_bin(&edir.join(format!("expert_{e:03}.bin")), hidden, moe_inter, mode)?);
+            experts.push(load_expert_bin(
+                &edir.join(format!("expert_{e:03}.bin")),
+                hidden,
+                moe_inter,
+                mode,
+            )?);
         }
         let shared = load_expert_bin(&edir.join("expert_shared.bin"), hidden, moe_inter, mode)?;
         let mw = MoeWeights {
@@ -346,7 +388,11 @@ fn load_layer(
 /// per draft round).
 fn load_mtp(dir: &Path, m: &GlmManifest, max_seq: usize) -> Result<MtpHead, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
-    let (h, nope, rope) = (m.num_attention_heads, m.qk_nope_head_dim, m.qk_rope_head_dim);
+    let (h, nope, rope) = (
+        m.num_attention_heads,
+        m.qk_nope_head_dim,
+        m.qk_rope_head_dim,
+    );
     let (vh, kvl, ql) = (m.v_head_dim, m.kv_lora_rank, m.q_lora_rank);
     let moe_inter = m.expert_intermediate;
 
@@ -442,7 +488,11 @@ pub fn load_stage(
 ) -> Result<GlmStage, LoadError> {
     let m = read_manifest(dir)?;
     let embed = if first {
-        Some(StFile::open(&dir.join("embed.safetensors"))?.f32("embed.weight")?.1)
+        Some(
+            StFile::open(&dir.join("embed.safetensors"))?
+                .f32("embed.weight")?
+                .1,
+        )
     } else {
         None
     };
@@ -476,7 +526,11 @@ pub fn load_model(dir: &Path, max_seq: usize) -> Result<GlmModel, LoadError> {
 /// dequantizes all int4 experts to f32 in RAM (tiny/dev); `Mmap` streams them
 /// from disk (the only mode that fits the real 410 GB model). The MTP draft
 /// head, when present, is always bf16 in RAM (mode-independent).
-pub fn load_model_with(dir: &Path, max_seq: usize, mode: ExpertsMode) -> Result<GlmModel, LoadError> {
+pub fn load_model_with(
+    dir: &Path,
+    max_seq: usize,
+    mode: ExpertsMode,
+) -> Result<GlmModel, LoadError> {
     let m = read_manifest(dir)?;
     let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode)?;
     let (final_norm, lm_head) = s.head.expect("full model has a head");

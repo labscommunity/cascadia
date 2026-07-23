@@ -17,7 +17,10 @@ macro_rules! fixtures {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
         if !p.exists() {
-            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            eprintln!(
+                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+                p.display()
+            );
             return;
         }
         StFile::open(&p).expect("open fixtures")
@@ -117,7 +120,10 @@ fn moe_batch_union_bit_exact_vs_per_token() {
 
     // Batch-union over all rows must match bit-for-bit.
     let batched = layer.forward_batch(&x, rows);
-    assert_eq!(batched, per_token, "batch-union diverged from per-token routing");
+    assert_eq!(
+        batched, per_token,
+        "batch-union diverged from per-token routing"
+    );
 }
 
 /// The learned-pin recorder: once a usage sink is attached, every routed
@@ -157,5 +163,8 @@ fn moe_records_routing_into_usage() {
     // Constant input -> the same top_k experts every token; all keyed to layer 7.
     let hot = u.hottest(n_experts);
     assert_eq!(hot.len(), top_k, "exactly top_k distinct experts fired");
-    assert!(hot.iter().all(|&(l, _)| l == 7), "all recorded at global layer 7");
+    assert!(
+        hot.iter().all(|&(l, _)| l == 7),
+        "all recorded at global layer 7"
+    );
 }

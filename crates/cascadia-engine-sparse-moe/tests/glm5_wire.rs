@@ -97,5 +97,8 @@ async fn glm5_two_rank_over_real_transport_matches_reference() {
         got.push(next);
     }
     eprintln!("reference: {want:?}\nglm5 wire 2-rank: {got:?}");
-    assert_eq!(got, want, "glm5 2-rank over real transport diverges from reference");
+    assert_eq!(
+        got, want,
+        "glm5 2-rank over real transport diverges from reference"
+    );
 }

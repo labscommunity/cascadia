@@ -65,7 +65,12 @@ pub fn int4_expert_bytes(hidden: usize, inter: usize) -> u64 {
 /// resident set (`resident`), the KV pools (`kv_bytes`), the batch-union
 /// working set, activations, and the page-cache reserve. Returns 0 when nothing fits (the caller
 /// then relies purely on the OS page cache).
-pub fn pin_expert_count(mem_available: u64, resident: u64, kv_bytes: u64, expert_bytes: u64) -> usize {
+pub fn pin_expert_count(
+    mem_available: u64,
+    resident: u64,
+    kv_bytes: u64,
+    expert_bytes: u64,
+) -> usize {
     if expert_bytes == 0 {
         return 0;
     }
@@ -117,7 +122,9 @@ impl UsageStats {
         for line in s.lines() {
             let mut it = line.split_whitespace();
             if let (Some(l), Some(e), Some(c)) = (it.next(), it.next(), it.next()) {
-                if let (Ok(l), Ok(e), Ok(c)) = (l.parse::<u32>(), e.parse::<u32>(), c.parse::<u64>()) {
+                if let (Ok(l), Ok(e), Ok(c)) =
+                    (l.parse::<u32>(), e.parse::<u32>(), c.parse::<u64>())
+                {
                     *self.counts.entry((l, e)).or_insert(0) += c;
                     self.total += c;
                 }
@@ -199,7 +206,10 @@ mod tests {
         // avail = 28.16 - 2.5 - 5.9 = ~19.76G; /18.9M = ~1045 experts.
         assert!((900..1200).contains(&n), "unexpected pin count {n}");
         // Degenerate: nothing fits -> 0, no panic.
-        assert_eq!(pin_expert_count(4_000_000_000, 2_000_000_000, 1_000_000_000, eb), 0);
+        assert_eq!(
+            pin_expert_count(4_000_000_000, 2_000_000_000, 1_000_000_000, eb),
+            0
+        );
         assert_eq!(pin_expert_count(32_000_000_000, 0, 0, 0), 0);
     }
 

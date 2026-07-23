@@ -52,6 +52,9 @@ fn staged_composition_matches_full_model() {
             .zip(&split)
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(worst < 1e-6, "pos {pos}: staged vs full logits diverge by {worst}");
+        assert!(
+            worst < 1e-6,
+            "pos {pos}: staged vs full logits diverge by {worst}"
+        );
     }
 }
