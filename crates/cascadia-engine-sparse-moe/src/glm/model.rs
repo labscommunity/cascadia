@@ -286,7 +286,6 @@ impl GlmModel {
             let hlast = xs[r * hd..(r + 1) * hd].to_vec();
             let mut x = hlast.clone();
             rmsnorm(&mut x, &self.final_norm, self.eps);
-            logits.iter_mut().for_each(|v| *v = 0.0);
             linear_f32(&x, &self.lm_head, self.vocab, self.hidden, &mut logits);
             preds.push(argmax(&logits) as u32);
             hlasts.push(hlast);
