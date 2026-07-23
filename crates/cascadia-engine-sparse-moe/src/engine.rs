@@ -2931,15 +2931,6 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 }
             }
             pos = n_prefill;
-            // Cache this prompt's full KV on every rank for future reuse.
-            if self.runner.prefix_cache_enabled() {
-                let key = self.prefix_remember(&prompt_ids[..n_prefill]);
-                self.runner.cache_prefix(key);
-                if let Err(e) = self.block_on(send_cache_prefix(&downstream, key)) {
-                    warn!(task = %id, "send_cache_prefix failed: {e}");
-                    return vec![(id.clone(), Chunk::error(id, format!("cache_prefix: {e}")))];
-                }
-            }
         } else {
             for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
                 let sample_back = i + 1 == n_prefill;
@@ -3013,6 +3004,21 @@ impl<R: StagedRunner> PipelineEngine<R> {
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
             "task done (dsv4 pipeline-parallel)"
         );
+        // Cache the full [prompt + generated] KV (positions [0, pos)) on every
+        // rank, so the NEXT turn — which resends this response as an assistant
+        // message — reuses the whole conversation (prompt AND response), not just
+        // the prompt. The key is exactly the tokens whose KV is now cached (pos
+        // covers the prompt plus every forwarded generated token).
+        if self.runner.prefix_cache_enabled() {
+            let gen_cached = pos.saturating_sub(n_prefill).min(generated.len());
+            let mut key_tokens = prompt_ids[..n_prefill].to_vec();
+            key_tokens.extend_from_slice(&generated[..gen_cached]);
+            let key = self.prefix_remember(&key_tokens);
+            self.runner.cache_prefix(key);
+            if let Err(e) = self.block_on(send_cache_prefix(&downstream, key)) {
+                warn!(task = %id, "post-decode send_cache_prefix failed: {e}");
+            }
+        }
         let mut chunk = Chunk::final_marker(id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
         chunk.finish_reason = Some(if hit_context_cap {
