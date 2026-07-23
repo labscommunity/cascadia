@@ -1390,14 +1390,10 @@ fn install_shutdown_signal_handler(
     })
 }
 
-async fn cmd_worker(args: WorkerArgs) -> Result<()> {
-    if args.rank >= args.total {
-        return Err(anyhow!(
-            "--rank must be in [0, {}); got {}",
-            args.total,
-            args.rank
-        ));
-    }
+/// Reject phase-split flag combinations before a worker binds any socket. Pure
+/// function of the args so it is unit-testable (the guards were inline in the
+/// async `cmd_worker`, reachable only by running a full worker).
+fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     // Fail loud, not silent: the phase-split flags are load-bearing when
     // given, and only the ov-runtime engine implements them.
     if (args.prefill_device.is_some()
@@ -1417,6 +1413,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
     }
+    Ok(())
+}
+
+async fn cmd_worker(args: WorkerArgs) -> Result<()> {
+    if args.rank >= args.total {
+        return Err(anyhow!(
+            "--rank must be in [0, {}); got {}",
+            args.total,
+            args.rank
+        ));
+    }
+    validate_worker_runtime_flags(&args)?;
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
 
@@ -2197,6 +2205,36 @@ mod python_tests {
         let mut a = WorkerArgs::single_node(model.into(), "GPU".into(), engine, ":8000".into());
         a.engine = engine;
         a
+    }
+
+    /// The phase-split flags only exist in the ov-runtime static path; using
+    /// one on another engine is rejected loudly (here: --gemv-offload on
+    /// ov-genai), not silently ignored.
+    #[test]
+    fn worker_flags_reject_phase_split_without_ov_runtime() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.gemv_offload = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+    }
+
+    /// A prefill device (or parking) is meaningless with chunked prefill
+    /// disabled — the two are mutually exclusive.
+    #[test]
+    fn worker_flags_reject_prefill_device_conflict_with_no_chunked() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.prefill_device = Some("NPU".into());
+        a.no_chunked_prefill = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("conflict"), "{err}");
+    }
+
+    /// A valid phase split (ov-runtime + prefill device, chunked enabled) passes.
+    #[test]
+    fn worker_flags_accept_valid_phase_split() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.prefill_device = Some("NPU".into());
+        assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 
     #[test]
