@@ -18,7 +18,7 @@ use super::model::GlmLayer;
 use super::moe::AnyExpert;
 use super::residency::{self, UsageStats};
 use crate::dsv4::loader::{ExpertsMode, LoadError};
-use crate::dsv4::math::{linear_f32, rmsnorm};
+use crate::dsv4::math::{linear_bf16_w, linear_f32, rmsnorm};
 use crate::dsv4::stage::even_layer_split;
 use crate::staged::StagedRunner;
 
@@ -65,10 +65,60 @@ fn index_aligned_split(n: usize, itypes: &[String], rank: u32, total: u32) -> (u
     (lo, hi)
 }
 
+/// A `vocab × hidden` edge table (embedding or lm_head) held either exact f32 or,
+/// when `CASCADIA_GLM5_BF16_HEAD` is set, bf16 bits — halving its RAM (~3 GB →
+/// ~1.5 GB per edge rank) so autopin can mlock more experts. bf16 rounds the
+/// looked-up embedding (negligible) and the final logits (a precision change;
+/// the model's attention shells are already bf16, but validate greedy parity
+/// before defaulting this on). Only the edge ranks hold one.
+enum WideTable {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+}
+
+impl WideTable {
+    /// Downcast a freshly-loaded f32 table to bf16 bits when `bf16` is set. The
+    /// f32 buffer is dropped here, so call this BEFORE mlocking experts to make
+    /// the freed RAM actually available to the pin budget.
+    fn from_f32(v: Vec<f32>, bf16: bool) -> Self {
+        if bf16 {
+            WideTable::Bf16(
+                v.iter()
+                    .map(|&x| half::bf16::from_f32(x).to_bits())
+                    .collect(),
+            )
+        } else {
+            WideTable::F32(v)
+        }
+    }
+
+    /// Row `t` (length `hidden`) as f32 — the embedding lookup.
+    fn row(&self, t: usize, hidden: usize) -> Vec<f32> {
+        let r = t * hidden..(t + 1) * hidden;
+        match self {
+            WideTable::F32(v) => v[r].to_vec(),
+            WideTable::Bf16(v) => v[r]
+                .iter()
+                .map(|&b| half::bf16::from_bits(b).to_f32())
+                .collect(),
+        }
+    }
+
+    /// `out[vocab] = self[vocab, hidden] · x[hidden]` — the lm_head projection.
+    /// The bf16 path uses the same kernel as the model's bf16 shells (f32 FMA
+    /// accumulation, bf16-rounded output).
+    fn matvec(&self, x: &[f32], vocab: usize, hidden: usize, out: &mut [f32]) {
+        match self {
+            WideTable::F32(w) => linear_f32(x, w, vocab, hidden, out),
+            WideTable::Bf16(w) => linear_bf16_w(x, w, vocab, hidden, out),
+        }
+    }
+}
+
 pub struct GlmRunner {
-    embed: Option<Vec<f32>>,            // [vocab, hidden] on rank 0
-    layers: Vec<GlmLayer>,              // this rank's slice
-    head: Option<(Vec<f32>, Vec<f32>)>, // (final_norm, lm_head) on the last rank
+    embed: Option<WideTable>,            // [vocab, hidden] on rank 0
+    layers: Vec<GlmLayer>,               // this rank's slice
+    head: Option<(Vec<f32>, WideTable)>, // (final_norm, lm_head) on the last rank
     hidden: usize,
     vocab: usize,
     eps: f32,
@@ -154,6 +204,18 @@ impl GlmRunner {
         };
         let mut s = load_stage(dir, max_seq, lo, hi, first, last, mode)?;
 
+        // Optional half-precision edge tables (CASCADIA_GLM5_BF16_HEAD): store
+        // embed / lm_head as bf16 to free ~3 GB/edge-rank back into the pin
+        // budget. Converted HERE — before mlocking experts below — so the f32
+        // buffers are dropped and the RAM is actually available. Default off; a
+        // logit-precision change, so validate greedy parity before promoting.
+        let bf16_head = std::env::var_os("CASCADIA_GLM5_BF16_HEAD").is_some();
+        let embed_tab = s.embed.take().map(|v| WideTable::from_f32(v, bf16_head));
+        let head_tab = s
+            .head
+            .take()
+            .map(|(norm, lm)| (norm, WideTable::from_f32(lm, bf16_head)));
+
         // --- learned-pin residency (cap_for_ram budget + AUTOPIN) -----------
         // Attach the routing histogram to every owned MoE layer (records which
         // experts fire), and mlock the hottest known experts in this slice up to
@@ -208,7 +270,7 @@ impl GlmRunner {
                 }
             }
 
-            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq);
+            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq, bf16_head);
             let (total, hot) = {
                 let u = usage.lock().unwrap();
                 (
@@ -238,9 +300,9 @@ impl GlmRunner {
         }
 
         Ok(Self {
-            embed: s.embed,
+            embed: embed_tab,
             layers: s.layers,
-            head: s.head,
+            head: head_tab,
             hidden: s.hidden,
             vocab: s.vocab,
             eps: s.eps,
@@ -271,6 +333,7 @@ impl GlmRunner {
         first: bool,
         last: bool,
         max_seq: usize,
+        bf16_head: bool,
     ) -> usize {
         let owned = hi - lo;
         let heads = m.num_attention_heads;
@@ -285,13 +348,15 @@ impl GlmRunner {
         // Router projections (f32) on owned MoE layers.
         let moe_owned = (lo..hi).filter(|li| !m.dense_layers.contains(li)).count();
         resident += (moe_owned * m.num_experts * m.hidden_size) as u64 * 4;
-        // Embedding / lm_head tables live on the edge ranks. The loader holds
-        // them as f32 (`StFile::f32`), so reserve 4 B/elem, not bf16's 2.
+        // Embedding / lm_head tables live on the edge ranks. f32 (4 B/elem) by
+        // default; bf16 (2 B) when CASCADIA_GLM5_BF16_HEAD has freed that RAM, so
+        // the pin budget grows by exactly what the downcast returned.
+        let head_elem = if bf16_head { 2 } else { 4 };
         if first {
-            resident += (m.vocab_size * m.hidden_size) as u64 * 4;
+            resident += (m.vocab_size * m.hidden_size) as u64 * head_elem;
         }
         if last {
-            resident += (m.vocab_size * m.hidden_size) as u64 * 4;
+            resident += (m.vocab_size * m.hidden_size) as u64 * head_elem;
         }
         // Absorbed-MLA latent KV cache: (kv_lora + qk_rope) f32 per token per layer,
         // plus the DSA indexer key cache (index_head_dim f32 per token per OWNED
@@ -388,8 +453,7 @@ impl StagedRunner for GlmRunner {
             .embed
             .as_ref()
             .expect("embed_token on a non-first rank");
-        let t = token as usize;
-        e[t * self.hidden..(t + 1) * self.hidden].to_vec()
+        e.row(token as usize, self.hidden)
     }
     fn forward_layers(&mut self, hidden: Vec<f32>, pos: usize, _token: Option<u32>) -> Vec<f32> {
         assert_eq!(
@@ -453,7 +517,43 @@ impl StagedRunner for GlmRunner {
         let mut x = hidden.to_vec();
         rmsnorm(&mut x, final_norm, self.eps);
         let mut logits = vec![0.0f32; self.vocab];
-        linear_f32(&x, lm_head, self.vocab, self.hidden, &mut logits);
+        lm_head.matvec(&x, self.vocab, self.hidden, &mut logits);
         logits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WideTable;
+
+    /// The bf16 edge table must round-trip its rows and produce logits within
+    /// bf16 tolerance of the f32 path — the opt-in `CASCADIA_GLM5_BF16_HEAD`
+    /// swap is a precision change, not a correctness one.
+    #[test]
+    fn widetable_bf16_tracks_f32() {
+        let (vocab, hidden) = (5usize, 16usize);
+        let w: Vec<f32> = (0..vocab * hidden)
+            .map(|i| (i as f32 * 0.017 - 0.4).sin())
+            .collect();
+        let f = WideTable::from_f32(w.clone(), false);
+        let b = WideTable::from_f32(w, true);
+
+        // Embedding lookup: bf16 rounds each element to ~3 significant bits of
+        // mantissa (rel err < 2^-8).
+        let (rf, rb) = (f.row(2, hidden), b.row(2, hidden));
+        for (a, c) in rf.iter().zip(&rb) {
+            assert!((a - c).abs() <= a.abs() / 128.0 + 1e-3, "row {a} vs {c}");
+        }
+
+        // lm_head projection: logits accumulate in f32, so the only error is the
+        // bf16-rounded weights + output — a few percent, never garbage.
+        let x: Vec<f32> = (0..hidden).map(|i| i as f32 * 0.1 - 0.3).collect();
+        let mut lf = vec![0.0f32; vocab];
+        let mut lb = vec![0.0f32; vocab];
+        f.matvec(&x, vocab, hidden, &mut lf);
+        b.matvec(&x, vocab, hidden, &mut lb);
+        for (a, c) in lf.iter().zip(&lb) {
+            assert!((a - c).abs() <= a.abs() * 0.05 + 1e-2, "logit {a} vs {c}");
+        }
     }
 }
