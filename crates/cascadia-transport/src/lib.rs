@@ -210,13 +210,32 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 fn send_burst_bytes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CASCADIA_SEND_BURST_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(|v: usize| if v == 0 { 0 } else { v.max(64 * 1024) })
-            .unwrap_or(0)
-    })
+    *V.get_or_init(|| parse_send_burst(std::env::var("CASCADIA_SEND_BURST_BYTES").ok().as_deref()))
+}
+
+/// Parse the CASCADIA_SEND_BURST_BYTES knob. Unset or `0` → pacing OFF; any
+/// other value is clamped up to 64 KiB (so a 256 MiB frame can't turn into
+/// millions of 2 ms sleeps and blow the receiver's whole-frame deadline). A
+/// set-but-unparseable value (`256k`, a trailing space, …) is warned about and
+/// treated as OFF — otherwise the operator fat-fingering the one knob they
+/// reach for *while chasing an intermittent wedge* gets silence, and "off
+/// because default" is indistinguishable from "off because I mistyped it".
+fn parse_send_burst(raw: Option<&str>) -> usize {
+    match raw {
+        None => 0,
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => 0,
+            Ok(v) => v.max(64 * 1024),
+            Err(_) => {
+                tracing::warn!(
+                    value = %s,
+                    "CASCADIA_SEND_BURST_BYTES is not a byte count (e.g. 262144); \
+                     send pacing stays OFF"
+                );
+                0
+            }
+        },
+    }
 }
 
 /// Receive a tensor from a connected stream.
@@ -856,6 +875,17 @@ impl ActivationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_send_burst_clamp_table() {
+        assert_eq!(parse_send_burst(None), 0); // unset -> off
+        assert_eq!(parse_send_burst(Some("0")), 0); // explicit off
+        assert_eq!(parse_send_burst(Some("1000")), 64 * 1024); // clamped up to 64 KiB
+        assert_eq!(parse_send_burst(Some("65536")), 65536); // at the floor
+        assert_eq!(parse_send_burst(Some("1048576")), 1048576); // above the floor, verbatim
+        assert_eq!(parse_send_burst(Some("256k")), 0); // unparseable -> off (warned)
+        assert_eq!(parse_send_burst(Some("262144 ")), 0); // trailing space -> off (warned)
+    }
 
     #[test]
     fn recv_timeout_precedence_config_over_env_over_default() {
