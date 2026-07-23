@@ -108,6 +108,14 @@ impl GlmRunner {
         } else {
             even_layer_split(n, rank, total)
         };
+        // A rank must own at least one layer; `total > num_layers` would leave a
+        // dead rank on the wire, paying every round-trip's latency for nothing.
+        if lo >= hi {
+            return Err(LoadError::Manifest(format!(
+                "rank {rank} of {total} owns zero layers [{lo}, {hi}) — total exceeds the \
+                 model's {n} layers; reduce --total"
+            )));
+        }
         // IndexShare invariant: a rank's first owned layer must be `"full"` (owns
         // an indexer / computes its own top-k). A `"shared"` first layer needs the
         // top-k carry from a `"full"` layer on the PREVIOUS rank, which the
@@ -179,15 +187,12 @@ impl GlmRunner {
             let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq);
             let (total, hot) = {
                 let u = usage.lock().unwrap();
-                (u.total, u.hottest(residency::autopin_count(u.total, budget)))
+                (u.total, u.hottest_in_range(lo, hi, residency::autopin_count(u.total, budget)))
             };
             let n_pin = hot.len();
             let mut pinned = 0usize;
             for (gl, e) in hot {
-                let gl = gl as usize;
-                if gl < lo || gl >= hi {
-                    continue; // another rank owns this layer
-                }
+                let gl = gl as usize; // hottest_in_range already restricts to [lo, hi)
                 if let Some(mm) =
                     s.layers[gl - lo].moe().and_then(|ml| ml.experts().get(e as usize)).and_then(AnyExpert::as_mmap)
                 {
