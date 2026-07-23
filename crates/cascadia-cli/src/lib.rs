@@ -2550,6 +2550,96 @@ mod tests {
         assert!(!flags.iter().any(|f| f == "--static-context"));
     }
 
+    /// `--static-prefill-seq` needs `--target npu` (chunked prefill is a
+    /// static-KV-path feature); the default cpu-gpu target rejects it.
+    #[test]
+    fn shard_flags_static_prefill_seq_requires_npu() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--static-prefill-seq",
+            "4",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains("--target npu"), "{err}");
+    }
+
+    /// `--static-prefill-seq 1` is nonsense (a 1-wide chunk is the seq=1 decode
+    /// path); only 0 (off) or >= 2 is valid.
+    #[test]
+    fn shard_flags_static_prefill_seq_one_rejected() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-prefill-seq",
+            "1",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains(">= 2"), "{err}");
+    }
+
+    /// A chunk wider than the KV window would evict its own tokens mid-chunk:
+    /// `--static-prefill-seq` must be <= `--static-context - 1`.
+    #[test]
+    fn shard_flags_static_prefill_seq_exceeds_context_rejected() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-context",
+            "8",
+            "--static-prefill-seq",
+            "8",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains("evict"), "{err}");
+    }
+
+    /// A valid `--static-prefill-seq` is forwarded to the exporter verbatim
+    /// (a dropped/defaulted value would silently export a wrong-shape variant).
+    #[test]
+    fn shard_flags_static_prefill_seq_forwarded() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-context",
+            "1024",
+            "--static-prefill-seq",
+            "64",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("valid prefill-seq flags");
+        assert!(has_pair(&flags, "--static-prefill-seq", "64"), "{flags:?}");
+    }
+
     /// Golden vector: pins VALUES (not just flag presence), `--quantization`
     /// forwarding, and flag/value adjacency for the whole NPU argv — a bug
     /// that pushes a default instead of the user's value passes every
