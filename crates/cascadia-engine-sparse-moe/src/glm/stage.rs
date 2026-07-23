@@ -210,6 +210,7 @@ impl GlmRunner {
         // buffers are dropped and the RAM is actually available. Default off; a
         // logit-precision change, so validate greedy parity before promoting.
         let bf16_head = std::env::var_os("CASCADIA_GLM5_BF16_HEAD").is_some();
+        let bf16_kv = std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some();
         let embed_tab = s.embed.take().map(|v| WideTable::from_f32(v, bf16_head));
         let head_tab = s
             .head
@@ -270,7 +271,7 @@ impl GlmRunner {
                 }
             }
 
-            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq, bf16_head);
+            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq, bf16_head, bf16_kv);
             let (total, hot) = {
                 let u = usage.lock().unwrap();
                 (
@@ -334,6 +335,7 @@ impl GlmRunner {
         last: bool,
         max_seq: usize,
         bf16_head: bool,
+        bf16_kv: bool,
     ) -> usize {
         let owned = hi - lo;
         let heads = m.num_attention_heads;
@@ -369,8 +371,12 @@ impl GlmRunner {
                     .unwrap_or(true)
             })
             .count();
-        let kv = owned as u64 * max_seq as u64 * (m.kv_lora_rank + m.qk_rope_head_dim) as u64 * 4
-            + full_owned as u64 * max_seq as u64 * m.index_head_dim as u64 * 4;
+        // Latent/k_pe cache: f32 (4 B) by default; bf16 (2 B) when
+        // CASCADIA_GLM5_BF16_KV frees it. The DSA indexer keys stay f32 (4 B).
+        let kv_elem = if bf16_kv { 2 } else { 4 };
+        let kv =
+            owned as u64 * max_seq as u64 * (m.kv_lora_rank + m.qk_rope_head_dim) as u64 * kv_elem
+                + full_owned as u64 * max_seq as u64 * m.index_head_dim as u64 * 4;
         let eb = residency::int4_expert_bytes(m.hidden_size, m.expert_intermediate);
         residency::pin_expert_count(residency::mem_available(), resident, kv, eb)
     }
