@@ -29,6 +29,8 @@
 //! indexer's top-`index_topk` positions (one set shared by all heads). At or
 //! below the budget it is the full causal range — bit-identical to dense.
 
+use half::bf16;
+
 use super::indexer::Indexer;
 use super::rope::apply_rope_row;
 use crate::dsv4::math::{dot, dot_bf16w, linear_bf16_w, rmsnorm};
@@ -38,6 +40,104 @@ use crate::dsv4::rope::Freqs;
 #[inline]
 fn widen(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
+}
+
+/// The MLA latent (`lc`) / k_pe (`rc`) cache, held either exact f32 or — opt-in
+/// via `CASCADIA_GLM5_BF16_KV` — bf16 bits, halving the KV RAM per rank (it scales
+/// with context length, so this frees the most under long agentic context). bf16
+/// rounds each cached latent, an attention-numerics change: validate greedy
+/// parity before defaulting on. The absorb core still accumulates in f32; only
+/// the stored latents are narrowed, read back through the same `widen`/`dot_bf16w`
+/// path the bf16 projection weights already use.
+enum KvStore {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+}
+
+impl KvStore {
+    fn zeros(n: usize, bf16_kv: bool) -> Self {
+        if bf16_kv {
+            KvStore::Bf16(vec![0u16; n])
+        } else {
+            KvStore::F32(vec![0.0; n])
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            KvStore::F32(v) => v.len(),
+            KvStore::Bf16(v) => v.len(),
+        }
+    }
+
+    fn fill0(&mut self) {
+        match self {
+            KvStore::F32(v) => v.fill(0.0),
+            KvStore::Bf16(v) => v.fill(0),
+        }
+    }
+
+    /// Write one f32 row (`dim` elems) at position `t`.
+    #[inline]
+    fn write_row(&mut self, t: usize, dim: usize, src: &[f32]) {
+        match self {
+            KvStore::F32(v) => v[t * dim..(t + 1) * dim].copy_from_slice(src),
+            KvStore::Bf16(v) => {
+                for (d, &s) in src.iter().enumerate() {
+                    v[t * dim + d] = bf16::from_f32(s).to_bits();
+                }
+            }
+        }
+    }
+
+    /// `dot(q, row t)` — `q` is f32 (`dim` elems). The bf16 arm reuses the same
+    /// widen-and-FMA kernel as the bf16 projection weights.
+    #[inline]
+    fn dot_row(&self, t: usize, dim: usize, q: &[f32]) -> f32 {
+        match self {
+            KvStore::F32(v) => dot(q, &v[t * dim..(t + 1) * dim]),
+            KvStore::Bf16(v) => dot_bf16w(&v[t * dim..(t + 1) * dim], q),
+        }
+    }
+
+    /// `acc += p · row t` — `acc` is f32 (`dim` elems).
+    #[inline]
+    fn axpy_row(&self, t: usize, dim: usize, p: f32, acc: &mut [f32]) {
+        match self {
+            KvStore::F32(v) => {
+                for (c, &l) in acc.iter_mut().zip(&v[t * dim..(t + 1) * dim]) {
+                    *c += p * l;
+                }
+            }
+            KvStore::Bf16(v) => {
+                for (c, &l) in acc.iter_mut().zip(&v[t * dim..(t + 1) * dim]) {
+                    *c += p * widen(l);
+                }
+            }
+        }
+    }
+
+    /// The first `n` elements as f32 — the prefix-cache snapshot (kept f32 so a
+    /// snapshot is dtype-independent).
+    fn to_f32_prefix(&self, n: usize) -> Vec<f32> {
+        match self {
+            KvStore::F32(v) => v[..n].to_vec(),
+            KvStore::Bf16(v) => v[..n].iter().map(|&b| widen(b)).collect(),
+        }
+    }
+
+    /// Restore a prefix from an f32 snapshot (narrowed back to the store dtype).
+    fn restore_prefix(&mut self, src: &[f32]) {
+        match self {
+            KvStore::F32(v) => v[..src.len()].copy_from_slice(src),
+            KvStore::Bf16(v) => {
+                for (d, &s) in src.iter().enumerate() {
+                    v[d] = bf16::from_f32(s).to_bits();
+                }
+            }
+        }
+    }
 }
 
 /// MLA latent-norm eps. HF runs `q_a_layernorm` / `kv_a_layernorm` at the
@@ -73,9 +173,9 @@ pub struct AttentionLayer {
     scale: f32,
     w: AttnWeights,
     freqs: Freqs,
-    lc: Vec<f32>, // [max_seq, kv_lora]
-    rc: Vec<f32>, // [max_seq, qk_rope]
-    len: usize,   // cached positions
+    lc: KvStore, // [max_seq, kv_lora]
+    rc: KvStore, // [max_seq, qk_rope]
+    len: usize,  // cached positions
     /// DSA lightning indexer. When attached and the cached length exceeds
     /// `index_topk`, the query attends only to the indexer's top-`index_topk`
     /// positions; otherwise attention is over the full causal range.
@@ -158,8 +258,16 @@ impl AttentionLayer {
             scale: (qk_head as f32).powf(-0.5),
             w,
             freqs,
-            lc: vec![0.0; max_seq * kv_lora],
-            rc: vec![0.0; max_seq * qk_rope],
+            // Opt-in bf16 KV (CASCADIA_GLM5_BF16_KV): halves the latent/k_pe cache
+            // RAM on every rank. Read once at layer build; default f32 (exact).
+            lc: KvStore::zeros(
+                max_seq * kv_lora,
+                std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
+            ),
+            rc: KvStore::zeros(
+                max_seq * qk_rope,
+                std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
+            ),
             len: 0,
             indexer: None,
             index_topk: usize::MAX,
@@ -184,8 +292,8 @@ impl AttentionLayer {
 
     /// Clear the KV cache (and the indexer's key cache, if attached).
     pub fn reset(&mut self) {
-        self.lc.fill(0.0);
-        self.rc.fill(0.0);
+        self.lc.fill0();
+        self.rc.fill0();
         self.len = 0;
         if let Some(ix) = self.indexer.as_mut() {
             ix.reset();
@@ -219,8 +327,8 @@ impl AttentionLayer {
         let n = self.len;
         AttnKv {
             len: n,
-            lc: self.lc[..n * self.kv_lora].to_vec(),
-            rc: self.rc[..n * self.qk_rope].to_vec(),
+            lc: self.lc.to_f32_prefix(n * self.kv_lora),
+            rc: self.rc.to_f32_prefix(n * self.qk_rope),
             ic: self.indexer.as_ref().map(|ix| ix.snapshot()),
         }
     }
@@ -230,8 +338,8 @@ impl AttentionLayer {
     /// (attention only touches `[0, len)`), matching [`Self::truncate`].
     pub fn restore(&mut self, kv: &AttnKv) {
         self.len = kv.len;
-        self.lc[..kv.lc.len()].copy_from_slice(&kv.lc);
-        self.rc[..kv.rc.len()].copy_from_slice(&kv.rc);
+        self.lc.restore_prefix(&kv.lc);
+        self.rc.restore_prefix(&kv.rc);
         if let (Some(ix), Some(ic)) = (self.indexer.as_mut(), kv.ic.as_ref()) {
             ix.restore(kv.len, ic);
         }
@@ -281,10 +389,10 @@ impl AttentionLayer {
         linear_bf16_w(x, &self.w.wkv_a, kvl + rope, self.hidden, &mut comp);
         let mut lat = comp[..kvl].to_vec();
         rmsnorm(&mut lat, &self.w.kv_a_ln, MLA_LATENT_EPS);
-        self.lc[pos * kvl..(pos + 1) * kvl].copy_from_slice(&lat);
+        self.lc.write_row(pos, kvl, &lat);
         let mut kpe = comp[kvl..].to_vec();
         apply_rope_row(&mut kpe, &self.freqs, pos, rope, false);
-        self.rc[pos * rope..(pos + 1) * rope].copy_from_slice(&kpe);
+        self.rc.write_row(pos, rope, &kpe);
         self.len += 1;
         let n = self.len; // cached tokens, includes self (causal)
 
@@ -340,8 +448,8 @@ impl AttentionLayer {
             // scores over the selected latents; softmax (f32).
             let mut smax = f32::NEG_INFINITY;
             for (j, &t) in sel.iter().enumerate() {
-                let sn = dot(&qabs, &self.lc[t * kvl..(t + 1) * kvl]);
-                let sp = dot(qpe, &self.rc[t * rope..(t + 1) * rope]);
+                let sn = self.lc.dot_row(t, kvl, &qabs);
+                let sp = self.rc.dot_row(t, rope, qpe);
                 let s = (sn + sp) * self.scale;
                 score[j] = s;
                 smax = smax.max(s);
@@ -356,9 +464,7 @@ impl AttentionLayer {
             clat.iter_mut().for_each(|v| *v = 0.0);
             for (j, &t) in sel.iter().enumerate() {
                 let p = score[j] / denom;
-                for (c, &l) in clat.iter_mut().zip(&self.lc[t * kvl..(t + 1) * kvl]) {
-                    *c += p * l;
-                }
+                self.lc.axpy_row(t, kvl, p, &mut clat);
             }
             let ctx_h = &mut ctx[hi * vh..(hi + 1) * vh];
             for (jj, o) in ctx_h.iter_mut().enumerate() {
@@ -371,5 +477,47 @@ impl AttentionLayer {
         let mut out = vec![0.0f32; self.hidden];
         linear_bf16_w(&ctx, &self.w.wo, self.hidden, h * vh, &mut out);
         out
+    }
+}
+
+#[cfg(test)]
+mod kv_tests {
+    use super::KvStore;
+
+    /// bf16 KV must track the f32 path within bf16 tolerance across the three
+    /// hot-path ops (write→dot, write→axpy, snapshot round-trip). The opt-in
+    /// `CASCADIA_GLM5_BF16_KV` swap is a precision change, not a correctness one.
+    #[test]
+    fn kvstore_bf16_tracks_f32() {
+        let (dim, rows) = (16usize, 3usize);
+        let mut f = KvStore::zeros(rows * dim, false);
+        let mut b = KvStore::zeros(rows * dim, true);
+        let row: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.13 - 0.7).sin()).collect();
+        for t in 0..rows {
+            f.write_row(t, dim, &row);
+            b.write_row(t, dim, &row);
+        }
+        let q: Vec<f32> = (0..dim).map(|i| i as f32 * 0.05 - 0.2).collect();
+
+        // dot_row: f32 accumulation, only the stored latent is bf16.
+        let (df, db) = (f.dot_row(1, dim, &q), b.dot_row(1, dim, &q));
+        assert!(
+            (df - db).abs() <= df.abs() * 0.05 + 1e-2,
+            "dot {df} vs {db}"
+        );
+
+        // axpy_row: weighted accumulate.
+        let mut af = vec![0.0f32; dim];
+        let mut ab = vec![0.0f32; dim];
+        f.axpy_row(2, dim, 0.5, &mut af);
+        b.axpy_row(2, dim, 0.5, &mut ab);
+        for (x, y) in af.iter().zip(&ab) {
+            assert!((x - y).abs() <= x.abs() * 0.02 + 1e-2, "axpy {x} vs {y}");
+        }
+
+        // snapshot round-trip: each element within one bf16 ULP.
+        for (x, y) in f.to_f32_prefix(dim).iter().zip(&b.to_f32_prefix(dim)) {
+            assert!((x - y).abs() <= x.abs() / 128.0 + 1e-3, "prefix {x} vs {y}");
+        }
     }
 }
