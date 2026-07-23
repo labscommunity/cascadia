@@ -338,8 +338,17 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
     assert!(!base.ids.is_empty(), "baseline generated no tokens");
 
     // Chunked prefill, same device (weight-stream amortization only).
-    let chunked_runs =
-        run_tasks(&shards, &device, None, false, false, &prompt, max_new, bench_tasks).await;
+    let chunked_runs = run_tasks(
+        &shards,
+        &device,
+        None,
+        false,
+        false,
+        &prompt,
+        max_new,
+        bench_tasks,
+    )
+    .await;
     for (i, c) in chunked_runs.iter().enumerate() {
         let label = if bench_tasks == 1 {
             format!("chunked   [{device}]")
@@ -347,14 +356,26 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
             format!("chunked#{}  [{device}]", i + 1)
         };
         report(&label, c);
-        assert_parity(&format!("chunked prefill on {device} (task {})", i + 1), &base, c);
+        assert_parity(
+            &format!("chunked prefill on {device} (task {})", i + 1),
+            &base,
+            c,
+        );
     }
 
     // Hybrid: chunked prefill on another device, decode unchanged.
     if let Some(pd) = prefill_device.as_deref() {
-        let hybrid_runs =
-            run_tasks(&shards, &device, Some(pd), false, false, &prompt, max_new, bench_tasks)
-                .await;
+        let hybrid_runs = run_tasks(
+            &shards,
+            &device,
+            Some(pd),
+            false,
+            false,
+            &prompt,
+            max_new,
+            bench_tasks,
+        )
+        .await;
         for (i, h) in hybrid_runs.iter().enumerate() {
             let label = if bench_tasks == 1 {
                 format!("hybrid    [{pd}+{device}]")
