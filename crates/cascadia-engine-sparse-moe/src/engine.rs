@@ -31,7 +31,8 @@ use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
     recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
     send_forward_batch, send_forward_batch_prefill, send_forward_nosample, send_forward_prefill,
-    send_reset, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    recv_key_body_server, send_cache_prefix, send_reset, send_restore_prefix,
+    send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -2060,6 +2061,10 @@ impl SparseMoEEngine {
                 "rank {} received ForwardBatchPrefill (Rust-shell prefill batching only)",
                 self.rank
             )),
+            FrameKind::RestorePrefix | FrameKind::CachePrefix => Err(format!(
+                "rank {} received a KV-prefix-cache frame (glm5 pipeline engine only)",
+                self.rank
+            )),
         }
     }
 
@@ -3032,6 +3037,36 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 }
                 res
             }
+            FrameKind::RestorePrefix => match self.block_on(recv_key_body_server(&upstream)) {
+                Ok(key) => {
+                    self.runner.restore_prefix(key);
+                    match downstream.as_ref() {
+                        Some(down) => self
+                            .block_on(send_restore_prefix(down, key))
+                            .map_err(|e| format!("relay restore_prefix: {e}")),
+                        None => Ok(()),
+                    }
+                }
+                Err(e) => {
+                    self.peer_disconnected = true;
+                    Err(format!("recv restore_prefix key: {e}"))
+                }
+            },
+            FrameKind::CachePrefix => match self.block_on(recv_key_body_server(&upstream)) {
+                Ok(key) => {
+                    self.runner.cache_prefix(key);
+                    match downstream.as_ref() {
+                        Some(down) => self
+                            .block_on(send_cache_prefix(down, key))
+                            .map_err(|e| format!("relay cache_prefix: {e}")),
+                        None => Ok(()),
+                    }
+                }
+                Err(e) => {
+                    self.peer_disconnected = true;
+                    Err(format!("recv cache_prefix key: {e}"))
+                }
+            },
             other => Err(format!(
                 "worker received unsupported frame {other:?} (dsv4 has no spec-decode batching)"
             )),

@@ -306,35 +306,6 @@ impl GlmRunner {
     fn snapshot_slice(&self) -> Vec<AttnKv> {
         self.layers.iter().map(|l| l.snapshot_kv()).collect()
     }
-
-    /// Whether the per-rank prefix cache is on (`CASCADIA_GLM5_PREFIX_CACHE`).
-    pub fn prefix_cache_enabled(&self) -> bool {
-        self.prefix_cache.enabled()
-    }
-
-    /// Cache this rank's current KV under `key` for later prefix reuse (no-op
-    /// when the cache is disabled).
-    pub fn cache_prefix(&mut self, key: u64) {
-        if self.prefix_cache.enabled() {
-            let snap = self.snapshot_slice();
-            self.prefix_cache.insert(key, snap);
-        }
-    }
-
-    /// Restore this rank's cached KV for `key`; the restored length becomes
-    /// `pos`, so the caller continues prefill/decode from there. Returns the
-    /// length, or `None` on a miss (caller prefills from position 0). Must be
-    /// called after [`StagedRunner::reset`].
-    pub fn restore_prefix(&mut self, key: u64) -> Option<usize> {
-        let snap = self.prefix_cache.take(key)?;
-        let len = snap.first().map(AttnKv::len).unwrap_or(0);
-        for (l, kv) in self.layers.iter_mut().zip(&snap) {
-            l.restore_kv(kv);
-        }
-        self.prefix_cache.insert(key, snap); // refresh to MRU
-        self.pos = len;
-        Some(len)
-    }
 }
 
 impl StagedRunner for GlmRunner {
@@ -358,6 +329,30 @@ impl StagedRunner for GlmRunner {
         for l in &mut self.layers {
             l.reset();
         }
+    }
+
+    fn prefix_cache_enabled(&self) -> bool {
+        self.prefix_cache.enabled()
+    }
+
+    fn cache_prefix(&mut self, key: u64) {
+        if self.prefix_cache.enabled() {
+            let snap = self.snapshot_slice();
+            self.prefix_cache.insert(key, snap);
+        }
+    }
+
+    fn restore_prefix(&mut self, key: u64) -> Option<usize> {
+        // Clone (not take+reinsert) so a hit does NOT change the cache's LRU
+        // order: rank 0's token index and every rank's SliceKvCache must evict in
+        // lockstep, which requires pure insertion-order LRU (no refresh on read).
+        let snap = self.prefix_cache.get(key)?.clone();
+        let len = snap.first().map(AttnKv::len).unwrap_or(0);
+        for (l, kv) in self.layers.iter_mut().zip(&snap) {
+            l.restore_kv(kv);
+        }
+        self.pos = len;
+        Some(len)
     }
     fn embed_token(&self, token: u32) -> Vec<f32> {
         let e = self.embed.as_ref().expect("embed_token on a non-first rank");
