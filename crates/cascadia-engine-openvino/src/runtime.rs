@@ -3317,6 +3317,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A blob import must drop CACHE_DIR (an import never writes the compile
+    /// cache, and a core-level cache property on `import_model` risks an
+    /// unsupported-property error that breaks AOT blob import outright) while
+    /// leaving every other plugin property intact.
+    #[test]
+    fn import_plugin_strips_cache_dir_keeps_rest() {
+        let p = PluginConfig::new()
+            .with("CACHE_DIR", "/tmp/x")
+            .with("PERFORMANCE_HINT", "LATENCY")
+            .with("NPU_USE_NPUW", "YES");
+        let out = import_plugin(&p);
+        assert!(!out.entries.iter().any(|(k, _)| k == "CACHE_DIR"));
+        assert!(out
+            .entries
+            .iter()
+            .any(|(k, v)| k == "PERFORMANCE_HINT" && v == "LATENCY"));
+        assert!(out
+            .entries
+            .iter()
+            .any(|(k, v)| k == "NPU_USE_NPUW" && v == "YES"));
+        assert_eq!(out.entries.len(), 2);
+    }
+
     #[test]
     fn argmax_row_selects_requested_row() {
         // 3 rows of vocab 4; best of row 1 is index 2; row 2 (pad garbage)
