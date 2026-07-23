@@ -34,7 +34,11 @@ pub struct ExpertW {
 ///   `swiglu`, only the weight dtype differs).
 pub enum AnyExpert {
     Bf16(ExpertW),
-    EagerF32 { wg: Vec<f32>, wu: Vec<f32>, wd: Vec<f32> },
+    EagerF32 {
+        wg: Vec<f32>,
+        wu: Vec<f32>,
+        wd: Vec<f32>,
+    },
     /// mmap'd int4 bin, rows dequantized on the fly — the only mode that fits
     /// the real model (eager f32 experts would be hundreds of GB per rank).
     Mmap(MmapExpert),
@@ -183,7 +187,13 @@ impl MoeLayer {
         let t_router = std::time::Instant::now();
         // router logits (f32) -> sigmoid + noaux_tc gate.
         let mut logits = vec![0.0f32; self.n_experts];
-        linear_f32(x, &self.w.router_w, self.n_experts, self.hidden, &mut logits);
+        linear_f32(
+            x,
+            &self.w.router_w,
+            self.n_experts,
+            self.hidden,
+            &mut logits,
+        );
         let gate = moe_gate(&logits, &self.w.router_bias, self.top_k, self.scale, true);
         // record the routing for learned-pin (no-op when no recorder attached).
         if let Some(u) = &self.usage {
@@ -207,7 +217,11 @@ impl MoeLayer {
             let bufs: Vec<Option<Vec<u8>>> = gate
                 .idx
                 .par_iter()
-                .map(|&e| self.w.experts[e as usize].as_mmap().and_then(|m| m.read_bytes().ok()))
+                .map(|&e| {
+                    self.w.experts[e as usize]
+                        .as_mmap()
+                        .and_then(|m| m.read_bytes().ok())
+                })
                 .collect();
             for (slot, (&e, &wj)) in gate.idx.iter().zip(&gate.weight).enumerate() {
                 let ex = &self.w.experts[e as usize];

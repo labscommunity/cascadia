@@ -19,15 +19,18 @@ use std::path::PathBuf;
 use cascadia_engine_sparse_moe::glm::loader::load_model;
 
 fn dir(tag: &str) -> Option<PathBuf> {
-    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(tag);
+    let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(tag);
     d.join("manifest.json").exists().then_some(d)
 }
 
 #[test]
 fn indexshare_shared_layers_reuse_carried_topk() {
-    let (Some(sparse), Some(dense)) =
-        (dir("glm5_export_indexshare"), dir("glm5_export_indexshare_dense"))
-    else {
+    let (Some(sparse), Some(dense)) = (
+        dir("glm5_export_indexshare"),
+        dir("glm5_export_indexshare_dense"),
+    ) else {
         eprintln!("SKIP: IndexShare fixtures absent (run tools/glm5_ref/gen_fixtures.py)");
         return;
     };
@@ -38,7 +41,9 @@ fn indexshare_shared_layers_reuse_carried_topk() {
     let sparse_tok = load_model(&sparse, max_seq)
         .expect("load IndexShare model (shared layers must not require indexer tensors)")
         .generate(&prompt, n_gen);
-    let dense_tok = load_model(&dense, max_seq).expect("load dense twin").generate(&prompt, n_gen);
+    let dense_tok = load_model(&dense, max_seq)
+        .expect("load dense twin")
+        .generate(&prompt, n_gen);
 
     // (2) shared layers prune only via the carried top-k -> sparse must diverge.
     assert_ne!(
@@ -47,6 +52,11 @@ fn indexshare_shared_layers_reuse_carried_topk() {
     );
 
     // deterministic across loads.
-    let again = load_model(&sparse, max_seq).expect("reload").generate(&prompt, n_gen);
-    assert_eq!(sparse_tok, again, "IndexShare generation is not deterministic");
+    let again = load_model(&sparse, max_seq)
+        .expect("reload")
+        .generate(&prompt, n_gen);
+    assert_eq!(
+        sparse_tok, again,
+        "IndexShare generation is not deterministic"
+    );
 }

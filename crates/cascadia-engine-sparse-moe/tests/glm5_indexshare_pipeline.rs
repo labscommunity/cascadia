@@ -35,7 +35,13 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// M-rank greedy generation over M-1 loopback links (decode path).
-async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32], n_gen: usize) -> Vec<u32> {
+async fn pipeline_generate(
+    dir: &Path,
+    max_seq: usize,
+    m: usize,
+    prompt: &[u32],
+    n_gen: usize,
+) -> Vec<u32> {
     let mut ranks: Vec<GlmRunner> = (0..m)
         .map(|r| GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0).expect("load rank"))
         .collect();
@@ -54,7 +60,10 @@ async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32],
         let sc = server.clone();
         let atask = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
         let mut client = ActivationClient::new("127.0.0.1", port);
-        client.connect_with_timeout(Duration::from_secs(5)).await.unwrap();
+        client
+            .connect_with_timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
         atask.await.unwrap();
         clients.push(Arc::new(Mutex::new(client)));
         servers.push(server);
@@ -78,7 +87,9 @@ async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32],
             let cfg2 = cfg.clone();
             let hsend = h;
             let send = tokio::spawn(async move {
-                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz]).await.unwrap();
+                send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz])
+                    .await
+                    .unwrap();
             });
             let k = recv_kind_server(&servers[i]).await.unwrap();
             assert_eq!(k, Some(FrameKind::Forward));
@@ -106,8 +117,8 @@ async fn pipeline_generate(dir: &Path, max_seq: usize, m: usize, prompt: &[u32],
 
 #[tokio::test]
 async fn indexshare_pipeline_matches_single_process_beyond_topk() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/glm5_export_indexshare_ml");
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_indexshare_ml");
     if !dir.join("manifest.json").exists() {
         eprintln!("SKIP: glm5_export_indexshare_ml absent (run tools/glm5_ref/gen_fixtures.py)");
         return;
@@ -116,7 +127,9 @@ async fn indexshare_pipeline_matches_single_process_beyond_topk() {
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let (n_gen, max_seq) = (4usize, 32usize);
 
-    let want = load_model(&dir, max_seq).expect("load_model").generate(&prompt, n_gen);
+    let want = load_model(&dir, max_seq)
+        .expect("load_model")
+        .generate(&prompt, n_gen);
 
     for m in [1usize, 2, 3] {
         let got = pipeline_generate(&dir, max_seq, m, &prompt, n_gen).await;

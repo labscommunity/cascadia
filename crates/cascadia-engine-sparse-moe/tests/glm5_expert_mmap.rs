@@ -12,14 +12,19 @@ use cascadia_engine_sparse_moe::glm::stage::GlmRunner;
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 
 fn argmax(v: &[f32]) -> usize {
-    v.iter().enumerate().fold((0usize, f32::MIN), |(bi, bv), (i, &x)| {
-        if x > bv {
-            (i, x)
-        } else {
-            (bi, bv)
-        }
-    })
-    .0
+    v.iter()
+        .enumerate()
+        .fold(
+            (0usize, f32::MIN),
+            |(bi, bv), (i, &x)| {
+                if x > bv {
+                    (i, x)
+                } else {
+                    (bi, bv)
+                }
+            },
+        )
+        .0
 }
 
 #[test]
@@ -51,14 +56,31 @@ fn eager_and_mmap_experts_agree() {
             let h = eg.forward_layers(h, pos, None);
             eg.head_logits(&h)
         };
-        let worst = lm.iter().zip(&le).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(worst < 5e-2, "pos {pos}: eager vs mmap logits diverge by {worst}");
-        assert_eq!(argmax(&lm), argmax(&le), "pos {pos}: argmax differs (eager vs mmap)");
+        let worst = lm
+            .iter()
+            .zip(&le)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 5e-2,
+            "pos {pos}: eager vs mmap logits diverge by {worst}"
+        );
+        assert_eq!(
+            argmax(&lm),
+            argmax(&le),
+            "pos {pos}: argmax differs (eager vs mmap)"
+        );
     }
 
     // End-to-end greedy must be token-identical.
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "mmap");
-    let got_mmap = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).unwrap().generate_argmax(&[1, 2, 3, 4], 4);
+    let got_mmap = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0)
+        .unwrap()
+        .generate_argmax(&[1, 2, 3, 4], 4);
     std::env::remove_var("CASCADIA_GLM5_EXPERTS");
-    assert_eq!(got_mmap, vec![4u32, 10, 3, 15], "mmap greedy diverges from reference");
+    assert_eq!(
+        got_mmap,
+        vec![4u32, 10, 3, 15],
+        "mmap greedy diverges from reference"
+    );
 }

@@ -24,9 +24,15 @@ fn r1_read_matches_mmap_reference() {
     // Force mmap experts (so the R1 read path is actually exercised) + R1 on.
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "mmap");
     std::env::set_var("CASCADIA_GLM5_R1READ", "1");
-    let got = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).unwrap().generate_argmax(&[1, 2, 3, 4], 4);
+    let got = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0)
+        .unwrap()
+        .generate_argmax(&[1, 2, 3, 4], 4);
     std::env::remove_var("CASCADIA_GLM5_EXPERTS");
     std::env::remove_var("CASCADIA_GLM5_R1READ");
     // Same reference as glm5_expert_mmap's mmap path → R1 is bit-identical.
-    assert_eq!(got, vec![4u32, 10, 3, 15], "R1 read path diverged from the mmap reference");
+    assert_eq!(
+        got,
+        vec![4u32, 10, 3, 15],
+        "R1 read path diverged from the mmap reference"
+    );
 }

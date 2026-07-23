@@ -22,7 +22,10 @@ macro_rules! fixtures {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
         if !p.exists() {
-            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            eprintln!(
+                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+                p.display()
+            );
             return;
         }
         StFile::open(&p).expect("open fixtures")
@@ -60,7 +63,10 @@ fn build_model(fx: &StFile, max_seq: usize) -> GlmModel {
         let freqs = precompute_freqs(rope, max_seq, 0, theta, 1.0, 32.0, 1.0);
         let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
         let mlp = if li < first_dense {
-            LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")).into(), inter: dense_inter }
+            LayerMlp::Dense {
+                w: load_expert(&format!("{lp}.dense")).into(),
+                inter: dense_inter,
+            }
         } else {
             let experts: Vec<AnyExpert> = (0..n_experts)
                 .map(|e| load_expert(&format!("{lp}.moe.e{e}")).into())
@@ -71,7 +77,9 @@ fn build_model(fx: &StFile, max_seq: usize) -> GlmModel {
                 experts,
                 shared: load_expert(&format!("{lp}.moe.sh")).into(),
             };
-            LayerMlp::Moe(MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw))
+            LayerMlp::Moe(MoeLayer::new(
+                hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw,
+            ))
         };
         layers.push(GlmLayer::new(
             hidden,
@@ -126,7 +134,12 @@ impl Grammar for Template {
 }
 
 /// Naive constrained decode: one model forward per emitted token (forced or free).
-fn naive_constrained(model: &mut GlmModel, prompt: &[u32], g: &Template, max_new: usize) -> Vec<u32> {
+fn naive_constrained(
+    model: &mut GlmModel,
+    prompt: &[u32],
+    g: &Template,
+    max_new: usize,
+) -> Vec<u32> {
     model.reset();
     let mut logits = Vec::new();
     for &t in prompt {
@@ -162,10 +175,16 @@ fn grammar_forced_run_batching_matches_naive() {
     let naive = naive_constrained(&mut model, &prompt, &g, max_new);
 
     // Same tokens as per-token constrained decode, and the template structure.
-    assert_eq!(out.tokens, naive, "grammar generation diverged from naive decode");
+    assert_eq!(
+        out.tokens, naive,
+        "grammar generation diverged from naive decode"
+    );
     assert_eq!(out.tokens.len(), 6, "template should emit 6 tokens");
     assert_eq!(&out.tokens[0..3], &RUN1, "first forced run");
-    assert!(FREE_SET.contains(&out.tokens[3]), "free token must be in the allowed set");
+    assert!(
+        FREE_SET.contains(&out.tokens[3]),
+        "free token must be in the allowed set"
+    );
     assert_eq!(&out.tokens[4..6], &RUN2, "second forced run");
 
     // The win: forced runs batched → fewer forwards than tokens. Here:
@@ -176,5 +195,8 @@ fn grammar_forced_run_batching_matches_naive() {
         out.forwards,
         out.tokens.len()
     );
-    assert_eq!(out.forwards, 4, "1 prefill + 2 forced runs + 1 free position");
+    assert_eq!(
+        out.forwards, 4,
+        "1 prefill + 2 forced runs + 1 free position"
+    );
 }

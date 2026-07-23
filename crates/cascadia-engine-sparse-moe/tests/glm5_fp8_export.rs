@@ -21,5 +21,9 @@ fn real_exporter_roundtrip_matches_reference() {
     let mut model = load_model(&dir, 32).expect("load fp8-exported model");
     let got = model.generate(&[1, 2, 3, 4], 4);
     // meta printed by gen_fixtures: [fp8 round-trip] ... greedy [9, 15, 0, 0]
-    assert_eq!(got, vec![9u32, 15, 0, 0], "fp8-exported loader greedy mismatch");
+    assert_eq!(
+        got,
+        vec![9u32, 15, 0, 0],
+        "fp8-exported loader greedy mismatch"
+    );
 }

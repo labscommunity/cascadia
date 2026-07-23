@@ -63,7 +63,11 @@ async fn step(
                 .unwrap();
         });
         let k = recv_kind_server(&servers[i]).await.unwrap();
-        assert_eq!(k, Some(FrameKind::Forward), "relay {i}: expected Forward frame");
+        assert_eq!(
+            k,
+            Some(FrameKind::Forward),
+            "relay {i}: expected Forward frame"
+        );
         let (_p, _c, hw, _s) = recv_forward_body_server(&servers[i]).await.unwrap();
         send_task.await.unwrap();
         h = ranks[i + 1].forward_layers(hw, pos, None);
@@ -148,6 +152,9 @@ async fn glm5_pipeline_matches_reference_for_1_2_3_4_ranks() {
     for m in [1usize, 2, 3, 4] {
         let got = run_pipeline(&dir, max_seq, m, &prompt, n_gen).await;
         eprintln!("M={m}: {got:?}  (reference {want:?})");
-        assert_eq!(got, want, "M={m}-rank pipeline diverges from single-process reference");
+        assert_eq!(
+            got, want,
+            "M={m}-rank pipeline diverges from single-process reference"
+        );
     }
 }

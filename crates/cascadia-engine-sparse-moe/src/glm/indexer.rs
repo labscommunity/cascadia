@@ -144,7 +144,13 @@ impl Indexer {
         let mut kd = vec![0.0f32; self.hd];
         linear_bf16_w(x, &self.w.ix_wk, self.hd, self.hidden, &mut kd);
         layernorm(&mut kd, &self.w.k_norm_w, &self.w.k_norm_b, self.eps);
-        apply_rope_row(&mut kd[..self.rope_dim], &self.freqs, pos, self.rope_dim, false);
+        apply_rope_row(
+            &mut kd[..self.rope_dim],
+            &self.freqs,
+            pos,
+            self.rope_dim,
+            false,
+        );
         self.ic[pos * self.hd..(pos + 1) * self.hd].copy_from_slice(&kd);
         self.len += 1;
     }
@@ -162,7 +168,13 @@ impl Indexer {
         linear_bf16_w(qr, &self.w.ix_wq, nh * hd, self.q_lora, &mut qi);
         for h in 0..nh {
             let base = h * hd;
-            apply_rope_row(&mut qi[base..base + self.rope_dim], &self.freqs, query_pos, self.rope_dim, false);
+            apply_rope_row(
+                &mut qi[base..base + self.rope_dim],
+                &self.freqs,
+                query_pos,
+                self.rope_dim,
+                false,
+            );
         }
         let mut w32 = vec![0.0f32; nh];
         linear_bf16_w(x, &self.w.ix_wp, nh, self.hidden, &mut w32);

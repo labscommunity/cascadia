@@ -17,7 +17,14 @@ fn silu(x: f32) -> f32 {
 
 /// SwiGLU FFN for one token. `wg`/`wu` are `[inter, hidden]`, `wd` is
 /// `[hidden, inter]` (bf16 bits). Returns `[hidden]`.
-pub fn swiglu(x: &[f32], wg: &[u16], wu: &[u16], wd: &[u16], hidden: usize, inter: usize) -> Vec<f32> {
+pub fn swiglu(
+    x: &[f32],
+    wg: &[u16],
+    wu: &[u16],
+    wd: &[u16],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
     assert_eq!(x.len(), hidden);
     assert_eq!(wg.len(), inter * hidden);
     assert_eq!(wu.len(), inter * hidden);
@@ -40,7 +47,14 @@ pub fn swiglu(x: &[f32], wg: &[u16], wu: &[u16], wd: &[u16], hidden: usize, inte
 /// but the projection weights are dequantized f32 (int4 values are not exactly
 /// bf16-representable, so they are kept f32, not re-rounded). `wg`/`wu` are
 /// `[inter, hidden]`, `wd` is `[hidden, inter]`.
-pub fn swiglu_f32w(x: &[f32], wg: &[f32], wu: &[f32], wd: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+pub fn swiglu_f32w(
+    x: &[f32],
+    wg: &[f32],
+    wu: &[f32],
+    wd: &[f32],
+    hidden: usize,
+    inter: usize,
+) -> Vec<f32> {
     assert_eq!(x.len(), hidden);
     assert_eq!(wg.len(), inter * hidden);
     assert_eq!(wu.len(), inter * hidden);

@@ -19,7 +19,10 @@ macro_rules! fixtures {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
         if !p.exists() {
-            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            eprintln!(
+                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+                p.display()
+            );
             return;
         }
         StFile::open(&p).expect("open fixtures")
@@ -60,7 +63,10 @@ fn build_model(fx: &StFile, max_seq: usize) -> GlmModel {
         let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
 
         let mlp = if li < first_dense {
-            LayerMlp::Dense { w: load_expert(&format!("{lp}.dense")).into(), inter: dense_inter }
+            LayerMlp::Dense {
+                w: load_expert(&format!("{lp}.dense")).into(),
+                inter: dense_inter,
+            }
         } else {
             let experts: Vec<AnyExpert> = (0..n_experts)
                 .map(|e| load_expert(&format!("{lp}.moe.e{e}")).into())
@@ -71,7 +77,9 @@ fn build_model(fx: &StFile, max_seq: usize) -> GlmModel {
                 experts,
                 shared: load_expert(&format!("{lp}.moe.sh")).into(),
             };
-            LayerMlp::Moe(MoeLayer::new(hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw))
+            LayerMlp::Moe(MoeLayer::new(
+                hidden, n_experts, top_k, moe_inter, moe_inter, scale, mw,
+            ))
         };
         layers.push(GlmLayer::new(
             hidden,
@@ -123,7 +131,10 @@ fn model_prefill_bit_exact_vs_per_token() {
     model.reset();
     let prefilled = model.prefill(&prompt);
 
-    assert_eq!(prefilled, per_token, "prefill last-position logits diverge from per-token");
+    assert_eq!(
+        prefilled, per_token,
+        "prefill last-position logits diverge from per-token"
+    );
 }
 
 /// KV-prefix cache parity: snapshotting the first `k` tokens' KV, restoring it
@@ -155,8 +166,14 @@ fn prefix_snapshot_restore_bit_exact_vs_full() {
     let reuse = model.prefill(&prompt[k..]);
     let reuse_step = model.forward_token(9);
 
-    assert_eq!(reuse, full, "prefix-cache prefill logits diverge from full prefill");
-    assert_eq!(reuse_step, full_step, "decode after prefix restore diverges from full");
+    assert_eq!(
+        reuse, full,
+        "prefix-cache prefill logits diverge from full prefill"
+    );
+    assert_eq!(
+        reuse_step, full_step,
+        "decode after prefix restore diverges from full"
+    );
 }
 
 /// End-to-end KvPrefixCache: warming the cache with a base prompt, then
@@ -175,9 +192,16 @@ fn prefix_cache_reuse_matches_uncached() {
     assert_eq!(r0, 0, "first call must be a cold miss");
 
     let (o_cached, r1) = m.generate_with_prefix_cache(&mut cache, &ext, 3);
-    assert_eq!(r1, base.len(), "ext should reuse the whole cached base prefix");
+    assert_eq!(
+        r1,
+        base.len(),
+        "ext should reuse the whole cached base prefix"
+    );
 
     let mut m2 = build_model(&fx, 16);
     let o_ref = m2.generate(&ext, 3);
-    assert_eq!(o_cached, o_ref, "prefix-cached generation diverges from uncached");
+    assert_eq!(
+        o_cached, o_ref,
+        "prefix-cached generation diverges from uncached"
+    );
 }

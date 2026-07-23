@@ -18,7 +18,10 @@ macro_rules! fixtures {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
         if !p.exists() {
-            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            eprintln!(
+                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+                p.display()
+            );
             return;
         }
         StFile::open(&p).expect("open fixtures")
@@ -71,8 +74,7 @@ fn mla_attention_matches_reference() {
         wo: bits(&fx.f32("attn.wo").unwrap().1),
     };
     let freqs = precompute_freqs(rope, seq, 0, theta, 1.0, 32.0, 1.0);
-    let mut layer =
-        AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, w, freqs);
+    let mut layer = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, seq, w, freqs);
 
     let (_, want) = fx.f32("attn.out").unwrap();
     let mut got = vec![0.0f32; seq * hidden];

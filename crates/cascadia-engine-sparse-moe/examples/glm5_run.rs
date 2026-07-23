@@ -39,22 +39,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tokenizer (needed only for text prompts / decoding).
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).ok();
     let prompt: Vec<u32> = if raw_ids {
-        prompt_arg.split_whitespace().map(|s| s.parse().unwrap()).collect()
+        prompt_arg
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect()
     } else {
-        let t = tok.as_ref().ok_or("text prompt needs tokenizer.json in <model_dir>")?;
-        t.encode(prompt_arg.as_str(), true).map_err(|e| e.to_string())?.get_ids().to_vec()
+        let t = tok
+            .as_ref()
+            .ok_or("text prompt needs tokenizer.json in <model_dir>")?;
+        t.encode(prompt_arg.as_str(), true)
+            .map_err(|e| e.to_string())?
+            .get_ids()
+            .to_vec()
     };
-    println!("[glm5_run] dir={} max_seq={} prompt_ids={} n_gen={}", dir.display(), max_seq, prompt.len(), n_gen);
+    println!(
+        "[glm5_run] dir={} max_seq={} prompt_ids={} n_gen={}",
+        dir.display(),
+        max_seq,
+        prompt.len(),
+        n_gen
+    );
 
     let t_load = Instant::now();
     let mut runner = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0)?;
-    println!("[glm5_run] loaded in {:.1}s (arch={})", t_load.elapsed().as_secs_f64(), runner.arch_name());
+    println!(
+        "[glm5_run] loaded in {:.1}s (arch={})",
+        t_load.elapsed().as_secs_f64(),
+        runner.arch_name()
+    );
 
     let t_gen = Instant::now();
     let out = runner.generate_argmax(&prompt, n_gen);
     let dt = t_gen.elapsed().as_secs_f64();
 
-    println!("[glm5_run] {} tokens in {:.1}s = {:.3} tok/s", out.len(), dt, out.len() as f64 / dt.max(1e-9));
+    println!(
+        "[glm5_run] {} tokens in {:.1}s = {:.3} tok/s",
+        out.len(),
+        dt,
+        out.len() as f64 / dt.max(1e-9)
+    );
     println!("[glm5_run] out ids: {out:?}");
     if let Some(t) = tok.as_ref() {
         match t.decode(&out, true) {

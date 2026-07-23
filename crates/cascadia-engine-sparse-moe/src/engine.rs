@@ -28,10 +28,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::dist::{
-    forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
-    recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
-    send_forward_batch, send_forward_batch_prefill, send_forward_nosample, send_forward_prefill,
-    recv_key_body_server, send_cache_prefix, send_reset, send_restore_prefix,
+    forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
+    recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
+    send_cache_prefix, send_forward, send_forward_batch, send_forward_batch_prefill,
+    send_forward_nosample, send_forward_prefill, send_reset, send_restore_prefix,
     send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
@@ -460,9 +460,10 @@ impl Builder for SparseMoEBuilder {
             if rank == 0 {
                 let tok_path = self.config.model_dir.join("tokenizer.json");
                 if tok_path.exists() {
-                    self.tokenizer = Some(Tokenizer::from_file(&tok_path).map_err(|e| {
-                        EngineError::Backend(format!("load tokenizer.json: {e}"))
-                    })?);
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
                 } else {
                     warn!(
                         "no tokenizer.json at {} — glm5 engine will only accept pre-tokenized inputs",
@@ -2900,7 +2901,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
-            return Some(vec![(id.clone(), Chunk::error(id, "rank 0 missing downstream"))]);
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(id, "rank 0 missing downstream"),
+            )]);
         };
         if self.tokenizer.is_none() {
             warn!(task = %id, "dsv4 rank 0 has no tokenizer");

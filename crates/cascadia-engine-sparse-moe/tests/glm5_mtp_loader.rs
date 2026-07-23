@@ -17,7 +17,10 @@ use cascadia_engine_sparse_moe::glm::loader::load_model;
 fn loader_mtp_spec_matches_greedy() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
     if !dir.join("mtp.safetensors").exists() {
-        eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", dir.display());
+        eprintln!(
+            "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+            dir.display()
+        );
         return;
     }
     let prompt: Vec<u32> = vec![1, 2, 3, 4];
@@ -26,7 +29,9 @@ fn loader_mtp_spec_matches_greedy() {
     let max_seq = prompt.len() + n_gen + 8;
 
     // Ground-truth greedy from the loaded model.
-    let want = load_model(&dir, max_seq).expect("load export").generate(&prompt, n_gen);
+    let want = load_model(&dir, max_seq)
+        .expect("load export")
+        .generate(&prompt, n_gen);
     assert_eq!(want.len(), n_gen);
 
     for g in [1usize, 2, 3, 4] {
@@ -36,6 +41,9 @@ fn loader_mtp_spec_matches_greedy() {
         assert_eq!(out.tokens, want, "loaded spec (g={g}) diverged from greedy");
         assert!(out.forwards <= n_gen + 1);
         assert!(out.accepted <= out.drafted);
-        eprintln!("g={g}: forwards={} drafted={} accepted={}", out.forwards, out.drafted, out.accepted);
+        eprintln!(
+            "g={g}: forwards={} drafted={} accepted={}",
+            out.forwards, out.drafted, out.accepted
+        );
     }
 }

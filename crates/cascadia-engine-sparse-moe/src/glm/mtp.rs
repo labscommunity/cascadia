@@ -22,11 +22,11 @@ pub struct MtpHead {
     pub hidden: usize,
     pub vocab: usize,
     pub eps: f32,
-    enorm: Vec<f32>,   // [hidden]
-    hnorm: Vec<f32>,   // [hidden]
+    enorm: Vec<f32>,    // [hidden]
+    hnorm: Vec<f32>,    // [hidden]
     mtp_norm: Vec<f32>, // shared_head.norm [hidden]
-    eh_proj: Vec<u16>, // [hidden, 2*hidden] (bf16 bits)
-    block: GlmLayer,   // the MTP transformer block (attn + MoE)
+    eh_proj: Vec<u16>,  // [hidden, 2*hidden] (bf16 bits)
+    block: GlmLayer,    // the MTP transformer block (attn + MoE)
 }
 
 impl MtpHead {
@@ -44,7 +44,16 @@ impl MtpHead {
         assert_eq!(hnorm.len(), hidden);
         assert_eq!(mtp_norm.len(), hidden);
         assert_eq!(eh_proj.len(), hidden * 2 * hidden);
-        Self { hidden, vocab, eps, enorm, hnorm, mtp_norm, eh_proj, block }
+        Self {
+            hidden,
+            vocab,
+            eps,
+            enorm,
+            hnorm,
+            mtp_norm,
+            eh_proj,
+            block,
+        }
     }
 
     /// Propose `g_steps` greedy draft tokens from the true pre-norm hidden

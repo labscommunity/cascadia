@@ -15,7 +15,10 @@ macro_rules! fixtures {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
         if !p.exists() {
-            eprintln!("SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)", p.display());
+            eprintln!(
+                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
+                p.display()
+            );
             return;
         }
         StFile::open(&p).expect("open fixtures")
@@ -58,7 +61,14 @@ fn swiglu_matches_reference() {
 
     let mut got = vec![0.0f32; rows * hidden];
     for r in 0..rows {
-        let y = swiglu(&x[r * hidden..(r + 1) * hidden], &wg, &wu, &wd, hidden, inter);
+        let y = swiglu(
+            &x[r * hidden..(r + 1) * hidden],
+            &wg,
+            &wu,
+            &wd,
+            hidden,
+            inter,
+        );
         got[r * hidden..(r + 1) * hidden].copy_from_slice(&y);
     }
     assert_close("ffn.out", &got, &want, 1e-3, 1e-2);

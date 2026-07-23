@@ -55,7 +55,10 @@ async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) 
         let sc = server.clone();
         let atask = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
         let mut client = ActivationClient::new("127.0.0.1", port);
-        client.connect_with_timeout(Duration::from_secs(5)).await.unwrap();
+        client
+            .connect_with_timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
         atask.await.unwrap();
         clients.push(Arc::new(Mutex::new(client)));
         servers.push(server);
@@ -81,7 +84,11 @@ async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) 
                 .unwrap();
         });
         let k = recv_kind_server(&servers[i]).await.unwrap();
-        assert_eq!(k, Some(FrameKind::ForwardBatchPrefill), "relay {i}: expected ForwardBatchPrefill");
+        assert_eq!(
+            k,
+            Some(FrameKind::ForwardBatchPrefill),
+            "relay {i}: expected ForwardBatchPrefill"
+        );
         let (_start, count, _s, hw, _shape) =
             recv_forward_batch_body_server(&servers[i]).await.unwrap();
         assert_eq!(count as usize, rows);
@@ -106,7 +113,9 @@ async fn glm5_batched_prefill_pipeline_matches_single_process() {
 
     // Single-process batched prefill is the reference (itself bit-exact vs
     // per-token, proven by glm5_model).
-    let want = load_model(&dir, max_seq).expect("load_model").prefill(&prompt);
+    let want = load_model(&dir, max_seq)
+        .expect("load_model")
+        .prefill(&prompt);
     let want_tok = argmax(&want);
 
     for m in [1usize, 2, 4] {
@@ -160,7 +169,10 @@ fn glm5_prefix_cache_pipeline_matches_full() {
         let mut ranks: Vec<GlmRunner> = (0..m)
             .map(|r| GlmRunner::load_staged(&dir, max_seq, r as u32, m as u32, 0, 0).expect("load"))
             .collect();
-        assert!(ranks[0].prefix_cache_enabled(), "prefix cache enabled by env");
+        assert!(
+            ranks[0].prefix_cache_enabled(),
+            "prefix cache enabled by env"
+        );
 
         // Reference: full prefill of `ext`.
         for r in &mut ranks {
@@ -181,7 +193,11 @@ fn glm5_prefix_cache_pipeline_matches_full() {
             r.reset();
         }
         for r in &mut ranks {
-            assert_eq!(r.restore_prefix(KEY), Some(base.len()), "M={m}: restored length");
+            assert_eq!(
+                r.restore_prefix(KEY),
+                Some(base.len()),
+                "M={m}: restored length"
+            );
         }
         let got = drive_prefill(&mut ranks, &ext[base.len()..], base.len());
 
