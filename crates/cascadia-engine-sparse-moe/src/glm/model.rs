@@ -8,6 +8,7 @@
 //! `rms_norm_eps` (1e-5).
 
 use super::attn::{AttentionLayer, AttnKv};
+use super::kv_cache::KvPrefixCache;
 use super::moe::{AnyExpert, MoeLayer};
 use super::mtp::MtpHead;
 use super::prof;
@@ -454,6 +455,42 @@ impl GlmModel {
             logits = self.forward_token(nxt);
         }
         gen
+    }
+
+    /// Greedy generation with a [`KvPrefixCache`]: if a cached prompt prefix is
+    /// found, restore its KV and prefill only the suffix (skipping the shared
+    /// prefix's expert streaming); otherwise a full prefill. This prompt's KV is
+    /// inserted for future reuse. Bit-identical to [`Self::generate`] (verified);
+    /// returns the tokens plus how many leading positions were reused.
+    pub fn generate_with_prefix_cache(
+        &mut self,
+        cache: &mut KvPrefixCache,
+        prompt: &[u32],
+        n_gen: usize,
+    ) -> (Vec<u32>, usize) {
+        assert!(!prompt.is_empty(), "generate_with_prefix_cache needs a non-empty prompt");
+        self.reset();
+        // Restore the longest cached prefix, then prefill the suffix. We must
+        // prefill at least the last prompt token to obtain its logits, so a
+        // full-prompt hit is capped to `len-1` (its last position is re-derived).
+        let mut reused = 0usize;
+        if let Some((k, snap)) = cache.longest_prefix(prompt) {
+            self.restore_prefix(snap);
+            reused = k.min(prompt.len() - 1);
+            if reused < k {
+                self.truncate(reused);
+            }
+        }
+        let mut logits = self.prefill(&prompt[reused..]);
+        // Cache this prompt's full KV so a future extension of it reuses more.
+        cache.insert(prompt.to_vec(), self.snapshot_prefix());
+        let mut out = Vec::with_capacity(n_gen);
+        for _ in 0..n_gen {
+            let nxt = argmax(&logits) as u32;
+            out.push(nxt);
+            logits = self.forward_token(nxt);
+        }
+        (out, reused)
     }
 }
 

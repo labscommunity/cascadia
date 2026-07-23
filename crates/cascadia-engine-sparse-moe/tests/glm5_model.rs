@@ -158,3 +158,26 @@ fn prefix_snapshot_restore_bit_exact_vs_full() {
     assert_eq!(reuse, full, "prefix-cache prefill logits diverge from full prefill");
     assert_eq!(reuse_step, full_step, "decode after prefix restore diverges from full");
 }
+
+/// End-to-end KvPrefixCache: warming the cache with a base prompt, then
+/// generating for an extension of it, must (a) reuse the whole base prefix and
+/// (b) produce tokens bit-identical to an uncached full generation.
+#[test]
+fn prefix_cache_reuse_matches_uncached() {
+    use cascadia_engine_sparse_moe::glm::kv_cache::KvPrefixCache;
+    let fx = fixtures!();
+    let base: Vec<u32> = vec![1, 2, 3];
+    let ext: Vec<u32> = vec![1, 2, 3, 4, 5]; // base is a prefix of ext
+    let mut cache = KvPrefixCache::new(4);
+
+    let mut m = build_model(&fx, 16);
+    let (_o0, r0) = m.generate_with_prefix_cache(&mut cache, &base, 2);
+    assert_eq!(r0, 0, "first call must be a cold miss");
+
+    let (o_cached, r1) = m.generate_with_prefix_cache(&mut cache, &ext, 3);
+    assert_eq!(r1, base.len(), "ext should reuse the whole cached base prefix");
+
+    let mut m2 = build_model(&fx, 16);
+    let o_ref = m2.generate(&ext, 3);
+    assert_eq!(o_cached, o_ref, "prefix-cached generation diverges from uncached");
+}
