@@ -157,6 +157,8 @@ cascadia worker --rank 0 --total 2 --engine ov-runtime --device GPU \
 
 Not sure of a node's address? `cascadia discover` lists Cascadia peers on the LAN and the `host:port` to pass to `--next`.
 
+Two stages on the **same host** (e.g. iGPU + dGPU in one box)? Link them over a Unix domain socket instead of loopback TCP — `--listen unix:/tmp/cascadia-1.sock` on the downstream, the same path as `--next` on the upstream. Measured 85–92 % lower per-frame round-trip latency for decode-sized frames (Unix only; see [docs/CLI.md](docs/CLI.md#unix-domain-sockets)).
+
 For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
 
 ### Engines

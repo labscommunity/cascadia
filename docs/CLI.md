@@ -98,15 +98,56 @@ cascadia worker --rank <N> --total <N> --model <DIR> [OPTIONS]
 | `--rank <RANK>` | *required* | 0-based stage index. |
 | `--total <TOTAL>` | *required* | Total number of stages. |
 | `--model <MODEL>` | *required* | Local model directory. Not an HF repo id. |
-| `--listen <LISTEN>` | `:9100` | Bind address for the upstream-receiving socket. |
-| `--next <NEXT>` | — | Downstream peer `host:port`. Required for every stage but the last. |
-| `--api <API>` | — | API bind address. **Rank 0 only** — other ranks enter the relay loop and never bind it. Passing it there logs a warning and is otherwise ignored. |
+| `--listen <LISTEN>` | `:9100` | Bind address for the upstream-receiving socket: `host:port`, `:port`, or a [unix socket](#unix-domain-sockets) `unix:/path.sock`. |
+| `--next <NEXT>` | — | Downstream peer: `host:port` or `unix:/path.sock`. Required for every stage but the last. |
+| `--api <API>` | — | API bind address (TCP only). **Rank 0 only** — other ranks enter the relay loop and never bind it. Passing it there logs a warning and is otherwise ignored. |
 | `--engine <ENGINE>` | `mock` | Inference engine. `mock` runs without OpenVINO. |
 | `--device <DEVICE>` | `CPU` | OpenVINO device target — see [below](#device-forms). |
 
 Rank 0 serves the API and holds the first layers; the last rank produces tokens
 and returns them up the chain. Start the *downstream* worker first — engines
 wait 60 s for a downstream peer, then give up.
+
+### Unix domain sockets
+
+When two adjacent stages run on the SAME host (iGPU stage 0 → dGPU stage 1 on
+one workstation, or single-box stage testing), link them over a Unix domain
+socket instead of loopback TCP ([#17](https://github.com/labscommunity/cascadia/issues/17)):
+
+```bash
+# stage 1 (start first)
+cascadia worker --rank 1 --total 2 --model <DIR> --listen unix:/tmp/cascadia-1.sock
+
+# stage 0
+cascadia worker --rank 0 --total 2 --model <DIR> --next unix:/tmp/cascadia-1.sock --api :8416
+```
+
+Address forms recognized for `--listen`/`--next`: `unix:/path.sock`
+(explicit), an absolute path, or any `.sock`-suffixed path. The wire format
+is identical to TCP; the two stages must simply agree on the path.
+
+Measured round-trip latency vs `127.0.0.1` TCP (Apple Silicon macOS, release
+build, `cargo test -p cascadia-transport --release --test uds_vs_tcp_bench --
+--ignored --nocapture`):
+
+| Frame | TCP p50 | UDS p50 | Win |
+|---|---|---|---|
+| 14 KiB (decode-step hidden state) | ~32–55 µs | ~4–5 µs | ~85–92 % |
+| 1 MiB (prefill/logits class) | ~145–180 µs | ~108–111 µs | ~24–40 % |
+
+Notes:
+
+- Unix only (Linux/macOS). On Windows a `unix:` address fails fast with a
+  clear error; use TCP there.
+- The socket file is created mode `0600` (owner-only) and unlinked on
+  shutdown; a stale socket left by a crash is unlinked and re-bound
+  automatically. A **non-socket** file at the path is never deleted — the
+  worker refuses to start instead.
+- `--api` stays TCP; unix addresses are for the inter-stage activation
+  relay only.
+- Cross-host topology probing doesn't apply: a UDS-listening stage
+  advertises no TCP relay port over mDNS, so the dashboard's latency matrix
+  skips it (in-host links aren't cross-host topology).
 
 ### Layer split
 

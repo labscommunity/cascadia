@@ -12,16 +12,26 @@
 //! Tensors up to 3D supported. Lower-rank tensors are wire-padded with
 //! leading-1 dimensions; receiver returns the wire-encoded shape.
 //!
-//! This is intentionally simple — raw TCP, point-to-point. It is the
-//! data plane between adjacent pipeline stages.
+//! This is intentionally simple — raw byte streams, point-to-point. It is
+//! the data plane between adjacent pipeline stages. Two stream flavors
+//! carry the identical wire format:
+//!
+//! * **TCP** (the default) — cross-host pipeline stages.
+//! * **Unix domain sockets** (`unix:/path/to.sock`, Unix only, #17) —
+//!   in-host stages (e.g. iGPU stage 0 → dGPU stage 1 on one box), which
+//!   skip the loopback TCP stack on every Forward/Reset/Token frame.
 
 use std::io;
-use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 /// Tune an inter-rank pipeline socket: TCP_NODELAY (activations are latency-
@@ -37,6 +47,119 @@ fn tune_pipeline_socket(sock: &TcpStream) {
         .with_time(Duration::from_secs(30))
         .with_interval(Duration::from_secs(15));
     let _ = socket2::SockRef::from(sock).set_tcp_keepalive(&ka);
+}
+
+/// A connected pipeline byte stream: TCP (cross-host) or a Unix domain
+/// socket (in-host, #17). Both carry the identical length-prefixed wire
+/// format; every frame helper in this crate is generic over
+/// `AsyncRead`/`AsyncWrite`, so the two arms share one code path.
+#[derive(Debug)]
+pub enum ActivationStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl ActivationStream {
+    /// Apply the per-flavor socket tuning: TCP gets NODELAY + keepalive
+    /// (see [`tune_pipeline_socket`]); UDS gets enlarged kernel buffers —
+    /// AF_UNIX defaults are tiny on macOS (~8 KiB) which throttles MB-class
+    /// prefill/logits frames well below loopback TCP. Nagle/keepalive don't
+    /// apply to UDS (no coalescing, and the kernel never drops an idle
+    /// local socket). Best-effort: option failures are ignored, never
+    /// fatal.
+    fn tune(&self) {
+        match self {
+            ActivationStream::Tcp(s) => tune_pipeline_socket(s),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => {
+                let sock = socket2::SockRef::from(s);
+                let _ = sock.set_send_buffer_size(1024 * 1024);
+                let _ = sock.set_recv_buffer_size(1024 * 1024);
+            }
+        }
+    }
+
+    /// Graceful write-side shutdown (best-effort, both flavors).
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            ActivationStream::Tcp(s) => s.shutdown().await,
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => s.shutdown().await,
+        }
+    }
+}
+
+impl AsyncRead for ActivationStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ActivationStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ActivationStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ActivationStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ActivationStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ActivationStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ActivationStream::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            ActivationStream::Tcp(s) => s.is_write_vectored(),
+            #[cfg(unix)]
+            ActivationStream::Unix(s) => s.is_write_vectored(),
+        }
+    }
+}
+
+/// The listening side of [`ActivationStream`].
+#[derive(Debug)]
+enum ActivationListener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(UnixListener),
 }
 
 pub const HEADER_SIZE: usize = 20;
@@ -59,10 +182,97 @@ pub const MAX_TENSOR_BYTES: usize = 256 * 1024 * 1024;
 /// gigabyte of "control bytes".
 pub const MAX_RAW_BYTES: usize = 64 * 1024;
 
+/// Where a pipeline endpoint lives: a TCP `host:port`, or a Unix domain
+/// socket path (in-host stages, #17). The wire format on top is identical.
+///
+/// Recognized string forms (see [`FromStr`]):
+/// * `unix:/tmp/cascadia-stage-1.sock` — explicit UDS
+/// * `/tmp/cascadia-stage-1.sock` — absolute path (UDS)
+/// * `stage-1.sock` — `.sock` suffix (UDS)
+/// * `127.0.0.1:9100` / `cascadia-matias-03:9100` — TCP (existing)
+///
+/// At the `(host, port)` seams the codebase already has everywhere
+/// (`PeerEndpoint`, `configure_listen`, the transport constructors), a UDS
+/// address travels as `host = "unix:/path"` (or a bare path) with the port
+/// ignored — see [`TransportAddr::from_host_port`]. No struct or wire
+/// schema changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransportAddr {
+    Tcp { host: String, port: u16 },
+    Unix(PathBuf),
+}
+
+impl TransportAddr {
+    /// Classify the `(host, port)` pair the existing plumbing carries.
+    /// `unix:`-prefixed, absolute-path, or `.sock`-suffixed hosts are UDS
+    /// (the port is ignored); anything else is TCP, byte-for-byte the
+    /// historical behavior.
+    pub fn from_host_port(host: &str, port: u16) -> Self {
+        if let Some(path) = host.strip_prefix("unix:") {
+            TransportAddr::Unix(PathBuf::from(path))
+        } else if host.starts_with('/') || host.ends_with(".sock") {
+            TransportAddr::Unix(PathBuf::from(host))
+        } else {
+            TransportAddr::Tcp {
+                host: host.to_string(),
+                port,
+            }
+        }
+    }
+
+    pub fn is_unix(&self) -> bool {
+        matches!(self, TransportAddr::Unix(_))
+    }
+}
+
+impl std::str::FromStr for TransportAddr {
+    type Err = TransportError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(path) = s.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err(TransportError::InvalidAddr(s.to_string()));
+            }
+            return Ok(TransportAddr::Unix(PathBuf::from(path)));
+        }
+        if s.starts_with('/') || s.ends_with(".sock") {
+            return Ok(TransportAddr::Unix(PathBuf::from(s)));
+        }
+        let (host, port) = s
+            .rsplit_once(':')
+            .ok_or_else(|| TransportError::InvalidAddr(s.to_string()))?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| TransportError::InvalidAddr(s.to_string()))?;
+        Ok(TransportAddr::Tcp {
+            host: host.to_string(),
+            port,
+        })
+    }
+}
+
+impl std::fmt::Display for TransportAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportAddr::Tcp { host, port } => write!(f, "{host}:{port}"),
+            TransportAddr::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("socket closed during recv")]
     SocketClosed,
+
+    #[error("invalid transport address: {0:?} (expected host:port or unix:/path.sock)")]
+    InvalidAddr(String),
+
+    #[error("unix domain sockets are not supported on this platform: {0}")]
+    UnixUnsupported(String),
+
+    #[error("refusing to unlink non-socket file at unix socket path: {0}")]
+    NotASocketFile(String),
 
     #[error("tensor rank > {MAX_RANK} not supported (got {0} dims)")]
     RankTooHigh(usize),
@@ -163,7 +373,10 @@ pub struct TransferStats {
 }
 
 /// Send a tensor over a connected stream.
-pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResult<TransferStats> {
+pub async fn send_tensor<W: AsyncWrite + Unpin>(
+    sock: &mut W,
+    tensor: &Tensor,
+) -> TransportResult<TransferStats> {
     let start = Instant::now();
     let mut header = [0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(&(tensor.data.len() as u32).to_be_bytes());
@@ -189,7 +402,9 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
 /// Also cross-checks the per-element count against the declared
 /// payload length so a peer can't claim `shape=[u32::MAX, ...]` to
 /// trigger overflow downstream.
-pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+pub async fn recv_tensor<R: AsyncRead + Unpin>(
+    sock: &mut R,
+) -> TransportResult<(Tensor, TransferStats)> {
     recv_tensor_inner(sock, None).await
 }
 
@@ -205,7 +420,9 @@ pub async fn recv_tensor(sock: &mut TcpStream) -> TransportResult<(Tensor, Trans
 /// step loop for the whole idle ceiling with the task slot held
 /// (overload-backlog Item 5: forwarded-to head wedges, task never
 /// finalizes).
-pub async fn recv_tensor_reply(sock: &mut TcpStream) -> TransportResult<(Tensor, TransferStats)> {
+pub async fn recv_tensor_reply<R: AsyncRead + Unpin>(
+    sock: &mut R,
+) -> TransportResult<(Tensor, TransferStats)> {
     recv_tensor_inner(sock, Some(recv_timeout())).await
 }
 
@@ -222,8 +439,8 @@ pub const PREFILL_REPLY_TIMEOUT_FACTOR: u32 = 10;
 /// [`recv_tensor_reply`] with the widened prefill budget. Use for the token
 /// reply to a multi-token (prefill) hidden state; everything else uses
 /// `recv_tensor_reply`.
-pub async fn recv_tensor_reply_prefill(
-    sock: &mut TcpStream,
+pub async fn recv_tensor_reply_prefill<R: AsyncRead + Unpin>(
+    sock: &mut R,
 ) -> TransportResult<(Tensor, TransferStats)> {
     // saturating_mul: an absurdly large configured base must clamp, not
     // panic the engine thread (Duration's Mul panics on overflow).
@@ -234,8 +451,8 @@ pub async fn recv_tensor_reply_prefill(
     .await
 }
 
-async fn recv_tensor_inner(
-    sock: &mut TcpStream,
+async fn recv_tensor_inner<R: AsyncRead + Unpin>(
+    sock: &mut R,
     deadline_first_byte: Option<Duration>,
 ) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
@@ -437,7 +654,10 @@ fn frame_idle_ceiling() -> Option<Duration> {
 /// [`TransportError::FrameIdleCeiling`] — distinguishable from the
 /// per-frame deadline's `Io(TimedOut)` so the wrappers can treat it as
 /// connection-fatal.
-async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact_frame_start<R: AsyncRead + Unpin>(
+    sock: &mut R,
+    buf: &mut [u8],
+) -> TransportResult<()> {
     let first_read = sock.read(buf);
     let n = match frame_idle_ceiling() {
         Some(ceiling) => match tokio::time::timeout(ceiling, first_read).await {
@@ -455,7 +675,7 @@ async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> Transpo
     Ok(())
 }
 
-async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()> {
+async fn recv_exact<R: AsyncRead + Unpin>(sock: &mut R, buf: &mut [u8]) -> TransportResult<()> {
     // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
     // to fill. A peer that opens a connection and stops sending — or
     // sends one byte per second — must not be able to pin a worker
@@ -477,8 +697,8 @@ async fn recv_exact(sock: &mut TcpStream, buf: &mut [u8]) -> TransportResult<()>
     recv_exact_within(sock, buf, recv_timeout()).await
 }
 
-async fn recv_exact_within(
-    sock: &mut TcpStream,
+async fn recv_exact_within<R: AsyncRead + Unpin>(
+    sock: &mut R,
     buf: &mut [u8],
     to: Duration,
 ) -> TransportResult<()> {
@@ -502,51 +722,117 @@ async fn recv_exact_within(
     }
 }
 
-/// TCP server that receives activations from upstream.
+/// Server side of an activation link: receives activations from upstream.
+/// Binds TCP (`host:port`) or a Unix domain socket (`unix:/path.sock`,
+/// in-host stages) — the frame protocol on top is identical.
 pub struct ActivationServer {
-    bind_host: String,
-    bind_port: u16,
-    listener: Option<TcpListener>,
-    client: Option<TcpStream>,
-    accepted_addr: Option<SocketAddr>,
+    addr: TransportAddr,
+    listener: Option<ActivationListener>,
+    client: Option<ActivationStream>,
+    accepted_peer: Option<String>,
     actual_port: u16,
+    /// Unix socket path this server bound and therefore OWNS — unlinked on
+    /// [`close`](Self::close) and on `Drop` so a crash-restart can re-bind.
+    #[cfg(unix)]
+    owned_unix_path: Option<PathBuf>,
 }
 
 impl ActivationServer {
+    /// `host` may be a hostname/IP (TCP, with `port`) or a UDS form
+    /// (`unix:/path.sock`, `/abs/path.sock` — `port` ignored). See
+    /// [`TransportAddr::from_host_port`].
     pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self::for_addr(TransportAddr::from_host_port(&host.into(), port))
+    }
+
+    pub fn for_addr(addr: TransportAddr) -> Self {
+        let actual_port = match &addr {
+            TransportAddr::Tcp { port, .. } => *port,
+            TransportAddr::Unix(_) => 0,
+        };
         Self {
-            bind_host: host.into(),
-            bind_port: port,
+            addr,
             listener: None,
             client: None,
-            accepted_addr: None,
-            actual_port: port,
+            accepted_peer: None,
+            actual_port,
+            #[cfg(unix)]
+            owned_unix_path: None,
         }
     }
 
     pub async fn start(&mut self) -> TransportResult<()> {
-        let listener = TcpListener::bind((self.bind_host.as_str(), self.bind_port)).await?;
-        self.actual_port = listener.local_addr()?.port();
-        self.listener = Some(listener);
-        info!(
-            host = %self.bind_host,
-            port = self.actual_port,
-            "ActivationServer listening"
-        );
+        match &self.addr {
+            TransportAddr::Tcp { host, port } => {
+                let listener = TcpListener::bind((host.as_str(), *port)).await?;
+                self.actual_port = listener.local_addr()?.port();
+                self.listener = Some(ActivationListener::Tcp(listener));
+                info!(
+                    host = %host,
+                    port = self.actual_port,
+                    "ActivationServer listening"
+                );
+            }
+            #[cfg(unix)]
+            TransportAddr::Unix(path) => {
+                // Crash recovery: a stale socket file from a previous run
+                // blocks bind with AddrInUse — unlink it first. ONLY a
+                // socket file: refusing to delete a regular file/dir at a
+                // mistyped path beats silently destroying user data.
+                match std::fs::symlink_metadata(path) {
+                    Ok(md) => {
+                        use std::os::unix::fs::FileTypeExt;
+                        if md.file_type().is_socket() {
+                            std::fs::remove_file(path)?;
+                            info!(path = %path.display(), "unlinked stale unix socket");
+                        } else {
+                            return Err(TransportError::NotASocketFile(path.display().to_string()));
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                let listener = UnixListener::bind(path)?;
+                // Owner-only: the socket is an unauthenticated pipeline
+                // endpoint; other users on a shared box must not reach it.
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                self.actual_port = 0;
+                self.owned_unix_path = Some(path.clone());
+                self.listener = Some(ActivationListener::Unix(listener));
+                info!(path = %path.display(), "ActivationServer listening (unix)");
+            }
+            #[cfg(not(unix))]
+            TransportAddr::Unix(path) => {
+                return Err(TransportError::UnixUnsupported(path.display().to_string()));
+            }
+        }
         Ok(())
     }
 
+    /// Bound TCP port (resolves `:0` ephemeral binds); 0 for unix sockets.
     pub fn port(&self) -> u16 {
         self.actual_port
     }
 
     pub async fn accept(&mut self) -> TransportResult<()> {
         let listener = self.listener.as_ref().ok_or(TransportError::NotStarted)?;
-        let (sock, addr) = listener.accept().await?;
-        tune_pipeline_socket(&sock);
-        info!(peer = %addr, "ActivationServer accepted connection");
-        self.client = Some(sock);
-        self.accepted_addr = Some(addr);
+        let (stream, peer) = match listener {
+            ActivationListener::Tcp(l) => {
+                let (sock, addr) = l.accept().await?;
+                (ActivationStream::Tcp(sock), addr.to_string())
+            }
+            #[cfg(unix)]
+            ActivationListener::Unix(l) => {
+                let (sock, _addr) = l.accept().await?;
+                // UDS peers are almost always unnamed; identify by our path.
+                (ActivationStream::Unix(sock), format!("{}", self.addr))
+            }
+        };
+        stream.tune();
+        info!(peer = %peer, "ActivationServer accepted connection");
+        self.client = Some(stream);
+        self.accepted_peer = Some(peer);
         Ok(())
     }
 
@@ -566,7 +852,7 @@ impl ActivationServer {
     fn drop_connection_if_recv_fatal(&mut self, err: Option<&TransportError>) {
         if err.is_some_and(recv_error_is_connection_fatal) {
             self.client = None; // drop closes the fd
-            self.accepted_addr = None;
+            self.accepted_peer = None;
         }
     }
 
@@ -607,7 +893,7 @@ impl ActivationServer {
         if let Some(mut s) = self.client.take() {
             let _ = s.shutdown().await;
         }
-        self.accepted_addr = None;
+        self.accepted_peer = None;
     }
 
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
@@ -645,29 +931,79 @@ impl ActivationServer {
             let _ = sock.shutdown().await;
         }
         self.listener = None;
-        self.accepted_addr = None;
+        self.accepted_peer = None;
+        self.unlink_owned_unix_socket();
+    }
+
+    /// Remove the unix socket file this server bound (no-op for TCP or if
+    /// already unlinked). Idempotent; called from `close()` and `Drop` so
+    /// graceful shutdown and panics both leave no stale socket behind.
+    #[cfg(unix)]
+    fn unlink_owned_unix_socket(&mut self) {
+        if let Some(path) = self.owned_unix_path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unlink_owned_unix_socket(&mut self) {}
+}
+
+impl Drop for ActivationServer {
+    fn drop(&mut self) {
+        self.unlink_owned_unix_socket();
     }
 }
 
-/// TCP client that sends activations to downstream.
+/// Client side of an activation link: sends activations to downstream.
+/// Dials TCP (`host:port`) or a Unix domain socket (`unix:/path.sock`).
 pub struct ActivationClient {
-    host: String,
-    port: u16,
-    sock: Option<TcpStream>,
+    target: TransportAddr,
+    sock: Option<ActivationStream>,
 }
 
 impl ActivationClient {
+    /// `host` may be a hostname/IP (TCP, with `port`) or a UDS form
+    /// (`unix:/path.sock`, `/abs/path.sock` — `port` ignored). See
+    /// [`TransportAddr::from_host_port`].
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
-            host: host.into(),
-            port,
+            target: TransportAddr::from_host_port(&host.into(), port),
             sock: None,
+        }
+    }
+
+    pub fn for_addr(target: TransportAddr) -> Self {
+        Self { target, sock: None }
+    }
+
+    /// One connect attempt for the configured target flavor.
+    async fn dial(&self) -> io::Result<ActivationStream> {
+        match &self.target {
+            TransportAddr::Tcp { host, port } => Ok(ActivationStream::Tcp(
+                TcpStream::connect((host.as_str(), *port)).await?,
+            )),
+            #[cfg(unix)]
+            TransportAddr::Unix(path) => {
+                Ok(ActivationStream::Unix(UnixStream::connect(path).await?))
+            }
+            #[cfg(not(unix))]
+            TransportAddr::Unix(_) => unreachable!("guarded in connect_with_timeout"),
         }
     }
 
     /// Connect with retries until `timeout` elapses (mirrors the Python
     /// implementation's wait-for-peer behaviour during pipeline startup).
+    /// The retry loop is flavor-agnostic: a UDS downstream that hasn't
+    /// bound its socket yet fails with NotFound/ConnectionRefused and is
+    /// retried exactly like a TCP peer that isn't accepting yet.
     pub async fn connect_with_timeout(&mut self, timeout: Duration) -> TransportResult<()> {
+        // A unix target on a non-unix platform can never succeed — fail
+        // fast instead of burning the whole connect timeout retrying.
+        #[cfg(not(unix))]
+        if let TransportAddr::Unix(path) = &self.target {
+            return Err(TransportError::UnixUnsupported(path.display().to_string()));
+        }
         let start = Instant::now();
         let deadline = start + timeout;
         // Tell the operator up-front what we're waiting on. Without this
@@ -676,18 +1012,17 @@ impl ActivationClient {
         // bring-up. We log the target and the budget so the wait is
         // legible, then a progress line every few seconds.
         info!(
-            host = %self.host,
-            port = self.port,
+            target = %self.target,
             timeout_s = timeout.as_secs(),
             "waiting for downstream peer to accept (start the downstream worker first)"
         );
         let mut last_err: Option<io::Error> = None;
         let mut next_progress = start + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match TcpStream::connect((self.host.as_str(), self.port)).await {
+            match self.dial().await {
                 Ok(sock) => {
-                    tune_pipeline_socket(&sock);
-                    info!(host = %self.host, port = self.port, "ActivationClient connected");
+                    sock.tune();
+                    info!(target = %self.target, "ActivationClient connected");
                     self.sock = Some(sock);
                     return Ok(());
                 }
@@ -696,8 +1031,7 @@ impl ActivationClient {
                     let now = Instant::now();
                     if now >= next_progress {
                         warn!(
-                            host = %self.host,
-                            port = self.port,
+                            target = %self.target,
                             waited_s = now.duration_since(start).as_secs(),
                             timeout_s = timeout.as_secs(),
                             "still waiting for downstream peer (not accepting yet)"
@@ -711,13 +1045,13 @@ impl ActivationClient {
         // Actionable timeout: name the address and the usual causes so an
         // operator doesn't have to reverse-engineer a bare io::Error.
         warn!(
-            host = %self.host,
-            port = self.port,
+            target = %self.target,
             timeout_s = timeout.as_secs(),
             last_error = ?last_err.as_ref().map(|e| e.to_string()),
             "could not connect to downstream peer within timeout — check that the \
-             downstream worker is running, that its --listen port matches this \
-             --next, and that no firewall blocks the port"
+             downstream worker is running, that its --listen address matches this \
+             --next, and that no firewall blocks the port (TCP) or that both \
+             stages use the same socket path (unix)"
         );
         if let Some(err) = last_err {
             return Err(err.into());
@@ -1377,6 +1711,287 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "recv after peer RST must fail fast"
+        );
+    }
+
+    // --- TransportAddr parsing (#17 acceptance) ---------------------------
+
+    #[test]
+    fn transport_addr_recognizes_all_forms() {
+        use std::str::FromStr;
+        // Explicit unix: prefix.
+        assert_eq!(
+            TransportAddr::from_str("unix:/tmp/cascadia-1.sock").unwrap(),
+            TransportAddr::Unix(PathBuf::from("/tmp/cascadia-1.sock"))
+        );
+        // Absolute path.
+        assert_eq!(
+            TransportAddr::from_str("/tmp/cascadia-1.sock").unwrap(),
+            TransportAddr::Unix(PathBuf::from("/tmp/cascadia-1.sock"))
+        );
+        // Relative path with .sock suffix.
+        assert_eq!(
+            TransportAddr::from_str("stage-1.sock").unwrap(),
+            TransportAddr::Unix(PathBuf::from("stage-1.sock"))
+        );
+        // IP:port.
+        assert_eq!(
+            TransportAddr::from_str("127.0.0.1:9100").unwrap(),
+            TransportAddr::Tcp {
+                host: "127.0.0.1".into(),
+                port: 9100
+            }
+        );
+        // hostname:port.
+        assert_eq!(
+            TransportAddr::from_str("cascadia-matias-03:9100").unwrap(),
+            TransportAddr::Tcp {
+                host: "cascadia-matias-03".into(),
+                port: 9100
+            }
+        );
+        // Rejects: empty unix path, missing port, junk port.
+        assert!(TransportAddr::from_str("unix:").is_err());
+        assert!(TransportAddr::from_str("justahost").is_err());
+        assert!(TransportAddr::from_str("host:notaport").is_err());
+    }
+
+    #[test]
+    fn from_host_port_matches_the_peer_endpoint_seam() {
+        // The (host, port) forms the CLI/PeerEndpoint plumbing carries.
+        assert_eq!(
+            TransportAddr::from_host_port("unix:/tmp/x.sock", 0),
+            TransportAddr::Unix(PathBuf::from("/tmp/x.sock"))
+        );
+        assert_eq!(
+            TransportAddr::from_host_port("/tmp/x.sock", 9100),
+            TransportAddr::Unix(PathBuf::from("/tmp/x.sock"))
+        );
+        assert_eq!(
+            TransportAddr::from_host_port("10.0.0.2", 9100),
+            TransportAddr::Tcp {
+                host: "10.0.0.2".into(),
+                port: 9100
+            }
+        );
+    }
+
+    // --- Unix-domain-socket transport (#17) --------------------------------
+
+    /// Per-test socket path in a short tmp dir (macOS sun_path caps at 104
+    /// bytes; the default TMPDIR + a long test name can exceed it).
+    #[cfg(unix)]
+    fn test_sock_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("cascadia-uds-tests");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{tag}-{}.sock", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_roundtrip_f32_2d() {
+        let sock_path = test_sock_path("roundtrip");
+        let _ = std::fs::remove_file(&sock_path);
+        let mut server = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        server.start().await.unwrap();
+        assert_eq!(server.port(), 0, "unix listeners have no TCP port");
+
+        let addr = format!("unix:{}", sock_path.display());
+        let server_handle = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let (got, _) = server.recv().await.unwrap();
+            server.close().await;
+            got
+        });
+
+        let mut client = ActivationClient::new(addr, 0);
+        client.connect().await.unwrap();
+        let payload = vec![0u8, 0, 128, 63, 0, 0, 0, 64]; // f32: 1.0, 2.0
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, payload.clone());
+        client.send(&tensor).await.unwrap();
+        let got = server_handle.await.unwrap();
+        assert_eq!(got.dtype, DType::F32);
+        assert_eq!(got.shape, [1, 1, 2]);
+        assert_eq!(got.data, payload);
+        assert!(
+            !sock_path.exists(),
+            "close() must unlink the socket file it bound"
+        );
+    }
+
+    /// Raw control bytes (the dist-spec frame protocol) over UDS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_raw_bytes_roundtrip() {
+        let sock_path = test_sock_path("raw");
+        let _ = std::fs::remove_file(&sock_path);
+        let mut server = ActivationServer::new(sock_path.display().to_string(), 0);
+        server.start().await.unwrap();
+        let addr = sock_path.display().to_string();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let kind = server.recv_raw(4).await.unwrap();
+            server.send_raw(&[9, 9]).await.unwrap();
+            kind
+        });
+        let mut client = ActivationClient::new(addr, 0);
+        client.connect().await.unwrap();
+        client.send_raw(&[1, 2, 3, 4]).await.unwrap();
+        let reply = client.recv_raw(2).await.unwrap();
+        let kind = h.await.unwrap();
+        assert_eq!(kind, vec![1, 2, 3, 4]);
+        assert_eq!(reply, vec![9, 9]);
+    }
+
+    /// A stale socket file from a crashed prior run must be unlinked and
+    /// re-bound automatically (#17 acceptance: crash recovery).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_stale_socket_is_unlinked_and_rebound() {
+        let sock_path = test_sock_path("stale");
+        let _ = std::fs::remove_file(&sock_path);
+        // Simulate the crash: bind a socket, then leak the file by
+        // mem::forgetting the server (Drop would unlink it).
+        let mut first = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        first.start().await.unwrap();
+        std::mem::forget(first);
+        assert!(sock_path.exists(), "precondition: stale socket file left");
+
+        let mut second = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        second
+            .start()
+            .await
+            .expect("stale socket must be unlinked and re-bound");
+        second.close().await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// A REGULAR file at the socket path must NOT be deleted — fail loud.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_refuses_to_unlink_non_socket_file() {
+        let sock_path = test_sock_path("nonsock");
+        std::fs::write(&sock_path, b"precious data").unwrap();
+        let mut server = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        let res = server.start().await;
+        assert!(
+            matches!(res, Err(TransportError::NotASocketFile(_))),
+            "must refuse to clobber a regular file: {res:?}"
+        );
+        assert_eq!(
+            std::fs::read(&sock_path).unwrap(),
+            b"precious data",
+            "the file must be untouched"
+        );
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// The bound socket must be owner-only (0600) — it is an
+    /// unauthenticated pipeline endpoint on a possibly-shared box.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_socket_mode_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let sock_path = test_sock_path("mode");
+        let _ = std::fs::remove_file(&sock_path);
+        let mut server = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        server.start().await.unwrap();
+        let mode = std::fs::metadata(&sock_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "socket mode {:o}", mode & 0o777);
+        server.close().await;
+    }
+
+    /// The dialer's retry loop must wait out a not-yet-bound UDS peer the
+    /// same way it waits for a not-yet-listening TCP peer (downstream-first
+    /// startup contract).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_connect_retries_until_server_binds() {
+        let sock_path = test_sock_path("retry");
+        let _ = std::fs::remove_file(&sock_path);
+        let addr = format!("unix:{}", sock_path.display());
+        let dial_addr = addr.clone();
+        let dialer = tokio::spawn(async move {
+            let mut client = ActivationClient::new(dial_addr, 0);
+            client
+                .connect_with_timeout(Duration::from_secs(10))
+                .await
+                .map(|_| client)
+        });
+        // Bind late: the client must be mid-retry by now.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut server = ActivationServer::new(addr, 0);
+        server.start().await.unwrap();
+        server.accept().await.unwrap();
+        let mut client = dialer
+            .await
+            .unwrap()
+            .expect("late-bound unix peer must be reachable via the retry loop");
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let (got, _) = server.recv().await.unwrap();
+        assert_eq!(got.data, tensor.data);
+        server.close().await;
+    }
+
+    /// Reply-deadline semantics are flavor-independent: a silent UDS peer
+    /// that owes a mid-task reply must fail fast and poison the connection,
+    /// exactly like TCP.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_reply_timeout_fails_fast_and_poisons() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let sock_path = test_sock_path("reply");
+        let _ = std::fs::remove_file(&sock_path);
+        let mut server = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        server.start().await.unwrap();
+        let addr = format!("unix:{}", sock_path.display());
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            let first = server.recv_reply().await;
+            let second = server.recv().await;
+            (first, second)
+        });
+        let mut client = ActivationClient::new(addr, 0);
+        client.connect().await.unwrap();
+        // Send nothing: the reply never comes.
+        let (first, second) = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(first.is_err(), "missing reply must time out, got {first:?}");
+        assert!(
+            matches!(second, Err(TransportError::NotConnected)),
+            "poisoned unix connection must fail fast: {second:?}"
+        );
+    }
+
+    /// Idle-tolerance parity: an idle gap longer than the strict recv
+    /// timeout must not kill a UDS link waiting for its NEXT frame.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uds_idle_gap_longer_than_timeout_does_not_kill_recv() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_activation_timeout_secs(1);
+        let sock_path = test_sock_path("idle");
+        let _ = std::fs::remove_file(&sock_path);
+        let mut server = ActivationServer::new(format!("unix:{}", sock_path.display()), 0);
+        server.start().await.unwrap();
+        let addr = format!("unix:{}", sock_path.display());
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await
+        });
+        let mut client = ActivationClient::new(addr, 0);
+        client.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await; // idle > timeout
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, vec![0, 0, 128, 63, 0, 0, 0, 64]);
+        client.send(&tensor).await.unwrap();
+        let got = h.await.unwrap();
+        set_activation_timeout_secs(0);
+        assert!(
+            got.is_ok(),
+            "idle unix link must not time out waiting for the next frame: {:?}",
+            got.err()
         );
     }
 
