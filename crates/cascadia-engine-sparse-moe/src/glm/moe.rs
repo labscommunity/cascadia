@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use super::ffn::{swiglu, swiglu_f32w, swiglu_mmap};
 use super::gate::moe_gate;
+use super::prof;
 use super::residency::UsageStats;
 use crate::dsv4::expert_mmap::MmapExpert;
 use crate::dsv4::math::linear_f32;
@@ -179,6 +180,7 @@ impl MoeLayer {
     /// MoE for one token `x` (`[hidden]`). Returns `[hidden]`.
     pub fn forward_token(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.hidden);
+        let t_router = std::time::Instant::now();
         // router logits (f32) -> sigmoid + noaux_tc gate.
         let mut logits = vec![0.0f32; self.n_experts];
         linear_f32(x, &self.w.router_w, self.n_experts, self.hidden, &mut logits);
@@ -191,8 +193,10 @@ impl MoeLayer {
                 }
             }
         }
+        prof::add(prof::ROUTER, t_router);
 
         // routed experts in gate order, then the shared expert.
+        let t_exp = std::time::Instant::now();
         let mut out = vec![0.0f32; self.hidden];
         if r1_read() {
             // Light-R1: read the routed experts' whole bins up-front and
@@ -227,6 +231,7 @@ impl MoeLayer {
         for (o, &si) in out.iter_mut().zip(&s) {
             *o += si;
         }
+        prof::add(prof::EXPERTS, t_exp);
         out
     }
 
