@@ -7,7 +7,7 @@
 //! `first_k_dense_replace` (3) layers. Both norms are RMSNorm, eps
 //! `rms_norm_eps` (1e-5).
 
-use super::attn::AttentionLayer;
+use super::attn::{AttentionLayer, AttnKv};
 use super::moe::{AnyExpert, MoeLayer};
 use super::mtp::MtpHead;
 use super::prof;
@@ -52,6 +52,16 @@ impl GlmLayer {
     /// Roll this layer's KV cache back to `len` positions (spec-decode reject).
     pub fn truncate(&mut self, len: usize) {
         self.attn.truncate(len);
+    }
+
+    /// Snapshot this layer's KV for prefix caching.
+    pub fn snapshot_kv(&self) -> AttnKv {
+        self.attn.snapshot()
+    }
+
+    /// Restore a KV snapshot into this layer (call after [`Self::reset`]).
+    pub fn restore_kv(&mut self, kv: &AttnKv) {
+        self.attn.restore(kv);
     }
 
     /// This layer's MoE block, if it is a sparse (non-dense) layer — for the
@@ -209,6 +219,30 @@ impl GlmModel {
     pub fn truncate(&mut self, len: usize) {
         for l in &mut self.layers {
             l.truncate(len);
+        }
+    }
+
+    /// Snapshot every layer's KV at the current cached length — a reusable prompt
+    /// prefix. Restore it (after [`Self::reset`]) to skip re-prefilling that
+    /// prefix, then continue with prefill / [`Self::forward_token`] of the suffix.
+    /// The per-layer int4 expert *weights* are unchanged; only the KV is saved,
+    /// so this trades RAM for the expert-streaming a re-prefill would repeat.
+    pub fn snapshot_prefix(&self) -> Vec<AttnKv> {
+        self.layers.iter().map(|l| l.snapshot_kv()).collect()
+    }
+
+    /// Restore a prefix snapshot into every layer (replaces current KV). The
+    /// snapshot must come from a model with this one's layer count and dims.
+    pub fn restore_prefix(&mut self, snap: &[AttnKv]) {
+        assert_eq!(
+            snap.len(),
+            self.layers.len(),
+            "prefix snapshot layer count {} != {}",
+            snap.len(),
+            self.layers.len()
+        );
+        for (l, kv) in self.layers.iter_mut().zip(snap) {
+            l.restore_kv(kv);
         }
     }
 
