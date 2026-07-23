@@ -64,6 +64,19 @@ pub trait StagedRunner: Send + 'static {
     /// Last-rank only: logits from the final hidden.
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32>;
 
+    /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:
+    /// unsupported — only the glm5 runner implements them, so dsv4 / OV runners
+    /// are unaffected. `restore_prefix` restores this rank's cached KV slice for
+    /// `key` and returns the restored length (== new pos), or `None` on a miss.
+    /// `cache_prefix` snapshots the current KV slice under `key`.
+    fn prefix_cache_enabled(&self) -> bool {
+        false
+    }
+    fn restore_prefix(&mut self, _key: u64) -> Option<usize> {
+        None
+    }
+    fn cache_prefix(&mut self, _key: u64) {}
+
     /// Single-stage generation with sampling (greedy when the config says so).
     /// Prompt tokens drive the same per-token path as decode; sampling happens
     /// once after prefill (mirroring the pipeline). A prompt longer than the

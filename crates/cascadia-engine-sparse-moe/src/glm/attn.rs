@@ -91,6 +91,7 @@ pub struct AttentionLayer {
 /// present). Restoring it into a freshly-`reset` layer lets a request skip
 /// re-prefilling a shared prompt prefix. Snapshot and layer must share dims
 /// (same model / rank).
+#[derive(Clone)]
 pub struct AttnKv {
     len: usize,
     lc: Vec<f32>,         // len * kv_lora

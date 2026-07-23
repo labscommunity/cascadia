@@ -121,6 +121,13 @@ pub enum FrameKind {
     /// `TokenBatch`. Lets rank 0 push the whole prompt in one frame while the
     /// MoE dedups overlapping experts across the prompt's positions.
     ForwardBatchPrefill = 0x53_4D_45_08, // "SME\x08"
+    /// Distributed KV-prefix cache (glm5). One-way, relayed downstream; body is
+    /// an 8 B big-endian u64 prefix key. `RestorePrefix`: restore the cached KV
+    /// slice for the key before the suffix prefill. `CachePrefix`: snapshot the
+    /// current KV slice under the key after prefill. Runners without prefix
+    /// caching (dsv4) treat both as no-ops.
+    RestorePrefix = 0x53_4D_45_09, // "SME\x09"
+    CachePrefix = 0x53_4D_45_0A,   // "SME\x0A"
 }
 
 impl FrameKind {
@@ -134,6 +141,8 @@ impl FrameKind {
             x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
             x if x == FrameKind::ForwardPrefill as u32 => Some(FrameKind::ForwardPrefill),
             x if x == FrameKind::ForwardBatchPrefill as u32 => Some(FrameKind::ForwardBatchPrefill),
+            x if x == FrameKind::RestorePrefix as u32 => Some(FrameKind::RestorePrefix),
+            x if x == FrameKind::CachePrefix as u32 => Some(FrameKind::CachePrefix),
             _ => None,
         }
     }
@@ -404,6 +413,44 @@ pub async fn send_reset(cli: &Mutex<ActivationClient>) -> TransportResult<()> {
     let mut guard = cli.lock().await;
     guard.send_raw(&header).await?;
     Ok(())
+}
+
+async fn send_key_frame(
+    cli: &Mutex<ActivationClient>,
+    kind: FrameKind,
+    key: u64,
+) -> TransportResult<()> {
+    let mut bytes = [0u8; 12];
+    bytes[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&key.to_be_bytes());
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Send a RestorePrefix frame downstream (one-way): the receiver restores its
+/// cached KV slice for `key` before the suffix prefill, then relays.
+pub async fn send_restore_prefix(cli: &Mutex<ActivationClient>, key: u64) -> TransportResult<()> {
+    send_key_frame(cli, FrameKind::RestorePrefix, key).await
+}
+
+/// Send a CachePrefix frame downstream (one-way): the receiver snapshots its
+/// current KV slice under `key` after prefill, then relays.
+pub async fn send_cache_prefix(cli: &Mutex<ActivationClient>, key: u64) -> TransportResult<()> {
+    send_key_frame(cli, FrameKind::CachePrefix, key).await
+}
+
+/// Receive an 8 B big-endian u64 key body from upstream (kind already consumed).
+pub async fn recv_key_body_server(srv: &Mutex<ActivationServer>) -> TransportResult<u64> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
 }
 
 /// Send a Token frame upstream (last rank → rank 0 path).

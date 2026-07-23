@@ -114,6 +114,9 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::ForwardBatchPrefill => {
                 println!("[server] FORWARD_BATCH_PREFILL not handled in dist_check — ignoring");
             }
+            FrameKind::RestorePrefix | FrameKind::CachePrefix => {
+                println!("[server] prefix-cache frame not handled in dist_check — ignoring");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");
