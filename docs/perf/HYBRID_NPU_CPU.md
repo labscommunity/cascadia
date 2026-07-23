@@ -192,14 +192,20 @@ Matrix takeaways:
   ladder-topping at 1B and 3B). The "NPU decode ~1.5× slower than CPU" regime
   from three-tier placement (Yi-9B class) is unreachable single-stage on a
   32 GB LNL box — the NPU compile envelope excludes those models first.
-- **Greedy parity across kernels/devices**: same-device CPU and NPU legs are
-  token-exact at every size (hard-asserted). GPU legs (seq=64 vs seq=1
-  compile to different kernel/accumulation choices) and cross-device hybrid
-  legs can fork at a genuine argmax near-tie — deterministic per config,
-  observed more often as model size grows, both branches usually coherent
-  (one 3B NPU→GPU short-prompt fork read distinctly worse). Perf sweeps on
-  those configs run with `CASCADIA_PARITY_SOFT=1`, which reports the fork
-  index + both texts instead of aborting; CPU/NPU validation never sets it.
+- **Greedy parity across kernels/devices**: the chunked/hybrid legs run a
+  *different compiled graph* (seq=`C`) from the seq=1 decode graph, so **any**
+  leg — same-device CPU/NPU included — can fork at a genuine argmax near-tie
+  when the two graphs' floating-point accumulation tips a near-equal top-2
+  (both branches coherent, deterministic per config, observed more often as
+  model size grows; measured 2026-07-23: a **1B same-device CPU run forks
+  ~token 30**, correcting an earlier "token-exact on CPU/NPU" claim). The host
+  KV state itself is byte-identical — proven by the ring-math unit tests
+  (`chunked_absorb_matches_sequential` et al.) — so the fork lives in the
+  graphs' FP, not the host bookkeeping. The harness therefore tolerates a
+  near-tie fork with a loud report (fork index + both texts) and hard-fails
+  only if the sequences fork **within the first 10 decoded tokens** — too early
+  to be a coincidental tie, so wrong prefill KV rather than a near-tie.
+  `CASCADIA_PARITY_SOFT=1` tolerates even an early fork, for pure timing sweeps.
 
 ## Big-model NPU routes (2026-07-16, second session)
 
