@@ -34,6 +34,14 @@ mod winmem {
         pub number_of_bytes: usize,
     }
 
+    /// `PSAPI_WORKING_SET_EX_INFORMATION` — one queried virtual address plus the
+    /// returned attributes block. `Valid` is bit 0 of `virtual_attributes`.
+    #[repr(C)]
+    pub struct WorkingSetExInfo {
+        pub virtual_address: *mut c_void,
+        pub virtual_attributes: usize,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         /// `BOOL VirtualLock(LPVOID lpAddress, SIZE_T dwSize)` — nonzero on success.
@@ -48,6 +56,9 @@ mod winmem {
             addresses: *const Win32MemoryRangeEntry,
             flags: u32,
         ) -> i32;
+        /// `BOOL QueryWorkingSetEx(HANDLE, PVOID buffer, DWORD size)` — fills the
+        /// `virtual_attributes` of each entry; bit 0 (`Valid`) = page resident.
+        pub fn QueryWorkingSetEx(process: isize, buffer: *mut c_void, size: u32) -> i32;
     }
 }
 
@@ -100,6 +111,83 @@ impl MmapExpert {
     #[inline]
     pub fn bin_len(&self) -> usize {
         self.mmap.len()
+    }
+
+    /// Estimate how many of this expert's mapped pages are resident in RAM right
+    /// now, by probing `samples` pages spread evenly across the bin. Returns
+    /// `(resident, probed)`; `(0, 0)` if the OS query is unavailable or fails.
+    ///
+    /// This is the decode profiler's TRUE expert-cache hit signal: mmap page
+    /// faults are not counted by the process read counter on Windows (paging I/O
+    /// is charged elsewhere), so residency is probed directly — `QueryWorkingSetEx`
+    /// on Windows, `mincore` on unix. Best-effort and read-only.
+    pub fn resident_pages_sampled(&self, samples: usize) -> (usize, usize) {
+        const PAGE: usize = 4096;
+        let len = self.mmap.len();
+        if len == 0 || samples == 0 {
+            return (0, 0);
+        }
+        let base = self.mmap.as_ptr() as usize;
+        let npages = len.div_ceil(PAGE);
+        let want = samples.min(npages);
+        let step = (npages / want).max(1);
+        let addrs: Vec<usize> = (0..npages)
+            .step_by(step)
+            .take(want)
+            .map(|p| base + p * PAGE)
+            .collect();
+
+        #[cfg(windows)]
+        {
+            use core::ffi::c_void;
+            let mut buf: Vec<winmem::WorkingSetExInfo> = addrs
+                .iter()
+                .map(|&a| winmem::WorkingSetExInfo {
+                    virtual_address: a as *mut c_void,
+                    virtual_attributes: 0,
+                })
+                .collect();
+            let bytes = (buf.len() * core::mem::size_of::<winmem::WorkingSetExInfo>()) as u32;
+            // SAFETY: `buf` is a valid array of `buf.len()` entries; QueryWorkingSetEx
+            // writes only the `virtual_attributes` field of each. Read-only otherwise.
+            let ok = unsafe {
+                winmem::QueryWorkingSetEx(
+                    winmem::GetCurrentProcess(),
+                    buf.as_mut_ptr() as *mut c_void,
+                    bytes,
+                )
+            };
+            if ok == 0 {
+                return (0, 0);
+            }
+            let res = buf.iter().filter(|e| e.virtual_attributes & 1 == 1).count();
+            (res, buf.len())
+        }
+        #[cfg(unix)]
+        {
+            use core::ffi::c_void;
+            extern "C" {
+                fn mincore(addr: *mut c_void, length: usize, vec: *mut u8) -> i32;
+            }
+            let (mut resident, mut probed) = (0usize, 0usize);
+            for &a in &addrs {
+                let mut v = [0u8; 1];
+                // SAFETY: [a, a+PAGE) lies within the mapped region (npages pages
+                // from base); mincore writes one residency byte into `v`.
+                let r = unsafe { mincore(a as *mut c_void, PAGE, v.as_mut_ptr()) };
+                if r == 0 {
+                    probed += 1;
+                    if v[0] & 1 == 1 {
+                        resident += 1;
+                    }
+                }
+            }
+            (resident, probed)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            (0, 0)
+        }
     }
 
     /// SwiGLU FFN over an explicitly-read byte buffer (the R1 path). Mirrors

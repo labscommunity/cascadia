@@ -239,9 +239,20 @@ impl MoeLayer {
         if prof::enabled() {
             for &e in &gate.idx {
                 prof::note_selection(self.layer_idx, e);
-                prof::note_expert_bytes(self.w.experts[e as usize].int4_bytes());
+                let ex = &self.w.experts[e as usize];
+                prof::note_expert_bytes(ex.int4_bytes());
+                // Probe residency BEFORE compute faults the pages in, so it
+                // reflects whether this token's access hit RAM.
+                if let Some(m) = ex.as_mmap() {
+                    let (res, probed) = m.resident_pages_sampled(8);
+                    prof::note_residency(res, probed);
+                }
             }
             prof::note_expert_bytes(self.w.shared.int4_bytes());
+            if let Some(m) = self.w.shared.as_mmap() {
+                let (res, probed) = m.resident_pages_sampled(8);
+                prof::note_residency(res, probed);
+            }
         }
 
         // routed experts in gate order, then the shared expert.
