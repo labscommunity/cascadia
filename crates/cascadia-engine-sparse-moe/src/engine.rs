@@ -2901,6 +2901,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                                 Chunk::error(id, format!("restore_prefix: {e}")),
                             )];
                         }
+                        info!(
+                            task = %id,
+                            reused = k,
+                            prompt = n_prefill,
+                            suffix = n_prefill - k,
+                            "glm5 kv-prefix cache HIT: prefilling suffix only"
+                        );
                         k
                     }
                     None => 0,
