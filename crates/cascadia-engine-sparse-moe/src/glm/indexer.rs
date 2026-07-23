@@ -123,6 +123,12 @@ impl Indexer {
     pub fn append_key(&mut self, x: &[f32]) {
         assert_eq!(x.len(), self.hidden);
         let pos = self.len;
+        assert!(
+            pos < self.ic.len() / self.hd,
+            "GLM indexer context length {} exceeds max_seq {}",
+            pos + 1,
+            self.ic.len() / self.hd
+        );
         let mut kd = vec![0.0f32; self.hd];
         linear_bf16_w(x, &self.w.ix_wk, self.hd, self.hidden, &mut kd);
         layernorm(&mut kd, &self.w.k_norm_w, &self.w.k_norm_b, self.eps);

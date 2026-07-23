@@ -108,6 +108,22 @@ impl GlmRunner {
         } else {
             even_layer_split(n, rank, total)
         };
+        // IndexShare invariant: a rank's first owned layer must be `"full"` (owns
+        // an indexer / computes its own top-k). A `"shared"` first layer needs the
+        // top-k carry from a `"full"` layer on the PREVIOUS rank, which the
+        // pipeline does not forward — attention would silently fall back to DENSE
+        // (correct only while context ≤ index_topk; DIVERGES for long context). The
+        // index-aligned split guarantees this, but an explicit ShardSpec
+        // (`layer_start`/`layer_end`) may not, so reject a bad boundary loudly
+        // rather than serve silently-wrong long-context output.
+        if lo != 0 && m.indexer_types.get(lo).map(|t| t != "full").unwrap_or(false) {
+            return Err(LoadError::Manifest(format!(
+                "rank {rank} starts on non-'full' IndexShare layer {lo} ('{}'): a rank \
+                 boundary must land on a 'full' layer or that layer runs dense attention. \
+                 Use index-aligned shard boundaries.",
+                m.indexer_types[lo]
+            )));
+        }
         let first = rank == 0;
         let last = rank == total - 1;
         // Real-model expert sets can't be held dequantized; tiny/dev ones are
@@ -229,15 +245,22 @@ impl GlmRunner {
         // Router projections (f32) on owned MoE layers.
         let moe_owned = (lo..hi).filter(|li| !m.dense_layers.contains(li)).count();
         resident += (moe_owned * m.num_experts * m.hidden_size) as u64 * 4;
-        // Embedding / lm_head bf16 tables live on the edge ranks.
+        // Embedding / lm_head tables live on the edge ranks. The loader holds
+        // them as f32 (`StFile::f32`), so reserve 4 B/elem, not bf16's 2.
         if first {
-            resident += (m.vocab_size * m.hidden_size) as u64 * 2;
+            resident += (m.vocab_size * m.hidden_size) as u64 * 4;
         }
         if last {
-            resident += (m.vocab_size * m.hidden_size) as u64 * 2;
+            resident += (m.vocab_size * m.hidden_size) as u64 * 4;
         }
-        // Absorbed-MLA latent KV cache: (kv_lora + qk_rope) f32 per token per layer.
-        let kv = owned as u64 * max_seq as u64 * (m.kv_lora_rank + m.qk_rope_head_dim) as u64 * 4;
+        // Absorbed-MLA latent KV cache: (kv_lora + qk_rope) f32 per token per layer,
+        // plus the DSA indexer key cache (index_head_dim f32 per token per OWNED
+        // "full" layer). Both scale with max_seq — significant at agentic context.
+        let full_owned = (lo..hi)
+            .filter(|li| m.indexer_types.get(*li).map(|t| t == "full").unwrap_or(true))
+            .count();
+        let kv = owned as u64 * max_seq as u64 * (m.kv_lora_rank + m.qk_rope_head_dim) as u64 * 4
+            + full_owned as u64 * max_seq as u64 * m.index_head_dim as u64 * 4;
         let eb = residency::int4_expert_bytes(m.hidden_size, m.expert_intermediate);
         residency::pin_expert_count(residency::mem_available(), resident, kv, eb)
     }

@@ -190,6 +190,15 @@ impl AttentionLayer {
         let (h, nope, rope) = (self.h, self.qk_nope, self.qk_rope);
         let (vh, kvl, qk) = (self.v_head, self.kv_lora, self.qk_head);
         let pos = self.len;
+        // KV caches + the rope table are sized to max_seq at load; a position past
+        // that would panic with an opaque slice-OOB. Fail with a diagnostic instead
+        // (the DSA long-context regime is exactly where this bites).
+        assert!(
+            pos < self.lc.len() / kvl,
+            "GLM context length {} exceeds max_seq {}; raise CASCADIA_GLM5_MAX_SEQ",
+            pos + 1,
+            self.lc.len() / kvl
+        );
 
         // q = wq_b · rmsnorm(wq_a · x), rope on each head's pe tail.
         let mut qr = vec![0.0f32; self.q_lora];

@@ -258,13 +258,12 @@ impl MoeLayer {
 
         // 1. Route every row in the block; record the (expert -> occurrences)
         //    map and the per-slot expert/weight, exactly as forward_token would.
-        let mut slot_e = vec![0u32; nblk * k]; // expert id per (blockrow, slot)
         let mut slot_w = vec![0.0f32; nblk * k]; // gate weight per (blockrow, slot)
         let mut occ: Vec<Vec<u32>> = vec![Vec::new(); self.n_experts]; // expert -> [blockrow*k+slot]
         let mut logits = vec![0.0f32; self.n_experts];
         for br in 0..nblk {
             let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
-            logits.iter_mut().for_each(|v| *v = 0.0);
+            // `linear_f32` overwrites every element, so no pre-zeroing needed.
             linear_f32(x, &self.w.router_w, self.n_experts, hidden, &mut logits);
             let gate = moe_gate(&logits, &self.w.router_bias, k, self.scale, true);
             if let Some(u) = &self.usage {
@@ -276,7 +275,6 @@ impl MoeLayer {
             }
             for (slot, (&e, &wj)) in gate.idx.iter().zip(&gate.weight).enumerate() {
                 let s = br * k + slot;
-                slot_e[s] = e;
                 slot_w[s] = wj;
                 occ[e as usize].push(s as u32);
             }
