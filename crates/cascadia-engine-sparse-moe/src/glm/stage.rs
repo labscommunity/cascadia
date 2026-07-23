@@ -423,6 +423,9 @@ impl StagedRunner for GlmRunner {
         // Per-token decode profile (no-op unless CASCADIA_GLM5_PROFILE is set);
         // in the pipeline each rank dumps its own layer-slice split.
         super::prof::dump("decode");
+        // OV expert cache hit/miss + working-set stats (no-op unless
+        // CASCADIA_GLM5_OV_STATS is set), emitted next to the decode profile.
+        super::ov_expert::stats::dump();
         x
     }
     fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
