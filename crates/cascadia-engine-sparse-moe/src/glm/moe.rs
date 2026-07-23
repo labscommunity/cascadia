@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use super::ffn::{swiglu, swiglu_f32w, swiglu_mmap};
 use super::gate::moe_gate;
+use super::ov_expert::OvExperts;
 use super::prof;
 use super::residency::UsageStats;
 use crate::dsv4::expert_mmap::MmapExpert;
@@ -111,8 +112,14 @@ pub struct MoeLayer {
     w: MoeWeights,
     /// Optional routing recorder (learned-pin). None on the golden path.
     usage: Option<Arc<Mutex<UsageStats>>>,
-    /// This layer's GLOBAL index (for the usage histogram key).
+    /// This layer's GLOBAL index (for the usage histogram key AND the OV IR
+    /// `layer_NN` lookup).
     layer_idx: u32,
+    /// Optional OpenVINO expert backend (iGPU / NPU / CPU), shared across all
+    /// layers. `Some` only when `CASCADIA_GLM5_OV_EXPERTS=1` and the model ships
+    /// an `experts_ov/` dir; then each routed / shared expert runs its compiled
+    /// OV IR instead of the Rust int4 kernel. `None` keeps the default path.
+    ov: Option<Arc<OvExperts>>,
 }
 
 impl MoeLayer {
@@ -144,6 +151,7 @@ impl MoeLayer {
             w,
             usage: None,
             layer_idx: 0,
+            ov: None,
         }
     }
 
@@ -151,6 +159,14 @@ impl MoeLayer {
     pub fn attach_usage(&mut self, layer_idx: u32, usage: Arc<Mutex<UsageStats>>) {
         self.layer_idx = layer_idx;
         self.usage = Some(usage);
+    }
+
+    /// Attach the shared OpenVINO expert backend (opt-in). When set, routed and
+    /// shared experts run their compiled OV IRs (keyed by this layer's global
+    /// `layer_idx`) instead of the Rust int4 kernel. No-op unless the loader
+    /// built an [`OvExperts`] from the env + `experts_ov/` dir.
+    pub fn attach_ov(&mut self, ov: Arc<OvExperts>) {
+        self.ov = Some(ov);
     }
 
     /// The routed experts (for pinning enumeration).
@@ -208,7 +224,17 @@ impl MoeLayer {
         // routed experts in gate order, then the shared expert.
         let t_exp = std::time::Instant::now();
         let mut out = vec![0.0f32; self.hidden];
-        if r1_read() {
+        if let Some(ov) = &self.ov {
+            // OpenVINO backend (opt-in): each routed expert runs its compiled OV
+            // IR on the configured device (iGPU / NPU / CPU); `routed` bakes the
+            // gate weight into its output, so accumulate directly.
+            for (&e, &wj) in gate.idx.iter().zip(&gate.weight) {
+                let y = ov.routed(self.layer_idx as usize, e as usize, x, wj);
+                for (o, &yi) in out.iter_mut().zip(&y) {
+                    *o += yi;
+                }
+            }
+        } else if r1_read() {
             // Light-R1: read the routed experts' whole bins up-front and
             // CONCURRENTLY (off the compute path, at full sequential bandwidth),
             // then compute from the buffers — instead of faulting mmap pages in
@@ -241,7 +267,10 @@ impl MoeLayer {
                 }
             }
         }
-        let s = self.w.shared.forward(x, self.hidden, self.shared_inter);
+        let s = match &self.ov {
+            Some(ov) => ov.shared(self.layer_idx as usize, x),
+            None => self.w.shared.forward(x, self.hidden, self.shared_inter),
+        };
         for (o, &si) in out.iter_mut().zip(&s) {
             *o += si;
         }
@@ -305,11 +334,15 @@ impl MoeLayer {
             if slots.is_empty() {
                 continue;
             }
-            let exp = &self.w.experts[e];
             for &s in slots {
                 let br = (s as usize) / k;
                 let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
-                let y = exp.forward(x, hidden, self.moe_inter);
+                let y = match &self.ov {
+                    // Unscaled expert output (route_w = 1.0); the gate weight is
+                    // applied in the gate-order accumulation pass below.
+                    Some(ov) => ov.routed(self.layer_idx as usize, e, x, 1.0),
+                    None => self.w.experts[e].forward(x, hidden, self.moe_inter),
+                };
                 ey[s as usize * hidden..(s as usize + 1) * hidden].copy_from_slice(&y);
             }
         }
