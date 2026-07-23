@@ -151,6 +151,22 @@ impl UsageStats {
         v.into_iter().map(|(k, _)| k).collect()
     }
 
+    /// The `n` hottest `(layer, expert)` keys whose layer is in `[lo, hi)`,
+    /// most-used first (ties → lower key). Lets a pipeline rank fill its pin
+    /// budget with the experts IT owns, instead of taking the GLOBAL top-`n` and
+    /// discarding the ~(1 − 1/total) that fall outside its slice.
+    pub fn hottest_in_range(&self, lo: usize, hi: usize, n: usize) -> Vec<(u32, u32)> {
+        let mut v: Vec<((u32, u32), u64)> = self
+            .counts
+            .iter()
+            .filter(|(k, _)| (k.0 as usize) >= lo && (k.0 as usize) < hi)
+            .map(|(&k, &c)| (k, c))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(n);
+        v.into_iter().map(|(k, _)| k).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
