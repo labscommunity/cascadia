@@ -2631,6 +2631,13 @@ pub struct PipelineEngine<R: StagedRunner> {
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// Rank-0 KV-prefix index: `(cached prompt prefix tokens, its key)`.
+    /// Insertion-ordered LRU capped at `prefix_cap`, in lockstep with every
+    /// rank's `SliceKvCache`, so a rank-0 index hit is guaranteed still cached on
+    /// all ranks. Unused unless the runner enables prefix caching.
+    prefix_index: Vec<(Vec<u32>, u64)>,
+    prefix_next_key: u64,
+    prefix_cap: usize,
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
@@ -2655,7 +2662,42 @@ impl<R: StagedRunner> PipelineEngine<R> {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            prefix_index: Vec::new(),
+            prefix_next_key: 0,
+            prefix_cap: std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0),
         }
+    }
+
+    /// Longest cached prompt prefix that is a STRICT prefix of `prompt` (length
+    /// `< prompt.len()`, so at least the last token is always prefilled to
+    /// produce logits). Returns `(key, len)`.
+    fn prefix_reuse(&self, prompt: &[u32]) -> Option<(u64, usize)> {
+        let mut best: Option<(u64, usize)> = None;
+        for (toks, key) in &self.prefix_index {
+            let k = toks.len();
+            if k < prompt.len() && prompt[..k] == toks[..] && best.map_or(true, |(_, b)| k > b) {
+                best = Some((*key, k));
+            }
+        }
+        best
+    }
+
+    /// Record `prompt`'s KV under a fresh key (LRU-evicting in lockstep with the
+    /// ranks' `SliceKvCache`). Returns the assigned key.
+    fn prefix_remember(&mut self, prompt: &[u32]) -> u64 {
+        let key = self.prefix_next_key;
+        self.prefix_next_key += 1;
+        if let Some(i) = self.prefix_index.iter().position(|(t, _)| t == prompt) {
+            self.prefix_index.remove(i);
+        }
+        self.prefix_index.push((prompt.to_vec(), key));
+        while self.prefix_index.len() > self.prefix_cap {
+            self.prefix_index.remove(0);
+        }
+        key
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -2843,10 +2885,38 @@ impl<R: StagedRunner> PipelineEngine<R> {
             );
         }
         if self.runner.supports_batched_prefill() && n_prefill > 0 {
-            // One ForwardBatchPrefill for the whole prompt: each rank runs its
-            // slice batched (batch-union MoE), the last rank samples only the
-            // final position — the first generated token.
-            match self.forward_prompt_batch_first(&prompt_ids[..n_prefill], &cfg, &downstream) {
+            // KV-prefix cache (opt-in): restore the longest cached prefix on every
+            // rank, then batch-prefill only the suffix (base = reused length).
+            // Skipping the shared prefix skips re-streaming its experts — ~78% of
+            // decode time on this NVMe-bound workload. `reuse == 0` (disabled or a
+            // miss) is the original full-prefill behaviour.
+            let reuse = if self.runner.prefix_cache_enabled() {
+                match self.prefix_reuse(&prompt_ids[..n_prefill]) {
+                    Some((key, k)) => {
+                        self.runner.restore_prefix(key);
+                        if let Err(e) = self.block_on(send_restore_prefix(&downstream, key)) {
+                            warn!(task = %id, "send_restore_prefix failed: {e}");
+                            return vec![(
+                                id.clone(),
+                                Chunk::error(id, format!("restore_prefix: {e}")),
+                            )];
+                        }
+                        k
+                    }
+                    None => 0,
+                }
+            } else {
+                0
+            };
+            // One ForwardBatchPrefill for the suffix: each rank runs its slice
+            // batched (batch-union MoE) starting at position `reuse`; the last
+            // rank samples only the final position — the first generated token.
+            match self.forward_prompt_batch_first(
+                &prompt_ids[reuse..n_prefill],
+                reuse,
+                &cfg,
+                &downstream,
+            ) {
                 Ok(tok_back) => next = tok_back,
                 Err(e) => {
                     warn!(task = %id, "batched prefill failed: {e}");
@@ -2854,6 +2924,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 }
             }
             pos = n_prefill;
+            // Cache this prompt's full KV on every rank for future reuse.
+            if self.runner.prefix_cache_enabled() {
+                let key = self.prefix_remember(&prompt_ids[..n_prefill]);
+                self.runner.cache_prefix(key);
+                if let Err(e) = self.block_on(send_cache_prefix(&downstream, key)) {
+                    warn!(task = %id, "send_cache_prefix failed: {e}");
+                    return vec![(id.clone(), Chunk::error(id, format!("cache_prefix: {e}")))];
+                }
+            }
         } else {
             for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
                 let sample_back = i + 1 == n_prefill;
@@ -3205,6 +3284,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
     fn forward_prompt_batch_first(
         &mut self,
         prompt: &[u32],
+        base: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<i64, String> {
@@ -3214,12 +3294,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
         for (r, &t) in prompt.iter().enumerate() {
             batch[r * hidden..(r + 1) * hidden].copy_from_slice(&self.runner.embed_token(t));
         }
-        let h = self.runner.forward_layers_batch(batch, 0, rows);
+        // `base` is the KV position the suffix starts at (0 = full prefill; > 0
+        // when a cached prefix was restored). Each rank appends rows at [base, ..).
+        let h = self.runner.forward_layers_batch(batch, base, rows);
         let cfg = cfg.clone();
         self.block_on(async {
             send_forward_batch_prefill(
                 downstream,
-                0,
+                base as u32,
                 rows as u32,
                 &cfg,
                 &h,
