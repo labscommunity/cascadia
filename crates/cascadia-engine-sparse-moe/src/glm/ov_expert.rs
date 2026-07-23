@@ -3,29 +3,39 @@
 //! Runs each routed / shared SwiGLU expert as a compiled OV IR instead of the
 //! Rust int4 mmap kernel. This is the counterpart of [`crate::dsv4::ov_expert`]
 //! for the glm shell — glm decode is NVMe-bound at 744B on a single 32 GB box
-//! (the experts stream from disk), so the OV backend only pays off once the
+//! (the experts stream from disk), so the OV backend can only help once the
 //! model is sharded across ENOUGH nodes that a rank's experts are RAM-resident.
-//! In that regime OV's int4 GEMV is markedly faster than the scalar-dequant Rust
-//! path (dsv4 measured ~4.6x on CPU, ~6x on the iGPU, batch=1, RAM-resident).
+//!
+//! EXPERIMENTAL — measured to lose on the sibling engine. A per-expert OV int4
+//! GEMV is faster than the Rust kernel in a single-expert microbenchmark
+//! (~4.6x CPU / ~6x iGPU, batch=1, RAM-resident), but the dsv4 fleet measured
+//! the END-TO-END distributed path at ~0.6 tok/s vs ~1.05 tok/s for the
+//! optimized Rust kernel — *slower* and fragile (the per-expert compile cache
+//! thrashes once the working set exceeds the LRU cap / RAM). Kept as an opt-in
+//! option; the Rust int4 path is the default and the one to prefer.
 //!
 //! Enabled by `CASCADIA_GLM5_OV_EXPERTS=1`; device from
 //! `CASCADIA_GLM5_OV_DEVICE` (default `GPU`). The per-expert IRs live at
 //! `<model>/experts_ov/layer_NN/expert_EEE/openvino_model.xml` (and
 //! `expert_shared/`), produced by `tools/glm5_expert_ov.py`. When the env is
 //! unset OR the `experts_ov` dir is absent this is `None` and the engine keeps
-//! the Rust int4 mmap path unchanged — entirely opt-in, no-op by default.
+//! the Rust int4 mmap path unchanged — entirely opt-in, no-op by default. A
+//! missing / uncompilable expert IR falls back to the Rust kernel (see `run`)
+//! rather than taking down a serving rank.
 //!
-//! The IR bakes the glm SwiGLU (`down(silu(gate·x) · up·x)`, no clamp). The
-//! routing weight is applied to the output (down is linear, so scaling the
-//! output equals scaling the intermediate) with the same final bf16 rounding as
-//! the Rust `AnyExpert::forward` boundary.
+//! The IR computes the glm SwiGLU (`down(silu(gate·x) · up·x)`, no clamp) and
+//! returns the bf16-rounded expert output. The routing weight is NOT baked in —
+//! the caller applies it in f32 (`out += wj · expert(x)`), matching the Rust
+//! path so prefill (`forward_block`) and decode (`forward_token`) agree.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use cascadia_ov_genai_shim::{DType, PluginConfig, Runtime};
 use lru::LruCache;
+use tracing::warn;
 
 use crate::dsv4::math::to_bf16;
 
@@ -43,6 +53,12 @@ pub struct OvExperts {
     /// across threads); expert calls within a rank are sequential, so the lock
     /// is uncontended.
     cache: Mutex<LruCache<(u32, u32), Runtime>>,
+    /// `(layer, expert)` keys whose IR is missing or won't compile. A partial /
+    /// corrupt `experts_ov/` (e.g. an export killed mid-run) must NOT take down a
+    /// serving rank: the first touch of such an expert falls back to the Rust
+    /// kernel and records the key here so subsequent tokens skip the (failing)
+    /// recompile + re-warn. Warned once per key.
+    failed: Mutex<HashSet<(u32, u32)>>,
 }
 
 impl OvExperts {
@@ -74,6 +90,7 @@ impl OvExperts {
             plugin,
             dim,
             cache: Mutex::new(LruCache::new(cap)),
+            failed: Mutex::new(HashSet::new()),
         })
     }
 
@@ -89,40 +106,80 @@ impl OvExperts {
             .join("openvino_model.xml")
     }
 
-    fn run(&self, lid: u32, eid: u32, x: &[f32], route_w: Option<f32>) -> Vec<f32> {
+    /// Run expert `eid` of layer `lid` on `x`, returning the bf16-rounded output
+    /// (`[dim]`), or `None` if this expert's IR is missing / won't compile / the
+    /// device call fails — the caller then falls back to the Rust kernel. The
+    /// routing weight is NOT baked in: the caller applies it in f32 (matching the
+    /// glm Rust path `out += wj * expert(x)`), so prefill and decode agree.
+    fn run(&self, lid: u32, eid: u32, x: &[f32]) -> Option<Vec<f32>> {
         let key = (lid, eid);
+        if self.failed.lock().unwrap().contains(&key) {
+            return None; // known-bad IR — skip straight to the Rust fallback
+        }
         let t0 = std::time::Instant::now();
         let mut cache = self.cache.lock().expect("OV expert cache lock");
         let miss = !cache.contains(&key);
         if miss {
             let path = self.xml(lid, eid);
-            let p = path.to_str().expect("utf-8 expert path");
-            let rt = Runtime::compile(p, &self.device, &self.plugin)
-                .unwrap_or_else(|e| panic!("compile OV expert {p} on {}: {e}", self.device));
-            cache.put(key, rt);
+            let Some(p) = path.to_str() else {
+                self.mark_failed(key, "non-utf8 IR path");
+                return None;
+            };
+            match Runtime::compile(p, &self.device, &self.plugin) {
+                Ok(rt) => {
+                    cache.put(key, rt);
+                }
+                Err(e) => {
+                    drop(cache);
+                    self.mark_failed(key, &format!("compile on {}: {e}", self.device));
+                    return None;
+                }
+            }
         }
         let rt = cache.get_mut(&key).unwrap();
-        rt.set_input("x", DType::F32, &[1, 1, self.dim], f32_bytes(x))
-            .expect("OV expert set_input");
-        rt.infer().expect("OV expert infer");
-        let (_, _, bytes) = rt.output(0).expect("OV expert output");
-        let w = route_w.unwrap_or(1.0);
+        // A device-side error (set_input/infer/output) is not necessarily
+        // permanent, so fall back for this call without latching the key.
+        if rt
+            .set_input("x", DType::F32, &[1, 1, self.dim], f32_bytes(x))
+            .is_err()
+        {
+            return None;
+        }
+        if rt.infer().is_err() {
+            return None;
+        }
+        let (_, _, bytes) = rt.output(0).ok()?;
         let out = bytes
             .chunks_exact(4)
-            .map(|c| to_bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * w))
+            .map(|c| to_bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
         stats::record(key, miss, t0);
-        out
+        Some(out)
     }
 
-    /// Routed expert `eid` on `x`, scaled by its routing weight `route_w`.
-    pub fn routed(&self, lid: usize, eid: usize, x: &[f32], route_w: f32) -> Vec<f32> {
-        self.run(lid as u32, eid as u32, x, Some(route_w))
+    /// Latch a permanently-bad expert key (missing / uncompilable IR) and warn
+    /// once, so subsequent tokens skip the failing recompile and fall back
+    /// silently to the Rust kernel.
+    fn mark_failed(&self, key: (u32, u32), why: &str) {
+        if self.failed.lock().unwrap().insert(key) {
+            warn!(
+                layer = key.0,
+                expert = key.1,
+                "OV expert IR unusable ({why}); falling back to the Rust int4 kernel for this expert"
+            );
+        }
     }
 
-    /// The always-on shared expert on `x` (unscaled).
-    pub fn shared(&self, lid: usize, x: &[f32]) -> Vec<f32> {
-        self.run(lid as u32, SHARED, x, None)
+    /// Routed expert `eid` on `x` (bf16 output; caller applies the gate weight),
+    /// or `None` to fall back to the Rust kernel.
+    pub fn routed(&self, lid: usize, eid: usize, x: &[f32]) -> Option<Vec<f32>> {
+        self.run(lid as u32, eid as u32, x)
+    }
+
+    /// The always-on shared expert on `x`, or `None` to fall back to the Rust
+    /// kernel.
+    pub fn shared(&self, lid: usize, x: &[f32]) -> Option<Vec<f32>> {
+        self.run(lid as u32, SHARED, x)
     }
 }
 

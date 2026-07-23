@@ -3181,6 +3181,11 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
         }
         let mut chunk = Chunk::final_marker(a.id.clone(), "");
+        // The completion's tokens all rode the streamed token chunks (each
+        // n_tokens=1); the final marker carries none. Set it explicitly to 0 so
+        // an orchestrator summing the per-frame SSE `n_tokens` field (which
+        // renders `n_tokens.unwrap_or(1)`) doesn't count a phantom token here.
+        chunk.n_tokens = Some(0);
         chunk.finish_reason = Some(if a.hit_context_cap {
             FinishReason::Length
         } else {

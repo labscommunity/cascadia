@@ -226,12 +226,18 @@ impl MoeLayer {
         let mut out = vec![0.0f32; self.hidden];
         if let Some(ov) = &self.ov {
             // OpenVINO backend (opt-in): each routed expert runs its compiled OV
-            // IR on the configured device (iGPU / NPU / CPU); `routed` bakes the
-            // gate weight into its output, so accumulate directly.
+            // IR on the configured device (iGPU / NPU / CPU). `routed` returns the
+            // UNSCALED bf16 output (or `None` -> fall back to the Rust kernel for
+            // that expert); the gate weight is applied here in f32, matching the
+            // Rust path's `out += wj * expert(x)` — so prefill and decode agree.
             for (&e, &wj) in gate.idx.iter().zip(&gate.weight) {
-                let y = ov.routed(self.layer_idx as usize, e as usize, x, wj);
+                let y = ov
+                    .routed(self.layer_idx as usize, e as usize, x)
+                    .unwrap_or_else(|| {
+                        self.w.experts[e as usize].forward(x, self.hidden, self.moe_inter)
+                    });
                 for (o, &yi) in out.iter_mut().zip(&y) {
-                    *o += yi;
+                    *o += wj * yi;
                 }
             }
         } else if r1_read() {
@@ -268,7 +274,9 @@ impl MoeLayer {
             }
         }
         let s = match &self.ov {
-            Some(ov) => ov.shared(self.layer_idx as usize, x),
+            Some(ov) => ov
+                .shared(self.layer_idx as usize, x)
+                .unwrap_or_else(|| self.w.shared.forward(x, self.hidden, self.shared_inter)),
             None => self.w.shared.forward(x, self.hidden, self.shared_inter),
         };
         for (o, &si) in out.iter_mut().zip(&s) {
@@ -338,9 +346,12 @@ impl MoeLayer {
                 let br = (s as usize) / k;
                 let x = &xs[(lo + br) * hidden..(lo + br + 1) * hidden];
                 let y = match &self.ov {
-                    // Unscaled expert output (route_w = 1.0); the gate weight is
-                    // applied in the gate-order accumulation pass below.
-                    Some(ov) => ov.routed(self.layer_idx as usize, e, x, 1.0),
+                    // Unscaled expert output; the gate weight is applied in the
+                    // gate-order accumulation pass below (matching forward_token).
+                    // `None` -> fall back to the Rust kernel for this expert.
+                    Some(ov) => ov
+                        .routed(self.layer_idx as usize, e, x)
+                        .unwrap_or_else(|| self.w.experts[e].forward(x, hidden, self.moe_inter)),
                     None => self.w.experts[e].forward(x, hidden, self.moe_inter),
                 };
                 ey[s as usize * hidden..(s as usize + 1) * hidden].copy_from_slice(&y);
@@ -360,7 +371,14 @@ impl MoeLayer {
                     *oo += wj * yi;
                 }
             }
-            let sh = self.w.shared.forward(x, hidden, self.shared_inter);
+            // Shared expert through OV too (or Rust fallback) — mirrors
+            // forward_token so prefill stays bit-identical to per-token decode.
+            let sh = match &self.ov {
+                Some(ov) => ov
+                    .shared(self.layer_idx as usize, x)
+                    .unwrap_or_else(|| self.w.shared.forward(x, hidden, self.shared_inter)),
+                None => self.w.shared.forward(x, hidden, self.shared_inter),
+            };
             for (oo, &si) in o.iter_mut().zip(&sh) {
                 *oo += si;
             }
