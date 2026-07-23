@@ -10,6 +10,7 @@
 use super::attn::AttentionLayer;
 use super::moe::{AnyExpert, MoeLayer};
 use super::mtp::MtpHead;
+use super::prof;
 use crate::dsv4::math::{linear_f32, rmsnorm};
 
 /// The per-layer feed-forward: routed MoE, or a dense SwiGLU (first-k layers).
@@ -83,10 +84,13 @@ impl GlmLayer {
     /// threads the IndexShare top-k selection (full layer writes, shared reads).
     pub fn forward_token(&mut self, x: &[f32], carry: &mut Option<Vec<usize>>) -> Vec<f32> {
         assert_eq!(x.len(), self.hidden);
+        let t_wall = std::time::Instant::now();
         // h = x + attn(rmsnorm(x, in_ln))
         let mut nrm = x.to_vec();
         rmsnorm(&mut nrm, &self.in_ln, self.eps);
+        let t_attn = std::time::Instant::now();
         let a = self.attn.forward_token(&nrm, carry);
+        prof::add(prof::ATTN, t_attn);
         let mut h: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
         // out = h + mlp(rmsnorm(h, post_ln))
         let mut nrm2 = h.clone();
@@ -98,6 +102,7 @@ impl GlmLayer {
         for (hi, &fi) in h.iter_mut().zip(&f) {
             *hi += fi;
         }
+        prof::add(prof::WALL, t_wall);
         h
     }
 
@@ -217,6 +222,7 @@ impl GlmModel {
         for l in &mut self.layers {
             x = l.forward_token(&x, &mut carry);
         }
+        prof::dump("decode");
         rmsnorm(&mut x, &self.final_norm, self.eps);
         let mut logits = vec![0.0f32; self.vocab];
         linear_f32(&x, &self.lm_head, self.vocab, self.hidden, &mut logits);

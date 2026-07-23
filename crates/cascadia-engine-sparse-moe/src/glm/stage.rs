@@ -346,6 +346,9 @@ impl StagedRunner for GlmRunner {
             }
         }
         self.pos += 1;
+        // Per-token decode profile (no-op unless CASCADIA_GLM5_PROFILE is set);
+        // in the pipeline each rank dumps its own layer-slice split.
+        super::prof::dump("decode");
         x
     }
     fn forward_layers_batch(&mut self, hidden: Vec<f32>, base: usize, rows: usize) -> Vec<f32> {
