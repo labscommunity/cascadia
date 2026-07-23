@@ -68,9 +68,7 @@ fn main() {
         .filter(|v| !v.trim().is_empty());
 
     let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .std("c++17");
+    build.cpp(true).std("c++17");
     // gemv_offload.cpp uses AVX2/FMA + AVX-VNNI intrinsics behind a runtime
     // guard; GCC/Clang additionally need the target flags at COMPILE time
     // (MSVC compiles intrinsics without arch flags). GCC >= 11 for -mavxvnni.
@@ -101,7 +99,10 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=openvino");
     // Windows SDKs ship tbb12.lib; Linux OV archives ship libtbb.so.12
     // (linker name `tbb`).
-    if std::env::var("TARGET").unwrap_or_default().contains("windows") {
+    if std::env::var("TARGET")
+        .unwrap_or_default()
+        .contains("windows")
+    {
         println!("cargo:rustc-link-lib=dylib=tbb12");
     } else {
         println!("cargo:rustc-link-lib=dylib=tbb");

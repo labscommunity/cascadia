@@ -2798,9 +2798,7 @@ impl Builder for OvRuntimeBuilder {
                     &import_plugin(&pplugin),
                 )
                 .map_err(map_ov_err)
-                .map_err(|e| {
-                    EngineError::Backend(format!("prefill blob import on {pdev}: {e}"))
-                })?
+                .map_err(|e| EngineError::Backend(format!("prefill blob import on {pdev}: {e}")))?
             } else {
                 OvRuntime::compile(&pxml, &pdev, &pplugin)
                     .map_err(map_ov_err)
