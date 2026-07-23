@@ -23,6 +23,7 @@ pub mod ffn;
 pub mod gate;
 pub mod grammar;
 pub mod indexer;
+pub mod kv_cache;
 pub mod loader;
 pub mod model;
 pub mod moe;
