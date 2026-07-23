@@ -119,3 +119,75 @@ async fn glm5_batched_prefill_pipeline_matches_single_process() {
         assert_eq!(argmax(&got), want_tok, "M={m}: first-token argmax mismatch");
     }
 }
+
+/// Drive the `m` ranks as one batched prefill of `prompt` at KV `base`, passing
+/// the hidden between ranks directly (the wire moves the same bytes — verified
+/// by the test above — so this isolates the per-rank KV/base behaviour).
+fn drive_prefill(ranks: &mut [GlmRunner], prompt: &[u32], base: usize) -> Vec<f32> {
+    let rows = prompt.len();
+    let hsz = ranks[0].hidden_size();
+    let mut batch = vec![0.0f32; rows * hsz];
+    for (r, &t) in prompt.iter().enumerate() {
+        batch[r * hsz..(r + 1) * hsz].copy_from_slice(&ranks[0].embed_token(t));
+    }
+    let mut h = ranks[0].forward_layers_batch(batch, base, rows);
+    for i in 1..ranks.len() {
+        h = ranks[i].forward_layers_batch(h, base, rows);
+    }
+    let last = (rows - 1) * hsz;
+    ranks[ranks.len() - 1].head_logits(&h[last..last + hsz])
+}
+
+/// Distributed KV-prefix cache parity: caching a base prompt's KV on every rank,
+/// restoring it, and prefilling only the SUFFIX (base = base-len) is
+/// bit-identical to a full prefill of the whole prompt across the same ranks —
+/// for 1/2/4-way shards. This is the correctness core of the distributed prefix
+/// cache (`cache_prefix`/`restore_prefix` per rank + `base` suffill).
+#[test]
+fn glm5_prefix_cache_pipeline_matches_full() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
+    if !dir.join("manifest.json").exists() {
+        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
+        return;
+    }
+    std::env::set_var("CASCADIA_GLM5_PREFIX_CACHE", "4");
+    let base: Vec<u32> = vec![1, 2, 3];
+    let ext: Vec<u32> = vec![1, 2, 3, 4, 5, 6]; // `base` is a prefix of `ext`
+    let max_seq = 32usize;
+    const KEY: u64 = 42;
+
+    for m in [1usize, 2, 4] {
+        let mut ranks: Vec<GlmRunner> = (0..m)
+            .map(|r| GlmRunner::load_staged(&dir, max_seq, r as u32, m as u32, 0, 0).expect("load"))
+            .collect();
+        assert!(ranks[0].prefix_cache_enabled(), "prefix cache enabled by env");
+
+        // Reference: full prefill of `ext`.
+        for r in &mut ranks {
+            r.reset();
+        }
+        let want = drive_prefill(&mut ranks, &ext, 0);
+
+        // Cached: prefill `base`, cache each rank's slice; reset; restore each
+        // rank; prefill the suffix at base = base.len().
+        for r in &mut ranks {
+            r.reset();
+        }
+        let _ = drive_prefill(&mut ranks, &base, 0);
+        for r in &mut ranks {
+            r.cache_prefix(KEY);
+        }
+        for r in &mut ranks {
+            r.reset();
+        }
+        for r in &mut ranks {
+            assert_eq!(r.restore_prefix(KEY), Some(base.len()), "M={m}: restored length");
+        }
+        let got = drive_prefill(&mut ranks, &ext[base.len()..], base.len());
+
+        assert_eq!(
+            got, want,
+            "M={m}: distributed prefix-cache reuse diverged from full prefill"
+        );
+    }
+}
