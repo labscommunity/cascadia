@@ -162,9 +162,21 @@ impl GlmRunner {
         let usage_path = dir.join(".coli_usage");
         let _ = usage.lock().unwrap().load(&usage_path);
 
+        // Optional OpenVINO expert backend (iGPU / NPU / CPU), shared across this
+        // rank's MoE layers. `Some` only when `CASCADIA_GLM5_OV_EXPERTS=1` and the
+        // model ships an `experts_ov/` dir; otherwise every layer keeps the Rust
+        // int4 path. Built once and Arc-shared so all layers share one LRU of
+        // compiled IRs. Worth enabling only once a rank's experts are RAM-resident
+        // (shard wide enough) — on a disk-streaming rank it just moves the same
+        // NVMe wait onto the accelerator.
+        let ov = super::ov_expert::OvExperts::from_env(dir, m.hidden_size).map(Arc::new);
+
         for (i, layer) in s.layers.iter_mut().enumerate() {
             if let Some(ml) = layer.moe_mut() {
                 ml.attach_usage((lo + i) as u32, Arc::clone(&usage));
+                if let Some(ov) = &ov {
+                    ml.attach_ov(Arc::clone(ov));
+                }
             }
         }
 
