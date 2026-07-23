@@ -11,6 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::attn::AttnKv;
+use super::kv_cache::SliceKvCache;
 use super::loader::{load_stage, read_manifest};
 use super::model::GlmLayer;
 use super::moe::AnyExpert;
@@ -81,6 +83,9 @@ pub struct GlmRunner {
     usage_path: PathBuf,
     /// Router-lookahead prefetch enabled (CASCADIA_GLM5_PREFETCH).
     prefetch: bool,
+    /// Per-rank KV-prefix cache of this rank's layer slice, keyed by a prefix key
+    /// rank 0 assigns. Disabled (cap 0) unless `CASCADIA_GLM5_PREFIX_CACHE` is set.
+    prefix_cache: SliceKvCache,
 }
 
 impl GlmRunner {
@@ -223,6 +228,12 @@ impl GlmRunner {
             usage,
             usage_path,
             prefetch: std::env::var("CASCADIA_GLM5_PREFETCH").is_ok(),
+            prefix_cache: SliceKvCache::new(
+                std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0),
+            ),
         })
     }
 
@@ -287,6 +298,42 @@ impl Drop for GlmRunner {
         if has_history {
             let _ = self.save_usage();
         }
+    }
+}
+
+impl GlmRunner {
+    /// Snapshot this rank's layer-slice KV (`[0, pos)`) for prefix caching.
+    fn snapshot_slice(&self) -> Vec<AttnKv> {
+        self.layers.iter().map(|l| l.snapshot_kv()).collect()
+    }
+
+    /// Whether the per-rank prefix cache is on (`CASCADIA_GLM5_PREFIX_CACHE`).
+    pub fn prefix_cache_enabled(&self) -> bool {
+        self.prefix_cache.enabled()
+    }
+
+    /// Cache this rank's current KV under `key` for later prefix reuse (no-op
+    /// when the cache is disabled).
+    pub fn cache_prefix(&mut self, key: u64) {
+        if self.prefix_cache.enabled() {
+            let snap = self.snapshot_slice();
+            self.prefix_cache.insert(key, snap);
+        }
+    }
+
+    /// Restore this rank's cached KV for `key`; the restored length becomes
+    /// `pos`, so the caller continues prefill/decode from there. Returns the
+    /// length, or `None` on a miss (caller prefills from position 0). Must be
+    /// called after [`StagedRunner::reset`].
+    pub fn restore_prefix(&mut self, key: u64) -> Option<usize> {
+        let snap = self.prefix_cache.take(key)?;
+        let len = snap.first().map(AttnKv::len).unwrap_or(0);
+        for (l, kv) in self.layers.iter_mut().zip(&snap) {
+            l.restore_kv(kv);
+        }
+        self.prefix_cache.insert(key, snap); // refresh to MRU
+        self.pos = len;
+        Some(len)
     }
 }
 

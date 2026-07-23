@@ -98,6 +98,29 @@ pub struct AttnKv {
     ic: Option<Vec<f32>>, // len * index_head_dim, if this layer has an indexer
 }
 
+impl AttnKv {
+    /// Number of cached positions this snapshot covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A placeholder snapshot of the given length with no cache payload — for
+    /// cache-bookkeeping tests only (not a restorable KV).
+    #[doc(hidden)]
+    pub fn empty(len: usize) -> Self {
+        Self {
+            len,
+            lc: Vec::new(),
+            rc: Vec::new(),
+            ic: None,
+        }
+    }
+}
+
 impl AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
