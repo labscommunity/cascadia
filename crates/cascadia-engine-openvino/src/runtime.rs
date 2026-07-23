@@ -622,11 +622,11 @@ fn npu_aot_blob(xml_path: &std::path::Path, device: &str) -> Option<std::path::P
     // Refuse a blob older than its IR: silently serving a stale compile's
     // weights is the worst failure mode. The fallthrough recompiles (slow,
     // and on small-RAM boxes possibly OOM) — but loudly and correctly.
-    if let (Ok(bm), Ok(xm)) = (
+    match (
         blob.metadata().and_then(|m| m.modified()),
         xml_path.metadata().and_then(|m| m.modified()),
     ) {
-        if bm < xm {
+        (Ok(bm), Ok(xm)) if bm < xm => {
             tracing::error!(
                 blob = %blob.display(),
                 "AOT blob is OLDER than its IR — ignoring it (re-export or delete \
@@ -634,6 +634,17 @@ fn npu_aot_blob(xml_path: &std::path::Path, device: &str) -> Option<std::path::P
             );
             return None;
         }
+        (Ok(_), Ok(_)) => {}
+        // Could not read both mtimes (unsupported FS, a TOCTOU delete after the
+        // exists() check, permissions): the freshness guard cannot run. Import
+        // the blob rather than force a needless recompile, but do NOT do it
+        // silently — an unverified stale blob imports and infers wrong tokens
+        // at a clean 200 OK, exactly the failure mode the guard exists to catch.
+        _ => tracing::warn!(
+            blob = %blob.display(),
+            "AOT blob freshness could not be verified (IR/blob mtime unavailable); \
+             importing it unchecked — validate the blob with a real inference at deploy"
+        ),
     }
     Some(blob)
 }
@@ -3277,6 +3288,31 @@ mod tests {
         // Non-NPU devices always compile.
         assert_eq!(npu_aot_blob(&xml, "CPU"), None);
         assert_eq!(npu_aot_blob(&xml, "GPU"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A blob older than its IR is refused (fall back to a fresh compile):
+    /// serving a stale compile's weights is the "worst failure mode" the guard
+    /// exists to prevent. The happy-path test above never makes the blob older,
+    /// so this pins the `bm < xm` branch specifically.
+    #[test]
+    fn npu_aot_blob_rejects_blob_older_than_ir() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("aot-blob-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("openvino_model.xml");
+        let blob = dir.join("openvino_model.blob");
+        std::fs::write(&xml, "x").unwrap();
+        std::fs::write(&blob, "b").unwrap();
+        // Backdate the blob 60 s behind the IR it claims to be a compile of.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(npu_aot_blob(&xml, "NPU"), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
