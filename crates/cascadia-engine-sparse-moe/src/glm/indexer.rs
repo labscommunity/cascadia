@@ -110,6 +110,18 @@ impl Indexer {
         self.len = len;
     }
 
+    /// Snapshot the cached index keys (`[0, len)`) for prefix caching.
+    pub fn snapshot(&self) -> Vec<f32> {
+        self.ic[..self.len * self.hd].to_vec()
+    }
+
+    /// Restore snapshotted index keys and set the cached length. Slots past `len`
+    /// are stale but never read (scoring only touches `[0, query_pos]`).
+    pub fn restore(&mut self, len: usize, ic: &[f32]) {
+        self.len = len;
+        self.ic[..ic.len()].copy_from_slice(ic);
+    }
+
     /// Number of cached keys.
     pub fn len(&self) -> usize {
         self.len

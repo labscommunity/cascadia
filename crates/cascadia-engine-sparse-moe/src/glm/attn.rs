@@ -86,6 +86,18 @@ pub struct AttentionLayer {
     is_shared: bool,
 }
 
+/// A saved KV snapshot for prefix reuse — the first `len` cached positions of
+/// one attention layer (MLA latent + rope caches, and the DSA indexer keys when
+/// present). Restoring it into a freshly-`reset` layer lets a request skip
+/// re-prefilling a shared prompt prefix. Snapshot and layer must share dims
+/// (same model / rank).
+pub struct AttnKv {
+    len: usize,
+    lc: Vec<f32>,         // len * kv_lora
+    rc: Vec<f32>,         // len * qk_rope
+    ic: Option<Vec<f32>>, // len * index_head_dim, if this layer has an indexer
+}
+
 impl AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -174,6 +186,30 @@ impl AttentionLayer {
         self.len = len;
         if let Some(ix) = self.indexer.as_mut() {
             ix.truncate(len);
+        }
+    }
+
+    /// Snapshot this layer's KV (`[0, len)`) for prefix caching — copies out the
+    /// latent/rope caches and the indexer keys.
+    pub fn snapshot(&self) -> AttnKv {
+        let n = self.len;
+        AttnKv {
+            len: n,
+            lc: self.lc[..n * self.kv_lora].to_vec(),
+            rc: self.rc[..n * self.qk_rope].to_vec(),
+            ic: self.indexer.as_ref().map(|ix| ix.snapshot()),
+        }
+    }
+
+    /// Restore a KV snapshot, replacing the current cache and length. Call after
+    /// [`Self::reset`]; the cache tail past `kv.len` is stale but never read
+    /// (attention only touches `[0, len)`), matching [`Self::truncate`].
+    pub fn restore(&mut self, kv: &AttnKv) {
+        self.len = kv.len;
+        self.lc[..kv.lc.len()].copy_from_slice(&kv.lc);
+        self.rc[..kv.rc.len()].copy_from_slice(&kv.rc);
+        if let (Some(ix), Some(ic)) = (self.indexer.as_mut(), kv.ic.as_ref()) {
+            ix.restore(kv.len, ic);
         }
     }
 

@@ -125,3 +125,36 @@ fn model_prefill_bit_exact_vs_per_token() {
 
     assert_eq!(prefilled, per_token, "prefill last-position logits diverge from per-token");
 }
+
+/// KV-prefix cache parity: snapshotting the first `k` tokens' KV, restoring it
+/// into a reset model, and prefilling only the suffix must be BIT-IDENTICAL to a
+/// full prefill of the whole prompt — both the last-position logits and a
+/// following decode step. This is the correctness core of prefix caching (skip
+/// re-prefilling a shared prompt prefix); the per-rank/cross-rank plumbing is
+/// built on top of it.
+#[test]
+fn prefix_snapshot_restore_bit_exact_vs_full() {
+    let fx = fixtures!();
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+    let k = 2usize; // cached prefix length
+    let mut model = build_model(&fx, prompt.len() + 2);
+
+    // Full: prefill the whole prompt, then one fixed decode step at position N.
+    model.reset();
+    let full = model.prefill(&prompt);
+    let full_step = model.forward_token(9);
+
+    // Cached: prefill the prefix, snapshot; reset; restore; prefill the suffix;
+    // then the same decode step. The restored KV makes the suffix's attention
+    // see the same [0, k) keys, so every downstream logit must match exactly.
+    model.reset();
+    let _ = model.prefill(&prompt[..k]);
+    let snap = model.snapshot_prefix();
+    model.reset();
+    model.restore_prefix(&snap);
+    let reuse = model.prefill(&prompt[k..]);
+    let reuse_step = model.forward_token(9);
+
+    assert_eq!(reuse, full, "prefix-cache prefill logits diverge from full prefill");
+    assert_eq!(reuse_step, full_step, "decode after prefix restore diverges from full");
+}
