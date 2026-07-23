@@ -63,3 +63,108 @@ impl KvPrefixCache {
         self.entries.is_empty()
     }
 }
+
+/// Per-rank slice KV cache for the distributed (pipeline) path — keyed by a
+/// `u64` prefix key that rank 0 assigns (a hash of the prompt prefix) so every
+/// rank caches/restores the same prefix in lockstep. Stores this rank's
+/// layer-slice KV snapshot. LRU-bounded; `cap == 0` disables it (always misses).
+pub struct SliceKvCache {
+    entries: Vec<(u64, Vec<AttnKv>)>,
+    cap: usize,
+}
+
+impl SliceKvCache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Whether caching is on (`cap > 0`).
+    pub fn enabled(&self) -> bool {
+        self.cap > 0
+    }
+
+    /// This rank's cached slice snapshot for `key`, if present.
+    pub fn get(&self, key: u64) -> Option<&Vec<AttnKv>> {
+        self.entries.iter().find(|(k, _)| *k == key).map(|(_, s)| s)
+    }
+
+    /// Remove and return the snapshot for `key` (lets the caller restore without
+    /// holding a borrow of the cache, then re-`insert`).
+    pub fn take(&mut self, key: u64) -> Option<Vec<AttnKv>> {
+        self.entries
+            .iter()
+            .position(|(k, _)| *k == key)
+            .map(|i| self.entries.remove(i).1)
+    }
+
+    /// Insert (or refresh to MRU) the snapshot for `key`. Evicts the LRU entry
+    /// over capacity; a no-op store when `cap == 0`.
+    pub fn insert(&mut self, key: u64, snap: Vec<AttnKv>) {
+        if let Some(i) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(i);
+        }
+        self.entries.push((key, snap));
+        while self.entries.len() > self.cap {
+            self.entries.remove(0);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv(len: usize) -> Vec<AttnKv> {
+        // A one-layer snapshot is enough to exercise the cache bookkeeping.
+        vec![AttnKv::empty(len)]
+    }
+
+    #[test]
+    fn slice_cache_get_take_lru() {
+        let mut c = SliceKvCache::new(2);
+        assert!(c.get(1).is_none());
+        c.insert(1, kv(3));
+        c.insert(2, kv(4));
+        assert_eq!(c.get(1).unwrap()[0].len(), 3);
+        // exceed cap -> evict LRU (key 1)
+        c.insert(3, kv(5));
+        assert!(c.get(1).is_none(), "key 1 should be evicted");
+        assert!(c.get(2).is_some() && c.get(3).is_some());
+        // take removes
+        let t = c.take(2).unwrap();
+        assert_eq!(t[0].len(), 4);
+        assert!(c.get(2).is_none());
+    }
+
+    #[test]
+    fn slice_cache_disabled_when_cap_zero() {
+        let mut c = SliceKvCache::new(0);
+        assert!(!c.enabled());
+        c.insert(1, kv(3));
+        assert!(c.get(1).is_none(), "cap 0 stores nothing");
+    }
+
+    #[test]
+    fn prefix_cache_longest_match() {
+        let mut c = KvPrefixCache::new(4);
+        c.insert(vec![1, 2, 3], Vec::new());
+        c.insert(vec![1, 2], Vec::new());
+        // longest prefix of [1,2,3,4] is [1,2,3]
+        assert_eq!(c.longest_prefix(&[1, 2, 3, 4]).unwrap().0, 3);
+        // [1,2,9] only matches [1,2]
+        assert_eq!(c.longest_prefix(&[1, 2, 9]).unwrap().0, 2);
+        // [5,6] matches nothing
+        assert!(c.longest_prefix(&[5, 6]).is_none());
+    }
+}
