@@ -95,6 +95,13 @@ impl MmapExpert {
         std::fs::read(&self.path)
     }
 
+    /// On-disk size of this expert's int4 bin, i.e. the bytes streamed for it at
+    /// 0% cache hit. Used by the decode profiler's residency accounting.
+    #[inline]
+    pub fn bin_len(&self) -> usize {
+        self.mmap.len()
+    }
+
     /// SwiGLU FFN over an explicitly-read byte buffer (the R1 path). Mirrors
     /// `crate::glm::ffn::swiglu_mmap` exactly, but reads weights from `data`
     /// (whole-expert buffer) rather than the mmap.

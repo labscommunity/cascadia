@@ -75,6 +75,16 @@ impl AnyExpert {
         }
     }
 
+    /// On-disk int4 bytes this expert streams at 0% cache hit. Only the `Mmap`
+    /// variant touches the disk; eager/bf16 experts are already resident, so 0.
+    #[inline]
+    pub fn int4_bytes(&self) -> usize {
+        match self {
+            AnyExpert::Mmap(m) => m.bin_len(),
+            _ => 0,
+        }
+    }
+
     /// `madvise(WILLNEED)` hint (mmap experts only; no-op otherwise).
     #[inline]
     pub fn prefetch(&self) {
@@ -220,6 +230,19 @@ impl MoeLayer {
             }
         }
         prof::add(prof::ROUTER, t_router);
+
+        // Decode-profiler residency accounting: the 0%-hit streaming baseline
+        // (on-disk int4 bytes) for this layer's routed + shared experts, plus
+        // the cross-token reuse set. Branch-independent — counts what WOULD be
+        // read regardless of which compute path runs. No-op unless
+        // CASCADIA_GLM5_PROFILE is set.
+        if prof::enabled() {
+            for &e in &gate.idx {
+                prof::note_selection(self.layer_idx, e);
+                prof::note_expert_bytes(self.w.experts[e as usize].int4_bytes());
+            }
+            prof::note_expert_bytes(self.w.shared.int4_bytes());
+        }
 
         // routed experts in gate order, then the shared expert.
         let t_exp = std::time::Instant::now();
