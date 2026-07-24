@@ -157,8 +157,15 @@ pub struct GlmRunner {
     usage: Arc<Mutex<UsageStats>>,
     /// Where [`Self::save_usage`] persists the histogram (`<dir>/.coli_usage`).
     usage_path: PathBuf,
-    /// Router-lookahead prefetch enabled (CASCADIA_GLM5_PREFETCH).
+    /// Router-lookahead prefetch enabled (CASCADIA_GLM5_PREFETCH) — histogram
+    /// (learned-pin) prediction of the next layer's experts.
     prefetch: bool,
+    /// Async lookahead prefetch (CASCADIA_GLM5_LOOKAHEAD): a background thread
+    /// does REAL cross-layer reads of the predicted, non-resident experts
+    /// (warming the OS page cache) so demand faults hit the cache. Predicts via
+    /// the next layer's own router on an attention-free proxy. `Some` only on an
+    /// mmap-expert rank with the env set. Takes precedence over `prefetch`.
+    lookahead: Option<super::lookahead::Lookahead>,
     /// Per-rank KV-prefix cache of this rank's layer slice, keyed by a prefix key
     /// rank 0 assigns. Disabled (cap 0) unless `CASCADIA_GLM5_PREFIX_CACHE` is set.
     prefix_cache: SliceKvCache,
@@ -272,6 +279,25 @@ impl GlmRunner {
         }
 
         if mode == ExpertsMode::Mmap {
+            // Windows caps VirtualLock'd pages at the process minimum working set,
+            // which defaults to a few MB — so raise it to cover everything we pin
+            // (always-active + hot experts) before pinning, or every pin fails and
+            // nothing stays resident. Sized from the pin budget and a sampled
+            // expert size; capped at ~80% of available RAM. No-op off Windows.
+            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq, bf16_head, bf16_kv);
+            let per_expert = s
+                .layers
+                .iter()
+                .find_map(|l| l.moe())
+                .and_then(|ml| ml.experts().first())
+                .and_then(AnyExpert::as_mmap)
+                .map(|mm| mm.bin_len())
+                .unwrap_or(19 * 1024 * 1024);
+            let owned = (lo..hi).count();
+            let want = (budget + owned * 4 + 16).saturating_mul(per_expert);
+            let cap = (residency::mem_available() as usize / 5) * 4;
+            crate::dsv4::expert_mmap::reserve_lockable(want.min(cap));
+
             // Always-active residency: the shared expert (fires every token) and
             // the dense-layer MLPs (first_k_dense_replace) are read on EVERY
             // forward, so under the routed-expert churn their pages get evicted
@@ -299,7 +325,6 @@ impl GlmRunner {
                 }
             }
 
-            let budget = Self::pin_budget(&m, lo, hi, first, last, max_seq, bf16_head, bf16_kv);
             let (total, hot) = {
                 let u = usage.lock().unwrap();
                 (
@@ -328,6 +353,22 @@ impl GlmRunner {
             }
         }
 
+        // Async lookahead: build the per-layer expert-bin table (local index -> routed
+        // bin paths) and spawn the background lookahead worker. Only on the mmap path
+        // (streamed experts); eager/bf16 have nothing to warm.
+        let lookahead =
+            if mode == ExpertsMode::Mmap && std::env::var_os("CASCADIA_GLM5_LOOKAHEAD").is_some() {
+                let table: super::lookahead::LookaheadTable = s
+                    .layers
+                    .iter()
+                    .map(|l| l.moe().map(|ml| ml.expert_bins()))
+                    .collect();
+                eprintln!("[glm5] rank {rank}: lookahead prefetch thread started");
+                Some(super::lookahead::Lookahead::new(table))
+            } else {
+                None
+            };
+
         Ok(Self {
             embed: embed_tab,
             layers: s.layers,
@@ -343,6 +384,7 @@ impl GlmRunner {
             usage,
             usage_path,
             prefetch: std::env::var("CASCADIA_GLM5_PREFETCH").is_ok(),
+            lookahead,
             prefix_cache: SliceKvCache::new(
                 std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
                     .ok()
@@ -507,7 +549,26 @@ impl StagedRunner for GlmRunner {
         // output is identical whether or not it fires.
         let n = self.layers.len();
         for i in 0..n {
-            if self.prefetch && i + 1 < n {
+            if let Some(lookahead) = &self.lookahead {
+                // Async lookahead: mark the current layer, compute it, then
+                // predict layer i+1's experts (its router on an attention-free
+                // proxy of i's output) and enqueue the non-resident ones for the
+                // background worker to warm. Hint-free, output-identical.
+                lookahead.set_cur_layer(i);
+                x = self.layers[i].forward_token(&x, &mut carry);
+                if i + 1 < n {
+                    let next = &self.layers[i + 1];
+                    if let Some(m) = next.moe() {
+                        let mut proxy = x.clone();
+                        rmsnorm(&mut proxy, next.post_ln(), next.eps);
+                        for e in m.predict_experts(&proxy) {
+                            if m.expert_cold(e) {
+                                lookahead.enqueue(i + 1, e);
+                            }
+                        }
+                    }
+                }
+            } else if self.prefetch && i + 1 < n {
                 let (head, tail) = self.layers.split_at_mut(i + 1);
                 if let Some(m) = tail[0].moe() {
                     m.prefetch_hot(PREFETCH_EXPERTS);

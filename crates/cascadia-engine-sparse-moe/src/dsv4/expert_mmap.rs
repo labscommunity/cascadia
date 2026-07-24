@@ -59,6 +59,52 @@ mod winmem {
         /// `BOOL QueryWorkingSetEx(HANDLE, PVOID buffer, DWORD size)` — fills the
         /// `virtual_attributes` of each entry; bit 0 (`Valid`) = page resident.
         pub fn QueryWorkingSetEx(process: isize, buffer: *mut c_void, size: u32) -> i32;
+        /// `BOOL SetProcessWorkingSetSizeEx(HANDLE, SIZE_T min, SIZE_T max, DWORD flags)`
+        /// — sets the working-set quota. The lockable-page count is bounded by the
+        /// minimum, so this must raise it before large `VirtualLock`s.
+        pub fn SetProcessWorkingSetSizeEx(
+            process: isize,
+            min: usize,
+            max: usize,
+            flags: u32,
+        ) -> i32;
+    }
+
+    /// `QUOTA_LIMITS_HARDWS_MIN_ENABLE` — enforce the minimum working set (so the
+    /// locked pages actually get the quota).
+    pub const QUOTA_LIMITS_HARDWS_MIN_ENABLE: u32 = 0x0000_0001;
+}
+
+/// Raise this process's minimum working set so `VirtualLock` can pin up to
+/// `bytes` of pages. Windows caps lockable pages at (minimum working set −
+/// overhead), which defaults to a few MB, so without this every large expert pin
+/// fails with `ERROR_WORKING_SET_QUOTA` and nothing stays resident. No-op off
+/// Windows. Best-effort: logs on failure, callers still fall back to page cache.
+pub fn reserve_lockable(bytes: usize) {
+    #[cfg(windows)]
+    {
+        let min = bytes.saturating_add(32 * 1024 * 1024); // overhead margin
+        let max = min.saturating_add(min / 4);
+        // SAFETY: pseudo-handle from GetCurrentProcess; the call only adjusts this
+        // process's own working-set quota.
+        let ok = unsafe {
+            winmem::SetProcessWorkingSetSizeEx(
+                winmem::GetCurrentProcess(),
+                min,
+                max,
+                winmem::QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+            )
+        };
+        if ok == 0 {
+            eprintln!(
+                "[glm5] SetProcessWorkingSetSizeEx({min}) failed: {} — hot-expert pins may not stick",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = bytes;
     }
 }
 
@@ -111,6 +157,12 @@ impl MmapExpert {
     #[inline]
     pub fn bin_len(&self) -> usize {
         self.mmap.len()
+    }
+
+    /// This expert's on-disk int4 bin path — for the lookahead prefetch worker to
+    /// warm its pages into the OS cache off the compute thread.
+    pub fn bin_path(&self) -> &Path {
+        &self.path
     }
 
     /// Estimate how many of this expert's mapped pages are resident in RAM right

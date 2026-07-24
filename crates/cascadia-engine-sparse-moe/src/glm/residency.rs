@@ -32,8 +32,10 @@ pub const AUTOPIN_MIN_SELECTIONS: u64 = 5_000;
 /// AUTOPIN confidence reaches 1.0 at this many selections.
 pub const AUTOPIN_FULL_SELECTIONS: f64 = 200_000.0;
 
-/// MemAvailable in bytes. Linux reads `/proc/meminfo`; other platforms (and an
-/// unreadable file) fall back to a conservative 8 GB.
+/// Available physical memory in bytes. Linux reads `/proc/meminfo`; Windows
+/// calls `GlobalMemoryStatusEx`; anything else (or a query failure) falls back
+/// to a conservative 8 GB. The autopin budget is sized from this, so on the
+/// 32 GB fleet the Windows path is what lets a rank pin its hot experts.
 pub fn mem_available() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -47,6 +49,31 @@ pub fn mem_available() -> u64 {
                     }
                 }
             }
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        // SAFETY: `ms` is a valid, zeroed MEMORYSTATUSEX with `length` set to its
+        // own size, as the API requires; the call only writes into it.
+        let mut ms: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        ms.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut ms) } != 0 {
+            return ms.avail_phys;
         }
     }
     8_000_000_000

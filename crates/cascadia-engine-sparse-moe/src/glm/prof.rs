@@ -25,7 +25,7 @@
 //! whole-run total). In the pipeline each rank profiles its OWN layer slice, so
 //! read the split — and the hit % — per rank.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -59,6 +59,37 @@ static SELECTIONS: AtomicU64 = AtomicU64::new(0);
 /// consecutive tokens' `(layer,expert)` sets — a running Jaccard of expert reuse.
 static OVL_INTER: AtomicU64 = AtomicU64::new(0);
 static OVL_UNION: AtomicU64 = AtomicU64::new(0);
+
+// --- LOOKAHEAD recall counters (measurement spike; gated by `enabled()`) ----------
+/// Routed selections this rank made that a next-layer LOOKAHEAD prediction had
+/// already named (the hits), over all selections whose layer WAS predicted (the
+/// total). recall = LOOKAHEAD_HIT / LOOKAHEAD_TOTAL — how often predicting layer L+1's
+/// experts from `rmsnorm(out_L, post_ln_{L+1})` (attention-free proxy) names the
+/// experts L+1 actually fires. This is the number that gates whether real-router
+/// prefetch can convert misses to hits at all on this workload.
+static LOOKAHEAD_HIT: AtomicU64 = AtomicU64::new(0);
+static LOOKAHEAD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-token `layer -> predicted routed-expert set`, keyed by the layer's GLOBAL
+/// index (same key `note_selection` uses), so a prediction issued for layer L+1
+/// during layer L's step is matched when L+1 actually selects. Cleared each token
+/// in [`roll_token`].
+fn predicted() -> &'static Mutex<HashMap<u32, HashSet<u32>>> {
+    static S: OnceLock<Mutex<HashMap<u32, HashSet<u32>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record LOOKAHEAD's predicted routed-expert set for `layer` (global index) this
+/// token (no-op when disabled). Called from the prefetch site before `layer`
+/// computes; matched against the real selections in [`note_selection`].
+pub fn note_predicted(layer: u32, experts: &[u32]) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut m) = predicted().lock() {
+        m.insert(layer, experts.iter().copied().collect());
+    }
+}
 
 /// This token's routed `(layer,expert)` set (key = `layer<<32 | expert`), rolled
 /// into `PREV_SET` at each dump to measure cross-token reuse.
@@ -116,6 +147,16 @@ pub fn note_selection(layer: u32, expert: u32) {
     if let Ok(mut s) = cur_set().lock() {
         s.insert(((layer as u64) << 32) | expert as u64);
     }
+    // LOOKAHEAD recall: only score layers that carried a prediction this token, so a
+    // baseline run (no LOOKAHEAD) leaves both counters at 0 (recall=n/a).
+    if let Ok(p) = predicted().lock() {
+        if let Some(set) = p.get(&layer) {
+            LOOKAHEAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+            if set.contains(&expert) {
+                LOOKAHEAD_HIT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Roll this token's routed set into the reuse accumulators. Called once per
@@ -127,6 +168,10 @@ fn roll_token() {
         OVL_INTER.fetch_add(inter, Ordering::Relaxed);
         OVL_UNION.fetch_add(uni, Ordering::Relaxed);
         *p = std::mem::take(&mut *c); // prev <- cur, cur <- empty
+    }
+    // Predictions are per-token; drop them so next token starts clean.
+    if let Ok(mut m) = predicted().lock() {
+        m.clear();
     }
     TOKENS.fetch_add(1, Ordering::Relaxed);
 }
@@ -191,4 +236,13 @@ pub fn dump(tag: &str) {
         100.0 * inter as f64 / union as f64,
         toks,
     );
+    // Lookahead recall (only meaningful under CASCADIA_GLM5_LOOKAHEAD; n/a otherwise).
+    let ph = LOOKAHEAD_HIT.load(Ordering::Relaxed);
+    let pt = LOOKAHEAD_TOTAL.load(Ordering::Relaxed);
+    if pt > 0 {
+        eprintln!(
+            "  lookahead    recall={:.1}%  ({ph}/{pt} predicted-and-fired)",
+            100.0 * ph as f64 / pt as f64,
+        );
+    }
 }

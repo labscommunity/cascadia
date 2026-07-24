@@ -88,6 +88,13 @@ impl GlmLayer {
         }
     }
 
+    /// This layer's `post_attention_layernorm` weight — the norm the router
+    /// input passes through. Used by the lookahead prefetch to build the
+    /// next-layer proxy `rmsnorm(prev_out, post_ln)` before predicting its experts.
+    pub fn post_ln(&self) -> &[f32] {
+        &self.post_ln
+    }
+
     /// The dense-layer MLP expert, if this is a dense (first-k) layer — for
     /// pinning the always-active weights.
     pub fn dense_expert(&self) -> Option<&AnyExpert> {

@@ -25,6 +25,7 @@ pub mod grammar;
 pub mod indexer;
 pub mod kv_cache;
 pub mod loader;
+pub mod lookahead;
 pub mod model;
 pub mod moe;
 pub mod mtp;
