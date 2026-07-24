@@ -96,13 +96,13 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::ForwardNoSample => {
                 // Prefill-intermediate: consume the body, ack with a dummy
                 // Token(-1) — same shape the real worker uses.
-                let (_p, _s, _h, _sh) = recv_forward_body_server(&server).await?;
+                let (_p, _s, _ph, _h, _sh) = recv_forward_body_server(&server).await?;
                 frame_count += 1;
                 send_token_upstream(&server, -1).await?;
             }
             FrameKind::ForwardPrefill => {
                 // Streamed prefill: consume the body, no ack (one-way).
-                let (_p, _s, _h, _sh) = recv_forward_body_server(&server).await?;
+                let (_p, _s, _ph, _h, _sh) = recv_forward_body_server(&server).await?;
                 frame_count += 1;
             }
             FrameKind::ForwardBatch => {
