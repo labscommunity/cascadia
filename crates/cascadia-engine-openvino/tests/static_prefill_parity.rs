@@ -131,47 +131,112 @@ fn report(name: &str, r: &RunOut) {
 /// of this bar. Runs shorter than this treat any fork as suspect (intended).
 const NEAR_TIE_MIN_PREFIX: usize = 10;
 
-/// Greedy-token parity against the tokenwise baseline. The chunked-prefill
-/// variant is a **different compiled graph** (seq=`C`) from the seq=1 decode
-/// graph, so the two accumulate floating-point differently — and a genuinely
-/// near-equal top-2 argmax can flip, forking the greedy text (both branches
-/// coherent). This is inherent to running two graphs and happens on **every**
-/// device, same-device CPU/NPU included: a 1B same-device CPU run forks
-/// ~token 30, deterministically (measured 2026-07-23), and the fork rate
+/// Greedy-token parity verdict against the tokenwise baseline — the pure
+/// decision, with the env read factored out of [`assert_parity`] so it is
+/// unit-testable without hardware.
+///
+/// The chunked-prefill variant is a **different compiled graph** (seq=`C`) from
+/// the seq=1 decode graph, so the two accumulate floating-point differently —
+/// and a genuinely near-equal top-2 argmax can flip, forking the greedy text
+/// (both branches coherent). This is inherent to running two graphs and happens
+/// on **every** device, same-device CPU/NPU included: a 1B same-device CPU run
+/// forks ~token 30, deterministically (measured 2026-07-23), and the fork rate
 /// grows with model size and on GPU / cross-device hybrid. So a fork is
-/// tolerated as a near-tie with a loud report — the ring-math unit tests
+/// tolerated as a near-tie — the ring-math unit tests
 /// (`chunked_absorb_matches_sequential` et al.) are what prove the host KV
 /// state is byte-identical. What a single near-tie CANNOT explain is a fork
 /// within the first `NEAR_TIE_MIN_PREFIX` decoded tokens: that points at
-/// genuinely wrong prefill KV, so it stays a hard failure.
-/// `CASCADIA_PARITY_SOFT=1` tolerates even an early fork (pure timing sweeps).
-/// CI is unaffected (no `CASCADIA_STATIC_SHARDS` there).
-fn assert_parity(what: &str, base: &RunOut, other: &RunOut) {
-    if base.ids == other.ids {
-        return;
+/// genuinely wrong prefill KV, so it is [`ParityVerdict::TooEarly`] (a hard
+/// failure) unless `soft` (`CASCADIA_PARITY_SOFT=1`, pure timing sweeps).
+#[derive(Debug, PartialEq, Eq)]
+enum ParityVerdict {
+    /// Token-for-token identical.
+    Exact,
+    /// Diverged at this index but tolerated as a near-tie (fork ≥
+    /// `NEAR_TIE_MIN_PREFIX`, or softened).
+    NearTie(usize),
+    /// Diverged within the first `NEAR_TIE_MIN_PREFIX` tokens — suspect wrong
+    /// prefill KV, not a coincidental tie. Hard failure.
+    TooEarly(usize),
+}
+
+fn parity_verdict(base: &[i64], other: &[i64], soft: bool) -> ParityVerdict {
+    if base == other {
+        return ParityVerdict::Exact;
     }
     let fork = base
-        .ids
         .iter()
-        .zip(&other.ids)
+        .zip(other)
         .position(|(a, b)| a != b)
-        .unwrap_or_else(|| base.ids.len().min(other.ids.len()));
-    let soft = std::env::var("CASCADIA_PARITY_SOFT").is_ok_and(|v| v == "1");
-    // A fork within the first NEAR_TIE_MIN_PREFIX tokens is too early to be a
-    // coincidental argmax near-tie — the prefill likely handed decode wrong KV.
-    // Keep it fatal unless explicitly softened.
+        .unwrap_or_else(|| base.len().min(other.len()));
     if fork < NEAR_TIE_MIN_PREFIX && !soft {
-        panic!(
+        ParityVerdict::TooEarly(fork)
+    } else {
+        ParityVerdict::NearTie(fork)
+    }
+}
+
+fn assert_parity(what: &str, base: &RunOut, other: &RunOut) {
+    let soft = std::env::var("CASCADIA_PARITY_SOFT").is_ok_and(|v| v == "1");
+    match parity_verdict(&base.ids, &other.ids, soft) {
+        ParityVerdict::Exact => {}
+        ParityVerdict::TooEarly(fork) => panic!(
             "{what} diverged from tokenwise at token {fork} (before the first \
              {NEAR_TIE_MIN_PREFIX} matched) — too early for a near-tie; suspect \
              wrong prefill KV (baseline text: {:?}, other text: {:?})",
             base.text, other.text
-        );
+        ),
+        ParityVerdict::NearTie(fork) => eprintln!(
+            "PARITY-SOFT: {what} diverged from tokenwise at token {fork} \
+             (tolerated as a near-tie fork; baseline text: {:?}, other text: {:?})",
+            base.text, other.text
+        ),
     }
-    eprintln!(
-        "PARITY-SOFT: {what} diverged from tokenwise at token {fork} \
-         (tolerated as a near-tie fork; baseline text: {:?}, other text: {:?})",
-        base.text, other.text
+}
+
+#[test]
+fn parity_verdict_exact_match() {
+    assert_eq!(
+        parity_verdict(&[1, 2, 3], &[1, 2, 3], false),
+        ParityVerdict::Exact
+    );
+}
+
+#[test]
+fn parity_verdict_tolerates_a_late_near_tie_fork() {
+    // Agree through the bar, then fork past it — a tolerated near-tie.
+    let base: Vec<i64> = (0..(NEAR_TIE_MIN_PREFIX as i64 + 6)).collect();
+    let mut other = base.clone();
+    let fork = NEAR_TIE_MIN_PREFIX + 3;
+    other[fork] = 9999;
+    assert_eq!(
+        parity_verdict(&base, &other, false),
+        ParityVerdict::NearTie(fork)
+    );
+}
+
+#[test]
+fn parity_verdict_hard_fails_an_early_fork() {
+    // Fork one token before the bar — too early to be a coincidental tie.
+    let base: Vec<i64> = (0..20).collect();
+    let mut other = base.clone();
+    let fork = NEAR_TIE_MIN_PREFIX - 1;
+    other[fork] = 9999;
+    assert_eq!(
+        parity_verdict(&base, &other, false),
+        ParityVerdict::TooEarly(fork)
+    );
+}
+
+#[test]
+fn parity_verdict_soft_tolerates_even_an_early_fork() {
+    // CASCADIA_PARITY_SOFT tolerates even a token-0 fork (pure timing sweeps).
+    let base: Vec<i64> = (0..20).collect();
+    let mut other = base.clone();
+    other[0] = 9999;
+    assert_eq!(
+        parity_verdict(&base, &other, true),
+        ParityVerdict::NearTie(0)
     );
 }
 
