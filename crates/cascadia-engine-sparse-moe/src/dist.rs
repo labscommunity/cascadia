@@ -128,6 +128,13 @@ pub enum FrameKind {
     /// caching (dsv4) treat both as no-ops.
     RestorePrefix = 0x53_4D_45_09, // "SME\x09"
     CachePrefix = 0x53_4D_45_0A,  // "SME\x0A"
+    /// Intermediate batched prefill (0x0B): identical body to `ForwardBatchPrefill`,
+    /// but the last rank advances KV over ALL rows and samples NOTHING — it replies
+    /// with a dummy `Token(-1)` ack and records no penalty history. Lets rank 0
+    /// prefill a prompt longer than `MAX_BATCH_COUNT` as a sequence of ≤256-row
+    /// windows: every window but the last is `NoSample`, and only the final
+    /// `ForwardBatchPrefill` samples the first generated token.
+    ForwardBatchPrefillNoSample = 0x53_4D_45_0B, // "SME\x0B"
 }
 
 impl FrameKind {
@@ -141,6 +148,9 @@ impl FrameKind {
             x if x == FrameKind::ForwardNoSample as u32 => Some(FrameKind::ForwardNoSample),
             x if x == FrameKind::ForwardPrefill as u32 => Some(FrameKind::ForwardPrefill),
             x if x == FrameKind::ForwardBatchPrefill as u32 => Some(FrameKind::ForwardBatchPrefill),
+            x if x == FrameKind::ForwardBatchPrefillNoSample as u32 => {
+                Some(FrameKind::ForwardBatchPrefillNoSample)
+            }
             x if x == FrameKind::RestorePrefix as u32 => Some(FrameKind::RestorePrefix),
             x if x == FrameKind::CachePrefix as u32 => Some(FrameKind::CachePrefix),
             _ => None,
@@ -561,6 +571,30 @@ pub async fn send_forward_batch_prefill(
 ) -> TransportResult<()> {
     send_forward_batch_kind(
         FrameKind::ForwardBatchPrefill,
+        cli,
+        past_seq_len_start,
+        batch_count,
+        sampling,
+        hidden_f32,
+        hidden_shape,
+    )
+    .await
+}
+
+/// Like [`send_forward_batch_prefill`], but tags the frame
+/// [`FrameKind::ForwardBatchPrefillNoSample`] so the last rank advances KV over
+/// the rows without sampling or recording — an intermediate window of a prompt
+/// longer than [`MAX_BATCH_COUNT`]. Replies with a dummy `Token(-1)` ack.
+pub async fn send_forward_batch_prefill_nosample(
+    cli: &Mutex<ActivationClient>,
+    past_seq_len_start: u32,
+    batch_count: u32,
+    sampling: &SamplingConfig,
+    hidden_f32: &[f32],
+    hidden_shape: [u32; 3],
+) -> TransportResult<()> {
+    send_forward_batch_kind(
+        FrameKind::ForwardBatchPrefillNoSample,
         cli,
         past_seq_len_start,
         batch_count,
