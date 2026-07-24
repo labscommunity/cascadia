@@ -67,7 +67,8 @@ with `shell_backend: "ov_ir"` in the manifest. FP8 block weights
 then re-quantized to INT4 via NNCF; the router gate / `e_score_correction_bias`
 are kept full precision.
 
-Needs a Python env with `torch`, `transformers>=4.57` (for `MiniMaxM2`),
+Needs a Python env with `torch`, `transformers>=5.2,<5.5` (for `MiniMaxM2`;
+4.57 ships only the M1 `MiniMax` classes — see `tools/requirements.txt`),
 `openvino` 2026.x, and `nncf`.
 
 ## Run
