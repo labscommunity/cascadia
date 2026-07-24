@@ -94,7 +94,7 @@ Lunar Lake AI PC (Core Ultra 7 258V, 32 GB LPDDR5X, Windows), OpenVINO GenAI
 release build, 2026-07-14. Every row of that run produced token-identical
 output — but the parity check is near-tie-tolerant (see the parity bullet
 below), so token-identity is the observed result for these prompts, not a
-guarantee: a later 1B/CPU run forked ~token 30.
+guarantee: a later 1B + 3B sweep saw near-tie forks as early as token 2.
 
 **Short prompt (~31 tokens → 1 chunk):**
 
@@ -200,15 +200,17 @@ Matrix takeaways:
   leg — same-device CPU/NPU included — can fork at a genuine argmax near-tie
   when the two graphs' floating-point accumulation tips a near-equal top-2
   (both branches coherent, deterministic per config, observed more often as
-  model size grows; measured 2026-07-23: a **1B same-device CPU run forks
-  ~token 30**, correcting an earlier "token-exact on CPU/NPU" claim). The host
-  KV state itself is byte-identical — proven by the ring-math unit tests
+  model size grows; a 1B + 3B sweep over varied prompts, 2026-07-24, saw forks
+  **as early as token 2**, correcting both an earlier "token-exact on CPU/NPU"
+  claim and an earlier reading that forks land ~token 30). The host KV state
+  itself is byte-identical — proven by the ring-math unit tests
   (`chunked_absorb_matches_sequential` et al.) — so the fork lives in the
   graphs' FP, not the host bookkeeping. The harness therefore tolerates a
   near-tie fork with a loud report (fork index + both texts) and hard-fails
-  only if the sequences fork **within the first 10 decoded tokens** — too early
-  to be a coincidental tie, so wrong prefill KV rather than a near-tie.
-  `CASCADIA_PARITY_SOFT=1` tolerates even an early fork, for pure timing sweeps.
+  only if the sequences fork **at the very first decoded token** — the only
+  position that reliably points at wrong prefill KV rather than a near-tie
+  (near-ties occur too early for a larger prefix guard to hold).
+  `CASCADIA_PARITY_SOFT=1` tolerates even that, for pure timing sweeps.
 
 ## Big-model NPU routes (2026-07-16, second session)
 

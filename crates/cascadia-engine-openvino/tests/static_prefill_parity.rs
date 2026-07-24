@@ -121,15 +121,19 @@ fn report(name: &str, r: &RunOut) {
     );
 }
 
-/// Minimum identical greedy prefix (decoded tokens) required to treat a
-/// divergence as a legitimate argmax near-tie rather than corruption. A single
-/// near-tie can only flip *after* the prefill has produced this many correct
-/// tokens; a fork earlier than this is too soon to be a coincidental tie and
-/// points at wrong prefill KV. Checking only the first token is too weak — a
-/// subtly-corrupted KV can emit a couple of plausible tokens before drifting.
-/// Measured near-tie forks (2026-07-23, 1B) landed at token ~29–30, well clear
-/// of this bar. Runs shorter than this treat any fork as suspect (intended).
-const NEAR_TIE_MIN_PREFIX: usize = 10;
+/// Minimum identical greedy prefix (decoded tokens) below which a divergence is
+/// treated as corruption (a hard failure) rather than a tolerated argmax
+/// near-tie. Set to 1: hard-fail ONLY a fork at token 0 (the first greedy token
+/// already differs — the strongest "wrong prefill KV" signal).
+///
+/// Why so low: a broader sweep (1B + 3B × varied prompts, 2026-07-24) found
+/// legitimate near-tie forks as early as **token 2** (both branches coherent,
+/// re-converging), so fork position does NOT reliably separate a near-tie from
+/// corruption. An earlier reading of "forks land ~token 30" came from one
+/// unrepresentative prompt; a higher bar hard-fails real near-ties. The
+/// first-token guard is the only position-based check that doesn't flake on the
+/// measured distribution. `CASCADIA_PARITY_SOFT=1` tolerates even a token-0 fork.
+const NEAR_TIE_MIN_PREFIX: usize = 1;
 
 /// Greedy-token parity verdict against the tokenwise baseline — the pure
 /// decision, with the env read factored out of [`assert_parity`] so it is
@@ -139,14 +143,14 @@ const NEAR_TIE_MIN_PREFIX: usize = 10;
 /// the seq=1 decode graph, so the two accumulate floating-point differently —
 /// and a genuinely near-equal top-2 argmax can flip, forking the greedy text
 /// (both branches coherent). This is inherent to running two graphs and happens
-/// on **every** device, same-device CPU/NPU included: a 1B same-device CPU run
-/// forks ~token 30, deterministically (measured 2026-07-23), and the fork rate
-/// grows with model size and on GPU / cross-device hybrid. So a fork is
-/// tolerated as a near-tie — the ring-math unit tests
+/// on **every** device, same-device CPU/NPU included, and **as early as token
+/// 2** (measured deterministically across 1B + 3B and varied prompts,
+/// 2026-07-24); the fork rate grows with model size and on GPU / cross-device
+/// hybrid. So a fork is tolerated as a near-tie — the ring-math unit tests
 /// (`chunked_absorb_matches_sequential` et al.) are what prove the host KV
-/// state is byte-identical. What a single near-tie CANNOT explain is a fork
-/// within the first `NEAR_TIE_MIN_PREFIX` decoded tokens: that points at
-/// genuinely wrong prefill KV, so it is [`ParityVerdict::TooEarly`] (a hard
+/// state is byte-identical. The only thing a near-tie cannot explain is a fork
+/// within the first `NEAR_TIE_MIN_PREFIX` decoded tokens (token 0): that points
+/// at genuinely wrong prefill KV, so it is [`ParityVerdict::TooEarly`] (a hard
 /// failure) unless `soft` (`CASCADIA_PARITY_SOFT=1`, pure timing sweeps).
 #[derive(Debug, PartialEq, Eq)]
 enum ParityVerdict {
