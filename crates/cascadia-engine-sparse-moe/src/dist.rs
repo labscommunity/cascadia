@@ -139,6 +139,13 @@ pub enum FrameKind {
     // ones; an older peer that lacks these rejects them in `from_code` (loud, not silent corruption).
     Capture = 0x53_4D_45_30, // "SME\x30" — head→down: snapshot each stage's KV under epoch E
     CaptureAck = 0x53_4D_45_31, // "SME\x31" — up: "captured @ E" (propagates head-ward like Token)
+    // Issue-34 consume path (§8). Appended codes only — never reorder existing ones. RESTORE(E) flows
+    // downstream like Capture; each rank restores its slice captured under E from its own stash.
+    // RestoreAck(E, verdict) flows upstream like CaptureAck, carrying the all-or-nothing verdict
+    // (1 ⇒ that rank AND its whole downstream restored). An older peer lacking these rejects them in
+    // `from_code` (loud, not silent corruption).
+    Restore = 0x53_4D_45_40,    // "SME\x40" — head→down: restore each stage's KV captured under epoch E
+    RestoreAck = 0x53_4D_45_41, // "SME\x41" — up: verdict byte (1 = restored, 0 = missed ⇒ head cold)
 }
 
 impl FrameKind {
@@ -159,6 +166,8 @@ impl FrameKind {
             x if x == FrameKind::CachePrefix as u32 => Some(FrameKind::CachePrefix),
             x if x == FrameKind::Capture as u32 => Some(FrameKind::Capture),
             x if x == FrameKind::CaptureAck as u32 => Some(FrameKind::CaptureAck),
+            x if x == FrameKind::Restore as u32 => Some(FrameKind::Restore),
+            x if x == FrameKind::RestoreAck as u32 => Some(FrameKind::RestoreAck),
             _ => None,
         }
     }
@@ -648,6 +657,75 @@ pub async fn recv_capture_ack_body_client(cli: &Mutex<ActivationClient>) -> Tran
     Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
 }
 
+// ───────────────────────── Issue-34 consume path: multi-stage KV RESTORE (§8) ─────────────────────────
+//
+// RESTORE(epoch) flows downstream like Capture but carries NO token body — the epoch alone keys each
+// rank's existing CAPTURE stash. RestoreAck(epoch, verdict) flows upstream like CaptureAck; a mid-stage
+// folds its downstream verdict into its own (local && down) so the head's single verdict==1 means every
+// stage restored. Any miss anywhere ⇒ verdict 0 ⇒ the head discards and cold-runs (all-or-nothing).
+
+/// Pure frame encoder (testable): kind(4) + epoch(8 BE). No token body (unlike Capture).
+fn restore_frame_bytes(epoch: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12);
+    b.extend_from_slice(&(FrameKind::Restore as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b
+}
+
+/// Pure ack encoder (testable): kind(4) + epoch(8 BE) + verdict(1).
+fn restore_ack_bytes(epoch: u64, verdict: u8) -> [u8; 13] {
+    let mut bytes = [0u8; 13];
+    bytes[0..4].copy_from_slice(&(FrameKind::RestoreAck as u32).to_be_bytes());
+    bytes[4..12].copy_from_slice(&epoch.to_be_bytes());
+    bytes[12] = verdict;
+    bytes
+}
+
+/// Send a Restore frame downstream (head/mid → next stage).
+pub async fn send_restore(cli: &Mutex<ActivationClient>, epoch: u64) -> TransportResult<()> {
+    let bytes = restore_frame_bytes(epoch);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a Restore body from upstream (kind already consumed). Returns the epoch to restore under.
+pub async fn recv_restore_body_server(srv: &Mutex<ActivationServer>) -> TransportResult<u64> {
+    let mut guard = srv.lock().await;
+    let raw = guard.recv_raw(8).await?;
+    drop(guard);
+    if raw.len() != 8 {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
+}
+
+/// Send a RestoreAck frame upstream (stage → head-ward). Body: kind(4) + epoch(8 BE) + verdict(1).
+pub async fn send_restore_ack_upstream(
+    srv: &Mutex<ActivationServer>,
+    epoch: u64,
+    verdict: u8,
+) -> TransportResult<()> {
+    let bytes = restore_ack_bytes(epoch, verdict);
+    let mut guard = srv.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a RestoreAck body from downstream (kind already consumed). Returns `(epoch, verdict)`.
+pub async fn recv_restore_ack_body_client(
+    cli: &Mutex<ActivationClient>,
+) -> TransportResult<(u64, u8)> {
+    let mut guard = cli.lock().await;
+    let raw = guard.recv_raw(9).await?;
+    drop(guard);
+    if raw.len() != 9 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(raw[0..8].try_into().unwrap());
+    Ok((epoch, raw[8]))
+}
+
 #[cfg(test)]
 mod capture_frame_tests {
     use super::*;
@@ -676,6 +754,43 @@ mod capture_frame_tests {
         let b = capture_frame_bytes(7, &[]);
         assert_eq!(b.len(), 16);
         assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn restore_frame_bytes_layout() {
+        let epoch = 0xDEAD_BEEF_0000_0001u64;
+        let b = restore_frame_bytes(epoch);
+        assert_eq!(b.len(), 12);
+        assert_eq!(b[0..4], (FrameKind::Restore as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+    }
+
+    #[test]
+    fn restore_ack_bytes_verdict_roundtrips() {
+        let epoch = 0x0102_0304_0506_0708u64;
+        for verdict in [0u8, 1u8] {
+            let b = restore_ack_bytes(epoch, verdict);
+            assert_eq!(b.len(), 13);
+            assert_eq!(b[0..4], (FrameKind::RestoreAck as u32).to_be_bytes());
+            // Decode exactly as `recv_restore_ack_body_client` does (after the 4-byte kind is consumed).
+            assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+            assert_eq!(b[12], verdict);
+        }
+    }
+
+    #[test]
+    fn restore_and_ack_codes_are_distinct_and_recognized() {
+        // Appended codes must round-trip through `from_code` and not collide with existing kinds.
+        assert_eq!(
+            FrameKind::from_code(FrameKind::Restore as u32),
+            Some(FrameKind::Restore)
+        );
+        assert_eq!(
+            FrameKind::from_code(FrameKind::RestoreAck as u32),
+            Some(FrameKind::RestoreAck)
+        );
+        assert_ne!(FrameKind::Restore as u32, FrameKind::Capture as u32);
+        assert_ne!(FrameKind::RestoreAck as u32, FrameKind::CaptureAck as u32);
     }
 }
 

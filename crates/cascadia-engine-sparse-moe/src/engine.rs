@@ -36,7 +36,9 @@ use crate::dist::{
 };
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
-    recv_capture_ack_body_client, recv_capture_body_server, send_capture, send_capture_ack_upstream,
+    recv_capture_ack_body_client, recv_capture_body_server, recv_restore_ack_body_client,
+    recv_restore_body_server, send_capture, send_capture_ack_upstream, send_restore,
+    send_restore_ack_upstream,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -1440,6 +1442,57 @@ impl SparseMoEEngine {
         // per-token Forward driver.
         let use_spec =
             self.spec_decode_k.map(|k| k > 0).unwrap_or(false) && sampling_cfg.temperature <= 0.0;
+
+        // Issue-34 consume (§8): SAME-CHAIN warm-resume. On a kv-prefix-cache hit, restore the head's
+        // own rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
+        // re-prefilling the matched prefix (`warm_prefix`). Any rank short ⇒ discard: re-RESET local +
+        // downstream and cold-run. Runs after the admission RESET above and before generation (rule §2).
+        // Inert unless kv_coord + cache enabled + a hit on the non-spec path; `warm_prefix == 0` leaves
+        // `drive_generation_first` byte-identical to the cold path. Spec-decode stays cold (parity with
+        // the single-stage cache bypass).
+        #[cfg(feature = "kv_coord")]
+        let warm_prefix: usize = if !use_spec && self.kv_prefix_cache.enabled() {
+            let fp = self.runner.fingerprint();
+            match self.kv_prefix_cache.lookup(&prompt_ids, &fp) {
+                Some(snap) => {
+                    let matched = snap.past_seq_len;
+                    let prefix32: Vec<i32> =
+                        prompt_ids[..matched].iter().map(|&t| t as i32).collect();
+                    // Same epoch the chain captured under: the head stashes the FULL prior sequence in
+                    // the prefix cache under the token vector it broadcast CAPTURE with, so a matched
+                    // prefix of that sequence hashes to the workers' capture epoch. A partial match
+                    // hashes elsewhere ⇒ workers miss ⇒ verdict 0 ⇒ safe cold fallback below.
+                    let epoch = crate::kv_coordination::synth_epoch(&prefix32);
+                    let local_ok = self.runner.restore_kv(&snap).is_ok();
+                    if local_ok && self.forward_restore_downstream(epoch) {
+                        info!(
+                            task = %task.task_id,
+                            warm_prefix = matched,
+                            prompt_len = prompt_ids.len(),
+                            "multi-stage warm-resumed"
+                        );
+                        matched
+                    } else {
+                        warn!(task = %task.task_id, "multi-stage restore incomplete; cold reset");
+                        self.runner.reset_kv();
+                        if let Err(e) = self.block_on(send_reset(&downstream)) {
+                            warn!(task = %task.task_id, "cold-fallback send_reset: {e}");
+                            return vec![(
+                                task.task_id.clone(),
+                                Chunk::final_marker(task.task_id, ""),
+                            )];
+                        }
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_prefix: usize = 0;
+
         let result_tokens = if use_spec {
             let k = self.spec_decode_k.unwrap();
             info!(
@@ -1467,7 +1520,13 @@ impl SparseMoEEngine {
                 }
             }
         } else {
-            match self.drive_generation_first(&prompt_ids, max_new, &sampling_cfg, &downstream) {
+            match self.drive_generation_first(
+                &prompt_ids,
+                max_new,
+                &sampling_cfg,
+                &downstream,
+                warm_prefix,
+            ) {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 driver failed: {e}");
@@ -1563,6 +1622,10 @@ impl SparseMoEEngine {
         max_new: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        // Issue-34 (§8): count of leading prompt tokens whose KV is already in the chain's restored
+        // caches (same-chain warm-resume). Those tokens are pushed into `history` for the past_seq_len
+        // accounting but NOT forwarded. `0` on every cold path ⇒ the loop below is byte-identical.
+        warm_prefix: usize,
     ) -> Result<Vec<i64>, String> {
         let hidden = self.runner.manifest.hidden_size as usize;
         let eos: Vec<i64> = self
@@ -1579,7 +1642,7 @@ impl SparseMoEEngine {
         // last-rank becomes the first generated token.
         info!(
             prompt_len = prompt_ids.len(),
-            "prefill (token-by-token, distributed)"
+            warm_prefix, "prefill (token-by-token, distributed)"
         );
         // Streamed-prefill sync window: every N intermediate tokens go as a
         // blocking ForwardNoSample (which acks) instead of a one-way
@@ -1590,6 +1653,12 @@ impl SparseMoEEngine {
         const PREFILL_SYNC_EVERY: usize = 256;
         for (i, &t) in prompt_ids.iter().enumerate() {
             history.push(t);
+            if i < warm_prefix {
+                // KV already restored for this token; skip its forward but keep `history` growing so
+                // `forward_one_token_first`'s `past_seq_len` stays correct. The prefix-cache `lookup`
+                // guarantees `warm_prefix < prompt_ids.len()`, so a suffix token always follows.
+                continue;
+            }
             if i + 1 == prompt_ids.len() {
                 // Last prompt token: a sampling Forward; the token it returns
                 // is the first generated token.
@@ -2178,6 +2247,42 @@ impl SparseMoEEngine {
         self.kv_capture.insert(epoch, (tokens, snap));
     }
 
+    /// Issue-34 consume (§8): broadcast `RESTORE(epoch)` down the chain and return the all-or-nothing
+    /// verdict (true ⇒ every downstream rank restored its slice). Used by the head admission trigger
+    /// (`step_first`) and the plane's `apply_warm_resume`. `total <= 1` or no downstream ⇒ nothing to
+    /// restore ⇒ true. Any transport error, a non-`RestoreAck` reply, or a verdict 0 ⇒ false ⇒ the
+    /// caller cold-falls-back (never a partial/corrupt warm).
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
+        if self.total <= 1 {
+            return true;
+        }
+        let Some(down) = self.transport.downstream.clone() else {
+            return true;
+        };
+        let verdict = self.block_on(async {
+            send_restore(&down, epoch)
+                .await
+                .map_err(|e| format!("send_restore: {e}"))?;
+            match recv_kind_client(&down).await {
+                Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(&down)
+                    .await
+                    .map(|(_, v)| v == 1)
+                    .map_err(|e| format!("recv_restore_ack: {e}")),
+                Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
+                Ok(None) => Err("downstream closed during restore-ack".to_string()),
+                Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+            }
+        });
+        match verdict {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "restore broadcast failed: {e}");
+                false
+            }
+        }
+    }
+
     fn handle_one_frame(
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
@@ -2371,13 +2476,69 @@ impl SparseMoEEngine {
                     .map_err(|e| format!("send_capture_ack: {e}"))?;
                 Ok(())
             }
+            // Issue-34 consume (§8): restore THIS rank's KV from its own CAPTURE stash under `epoch`,
+            // chain RESTORE downstream, then ack upstream with the all-or-nothing verdict (local && down).
+            // Any miss ⇒ verdict 0 ⇒ the head cold-resets the whole chain (never a partial restore).
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => {
+                let epoch = self
+                    .block_on(recv_restore_body_server(upstream))
+                    .map_err(|e| format!("recv_restore: {e}"))?;
+                // Same-chain: restore from this rank's own capture stash. `.get`+clone (not remove) —
+                // a repeat warm-resume over the same epoch may legitimately restore again.
+                let local_ok = match self.kv_capture.get(&epoch).cloned() {
+                    Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                    None => false,
+                };
+                // Chain downstream unless we're the last rank. A transport error folds into verdict 0
+                // (all-or-nothing) rather than aborting — the head still gets a definite NAK and cold-runs.
+                let down_ok = if self.is_last() {
+                    true
+                } else if let Some(down) = downstream.as_ref() {
+                    self.block_on(async {
+                        send_restore(down, epoch)
+                            .await
+                            .map_err(|e| format!("send_restore: {e}"))?;
+                        match recv_kind_client(down).await {
+                            Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
+                                .await
+                                .map(|(_, v)| v == 1)
+                                .map_err(|e| format!("recv_restore_ack: {e}")),
+                            Ok(Some(other)) => {
+                                Err(format!("expected RestoreAck downstream, got {other:?}"))
+                            }
+                            Ok(None) => Err("downstream closed during restore-ack".into()),
+                            Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+                        }
+                    })
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                self.block_on(send_restore_ack_upstream(
+                    upstream,
+                    epoch,
+                    u8::from(local_ok && down_ok),
+                ))
+                .map_err(|e| format!("send_restore_ack: {e}"))?;
+                Ok(())
+            }
             #[cfg(not(feature = "kv_coord"))]
             FrameKind::Capture => Err(format!(
                 "rank {} received CAPTURE but kv_coord is not built",
                 self.rank
             )),
+            #[cfg(not(feature = "kv_coord"))]
+            FrameKind::Restore => Err(format!(
+                "rank {} received RESTORE but kv_coord is not built",
+                self.rank
+            )),
             FrameKind::CaptureAck => Err(format!(
                 "rank {} received unexpected CAPTURE_ACK from upstream",
+                self.rank
+            )),
+            FrameKind::RestoreAck => Err(format!(
+                "rank {} received unexpected RESTORE_ACK from upstream",
                 self.rank
             )),
         }

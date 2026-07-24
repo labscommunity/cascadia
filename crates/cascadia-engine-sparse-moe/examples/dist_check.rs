@@ -120,6 +120,9 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::Capture | FrameKind::CaptureAck => {
                 println!("[server] CAPTURE/CAPTURE_ACK not handled in dist_check — ignoring");
             }
+            FrameKind::Restore | FrameKind::RestoreAck => {
+                println!("[server] RESTORE/RESTORE_ACK not handled in dist_check — ignoring");
+            }
         }
     }
     println!("[server] frames processed: {frame_count} (got_reset={got_reset})");
