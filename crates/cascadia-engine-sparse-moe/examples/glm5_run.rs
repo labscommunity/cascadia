@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let t_load = Instant::now();
-    let mut runner = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0)?;
+    let mut runner = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0, Default::default())?;
     println!(
         "[glm5_run] loaded in {:.1}s (arch={})",
         t_load.elapsed().as_secs_f64(),

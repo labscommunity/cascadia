@@ -455,6 +455,7 @@ impl Builder for SparseMoEBuilder {
                 total,
                 shard.layer_start,
                 shard.layer_end,
+                crate::glm::stage::StageOpts::from_env(),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
             if rank == 0 {

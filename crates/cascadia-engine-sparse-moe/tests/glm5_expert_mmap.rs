@@ -38,9 +38,11 @@ fn eager_and_mmap_experts_agree() {
     // Force each mode via the env override, load, then clear (single test in
     // this binary -> no env race).
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "mmap");
-    let mut mm = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).expect("mmap load");
+    let mut mm =
+        GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("mmap load");
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "eager");
-    let mut eg = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).expect("eager load");
+    let mut eg =
+        GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("eager load");
     std::env::remove_var("CASCADIA_GLM5_EXPERTS");
 
     mm.reset();
@@ -74,7 +76,7 @@ fn eager_and_mmap_experts_agree() {
 
     // End-to-end greedy must be token-identical.
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "mmap");
-    let got_mmap = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0)
+    let got_mmap = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default())
         .unwrap()
         .generate_argmax(&[1, 2, 3, 4], 4);
     std::env::remove_var("CASCADIA_GLM5_EXPERTS");

@@ -35,8 +35,8 @@ async fn glm5_two_rank_over_real_transport_matches_reference() {
     let prompt: Vec<u32> = vec![1, 2, 3, 4];
     let want: Vec<u32> = vec![4, 10, 3, 15]; // loader/reference greedy
 
-    let mut r0 = GlmRunner::load_staged(&dir, 32, 0, 2, 0, 0).expect("rank0");
-    let mut r1 = GlmRunner::load_staged(&dir, 32, 1, 2, 0, 0).expect("rank1");
+    let mut r0 = GlmRunner::load_staged(&dir, 32, 0, 2, 0, 0, Default::default()).expect("rank0");
+    let mut r1 = GlmRunner::load_staged(&dir, 32, 1, 2, 0, 0, Default::default()).expect("rank1");
     r0.reset();
     r1.reset();
     let hsz = r0.hidden_size() as u32;

@@ -43,7 +43,10 @@ async fn pipeline_generate(
     n_gen: usize,
 ) -> Vec<u32> {
     let mut ranks: Vec<GlmRunner> = (0..m)
-        .map(|r| GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0).expect("load rank"))
+        .map(|r| {
+            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
+                .expect("load rank")
+        })
         .collect();
     for r in &mut ranks {
         r.reset();

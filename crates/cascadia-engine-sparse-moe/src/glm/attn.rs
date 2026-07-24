@@ -258,21 +258,26 @@ impl AttentionLayer {
             scale: (qk_head as f32).powf(-0.5),
             w,
             freqs,
-            // Opt-in bf16 KV (CASCADIA_GLM5_BF16_KV): halves the latent/k_pe cache
-            // RAM on every rank. Read once at layer build; default f32 (exact).
-            lc: KvStore::zeros(
-                max_seq * kv_lora,
-                std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
-            ),
-            rc: KvStore::zeros(
-                max_seq * qk_rope,
-                std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
-            ),
+            // KV starts exact f32; the loader flips it to bf16 via
+            // `set_kv_precision` when the caller (StageOpts) asks. No env read
+            // here, so the pin-budget reservation and this allocation can't
+            // disagree.
+            lc: KvStore::zeros(max_seq * kv_lora, false),
+            rc: KvStore::zeros(max_seq * qk_rope, false),
             len: 0,
             indexer: None,
             index_topk: usize::MAX,
             is_shared: false,
         }
+    }
+
+    /// Select the KV-cache precision (f32 exact by default, or bf16 to halve KV
+    /// RAM). Reallocates the freshly-zeroed latent/k_pe caches, so call this right
+    /// after [`Self::new`], before any token is appended. Cheap (empty buffers).
+    pub fn set_kv_precision(&mut self, bf16_kv: bool) {
+        let max_seq = self.lc.len() / self.kv_lora;
+        self.lc = KvStore::zeros(max_seq * self.kv_lora, bf16_kv);
+        self.rc = KvStore::zeros(max_seq * self.qk_rope, bf16_kv);
     }
 
     /// Attach the DSA lightning indexer (with its `index_topk` budget). Without

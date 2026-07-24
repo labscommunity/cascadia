@@ -44,7 +44,10 @@ async fn pipeline_generate(
     n_gen: usize,
 ) -> Vec<u32> {
     let mut ranks: Vec<GlmRunner> = (0..m)
-        .map(|r| GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0).expect("load rank"))
+        .map(|r| {
+            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
+                .expect("load rank")
+        })
         .collect();
     for run in ranks.iter_mut() {
         run.reset();
@@ -151,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    RAM stays ~one full model.
     let want: Vec<u32> = {
         let t0 = Instant::now();
-        let mut solo = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0)?;
+        let mut solo = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0, Default::default())?;
         println!(
             "[shardcheck] single-process loaded in {:.0}s",
             t0.elapsed().as_secs_f64()
