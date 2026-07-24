@@ -322,8 +322,17 @@ fn sanitize_f32(x: f32, fallback: f32, min: f32) -> f32 {
 }
 
 /// Send a Forward-shaped frame downstream: kind + past_seq_len (u32 BE) +
-/// SamplingConfig block + hidden tensor. Shared by [`send_forward`] and
-/// [`send_forward_nosample`] — the two kinds carry identical bodies.
+/// SamplingConfig block + 1 B `push_history` flag + hidden tensor. Shared by
+/// [`send_forward`], [`send_forward_nosample`] and [`send_forward_prefill`] —
+/// the kinds carry identical bodies.
+///
+/// `push_history` tells the last rank whether this forward's sampled token is a
+/// *kept* generated token (true ⇒ include it in the rep-penalty history) vs a
+/// discarded prefill sample (false). It lets the multi-stage rep-penalty window
+/// cover generated tokens only — matching the single-stage path — and is what
+/// makes a warm-resumed run byte-identical to a cold one (the skipped prefill
+/// forwards would otherwise desync the history). Both pipeline ends are the same
+/// build, so the wire layout is extended unconditionally (no version byte).
 async fn send_forward_kind(
     cli: &Mutex<ActivationClient>,
     kind: FrameKind,
@@ -331,13 +340,15 @@ async fn send_forward_kind(
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
+    push_history: bool,
 ) -> TransportResult<()> {
-    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES];
+    let mut header = [0u8; 8 + SAMPLING_WIRE_BYTES + 1];
     header[0..4].copy_from_slice(&(kind as u32).to_be_bytes());
     header[4..8].copy_from_slice(&past_seq_len.to_be_bytes());
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     encode_sampling(sampling, &mut sbytes);
     header[8..8 + SAMPLING_WIRE_BYTES].copy_from_slice(&sbytes);
+    header[8 + SAMPLING_WIRE_BYTES] = u8::from(push_history);
     let tensor = hidden_to_tensor(hidden_f32, hidden_shape);
     let mut guard = cli.lock().await;
     guard.send_raw(&header).await?;
@@ -345,14 +356,15 @@ async fn send_forward_kind(
     Ok(())
 }
 
-/// Send a Forward frame downstream: kind + past_seq_len (u32 BE) + 28 B
-/// SamplingConfig + hidden tensor.
+/// Send a sampling Forward frame downstream: kind + past_seq_len (u32 BE) +
+/// 28 B SamplingConfig + 1 B `push_history` + hidden tensor.
 pub async fn send_forward(
     cli: &Mutex<ActivationClient>,
     past_seq_len: u32,
     sampling: &SamplingConfig,
     hidden_f32: &[f32],
     hidden_shape: [u32; 3],
+    push_history: bool,
 ) -> TransportResult<()> {
     send_forward_kind(
         cli,
@@ -361,6 +373,7 @@ pub async fn send_forward(
         sampling,
         hidden_f32,
         hidden_shape,
+        push_history,
     )
     .await
 }
@@ -384,6 +397,8 @@ pub async fn send_forward_nosample(
         sampling,
         hidden_f32,
         hidden_shape,
+        // the sample is discarded, so it never enters the rep-penalty history
+        false,
     )
     .await
 }
@@ -406,29 +421,32 @@ pub async fn send_forward_prefill(
         sampling,
         hidden_f32,
         hidden_shape,
+        // the sample is discarded, so it never enters the rep-penalty history
+        false,
     )
     .await
 }
 
 /// Receive a Forward frame's body (the kind code has already been
 /// consumed by `recv_kind_*`). Returns
-/// `(past_seq_len, sampling, hidden_f32, shape)`.
+/// `(past_seq_len, sampling, push_history, hidden_f32, shape)`.
 pub async fn recv_forward_body_server(
     srv: &Mutex<ActivationServer>,
-) -> TransportResult<(u32, SamplingConfig, Vec<f32>, [u32; 3])> {
+) -> TransportResult<(u32, SamplingConfig, bool, Vec<f32>, [u32; 3])> {
     let mut guard = srv.lock().await;
-    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES).await?;
-    if raw.len() != 4 + SAMPLING_WIRE_BYTES {
+    let raw = guard.recv_raw(4 + SAMPLING_WIRE_BYTES + 1).await?;
+    if raw.len() != 4 + SAMPLING_WIRE_BYTES + 1 {
         return Err(TransportError::SocketClosed);
     }
     let past_seq_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let mut sbytes = [0u8; SAMPLING_WIRE_BYTES];
     sbytes.copy_from_slice(&raw[4..4 + SAMPLING_WIRE_BYTES]);
     let sampling = decode_sampling(&sbytes);
+    let push_history = raw[4 + SAMPLING_WIRE_BYTES] != 0;
     let (tensor, _) = guard.recv().await?;
     drop(guard);
     let (h, shape) = tensor_to_hidden(&tensor)?;
-    Ok((past_seq_len, sampling, h, shape))
+    Ok((past_seq_len, sampling, push_history, h, shape))
 }
 
 /// Send a Reset frame downstream — clears KV state for a new task.

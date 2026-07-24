@@ -774,6 +774,38 @@ impl Builder for SparseMoEBuilder {
             } else {
                 info!("built MiniMax-M2 OV-IR engine (single-stage)");
             }
+            // Issue-34 §8: multi-stage warm-resume prefix cache. Only wired for the
+            // pipeline path under `kv_coord` (per-stage CAPTURE/RESTORE over the
+            // transport); single-stage OvMoe has no capture point yet, so it stays
+            // off. Without the feature the cache is disabled (allocating it would
+            // only waste memory with no warm-pull plane).
+            let ov_kv_cache_size = if total > 1 {
+                #[cfg(feature = "kv_coord")]
+                {
+                    self.config.kv_prefix_cache_size
+                }
+                #[cfg(not(feature = "kv_coord"))]
+                {
+                    if self.config.kv_prefix_cache_size > 0 {
+                        warn!(
+                            requested = self.config.kv_prefix_cache_size,
+                            total,
+                            "kv-prefix-cache disabled: multi-stage capture needs the kv_coord feature"
+                        );
+                    }
+                    0
+                }
+            } else {
+                0
+            };
+            let ov_kv_cache =
+                crate::ov_kv_cache::OvMoeKvPrefixCache::new(ov_kv_cache_size as usize);
+            if ov_kv_cache.enabled() {
+                info!(
+                    capacity = ov_kv_cache_size,
+                    rank, total, "OvMoe kv-prefix-cache enabled (multi-stage warm-resume)"
+                );
+            }
             return Ok(Box::new(OvMoeEngine::new(
                 ov,
                 self.tokenizer,
@@ -781,6 +813,7 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                ov_kv_cache,
             )));
         }
         let runner = self.runner.ok_or(EngineError::NotLoaded)?;
@@ -1746,7 +1779,7 @@ impl SparseMoEEngine {
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<Arc<TokioMutex<ActivationClient>>>,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+        let (past_seq_len, sampling_cfg, _push_history, hidden_f32, in_shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward(prefill): {e}"))?;
         let hidden = self.runner.manifest.hidden_size as usize;
@@ -1820,6 +1853,8 @@ impl SparseMoEEngine {
                     cfg,
                     &h_after_shells,
                     [1, 1, hidden as u32],
+                    // K2.6 keeps its rep-penalty behaviour: every SAMPLED token is kept.
+                    true,
                 )
                 .await
                 .map_err(|e| format!("send_forward: {e}"))?;
@@ -2333,7 +2368,7 @@ impl SparseMoEEngine {
                 // and acks with a dummy Token(-1) — keeps phantom prefill
                 // samples out of the penalty history.
                 let sample = matches!(k, FrameKind::Forward);
-                let (past_seq_len, sampling_cfg, hidden_f32, in_shape) = self
+                let (past_seq_len, sampling_cfg, push_history, hidden_f32, in_shape) = self
                     .block_on(recv_forward_body_server(upstream))
                     .map_err(|e| format!("recv_forward: {e}"))?;
                 let hidden = self.runner.manifest.hidden_size as usize;
@@ -2395,6 +2430,7 @@ impl SparseMoEEngine {
                                 &sampling_cfg,
                                 &h_after,
                                 [1, 1, hidden as u32],
+                                push_history,
                             )
                             .await
                             .map_err(|e| format!("send_forward: {e}"))?;
@@ -2698,6 +2734,18 @@ pub struct OvMoeEngine {
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// Multi-stage warm-resume (Issue-34 §8): head (rank 0) maps a prompt
+    /// prefix → its own KV snapshot; a hit restores locally and broadcasts
+    /// RESTORE@epoch downstream. Disabled (capacity 0) on single-stage or
+    /// without `kv_coord`. f32-native (`ov_kv_cache`) — the OV-IR KV is
+    /// host-held `f32`, so the snapshot is byte-identical to a cold prefill.
+    kv_prefix_cache: crate::ov_kv_cache::OvMoeKvPrefixCache,
+    /// Worker ranks: `epoch → (prompt tokens, this rank's KV snapshot)`,
+    /// stashed on a CAPTURE frame and restored on a matching RESTORE. Bounded
+    /// by the prefix-cache capacity.
+    #[cfg(feature = "kv_coord")]
+    kv_capture:
+        std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
 }
 
 impl OvMoeEngine {
@@ -2708,6 +2756,7 @@ impl OvMoeEngine {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
+        kv_prefix_cache: crate::ov_kv_cache::OvMoeKvPrefixCache,
     ) -> Self {
         Self {
             runner,
@@ -2721,6 +2770,9 @@ impl OvMoeEngine {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            kv_prefix_cache,
+            #[cfg(feature = "kv_coord")]
+            kv_capture: std::collections::HashMap::new(),
         }
     }
 
@@ -2808,7 +2860,7 @@ impl OvMoeEngine {
         let h = self.runner.hidden_size() as u32;
         self.block_on(async {
             if sample_back {
-                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
             } else {
@@ -2874,15 +2926,63 @@ impl OvMoeEngine {
             return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
         }
 
-        // Prefill: feed every prompt token. The sample produced after the
-        // LAST prompt token is the first generated token — matching
-        // `OvMoeRunner::generate_timed`. Intermediate steps go as
-        // ForwardNoSample so their discarded tokens never enter the last
-        // rank's penalty history (see FrameKind::ForwardNoSample).
-        let mut pos = 0usize;
+        // Issue-34 consume (§8): same-chain warm-resume. On a kv-prefix-cache hit, restore the head's
+        // rank-0 slice and RESTORE the whole downstream chain (all-or-nothing); on success skip
+        // re-prefilling the matched prefix (`warm_prefix`). Any rank short ⇒ cold-reset local +
+        // downstream and cold-run. Runs after the admission RESET, before prefill. Inert unless
+        // kv_coord + cache enabled + a hit; `warm_prefix == 0` leaves prefill byte-identical to cold.
+        #[cfg(feature = "kv_coord")]
+        let warm_prefix: usize = if self.kv_prefix_cache.enabled() {
+            let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+            let fp = self.runner.fingerprint();
+            match self.kv_prefix_cache.lookup(&prompt64, &fp) {
+                Some(snap) => {
+                    let matched = snap.past_seq_len;
+                    // The workers stashed their slices under E = synth_epoch(the captured token
+                    // vector), and that captured vector is exactly this matched prefix (capture keys
+                    // on `full_tokens[..past_seq_len]`, see below). So the matched prefix hashes to
+                    // the workers' capture epoch; a partial/other match hashes elsewhere ⇒ verdict 0.
+                    let prefix32: Vec<i32> =
+                        prompt_ids[..matched].iter().map(|&t| t as i32).collect();
+                    let epoch = crate::kv_coordination::synth_epoch(&prefix32);
+                    let local_ok = self.runner.restore_kv(&snap).is_ok();
+                    if local_ok && self.forward_restore_downstream(epoch) {
+                        info!(
+                            task = %id,
+                            warm_prefix = matched,
+                            prompt_len = prompt_ids.len(),
+                            "multi-stage warm-resumed"
+                        );
+                        matched
+                    } else {
+                        warn!(task = %id, "multi-stage restore incomplete; cold reset");
+                        self.runner.reset();
+                        if let Err(e) = self.block_on(send_reset(&downstream)) {
+                            warn!(task = %id, "cold-fallback send_reset: {e}");
+                            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+                        }
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        #[cfg(not(feature = "kv_coord"))]
+        let warm_prefix: usize = 0;
+
+        // Prefill: feed every prompt token past the warm-resumed prefix. The
+        // sample produced after the LAST prompt token is the first generated
+        // token — matching `OvMoeRunner::generate_timed`. Intermediate steps go
+        // as ForwardNoSample so their discarded tokens never enter the last
+        // rank's penalty history (see FrameKind::ForwardNoSample). The cache
+        // lookup guarantees `warm_prefix < prompt_ids.len()`, so a suffix token
+        // always follows.
+        let mut pos = warm_prefix;
         let mut next: i64 = -1;
         let n_prompt = prompt_ids.len();
-        for (i, &t) in prompt_ids.iter().enumerate() {
+        for (i, &t) in prompt_ids.iter().enumerate().skip(warm_prefix) {
             let sample_back = i + 1 == n_prompt;
             match self.forward_one_token_first(t, pos, &cfg, &downstream, sample_back) {
                 Ok(tok_back) => next = tok_back,
@@ -2913,6 +3013,58 @@ impl OvMoeEngine {
             pos += 1;
         }
 
+        // Issue-34 §8: capture the post-turn KV across the whole chain so a later request extending
+        // this sequence can warm-resume. Snapshot the head's slice FIRST to learn the true KV depth —
+        // the final sampled token is never fed, so depth == (prompt + generated) - 1 — and key the
+        // capture epoch + prefix cache on exactly `full_tokens[..depth]`, so the workers' capture epoch
+        // and a future restore epoch agree (avoids the off-by-one that would silently NAK every warm
+        // resume). The head mints E = synth_epoch(captured), broadcasts CAPTURE(E, captured); each stage
+        // snapshots its slice under E and acks up; the head's single ack ⇒ every stage captured. Then
+        // seed the head's prefix cache. Best-effort: any error skips the cache (warm-pull degrades to
+        // cold) and never touches the already-served output.
+        #[cfg(feature = "kv_coord")]
+        if self.kv_prefix_cache.enabled() && !generated.is_empty() {
+            match self.runner.snapshot_kv() {
+                Ok(snap) => {
+                    let depth = snap.past_seq_len;
+                    let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
+                    full_tokens.extend(generated.iter().map(|&t| t as i32));
+                    if depth >= 1 && depth <= full_tokens.len() {
+                        let captured: Vec<i32> = full_tokens[..depth].to_vec();
+                        let epoch = crate::kv_coordination::synth_epoch(&captured);
+                        let acked = self.block_on(async {
+                            send_capture(&downstream, epoch, &captured)
+                                .await
+                                .map_err(|e| format!("send_capture: {e}"))?;
+                            match recv_kind_client(&downstream).await {
+                                Ok(Some(FrameKind::CaptureAck)) => {
+                                    recv_capture_ack_body_client(&downstream)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|e| format!("recv_capture_ack: {e}"))
+                                }
+                                Ok(Some(other)) => {
+                                    Err(format!("expected CaptureAck, got {other:?}"))
+                                }
+                                Ok(None) => Err("downstream closed during capture".into()),
+                                Err(e) => Err(format!("recv_kind (capture): {e}")),
+                            }
+                        });
+                        match acked {
+                            Ok(()) => {
+                                let fp = self.runner.fingerprint();
+                                let captured64: Vec<i64> =
+                                    captured.iter().map(|&t| i64::from(t)).collect();
+                                self.kv_prefix_cache.insert(captured64, &fp, snap);
+                            }
+                            Err(e) => warn!(task = %id, "kv multi-stage capture skipped: {e}"),
+                        }
+                    }
+                }
+                Err(e) => warn!(task = %id, "kv capture: snapshot_kv failed: {e}"),
+            }
+        }
+
         let n_tokens = generated.len() as u32;
         let text = self
             .tokenizer
@@ -2933,6 +3085,145 @@ impl OvMoeEngine {
         chunk.n_tokens = Some(n_tokens);
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(id, chunk)]
+    }
+
+    /// Snapshot this rank's KV under `epoch` for a later RESTORE. Bounded by the prefix-cache
+    /// capacity; on overflow an arbitrary older capture is evicted. Best-effort — a snapshot failure
+    /// just skips it (that rank's warm-pull degrades to cold).
+    #[cfg(feature = "kv_coord")]
+    fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>) {
+        if !self.kv_prefix_cache.enabled() {
+            return;
+        }
+        let snap = match self.runner.snapshot_kv() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "kv capture: snapshot_kv failed: {e}");
+                return;
+            }
+        };
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+            let Some(k) = self.kv_capture.keys().next().copied() else {
+                break;
+            };
+            self.kv_capture.remove(&k);
+        }
+        self.kv_capture.insert(epoch, (tokens, snap));
+    }
+
+    /// Broadcast RESTORE(epoch) down the chain; return the all-or-nothing verdict (true ⇒ every
+    /// downstream rank restored its slice). `total <= 1` or no downstream ⇒ true. Any transport error,
+    /// a non-`RestoreAck` reply, or verdict 0 ⇒ false ⇒ the caller cold-falls-back (never a partial
+    /// warm). Used by the head admission trigger in `step_first`.
+    #[cfg(feature = "kv_coord")]
+    fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
+        if self.total <= 1 {
+            return true;
+        }
+        let Some(down) = self.transport.downstream.clone() else {
+            return true;
+        };
+        let verdict = self.block_on(async {
+            send_restore(&down, epoch)
+                .await
+                .map_err(|e| format!("send_restore: {e}"))?;
+            match recv_kind_client(&down).await {
+                Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(&down)
+                    .await
+                    .map(|(_, v)| v == 1)
+                    .map_err(|e| format!("recv_restore_ack: {e}")),
+                Ok(Some(other)) => Err(format!("expected RestoreAck, got {other:?}")),
+                Ok(None) => Err("downstream closed during restore-ack".to_string()),
+                Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+            }
+        });
+        match verdict {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(rank = self.rank, epoch, "restore broadcast failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Worker CAPTURE handler: snapshot this stage's KV under the head-assigned `epoch`, relay CAPTURE
+    /// downstream (awaiting its ack), then ack upstream — so the head's single ack means every stage
+    /// captured.
+    #[cfg(feature = "kv_coord")]
+    fn handle_capture(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (epoch, tokens) = self
+            .block_on(recv_capture_body_server(upstream))
+            .map_err(|e| format!("recv_capture: {e}"))?;
+        self.capture_under_epoch(epoch, tokens.clone());
+        if let Some(down) = downstream {
+            self.block_on(async {
+                send_capture(down, epoch, &tokens)
+                    .await
+                    .map_err(|e| format!("send_capture: {e}"))?;
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("recv_capture_ack: {e}")),
+                    Ok(Some(other)) => Err(format!("expected CaptureAck downstream, got {other:?}")),
+                    Ok(None) => Err("downstream closed during capture-ack".into()),
+                    Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                }
+            })?;
+        }
+        self.block_on(send_capture_ack_upstream(upstream, epoch))
+            .map_err(|e| format!("send_capture_ack: {e}"))
+    }
+
+    /// Worker RESTORE handler: restore THIS rank's KV from its own capture stash under `epoch`, chain
+    /// RESTORE downstream, then ack upstream with the all-or-nothing verdict (local && downstream). Any
+    /// miss ⇒ verdict 0 ⇒ the head cold-resets the whole chain (never a partial restore).
+    #[cfg(feature = "kv_coord")]
+    fn handle_restore(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let epoch = self
+            .block_on(recv_restore_body_server(upstream))
+            .map_err(|e| format!("recv_restore: {e}"))?;
+        // `.get`+clone (not remove) — a repeat warm-resume over the same epoch may restore again.
+        let local_ok = match self.kv_capture.get(&epoch).cloned() {
+            Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+            None => false,
+        };
+        let down_ok = if self.is_last() {
+            true
+        } else if let Some(down) = downstream {
+            self.block_on(async {
+                send_restore(down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?;
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
+                        .await
+                        .map(|(_, v)| v == 1)
+                        .map_err(|e| format!("recv_restore_ack: {e}")),
+                    Ok(Some(other)) => Err(format!("expected RestoreAck downstream, got {other:?}")),
+                    Ok(None) => Err("downstream closed during restore-ack".into()),
+                    Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+                }
+            })
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        self.block_on(send_restore_ack_upstream(
+            upstream,
+            epoch,
+            u8::from(local_ok && down_ok),
+        ))
+        .map_err(|e| format!("send_restore_ack: {e}"))
     }
 
     /// Worker rank (rank > 0): service one frame from upstream per call.
@@ -2975,6 +3266,14 @@ impl OvMoeEngine {
             FrameKind::ForwardNoSample => {
                 self.handle_forward(&upstream, downstream.as_ref(), false)
             }
+            // Issue-34 §8: multi-stage capture/restore. CAPTURE snapshots this stage's KV under the
+            // head-assigned epoch and relays downstream; RESTORE restores it from the local stash and
+            // acks the all-or-nothing verdict upstream. Reuses the engine-agnostic `dist` codec (the
+            // frame carries only the epoch + token vector — KV bytes stay per-rank).
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Capture => self.handle_capture(&upstream, downstream.as_ref()),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::Restore => self.handle_restore(&upstream, downstream.as_ref()),
             other => Err(format!(
                 "worker received unsupported frame {other:?} (MiniMax-M2 has no spec-decode batching)"
             )),
@@ -2998,7 +3297,7 @@ impl OvMoeEngine {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
@@ -3026,7 +3325,12 @@ impl OvMoeEngine {
                 &sampling_cfg,
                 &mut self.last_rank_rng,
             );
-            self.last_rank_history.push(token);
+            // Only kept (generated) tokens enter the rep-penalty history — discarded prefill samples
+            // do not. Keeps the window generated-only (matching single-stage) so a warm-resumed run,
+            // which skips the prefill forwards, is byte-identical to a cold one.
+            if push_history {
+                self.last_rank_history.push(token);
+            }
             self.block_on(send_token_upstream(upstream, token))
                 .map_err(|e| format!("send_token: {e}"))?;
             Ok(())
@@ -3035,9 +3339,16 @@ impl OvMoeEngine {
             let h = self.runner.hidden_size() as u32;
             self.block_on(async {
                 if sample {
-                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
-                        .await
-                        .map_err(|e| format!("send_forward: {e}"))?;
+                    send_forward(
+                        down,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
                 } else {
                     send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
                         .await
@@ -3364,7 +3675,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         let h = self.runner.hidden_size() as u32;
         self.block_on(async {
             if sample_back {
-                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h])
+                send_forward(downstream, pos as u32, cfg, &hidden, [1, 1, h], true)
                     .await
                     .map_err(|e| format!("send_forward: {e}"))?;
             } else {
@@ -3916,7 +4227,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
         sample: bool,
     ) -> Result<(), String> {
-        let (past_seq_len, sampling_cfg, hidden_f32, _shape) = self
+        let (past_seq_len, sampling_cfg, push_history, hidden_f32, _shape) = self
             .block_on(recv_forward_body_server(upstream))
             .map_err(|e| format!("recv_forward_body: {e}"))?;
         let pos = past_seq_len as usize;
@@ -3975,9 +4286,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
             let reply_deadline = Self::reply_deadline();
             self.block_on(async {
                 if sample {
-                    send_forward(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
-                        .await
-                        .map_err(|e| format!("send_forward: {e}"))?;
+                    send_forward(
+                        down,
+                        past_seq_len,
+                        &sampling_cfg,
+                        &hidden,
+                        [1, 1, h],
+                        push_history,
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward: {e}"))?;
                 } else {
                     send_forward_nosample(down, past_seq_len, &sampling_cfg, &hidden, [1, 1, h])
                         .await

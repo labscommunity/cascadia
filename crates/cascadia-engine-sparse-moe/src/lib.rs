@@ -45,6 +45,7 @@ pub mod kv_coordination;
 pub mod kv_prefix_cache;
 pub mod manifest;
 pub mod ngram_draft;
+pub mod ov_kv_cache;
 pub mod ov_moe;
 pub mod runner;
 pub mod sampling;

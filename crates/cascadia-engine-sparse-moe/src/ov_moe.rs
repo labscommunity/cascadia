@@ -46,7 +46,9 @@ use tracing::info;
 
 use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 
+use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
+use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvSnapshot};
 use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Group size of the int4_bin quantization (cols per scale group).
@@ -516,6 +518,90 @@ impl OvMoeRunner {
         for k in &mut self.kv {
             k.reset();
         }
+    }
+
+    /// [`ModelFingerprint`] for this rank — the KV-prefix cache key. Same
+    /// rule as the K2.6 runner: any field that changes the KV bits (arch,
+    /// dims, this rank's layer slice) is baked in, so a snapshot from a
+    /// different model or rank can never be restored.
+    pub fn fingerprint(&self) -> ModelFingerprint {
+        let layer_start = self.layer_ids.first().copied().unwrap_or(0);
+        let layer_end = self.layer_ids.last().map(|&l| l + 1).unwrap_or(0);
+        ModelFingerprint {
+            arch: self.manifest.arch.clone(),
+            num_layers: self.manifest.num_layers,
+            num_experts: self.manifest.num_experts,
+            top_k: self.manifest.top_k,
+            hidden_size: self.manifest.hidden_size,
+            num_kv_heads: self.manifest.num_kv_heads,
+            qk_head_dim: self.manifest.qk_head_dim,
+            v_head_dim: self.manifest.v_head_dim,
+            vocab_size: self.manifest.vocab_size,
+            layer_start,
+            layer_end,
+            is_first: self.is_first,
+            is_last: self.is_last,
+        }
+    }
+
+    /// Snapshot this rank's KV (only its owned layers) into an
+    /// [`OvMoeKvSnapshot`]. The `f32` buffers are cloned verbatim — no
+    /// precision loss — so a later [`Self::restore_kv`] is bit-identical to
+    /// a cold prefill. Every owned layer must agree on `seq` (they advance
+    /// in lockstep through `forward_layers`); a mismatch is an engine bug,
+    /// not recoverable state.
+    pub fn snapshot_kv(&self) -> Result<OvMoeKvSnapshot, OvMoeError> {
+        let ps = match self.kv.first() {
+            Some(l) => l.seq,
+            None => {
+                return Err(OvMoeError::Internal(
+                    "snapshot_kv: rank holds no layers".into(),
+                ))
+            }
+        };
+        for (idx, l) in self.kv.iter().enumerate() {
+            if l.seq != ps {
+                return Err(OvMoeError::Internal(format!(
+                    "snapshot_kv: layer {idx} seq {} != expected {ps}",
+                    l.seq
+                )));
+            }
+        }
+        let layers = self
+            .kv
+            .iter()
+            .map(|l| OvLayerKvSlice {
+                k: l.k.clone(),
+                v: l.v.clone(),
+                seq: l.seq,
+            })
+            .collect();
+        Ok(OvMoeKvSnapshot {
+            past_seq_len: ps,
+            layers,
+        })
+    }
+
+    /// Restore a previously-captured snapshot into this rank's KV. The
+    /// snapshot must have one slice per owned layer (fingerprint check
+    /// upstream guarantees the same rank/model; this is defence in depth).
+    /// After Ok, every layer's `seq` equals the snapshot's `past_seq_len`
+    /// and the next `forward_layers` writes its slot at that offset —
+    /// exactly as after a fresh prefill of the matched prefix.
+    pub fn restore_kv(&mut self, snap: &OvMoeKvSnapshot) -> Result<(), OvMoeError> {
+        if snap.layers.len() != self.kv.len() {
+            return Err(OvMoeError::Internal(format!(
+                "restore_kv: snapshot has {} layers, rank owns {}",
+                snap.layers.len(),
+                self.kv.len()
+            )));
+        }
+        for (dst, src) in self.kv.iter_mut().zip(&snap.layers) {
+            dst.k = src.k.clone();
+            dst.v = src.v.clone();
+            dst.seq = src.seq;
+        }
+        Ok(())
     }
 
     pub fn eos_token_ids(&self) -> &[u32] {

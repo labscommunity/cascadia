@@ -83,7 +83,7 @@ async fn dsv4_three_rank_mid_relay_matches_reference() {
         let c01b = c01.clone();
         let cfgb = cfg.clone();
         let st = tokio::spawn(async move {
-            send_forward(&c01b, pos as u32, &cfgb, &hid, [1, 1, h])
+            send_forward(&c01b, pos as u32, &cfgb, &hid, [1, 1, h], true)
                 .await
                 .unwrap();
         });
@@ -92,13 +92,13 @@ async fn dsv4_three_rank_mid_relay_matches_reference() {
             recv_kind_server(s01).await.unwrap(),
             Some(FrameKind::Forward)
         );
-        let (_p, _c, hw, _s) = recv_forward_body_server(s01).await.unwrap();
+        let (_p, _c, _ph, hw, _s) = recv_forward_body_server(s01).await.unwrap();
         st.await.unwrap();
         let hmid = r1.forward_layers(hw, pos, None);
         let c12b = c12.clone();
         let cfgb = cfg.clone();
         let st2 = tokio::spawn(async move {
-            send_forward(&c12b, pos as u32, &cfgb, &hmid, [1, 1, h])
+            send_forward(&c12b, pos as u32, &cfgb, &hmid, [1, 1, h], true)
                 .await
                 .unwrap();
         });
@@ -107,7 +107,7 @@ async fn dsv4_three_rank_mid_relay_matches_reference() {
             recv_kind_server(s12).await.unwrap(),
             Some(FrameKind::Forward)
         );
-        let (_p2, _c2, hw2, _s2) = recv_forward_body_server(s12).await.unwrap();
+        let (_p2, _c2, _ph2, hw2, _s2) = recv_forward_body_server(s12).await.unwrap();
         st2.await.unwrap();
         let hlast = r2.forward_layers(hw2, pos, None);
         argmax(&r2.head_logits(&hlast))
