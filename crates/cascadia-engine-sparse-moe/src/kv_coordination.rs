@@ -250,6 +250,20 @@ impl KvCoordination for SparseMoEEngine {
         self.kv_prefix_cache.insert(prefix, &fp, snap);
         Ok(())
     }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        // Plane-driven warm-resume: restore the head's own rank-0 slice staged under `epoch`, then
+        // RESTORE the whole downstream chain (all-or-nothing). Mirrors the worker RESTORE handler's
+        // local apply. A head-local miss ⇒ false (the caller cold-runs; never a partial restore).
+        let local_ok = match self.kv_capture.get(&epoch).cloned() {
+            Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+            None => false,
+        };
+        if !local_ok {
+            return false;
+        }
+        self.forward_restore_downstream(epoch)
+    }
 }
 
 /// Shared handle to the holder-side snapshot cache. The engine mirrors its captures here; the holder
