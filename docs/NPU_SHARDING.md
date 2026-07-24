@@ -100,9 +100,12 @@ sequential path). **Chunks are capped at the KV window** (`chunk_take`): a
 single chunk-wide mask cannot express the per-token eviction the seq=1
 sliding window performs, so any prompt tail whose rows would sit past
 position `static_context − 1` steps one token at a time through the decode
-model. Chunked output is therefore token-identical to the tokenwise path in
-every regime, including prompts longer than the window (which degrade to the
-same warned sliding-window behavior either way).
+model. So the cap itself adds no divergence beyond what the seq=1 sliding
+window already does, in every regime — including prompts longer than the window
+(both degrade to the same warned behavior). Output is *near-tie-tolerant*
+parity, not guaranteed token-identical: the seq=`C` prefill graph and the seq=1
+graph accumulate FP differently, so greedy decoding can fork at an argmax
+near-tie (see `assert_parity`).
 
 The prefill variant compiles on **`--prefill-device`** when given — this is the
 hybrid split (see `docs/perf/HYBRID_NPU_CPU.md`):

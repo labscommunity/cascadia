@@ -91,8 +91,10 @@ CASCADIA_STATIC_SHARDS=./l32-1b-npu CASCADIA_PREFILL_DEVICE=NPU \
 Lunar Lake AI PC (Core Ultra 7 258V, 32 GB LPDDR5X, Windows), OpenVINO GenAI
 2026.1 SDK, Llama-3.2-1B-Instruct INT4 single-stage static shard
 (`--static-context 1024 --static-prefill-seq 64`), greedy, 32 new tokens,
-release build, 2026-07-14. Every row produced token-identical output
-(`static_prefill_parity` asserts it).
+release build, 2026-07-14. Every row of that run produced token-identical
+output — but the parity check is near-tie-tolerant (see the parity bullet
+below), so token-identity is the observed result for these prompts, not a
+guarantee: a later 1B/CPU run forked ~token 30.
 
 **Short prompt (~31 tokens → 1 chunk):**
 
@@ -114,8 +116,9 @@ the skip-unused-logits + buffer-reuse fixes cut hybrid TTFT a further ~27%):
 | **hybrid `[NPU prefill + CPU decode]`** | **687 ms** | 18.80 | **33.4×** |
 
 **Over-window prompt (~1200 tokens > the 1023-slot window)** — the parity-cap
-regime: the first 1023 rows chunk, the ~177-token tail steps tokenwise, and
-all three configs stay token-identical (this leg diverged before the cap):
+regime: the first 1023 rows chunk, the ~177-token tail steps tokenwise. All
+three configs produced identical output in this run (no near-tie fork within
+the generated span):
 
 | Config | TTFT | Decode tok/s | TTFT vs tokenwise |
 |---|---|---|---|
@@ -244,7 +247,8 @@ routes around it — the first three measured on pawan-01 (32 GB LNL):
    NPUW_WEIGHTS_BANK=bank0, NPUW_HOST_GATHER=YES` at compile makes NPUW
    detect the 32 repeated decoder blocks and compile ONE function body:
    the monolithic 8B compiled on-box at ~21.5 GB peak (floor 5.4 GB free),
-   token-exact parity, chunked NPU prefill TTFT **1.71 s** (short prompt).
+   greedy output matched the baseline in that run (near-tie-tolerant parity),
+   chunked NPU prefill TTFT **1.71 s** (short prompt).
    Decode through the folded/DCOFF model is only **1.16–1.19 tok/s** (DCOFF
    expands weights to f16 → 2× decode bytes, plus per-layer funcall
    overhead) — so use folding for PREFILL and decode on CPU/GPU (needs
@@ -303,8 +307,9 @@ on-box NPU compile (or move the compile off-box / behind NPUW folding), and
 - Chunks are capped at the KV window: only rows whose absolute position stays
   ≤ `static_context − 1` run chunked; an over-window prompt tail steps
   tokenwise through the decode model (a chunk-wide mask cannot express
-  per-token eviction), keeping chunked output token-identical to the seq=1
-  path in every regime. So the chunked speedup applies to the first
+  per-token eviction), so the cap adds no divergence beyond the seq=1 path's
+  own eviction in any regime (greedy tokens can still fork at an argmax
+  near-tie — see `assert_parity`). So the chunked speedup applies to the first
   `static_context − 1` prompt tokens — size `--static-context` to your
   prompts.
 - Very short prompts (≲ C/8 tokens) may not gain: they pay one padded C-wide

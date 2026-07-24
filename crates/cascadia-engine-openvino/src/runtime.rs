@@ -1308,10 +1308,12 @@ impl OvRuntimeEngine {
                 // the bandwidth-lean seq=1 decode loop. Chunks are CAPPED at
                 // the KV window (`chunk_take`): any prompt tail whose rows
                 // would sit past `past_len` steps one token at a time through
-                // the decode model, keeping chunked output token-identical to
-                // the seq=1 path in every regime, including over-window
-                // prompts. The token from the final real row is the first
-                // generated token, exactly as in the seq=1 path.
+                // the decode model, so the cap itself introduces no divergence
+                // from the seq=1 path in any regime, including over-window
+                // prompts (the KV ring state matches; greedy tokens can still
+                // fork at an argmax near-tie — see `assert_parity`). The token
+                // from the final real row is the first generated token, exactly
+                // as in the seq=1 path.
                 let c = self.prefill.as_ref().map(|p| p.seq).unwrap_or(1);
                 let past_len = self.static_kv.as_ref().map(|sk| sk.past_len).unwrap_or(0);
                 let mut nt = 0i32;

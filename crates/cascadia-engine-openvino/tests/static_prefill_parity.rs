@@ -2,11 +2,13 @@
 //!
 //! Proves the load-bearing property of the hybrid NPU+CPU split: a run that
 //! prefills through the chunked variant (optionally on a DIFFERENT device)
-//! must produce token-for-token the same greedy output as the legacy
-//! one-token-per-step static path — i.e. the shared host KV ring hands the
-//! decode loop identical state no matter which device (or window width)
-//! filled it. Also prints TTFT + decode tok/s per config, so on hardware it
-//! doubles as the phase-split bench.
+//! reconstructs the same host KV ring state as the legacy one-token-per-step
+//! static path, so its greedy output matches *modulo argmax near-tie forks*
+//! (the seq=C prefill graph and the seq=1 decode graph accumulate FP
+//! differently — see `assert_parity`). The byte-identical ring bookkeeping is
+//! proven by the ring-math unit tests; this test adds the on-hardware
+//! end-to-end check and prints TTFT + decode tok/s per config, so it doubles
+//! as the phase-split bench.
 //!
 //! Needs real OpenVINO + a SINGLE-STAGE static export with a prefill variant:
 //!
@@ -22,9 +24,10 @@
 //! `CASCADIA_PREFILL_DEVICE` (prefill device for the chunked run — set NPU
 //! on an AI PC for the hybrid split; default = decode device),
 //! `CASCADIA_STATIC_PROMPT`, `CASCADIA_STATIC_MAX_NEW` (default 32),
-//! `CASCADIA_PARITY_SOFT=1` (report a token divergence instead of failing —
-//! for GPU / cross-device perf sweeps where greedy near-ties legitimately
-//! fork; see `assert_parity`).
+//! `CASCADIA_PARITY_SOFT=1` (tolerate even an EARLY fork — one within the first
+//! `NEAR_TIE_MIN_PREFIX` decoded tokens, which otherwise hard-fails as suspect
+//! corruption; late near-tie forks are already tolerated by default. For pure
+//! timing sweeps; see `assert_parity`).
 //! Unset `CASCADIA_STATIC_SHARDS` ⇒ skip-pass (stub CI stays green).
 //! Multi-stage pipelines are exercised on hardware via `cascadia worker`
 //! (`--prefill-device`), not here.
