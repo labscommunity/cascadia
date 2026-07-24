@@ -1286,6 +1286,9 @@ pub struct OvDistSpecEngine {
     /// coordination-plane fingerprint. `kv_coord` only.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Lock-free holder mirror of `kv` so a busy driver still answers cross-chain pulls.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
 }
@@ -1468,6 +1471,15 @@ impl Engine for OvDistSpecEngine {
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            // Same fp the engine advertises via `model_fingerprint()` (model-level; see kv_fingerprint).
+            model_fp: self.kv_fingerprint(),
+        }))
     }
 }
 
@@ -1895,6 +1907,10 @@ impl Builder for OvDistSpecBuilder {
             active: None,
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
+            #[cfg(feature = "kv_coord")]
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
         }))
     }
 }
@@ -1908,14 +1924,15 @@ pub struct OvDistSpecWorkerEngine {
     upstream: Arc<tokio::sync::Mutex<ActivationServer>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
-    /// Issue-34: opaque KV blob cache + this rank's identity (model id + rank) for the
-    /// coordination-plane fingerprint. `kv_coord` only.
+    /// Issue-34: opaque KV blob cache + a model-level id for the coordination-plane fingerprint.
+    /// `kv_coord` only.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
+    /// Lock-free holder mirror of `kv` so a busy worker still answers cross-chain per-rank GETs.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::kv_coordination::SharedKvCache,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
-    #[cfg(feature = "kv_coord")]
-    kv_rank: u32,
 }
 
 impl Engine for OvDistSpecWorkerEngine {
@@ -1983,6 +2000,16 @@ impl Engine for OvDistSpecWorkerEngine {
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::kv_coordination::OvKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            // Same model-level fp the engine advertises (see kv_fingerprint) so the pull's single
+            // asserted fingerprint matches this rank's GET.
+            model_fp: self.kv_fingerprint(),
+        }))
+    }
 }
 
 impl OvDistSpecWorkerEngine {
@@ -2036,7 +2063,14 @@ impl OvDistSpecWorkerEngine {
                 // Compact this rank's KV with the driver's mask (shared across the target chain).
                 if let Ok(blob) = self.runtime.get_state_blob() {
                     match crate::kv_coordination::kv_compact_blob(&blob, &valid) {
-                        Some(blob) => self.kv.capture_under_epoch(epoch, tokens.clone(), blob),
+                        Some(blob) => {
+                            // Mirror into the lock-free holder cache so this rank serves its slice unblocked.
+                            self.kv_share
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .capture_under_epoch(epoch, tokens.clone(), blob.clone());
+                            self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                        }
                         None => warn!("ov-dist-spec worker: KV compaction failed; skip capture"),
                     }
                 }
@@ -2464,9 +2498,11 @@ impl Builder for OvDistSpecWorkerBuilder {
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
-            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
+            kv_share: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::kv_coordination::OvKvCache::default(),
+            )),
             #[cfg(feature = "kv_coord")]
-            kv_rank: self.rank,
+            kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
         }))
     }
 }
@@ -2476,10 +2512,12 @@ impl Builder for OvDistSpecWorkerBuilder {
 #[cfg(feature = "kv_coord")]
 impl OvDistSpecEngine {
     /// head = rank 0 (holds draft + target stage0); workers are ranks 1.. .
+    /// MODEL-level fp (the target pipeline dir — identical on every rank of a chain), NOT per-rank: a
+    /// cross-chain pull asserts ONE fingerprint (the entry head's) for every rank's GET, so a per-rank
+    /// fp would reject rank>0. Mirrors qwen36 (fcd3e4e). Identical sharding across chains guards the
+    /// stage span, replacing the dropped per-rank component.
     fn kv_fingerprint(&self) -> u64 {
-        let mut buf = self.kv_model_id.clone().into_bytes();
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        crate::kv_coordination::fnv1a64(&buf)
+        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
     }
     /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
     /// the target chain so every worker rank stashes its slice. Best-effort.
@@ -2502,6 +2540,11 @@ impl OvDistSpecEngine {
         if let Err(e) = self.target.capture_downstream(epoch, &tokens) {
             warn!(error = %e, "ov-dist-spec: CAPTURE broadcast failed (best-effort)");
         }
+        // Mirror into the lock-free holder cache so a busy driver serves this turn's KV unblocked.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capture(tokens.clone(), blob.clone());
         self.kv.capture(tokens, blob);
     }
 
@@ -2621,10 +2664,10 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
 
 #[cfg(feature = "kv_coord")]
 impl OvDistSpecWorkerEngine {
+    /// MODEL-level fp — identical on every rank so a cross-chain pull's single asserted fingerprint
+    /// matches rank>0 GETs. See the driver's `kv_fingerprint` for the full rationale (fcd3e4e).
     fn kv_fingerprint(&self) -> u64 {
-        let mut buf = self.kv_model_id.clone().into_bytes();
-        buf.extend_from_slice(&self.kv_rank.to_le_bytes());
-        crate::kv_coordination::fnv1a64(&buf)
+        crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
     }
     fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
         let up = self.upstream.clone();
