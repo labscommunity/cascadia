@@ -213,19 +213,30 @@ fn send_burst_bytes() -> usize {
     *V.get_or_init(|| parse_send_burst(std::env::var("CASCADIA_SEND_BURST_BYTES").ok().as_deref()))
 }
 
-/// Parse the CASCADIA_SEND_BURST_BYTES knob. Unset or `0` → pacing OFF; any
-/// other value is clamped up to 64 KiB (so a 256 MiB frame can't turn into
-/// millions of 2 ms sleeps and blow the receiver's whole-frame deadline). A
-/// set-but-unparseable value (`256k`, a trailing space, …) is warned about and
-/// treated as OFF — otherwise the operator fat-fingering the one knob they
-/// reach for *while chasing an intermittent wedge* gets silence, and "off
-/// because default" is indistinguishable from "off because I mistyped it".
+/// Parse the CASCADIA_SEND_BURST_BYTES knob. Unset or `0` → pacing OFF; a value
+/// below the 64 KiB floor is clamped UP to 64 KiB (so a 256 MiB frame can't turn
+/// into millions of 2 ms sleeps and blow the receiver's whole-frame deadline);
+/// anything at/above the floor is used verbatim. Both a set-but-unparseable
+/// value (`256k`, a trailing space, …) AND a silently-clamped small value are
+/// warned about — otherwise the operator fat-fingering the one knob they reach
+/// for *while chasing an intermittent wedge* gets silence: "off because default"
+/// vs "off because I mistyped it", or "I set 4 KiB" vs "it actually ran 64 KiB".
 fn parse_send_burst(raw: Option<&str>) -> usize {
+    const FLOOR: usize = 64 * 1024;
     match raw {
         None => 0,
         Some(s) => match s.parse::<usize>() {
             Ok(0) => 0,
-            Ok(v) => v.max(64 * 1024),
+            Ok(v) if v < FLOOR => {
+                tracing::warn!(
+                    value = v,
+                    floor = FLOOR,
+                    "CASCADIA_SEND_BURST_BYTES is below the 64 KiB floor; clamped \
+                     up to 65536 (a sub-64 KiB burst wasn't actually tested)"
+                );
+                FLOOR
+            }
+            Ok(v) => v,
             Err(_) => {
                 tracing::warn!(
                     value = %s,
