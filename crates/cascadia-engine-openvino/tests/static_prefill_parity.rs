@@ -395,8 +395,8 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
 
     // Parking (CASCADIA_PARK=1): two sequential tasks through one engine
     // with --park-prefill semantics — task 1 parks after prefill, task 2
-    // pays the reload (visible in its TTFT). Both must stay token-identical
-    // to the baseline.
+    // pays the reload (visible in its TTFT). Both must stay in parity with the
+    // baseline (near-tie-tolerant; see `assert_parity`).
     if std::env::var("CASCADIA_PARK").is_ok_and(|v| v == "1") {
         let pd = prefill_device.as_deref();
         let outs = run_tasks(&shards, &device, pd, false, true, &prompt, max_new, 2).await;
