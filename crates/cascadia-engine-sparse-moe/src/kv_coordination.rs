@@ -19,7 +19,7 @@ use cascadia_engine::KvCoordination;
 use cascadia_kv_wire::{LayerMeta, Manifest, PartnerId, KV_LAYOUT_VERSION, SCHEMA_VERSION};
 
 use crate::engine::SparseMoEEngine;
-use crate::kv_prefix_cache::{KvSnapshot, LayerKvSlice};
+use crate::kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 
 /// KV codec/engine revision — bump on any change to the snapshot buffer layout. Producer (export) and
 /// consumer (`consumer_engine_rev`) both read this, so the codec's engine-rev guard is self-consistent.
@@ -241,8 +241,109 @@ impl KvCoordination for SparseMoEEngine {
         }
         let fp = self.runner.fingerprint();
         let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
+        // Mirror into the holder cache so a busy engine still serves this prefix lock-free.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .insert(prefix.clone(), &fp, snap.clone());
         self.kv_prefix_cache.insert(prefix, &fp, snap);
         Ok(())
+    }
+}
+
+/// Shared handle to the holder-side snapshot cache. The engine mirrors its captures here; the holder
+/// reads it without ever taking the engine lock (so a busy node still answers a pull).
+pub(crate) type SharedHolderCache = std::sync::Arc<std::sync::Mutex<SparseHolderState>>;
+
+/// Holder-side mirror of the engine's KV caches: the content-keyed prefix cache, the NEGOTIATE→GET
+/// offers, and the multi-stage captures. Populated alongside the engine's own caches so
+/// [`SparseMoeKvHolder`] can serve NEGOTIATE/GET without the engine lock.
+pub(crate) struct SparseHolderState {
+    /// Mirror of the engine's `kv_prefix_cache`. `pub(crate)` so the engine's store sites mirror here.
+    pub(crate) prefix: KvPrefixCache,
+    /// Holder-internal NEGOTIATE→GET correlation (mirror of the engine's `kv_offers`).
+    offers: std::collections::HashMap<u64, (Vec<i32>, KvSnapshot)>,
+    /// Mirror of the engine's `kv_capture` (multi-stage per-rank captures). `pub(crate)` for mirroring.
+    pub(crate) captures: std::collections::HashMap<u64, (Vec<i32>, KvSnapshot)>,
+    /// Fingerprint snapshotted at holder creation (the prefix cache's lookup key).
+    fp: ModelFingerprint,
+}
+
+impl SparseHolderState {
+    pub(crate) fn new(capacity: usize, fp: ModelFingerprint) -> Self {
+        Self {
+            prefix: KvPrefixCache::new(capacity),
+            offers: std::collections::HashMap::new(),
+            captures: std::collections::HashMap::new(),
+            fp,
+        }
+    }
+}
+
+/// Lock-free [`cascadia_engine::KvSnapshotHolder`] over a [`SharedHolderCache`]. Serves NEGOTIATE/GET
+/// by locking ONLY the holder cache — which inference touches only briefly at capture, not across the
+/// forward pass — so the holder never starves on the engine lock the live generation holds. `model_fp`
+/// is the engine's static stage fingerprint digest, snapshotted at handle creation.
+pub(crate) struct SparseMoeKvHolder {
+    pub(crate) cache: SharedHolderCache,
+    pub(crate) model_fp: u64,
+}
+
+impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
+    fn model_fingerprint(&self) -> u64 {
+        self.model_fp
+    }
+
+    fn lookup(&self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        // Replicates `KvCoordination::lookup` against the mirrored holder cache.
+        let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.prefix.enabled() {
+            return None; // capacity-0 (e.g. total>1, sharded) — nothing to offer
+        }
+        // Clone the fingerprint so `g.prefix` can take the `&mut` borrow the lookup needs while `g.fp`
+        // is read — a simultaneous field split isn't possible through the mutex guard's Deref.
+        let fp = g.fp.clone();
+        let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
+        let snap = g.prefix.lookup(&prompt, &fp)?;
+        let len = snap.past_seq_len;
+        let prefix = token_ids.get(..len)?.to_vec();
+        let epoch = synth_epoch(&prefix);
+        if g.offers.len() >= KV_MAX_OFFERS {
+            // Drop an arbitrary stale offer (bounded growth; offers are short-lived NEGOTIATE→GET).
+            if let Some(k) = g.offers.keys().next().copied() {
+                g.offers.remove(&k);
+            }
+        }
+        g.offers.insert(epoch, (prefix, snap));
+        Some((epoch, len as u32))
+    }
+
+    fn export(
+        &self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        // Replicates `KvCoordination::export` against the mirrored holder cache.
+        let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (prefix, snap) = if let Some(off) = g.offers.remove(&expected_epoch) {
+            off
+        } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
+            (tokens.clone(), snap.clone())
+        } else {
+            return None;
+        };
+        if snap.past_seq_len as u32 != expected_len {
+            return None; // drifted from what was negotiated
+        }
+        Some(snapshot_to_wire(
+            &prefix,
+            &snap,
+            partner,
+            self.model_fp,
+            expected_epoch,
+        ))
     }
 }
 

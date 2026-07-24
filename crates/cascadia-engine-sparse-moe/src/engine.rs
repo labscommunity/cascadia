@@ -865,6 +865,16 @@ impl Builder for SparseMoEBuilder {
                 );
             }
         }
+        // Snapshot the holder mirror before the struct literal moves `runner` / `kv_prefix_cache`
+        // (fingerprint()/capacity() are `&self`; the struct-literal field shorthands below would
+        // otherwise move them first).
+        #[cfg(feature = "kv_coord")]
+        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::kv_coordination::SparseHolderState::new(
+                kv_prefix_cache.capacity(),
+                runner.fingerprint(),
+            ),
+        ));
         Ok(Box::new(SparseMoEEngine {
             runner,
             tokenizer: self.tokenizer,
@@ -884,6 +894,8 @@ impl Builder for SparseMoEBuilder {
             kv_offers: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
             kv_capture: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_share,
         }))
     }
 }
@@ -1090,6 +1102,11 @@ pub struct SparseMoEEngine {
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_capture:
         std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+    /// Issue-34 Option C (holder mirror): the lock-free snapshot cache the [`crate::kv_coordination::
+    /// SparseMoeKvHolder`] serves from. Populated alongside `kv_prefix_cache` / `kv_offers` /
+    /// `kv_capture` so a busy engine answers cross-chain KV pulls without the engine lock.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_share: crate::kv_coordination::SharedHolderCache,
 }
 
 impl SparseMoEEngine {
@@ -1218,6 +1235,17 @@ impl Engine for SparseMoEEngine {
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         // Issue-34 Option C: the sparse-MoE engine holds a `KvPrefixCache`, so it participates.
         Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        // Lock-free holder over the mirrored snapshot cache; a pull never contends the engine lock.
+        Some(std::sync::Arc::new(
+            crate::kv_coordination::SparseMoeKvHolder {
+                cache: std::sync::Arc::clone(&self.kv_share),
+                model_fp: self.runner.fingerprint().digest(),
+            },
+        ))
     }
 
     fn close(&mut self) {
@@ -1480,8 +1508,13 @@ impl SparseMoEEngine {
                 Ok(()) => {
                     if let Ok(snap) = self.runner.snapshot_kv() {
                         let fp = self.runner.fingerprint();
-                        let prompt64: Vec<i64> =
-                            full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        let prompt64: Vec<i64> = full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        // Mirror into the holder cache so a busy engine still serves this prefix.
+                        self.kv_share
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .prefix
+                            .insert(prompt64.clone(), &fp, snap.clone());
                         self.kv_prefix_cache.insert(prompt64, &fp, snap);
                     }
                 }
@@ -2129,6 +2162,18 @@ impl SparseMoEEngine {
                 break;
             };
             self.kv_capture.remove(&k);
+        }
+        // Mirror into the holder cache, bounded by the SAME `cap` as `kv_capture` above — else the
+        // holder mirror grows one ~GiB snapshot per epoch forever while the engine's map stays bounded.
+        {
+            let mut g = self.kv_share.lock().unwrap_or_else(|e| e.into_inner());
+            while g.captures.len() >= cap && !g.captures.contains_key(&epoch) {
+                let Some(k) = g.captures.keys().next().copied() else {
+                    break;
+                };
+                g.captures.remove(&k);
+            }
+            g.captures.insert(epoch, (tokens.clone(), snap.clone()));
         }
         self.kv_capture.insert(epoch, (tokens, snap));
     }
