@@ -31,8 +31,8 @@ use crate::dist::{
     forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
     recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
     send_cache_prefix, send_forward, send_forward_batch, send_forward_batch_prefill,
-    send_forward_nosample, send_forward_prefill, send_reset, send_restore_prefix,
-    send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
+    send_restore_prefix, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -2075,10 +2075,12 @@ impl SparseMoEEngine {
                 "rank {} received unexpected TOKEN_BATCH from upstream",
                 self.rank
             )),
-            FrameKind::ForwardBatchPrefill => Err(format!(
-                "rank {} received ForwardBatchPrefill (Rust-shell prefill batching only)",
-                self.rank
-            )),
+            FrameKind::ForwardBatchPrefill | FrameKind::ForwardBatchPrefillNoSample => {
+                Err(format!(
+                    "rank {} received ForwardBatchPrefill (Rust-shell prefill batching only)",
+                    self.rank
+                ))
+            }
             FrameKind::RestorePrefix | FrameKind::CachePrefix => Err(format!(
                 "rank {} received a KV-prefix-cache frame (glm5 pipeline engine only)",
                 self.rank
@@ -3047,20 +3049,30 @@ impl<R: StagedRunner> PipelineEngine<R> {
             } else {
                 0
             };
-            // One ForwardBatchPrefill for the suffix: each rank runs its slice
-            // batched (batch-union MoE) starting at position `reuse`; the last
-            // rank samples only the final position — the first generated token.
-            match self.forward_prompt_batch_first(
-                &prompt_ids[reuse..n_prefill],
-                reuse,
-                &cfg,
-                &downstream,
-            ) {
-                Ok(tok_back) => next = tok_back,
-                Err(e) => {
-                    warn!(task = %id, "batched prefill failed: {e}");
-                    return Some(vec![(id.clone(), Chunk::error(id, e))]);
+            // Prefill the suffix in windows of at most MAX_BATCH_COUNT rows (the
+            // wire caps one ForwardBatch at MAX_BATCH_COUNT, since it was built for
+            // spec-decode K). KV accumulates across windows exactly as it would
+            // token-by-token; every window but the last is NoSample, and only the
+            // final ForwardBatchPrefill samples the first generated token — so no
+            // mid-prompt row is recorded into the last rank's rep-penalty history.
+            let suffix = &prompt_ids[reuse..n_prefill];
+            let win = crate::dist::MAX_BATCH_COUNT as usize;
+            let n_windows = suffix.len().div_ceil(win);
+            let mut wbase = reuse;
+            for (wi, chunk) in suffix.chunks(win).enumerate() {
+                let is_last = wi + 1 == n_windows;
+                match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last) {
+                    Ok(tok_back) => {
+                        if is_last {
+                            next = tok_back;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(task = %id, "batched prefill window {wi} failed: {e}");
+                        return Some(vec![(id.clone(), Chunk::error(id, e))]);
+                    }
                 }
+                wbase += chunk.len();
             }
             pos = n_prefill;
         } else {
@@ -3288,7 +3300,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
             FrameKind::ForwardBatchPrefill => {
                 // Batched prompt prefill (Rust shell). Fatal on error, like the
                 // other prefill frames: a KV hole would corrupt the whole run.
-                let res = self.handle_forward_batch_prefill(&upstream, downstream.as_ref());
+                let res = self.handle_forward_batch_prefill(&upstream, downstream.as_ref(), true);
+                if res.is_err() {
+                    self.peer_disconnected = true;
+                }
+                res
+            }
+            FrameKind::ForwardBatchPrefillNoSample => {
+                // An intermediate window of a prompt longer than MAX_BATCH_COUNT:
+                // advance KV over the rows, sample nothing. Same fatal-on-error.
+                let res = self.handle_forward_batch_prefill(&upstream, downstream.as_ref(), false);
                 if res.is_err() {
                     self.peer_disconnected = true;
                 }
@@ -3432,6 +3453,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        sample: bool,
     ) -> Result<(), String> {
         let (base, batch_count, sampling_cfg, hidden_f32, in_shape) = self
             .block_on(recv_forward_batch_body_server(upstream))
@@ -3462,6 +3484,15 @@ impl<R: StagedRunner> PipelineEngine<R> {
         }
         let h = self.runner.forward_layers_batch(hidden_f32, base, rows);
         if self.is_last() {
+            if !sample {
+                // Intermediate window: KV is advanced above; sample nothing and
+                // record nothing (recording mid-prompt rows would poison the
+                // rep-penalty history). Reply with a dummy Token(-1) ack so the
+                // driver can pipeline the next window.
+                return self
+                    .block_on(send_token_upstream(upstream, -1))
+                    .map_err(|e| format!("send_token (batch prefill nosample): {e}"));
+            }
             let last = (rows - 1) * hidden;
             let logits = self.runner.head_logits(&h[last..last + hidden]);
             if !self.last_rank_rng_seeded {
@@ -3480,16 +3511,31 @@ impl<R: StagedRunner> PipelineEngine<R> {
         } else {
             let down = downstream.ok_or("mid rank missing downstream")?;
             self.block_on(async {
-                send_forward_batch_prefill(
-                    down,
-                    base as u32,
-                    batch_count,
-                    &sampling_cfg,
-                    &h,
-                    [1, batch_count, hidden as u32],
-                )
-                .await
-                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                // Relay with the matching kind so the last rank knows whether to
+                // sample this window.
+                if sample {
+                    send_forward_batch_prefill(
+                        down,
+                        base as u32,
+                        batch_count,
+                        &sampling_cfg,
+                        &h,
+                        [1, batch_count, hidden as u32],
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                } else {
+                    send_forward_batch_prefill_nosample(
+                        down,
+                        base as u32,
+                        batch_count,
+                        &sampling_cfg,
+                        &h,
+                        [1, batch_count, hidden as u32],
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
+                }
                 match recv_kind_client(down).await {
                     Ok(Some(FrameKind::Token)) => {
                         let t = recv_token_body_client(down)
@@ -3517,6 +3563,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         base: usize,
         cfg: &crate::sampling::SamplingConfig,
         downstream: &Arc<TokioMutex<ActivationClient>>,
+        sample: bool,
     ) -> Result<i64, String> {
         let hidden = self.runner.hidden_size();
         let rows = prompt.len();
@@ -3524,21 +3571,36 @@ impl<R: StagedRunner> PipelineEngine<R> {
         for (r, &t) in prompt.iter().enumerate() {
             batch[r * hidden..(r + 1) * hidden].copy_from_slice(&self.runner.embed_token(t));
         }
-        // `base` is the KV position the suffix starts at (0 = full prefill; > 0
-        // when a cached prefix was restored). Each rank appends rows at [base, ..).
+        // `base` is the KV position this window starts at (0 = full prefill; > 0
+        // for a restored prefix or a later window of a >MAX_BATCH_COUNT prompt).
+        // Each rank appends rows at [base, ..). `sample=false` windows advance KV
+        // without sampling and reply with a dummy Token(-1).
         let h = self.runner.forward_layers_batch(batch, base, rows);
         let cfg = cfg.clone();
         self.block_on(async {
-            send_forward_batch_prefill(
-                downstream,
-                base as u32,
-                rows as u32,
-                &cfg,
-                &h,
-                [1, rows as u32, hidden as u32],
-            )
-            .await
-            .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+            if sample {
+                send_forward_batch_prefill(
+                    downstream,
+                    base as u32,
+                    rows as u32,
+                    &cfg,
+                    &h,
+                    [1, rows as u32, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+            } else {
+                send_forward_batch_prefill_nosample(
+                    downstream,
+                    base as u32,
+                    rows as u32,
+                    &cfg,
+                    &h,
+                    [1, rows as u32, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
+            }
             match recv_kind_client(downstream).await {
                 Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
                     .await
