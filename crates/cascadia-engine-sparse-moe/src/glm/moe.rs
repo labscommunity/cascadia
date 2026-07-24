@@ -207,6 +207,67 @@ impl MoeLayer {
         }
     }
 
+    /// Predict this layer's routed experts for a proxy hidden `x` — the SAME
+    /// router GEMV + `noaux_tc` top-k as [`Self::forward_token`], but returning
+    /// only the selected ids (no expert compute, no KV, no profiler mutation).
+    /// Byte-identical selection to `forward_token` for identical `x`; recall <
+    /// 100% comes only from `x` being a proxy for the true next-layer input.
+    pub fn predict_topk(&self, x: &[f32]) -> Vec<u32> {
+        debug_assert_eq!(x.len(), self.hidden);
+        let mut logits = vec![0.0f32; self.n_experts];
+        linear_f32(
+            x,
+            &self.w.router_w,
+            self.n_experts,
+            self.hidden,
+            &mut logits,
+        );
+        moe_gate(&logits, &self.w.router_bias, self.top_k, self.scale, true).idx
+    }
+
+    /// Predict this layer's routed experts from `proxy` for the async prefetch
+    /// worker, recording them for the recall metric and returning the ids for the
+    /// caller to residency-gate + enqueue (the worker does the warming).
+    pub fn predict_experts(&self, proxy: &[f32]) -> Vec<u32> {
+        let pred = self.predict_topk(proxy);
+        prof::note_predicted(self.layer_idx, &pred);
+        pred
+    }
+
+    /// Miss-only gate: is routed expert `eid` currently NOT resident (worth
+    /// warming)? Probes the working set; a mostly-resident expert returns false
+    /// so the prefetch worker never spends bandwidth re-reading a hot expert.
+    /// Non-mmap experts are always "resident" (already in RAM) -> never enqueued.
+    pub fn expert_cold(&self, eid: u32) -> bool {
+        match self
+            .w
+            .experts
+            .get(eid as usize)
+            .and_then(AnyExpert::as_mmap)
+        {
+            Some(m) => {
+                let (resident, probed) = m.resident_pages_sampled(8);
+                probed > 0 && resident * 2 < probed // < ~50% resident -> cold
+            }
+            None => false,
+        }
+    }
+
+    /// This layer's routed-expert bin table for the LOOKAHEAD worker (paths + sizes;
+    /// `None` per expert on the non-mmap path).
+    pub fn expert_bins(&self) -> super::lookahead::LayerBins {
+        let routed = self
+            .w
+            .experts
+            .iter()
+            .map(|e| {
+                e.as_mmap()
+                    .map(|m| (m.bin_path().to_path_buf(), m.bin_len() as u64))
+            })
+            .collect();
+        super::lookahead::LayerBins { routed }
+    }
+
     /// MoE for one token `x` (`[hidden]`). Returns `[hidden]`.
     pub fn forward_token(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.hidden);
@@ -417,5 +478,52 @@ impl MoeLayer {
                 *oo += si;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A zeroed EagerF32 expert of the given shape (predict_topk never touches
+    /// expert weights, so shape is all that matters for building a `MoeLayer`).
+    fn zero_expert(hidden: usize, inter: usize) -> AnyExpert {
+        AnyExpert::EagerF32 {
+            wg: vec![0.0; inter * hidden],
+            wu: vec![0.0; inter * hidden],
+            wd: vec![0.0; hidden * inter],
+        }
+    }
+
+    /// `predict_topk` must reproduce `forward_token`'s selection exactly: same
+    /// router GEMV orientation (`[n_experts, hidden]` row-major), same `noaux_tc`
+    /// top-k. Craft a router whose expert order is unambiguous and assert the ids.
+    #[test]
+    fn predict_topk_selects_the_router_topk() {
+        let (hidden, n_experts, top_k, inter) = (4usize, 6usize, 2usize, 2usize);
+        // Row e = router_w[e*hidden .. e*hidden+hidden]; with x=[1,0,0,0] the
+        // logit for expert e is exactly column 0 = router_w[e*hidden].
+        let col0 = [0.1f32, 0.9, 0.2, 0.8, 0.3, 0.05];
+        let mut router_w = vec![0.0f32; n_experts * hidden];
+        for (e, &v) in col0.iter().enumerate() {
+            router_w[e * hidden] = v;
+        }
+        let w = MoeWeights {
+            router_w,
+            router_bias: vec![0.0; n_experts],
+            experts: (0..n_experts).map(|_| zero_expert(hidden, inter)).collect(),
+            shared: zero_expert(hidden, inter),
+        };
+        let layer = MoeLayer::new(hidden, n_experts, top_k, inter, inter, 1.0, w);
+
+        // Highest logits are expert 1 (0.9) then expert 3 (0.8); gate returns ids
+        // in descending-score order.
+        let pred = layer.predict_topk(&[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(pred, vec![1, 3]);
+
+        // A different one-hot input must re-rank: x=[0,1,0,0] reads column 1,
+        // which is all-zero here, so it selects the two lowest ids (tie-break).
+        let pred2 = layer.predict_topk(&[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(pred2, vec![0, 1]);
     }
 }
