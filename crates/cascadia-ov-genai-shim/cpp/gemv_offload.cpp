@@ -358,6 +358,16 @@ public:
     const std::string& tag() const { return m_tag; }
 
     void validate_and_infer_types() override {
+        // The weights live as op MEMBERS (invisible to attribute comparison), so
+        // two structurally-identical ops (same dims + same activation input —
+        // e.g. a layer's k_proj/v_proj) would be merged by CSE, silently routing
+        // one projection's weights into the other → wrong output at a clean 200
+        // OK. The per-instance weights_tag is the ONLY thing that defeats that
+        // merge, so it must be non-empty. Enforce it at construction/clone rather
+        // than trust the exporter's friendly names to happen to be unique.
+        NODE_VALIDATION_CHECK(this, !m_tag.empty(),
+                              "CascadiaInt4Gemv requires a non-empty weights_tag "
+                              "(defeats CSE merging of distinct-weight ops)");
         auto shape = get_input_partial_shape(0);
         NODE_VALIDATION_CHECK(this, shape.rank().is_static() && shape.rank().get_length() >= 1,
                               "activation rank must be static");
