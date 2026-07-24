@@ -16,7 +16,7 @@ use cascadia_engine_sparse_moe::dist::{
     recv_forward_batch_body_server, recv_kind_server, send_forward_batch_prefill, FrameKind,
 };
 use cascadia_engine_sparse_moe::glm::loader::load_model;
-use cascadia_engine_sparse_moe::glm::stage::GlmRunner;
+use cascadia_engine_sparse_moe::glm::stage::{GlmRunner, StageOpts};
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
@@ -37,7 +37,10 @@ fn argmax(v: &[f32]) -> u32 {
 async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) -> Vec<f32> {
     let rows = prompt.len();
     let mut ranks: Vec<GlmRunner> = (0..m)
-        .map(|r| GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0).expect("load rank"))
+        .map(|r| {
+            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
+                .expect("load rank")
+        })
         .collect();
     for r in &mut ranks {
         r.reset();
@@ -167,7 +170,10 @@ fn glm5_prefix_cache_pipeline_matches_full() {
 
     for m in [1usize, 2, 4] {
         let mut ranks: Vec<GlmRunner> = (0..m)
-            .map(|r| GlmRunner::load_staged(&dir, max_seq, r as u32, m as u32, 0, 0).expect("load"))
+            .map(|r| {
+                GlmRunner::load_staged(&dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
+                    .expect("load")
+            })
             .collect();
         assert!(
             ranks[0].prefix_cache_enabled(),
@@ -206,4 +212,61 @@ fn glm5_prefix_cache_pipeline_matches_full() {
             "M={m}: distributed prefix-cache reuse diverged from full prefill"
         );
     }
+}
+
+/// CI coverage for the FLOWN config: the bf16 embed/lm_head path (production
+/// default) must run end-to-end through the staged pipeline and stay within bf16
+/// tolerance of the exact-f32 reference. This is the "bounded logit error within
+/// the model's bf16 contract" guarantee — NOT byte-identity (which is prompt- and
+/// scale-dependent and would be a flaky assertion). m=1 so rank 0 holds BOTH the
+/// bf16 embed and the bf16 lm_head.
+#[test]
+fn glm5_bf16_head_pipeline_bounded_vs_f32() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
+    if !dir.join("manifest.json").exists() {
+        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
+        return;
+    }
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+    let max_seq = 32usize;
+
+    let mut f32r = [
+        GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0, StageOpts::default()).expect("load f32"),
+    ];
+    f32r[0].reset();
+    let want = drive_prefill(&mut f32r, &prompt, 0);
+
+    let mut bf16r = [GlmRunner::load_staged(
+        &dir,
+        max_seq,
+        0,
+        1,
+        0,
+        0,
+        StageOpts {
+            bf16_head: true,
+            bf16_kv: false,
+        },
+    )
+    .expect("load bf16-head")];
+    bf16r[0].reset();
+    let got = drive_prefill(&mut bf16r, &prompt, 0);
+
+    assert_eq!(got.len(), want.len(), "bf16-head logit length mismatch");
+    assert!(
+        got.iter().all(|x| x.is_finite()),
+        "bf16-head produced non-finite logits"
+    );
+    // Weights round to bf16 (~2^-8 rel), accumulation stays f32 -> logits move a
+    // few percent at most. A generous 15% bound catches gross breakage without
+    // flaking on the tiny fixture's argmax sensitivity.
+    let max_rel = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_rel < 0.15,
+        "bf16-head logits diverged from f32 beyond bf16 tolerance: max rel {max_rel}"
+    );
 }

@@ -24,7 +24,8 @@ fn runner_greedy_matches_reference() {
         eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
         return;
     };
-    let mut runner = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).expect("load glm5 stage");
+    let mut runner =
+        GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("load glm5 stage");
     let got = runner.generate_argmax(&[1, 2, 3, 4], 4);
     assert_eq!(got, vec![4u32, 10, 3, 15], "runner greedy mismatch");
 }
@@ -36,7 +37,8 @@ fn staged_composition_matches_full_model() {
         return;
     };
     let mut model = load_model(&dir, 32).expect("load full");
-    let mut runner = GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0).expect("load stage");
+    let mut runner =
+        GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("load stage");
     model.reset();
     runner.reset();
     // Drive both over the same tokens; the split staged path must equal the

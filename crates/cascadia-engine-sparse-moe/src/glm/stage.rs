@@ -115,6 +115,32 @@ impl WideTable {
     }
 }
 
+/// Precision choices for the staged runner's f32-vs-bf16 tables. `Default` is
+/// exact f32 — what the correctness tests and the single-process reference
+/// compare against. Production selects precision via [`StageOpts::from_env`], so
+/// the env is read in ONE place (not scattered through the loader).
+#[derive(Clone, Copy, Default)]
+pub struct StageOpts {
+    /// embed + lm_head as bf16 (frees ~3 GB/edge-rank → more resident experts;
+    /// ~1.2× decode, output within bf16 tolerance of f32).
+    pub bf16_head: bool,
+    /// MLA latent / k_pe KV cache as bf16 (frees KV RAM ∝ `max_seq`).
+    pub bf16_kv: bool,
+}
+
+impl StageOpts {
+    /// Production defaults from env: bf16 head **on** (opt out with
+    /// `CASCADIA_GLM5_F32_HEAD`), bf16 KV **off** (opt in with
+    /// `CASCADIA_GLM5_BF16_KV`). Call this only from the serving entry point;
+    /// tests/examples pass an explicit `StageOpts` (default = exact f32).
+    pub fn from_env() -> Self {
+        Self {
+            bf16_head: std::env::var_os("CASCADIA_GLM5_F32_HEAD").is_none(),
+            bf16_kv: std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
+        }
+    }
+}
+
 pub struct GlmRunner {
     embed: Option<WideTable>,            // [vocab, hidden] on rank 0
     layers: Vec<GlmLayer>,               // this rank's slice
@@ -148,6 +174,7 @@ impl GlmRunner {
         total: u32,
         layer_start: u32,
         layer_end: u32,
+        opts: StageOpts,
     ) -> Result<Self, LoadError> {
         let m = read_manifest(dir)?;
         let n = m.num_layers;
@@ -202,15 +229,16 @@ impl GlmRunner {
             _ if m.num_experts > 32 => ExpertsMode::Mmap,
             _ => ExpertsMode::Eager,
         };
-        let mut s = load_stage(dir, max_seq, lo, hi, first, last, mode)?;
+        // Precision comes from the caller (StageOpts), never env here — so the
+        // pin-budget reservation and the actual KV/head allocations derive from
+        // the SAME value and can't disagree.
+        let (bf16_head, bf16_kv) = (opts.bf16_head, opts.bf16_kv);
+        let mut s = load_stage(dir, max_seq, lo, hi, first, last, mode, bf16_kv)?;
 
-        // Optional half-precision edge tables (CASCADIA_GLM5_BF16_HEAD): store
-        // embed / lm_head as bf16 to free ~3 GB/edge-rank back into the pin
-        // budget. Converted HERE — before mlocking experts below — so the f32
-        // buffers are dropped and the RAM is actually available. Default off; a
-        // logit-precision change, so validate greedy parity before promoting.
-        let bf16_head = std::env::var_os("CASCADIA_GLM5_BF16_HEAD").is_some();
-        let bf16_kv = std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some();
+        // Half-precision edge tables: store embed / lm_head as bf16 to free
+        // ~3 GB/edge-rank back into the pin budget. Converted HERE — before
+        // mlocking experts below — so the f32 buffers are dropped and the RAM is
+        // actually available.
         let embed_tab = s.embed.take().map(|v| WideTable::from_f32(v, bf16_head));
         let head_tab = s
             .head

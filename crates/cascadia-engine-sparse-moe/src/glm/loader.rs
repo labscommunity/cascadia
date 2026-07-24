@@ -270,6 +270,7 @@ fn load_layer(
     li: usize,
     max_seq: usize,
     mode: ExpertsMode,
+    bf16_kv: bool,
 ) -> Result<GlmLayer, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
     let (h, nope, rope) = (
@@ -297,6 +298,7 @@ fn load_layer(
     };
     let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
     let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+    attn.set_kv_precision(bf16_kv);
 
     // DSA / IndexShare (when exported): a "full" layer owns an indexer and
     // publishes its top-`index_topk` selection; a "shared" layer reuses the
@@ -386,7 +388,12 @@ fn load_layer(
 /// its experts are stored bf16 in the safetensors ([`AnyExpert::Bf16`]).
 /// `max_seq` sizes the block's KV cache (it resets and consumes ≤ g positions
 /// per draft round).
-fn load_mtp(dir: &Path, m: &GlmManifest, max_seq: usize) -> Result<MtpHead, LoadError> {
+fn load_mtp(
+    dir: &Path,
+    m: &GlmManifest,
+    max_seq: usize,
+    bf16_kv: bool,
+) -> Result<MtpHead, LoadError> {
     let (hidden, eps) = (m.hidden_size, m.rms_norm_eps);
     let (h, nope, rope) = (
         m.num_attention_heads,
@@ -420,7 +427,8 @@ fn load_mtp(dir: &Path, m: &GlmManifest, max_seq: usize) -> Result<MtpHead, Load
         wo: gb("mtp.block.self_attn.o_proj.weight")?,
     };
     let freqs = precompute_freqs(rope, max_seq, 0, m.rope_theta, 1.0, 32.0, 1.0);
-    let attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+    let mut attn = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, aw, freqs);
+    attn.set_kv_precision(bf16_kv);
 
     let mut experts = Vec::with_capacity(m.num_experts);
     for e in 0..m.num_experts {
@@ -485,6 +493,7 @@ pub fn load_stage(
     first: bool,
     last: bool,
     mode: ExpertsMode,
+    bf16_kv: bool,
 ) -> Result<GlmStage, LoadError> {
     let m = read_manifest(dir)?;
     let embed = if first {
@@ -504,7 +513,7 @@ pub fn load_stage(
     };
     let mut layers = Vec::with_capacity(hi - lo);
     for li in lo..hi {
-        layers.push(load_layer(dir, &m, li, max_seq, mode)?);
+        layers.push(load_layer(dir, &m, li, max_seq, mode, bf16_kv)?);
     }
     Ok(GlmStage {
         embed,
@@ -532,7 +541,9 @@ pub fn load_model_with(
     mode: ExpertsMode,
 ) -> Result<GlmModel, LoadError> {
     let m = read_manifest(dir)?;
-    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode)?;
+    // The single-process reference is always exact f32 KV (bf16_kv = false); it is
+    // the oracle the staged runner is validated against.
+    let s = load_stage(dir, max_seq, 0, m.num_layers, true, true, mode, false)?;
     let (final_norm, lm_head) = s.head.expect("full model has a head");
     let mut model = GlmModel::new(
         s.hidden,
@@ -545,7 +556,7 @@ pub fn load_model_with(
     );
     // Attach the MTP draft head (speculative decode) when the export carries one.
     if m.has_mtp {
-        model.set_mtp(load_mtp(dir, &m, max_seq)?);
+        model.set_mtp(load_mtp(dir, &m, max_seq, false)?);
     }
     Ok(model)
 }

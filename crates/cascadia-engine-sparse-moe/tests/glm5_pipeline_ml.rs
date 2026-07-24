@@ -86,7 +86,7 @@ async fn run_pipeline(
 ) -> Vec<u32> {
     let mut ranks: Vec<GlmRunner> = (0..m)
         .map(|r| {
-            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0)
+            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
                 .unwrap_or_else(|e| panic!("load rank {r}/{m}: {e}"))
         })
         .collect();
