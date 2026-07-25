@@ -1,5 +1,85 @@
 # Changelog
 
+## [0.1.3](https://github.com/labscommunity/cascadia/compare/v0.1.2...v0.1.3) (2026-07-25)
+
+
+### Features
+
+* **cli:** --prefill-device / --no-chunked-prefill + shard --static-prefill-seq ([46c81b6](https://github.com/labscommunity/cascadia/commit/46c81b66bde8eece77d8a1b4e7500a242ffeb431))
+* **engine:** --park-prefill — release prefill weights between prefills ([381c08b](https://github.com/labscommunity/cascadia/commit/381c08b31d1c0e57d01ba3b2c36f7bb32404855e))
+* **engine:** chunked multi-token prefill + per-phase device on the static path ([cff6933](https://github.com/labscommunity/cascadia/commit/cff6933eca57dceffbddbdaebd5dd8aa05ff94c4))
+* **engine:** consume AOT NPU blobs — .blob sibling of the IR imports instead of compiling ([638afa9](https://github.com/labscommunity/cascadia/commit/638afa9bc8ff97d72fb2ddfa1909ec81d4e10aa1))
+* **engine:** npuw bank probe + park-without-cache warning ([2fb27d4](https://github.com/labscommunity/cascadia/commit/2fb27d48e1479460a11e6f12c542f93fd6a981f1))
+* **export:** emit chunked-prefill static IR variant (--static-prefill-seq) ([c1482cb](https://github.com/labscommunity/cascadia/commit/c1482cbf00234c3ec5be613a7fcc4d1c0b16f431))
+* hybrid NPU+CPU execution — chunked prefill on one device, decode on another ([ae008f8](https://github.com/labscommunity/cascadia/commit/ae008f8d8f1fdfc1f9c77fc401b867b31af22090))
+* **shim:** AOT blob-import FFI + probe — NPU compile spike moves off-box ([6e97af2](https://github.com/labscommunity/cascadia/commit/6e97af2ea1dfc18958addb81791990befa9f1d1a))
+* **shim:** AVX2 GEMV path, CSE weights-tag, residency probe + spike notes ([df9a770](https://github.com/labscommunity/cascadia/commit/df9a770354965e6254f43b568383a25a797bfb35))
+* **shim:** CascadiaInt4Gemv extension op — decode GEMV from the .bin mmap (spike) ([4274b5d](https://github.com/labscommunity/cascadia/commit/4274b5d56b43157464bd368f8ba0ba322f0f8fed))
+* **shim:** oneDNN embedding probe — endgame closed by data (fork-only kernels) ([ccb47b0](https://github.com/labscommunity/cascadia/commit/ccb47b0eee25d06dcb1d0f869411d457e020ed36))
+* **shim:** PERF_COUNT profiling FFI + flat kernels — gap fully attributed ([487c5fb](https://github.com/labscommunity/cascadia/commit/487c5fb4f8b9ad16e4773c08ecd053f473286a31))
+* **shim:** sibling GEMV fusion (q/k/v, gate/up) — measured perf-neutral ([e93a3e2](https://github.com/labscommunity/cascadia/commit/e93a3e23ea279ce3b7ce6fff7876065b50f10340))
+* weight-residency paths for the hybrid split — --park-prefill, NPUW bank probe, in-place GEMV RFC ([7f4f37a](https://github.com/labscommunity/cascadia/commit/7f4f37ac5196d1d55e9c578d99f952af5f71aa73))
+
+
+### Bug Fixes
+
+* **engine-openvino:** lower the near-tie guard to the first token (10 -&gt; 1) ([c87c09d](https://github.com/labscommunity/cascadia/commit/c87c09d793e92aea6bbe231ecb4f69a98883cd27))
+* **engine:** review findings — park on cancel/failure, parked-check before ring mutation, warmup ensure, doc placement, probe resilience, 1-based labels ([44a78fe](https://github.com/labscommunity/cascadia/commit/44a78feeb4b371bbfa346e1ff6af9b7cbbe8017d))
+* **engine:** review findings — per-device prefill plugin props, cross-stage geometry check, loud argmax on truncated logits ([4bd6a51](https://github.com/labscommunity/cascadia/commit/4bd6a519166a32c5f8bc50e225b017f1c5b3503f))
+* **engine:** review findings — window-parity cap, sub-chunking, guards, reuse ([fb5d9aa](https://github.com/labscommunity/cascadia/commit/fb5d9aaeb1e308fa80e78e65f4c351b192ec92ef))
+* **engine:** warn on an unverifiable AOT blob instead of silently trusting it ([701cbf4](https://github.com/labscommunity/cascadia/commit/701cbf48012128d3e8f23f49cb713f618445c6ee))
+* **export:** remove stale prefill variant on re-export ([5814e59](https://github.com/labscommunity/cascadia/commit/5814e599f95696104b8f314206b9497fe413be83))
+* **review:** gemv CACHE_DIR strip via props, stale-blob guard, Linux SIMD/tbb build, matcher+fusion guards, tellg check, pacing safety, profiling truncation, xfer wait bug ([506c254](https://github.com/labscommunity/cascadia/commit/506c2540aa7ec9b348df9ee7f5997d2b45a8c667))
+* **shim:** reject an empty CascadiaInt4Gemv weights_tag (CSE-merge guard) ([4177b9d](https://github.com/labscommunity/cascadia/commit/4177b9da2b1fbf34de196d0fcec64a568f107181))
+* **transport:** pace large tensor payloads into bounded bursts — DERP-relayed links drop ~750KB single bursts intermittently ([8ec831a](https://github.com/labscommunity/cascadia/commit/8ec831a076dee25820b78f464539409fc66b53e3))
+* **transport:** warn on an unparseable CASCADIA_SEND_BURST_BYTES instead of silent OFF ([9be0d40](https://github.com/labscommunity/cascadia/commit/9be0d409f03e550c9375c8e3b13fd20564ddf46a))
+* **transport:** warn when CASCADIA_SEND_BURST_BYTES is clamped up to the 64 KiB floor ([566cdb5](https://github.com/labscommunity/cascadia/commit/566cdb5f94f086cf063857a50d399195d62961d0))
+
+
+### Performance
+
+* **shim:** gemv-offload 66-73% -&gt; 75-79% of stock; frontier mapped ([25d4133](https://github.com/labscommunity/cascadia/commit/25d413350296433461dbcdf0ecbd8b60db00dfae))
+
+
+### Documentation
+
+* **experiments:** track the gemv-offload spike notes incl. NPU cache-import init warning ([f49dcaf](https://github.com/labscommunity/cascadia/commit/f49dcaf1c691254d7cd656febead26941f5e1a3a))
+* **experiments:** track the NPUW weights-bank probe notes (gitignore exempts) ([dff68e0](https://github.com/labscommunity/cascadia/commit/dff68e06960f14acf489997538fb09b4e5f6817a))
+* **perf:** 70B blocker dossier — frame black-holing on DERP links, everything else ruled out ([eed8d82](https://github.com/labscommunity/cascadia/commit/eed8d82744fd50259bd070048ed2f94acf1ef6ff))
+* **perf:** add 2-stage hybrid pipeline smoke numbers ([6db3ccd](https://github.com/labscommunity/cascadia/commit/6db3ccd87e2fc04d7ab3a65d6ceef713d4e555d9))
+* **perf:** big-model NPU routes — 2-stage PP, AOT blob import, NPUW folding (all measured) ([d3ea8ce](https://github.com/labscommunity/cascadia/commit/d3ea8ce1635475018065007ef41dfcb313f51299))
+* **perf:** correct over-window semantics + short-prompt and placement notes ([62000f5](https://github.com/labscommunity/cascadia/commit/62000f5ca6123ff8401f9f7651fbee065690ceb4))
+* **perf:** device x model-size matrix (1B/3B/8B x CPU/GPU/NPU) on LNL 32GB ([fbd8970](https://github.com/labscommunity/cascadia/commit/fbd8970fef2a83ea085220f77bdb7536fbf9167d))
+* **perf:** finalize tier results — 32B 3-box measured, 70B health-validated with isolated blockers ([0f80217](https://github.com/labscommunity/cascadia/commit/0f80217c2a0e96874808128f05818d5afac5e9a7))
+* **perf:** hybrid NPU+CPU phase split — design, quickstart, measured results ([328ef7e](https://github.com/labscommunity/cascadia/commit/328ef7e6021e8866a199fb6e12d93f1134340122))
+* **perf:** link PR [#107](https://github.com/labscommunity/cascadia/issues/107) in status line ([85cc925](https://github.com/labscommunity/cascadia/commit/85cc9256594271aaa5f20b0a97da76654e328f2c))
+* **perf:** NPU TTFT tier benchmarks — method, 14B results, attribution, fleet deployment learnings ([08369df](https://github.com/labscommunity/cascadia/commit/08369dfa6f2669eebd55c39011be9ebe5b8814b6))
+* **perf:** parking measurements + npuw bank probe results ([d15484a](https://github.com/labscommunity/cascadia/commit/d15484a6bd8859814e58b1ec961ceaf6b0ae3080))
+* **perf:** post-fix re-validation numbers (33x long-prompt, over-window leg, warm smoke) ([0610d22](https://github.com/labscommunity/cascadia/commit/0610d2225237307d599993caea3f8051d794fc41))
+* qualify the remaining token-exactness claims for near-tie tolerance ([aeba7eb](https://github.com/labscommunity/cascadia/commit/aeba7eb422e8c24db531a7328cd12f928e704fb0))
+* **rfcs:** narrow the in-place GEMV ask per spike evidence ([8f1e37a](https://github.com/labscommunity/cascadia/commit/8f1e37a75b5f53eb3d2e7c1831cf8e0190138c98))
+* **test:** parking leg is near-tie-tolerant parity, not token-identical ([527c9bc](https://github.com/labscommunity/cascadia/commit/527c9bca60fcb20b38f80ad83403a1995dd9e81f))
+
+
+### Testing
+
+* **cli:** cover shard --static-prefill-seq validation + forwarding ([4e6d109](https://github.com/labscommunity/cascadia/commit/4e6d1094222a75d945e4e1d029fa0e2584b9e2db))
+* **cli:** cover the worker phase-split flag guards ([619a3be](https://github.com/labscommunity/cascadia/commit/619a3be7544b123899e8e34dcd3e49b98db172aa))
+* **engine-openvino:** CASCADIA_PARITY_SOFT knob for GPU/cross-device sweeps ([64d9f93](https://github.com/labscommunity/cascadia/commit/64d9f93eb8579085b5b4d6968f4f6647197020fe))
+* **engine-openvino:** CASCADIA_STATIC_TASKS knob — steady-state TTFT past the NPU cache-import init ([109603e](https://github.com/labscommunity/cascadia/commit/109603e84b12314f2d7e27c0b202327d9841e4a4))
+* **engine-openvino:** CASCADIA_WARM_INFER — isolate graph-specific first-inference pathologies ([db06dd5](https://github.com/labscommunity/cascadia/commit/db06dd5c80a0d772c741556184fa569e0f542b64))
+* **engine-openvino:** cover import_plugin CACHE_DIR strip ([d2dba1c](https://github.com/labscommunity/cascadia/commit/d2dba1c973e227aa2fc57bcbc9d8b45ce3d1636c))
+* **engine-openvino:** parking leg honors CASCADIA_PARITY_SOFT ([ca937a0](https://github.com/labscommunity/cascadia/commit/ca937a0400e61764e59cb1274ae450426761726a))
+* **engine-openvino:** sequential cache-warm probe — no overlapping NPU compile transients at pipeline bring-up ([988b1b9](https://github.com/labscommunity/cascadia/commit/988b1b90fad52e3fa7d5eed2a1215cd2c6f6554c))
+* **engine-openvino:** tolerate near-tie prefill forks; correct the token-exact claim ([7623bbb](https://github.com/labscommunity/cascadia/commit/7623bbb000a2280dbb01ce9a8483a35d3f7d58dd))
+* **engine-openvino:** unit-test the parity verdict (no hardware) ([968e2c4](https://github.com/labscommunity/cascadia/commit/968e2c406f8bbfcf56d722b95083157b7757b047))
+* **engine:** chunked-prefill ring equivalence + phase-split parity gate ([f65701b](https://github.com/labscommunity/cascadia/commit/f65701bbcdeee3018089094eb2f77c3dcbcd5958))
+
+
+### Miscellaneous
+
+* **transport:** default send pacing off — did not resolve the DERP frame loss; kept as experiment knob ([4592fe2](https://github.com/labscommunity/cascadia/commit/4592fe2e8032b8129259e43fd55dfe5828b13079))
+
 ## [0.1.2](https://github.com/labscommunity/cascadia/compare/v0.1.1...v0.1.2) (2026-07-21)
 
 
