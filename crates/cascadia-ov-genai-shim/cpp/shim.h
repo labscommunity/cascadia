@@ -149,6 +149,41 @@ int32_t cascadia_runtime_compile(
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle);
 
+/// Compile like cascadia_runtime_compile, but first rewrite every NNCF
+/// sym-INT4 decompress→MatMul into the CascadiaInt4Gemv extension op whose
+/// weights stay backed by the read_model mmap of the original .bin — the
+/// CPU plugin never makes its own resident repacked copy. CPU-class devices
+/// only (the op executes via the evaluate() fallback). Do not pass CACHE_DIR
+/// (the custom op's member tensors don't survive blob serialization).
+/// `out_offloaded` (optional) receives the number of MatMuls rewritten.
+int32_t cascadia_runtime_compile_gemv_offload(
+    const char* model_xml_path,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    uint32_t* out_offloaded,
+    cascadia_runtime_t** out_handle);
+
+/// Import a precompiled blob (produced by ov::CompiledModel::export_model,
+/// e.g. an AOT cross-compile on a big-RAM host with NPU_PLATFORM set) instead
+/// of compiling from IR. Skips the compiler entirely — the NPU compile
+/// transient (~5.5x INT4 bytes host RAM) never happens on this box; peak is
+/// ~the blob size. Same handle contract as cascadia_runtime_compile (the
+/// infer request is created eagerly, which forces device weight load).
+int32_t cascadia_runtime_import_blob(
+    const char* blob_path,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_runtime_t** out_handle);
+
+/// Serialize the last inference's per-node profiling info (requires the
+/// model to have been compiled with the PERF_COUNT=YES plugin property) as
+/// TSV lines "node_name\tnode_type\texec_type\treal_us\tcpu_us\n" into
+/// `out_buf` (truncating at `buf_cap`); `out_len` receives the byte count.
+int32_t cascadia_runtime_profiling(
+    cascadia_runtime_t* handle, char* out_buf, size_t buf_cap, size_t* out_len);
+
 /// Reset stateful KV-cache nodes to their initial value. No-op on
 /// stateless models.
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle);

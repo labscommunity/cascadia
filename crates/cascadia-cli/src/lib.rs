@@ -389,6 +389,16 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = false)]
     pub park_prefill: bool,
 
+    /// SPIKE: execute the decode model's sym-INT4 weight matmuls through the
+    /// CascadiaInt4Gemv extension op straight from the mmapped IR .bin — the
+    /// CPU plugin never makes its own resident repacked weight copy, so a
+    /// hybrid stage's decode side costs ~0 extra weight RAM. ov-runtime,
+    /// stateless static exports, --device CPU only. Numeric note: the op's
+    /// accumulation order differs from oneDNN's, so output parity vs the
+    /// stock kernel is validated empirically, not guaranteed bit-for-bit.
+    #[arg(long, default_value_t = false)]
+    pub gemv_offload: bool,
+
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
     pub draft_model: Option<String>,
@@ -607,6 +617,7 @@ impl WorkerArgs {
             prefill_device: None,
             no_chunked_prefill: false,
             park_prefill: false,
+            gemv_offload: false,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -1148,6 +1159,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
             b = b.with_prefill_parking(args.park_prefill);
+            b = b.with_gemv_offload(args.gemv_offload);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1378,22 +1390,21 @@ fn install_shutdown_signal_handler(
     })
 }
 
-async fn cmd_worker(args: WorkerArgs) -> Result<()> {
-    if args.rank >= args.total {
-        return Err(anyhow!(
-            "--rank must be in [0, {}); got {}",
-            args.total,
-            args.rank
-        ));
-    }
+/// Reject phase-split flag combinations before a worker binds any socket. Pure
+/// function of the args so it is unit-testable (the guards were inline in the
+/// async `cmd_worker`, reachable only by running a full worker).
+fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     // Fail loud, not silent: the phase-split flags are load-bearing when
     // given, and only the ov-runtime engine implements them.
-    if (args.prefill_device.is_some() || args.no_chunked_prefill || args.park_prefill)
+    if (args.prefill_device.is_some()
+        || args.no_chunked_prefill
+        || args.park_prefill
+        || args.gemv_offload)
         && args.engine != EngineKind::OvRuntime
     {
         return Err(anyhow!(
-            "--prefill-device / --no-chunked-prefill / --park-prefill require \
-             --engine ov-runtime (the chunked-prefill phase split lives in the \
+            "--prefill-device / --no-chunked-prefill / --park-prefill / --gemv-offload \
+             require --engine ov-runtime (the chunked-prefill phase split lives in the \
              static-KV runtime path)"
         ));
     }
@@ -1402,6 +1413,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
     }
+    Ok(())
+}
+
+async fn cmd_worker(args: WorkerArgs) -> Result<()> {
+    if args.rank >= args.total {
+        return Err(anyhow!(
+            "--rank must be in [0, {}); got {}",
+            args.total,
+            args.rank
+        ));
+    }
+    validate_worker_runtime_flags(&args)?;
     let is_first = args.rank == 0;
     let is_last = args.rank == args.total - 1;
 
@@ -2184,6 +2207,36 @@ mod python_tests {
         a
     }
 
+    /// The phase-split flags only exist in the ov-runtime static path; using
+    /// one on another engine is rejected loudly (here: --gemv-offload on
+    /// ov-genai), not silently ignored.
+    #[test]
+    fn worker_flags_reject_phase_split_without_ov_runtime() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.gemv_offload = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+    }
+
+    /// A prefill device (or parking) is meaningless with chunked prefill
+    /// disabled — the two are mutually exclusive.
+    #[test]
+    fn worker_flags_reject_prefill_device_conflict_with_no_chunked() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.prefill_device = Some("NPU".into());
+        a.no_chunked_prefill = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("conflict"), "{err}");
+    }
+
+    /// A valid phase split (ov-runtime + prefill device, chunked enabled) passes.
+    #[test]
+    fn worker_flags_accept_valid_phase_split() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.prefill_device = Some("NPU".into());
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
     #[test]
     fn explicit_interpreter_that_cannot_run_names_the_path() {
         // Must not tell the user to "pass --python" — they just did.
@@ -2533,6 +2586,96 @@ mod tests {
         assert!(has_pair(&flags, "--default-dtype", "fp16"));
         assert!(!flags.iter().any(|f| f == "--static-seq"));
         assert!(!flags.iter().any(|f| f == "--static-context"));
+    }
+
+    /// `--static-prefill-seq` needs `--target npu` (chunked prefill is a
+    /// static-KV-path feature); the default cpu-gpu target rejects it.
+    #[test]
+    fn shard_flags_static_prefill_seq_requires_npu() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--static-prefill-seq",
+            "4",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains("--target npu"), "{err}");
+    }
+
+    /// `--static-prefill-seq 1` is nonsense (a 1-wide chunk is the seq=1 decode
+    /// path); only 0 (off) or >= 2 is valid.
+    #[test]
+    fn shard_flags_static_prefill_seq_one_rejected() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-prefill-seq",
+            "1",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains(">= 2"), "{err}");
+    }
+
+    /// A chunk wider than the KV window would evict its own tokens mid-chunk:
+    /// `--static-prefill-seq` must be <= `--static-context - 1`.
+    #[test]
+    fn shard_flags_static_prefill_seq_exceeds_context_rejected() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-context",
+            "8",
+            "--static-prefill-seq",
+            "8",
+        ]);
+        let err = shard_exporter_flags(&args).unwrap_err().to_string();
+        assert!(err.contains("evict"), "{err}");
+    }
+
+    /// A valid `--static-prefill-seq` is forwarded to the exporter verbatim
+    /// (a dropped/defaulted value would silently export a wrong-shape variant).
+    #[test]
+    fn shard_flags_static_prefill_seq_forwarded() {
+        let args = parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "--output-dir",
+            "o",
+            "--num-stages",
+            "1",
+            "--target",
+            "npu",
+            "--static-context",
+            "1024",
+            "--static-prefill-seq",
+            "64",
+        ]);
+        let flags = shard_exporter_flags(&args).expect("valid prefill-seq flags");
+        assert!(has_pair(&flags, "--static-prefill-seq", "64"), "{flags:?}");
     }
 
     /// Golden vector: pins VALUES (not just flag presence), `--quantization`

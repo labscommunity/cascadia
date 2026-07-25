@@ -104,6 +104,29 @@ async fn run_tasks(
     if let Ok(cache) = std::env::var("CASCADIA_OV_CACHE") {
         builder = builder.with_cache_dir(cache);
     }
+    // CASCADIA_GEMV_OFFLOAD=1: run the NON-baseline legs' decode through the
+    // CascadiaInt4Gemv extension op (weights from the .bin mmap). The
+    // tokenwise baseline (disable_chunk) stays on the stock kernel, so the
+    // parity asserts become the cross-kernel check: offloaded decode vs
+    // oneDNN decode. Accumulation order differs, so a greedy divergence here
+    // is DATA about kernel rounding, not necessarily a bug — investigate
+    // before loosening.
+    if std::env::var("CASCADIA_GEMV_OFFLOAD").is_ok_and(|v| v == "1") && !disable_chunk {
+        builder = builder.with_gemv_offload(true);
+    }
+    // CASCADIA_OV_PROPS="K=V,K=V": raw plugin properties for perf probing
+    // (e.g. INFERENCE_NUM_THREADS=8 — the LATENCY hint pins LNL to its 4
+    // P-cores, halving the custom op's row parallelism).
+    if let Ok(props) = std::env::var("CASCADIA_OV_PROPS") {
+        let kv: Vec<(String, String)> = props
+            .split(',')
+            .filter_map(|p| {
+                p.split_once('=')
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        builder = builder.with_ov_properties(kv);
+    }
     builder
         .connect(PeerLayout::single_stage())
         .await
@@ -113,7 +136,16 @@ async fn run_tasks(
         .await
         .expect("load");
     use futures::StreamExt;
-    while load.next().await.is_some() {}
+    // Surface load progress when the gemv-offload leg runs: the offloaded
+    // MatMul count printed here is the proof the extension pass actually
+    // fired (0 matches silently degrades to stock and would make the parity
+    // assertion vacuous for the offload).
+    let show_load = std::env::var("CASCADIA_GEMV_OFFLOAD").is_ok_and(|v| v == "1");
+    while let Some(ev) = load.next().await {
+        if show_load {
+            eprintln!("load: {ev:?}");
+        }
+    }
     let mut engine = Box::new(builder).build().expect("build");
 
     let mut outs = Vec::new();

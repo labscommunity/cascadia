@@ -62,6 +62,34 @@ OS page cache of the shared .bin).
 - Weightless blobs / mmap: shares the *source* pages (already the case) but
   not the resident execution copies.
 
+## Spike evidence (2026-07-15, revises the ask)
+
+A working prototype now exists on cascadia's side (`CascadiaInt4Gemv`
+extension op, experiments/gemv-offload-spike/NOTES.md): 113/113 sym-INT4
+MatMuls rewritten, token-parity vs the stock kernel, ~70% of stock decode
+throughput after one AVX2 pass. Its residency probe found the 2026.1 CPU
+executor ALREADY keeps these decompress-subgraph weights mmap-backed at
+steady state for this IR (steady private 0.11 GB; the big private cost is a
+~1 GB compile-time transient). The RFC's ask therefore narrows to:
+1. make the mmap-backed execution of grouped-INT4 decompress weights a
+   DOCUMENTED CONTRACT (per-version/arch behavior today, observed not
+   promised), and
+2. eliminate the compile-time private peak for these constants,
+rather than proposing a wholly new no-repack mode.
+
+## Upstream-gap evidence (2026-07-15, second spike round)
+
+Embedding upstream oneDNN 3.12 inside our extension op (matmul with s4
+weights + grouped f16 decompression scales, `fpmath_mode(f16,
+apply_to_int)`) produced numerically correct output but selected `ref:any`
+even with `format_tag::any` — **upstream oneDNN has no optimized kernel for
+this shape at all**. The ~51 GB/s `FullyConnectedCompressed` path measured
+in the CPU plugin therefore lives in the openvinotoolkit/oneDNN fork /
+OV-internal kernels only. This sharpens the ask: the capability exists and
+is Intel-maintained; exposing it (as a documented plugin behavior or via
+upstreaming the kernels) is the only way third parties can reach it without
+forking.
+
 ## Open questions
 
 1. Does oneDNN's `weights_decompression` brgemm path accept an external

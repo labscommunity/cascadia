@@ -157,8 +157,31 @@ mod sys {
             out_handle: *mut *mut cascadia_runtime_t,
         ) -> c_int;
 
+        pub fn cascadia_runtime_compile_gemv_offload(
+            model_xml_path: *const c_char,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_offloaded: *mut u32,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+
+        pub fn cascadia_runtime_import_blob(
+            blob_path: *const c_char,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
+        pub fn cascadia_runtime_profiling(
+            handle: *mut cascadia_runtime_t,
+            out_buf: *mut c_char,
+            buf_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
 
         pub fn cascadia_runtime_input_count(handle: *mut cascadia_runtime_t) -> usize;
         pub fn cascadia_runtime_output_count(handle: *mut cascadia_runtime_t) -> usize;
@@ -634,6 +657,136 @@ impl Runtime {
             return Err(Error::Native(last_native_error()));
         }
         Ok(Self { handle })
+    }
+
+    /// Import a precompiled blob (from `ov::CompiledModel::export_model`,
+    /// e.g. an AOT cross-compile on a big-RAM host with `NPU_PLATFORM` set)
+    /// instead of compiling from IR — the compiler (and its ~5.5x-INT4-bytes
+    /// host-RAM transient) never runs on this box.
+    pub fn import_blob(blob_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        Self::do_import_blob(blob_path, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_import_blob(_path: &str, _device: &str, _plugin: &PluginConfig) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_import_blob(blob_path: &str, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        let path_c = cstr(blob_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::cascadia_runtime_import_blob(
+                path_c.as_ptr(),
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self { handle })
+    }
+
+    /// Compile with the CascadiaInt4Gemv offload pass: NNCF sym-INT4
+    /// decompress→MatMul chains execute from the read_model mmap through the
+    /// extension op instead of a plugin-repacked resident weight copy.
+    /// Returns the runtime plus the number of MatMuls offloaded. CPU-class
+    /// devices only (the op runs via the evaluate() fallback); do not pass
+    /// CACHE_DIR (op member tensors don't survive blob serialization).
+    pub fn compile_gemv_offload(
+        model_xml_path: &str,
+        device: &str,
+        plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        Self::do_compile_gemv_offload(model_xml_path, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_compile_gemv_offload(
+        _path: &str,
+        _device: &str,
+        _plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_compile_gemv_offload(
+        model_xml_path: &str,
+        device: &str,
+        plugin: &PluginConfig,
+    ) -> Result<(Self, u32)> {
+        let path_c = cstr(model_xml_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+
+        let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+        let mut offloaded: u32 = 0;
+        let rc = unsafe {
+            sys::cascadia_runtime_compile_gemv_offload(
+                path_c.as_ptr(),
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut offloaded,
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok((Self { handle }, offloaded))
+    }
+
+    /// Per-node profiling of the last inference as TSV lines
+    /// `node_name\tnode_type\texec_type\treal_us\tcpu_us` — requires the
+    /// model compiled with the `PERF_COUNT=YES` plugin property.
+    pub fn profiling(&self) -> Result<String> {
+        #[cfg(not(feature = "openvino"))]
+        return Err(Error::Stub);
+        #[cfg(feature = "openvino")]
+        {
+            let mut buf = vec![0u8; 1 << 20];
+            let mut len: usize = 0;
+            let rc = unsafe {
+                sys::cascadia_runtime_profiling(
+                    self.handle,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                    &mut len,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            // The shim truncates at buf_cap, possibly mid-line or mid-UTF-8:
+            // decode lossily and flag the cut instead of erroring out or
+            // silently dropping tail nodes from the attribution.
+            let truncated = len >= buf.len();
+            buf.truncate(len);
+            let mut s = String::from_utf8_lossy(&buf).into_owned();
+            if truncated {
+                s.push_str("\n[PROFILING OUTPUT TRUNCATED AT 1 MiB BUFFER CAP]\n");
+            }
+            Ok(s)
+        }
     }
 
     pub fn reset_state(&mut self) -> Result<()> {

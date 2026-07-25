@@ -5,7 +5,10 @@
 
 #include "shim.h"
 
+#include "gemv_offload.hpp"
+
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <new>
@@ -486,6 +489,128 @@ int32_t cascadia_runtime_compile(
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle) { delete handle; }
 
+int32_t cascadia_runtime_import_blob(
+    const char* blob_path, const char* device,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_runtime_t** out_handle) {
+    if (!blob_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_import_blob"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+
+        std::ifstream f(blob_path, std::ios::binary | std::ios::ate);
+        if (!f) {
+            set_last_error((std::string("cannot open blob: ") + blob_path).c_str());
+            return 1;
+        }
+        const auto pos = f.tellg();
+        if (pos < 0 || pos == std::ifstream::pos_type(0)) {
+            set_last_error(
+                (std::string("cannot size blob (empty or unreadable): ") + blob_path).c_str());
+            return 1;
+        }
+        const auto size = static_cast<size_t>(pos);
+        f.seekg(0);
+        ov::Tensor blob(ov::element::u8, ov::Shape{size});
+        if (!f.read(reinterpret_cast<char*>(blob.data()),
+                    static_cast<std::streamsize>(size))) {
+            set_last_error((std::string("short read on blob: ") + blob_path).c_str());
+            return 1;
+        }
+        f.close();
+
+        auto compiled =
+            handle->core.import_model(blob, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_import_blob"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_compile_gemv_offload(
+    const char* model_xml_path, const char* device,
+    const char* const* properties_kv, size_t properties_count,
+    uint32_t* out_offloaded,
+    cascadia_runtime_t** out_handle) {
+    if (!model_xml_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_compile_gemv_offload"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+        // read_model keeps the .bin mmapped; the offload pass moves the
+        // sym-INT4 weight constants into CascadiaInt4Gemv op members so the
+        // plugin compile below never repacks them into a resident copy.
+        auto model = handle->core.read_model(std::string(model_xml_path));
+        const uint32_t offloaded = cascadia_gemv::offload_int4_gemv(handle->core, model);
+        if (out_offloaded) *out_offloaded = offloaded;
+        auto compiled = handle->core.compile_model(model, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_compile_gemv_offload"); return 1;
+    }
+}
+
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) {
         set_last_error("null runtime handle"); return 1;
@@ -501,6 +626,36 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
         set_last_error(e); return 1;
     } catch (...) {
         set_last_error("unknown C++ exception in runtime_reset_state"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_profiling(
+    cascadia_runtime_t* handle, char* out_buf, size_t buf_cap, size_t* out_len) {
+    if (!handle || !handle->request || !out_buf || !out_len) {
+        set_last_error("null arg in runtime_profiling"); return 1;
+    }
+    try {
+        std::string acc;
+        for (const auto& pi : handle->request->get_profiling_info()) {
+            acc += pi.node_name;
+            acc += '\t';
+            acc += pi.node_type;
+            acc += '\t';
+            acc += pi.exec_type;
+            acc += '\t';
+            acc += std::to_string(pi.real_time.count());
+            acc += '\t';
+            acc += std::to_string(pi.cpu_time.count());
+            acc += '\n';
+        }
+        const size_t len = acc.size() < buf_cap ? acc.size() : buf_cap;
+        std::memcpy(out_buf, acc.data(), len);
+        *out_len = len;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_profiling"); return 1;
     }
 }
 

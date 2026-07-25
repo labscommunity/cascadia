@@ -43,7 +43,7 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
@@ -595,11 +595,67 @@ struct StaticPrefill {
 /// Everything needed to re-create a parked prefill compilation: the variant's
 /// IR path, its device, and the plugin properties the original compile used
 /// (CACHE_DIR etc., so a reload hits the OV blob/UMD cache instead of a cold
-/// compile).
+/// compile). `blob` short-circuits the reload to an AOT blob import.
 struct PrefillReload {
     xml: String,
     device: String,
     plugin_entries: Vec<(String, String)>,
+    blob: Option<String>,
+}
+
+/// Path of a precompiled AOT blob to IMPORT instead of compiling, when the
+/// target device is the NPU and a `.blob` sibling of the IR exists (same
+/// basename: `openvino_model.xml` → `openvino_model.blob`). Blobs come from
+/// `ov::CompiledModel::export_model` — typically cross-compiled on a big-RAM
+/// host with `NPU_PLATFORM` set — and importing skips the NPU compiler's
+/// ~6–9×-INT4-bytes host-RAM transient entirely (measured ~7 s / no visible
+/// RAM movement for an 8B variant, vs a >23 GB on-box compile). NPU only:
+/// blobs are device- and driver-specific, and CPU/GPU compiles are cheap.
+fn npu_aot_blob(xml_path: &std::path::Path, device: &str) -> Option<std::path::PathBuf> {
+    if !device.trim().to_ascii_uppercase().starts_with("NPU") {
+        return None;
+    }
+    let blob = xml_path.with_extension("blob");
+    if !blob.exists() {
+        return None;
+    }
+    // Refuse a blob older than its IR: silently serving a stale compile's
+    // weights is the worst failure mode. The fallthrough recompiles (slow,
+    // and on small-RAM boxes possibly OOM) — but loudly and correctly.
+    match (
+        blob.metadata().and_then(|m| m.modified()),
+        xml_path.metadata().and_then(|m| m.modified()),
+    ) {
+        (Ok(bm), Ok(xm)) if bm < xm => {
+            tracing::error!(
+                blob = %blob.display(),
+                "AOT blob is OLDER than its IR — ignoring it (re-export or delete \
+                 the stale blob); falling back to on-box compile"
+            );
+            return None;
+        }
+        (Ok(_), Ok(_)) => {}
+        // Could not read both mtimes (unsupported FS, a TOCTOU delete after the
+        // exists() check, permissions): the freshness guard cannot run. Import
+        // the blob rather than force a needless recompile, but do NOT do it
+        // silently — an unverified stale blob imports and infers wrong tokens
+        // at a clean 200 OK, exactly the failure mode the guard exists to catch.
+        _ => tracing::warn!(
+            blob = %blob.display(),
+            "AOT blob freshness could not be verified (IR/blob mtime unavailable); \
+             importing it unchecked — validate the blob with a real inference at deploy"
+        ),
+    }
+    Some(blob)
+}
+
+/// Plugin config for a blob import: the compile-time properties minus
+/// CACHE_DIR (an import never writes the compile cache, and core-level cache
+/// properties on `import_model` risk an unsupported-property error).
+fn import_plugin(plugin: &PluginConfig) -> PluginConfig {
+    let mut p = plugin.clone();
+    p.entries.retain(|(k, _)| k != "CACHE_DIR");
+    p
 }
 
 // -------- Engine --------
@@ -1031,8 +1087,10 @@ impl OvRuntimeEngine {
         want_output: bool,
     ) -> EngineResult<(Vec<f32>, Vec<usize>)> {
         let take = chunk.len();
+        debug!(take, position, "first-stage chunk: infer start");
         let (dtype, shape, bytes) =
             self.static_infer_chunk(ChunkInput::Ids(chunk), take, position, want_output)?;
+        debug!(take, position, "first-stage chunk: infer+absorb done");
         if !want_output {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -1066,6 +1124,7 @@ impl OvRuntimeEngine {
         shape: [usize; 3],
         position: i64,
     ) -> EngineResult<()> {
+        debug!(?shape, position, "downstream send: start");
         let downstream = self
             .downstream
             .clone()
@@ -1094,6 +1153,7 @@ impl OvRuntimeEngine {
             guard.send(&hid).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))?;
+        debug!(position, "downstream send: done");
         Ok(())
     }
 
@@ -1147,6 +1207,7 @@ impl OvRuntimeEngine {
         // hidden activation (see send_hidden_downstream). Each frame's payload
         // must match its shape*dtype, so we recv two separate tensors here.
         let want_pos = self.static_kv.is_some();
+        debug!(want_pos, "upstream recv: waiting");
         let (pos_tensor, tensor) = self
             .block_on(async move {
                 let mut guard = upstream.lock().await;
@@ -1159,6 +1220,7 @@ impl OvRuntimeEngine {
                 // can't wedge the stage (see `recv_tensor_reply`).
                 let (pos_tensor, t) = if want_pos {
                     let pos = guard.recv().await?.0;
+                    tracing::debug!("upstream recv: position frame arrived");
                     let (t, _) = guard.recv_reply().await?;
                     (Some(pos), t)
                 } else {
@@ -1168,6 +1230,7 @@ impl OvRuntimeEngine {
                 Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
+        debug!("upstream recv: frames arrived");
         // Decode + strictly validate the position frame outside the transport
         // closure (so a bad frame yields a clear EngineError, not a desync).
         let position = match pos_tensor {
@@ -1597,6 +1660,9 @@ impl OvRuntimeEngine {
                 other_ms,
                 "ov-runtime task done"
             );
+            if std::env::var("CASCADIA_PERF_DUMP").is_ok_and(|v| v == "1") {
+                dump_decode_profile(&self.runtime);
+            }
             self.active = None;
         }
 
@@ -1724,9 +1790,19 @@ impl OvRuntimeEngine {
         let plugin = PluginConfig {
             entries: src.plugin_entries.clone(),
         };
-        let prt = OvRuntime::compile(&src.xml, &src.device, &plugin)
-            .map_err(map_ov_err)
-            .map_err(|e| EngineError::Backend(format!("prefill reload on {}: {e}", src.device)))?;
+        let prt = if let Some(blob) = &src.blob {
+            OvRuntime::import_blob(blob, &src.device, &import_plugin(&plugin))
+                .map_err(map_ov_err)
+                .map_err(|e| {
+                    EngineError::Backend(format!("prefill blob re-import on {}: {e}", src.device))
+                })?
+        } else {
+            OvRuntime::compile(&src.xml, &src.device, &plugin)
+                .map_err(map_ov_err)
+                .map_err(|e| {
+                    EngineError::Backend(format!("prefill reload on {}: {e}", src.device))
+                })?
+        };
         if let Some(pf) = self.prefill.as_mut() {
             pf.runtime = Some(prt);
         }
@@ -2129,6 +2205,62 @@ impl Engine for OvRuntimeEngine {
     }
 }
 
+/// CASCADIA_PERF_DUMP=1 (spike diagnostics): after a task finishes, print an
+/// aggregated per-node profile of the decode model's LAST inference — one
+/// representative decode token. Needs the model compiled with PERF_COUNT=YES
+/// (pass it via the plugin properties). Times inflate under profiling; use
+/// for ATTRIBUTION between node kinds, not absolute tok/s math.
+fn dump_decode_profile(runtime: &OvRuntime) {
+    let raw = match runtime.profiling() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("perf-dump unavailable: {e} (compile with PERF_COUNT=YES)");
+            return;
+        }
+    };
+    let mut by_type: std::collections::HashMap<String, (u64, u64, u32)> =
+        std::collections::HashMap::new();
+    let mut nodes: Vec<(String, String, u64)> = Vec::new();
+    let mut total_us = 0u64;
+    for line in raw.lines() {
+        let mut it = line.split('\t');
+        let (name, ntype, etype, real) = (
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+            it.next().unwrap_or(""),
+            it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        );
+        let cpu = it.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        total_us += real;
+        let e = by_type.entry(ntype.to_string()).or_default();
+        e.0 += real;
+        e.1 += cpu;
+        e.2 += 1;
+        if real > 0 {
+            nodes.push((name.to_string(), format!("{ntype}/{etype}"), real));
+        }
+    }
+    let mut rows: Vec<_> = by_type.into_iter().collect();
+    rows.sort_by_key(|(_, (real, _, _))| std::cmp::Reverse(*real));
+    eprintln!("perf-dump: decode-infer total {total_us} us by node type:");
+    for (ntype, (real, cpu, count)) in rows.iter().take(14) {
+        eprintln!("  {ntype:<28} real {real:>8} us  cpu {cpu:>8} us  x{count}");
+    }
+    nodes.sort_by_key(|(_, _, real)| std::cmp::Reverse(*real));
+    eprintln!("perf-dump: top nodes:");
+    for (name, kind, real) in nodes.iter().take(10) {
+        let short: String = name
+            .chars()
+            .rev()
+            .take(48)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .collect();
+        eprintln!("  {real:>8} us  {kind:<28} ...{short}");
+    }
+}
+
 /// Resolve canonical input-port names ("input_ids", "attention_mask", ...)
 /// of a compiled runtime via its alias lists. v5 IRs export ports under
 /// conventional names but the IR's primary name is sometimes an internal node
@@ -2261,6 +2393,12 @@ pub struct OvRuntimeBuilder {
     /// the two-model split) and re-create it on the next prefill from the
     /// blob cache. For memory-tight stages; costs a per-task reload.
     pub park_prefill: bool,
+    /// `--gemv-offload` (SPIKE): compile the decode model with the
+    /// CascadiaInt4Gemv extension pass — sym-INT4 weight matmuls execute
+    /// straight from the mmapped .bin through a custom op instead of a
+    /// plugin-repacked resident copy (~1x steady-state decode weights).
+    /// Stateless static exports on a CPU device only.
+    pub gemv_offload: bool,
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
@@ -2314,6 +2452,11 @@ impl OvRuntimeBuilder {
     /// Park the prefill model between prefills (see `park_prefill`).
     pub fn with_prefill_parking(mut self, park: bool) -> Self {
         self.park_prefill = park;
+        self
+    }
+    /// Decode-side INT4 GEMV offload (see `gemv_offload`).
+    pub fn with_gemv_offload(mut self, offload: bool) -> Self {
+        self.gemv_offload = offload;
         self
     }
     /// Skip the export's chunked-prefill variant (prefill one token per step).
@@ -2469,6 +2612,26 @@ impl Builder for OvRuntimeBuilder {
             }
             _ => None,
         };
+        // --gemv-offload (spike): the offloaded matmuls run on the CPU
+        // plugin's evaluate() fallback, and the rewrite targets the stateless
+        // static IR's sym-INT4 pattern — gate both up front.
+        if self.gemv_offload {
+            if stage_cfg.stateful {
+                return Err(EngineError::ShardRejected(
+                    "--gemv-offload requires a stateless static export \
+                     (tools/export_shards.py --target npu)"
+                        .into(),
+                ));
+            }
+            if !self.device.trim().to_ascii_uppercase().starts_with("CPU") {
+                return Err(EngineError::ShardRejected(format!(
+                    "--gemv-offload executes offloaded matmuls on the CPU evaluate() \
+                     fallback — --device must be CPU (got {})",
+                    self.device
+                )));
+            }
+        }
+
         if (self.prefill_device.is_some() || self.park_prefill)
             && self.static_prefill_params.is_none()
         {
@@ -2552,9 +2715,51 @@ impl Builder for OvRuntimeBuilder {
         )));
         let plugin = self.plugin();
         let xml_path = stage_dir.join("openvino_model.xml");
-        let runtime =
+        let runtime = if self.gemv_offload {
+            // The custom op's member tensors don't survive blob
+            // serialization — strip CACHE_DIR for THIS compile only (the
+            // prefill compile below still caches; CPU compiles are fast).
+            let mut p = self.plugin();
+            let had_cache = p.entries.iter().any(|(k, _)| k == "CACHE_DIR");
+            if had_cache {
+                p.entries.retain(|(k, _)| k != "CACHE_DIR");
+                warn!(
+                    "--gemv-offload: decode compile skips CACHE_DIR (custom-op weights \
+                     don't survive blob serialization); the prefill compile still caches"
+                );
+            }
+            let (rt, offloaded) = OvRuntime::compile_gemv_offload(
+                xml_path.to_str().unwrap_or_default(),
+                &self.device,
+                &p,
+            )
+            .map_err(map_ov_err)?;
+            events.push(LoadProgress::message(format!(
+                "gemv-offload: {offloaded} sym-INT4 matmuls execute from the .bin mmap \
+                 (no plugin-resident weight copy)"
+            )));
+            if offloaded == 0 {
+                warn!(
+                    "--gemv-offload matched 0 matmuls — the IR does not carry the \
+                     expected NNCF sym-INT4 pattern; decode runs fully stock"
+                );
+            }
+            rt
+        } else if let Some(blob) = npu_aot_blob(&xml_path, &self.device) {
+            events.push(LoadProgress::message(format!(
+                "importing precompiled NPU blob (AOT, no on-box compile): {}",
+                blob.display()
+            )));
+            OvRuntime::import_blob(
+                blob.to_str().unwrap_or_default(),
+                &self.device,
+                &import_plugin(&plugin),
+            )
+            .map_err(map_ov_err)?
+        } else {
             OvRuntime::compile(xml_path.to_str().unwrap_or_default(), &self.device, &plugin)
-                .map_err(map_ov_err)?;
+                .map_err(map_ov_err)?
+        };
         self.input_names = runtime.input_names().map_err(map_ov_err)?;
         self.runtime = Some(runtime);
 
@@ -2592,11 +2797,26 @@ impl Builder for OvRuntimeBuilder {
                 }
             };
             let pxml = prefill_xml.to_str().unwrap_or_default().to_string();
-            let prt = OvRuntime::compile(&pxml, &pdev, &pplugin)
+            let pblob = npu_aot_blob(&prefill_xml, &pdev);
+            let prt = if let Some(blob) = &pblob {
+                events.push(LoadProgress::message(format!(
+                    "importing precompiled NPU prefill blob (AOT): {}",
+                    blob.display()
+                )));
+                OvRuntime::import_blob(
+                    blob.to_str().unwrap_or_default(),
+                    &pdev,
+                    &import_plugin(&pplugin),
+                )
                 .map_err(map_ov_err)
-                .map_err(|e| {
-                    EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
-                })?;
+                .map_err(|e| EngineError::Backend(format!("prefill blob import on {pdev}: {e}")))?
+            } else {
+                OvRuntime::compile(&pxml, &pdev, &pplugin)
+                    .map_err(map_ov_err)
+                    .map_err(|e| {
+                        EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
+                    })?
+            };
             self.prefill_runtime = Some(prt);
             if self.park_prefill && self.cache_dir.is_none() {
                 warn!(
@@ -2612,6 +2832,7 @@ impl Builder for OvRuntimeBuilder {
                 xml: pxml,
                 device: pdev,
                 plugin_entries: pplugin.entries.clone(),
+                blob: pblob.map(|b| b.to_string_lossy().into_owned()),
             });
         }
 
@@ -3046,6 +3267,79 @@ mod tests {
         assert_eq!(chunk_take(4, 100, 1000, past_len), 0);
     }
 
+    /// AOT blob import triggers ONLY for the NPU device and only when a
+    /// `.blob` sibling of the IR exists — CPU/GPU always compile (blobs are
+    /// device-specific), and an absent blob falls back to the compiler.
+    #[test]
+    fn npu_aot_blob_selects_only_npu_with_blob_present() {
+        let dir = std::env::temp_dir().join(format!("aot-blob-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("openvino_model.xml");
+        std::fs::write(&xml, "x").unwrap();
+
+        // No blob on disk: never selected.
+        assert_eq!(npu_aot_blob(&xml, "NPU"), None);
+
+        let blob = dir.join("openvino_model.blob");
+        std::fs::write(&blob, "b").unwrap();
+        // Blob present: NPU (any casing/config suffix) imports it.
+        assert_eq!(npu_aot_blob(&xml, "NPU"), Some(blob.clone()));
+        assert_eq!(npu_aot_blob(&xml, " npu "), Some(blob.clone()));
+        // Non-NPU devices always compile.
+        assert_eq!(npu_aot_blob(&xml, "CPU"), None);
+        assert_eq!(npu_aot_blob(&xml, "GPU"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A blob older than its IR is refused (fall back to a fresh compile):
+    /// serving a stale compile's weights is the "worst failure mode" the guard
+    /// exists to prevent. The happy-path test above never makes the blob older,
+    /// so this pins the `bm < xm` branch specifically.
+    #[test]
+    fn npu_aot_blob_rejects_blob_older_than_ir() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("aot-blob-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = dir.join("openvino_model.xml");
+        let blob = dir.join("openvino_model.blob");
+        std::fs::write(&xml, "x").unwrap();
+        std::fs::write(&blob, "b").unwrap();
+        // Backdate the blob 60 s behind the IR it claims to be a compile of.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&blob)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(npu_aot_blob(&xml, "NPU"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A blob import must drop CACHE_DIR (an import never writes the compile
+    /// cache, and a core-level cache property on `import_model` risks an
+    /// unsupported-property error that breaks AOT blob import outright) while
+    /// leaving every other plugin property intact.
+    #[test]
+    fn import_plugin_strips_cache_dir_keeps_rest() {
+        let p = PluginConfig::new()
+            .with("CACHE_DIR", "/tmp/x")
+            .with("PERFORMANCE_HINT", "LATENCY")
+            .with("NPU_USE_NPUW", "YES");
+        let out = import_plugin(&p);
+        assert!(!out.entries.iter().any(|(k, _)| k == "CACHE_DIR"));
+        assert!(out
+            .entries
+            .iter()
+            .any(|(k, v)| k == "PERFORMANCE_HINT" && v == "LATENCY"));
+        assert!(out
+            .entries
+            .iter()
+            .any(|(k, v)| k == "NPU_USE_NPUW" && v == "YES"));
+        assert_eq!(out.entries.len(), 2);
+    }
+
     #[test]
     fn argmax_row_selects_requested_row() {
         // 3 rows of vocab 4; best of row 1 is index 2; row 2 (pad garbage)
@@ -3133,6 +3427,40 @@ mod tests {
             .err()
             .expect("advertised variant without the IR file must be rejected");
         assert!(err.to_string().contains("missing"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gemv_offload_on_stateful_shard_rejected() {
+        let dir = write_stage_dir(
+            "gemv-stateful",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,"stateful":true}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU").with_gemv_offload(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("stateful + --gemv-offload must be rejected");
+        assert!(err.to_string().contains("--gemv-offload"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gemv_offload_on_non_cpu_device_rejected() {
+        let dir = write_stage_dir(
+            "gemv-npu",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,
+                "stateful":false,"static_seq":1,"static_context":8,
+                "num_kv_heads":2,"head_dim":4}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "NPU").with_gemv_offload(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "NPU"))
+            .await
+            .err()
+            .expect("non-CPU device + --gemv-offload must be rejected");
+        assert!(err.to_string().contains("CPU"), "got: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
