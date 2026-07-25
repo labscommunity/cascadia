@@ -197,7 +197,7 @@ pub enum Command {
     Completions(CompletionsArgs),
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
     Mock,
     OvGenai,
@@ -360,6 +360,24 @@ pub struct WorkerArgs {
     /// LLMPipeline).
     #[arg(long, value_name = "TOKS")]
     pub npu_min_response_len: Option<u32>,
+
+    /// Device for the chunked-prefill IR variant (default: same as
+    /// --device). ov-runtime engine on a stateless static export
+    /// (tools/export_shards.py --target npu --static-prefill-seq N) only.
+    /// The phase split: e.g. `--device CPU --prefill-device NPU` runs the
+    /// compute-bound wide prefill on the NPU and the bandwidth-bound seq=1
+    /// decode on the CPU, sharing one host-side KV ring. Accepts the same
+    /// OpenVINO device forms as --device. Note both compilations hold their
+    /// own copy of the stage weights (~2x weight RSS when the devices
+    /// differ); KV is not duplicated.
+    #[arg(long)]
+    pub prefill_device: Option<String>,
+
+    /// Ignore the export's chunked-prefill IR variant and prefill one token
+    /// per step (ov-runtime static path only; conflicts with
+    /// --prefill-device). Escape hatch / A-B baseline knob.
+    #[arg(long, default_value_t = false)]
+    pub no_chunked_prefill: bool,
 
     /// Speculative-decode draft model path (FastDraft companion).
     #[arg(long)]
@@ -576,6 +594,8 @@ impl WorkerArgs {
             npu_prefill_chunk_size: None,
             npu_max_prompt_len: None,
             npu_min_response_len: None,
+            prefill_device: None,
+            no_chunked_prefill: false,
             draft_model: None,
             draft_device: None,
             spec_k: 5,
@@ -636,6 +656,13 @@ pub struct ShardArgs {
     /// static_context - static_seq); ignored without `--target npu`.
     #[arg(long, default_value_t = DEFAULT_STATIC_CONTEXT)]
     pub static_context: u32,
+
+    /// NPU only: also emit a chunked-prefill IR variant with a fixed seq=N
+    /// query window (openvino_prefill_model.xml). Enables `cascadia worker
+    /// --prefill-device` phase-split execution (e.g. prefill on NPU, decode
+    /// on CPU) and ~N× fewer prefill forwards even single-device. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub static_prefill_seq: u32,
 
     /// torch default dtype during export. FP16 reduces memory and is
     /// required for `--target npu` (the runtime feeds KV as f16).
@@ -1105,6 +1132,10 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
         }
         EngineKind::OvRuntime => {
             let mut b = OvRuntimeBuilder::new(&args.model, args.rank, args.total, &args.device);
+            if let Some(dev) = &args.prefill_device {
+                b = b.with_prefill_device(dev);
+            }
+            b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1341,6 +1372,21 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             "--rank must be in [0, {}); got {}",
             args.total,
             args.rank
+        ));
+    }
+    // Fail loud, not silent: the phase-split flags are load-bearing when
+    // given, and only the ov-runtime engine implements them.
+    if (args.prefill_device.is_some() || args.no_chunked_prefill)
+        && args.engine != EngineKind::OvRuntime
+    {
+        return Err(anyhow!(
+            "--prefill-device / --no-chunked-prefill require --engine ov-runtime \
+             (the chunked-prefill phase split lives in the static-KV runtime path)"
+        ));
+    }
+    if args.prefill_device.is_some() && args.no_chunked_prefill {
+        return Err(anyhow!(
+            "--prefill-device conflicts with --no-chunked-prefill"
         ));
     }
     let is_first = args.rank == 0;
@@ -1845,6 +1891,24 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
     if args.target == ShardTarget::Npu && args.default_dtype != ShardDtype::Fp16 {
         return Err(anyhow!("--default-dtype must be fp16 for --target npu"));
     }
+    if args.static_prefill_seq != 0 {
+        if args.target != ShardTarget::Npu {
+            return Err(anyhow!("--static-prefill-seq requires --target npu"));
+        }
+        if args.static_prefill_seq == 1 {
+            return Err(anyhow!(
+                "--static-prefill-seq must be 0 (off) or >= 2 (the chunked-prefill window)"
+            ));
+        }
+        if args.static_prefill_seq > args.static_context.saturating_sub(1) {
+            return Err(anyhow!(
+                "--static-prefill-seq ({}) must be <= --static-context - 1 ({}) — a chunk \
+                 wider than the KV window would evict its own tokens mid-chunk",
+                args.static_prefill_seq,
+                args.static_context.saturating_sub(1)
+            ));
+        }
+    }
     let mut flags = vec![
         "--model".into(),
         args.model.clone(),
@@ -1864,6 +1928,10 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
         flags.push(args.static_seq.to_string());
         flags.push("--static-context".into());
         flags.push(args.static_context.to_string());
+        if args.static_prefill_seq != 0 {
+            flags.push("--static-prefill-seq".into());
+            flags.push(args.static_prefill_seq.to_string());
+        }
     }
     if let Some(s) = &args.layer_split {
         flags.push("--layer-split".into());

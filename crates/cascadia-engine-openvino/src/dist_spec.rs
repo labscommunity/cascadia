@@ -225,32 +225,9 @@ fn read_stage_config(p: &std::path::Path) -> Result<StageConfig, EngineError> {
 fn v5_inputs(
     runtime: &OvRuntime,
 ) -> Result<std::collections::HashMap<String, String>, EngineError> {
-    use std::collections::HashMap;
-    let n_inputs = runtime.input_count();
-    let mut map: HashMap<String, String> = HashMap::new();
-    // Mirrors the Python _v5_inputs(): for each input port, check ALL
-    // its aliases against each canonical name; if a match is found,
-    // map the canonical name -> the port's primary (first) name.
-    for canonical in [
-        "input_ids",
-        "hidden_states",
-        "attention_mask",
-        "position_ids",
-        "beam_idx",
-    ] {
-        for idx in 0..n_inputs {
-            let aliases = runtime.input_aliases(idx).map_err(map_ov_err)?;
-            let primary = runtime.input_name(idx).map_err(map_ov_err)?;
-            if aliases
-                .iter()
-                .any(|a| a == canonical || a.contains(canonical))
-            {
-                map.insert(canonical.to_string(), primary);
-                break;
-            }
-        }
-    }
-    Ok(map)
+    // One shared resolver across the OV engines (mirrors the Python
+    // _v5_inputs()); see runtime::resolve_canonical_inputs.
+    crate::runtime::resolve_canonical_inputs(runtime)
 }
 
 // -------- frame send / recv on the underlying TcpStream --------

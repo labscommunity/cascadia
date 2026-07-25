@@ -1257,7 +1257,7 @@ def export_single_stage(
     model_dir, output_dir, stage_plan, config, quantization, rope_theta, arch_tag,
     partial_rotary_factor=1.0,
     cache_reorder=True,
-    target="cpu-gpu", static_seq=1, static_context=1024,
+    target="cpu-gpu", static_seq=1, static_context=1024, static_prefill_seq=0,
 ):
     import openvino as ov
 
@@ -1497,11 +1497,66 @@ def export_single_stage(
     # 9. Save.
     stage_dir = os.path.join(output_dir, f"stage_{stage_idx}")
     os.makedirs(stage_dir, exist_ok=True)
+    # Remove any prefill variant from a previous export of this stage dir
+    # up front: re-exporting without --static-prefill-seq (or with different
+    # static dims) must not leave a stale, shape-mismatched variant beside a
+    # fresh decode IR (step 9b re-emits it when requested).
+    for stale in ("openvino_prefill_model.xml", "openvino_prefill_model.bin"):
+        stale_path = os.path.join(stage_dir, stale)
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+            print(f"  removed stale {stale}", flush=True)
     xml_path = os.path.join(stage_dir, "openvino_model.xml")
     print("  Saving model...", flush=True)
     ov.save_model(ov_model, xml_path, compress_to_fp16=True)
     bin_size_mb = os.path.getsize(xml_path.replace(".xml", ".bin")) / 1e6
     print(f"  Saved: {stage_dir} ({bin_size_mb:.0f} MB)", flush=True)
+
+    # 9b. NPU chunked-prefill variant: reshape the SAME compressed static
+    # graph to a seq=C query window and save it as a sibling IR. The prefill
+    # context is past_len + C (not static_context + C - 1 by accident: with
+    # static_seq=1, past_len = static_context - 1), so the prefill and decode
+    # models take byte-identical past_key_values.* tensors [1, kvh, past_len,
+    # hd] and can share one host-side KV ring (crates/.../runtime.rs
+    # StaticKv). Reshaping static->static reuses the exact shape-propagation
+    # path the seq=1 pin already exercised; one trace + one NNCF pass covers
+    # both variants (costs a second .bin on disk).
+    #
+    # ORDERING: the reshape mutates ov_model IN PLACE (a clone would double
+    # peak export RAM for large stages), so the seq=1 save above MUST stay
+    # before this block, and nothing below may serialize ov_model expecting
+    # seq=1. Add post-processing above this line, not after it.
+    static_prefill_context = 0
+    if npu and static_prefill_seq and static_prefill_seq > 1:
+        c = static_prefill_seq
+        static_prefill_context = past_len + c
+        main_name = "input_ids" if has_embed else "hidden_states"
+        shape_map = {
+            main_name: [1, c] if has_embed else [1, c, config.hidden_size],
+            "attention_mask": [1, static_prefill_context],
+            "position_ids": [1, c],
+        }
+        print(
+            f"  prefill variant: reshape seq {static_seq}->{c}, "
+            f"context {static_context}->{static_prefill_context}...",
+            flush=True,
+        )
+        ov_model.reshape(shape_map)
+        ov_model.validate_nodes_and_infer_types()
+        bad = [
+            f"{p.get_any_name()}{p.partial_shape}"
+            for p in list(ov_model.inputs) + list(ov_model.outputs)
+            if not p.partial_shape.is_static
+        ]
+        if bad:
+            raise RuntimeError(
+                f"NPU prefill variant (stage {stage_idx}): reshape to seq={c} left "
+                f"dynamic dims — the NPU compiler will reject this IR: {bad}"
+            )
+        prefill_xml = os.path.join(stage_dir, "openvino_prefill_model.xml")
+        ov.save_model(ov_model, prefill_xml, compress_to_fp16=True)
+        prefill_mb = os.path.getsize(prefill_xml.replace(".xml", ".bin")) / 1e6
+        print(f"  Saved prefill variant: {prefill_xml} ({prefill_mb:.0f} MB)", flush=True)
 
     # 10. Per-stage metadata.
     meta = {
@@ -1523,6 +1578,8 @@ def export_single_stage(
         "target": target,
         "static_seq": static_seq if npu else None,
         "static_context": static_context if npu else None,
+        "static_prefill_seq": static_prefill_seq if static_prefill_context else None,
+        "static_prefill_context": static_prefill_context or None,
         "inputs": (
             "input_ids/hidden_states, attention_mask, position_ids, "
             "past_key_values.* (explicit KV in/out)"
@@ -1697,6 +1754,18 @@ def main():
         help="NPU only: fixed total context; past-KV length = context - seq.",
     )
     parser.add_argument(
+        "--static-prefill-seq",
+        type=int,
+        default=0,
+        help="NPU only: also emit a chunked-prefill IR variant "
+        "(openvino_prefill_model.xml) with a fixed seq=N query window and "
+        "context = (static-context - 1) + N, sharing the decode variant's "
+        "past-KV shape. 0 (default) = decode-only export; the runtime then "
+        "prefills one token per step. Enables `cascadia worker "
+        "--prefill-device` phase-split execution (e.g. prefill on NPU, "
+        "decode on CPU).",
+    )
+    parser.add_argument(
         "--partial-rotary-factor",
         type=float,
         default=None,
@@ -1725,8 +1794,9 @@ def main():
 
     # The NPU runtime decodes one token per step and derives past-KV length as
     # static_context - 1, so reject configs it cannot load (fail fast — the
-    # export takes minutes). chunked prefill (static_seq > 1) is not yet wired
-    # into the runtime.
+    # export takes minutes). Chunked prefill is wired via a SEPARATE seq=N
+    # variant (--static-prefill-seq, step 9b), not by widening static_seq:
+    # the decode model stays seq=1.
     if args.target == "npu":
         if args.static_seq != 1:
             parser.error(
@@ -1744,6 +1814,19 @@ def main():
                 f"f16; --default-dtype {args.default_dtype} would emit f32 KV ports and fail "
                 f"the present-shape check at first inference)"
             )
+        if args.static_prefill_seq < 0 or args.static_prefill_seq == 1:
+            parser.error(
+                "--static-prefill-seq must be 0 (no prefill variant) or >= 2 "
+                "(the chunked-prefill query window)"
+            )
+        if args.static_prefill_seq > args.static_context - 1:
+            parser.error(
+                f"--static-prefill-seq ({args.static_prefill_seq}) must be <= "
+                f"--static-context - 1 ({args.static_context - 1}) — a chunk wider than "
+                f"the KV window would evict its own tokens mid-chunk"
+            )
+    elif args.static_prefill_seq:
+        parser.error("--static-prefill-seq requires --target npu")
     elif args.static_seq != 1 or args.static_context != 1024:
         print(
             "WARNING: --static-seq/--static-context are ignored without --target npu "
@@ -2118,6 +2201,7 @@ def main():
             target=args.target,
             static_seq=args.static_seq,
             static_context=args.static_context,
+            static_prefill_seq=args.static_prefill_seq,
         )
         total_mb += size
         gc.collect()

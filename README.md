@@ -199,6 +199,7 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 
 - **Placement is manual today.** Operators set `--rank` / `--total` / `--listen` / `--next host:port` on each worker. `cascadia discover` browses the LAN, but workers still need explicit ranks, full auto-ring formation is not yet wired into `cascadia worker` (tracked in [#89](https://github.com/labscommunity/cascadia/issues/89)).
 - **Device profiling.** `cascadia profile-devices --model <dir>` benchmarks each OV device (iGPU / NPU / CPU) on a host and writes `device_profile.json`, step 1 toward automatic placement. See [docs/perf/DEVICE_PROFILE.md](docs/perf/DEVICE_PROFILE.md).
+- **Hybrid NPU+CPU phase split.** On static (`--target npu`) shards, `cascadia worker --device CPU --prefill-device NPU` runs the compute-bound chunked prefill on the NPU and the bandwidth-bound decode on the CPU, sharing one host KV ring. See [docs/perf/HYBRID_NPU_CPU.md](docs/perf/HYBRID_NPU_CPU.md).
 - **Tensor parallelism:** type-system plumbing only; no engine implements it yet. See [docs/TENSOR_PARALLELISM.md](docs/TENSOR_PARALLELISM.md).
 
 ## Deploying
