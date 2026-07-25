@@ -24,10 +24,16 @@
 //! `CASCADIA_PREFILL_DEVICE` (prefill device for the chunked run — set NPU
 //! on an AI PC for the hybrid split; default = decode device),
 //! `CASCADIA_STATIC_PROMPT`, `CASCADIA_STATIC_MAX_NEW` (default 32),
+//! `CASCADIA_STATIC_TASKS=N` (sequential requests per chunked/hybrid engine —
+//! request 2+ is steady-state TTFT, without the ~300 ms first-infer init a
+//! cache-imported NPU blob defers),
 //! `CASCADIA_PARITY_SOFT=1` (tolerate even an EARLY fork — one within the first
 //! `NEAR_TIE_MIN_PREFIX` decoded tokens, which otherwise hard-fails as suspect
 //! corruption; late near-tie forks are already tolerated by default. For pure
 //! timing sweeps; see `assert_parity`).
+//! NOTE: `CASCADIA_OV_CACHE` applies to EVERY leg's compiles (not only the
+//! parking leg) — cached-NPU legs pay the ~300-430 ms first-infer import
+//! init, so compare like-for-like when A/B-ing against cacheless runs.
 //! Unset `CASCADIA_STATIC_SHARDS` ⇒ skip-pass (stub CI stays green).
 //! Multi-stage pipelines are exercised on hardware via `cascadia worker`
 //! (`--prefill-device`), not here.
@@ -57,10 +63,46 @@ async fn run_once(
     prompt: &str,
     max_new: u32,
 ) -> RunOut {
-    let mut builder =
-        OvRuntimeBuilder::new(shards, 0, 1, device).with_chunked_prefill_disabled(disable_chunk);
+    run_tasks(
+        shards,
+        device,
+        prefill_device,
+        disable_chunk,
+        false,
+        prompt,
+        max_new,
+        1,
+    )
+    .await
+    .remove(0)
+}
+
+/// Drive `tasks` sequential generations through one engine instance. With
+/// `park` the prefill model is dropped after each task's prefill and
+/// reloaded on the next — task 2's TTFT includes the reload, which is the
+/// number `--park-prefill` trades for ~1x steady-state weight residency.
+#[allow(clippy::too_many_arguments)]
+async fn run_tasks(
+    shards: &str,
+    device: &str,
+    prefill_device: Option<&str>,
+    disable_chunk: bool,
+    park: bool,
+    prompt: &str,
+    max_new: u32,
+    tasks: usize,
+) -> Vec<RunOut> {
+    let mut builder = OvRuntimeBuilder::new(shards, 0, 1, device)
+        .with_chunked_prefill_disabled(disable_chunk)
+        .with_prefill_parking(park);
     if let Some(pd) = prefill_device {
         builder = builder.with_prefill_device(pd);
+    }
+    // CASCADIA_OV_CACHE: compiled-blob cache dir. Load-bearing for the
+    // parking leg — without it a parked model's reload is a full cold
+    // compile (~minutes on NPU) instead of a cache import.
+    if let Ok(cache) = std::env::var("CASCADIA_OV_CACHE") {
+        builder = builder.with_cache_dir(cache);
     }
     builder
         .connect(PeerLayout::single_stage())
@@ -74,36 +116,41 @@ async fn run_once(
     while load.next().await.is_some() {}
     let mut engine = Box::new(builder).build().expect("build");
 
-    let task = GenerationTask::new("static-prefill-parity", prompt).with_max_tokens(max_new);
-    engine.submit(task).expect("submit");
+    let mut outs = Vec::new();
+    for n in 0..tasks {
+        let task = GenerationTask::new(format!("static-prefill-parity-{n}"), prompt)
+            .with_max_tokens(max_new);
+        engine.submit(task).expect("submit");
 
-    let started = Instant::now();
-    let mut ttft = None;
-    let mut ids = Vec::new();
-    let mut text = String::new();
-    loop {
-        let chunks = engine.step().expect("step");
-        let mut done = false;
-        for (_, c) in chunks {
-            if ttft.is_none() {
-                ttft = Some(started.elapsed());
+        let started = Instant::now();
+        let mut ttft = None;
+        let mut ids = Vec::new();
+        let mut text = String::new();
+        loop {
+            let chunks = engine.step().expect("step");
+            let mut done = false;
+            for (_, c) in chunks {
+                if ttft.is_none() {
+                    ttft = Some(started.elapsed());
+                }
+                ids.push(c.token_id);
+                text.push_str(&c.text);
+                if c.is_final {
+                    done = true;
+                }
             }
-            ids.push(c.token_id);
-            text.push_str(&c.text);
-            if c.is_final {
-                done = true;
+            if done {
+                break;
             }
         }
-        if done {
-            break;
-        }
+        outs.push(RunOut {
+            ids,
+            text,
+            ttft: ttft.unwrap_or_default(),
+            total: started.elapsed(),
+        });
     }
-    RunOut {
-        ids,
-        text,
-        ttft: ttft.unwrap_or_default(),
-        total: started.elapsed(),
-    }
+    outs
 }
 
 fn report(name: &str, r: &RunOut) {
@@ -257,6 +304,16 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    // CASCADIA_STATIC_TASKS=N (default 1): drive N sequential requests
+    // through the chunked/hybrid engines and report each. Request 1 through
+    // a cache-imported NPU blob pays ~300 ms of driver init the import
+    // deferred (a cold in-process compile does not); request 2+ is the
+    // steady-state TTFT a long-lived worker sees.
+    let bench_tasks: usize = std::env::var("CASCADIA_STATIC_TASKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
 
     // Guard against a vacuous pass: without a chunked-prefill variant, the
     // "chunked" and "hybrid" runs silently take the identical tokenwise path
@@ -281,20 +338,75 @@ async fn chunked_prefill_matches_tokenwise_and_reports_timing() {
     assert!(!base.ids.is_empty(), "baseline generated no tokens");
 
     // Chunked prefill, same device (weight-stream amortization only).
-    let chunked = run_once(&shards, &device, None, false, &prompt, max_new).await;
-    report(&format!("chunked   [{device}]"), &chunked);
-    assert_parity(&format!("chunked prefill on {device}"), &base, &chunked);
+    let chunked_runs = run_tasks(
+        &shards,
+        &device,
+        None,
+        false,
+        false,
+        &prompt,
+        max_new,
+        bench_tasks,
+    )
+    .await;
+    for (i, c) in chunked_runs.iter().enumerate() {
+        let label = if bench_tasks == 1 {
+            format!("chunked   [{device}]")
+        } else {
+            format!("chunked#{}  [{device}]", i + 1)
+        };
+        report(&label, c);
+        assert_parity(
+            &format!("chunked prefill on {device} (task {})", i + 1),
+            &base,
+            c,
+        );
+    }
 
     // Hybrid: chunked prefill on another device, decode unchanged.
     if let Some(pd) = prefill_device.as_deref() {
-        let hybrid = run_once(&shards, &device, Some(pd), false, &prompt, max_new).await;
-        report(&format!("hybrid    [{pd}+{device}]"), &hybrid);
-        assert_parity(
-            &format!("hybrid ({pd} prefill + {device} decode)"),
-            &base,
-            &hybrid,
-        );
+        let hybrid_runs = run_tasks(
+            &shards,
+            &device,
+            Some(pd),
+            false,
+            false,
+            &prompt,
+            max_new,
+            bench_tasks,
+        )
+        .await;
+        for (i, h) in hybrid_runs.iter().enumerate() {
+            let label = if bench_tasks == 1 {
+                format!("hybrid    [{pd}+{device}]")
+            } else {
+                format!("hybrid#{}  [{pd}+{device}]", i + 1)
+            };
+            report(&label, h);
+            assert_parity(
+                &format!("hybrid ({pd} prefill + {device} decode, task {})", i + 1),
+                &base,
+                h,
+            );
+        }
     } else {
         eprintln!("CASCADIA_PREFILL_DEVICE not set; hybrid leg skipped");
+    }
+
+    // Parking (CASCADIA_PARK=1): two sequential tasks through one engine
+    // with --park-prefill semantics — task 1 parks after prefill, task 2
+    // pays the reload (visible in its TTFT). Both must stay in parity with the
+    // baseline (near-tie-tolerant; see `assert_parity`).
+    if std::env::var("CASCADIA_PARK").is_ok_and(|v| v == "1") {
+        let pd = prefill_device.as_deref();
+        let outs = run_tasks(&shards, &device, pd, false, true, &prompt, max_new, 2).await;
+        let label = pd.unwrap_or(&device).to_string();
+        report(&format!("parked#1  [{label}+{device}]"), &outs[0]);
+        report(&format!("parked#2  [{label}+{device}]"), &outs[1]);
+        for (n, o) in outs.iter().enumerate() {
+            assert_parity(&format!("parked task {}", n + 1), &base, o);
+        }
+    } else {
+        eprintln!("CASCADIA_PARK not set; parking leg skipped");
     }
 }

@@ -570,7 +570,12 @@ fn float_elem_bytes(dtype: ShimDType) -> EngineResult<usize> {
 /// prefill→decode handoff is zero-cost by construction, and the two devices
 /// never hold KV — only weights — so DRAM keeps a single KV copy.
 struct StaticPrefill {
-    runtime: OvRuntime,
+    /// The compiled prefill model. `None` while PARKED (`--park-prefill`):
+    /// dropping the CompiledModel releases its resident weight copy — the
+    /// structural memory cost of the two-model split — between prefills;
+    /// `ensure_prefill_loaded` re-creates it from `PrefillReload` on demand.
+    /// Wiring, window dims, and buffers persist across park/reload.
+    runtime: Option<OvRuntime>,
     /// Fixed query-window width C of the prefill IR.
     seq: usize,
     /// Fixed total context of the prefill IR (= ring past_len + seq).
@@ -585,6 +590,16 @@ struct StaticPrefill {
     mask_bytes: Vec<u8>,
     primary_buf: Vec<u8>,
     pos_buf: Vec<u8>,
+}
+
+/// Everything needed to re-create a parked prefill compilation: the variant's
+/// IR path, its device, and the plugin properties the original compile used
+/// (CACHE_DIR etc., so a reload hits the OV blob/UMD cache instead of a cold
+/// compile).
+struct PrefillReload {
+    xml: String,
+    device: String,
+    plugin_entries: Vec<(String, String)>,
 }
 
 // -------- Engine --------
@@ -638,6 +653,13 @@ pub struct OvRuntimeEngine {
     /// possibly on a different device — that consumes the prompt `seq` tokens
     /// per inference, sharing `static_kv`'s ring with the decode model.
     prefill: Option<StaticPrefill>,
+    /// `--park-prefill`: drop the prefill CompiledModel after each task's
+    /// prefill phase (freeing its resident weight copy) and re-create it on
+    /// the next prefill. Trades a per-task reload for ~1× steady-state
+    /// weight residency between requests.
+    park_prefill: bool,
+    /// Reload source for a parked prefill model.
+    prefill_reload: Option<PrefillReload>,
     step_warn: StepWarnLimiter,
 }
 
@@ -917,6 +939,7 @@ impl OvRuntimeEngine {
         let pf_seq = self.prefill.as_ref().map(|p| p.seq);
 
         if let (Some(pf_seq), true) = (pf_seq, in_window) {
+            self.ensure_prefill_loaded()?;
             let mut rows: Vec<f32> = Vec::new();
             let mut x_out = 0usize;
             let mut off = 0usize;
@@ -1249,6 +1272,9 @@ impl OvRuntimeEngine {
                 sk.reset();
             }
             self.position = 0;
+            // Failure recovery is also a going-idle transition: release the
+            // prefill weight copy (no-op unless --park-prefill).
+            self.park_prefill_model();
             res = Err(match failed {
                 Some(id) => e.for_task(id),
                 None => e,
@@ -1323,6 +1349,9 @@ impl OvRuntimeEngine {
                     let take = chunk_take(c, tokens.len() - idx, chunk_start as usize, past_len);
                     let ts = std::time::Instant::now();
                     let (token, wire) = if take >= 2 {
+                        // Lazy so a prompt that never chunks (1-token, or
+                        // fully over-window) skips a parked model's reload.
+                        self.ensure_prefill_loaded()?;
                         let is_final_chunk = idx + take == tokens.len();
                         // Single-stage: nothing reads a non-final chunk's
                         // logits — skip the [1,C,vocab] copy + convert.
@@ -1393,6 +1422,9 @@ impl OvRuntimeEngine {
                 if let Some(a) = self.active.as_mut() {
                     a.t_prefill = a.started.elapsed();
                 }
+                // Prefill phase over: with --park-prefill, release the
+                // prefill model's resident weights until the next task.
+                self.park_prefill_model();
             }
             nt
         } else {
@@ -1677,14 +1709,49 @@ impl OvRuntimeEngine {
         Ok((odt, oshape, obytes))
     }
 
-    /// One chunked-prefill inference covering `real` (<= C) tokens starting at
-    /// absolute `position`, on the prefill runtime (`--prefill-device`). Pads
-    /// the primary input to the fixed C-window, masks the padding, feeds the
-    /// SAME host KV ring the decode model uses, absorbs the `real` new
-    /// tokens' K/V, and returns output 0 (`[1, C, X]`; rows `real..C` are
-    /// pad-query garbage the caller must never use). The ring is the whole
-    /// prefill→decode handoff: KV lives once in host DRAM regardless of which
-    /// device computed it.
+    /// Re-create a parked prefill compilation (no-op while loaded or without
+    /// a variant). Reload cost is logged; with a CACHE_DIR-backed compile the
+    /// reload comes from the OV blob/UMD cache rather than a cold compile.
+    fn ensure_prefill_loaded(&mut self) -> EngineResult<()> {
+        let parked = self.prefill.as_ref().is_some_and(|p| p.runtime.is_none());
+        if !parked {
+            return Ok(());
+        }
+        let src = self.prefill_reload.as_ref().ok_or_else(|| {
+            EngineError::Backend("parked prefill model without a reload source".into())
+        })?;
+        let ts = std::time::Instant::now();
+        let plugin = PluginConfig {
+            entries: src.plugin_entries.clone(),
+        };
+        let prt = OvRuntime::compile(&src.xml, &src.device, &plugin)
+            .map_err(map_ov_err)
+            .map_err(|e| EngineError::Backend(format!("prefill reload on {}: {e}", src.device)))?;
+        if let Some(pf) = self.prefill.as_mut() {
+            pf.runtime = Some(prt);
+        }
+        info!(
+            reload_ms = ts.elapsed().as_millis() as u64,
+            device = %src.device,
+            "prefill model reloaded (was parked)"
+        );
+        Ok(())
+    }
+
+    /// `--park-prefill`: drop the prefill CompiledModel, releasing its
+    /// resident weight copy until the next prefill. Wiring and buffers stay.
+    /// Cheap no-op when disabled, already parked, or no variant exists.
+    fn park_prefill_model(&mut self) {
+        if !self.park_prefill {
+            return;
+        }
+        if let Some(pf) = self.prefill.as_mut() {
+            if pf.runtime.take().is_some() {
+                info!("prefill model parked (resident weights freed until next prefill)");
+            }
+        }
+    }
+
     /// Run one chunked-prefill inference for `real` (<= C) tokens starting at
     /// absolute `position`, absorbing their K/V into the shared ring. Returns
     /// the primary output `[1, C, X]` bytes when `want_output`, else empty —
@@ -1719,6 +1786,14 @@ impl OvRuntimeEngine {
                 "negative chunk position {position}"
             )));
         }
+        // Parked check FIRST: begin_token/write_prefill_mask mutate ring
+        // state — advancing the cursor for a token whose K/V is never
+        // absorbed would desync the ring if this error ever fires.
+        let prt = pf.runtime.as_mut().ok_or_else(|| {
+            EngineError::Backend(
+                "prefill model is parked — callers must ensure_prefill_loaded first".into(),
+            )
+        })?;
         sk.begin_token(position as usize);
         sk.write_prefill_mask(&mut pf.mask_bytes, pf.context, real);
 
@@ -1765,39 +1840,33 @@ impl OvRuntimeEngine {
         }
 
         match input {
-            ChunkInput::Ids(_) => pf
-                .runtime
+            ChunkInput::Ids(_) => prt
                 .set_input(in_main, ShimDType::I64, &[1, pf.seq], &pf.primary_buf)
                 .map_err(map_ov_err)?,
-            ChunkInput::Hidden(_, hid) => pf
-                .runtime
+            ChunkInput::Hidden(_, hid) => prt
                 .set_input(in_main, ShimDType::F16, &[1, pf.seq, hid], &pf.primary_buf)
                 .map_err(map_ov_err)?,
         }
-        pf.runtime
-            .set_input(
-                &pf.attn_in,
-                ShimDType::I64,
-                &[1, pf.context],
-                &pf.mask_bytes,
-            )
-            .map_err(map_ov_err)?;
-        pf.runtime
-            .set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
+        prt.set_input(
+            &pf.attn_in,
+            ShimDType::I64,
+            &[1, pf.context],
+            &pf.mask_bytes,
+        )
+        .map_err(map_ov_err)?;
+        prt.set_input(&pf.pos_in, ShimDType::I64, &[1, pf.seq], &pf.pos_buf)
             .map_err(map_ov_err)?;
         let kv_shape = [1, sk.kv_heads, sk.past_len, sk.head_dim];
         for (li, layer) in pf.layers.iter().enumerate() {
-            pf.runtime
-                .set_input(&layer.key_in, sk.kv_dtype, &kv_shape, &sk.key_buf[li])
+            prt.set_input(&layer.key_in, sk.kv_dtype, &kv_shape, &sk.key_buf[li])
                 .map_err(map_ov_err)?;
-            pf.runtime
-                .set_input(&layer.val_in, sk.kv_dtype, &kv_shape, &sk.val_buf[li])
+            prt.set_input(&layer.val_in, sk.kv_dtype, &kv_shape, &sk.val_buf[li])
                 .map_err(map_ov_err)?;
         }
-        pf.runtime.infer().map_err(map_ov_err)?;
+        prt.infer().map_err(map_ov_err)?;
 
         let primary = if want_output {
-            pf.runtime.output(0).map_err(map_ov_err)?
+            prt.output(0).map_err(map_ov_err)?
         } else {
             (ShimDType::F16, Vec::new(), Vec::new())
         };
@@ -1809,8 +1878,8 @@ impl OvRuntimeEngine {
         let want_shape = [1usize, sk.kv_heads, pf.context, sk.head_dim];
         for li in 0..pf.layers.len() {
             let (ko, vo) = (pf.layers[li].key_out, pf.layers[li].val_out);
-            let (_, kshape, kpres) = pf.runtime.output(ko).map_err(map_ov_err)?;
-            let (_, vshape, vpres) = pf.runtime.output(vo).map_err(map_ov_err)?;
+            let (_, kshape, kpres) = prt.output(ko).map_err(map_ov_err)?;
+            let (_, vshape, vpres) = prt.output(vo).map_err(map_ov_err)?;
             if kpres.len() != expect
                 || vpres.len() != expect
                 || kshape != want_shape
@@ -1832,6 +1901,11 @@ impl OvRuntimeEngine {
 
     fn step_last(&mut self) -> EngineResult<()> {
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        // A seq=1 static frame means this task's prefill chunks are done —
+        // with --park-prefill, release the prefill model's weights now.
+        if pos_opt.is_some() && shape[1] == 1 {
+            self.park_prefill_model();
+        }
         let (out, out_shape) = match pos_opt {
             // Static (NPU): the carried absolute position drives the ring
             // (reset at 0); seq is always 1.
@@ -1859,6 +1933,11 @@ impl OvRuntimeEngine {
         // stage, so it gets the widened prefill budget. Seq=1 frames (decode
         // steps, tokenwise prefill) keep the strict decode deadline.
         let prefill_reply = shape[1] > 1;
+        // A seq=1 static frame means this task's prefill chunks are done —
+        // with --park-prefill, release the prefill model's weights now.
+        if pos_opt.is_some() && shape[1] == 1 {
+            self.park_prefill_model();
+        }
         let (out, out_shape, fwd_pos) = match pos_opt {
             Some(pos) => {
                 let (o, s) = self.run_relay(&hidden, shape, pos)?;
@@ -1936,7 +2015,13 @@ impl Engine for OvRuntimeEngine {
                 // inflates the first real request's TTFT — the very metric
                 // the phase split exists to improve.
                 if self.prefill.is_some() && !warm.is_empty() {
-                    if let Err(e) = self.run_first_chunk(warm, 0, true) {
+                    // Ensure covers a future re-warm with --park-prefill:
+                    // today warmup precedes any park, but that ordering is
+                    // an invariant nothing else enforces.
+                    if let Err(e) = self
+                        .ensure_prefill_loaded()
+                        .and_then(|_| self.run_first_chunk(warm, 0, true).map(|_| ()))
+                    {
                         warn!(error = %e, "ov-runtime warmup (prefill model) failed");
                     }
                 }
@@ -2035,6 +2120,11 @@ impl Engine for OvRuntimeEngine {
                 sk.reset();
             }
             self.position = 0;
+            // Cancel is a "task over, going idle" transition — exactly what
+            // --park-prefill exists for. Without this, a cancelled task
+            // leaves the second weight copy resident until the NEXT task's
+            // prefill completes.
+            self.park_prefill_model();
         }
     }
 }
@@ -2166,6 +2256,11 @@ pub struct OvRuntimeBuilder {
     /// Ignore the export's chunked-prefill variant and prefill one token per
     /// step (the pre-variant behavior); conflicts with `prefill_device`.
     pub disable_chunked_prefill: bool,
+    /// `--park-prefill`: drop the prefill CompiledModel after each task's
+    /// prefill (freeing its resident weight copy — the structural cost of
+    /// the two-model split) and re-create it on the next prefill from the
+    /// blob cache. For memory-tight stages; costs a per-task reload.
+    pub park_prefill: bool,
     pub cache_dir: Option<String>,
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
@@ -2173,6 +2268,7 @@ pub struct OvRuntimeBuilder {
     pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
     prefill_runtime: Option<OvRuntime>,
+    prefill_reload: Option<PrefillReload>,
     spec: Option<ShardSpec>,
     rotary: Option<Rotary>,
     hidden_size: usize,
@@ -2213,6 +2309,11 @@ impl OvRuntimeBuilder {
     /// `device` — the NPU+CPU (or GPU+CPU) phase split.
     pub fn with_prefill_device(mut self, device: impl Into<String>) -> Self {
         self.prefill_device = Some(device.into());
+        self
+    }
+    /// Park the prefill model between prefills (see `park_prefill`).
+    pub fn with_prefill_parking(mut self, park: bool) -> Self {
+        self.park_prefill = park;
         self
     }
     /// Skip the export's chunked-prefill variant (prefill one token per step).
@@ -2368,18 +2469,27 @@ impl Builder for OvRuntimeBuilder {
             }
             _ => None,
         };
-        if self.prefill_device.is_some() && self.static_prefill_params.is_none() {
-            return Err(EngineError::ShardRejected(if stage_cfg.stateful {
-                "--prefill-device requires a stateless static export: re-export with \
-                 tools/export_shards.py --target npu --static-prefill-seq N (the stateful \
-                 path keeps KV inside OV state, which two devices cannot share)"
-                    .into()
-            } else if self.disable_chunked_prefill {
-                "--prefill-device conflicts with --no-chunked-prefill".into()
+        if (self.prefill_device.is_some() || self.park_prefill)
+            && self.static_prefill_params.is_none()
+        {
+            let flag = if self.prefill_device.is_some() {
+                "--prefill-device"
             } else {
-                "--prefill-device requires a chunked-prefill IR variant: re-export this \
-                 pipeline with --static-prefill-seq N"
-                    .into()
+                "--park-prefill"
+            };
+            return Err(EngineError::ShardRejected(if stage_cfg.stateful {
+                format!(
+                    "{flag} requires a stateless static export: re-export with \
+                     tools/export_shards.py --target npu --static-prefill-seq N (the stateful \
+                     path keeps KV inside OV state, which two devices cannot share)"
+                )
+            } else if self.disable_chunked_prefill {
+                format!("{flag} conflicts with --no-chunked-prefill")
+            } else {
+                format!(
+                    "{flag} requires a chunked-prefill IR variant: re-export this \
+                     pipeline with --static-prefill-seq N"
+                )
             }));
         }
 
@@ -2481,12 +2591,28 @@ impl Builder for OvRuntimeBuilder {
                         .collect(),
                 }
             };
-            let prt = OvRuntime::compile(prefill_xml.to_str().unwrap_or_default(), &pdev, &pplugin)
+            let pxml = prefill_xml.to_str().unwrap_or_default().to_string();
+            let prt = OvRuntime::compile(&pxml, &pdev, &pplugin)
                 .map_err(map_ov_err)
                 .map_err(|e| {
                     EngineError::Backend(format!("chunked-prefill variant on {pdev}: {e}"))
                 })?;
             self.prefill_runtime = Some(prt);
+            if self.park_prefill && self.cache_dir.is_none() {
+                warn!(
+                    "--park-prefill without --ov-cache-dir: every reload is a full \
+                     cold compile (measured ~minutes on NPU) instead of a blob-cache \
+                     import — set --ov-cache-dir"
+                );
+            }
+            // Everything a parked model needs to come back (--park-prefill);
+            // the PREFILL device's plugin entries so a reload both hits the
+            // compile cache and never re-introduces decode-device tuning.
+            self.prefill_reload = Some(PrefillReload {
+                xml: pxml,
+                device: pdev,
+                plugin_entries: pplugin.entries.clone(),
+            });
         }
 
         events.push(LoadProgress::message(
@@ -2675,7 +2801,7 @@ impl Builder for OvRuntimeBuilder {
                     )));
                 }
                 Some(StaticPrefill {
-                    runtime: prt,
+                    runtime: Some(prt),
                     seq: pseq as usize,
                     context: pctx as usize,
                     ids_in,
@@ -2707,6 +2833,8 @@ impl Builder for OvRuntimeBuilder {
             active: None,
             static_kv,
             prefill,
+            park_prefill: self.park_prefill,
+            prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
         }))
     }
@@ -3005,6 +3133,22 @@ mod tests {
             .err()
             .expect("advertised variant without the IR file must be rejected");
         assert!(err.to_string().contains("missing"), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn park_prefill_on_stateful_shard_rejected() {
+        let dir = write_stage_dir(
+            "park-stateful",
+            r#"{"layer_start":0,"layer_end":2,"has_embed":true,"has_head":true,"stateful":true}"#,
+        );
+        let mut b = OvRuntimeBuilder::new(&dir, 0, 1, "CPU").with_prefill_parking(true);
+        let err = b
+            .load(ShardSpec::single_stage("m", "CPU"))
+            .await
+            .err()
+            .expect("stateful + --park-prefill must be rejected");
+        assert!(err.to_string().contains("--park-prefill"), "got: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
