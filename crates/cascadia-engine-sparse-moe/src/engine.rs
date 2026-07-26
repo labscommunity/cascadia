@@ -774,36 +774,28 @@ impl Builder for SparseMoEBuilder {
             } else {
                 info!("built MiniMax-M2 OV-IR engine (single-stage)");
             }
-            // Issue-34 §8: multi-stage warm-resume prefix cache. Only wired for the
-            // pipeline path under `kv_coord` (per-stage CAPTURE/RESTORE over the
-            // transport); single-stage OvMoe has no capture point yet, so it stays
-            // off. Without the feature the cache is disabled (allocating it would
-            // only waste memory with no warm-pull plane).
-            let ov_kv_cache_size = if total > 1 {
-                #[cfg(feature = "kv_coord")]
-                {
-                    self.config.kv_prefix_cache_size
+            // Issue-34: KV warm-resume prefix cache. Under `kv_coord`, enabled for BOTH single-stage
+            // (cross-chain warm-pull + local warm-resume, Phase 2) and multi-stage (per-stage
+            // CAPTURE/RESTORE over the transport, Phase 1). Without the feature there is no warm
+            // plane, so the cache stays off (allocating it would only waste memory).
+            #[cfg(feature = "kv_coord")]
+            let ov_kv_cache_size = self.config.kv_prefix_cache_size;
+            #[cfg(not(feature = "kv_coord"))]
+            let ov_kv_cache_size = {
+                if self.config.kv_prefix_cache_size > 0 {
+                    warn!(
+                        requested = self.config.kv_prefix_cache_size,
+                        total, "kv-prefix-cache disabled: warm-resume needs the kv_coord feature"
+                    );
                 }
-                #[cfg(not(feature = "kv_coord"))]
-                {
-                    if self.config.kv_prefix_cache_size > 0 {
-                        warn!(
-                            requested = self.config.kv_prefix_cache_size,
-                            total,
-                            "kv-prefix-cache disabled: multi-stage capture needs the kv_coord feature"
-                        );
-                    }
-                    0
-                }
-            } else {
-                0
+                0u32
             };
             let ov_kv_cache =
                 crate::ov_kv_cache::OvMoeKvPrefixCache::new(ov_kv_cache_size as usize);
             if ov_kv_cache.enabled() {
                 info!(
                     capacity = ov_kv_cache_size,
-                    rank, total, "OvMoe kv-prefix-cache enabled (multi-stage warm-resume)"
+                    rank, total, "OvMoe kv-prefix-cache enabled (warm-resume)"
                 );
             }
             return Ok(Box::new(OvMoeEngine::new(
@@ -2746,6 +2738,15 @@ pub struct OvMoeEngine {
     #[cfg(feature = "kv_coord")]
     kv_capture:
         std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    /// Cross-chain (Issue-34 Option C) head/single-stage NEGOTIATE→GET offers:
+    /// `epoch → (prefix tokens, snapshot)`, short-lived (created on NEGOTIATE, consumed on GET).
+    #[cfg(feature = "kv_coord")]
+    kv_offers:
+        std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    /// Holder-side mirror of the prefix/offer/capture caches, served lock-free by
+    /// [`crate::ov_kv_coordination::OvMoeKvHolder`] for cross-chain NEGOTIATE/GET.
+    #[cfg(feature = "kv_coord")]
+    kv_share: crate::ov_kv_coordination::OvSharedHolderCache,
 }
 
 impl OvMoeEngine {
@@ -2758,6 +2759,15 @@ impl OvMoeEngine {
         total: u32,
         kv_prefix_cache: crate::ov_kv_cache::OvMoeKvPrefixCache,
     ) -> Self {
+        // Build the holder mirror before `runner`/`kv_prefix_cache` move into the struct literal
+        // (fingerprint()/capacity() are `&self`).
+        #[cfg(feature = "kv_coord")]
+        let kv_share = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::ov_kv_coordination::OvHolderState::new(
+                kv_prefix_cache.capacity(),
+                runner.fingerprint(),
+            ),
+        ));
         Self {
             runner,
             tokenizer,
@@ -2773,6 +2783,10 @@ impl OvMoeEngine {
             kv_prefix_cache,
             #[cfg(feature = "kv_coord")]
             kv_capture: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_offers: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_share,
         }
     }
 
@@ -2810,16 +2824,39 @@ impl OvMoeEngine {
         };
         let max_new = task.max_tokens.max(1) as usize;
         let sampling_cfg = sampling_from_task(&task);
-        let generated = match self.runner.generate(&prompt_ids, max_new, &sampling_cfg) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
-                return vec![(
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
-                )];
-            }
-        };
+        // Warm-resume + capture via the prefix cache (Issue-34 Phase 2). Disabled cache ⇒
+        // byte-identical to a plain `generate`. On a fresh prompt, `_cached` is the prompt's KV
+        // snapshot — mirror it into the lock-free holder so a cross-chain GET can serve this prefix.
+        let cache_opt: Option<&mut crate::ov_kv_cache::OvMoeKvPrefixCache> =
+            if self.kv_prefix_cache.enabled() {
+                Some(&mut self.kv_prefix_cache)
+            } else {
+                None
+            };
+        let (generated, _cached) =
+            match self
+                .runner
+                .generate_with_cache(&prompt_ids, max_new, &sampling_cfg, cache_opt)
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
+                    )];
+                }
+            };
+        #[cfg(feature = "kv_coord")]
+        if let Some(snap) = _cached {
+            let fp = self.runner.fingerprint();
+            let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+            self.kv_share
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .prefix
+                .insert(prompt64, &fp, snap);
+        }
         let n_tokens = generated.len() as u32;
         let text = tok.decode(&generated, true).unwrap_or_default();
         let elapsed = started.elapsed().as_secs_f64();
@@ -3426,6 +3463,118 @@ impl Engine for OvMoeEngine {
         } else {
             self.step_worker()
         })
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
+        Some(self)
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
+        Some(std::sync::Arc::new(crate::ov_kv_coordination::OvMoeKvHolder {
+            cache: std::sync::Arc::clone(&self.kv_share),
+            model_fp: self.runner.fingerprint().digest(),
+        }))
+    }
+}
+
+/// Cross-chain (Issue-34 Option C) warm-pull for OvMoe: NEGOTIATE→GET→insert, mirroring
+/// `SparseMoEEngine` but over the OPAQUE f32 wire (see `ov_kv_coordination`).
+#[cfg(feature = "kv_coord")]
+impl cascadia_engine::KvCoordination for OvMoeEngine {
+    fn model_fingerprint(&self) -> u64 {
+        self.runner.fingerprint().digest()
+    }
+
+    fn layout_version(&self) -> u16 {
+        cascadia_kv_wire::OPAQUE_KV_LAYOUT
+    }
+
+    fn engine_rev(&self) -> u64 {
+        crate::ov_kv_coordination::KV_ENGINE_REV
+    }
+
+    fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+        let enc = self.tokenizer.as_ref()?.encode(text, true).ok()?;
+        Some(enc.get_ids().iter().map(|&u| u as i32).collect())
+    }
+
+    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        if !self.kv_prefix_cache.enabled() {
+            return None;
+        }
+        let fp = self.runner.fingerprint();
+        let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
+        let snap = self.kv_prefix_cache.lookup(&prompt, &fp)?;
+        let len = snap.past_seq_len;
+        let prefix = token_ids.get(..len)?.to_vec();
+        let epoch = crate::kv_coordination::synth_epoch(&prefix);
+        if self.kv_offers.len() >= crate::ov_kv_coordination::KV_MAX_OFFERS {
+            if let Some(k) = self.kv_offers.keys().next().copied() {
+                self.kv_offers.remove(&k);
+            }
+        }
+        self.kv_offers.insert(epoch, (prefix, snap));
+        Some((epoch, len as u32))
+    }
+
+    fn export(
+        &mut self,
+        partner: &str,
+        expected_epoch: u64,
+        expected_len: u32,
+    ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let model_fp = self.runner.fingerprint().digest();
+        let (prefix, snap) = if let Some(off) = self.kv_offers.remove(&expected_epoch) {
+            off
+        } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+            (tokens.clone(), snap.clone())
+        } else {
+            return None;
+        };
+        if snap.past_seq_len as u32 != expected_len {
+            return None;
+        }
+        Some(crate::ov_kv_coordination::ov_snapshot_to_wire(
+            &prefix,
+            &snap,
+            partner,
+            model_fp,
+            expected_epoch,
+        ))
+    }
+
+    fn insert(
+        &mut self,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
+        if !self.kv_prefix_cache.enabled() {
+            return Ok(());
+        }
+        let fp = self.runner.fingerprint();
+        let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
+        // Mirror into the holder cache so a busy engine still serves this prefix lock-free.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .insert(prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache.insert(prefix, &fp, snap);
+        Ok(())
+    }
+
+    fn apply_warm_resume(&mut self, epoch: u64) -> bool {
+        let local_ok = match self.kv_capture.get(&epoch).cloned() {
+            Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+            None => false,
+        };
+        if !local_ok {
+            return false;
+        }
+        self.forward_restore_downstream(epoch)
     }
 }
 
