@@ -146,6 +146,10 @@ pub enum FrameKind {
     // `from_code` (loud, not silent corruption).
     Restore = 0x53_4D_45_40,    // "SME\x40" — head→down: restore each stage's KV captured under epoch E
     RestoreAck = 0x53_4D_45_41, // "SME\x41" — up: verdict byte (1 = restored, 0 = missed ⇒ head cold)
+    // Issue-34 cross-chain: like Restore but CARRIES the pulled slice blob inline (epoch + len + blob).
+    // The moved-to head sends this to a moved-to tail that has NO local capture for a FOREIGN chain's
+    // epoch; the tail applies the carried blob directly. Appended code — never reorder existing ones.
+    RestoreCarry = 0x53_4D_45_42, // "SME\x42" — head→down: RESTORE carrying the pulled slice blob
 }
 
 impl FrameKind {
@@ -168,6 +172,7 @@ impl FrameKind {
             x if x == FrameKind::CaptureAck as u32 => Some(FrameKind::CaptureAck),
             x if x == FrameKind::Restore as u32 => Some(FrameKind::Restore),
             x if x == FrameKind::RestoreAck as u32 => Some(FrameKind::RestoreAck),
+            x if x == FrameKind::RestoreCarry as u32 => Some(FrameKind::RestoreCarry),
             _ => None,
         }
     }
@@ -716,6 +721,62 @@ pub async fn recv_restore_body_server(srv: &Mutex<ActivationServer>) -> Transpor
         return Err(TransportError::SocketClosed);
     }
     Ok(u64::from_be_bytes(raw[0..8].try_into().unwrap()))
+}
+
+/// Hard cap on a RestoreCarry blob — bounds the recv-side allocation from the 4-byte length field
+/// against a corrupt/adversarial peer (mirrors `MAX_CAPTURE_TOKENS`). The opaque f32 KV slice is
+/// ~tens of MiB for a small model; 512 MiB is a generous upper bound.
+pub const MAX_RESTORE_BLOB_BYTES: u32 = 512 << 20;
+
+/// Pure RestoreCarry encoder (testable): kind(4) + epoch(8 BE) + blob_len(4 BE) + blob.
+fn restore_carry_bytes(epoch: u64, blob: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(16 + blob.len());
+    b.extend_from_slice(&(FrameKind::RestoreCarry as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+    b.extend_from_slice(blob);
+    b
+}
+
+/// Send a RestoreCarry frame downstream (head → next stage), carrying the pulled slice blob inline.
+pub async fn send_restore_carry(
+    cli: &Mutex<ActivationClient>,
+    epoch: u64,
+    blob: &[u8],
+) -> TransportResult<()> {
+    let bytes = restore_carry_bytes(epoch, blob);
+    let mut guard = cli.lock().await;
+    guard.send_raw(&bytes).await?;
+    Ok(())
+}
+
+/// Receive a RestoreCarry body from upstream (kind already consumed). Returns `(epoch, blob)`.
+pub async fn recv_restore_carry_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<u8>)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(12).await?;
+    if head.len() != 12 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let len = u32::from_be_bytes(head[8..12].try_into().unwrap());
+    if len > MAX_RESTORE_BLOB_BYTES {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "restore-carry blob {len} exceeds MAX_RESTORE_BLOB_BYTES {MAX_RESTORE_BLOB_BYTES}"
+        ))));
+    }
+    let n = len as usize;
+    let blob = if n > 0 {
+        guard.recv_raw(n).await?
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    if blob.len() != n {
+        return Err(TransportError::SocketClosed);
+    }
+    Ok((epoch, blob))
 }
 
 /// Send a RestoreAck frame upstream (stage → head-ward). Body: kind(4) + epoch(8 BE) + verdict(1).

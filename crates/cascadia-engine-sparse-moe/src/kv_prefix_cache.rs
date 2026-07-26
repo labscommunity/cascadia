@@ -139,6 +139,28 @@ impl ModelFingerprint {
         self.hash(&mut h);
         h.finish()
     }
+
+    /// Issue-34 cross-chain PLANE digest: hashes only the model-identity fields, EXCLUDING the
+    /// per-stage slice (`layer_start/layer_end/is_first/is_last`). A move A→B pulls every rank's KV
+    /// keyed by ONE fingerprint (the moved-to head's), so a tail holder's fp must match despite its
+    /// different layer span — a per-stage digest would wrongly reject the worker ranks of a legitimate
+    /// move. LOCAL cache keys keep the full `digest()` (a rank-0 snapshot must never restore on rank 1);
+    /// this is used only for `model_fingerprint`/holder/export on the plane. Mirrors the OV engines'
+    /// deliberately model-level plane fingerprint.
+    pub fn plane_digest(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        self.arch.hash(&mut h);
+        self.num_layers.hash(&mut h);
+        self.num_experts.hash(&mut h);
+        self.top_k.hash(&mut h);
+        self.hidden_size.hash(&mut h);
+        self.num_kv_heads.hash(&mut h);
+        self.qk_head_dim.hash(&mut h);
+        self.v_head_dim.hash(&mut h);
+        self.vocab_size.hash(&mut h);
+        h.finish()
+    }
 }
 
 /// Cache key: model fingerprint digest + 64-bit hash of the token-id
