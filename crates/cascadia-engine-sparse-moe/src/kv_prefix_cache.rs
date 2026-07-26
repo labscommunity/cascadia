@@ -395,6 +395,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plane_digest_ignores_stage_slice_but_not_model() {
+        // Same model, different stage slice ⇒ SAME plane_digest (cross-chain pull asserts one fp for
+        // every rank), but DIFFERENT full digest (local cache must never cross ranks).
+        let head = fp_a(); // layers 0..MAX, is_first=is_last=true
+        let mut tail = fp_a();
+        tail.layer_start = 30;
+        tail.layer_end = 61;
+        tail.is_first = false;
+        assert_eq!(
+            head.plane_digest(),
+            tail.plane_digest(),
+            "stage slice must not change the plane fp"
+        );
+        assert_ne!(
+            head.digest(),
+            tail.digest(),
+            "full digest must reflect the stage slice"
+        );
+        // A different MODEL must change the plane fp.
+        assert_ne!(
+            head.plane_digest(),
+            fp_b().plane_digest(),
+            "different arch/num_layers must change the plane fp"
+        );
+    }
+
     /// Minimal snapshot for tests: 2 heads, head_dim 2, n_slots = past_seq_len.
     /// `fill` is treated as the raw u16 storage value (bf16-as-u16); the
     /// tests only check round-trip identity, not numeric semantics.

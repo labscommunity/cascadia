@@ -3079,7 +3079,7 @@ impl OvMoeEngine {
                     let depth = snap.past_seq_len;
                     let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                     full_tokens.extend(generated.iter().map(|&t| t as i32));
-                    tracing::info!(target: "cascadia::kv", event = "ovmoe_ms_capture_attempt",
+                    tracing::debug!(target: "cascadia::kv", event = "ovmoe_ms_capture_attempt",
                         depth, full_len = full_tokens.len(), gen = generated.len(),
                         in_range = (depth >= 1 && depth <= full_tokens.len()));
                     if depth >= 1 && depth <= full_tokens.len() {
@@ -3117,7 +3117,7 @@ impl OvMoeEngine {
                                     .unwrap_or_else(|e| e.into_inner())
                                     .prefix
                                     .insert(captured64.clone(), &fp, snap.clone());
-                                tracing::info!(target: "cascadia::kv", event = "ovmoe_ms_holder_mirror",
+                                tracing::debug!(target: "cascadia::kv", event = "ovmoe_ms_holder_mirror",
                                     captured_len = captured64.len(),
                                     "mirrored multi-stage capture into holder");
                                 self.kv_prefix_cache.insert(captured64, &fp, snap);
@@ -3211,10 +3211,14 @@ impl OvMoeEngine {
         let carried = self.kv_downstream.remove(&epoch);
         let verdict = self.block_on(async {
             match &carried {
-                Some(blob) => send_restore_carry(&down, epoch, blob)
-                    .await
-                    .map_err(|e| format!("send_restore_carry: {e}"))?,
-                None => send_restore(&down, epoch)
+                Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
+                    send_restore_carry(&down, epoch, blob)
+                        .await
+                        .map_err(|e| format!("send_restore_carry: {e}"))?
+                }
+                // None, or an oversized blob (guards the u32 len field + the peer's recv alloc) ⇒ bare
+                // RESTORE ⇒ the moved-to tail misses the foreign epoch ⇒ deliberate clean cold.
+                _ => send_restore(&down, epoch)
                     .await
                     .map_err(|e| format!("send_restore: {e}"))?,
             }
@@ -3687,6 +3691,17 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
         let blob = crate::ov_kv_coordination::ov_blob_encode(&snap);
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        // Carried-slice RESTORE addresses each downstream rank BY EPOCH, and every rank's manifest in
+        // one pull shares the same token_ids ⇒ the same epoch. With >1 downstream rank (a 3+-stage
+        // chain) a second rank's blob would overwrite the first, and `restore_kv` checks only layer
+        // COUNT — so a rank could restore ANOTHER rank's KV (silent wrong output). Reject a colliding
+        // stash of a DIFFERENT blob ⇒ that rank votes cold ⇒ clean all-or-nothing cold, never a
+        // wrong-rank restore. A 2-stage chain has one downstream rank and never collides; an idempotent
+        // same-blob re-stash (retry) is allowed. (3+-stage carried restore needs per-rank keying — a
+        // follow-up; today it degrades to a safe cold.)
+        if let Some(existing) = self.kv_downstream.get(&epoch) {
+            return if existing == &blob { Ok(()) } else { Err(()) };
+        }
         let cap = self.kv_prefix_cache.capacity().max(1);
         while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
             let Some(k) = self.kv_downstream.keys().next().copied() else {

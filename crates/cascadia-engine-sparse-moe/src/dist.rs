@@ -53,7 +53,7 @@
 use std::sync::Arc;
 
 use cascadia_transport::{
-    ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
+    ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult, MAX_RAW_BYTES,
 };
 use tokio::sync::Mutex;
 
@@ -751,6 +751,13 @@ pub async fn send_restore_carry(
 }
 
 /// Receive a RestoreCarry body from upstream (kind already consumed). Returns `(epoch, blob)`.
+///
+/// The KV blob routinely exceeds `recv_raw`'s per-read cap ([`MAX_RAW_BYTES`], 64 KiB) — a real
+/// model's slice is many MiB — so read it in `MAX_RAW_BYTES` chunks. ALWAYS consume exactly `len`
+/// bytes off the wire (accept OR drain), so a rejected/oversized frame never leaves the framed pipeline
+/// stream desynced. A blob over [`MAX_RESTORE_BLOB_BYTES`] is drained in-chunks (bounded allocation)
+/// and rejected. The sender writes the blob contiguously (`send_raw` is uncapped), so the wire format
+/// is unchanged — only the read is chunked.
 pub async fn recv_restore_carry_body_server(
     srv: &Mutex<ActivationServer>,
 ) -> TransportResult<(u64, Vec<u8>)> {
@@ -760,21 +767,27 @@ pub async fn recv_restore_carry_body_server(
         return Err(TransportError::SocketClosed);
     }
     let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
-    let len = u32::from_be_bytes(head[8..12].try_into().unwrap());
-    if len > MAX_RESTORE_BLOB_BYTES {
+    let len = u32::from_be_bytes(head[8..12].try_into().unwrap()) as usize;
+    // Over the accept ceiling ⇒ drain (discard) rather than assemble, but still consume every byte.
+    let accept = len <= MAX_RESTORE_BLOB_BYTES as usize;
+    let mut blob = Vec::new();
+    let mut remaining = len;
+    while remaining > 0 {
+        let take = remaining.min(MAX_RAW_BYTES);
+        let chunk = guard.recv_raw(take).await?;
+        if chunk.len() != take {
+            return Err(TransportError::SocketClosed);
+        }
+        if accept {
+            blob.extend_from_slice(&chunk);
+        }
+        remaining -= take;
+    }
+    drop(guard);
+    if !accept {
         return Err(TransportError::Io(std::io::Error::other(format!(
             "restore-carry blob {len} exceeds MAX_RESTORE_BLOB_BYTES {MAX_RESTORE_BLOB_BYTES}"
         ))));
-    }
-    let n = len as usize;
-    let blob = if n > 0 {
-        guard.recv_raw(n).await?
-    } else {
-        Vec::new()
-    };
-    drop(guard);
-    if blob.len() != n {
-        return Err(TransportError::SocketClosed);
     }
     Ok((epoch, blob))
 }
@@ -826,6 +839,31 @@ mod capture_frame_tests {
             .collect();
         assert_eq!(got, toks);
         assert_eq!(b.len(), 16 + toks.len() * 4);
+    }
+
+    #[test]
+    fn restore_carry_bytes_layout_roundtrips() {
+        let blob = vec![0u8, 1, 2, 255, 128, 7, 42];
+        let epoch = 0x0102_0304_0506_0708u64;
+        let b = restore_carry_bytes(epoch, &blob);
+        assert_eq!(b[0..4], (FrameKind::RestoreCarry as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            blob.len() as u32
+        );
+        assert_eq!(&b[16..], &blob[..]);
+        assert_eq!(b.len(), 16 + blob.len());
+        // Empty blob: header only, len field 0.
+        let e = restore_carry_bytes(epoch, &[]);
+        assert_eq!(u32::from_be_bytes(e[12..16].try_into().unwrap()), 0);
+        assert_eq!(e.len(), 16);
+        // Appended code, distinct from Restore/RestoreAck.
+        assert_ne!(FrameKind::RestoreCarry as u32, FrameKind::Restore as u32);
+        assert_eq!(
+            FrameKind::from_code(FrameKind::RestoreCarry as u32),
+            Some(FrameKind::RestoreCarry)
+        );
     }
 
     #[test]
