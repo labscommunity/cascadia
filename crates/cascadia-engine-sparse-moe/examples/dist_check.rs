@@ -75,7 +75,7 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
                 println!("[server] recv RESET");
             }
             FrameKind::Forward => {
-                let (past_seq_len, _sampling, hidden, shape) =
+                let (past_seq_len, _sampling, _push_history, hidden, shape) =
                     recv_forward_body_server(&server).await?;
                 let mean: f32 = hidden.iter().copied().sum::<f32>() / hidden.len() as f32;
                 frame_count += 1;
@@ -120,8 +120,8 @@ async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             FrameKind::Capture | FrameKind::CaptureAck => {
                 println!("[server] CAPTURE/CAPTURE_ACK not handled in dist_check — ignoring");
             }
-            FrameKind::Restore | FrameKind::RestoreAck => {
-                println!("[server] RESTORE/RESTORE_ACK not handled in dist_check — ignoring");
+            FrameKind::Restore | FrameKind::RestoreAck | FrameKind::RestoreCarry => {
+                println!("[server] RESTORE/RESTORE_ACK/RESTORE_CARRY not handled in dist_check — ignoring");
             }
         }
     }
@@ -155,7 +155,7 @@ async fn run_client(peer: &str, port: u16, rounds: u32) -> Result<(), Box<dyn st
         }
         let cfg = cascadia_engine_sparse_moe::SamplingConfig::default();
         let t0 = Instant::now();
-        send_forward(&client, round, &cfg, &hidden, shape).await?;
+        send_forward(&client, round, &cfg, &hidden, shape, false).await?;
         let kind = recv_kind_client(&client).await?;
         let Some(FrameKind::Token) = kind else {
             return Err(format!("expected TOKEN, got {kind:?}").into());
