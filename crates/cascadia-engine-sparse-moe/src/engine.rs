@@ -37,8 +37,8 @@ use crate::dist::{
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
     recv_capture_ack_body_client, recv_capture_body_server, recv_restore_ack_body_client,
-    recv_restore_body_server, send_capture, send_capture_ack_upstream, send_restore,
-    send_restore_ack_upstream,
+    recv_restore_body_server, recv_restore_carry_body_server, send_capture,
+    send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -2569,6 +2569,11 @@ impl SparseMoEEngine {
                 "rank {} received unexpected RESTORE_ACK from upstream",
                 self.rank
             )),
+            // Cross-chain carried-slice restore is an OvMoe-only path; K2.6 sparse-moe never emits it.
+            FrameKind::RestoreCarry => Err(format!(
+                "rank {} received RESTORE_CARRY but K2.6 sparse-moe has no carried-slice restore",
+                self.rank
+            )),
         }
     }
 
@@ -2747,6 +2752,12 @@ pub struct OvMoeEngine {
     /// [`crate::ov_kv_coordination::OvMoeKvHolder`] for cross-chain NEGOTIATE/GET.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::ov_kv_coordination::OvSharedHolderCache,
+    /// Issue-34 cross-chain multi-stage: a moved-to head (rank 0) stashes each PULLED downstream
+    /// rank's slice as an opaque blob keyed by content epoch, then ships it inline in `RESTORE_CARRY`
+    /// so the moved-to tail — which has NO local capture for a FOREIGN chain's epoch — applies it.
+    /// One-shot: removed on send. Bounded by the prefix-cache capacity.
+    #[cfg(feature = "kv_coord")]
+    kv_downstream: std::collections::HashMap<u64, Vec<u8>>,
 }
 
 impl OvMoeEngine {
@@ -2787,6 +2798,8 @@ impl OvMoeEngine {
             kv_offers: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
             kv_share,
+            #[cfg(feature = "kv_coord")]
+            kv_downstream: std::collections::HashMap::new(),
         }
     }
 
@@ -3182,7 +3195,10 @@ impl OvMoeEngine {
     /// Broadcast RESTORE(epoch) down the chain; return the all-or-nothing verdict (true ⇒ every
     /// downstream rank restored its slice). `total <= 1` or no downstream ⇒ true. Any transport error,
     /// a non-`RestoreAck` reply, or verdict 0 ⇒ false ⇒ the caller cold-falls-back (never a partial
-    /// warm). Used by the head admission trigger in `step_first`.
+    /// warm). Used by the head admission trigger in `step_first`. Cross-chain: if this rank stashed a
+    /// pulled downstream slice under `epoch` (`stash_downstream_rank`), ship it INLINE via RESTORE_CARRY
+    /// (the moved-to tail has no local capture for a foreign chain's epoch); else a bare RESTORE
+    /// (same-chain, byte-identical to before).
     #[cfg(feature = "kv_coord")]
     fn forward_restore_downstream(&mut self, epoch: u64) -> bool {
         if self.total <= 1 {
@@ -3191,10 +3207,17 @@ impl OvMoeEngine {
         let Some(down) = self.transport.downstream.clone() else {
             return true;
         };
+        // One-shot: take the carried blob (if any) before the async send.
+        let carried = self.kv_downstream.remove(&epoch);
         let verdict = self.block_on(async {
-            send_restore(&down, epoch)
-                .await
-                .map_err(|e| format!("send_restore: {e}"))?;
+            match &carried {
+                Some(blob) => send_restore_carry(&down, epoch, blob)
+                    .await
+                    .map_err(|e| format!("send_restore_carry: {e}"))?,
+                None => send_restore(&down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?,
+            }
             match recv_kind_client(&down).await {
                 Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(&down)
                     .await
@@ -3293,6 +3316,54 @@ impl OvMoeEngine {
         .map_err(|e| format!("send_restore_ack: {e}"))
     }
 
+    /// Cross-chain worker RESTORE handler: the moved-to head shipped THIS rank's pulled slice inline
+    /// (the tail has no local capture for a foreign chain's epoch). Decode + restore, chain downstream
+    /// for 3+ stages (bare RESTORE — those ranks carry their own slice; 2-stage never hits this), then
+    /// ack the all-or-nothing verdict upstream.
+    #[cfg(feature = "kv_coord")]
+    fn handle_restore_carry(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        let (epoch, blob) = self
+            .block_on(recv_restore_carry_body_server(upstream))
+            .map_err(|e| format!("recv_restore_carry: {e}"))?;
+        let local_ok = match crate::ov_kv_coordination::ov_blob_decode(&blob) {
+            Some(snap) => self.runner.restore_kv(&snap).is_ok(),
+            None => false,
+        };
+        tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_restore_carried",
+            rank = self.rank, epoch, ok = local_ok, blob_len = blob.len());
+        let down_ok = if self.is_last() {
+            true
+        } else if let Some(down) = downstream {
+            self.block_on(async {
+                send_restore(down, epoch)
+                    .await
+                    .map_err(|e| format!("send_restore: {e}"))?;
+                match recv_kind_client(down).await {
+                    Ok(Some(FrameKind::RestoreAck)) => recv_restore_ack_body_client(down)
+                        .await
+                        .map(|(_, v)| v == 1)
+                        .map_err(|e| format!("recv_restore_ack: {e}")),
+                    Ok(Some(other)) => Err(format!("expected RestoreAck downstream, got {other:?}")),
+                    Ok(None) => Err("downstream closed during restore-ack".into()),
+                    Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
+                }
+            })
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        self.block_on(send_restore_ack_upstream(
+            upstream,
+            epoch,
+            u8::from(local_ok && down_ok),
+        ))
+        .map_err(|e| format!("send_restore_ack: {e}"))
+    }
+
     /// Worker rank (rank > 0): service one frame from upstream per call.
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
         if self.peer_disconnected {
@@ -3341,6 +3412,8 @@ impl OvMoeEngine {
             FrameKind::Capture => self.handle_capture(&upstream, downstream.as_ref()),
             #[cfg(feature = "kv_coord")]
             FrameKind::Restore => self.handle_restore(&upstream, downstream.as_ref()),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::RestoreCarry => self.handle_restore_carry(&upstream, downstream.as_ref()),
             other => Err(format!(
                 "worker received unsupported frame {other:?} (MiniMax-M2 has no spec-decode batching)"
             )),
@@ -3504,7 +3577,9 @@ impl Engine for OvMoeEngine {
     fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
         Some(std::sync::Arc::new(crate::ov_kv_coordination::OvMoeKvHolder {
             cache: std::sync::Arc::clone(&self.kv_share),
-            model_fp: self.runner.fingerprint().digest(),
+            // Plane-level fp (model-identity only): a cross-chain pull asserts the moved-to head's fp
+            // for EVERY rank's GET, so this tail holder must match despite its per-stage layer span.
+            model_fp: self.runner.fingerprint().plane_digest(),
         }))
     }
 }
@@ -3514,7 +3589,9 @@ impl Engine for OvMoeEngine {
 #[cfg(feature = "kv_coord")]
 impl cascadia_engine::KvCoordination for OvMoeEngine {
     fn model_fingerprint(&self) -> u64 {
-        self.runner.fingerprint().digest()
+        // Plane-level (model-identity only) so a moved-to head's single asserted fp matches EVERY
+        // prior-chain rank's holder/export (each rank has a different per-stage layer span).
+        self.runner.fingerprint().plane_digest()
     }
 
     fn layout_version(&self) -> u16 {
@@ -3555,7 +3632,9 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         expected_epoch: u64,
         expected_len: u32,
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
-        let model_fp = self.runner.fingerprint().digest();
+        // Plane-level fp so a cross-chain consumer validating against the moved-to head's fp accepts
+        // this (differently-sliced) rank's manifest.
+        let model_fp = self.runner.fingerprint().plane_digest();
         let (prefix, snap) = if let Some(off) = self.kv_offers.remove(&expected_epoch) {
             off
         } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
@@ -3593,6 +3672,29 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
             .prefix
             .insert(prefix.clone(), &fp, snap.clone());
         self.kv_prefix_cache.insert(prefix, &fp, snap);
+        Ok(())
+    }
+
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        // Issue-34 cross-chain multi-stage: a DOWNSTREAM rank's pulled slice can't be applied on this
+        // (head) rank locally; stash it under the content epoch so `forward_restore_downstream` ships it
+        // inline via RESTORE_CARRY. Decode eagerly so a corrupt pull votes fail here (not mid-restore).
+        let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
+        let blob = crate::ov_kv_coordination::ov_blob_encode(&snap);
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        let cap = self.kv_prefix_cache.capacity().max(1);
+        while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
+            let Some(k) = self.kv_downstream.keys().next().copied() else {
+                break;
+            };
+            self.kv_downstream.remove(&k);
+        }
+        self.kv_downstream.insert(epoch, blob);
         Ok(())
     }
 
