@@ -48,7 +48,7 @@ use cascadia_ov_genai_shim::{DType, Error as OvError, PluginConfig, Runtime};
 
 use crate::kv_prefix_cache::ModelFingerprint;
 use crate::manifest::{Manifest, ManifestError};
-use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvSnapshot};
+use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
 use crate::sampling::{init_rng, sample, SamplingConfig};
 
 /// Group size of the int4_bin quantization (cols per scale group).
@@ -861,6 +861,92 @@ impl OvMoeRunner {
         max_new: usize,
     ) -> Result<Vec<u32>, OvMoeError> {
         self.generate(prompt_ids, max_new, &SamplingConfig::default())
+    }
+
+    /// Generate with an optional KV-prefix cache (Issue-34: local warm-resume + cross-chain source).
+    /// On a cache HIT, restores the matched prefix's KV and prefills only the suffix; on a MISS,
+    /// snapshots the FULL prompt's KV (depth == prompt.len, taken at the prefill boundary before
+    /// decode — no off-by-one) and inserts it keyed by the prompt. Returns the generated tokens plus
+    /// the snapshot inserted on a miss, so the engine can mirror it into its lock-free holder cache.
+    /// `cache = None` is byte-identical to [`Self::generate`]. Prefill uses `step_logits` (no
+    /// sampling), so the rep-penalty `history` covers generated tokens only — a warm run matches cold.
+    pub fn generate_with_cache(
+        &mut self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        mut cache: Option<&mut OvMoeKvPrefixCache>,
+    ) -> Result<(Vec<u32>, Option<OvMoeKvSnapshot>), OvMoeError> {
+        if prompt_ids.is_empty() || max_new == 0 {
+            return Ok((Vec::new(), None));
+        }
+        self.reset();
+        let mut rng = init_rng(cfg.seed);
+        let eos = self.manifest.eos_token_ids.clone();
+        let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
+
+        // Cache lookup / restore. `fp` computed only when the cache is present + enabled, so the
+        // `None` path stays allocation-identical to `generate`.
+        let mut fp: Option<ModelFingerprint> = None;
+        let mut cache_skip = 0usize;
+        let mut cache_hit = false;
+        if let Some(c) = cache.as_mut() {
+            if c.enabled() {
+                let fingerprint = fp.insert(self.fingerprint());
+                if let Some(snap) = c.lookup(&prompt64, fingerprint) {
+                    cache_skip = snap.past_seq_len;
+                    self.restore_kv(&snap)?;
+                    cache_hit = true;
+                }
+            }
+        }
+
+        // Prefill the suffix (positions [cache_skip, prompt.len)); the restored prefix's KV is already
+        // in place. `pos` advances for skipped tokens too so past_seq_len stays correct.
+        let mut pos = 0usize;
+        let mut logits: Vec<f32> = Vec::new();
+        for (i, &t) in prompt_ids.iter().enumerate() {
+            if i < cache_skip {
+                pos += 1;
+                continue;
+            }
+            logits = self.step_logits(t, pos)?;
+            pos += 1;
+        }
+
+        // On a miss, snapshot the full prompt's KV and insert it (keyed by the prompt).
+        let mut cached_snap: Option<OvMoeKvSnapshot> = None;
+        if !cache_hit {
+            if let Some(c) = cache.as_mut() {
+                if c.enabled() {
+                    let fingerprint = fp.get_or_insert_with(|| self.fingerprint());
+                    if let Ok(snap) = self.snapshot_kv() {
+                        c.insert(prompt64.clone(), fingerprint, snap.clone());
+                        cached_snap = Some(snap);
+                    }
+                }
+            }
+        }
+
+        // First generated token from the last prefill step's logits, then decode.
+        let mut history: Vec<i64> = Vec::with_capacity(max_new);
+        let mut out: Vec<u32> = Vec::with_capacity(max_new);
+        if logits.is_empty() {
+            // No suffix token (cache_skip == prompt.len) — the lookup contract forbids this, but
+            // return safely rather than sample from stale logits.
+            return Ok((out, cached_snap));
+        }
+        loop {
+            let next = sample(&logits, &history, cfg, &mut rng) as u32;
+            out.push(next);
+            history.push(next as i64);
+            if out.len() >= max_new || eos.contains(&next) {
+                break;
+            }
+            logits = self.step_logits(next, pos)?;
+            pos += 1;
+        }
+        Ok((out, cached_snap))
     }
 }
 

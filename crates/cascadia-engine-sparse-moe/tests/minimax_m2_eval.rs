@@ -532,3 +532,45 @@ fn minimax_m2_two_stage_snapshot_restore_matches_continuous() {
     eprintln!("2stage warm: {warm:?}");
     assert_eq!(warm, cold, "2-stage snapshot/restore must match continuous");
 }
+
+/// Single-stage `generate_with_cache` warm-resume must match a cold run (Issue-34 Phase 2). Prime a
+/// base prompt (miss → caches base→base-KV), then generate a longer prompt sharing that prefix (hit
+/// → restores base KV, prefills only the suffix). The warm continuation must equal a cold generation
+/// of the full prompt. Gated on `M2_MODEL_DIR`.
+#[test]
+fn minimax_m2_generate_with_cache_warm_matches_cold() {
+    let Some(model_dir) = env_dir("M2_MODEL_DIR") else {
+        eprintln!("M2_MODEL_DIR not set / missing; skipping generate_with_cache test");
+        return;
+    };
+    let dev = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
+    let mut r = OvMoeRunner::load(model_dir, &dev, PluginConfig::new(), None).expect("load");
+    let cfg = cascadia_engine_sparse_moe::sampling::SamplingConfig::default(); // greedy
+    let n = 8usize;
+
+    let base: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let full: Vec<u32> = {
+        let mut v = base.clone();
+        v.extend_from_slice(&[11, 12, 13, 14]);
+        v
+    };
+
+    // Cold: full prompt, no cache.
+    let (cold, _) = r
+        .generate_with_cache(&full, n, &cfg, None)
+        .expect("cold generate");
+
+    // Warm: prime `base` (miss, caches it), then `full` (hit on base → warm-resume).
+    let mut cache = cascadia_engine_sparse_moe::ov_kv_cache::OvMoeKvPrefixCache::new(4);
+    let (_prime, cached) = r
+        .generate_with_cache(&base, 1, &cfg, Some(&mut cache))
+        .expect("prime");
+    assert!(cached.is_some(), "prime should cache the base prompt");
+    let (warm, _) = r
+        .generate_with_cache(&full, n, &cfg, Some(&mut cache))
+        .expect("warm generate");
+
+    eprintln!("cold: {cold:?}");
+    eprintln!("warm: {warm:?}");
+    assert_eq!(warm, cold, "generate_with_cache warm run must match cold");
+}
