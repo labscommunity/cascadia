@@ -3066,6 +3066,9 @@ impl OvMoeEngine {
                     let depth = snap.past_seq_len;
                     let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                     full_tokens.extend(generated.iter().map(|&t| t as i32));
+                    tracing::info!(target: "cascadia::kv", event = "ovmoe_ms_capture_attempt",
+                        depth, full_len = full_tokens.len(), gen = generated.len(),
+                        in_range = (depth >= 1 && depth <= full_tokens.len()));
                     if depth >= 1 && depth <= full_tokens.len() {
                         let captured: Vec<i32> = full_tokens[..depth].to_vec();
                         let epoch = crate::kv_coordination::synth_epoch(&captured);
@@ -3092,6 +3095,18 @@ impl OvMoeEngine {
                                 let fp = self.runner.fingerprint();
                                 let captured64: Vec<i64> =
                                     captured.iter().map(|&t| i64::from(t)).collect();
+                                // Mirror into the holder cache (kv_share) so an ejected/busy engine
+                                // still serves this prefix over the cross-chain KV plane — matches the
+                                // single-stage path + SparseMoEEngine. Without it the holder is empty
+                                // and every cross-chain NEGOTIATE misses (warm-pull degrades to cold).
+                                self.kv_share
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .prefix
+                                    .insert(captured64.clone(), &fp, snap.clone());
+                                tracing::info!(target: "cascadia::kv", event = "ovmoe_ms_holder_mirror",
+                                    captured_len = captured64.len(),
+                                    "mirrored multi-stage capture into holder");
                                 self.kv_prefix_cache.insert(captured64, &fp, snap);
                             }
                             Err(e) => warn!(task = %id, "kv multi-stage capture skipped: {e}"),
@@ -3146,6 +3161,21 @@ impl OvMoeEngine {
             };
             self.kv_capture.remove(&k);
         }
+        // Mirror into the holder cache (epoch-keyed) so a cross-chain GET for THIS rank's slice
+        // resolves — the moved-to head fetches each downstream rank by epoch. Matches
+        // SparseMoEEngine; bounded by the same cap so the mirror can't grow unbounded.
+        {
+            let mut g = self.kv_share.lock().unwrap_or_else(|e| e.into_inner());
+            while g.captures.len() >= cap && !g.captures.contains_key(&epoch) {
+                let Some(k) = g.captures.keys().next().copied() else {
+                    break;
+                };
+                g.captures.remove(&k);
+            }
+            g.captures.insert(epoch, (tokens.clone(), snap.clone()));
+        }
+        tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_capture_mirror",
+            rank = self.rank, epoch, "mirrored tail capture into holder");
         self.kv_capture.insert(epoch, (tokens, snap));
     }
 
