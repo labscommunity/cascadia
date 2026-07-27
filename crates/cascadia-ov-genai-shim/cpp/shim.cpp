@@ -7,9 +7,10 @@
 
 #include "gemv_offload.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -1006,6 +1007,34 @@ static ov::element::Type code_to_ov_type(uint8_t c) {
     }
 }
 
+// Parse a KV VariableState name of the form "past_key_values.<layer>.<key|value>" into a canonical
+// ordinal (layer*2 + [is_value]). get/set_state_blob use this to align a donor blob to the recipient's
+// states by KV IDENTITY rather than by OV's query_state() ORDER or by the raw state NAME — neither of
+// which is stable across two independently-compiled instances of the same IR (a cross-chain warm-pull:
+// the donor engine on chain A and our engine on chain B are separate compilations). Returns false for
+// any name that isn't exactly this shape, and the caller then keeps the plain positional path
+// (behavior-identical for same-instance round-trips and for models that don't use this KV naming).
+static bool kv_canonical_key(const std::string& name, uint64_t* out_key) {
+    static const char PFX[] = "past_key_values.";
+    const size_t PFX_LEN = sizeof(PFX) - 1;
+    if (name.size() <= PFX_LEN || name.compare(0, PFX_LEN, PFX) != 0) return false;
+    size_t dot = name.find('.', PFX_LEN);
+    if (dot == std::string::npos || dot == PFX_LEN) return false;
+    uint64_t layer = 0;
+    for (size_t i = PFX_LEN; i < dot; ++i) {
+        char c = name[i];
+        if (c < '0' || c > '9') return false;
+        layer = layer * 10 + static_cast<uint64_t>(c - '0');
+    }
+    const std::string suffix = name.substr(dot + 1);
+    uint64_t kv;
+    if (suffix == "key") kv = 0;
+    else if (suffix == "value") kv = 1;
+    else return false;
+    *out_key = layer * 2 + kv;
+    return true;
+}
+
 // Two-call: pass buf=nullptr/cap=0 to learn the size in *len_out, then call again with a buffer of
 // that size. Returns 0 on success (incl. the size-query); 1 on error. `*len_out` is always set.
 int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf, size_t cap,
@@ -1026,6 +1055,25 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
         }
         *len_out = total;
         if (!buf || cap < total) return 0; // size query
+        // Emit states in canonical (layer, key/value) order parsed from the name, so a consumer on a
+        // DIFFERENTLY-compiled instance realigns by identity even when its own query_state() order or
+        // raw state names differ. Non-canonical names (other models) keep query_state() order.
+        {
+            std::vector<uint64_t> keys(snaps.size());
+            bool canonical = true;
+            for (size_t i = 0; i < snaps.size(); ++i)
+                if (!kv_canonical_key(snaps[i].first, &keys[i])) { canonical = false; break; }
+            if (canonical) {
+                std::vector<size_t> ord(snaps.size());
+                for (size_t i = 0; i < snaps.size(); ++i) ord[i] = i;
+                std::stable_sort(ord.begin(), ord.end(),
+                                 [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+                std::vector<std::pair<std::string, ov::Tensor>> sorted;
+                sorted.reserve(snaps.size());
+                for (size_t i : ord) sorted.push_back(std::move(snaps[i]));
+                snaps.swap(sorted);
+            }
+        }
         uint8_t* p = buf;
         auto put32 = [&](uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
         auto put64 = [&](uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
@@ -1052,38 +1100,69 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
     if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
     if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
     try {
+        // Canonical restore keyed by KV IDENTITY (layer, key/value) parsed from each VariableState
+        // name. get_state_blob emits states in this same canonical order, so blob slot i maps to the
+        // model state that shares its identity — independent of OV's per-INSTANCE query_state() ORDER
+        // and of instance-specific state NAMES. A cross-chain warm-pull restores a slice captured on a
+        // separately-compiled donor engine: neither its state order (plain positional ⇒ states land in
+        // the WRONG slots ⇒ garbage) nor its raw names (name-keyed ⇒ "applied 0 of N" ⇒ always cold)
+        // are guaranteed equal to ours. Sorting BOTH ends by the identity parsed from the name (and
+        // asserting the identities agree per slot) is the only cross-instance-stable alignment — it is
+        // what OvMoe achieves by restoring per layer ordinal. Non-canonical names fall back to
+        // positional (same-instance round-trips stay byte-identical; other models unaffected). Byte-size
+        // + count + identity guards degrade any genuine mismatch to an all-or-nothing cold reprefill.
         auto states = handle->request->query_state();
-        std::map<std::string, ov::VariableState*> by_name;
-        for (auto& s : states) by_name[s.get_name()] = &s;
+        std::vector<size_t> order(states.size());
+        for (size_t i = 0; i < states.size(); ++i) order[i] = i;
+        std::vector<uint64_t> mkeys(states.size());
+        bool canonical = true;
+        for (size_t i = 0; i < states.size(); ++i)
+            if (!kv_canonical_key(states[i].get_name(), &mkeys[i])) { canonical = false; break; }
+        if (canonical) {
+            std::stable_sort(order.begin(), order.end(),
+                             [&](size_t a, size_t b) { return mkeys[a] < mkeys[b]; });
+        }
         const uint8_t* p = buf;
         const uint8_t* end = buf + len;
         auto need = [&](size_t n) { if (static_cast<size_t>(end - p) < n) throw std::runtime_error("set_state_blob: truncated"); };
         auto get32 = [&]() { need(4); uint32_t v; std::memcpy(&v, p, 4); p += 4; return v; };
         auto get64 = [&]() { need(8); uint64_t v; std::memcpy(&v, p, 8); p += 8; return v; };
         uint32_t count = get32();
+        if (count != states.size()) {
+            std::ostringstream oss;
+            oss << "set_state_blob: blob has " << count << " states, model has " << states.size();
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
         uint32_t applied = 0;
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nl = get32(); need(nl);
-            std::string name(reinterpret_cast<const char*>(p), nl); p += nl;
+            std::string bname(reinterpret_cast<const char*>(p), nl); p += nl;
             need(1); uint8_t dcode = *p++;
             need(1); uint8_t rank = *p++;
             ov::Shape shape; shape.reserve(rank);
             for (uint8_t r = 0; r < rank; ++r) shape.push_back(static_cast<size_t>(get64()));
             uint64_t nb = get64(); need(nb);
-            auto it = by_name.find(name);
-            if (it != by_name.end()) {
-                ov::Tensor t(code_to_ov_type(dcode), shape);
-                if (t.get_byte_size() == nb) {
-                    std::memcpy(t.data(), p, nb);
-                    it->second->set_state(t);
-                    ++applied;
-                }
+            const size_t dst = order[i];
+            // In canonical mode the donor's slot identity must equal the destination's — a divergent
+            // set (wrong rank/model, or a donor that couldn't emit canonically) leaves applied<count ⇒
+            // the all-or-nothing cold fallback below, never a silent mis-map.
+            bool identity_ok = true;
+            if (canonical) {
+                uint64_t bkey;
+                identity_ok = kv_canonical_key(bname, &bkey) && bkey == mkeys[dst];
+            }
+            ov::Tensor t(code_to_ov_type(dcode), shape);
+            if (identity_ok && t.get_byte_size() == nb) {
+                std::memcpy(t.data(), p, nb);
+                states[dst].set_state(t);
+                ++applied;
             }
             p += nb;
         }
-        // A skipped state (name absent / byte-size mismatch) leaves that variable at its CURRENT
-        // value while its siblings carry the donor's — a silent half-restore the caller then treats
-        // as a good warm resume. Fail instead so the engine falls back to a cold reprefill.
+        // A skipped state (byte-size mismatch) leaves that variable at its CURRENT value while its
+        // siblings carry the donor's — a silent half-restore the caller then treats as a good warm
+        // resume. Fail instead so the engine falls back to a cold reprefill.
         if (applied != count) {
             std::ostringstream oss;
             oss << "set_state_blob: applied " << applied << " of " << count << " states";
