@@ -1365,8 +1365,10 @@ impl Runtime {
     }
 
     /// Issue-34: restore KV variable-states from a blob produced by [`Runtime::get_state_blob`] on the
-    /// same model. States are matched by name; if ANY entry fails to apply the call returns `Err`
-    /// rather than silently half-restoring.
+    /// same model IR. States are matched by POSITION (blob order == `query_state()` order), so a blob
+    /// from a different engine instance restores cleanly (VariableState names are not portable across
+    /// instances). If ANY entry fails to apply the call returns `Err` rather than silently
+    /// half-restoring.
     ///
     /// On `Err` the request may already be **partially restored** — entries are applied as the blob
     /// is parsed. Callers must scrub with [`Runtime::recreate_request`] (or `reset_state` where that
