@@ -34,7 +34,7 @@ use cascadia_ov_genai_shim::{
 };
 use cascadia_transport::{
     recv_tensor, send_tensor, ActivationClient, ActivationServer, DType as WireDType,
-    Tensor as WireTensor, MAX_RANK,
+    Tensor as WireTensor, MAX_RANK, MAX_RAW_BYTES,
 };
 use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
 use futures::stream;
@@ -44,6 +44,11 @@ use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 // -------- frame protocol --------
+
+/// Ceiling on a carried RESTORE blob; guards against a desynced frame stream misreading the length
+/// as garbage and triggering an unbounded read. One rank's whole-state KV is tens of MB.
+#[cfg(feature = "kv_coord")]
+const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2100,7 +2105,20 @@ impl OvDistSpecWorkerEngine {
                     let eb = g.recv_raw(8).await?;
                     let lb = g.recv_raw(8).await?;
                     let n = u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
-                    let blob = if n > 0 { g.recv_raw(n).await? } else { Vec::new() };
+                    // recv_raw caps each read at MAX_RAW_BYTES; a whole-state KV blob is far larger, so
+                    // drain it in capped chunks (matching the send-side write_all) or the stream desyncs.
+                    let blob = if n == 0 {
+                        Vec::new()
+                    } else if n > MAX_CARRY_BLOB_BYTES {
+                        return Err(cascadia_transport::TransportError::SocketClosed);
+                    } else {
+                        let mut buf = Vec::with_capacity(n);
+                        while buf.len() < n {
+                            let take = (n - buf.len()).min(MAX_RAW_BYTES);
+                            buf.extend_from_slice(&g.recv_raw(take).await?);
+                        }
+                        buf
+                    };
                     Ok::<_, cascadia_transport::TransportError>((eb, blob))
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -2108,18 +2126,21 @@ impl OvDistSpecWorkerEngine {
                     u64::from_le_bytes(eb.as_slice().try_into().map_err(|_| {
                         EngineError::Backend("ov-dist-spec: bad RESTORE body".into())
                     })?);
-                // Prefer this rank's own CAPTURE (same-chain); else set_state the head's carried slice
-                // (cross-chain move — the tail has no capture for a foreign chain's epoch).
-                let local_ok = match self.kv.take_capture(epoch) {
-                    Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
-                    None if !carried.is_empty() => {
-                        let ok = self.runtime.set_state_blob(&carried).is_ok();
-                        if ok {
-                            info!(epoch, blob_len = carried.len(), "distspec_tail_restore_carried");
-                        }
-                        ok
+                // A non-empty carried slice IS the cross-chain move — the head pulled and handed this
+                // rank its slice, so use it (mirrors the certified ov-runtime tail path). Only when
+                // carried is empty (same-chain restore) fall back to this rank's own CAPTURE. Preferring
+                // a stale local CAPTURE would shadow the carried path whenever the content epoch already
+                // exists locally (e.g. the cert's B-chain warm-up serves the same prompt).
+                let local_ok = if !carried.is_empty() {
+                    let ok = self.runtime.set_state_blob(&carried).is_ok();
+                    if ok {
+                        info!(epoch, blob_len = carried.len(), "distspec_tail_restore_carried");
                     }
-                    None => false,
+                    ok
+                } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
+                    self.runtime.set_state_blob(&blob).is_ok()
+                } else {
+                    false
                 };
                 let down_ok = if self.is_last {
                     true
