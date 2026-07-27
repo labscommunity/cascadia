@@ -1015,24 +1015,69 @@ static ov::element::Type code_to_ov_type(uint8_t c) {
 // any name that isn't exactly this shape, and the caller then keeps the plain positional path
 // (behavior-identical for same-instance round-trips and for models that don't use this KV naming).
 static bool kv_canonical_key(const std::string& name, uint64_t* out_key) {
-    static const char PFX[] = "past_key_values.";
-    const size_t PFX_LEN = sizeof(PFX) - 1;
-    if (name.size() <= PFX_LEN || name.compare(0, PFX_LEN, PFX) != 0) return false;
-    size_t dot = name.find('.', PFX_LEN);
-    if (dot == std::string::npos || dot == PFX_LEN) return false;
-    uint64_t layer = 0;
-    for (size_t i = PFX_LEN; i < dot; ++i) {
-        char c = name[i];
-        if (c < '0' || c > '9') return false;
-        layer = layer * 10 + static_cast<uint64_t>(c - '0');
+    // Family A — llama/genai stateful KV: "past_key_values.<layer>.<key|value>". A KV VariableState fuses
+    // the past_key_values input + present output tensors, and a separate compilation can surface
+    // get_name() as the two aliases JOINED ("past_key_values.1.valuepresent.1.value"), so match the kv
+    // token as a PREFIX of the suffix, not the whole remainder (exact-suffix rejected the donor form ⇒
+    // applied 0 of N ⇒ cold). key = layer*2 + {key:0, value:1}.
+    {
+        static const char PFX[] = "past_key_values.";
+        const size_t L = sizeof(PFX) - 1;
+        if (name.size() > L && name.compare(0, L, PFX) == 0) {
+            size_t dot = name.find('.', L);
+            if (dot != std::string::npos && dot != L) {
+                bool digits = true;
+                uint64_t layer = 0;
+                for (size_t i = L; i < dot; ++i) {
+                    char c = name[i];
+                    if (c < '0' || c > '9') { digits = false; break; }
+                    layer = layer * 10 + static_cast<uint64_t>(c - '0');
+                }
+                if (digits) {
+                    const std::string suffix = name.substr(dot + 1);
+                    if (suffix.rfind("value", 0) == 0) { *out_key = layer * 2 + 1; return true; }
+                    if (suffix.rfind("key", 0) == 0)   { *out_key = layer * 2 + 0; return true; }
+                }
+            }
+        }
     }
-    const std::string suffix = name.substr(dot + 1);
-    uint64_t kv;
-    if (suffix == "key") kv = 0;
-    else if (suffix == "value") kv = 1;
-    else return false;
-    *out_key = layer * 2 + kv;
-    return true;
+    // Family B — qwen36 hybrid (full-attention + DeltaNet/SSM) stateful KV. The compiled query_state()
+    // name is "cache_params.past.<kind>.<idx>" (kind ∈ {key,value,conv,ssm}; idx = the per-kind layer
+    // index), typically FUSED with the "cache_params.present.<kind>.<idx>" output alias joined onto the
+    // end (get_name() concatenates the ReadValue input + Assign output tensor names). Parse the past.*
+    // identity and ignore any trailing alias. key = idx*4 + {key:0, value:1, conv:2, ssm:3}: four disjoint
+    // mod-4 lanes so the kinds never collide and each kind's indices stay ordered. A model uses ONE family,
+    // so this never overlaps Family A. Without this, qwen36 states parse non-canonical ⇒ positional restore
+    // ⇒ cross-instance slot scramble ⇒ DIVERGE.
+    {
+        static const char PFX[] = "cache_params.past.";
+        const size_t L = sizeof(PFX) - 1;
+        // SEARCH (not anchor): get_name() fuses the past + present aliases and a separate compilation may
+        // order them either way ("cache_params.past.…cache_params.present.…" or present-first), so locate
+        // the past.* alias wherever it sits and parse its (kind, idx).
+        size_t at = name.find(PFX);
+        if (at != std::string::npos) {
+            const size_t kstart = at + L;
+            size_t dot = name.find('.', kstart);
+            if (dot != std::string::npos && dot != kstart) {
+                const std::string kind = name.substr(kstart, dot - kstart);
+                uint64_t koff;
+                if (kind == "key") koff = 0;
+                else if (kind == "value") koff = 1;
+                else if (kind == "conv") koff = 2;
+                else if (kind == "ssm") koff = 3;
+                else return false;
+                size_t s = dot + 1, e = s;
+                while (e < name.size() && name[e] >= '0' && name[e] <= '9') ++e;
+                if (e == s) return false;                            // need a numeric index
+                uint64_t idx = 0;
+                for (size_t i = s; i < e; ++i) idx = idx * 10 + static_cast<uint64_t>(name[i] - '0');
+                *out_key = idx * 4 + koff;                            // other alias ignored
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // Two-call: pass buf=nullptr/cap=0 to learn the size in *len_out, then call again with a buffer of
@@ -1118,6 +1163,18 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         bool canonical = true;
         for (size_t i = 0; i < states.size(); ++i)
             if (!kv_canonical_key(states[i].get_name(), &mkeys[i])) { canonical = false; break; }
+        // DIAG (temporary): non-canonical ⇒ positional restore is only correct same-instance; a cross-chain
+        // donor scrambles slots ⇒ DIVERGE. Fail closed + surface the runtime query_state() names.
+        if (!canonical) {
+            std::ostringstream oss;
+            oss << "set_state_blob: non-canonical model states (n=" << states.size() << "):";
+            for (size_t i = 0; i < states.size() && i < 6; ++i)
+                oss << " [" << i << "]=" << states[i].get_name();
+            if (states.size() > 6)
+                oss << " ... [" << (states.size() - 1) << "]=" << states[states.size() - 1].get_name();
+            set_last_error(oss.str().c_str());
+            return 1;
+        }
         if (canonical) {
             std::stable_sort(order.begin(), order.end(),
                              [&](size_t a, size_t b) { return mkeys[a] < mkeys[b]; });
@@ -1135,9 +1192,12 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
             return 1;
         }
         uint32_t applied = 0;
+        std::string dbg_b0, dbg_blast; // diagnostic: first/last blob state names
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t nl = get32(); need(nl);
             std::string bname(reinterpret_cast<const char*>(p), nl); p += nl;
+            if (i == 0) dbg_b0 = bname;
+            if (i + 1 == count) dbg_blast = bname;
             need(1); uint8_t dcode = *p++;
             need(1); uint8_t rank = *p++;
             ov::Shape shape; shape.reserve(rank);
@@ -1165,7 +1225,11 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         // resume. Fail instead so the engine falls back to a cold reprefill.
         if (applied != count) {
             std::ostringstream oss;
-            oss << "set_state_blob: applied " << applied << " of " << count << " states";
+            oss << "set_state_blob: applied " << applied << " of " << count << " states"
+                << " (canonical=" << (canonical ? 1 : 0)
+                << " model0=" << (states.empty() ? "" : states[order[0]].get_name())
+                << " modelN=" << (states.empty() ? "" : states[order[states.size() - 1]].get_name())
+                << " blob0=" << dbg_b0 << " blobN=" << dbg_blast << ")";
             set_last_error(oss.str().c_str());
             return 1;
         }
