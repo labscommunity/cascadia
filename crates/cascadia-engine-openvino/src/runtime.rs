@@ -4072,7 +4072,23 @@ impl OvRuntimeEngine {
         // Issue-34 multi-stage cross-chain: ship the downstream rank's pulled blob inline so it can
         // `set_state` (it has no local capture for a foreign chain's epoch). Absent ⇒ bare RESTORE
         // (same-chain path, where the rank restores from its own CAPTURE stash).
-        if let Some(blob) = self.kv.take_downstream(epoch) {
+        // Prefer the epoch-keyed slot; on a miss fall back to the single stashed blob (2-stage move
+        // stashes exactly one downstream slice per turn — see take_downstream_single). The miss is a
+        // stash/restore epoch-key drift: the head keys the stash by the pulled rank's manifest tokens
+        // while restore keys by its own warm prefix; log both so the residual drift is diagnosable
+        // (3+-stage needs per-(epoch,rank) keying — follow-up).
+        let carried = self.kv.take_downstream(epoch).or_else(|| {
+            let n = self.kv.downstream_len();
+            let single = self.kv.take_downstream_single();
+            warn!(
+                epoch,
+                stashed = n,
+                recovered = single.is_some(),
+                "ov_restore_carry_epoch_miss; single-slot fallback"
+            );
+            single
+        });
+        if let Some(blob) = carried {
             info!(epoch, blob_len = blob.len(), "ov_restore_carry_downstream");
             data.extend_from_slice(&blob);
         }

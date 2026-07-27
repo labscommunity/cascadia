@@ -375,12 +375,31 @@ impl OvKvCache {
                 self.downstream.remove(&k);
             }
         }
+        tracing::info!(target: "cascadia::kv", event = "kv_stash_downstream",
+            epoch, blob = blob.len(), n = self.downstream.len() + 1);
         self.downstream.insert(epoch, blob);
     }
 
     /// Head: take the downstream blob to ship in `RESTORE(epoch)`. Removed on take (one per turn).
     pub(crate) fn take_downstream(&mut self, epoch: u64) -> Option<Vec<u8>> {
         self.downstream.remove(&epoch)
+    }
+
+    /// Count of stashed downstream blobs (diagnostic + single-slot fallback guard).
+    pub(crate) fn downstream_len(&self) -> usize {
+        self.downstream.len()
+    }
+
+    /// Head: take the ONLY stashed downstream blob, epoch-agnostic. A 2-stage cross-chain move stashes
+    /// exactly one downstream slice per turn, so when the epoch lookup misses (stash/restore key drift)
+    /// the single slot is unambiguously the right blob. Returns None if 0 or >1 are stashed (3+-stage
+    /// must key per (epoch,rank) — see follow-up). Removed on take.
+    pub(crate) fn take_downstream_single(&mut self) -> Option<Vec<u8>> {
+        if self.downstream.len() != 1 {
+            return None;
+        }
+        let k = *self.downstream.keys().next()?;
+        self.downstream.remove(&k)
     }
 
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
