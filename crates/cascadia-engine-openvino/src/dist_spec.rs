@@ -651,14 +651,25 @@ impl DistributedMaskedReq {
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
 
-    /// §8 RESTORE: broadcast `epoch` down the target chain; return the all-or-nothing verdict.
-    pub(crate) fn restore_downstream(&mut self, epoch: u64) -> Result<bool, EngineError> {
+    /// §8 RESTORE: broadcast `epoch` (+ the downstream rank's carried blob, if any) down the target
+    /// chain; return the all-or-nothing verdict. `carried` is the head-pulled slice for the next rank on
+    /// a cross-chain move (empty ⇒ same-chain: the rank restores from its own CAPTURE). Wire: [epoch:8]
+    /// [carried_len:8 LE][carried].
+    pub(crate) fn restore_downstream(
+        &mut self,
+        epoch: u64,
+        carried: Vec<u8>,
+    ) -> Result<bool, EngineError> {
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
             g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
                 .await?;
             g.send_raw(&epoch.to_le_bytes()).await?;
+            g.send_raw(&(carried.len() as u64).to_le_bytes()).await?;
+            if !carried.is_empty() {
+                g.send_raw(&carried).await?;
+            }
             let kb = g.recv_raw(4).await?;
             if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
                 return Err(cascadia_transport::TransportError::SocketClosed);
@@ -2083,17 +2094,31 @@ impl OvDistSpecWorkerEngine {
             #[cfg(feature = "kv_coord")]
             FrameKind::Restore => {
                 let up = self.upstream.clone();
-                let eb = run_async(&self.runtime_handle, async move {
+                // [epoch:8][carried_len:8 LE][carried] — carried is the head's inline cross-chain slice.
+                let (eb, carried) = run_async(&self.runtime_handle, async move {
                     let mut g = up.lock().await;
-                    g.recv_raw(8).await
+                    let eb = g.recv_raw(8).await?;
+                    let lb = g.recv_raw(8).await?;
+                    let n = u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
+                    let blob = if n > 0 { g.recv_raw(n).await? } else { Vec::new() };
+                    Ok::<_, cascadia_transport::TransportError>((eb, blob))
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
                 let epoch =
                     u64::from_le_bytes(eb.as_slice().try_into().map_err(|_| {
                         EngineError::Backend("ov-dist-spec: bad RESTORE body".into())
                     })?);
+                // Prefer this rank's own CAPTURE (same-chain); else set_state the head's carried slice
+                // (cross-chain move — the tail has no capture for a foreign chain's epoch).
                 let local_ok = match self.kv.take_capture(epoch) {
                     Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+                    None if !carried.is_empty() => {
+                        let ok = self.runtime.set_state_blob(&carried).is_ok();
+                        if ok {
+                            info!(epoch, blob_len = carried.len(), "distspec_tail_restore_carried");
+                        }
+                        ok
+                    }
                     None => false,
                 };
                 let down_ok = if self.is_last {
@@ -2569,9 +2594,17 @@ impl OvDistSpecEngine {
             return 0;
         }
         let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+        // Cross-chain: hand the pulled downstream slice to the tail inline (stash_downstream_rank stashed
+        // it under `epoch`; single-slot fallback for the 2-stage move). Empty ⇒ same-chain (tail restores
+        // from its own CAPTURE).
+        let carried = self
+            .kv
+            .take_downstream(epoch)
+            .or_else(|| self.kv.take_downstream_single())
+            .unwrap_or_default();
         let ok = self.draft.kv_restore(&parts[0])
             && self.target.stage0_restore(&parts[1])
-            && self.target.restore_downstream(epoch).unwrap_or(false);
+            && self.target.restore_downstream(epoch, carried).unwrap_or(false);
         if ok {
             // Each model's cursor = its real KV depth, not the token count (off-by-one — see
             // kv_seq_from_blob). Steady state: draft is 0..=1 behind the target. Align to the target by
@@ -2658,6 +2691,21 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         self.kv.insert_both(tokens, blob);
+        Ok(())
+    }
+    // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
+    // under the content epoch so `restore_downstream` ships it inline in the RESTORE frame to that rank.
+    // Without this the trait default returns Err ⇒ the head drops every downstream rank's pulled blob,
+    // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        self.kv.stash_downstream(epoch, blob);
         Ok(())
     }
 }
@@ -2766,6 +2814,21 @@ impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         self.kv.insert_both(tokens, blob);
+        Ok(())
+    }
+    // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
+    // under the content epoch so `restore_downstream` ships it inline in the RESTORE frame to that rank.
+    // Without this the trait default returns Err ⇒ the head drops every downstream rank's pulled blob,
+    // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
+    fn stash_downstream_rank(
+        &mut self,
+        _rank: u16,
+        manifest: &cascadia_kv_wire::Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
+        let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        self.kv.stash_downstream(epoch, blob);
         Ok(())
     }
 }
