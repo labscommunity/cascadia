@@ -45,6 +45,23 @@ const HIDDEN: usize = 2048;
 /// logits buffer (~254 MB f32 at 256 with the 248320 vocab) and the
 /// per-chunk wire frame (256 * 2048 * 4 B = 2 MiB, day-0 probe sized).
 const PREFILL_CHUNK: usize = 256;
+
+/// Effective prefill span. Default = PREFILL_CHUNK (T>1 batched, ~4.2x TTFT win).
+///
+/// `CASCADIA_QWEN36_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path that
+/// generation (decode) already uses. The DeltaNet/SSM recurrent scan is non-associative in f16, so a
+/// T>1 chunked prefill and the T=1 decode fold diverge sub-ulp; the f16 MoE router then amplifies that
+/// to a token flip. Under T=1 everywhere, turn-1 prefill, turn-1 decode, and a cold reprefill all
+/// traverse the identical kernel ⇒ bit-identical states ⇒ byte-identical greedy (cross-chain warm==cold
+/// cert passes). Opt-in only — production keeps chunked prefill; warm-resume there stays
+/// greedy-equivalent, not bit-identical. Read per chunk (a handful of times per prefill; negligible).
+fn prefill_chunk() -> usize {
+    if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
+        1
+    } else {
+        PREFILL_CHUNK
+    }
+}
 const MROPE_ROWS: usize = 4;
 
 // Pipeline wire protocol: header [kind u32][epoch u32][pos u32] (BE), then
@@ -1103,7 +1120,7 @@ impl Qwen36Engine {
                 < self.active.as_ref().unwrap().prompt_ids.len()
             {
                 let t = self.active.as_ref().unwrap();
-                let end = (t.prefill_idx + PREFILL_CHUNK).min(t.prompt_ids.len());
+                let end = (t.prefill_idx + prefill_chunk()).min(t.prompt_ids.len());
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 let n = toks.len();
@@ -1584,7 +1601,7 @@ impl Qwen36Engine {
                 < self.active.as_ref().unwrap().prompt_ids.len()
             {
                 let t = self.active.as_ref().unwrap();
-                let end = (t.prefill_idx + PREFILL_CHUNK).min(t.prompt_ids.len());
+                let end = (t.prefill_idx + prefill_chunk()).min(t.prompt_ids.len());
                 let toks: Vec<u32> = t.prompt_ids[t.prefill_idx..end].to_vec();
                 let t0 = t.step;
                 match self.run_span(&toks, t0) {
