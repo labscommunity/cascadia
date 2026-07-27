@@ -72,7 +72,19 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
     let mut seq = 0usize;
     for _ in 0..count {
         let name_len = u32_at(blob, p)? as usize;
-        p = p.checked_add(4)?.checked_add(name_len)?; // skip name_len + name
+        let name_at = p.checked_add(4)?;
+        // Hybrid models (qwen36) mix attention KV — whose shape[2] IS the fold depth — with fixed-shape
+        // DeltaNet/SSM recurrent states (conv/ssm) whose shape[2] is a constant (e.g. 128) that would
+        // poison the depth max. Only attention states carry the true resume depth; skip the recurrent
+        // ones. Pure-attention models (llama/dist-spec) have no conv/ssm names ⇒ unchanged.
+        let is_recurrent = blob
+            .get(name_at..name_at.checked_add(name_len)?)
+            .map(|b| {
+                let n = String::from_utf8_lossy(b);
+                n.contains("conv") || n.contains("ssm")
+            })
+            .unwrap_or(false);
+        p = name_at.checked_add(name_len)?; // skip name_len + name
         let _dtype = *blob.get(p)?;
         let rank = *blob.get(p.checked_add(1)?)? as usize;
         p = p.checked_add(2)?;
@@ -84,7 +96,7 @@ pub(crate) fn kv_seq_from_blob(blob: &[u8]) -> Option<usize> {
                 seq_dim = d;
             }
         }
-        if rank >= 3 {
+        if rank >= 3 && !is_recurrent {
             seq = seq.max(seq_dim);
         }
         let nb = u64_at(blob, p)? as usize;
