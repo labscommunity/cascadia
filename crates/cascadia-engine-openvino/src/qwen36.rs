@@ -1046,16 +1046,15 @@ impl Qwen36Engine {
                                         .unwrap_or(false));
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                                // kv_seq_from_framed_blob now ignores the fixed-shape DeltaNet conv/ssm
+                                // states (they poisoned the depth max with a constant 128), so it returns
+                                // the TRUE attention fold depth. Resume there (`.min(len)`, matching the
+                                // GREEN ov-runtime path). Resuming at len-1 re-fed the last folded token,
+                                // which the position-free DeltaNet layers double-applied ⇒ cross-chain
+                                // DIVERGE; the attention-only depth is correct for both attention and SSM.
                                 let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                    // Clamp to len-1, not len: the depth heuristic maxes shape[2]
-                                    // over rank>=3 states, and this model's fixed-shape DeltaNet ssm
-                                    // state [32,128,128] contributes a constant 128, so `.min(len)`
-                                    // returned `len` and warm-resume skipped prompt token len-1
-                                    // chain-wide. A matched prefix of `len` holds at most len-1
-                                    // depth; under-warming just re-prefills one token, over-warming
-                                    // corrupts.
-                                    .map(|s| s.min(len.saturating_sub(1)))
-                                    .unwrap_or(len.saturating_sub(1));
+                                    .map(|s| s.min(len))
+                                    .unwrap_or(len);
                                 info!(task = %task.task_id, warm_prefix = warm, matched = len, "qwen36 pipeline warm-resumed");
                                 warm
                             } else {
@@ -1534,11 +1533,11 @@ impl Qwen36Engine {
                     match self.kv.take_warm(&prompt_i32) {
                         Some((blob, len)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
+                            // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
+                            // the true attention depth, so resume at `.min(len)` (matching ov-runtime).
                             let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
-                                // See the sibling site: the fixed-shape ssm state poisons the depth
-                                // heuristic, so clamp to len-1 rather than len.
-                                .map(|s| s.min(len.saturating_sub(1)))
-                                .unwrap_or(len.saturating_sub(1));
+                                .map(|s| s.min(len))
+                                .unwrap_or(len);
                             info!(
                                 warm_prefix = warm,
                                 matched = len,

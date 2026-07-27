@@ -1163,18 +1163,6 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         bool canonical = true;
         for (size_t i = 0; i < states.size(); ++i)
             if (!kv_canonical_key(states[i].get_name(), &mkeys[i])) { canonical = false; break; }
-        // DIAG (temporary): non-canonical ⇒ positional restore is only correct same-instance; a cross-chain
-        // donor scrambles slots ⇒ DIVERGE. Fail closed + surface the runtime query_state() names.
-        if (!canonical) {
-            std::ostringstream oss;
-            oss << "set_state_blob: non-canonical model states (n=" << states.size() << "):";
-            for (size_t i = 0; i < states.size() && i < 6; ++i)
-                oss << " [" << i << "]=" << states[i].get_name();
-            if (states.size() > 6)
-                oss << " ... [" << (states.size() - 1) << "]=" << states[states.size() - 1].get_name();
-            set_last_error(oss.str().c_str());
-            return 1;
-        }
         if (canonical) {
             std::stable_sort(order.begin(), order.end(),
                              [&](size_t a, size_t b) { return mkeys[a] < mkeys[b]; });
