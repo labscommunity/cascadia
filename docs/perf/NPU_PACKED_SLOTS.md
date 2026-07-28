@@ -122,25 +122,43 @@ prefills a chunk or decodes a row per ready slot, and a finished slot retires
 immediately — freeing its KV region for the next admission rather than waiting
 for the batch.
 
-Validated on Llama-3.2-1B-Instruct (single-stage int4 static export) on the
-**CPU** device, which runs the stateless static path just as the NPU does — so
-the concurrency semantics are exercised without contending for an NPU:
+Validated on Llama-3.2-1B-Instruct (single-stage int4 static export), on both
+devices that run the stateless static path:
+
+**NPU** (Intel AI Boost), 4 slots:
+
+```
+packed, 4 slots   first tokens 2.67-2.85 s  all complete  8.68 s  overlap yes
+baseline (off)    first tokens 0.32-7.48 s  all complete 11.17 s  overlap no
+```
+
+**CPU**, 4 slots:
 
 ```
 packed, 4 slots   first tokens 2.12-2.93 s   all complete  9.32 s   overlap yes
 baseline (off)    first tokens 0.57-12.53 s  all complete 18.34 s   overlap no
 ```
 
-Baseline serializes: each request's first token lands only after the previous
-one finishes. Packed admits all four at once (log shows slots 0/1/2/3), and the
-two that hit EOS early retired at 5.5 s and 5.9 s while the others ran on —
-continuous, not batch-synchronous. Wall clock ~2.0x; worst-case time-to-first-
-token 12.53 s -> 2.93 s (4.3x). Both configurations return identical text for
-the same prompt ("The capital of France is Paris."), which is an end-to-end
-parity check between the packed and single-task paths.
+Both devices return the same text for the same prompt ("The capital of France is
+Paris.", usage 42 + 15), so the packed path is device-independent as expected —
+it is the same stateless static IR, only the compile target differs.
 
-Note these CPU ratios measure scheduling behaviour, not the weight-amortization
-win — that is the NPU property (16:1 weight:KV) measured in the table above.
+Baseline serializes on both: each request's first token lands only after the
+previous one finishes (worst case 7.48 s on NPU, 12.53 s on CPU). Packed admits
+all four at once and the early finishers retire while the others run on —
+continuous, not batch-synchronous. Worst-case time-to-first-token improves
+7.48 s -> 2.85 s on NPU (2.6x) and 12.53 s -> 2.93 s on CPU (4.3x); wall clock
+1.3x and 2.0x respectively.
+
+These end-to-end ratios at 4 slots measure SCHEDULING, and are bounded by it:
+the win grows with slot count, and the weight-amortization ceiling (3.1x at 8
+slots, 6.0x at 16) is the graph-level NPU property measured in the table above.
+A deployment wanting that ceiling exports with more slots and a wider
+`--static-context`.
+
+Note also that packed mode skips compiling the chunked-prefill variant
+entirely — a packed plan whose rows all belong to one slot IS a causal chunk —
+saving a full NPU compile and a second resident weight copy.
 
 ### Multi-stage
 

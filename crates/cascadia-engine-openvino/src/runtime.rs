@@ -3147,6 +3147,18 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
+        // The packed variant does its own chunked prefill (a plan whose rows all
+        // belong to one slot IS a causal chunk), so the separate prefill model
+        // would never be used — skip compiling it and keep its weights off the
+        // device. On NPU that is a whole compile (~100 s) and a second resident
+        // weight copy saved.
+        if self.packed_params.is_some() && self.static_prefill_params.take().is_some() {
+            events.push(LoadProgress::message(String::from(
+                "packed slots: skipping the chunked-prefill variant (packed inference covers \
+                 prefill natively)",
+            )));
+        }
+
         // --gemv-offload (spike): the offloaded matmuls run on the CPU
         // plugin's evaluate() fallback, and the rewrite targets the stateless
         // static IR's sym-INT4 pattern — gate both up front.
