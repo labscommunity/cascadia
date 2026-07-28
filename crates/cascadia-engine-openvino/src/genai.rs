@@ -536,7 +536,6 @@ struct ActiveCbTask {
 /// An empty Vec from `step()` means "nothing in flight", and the runner's
 /// no-progress guard relies on that distinction.
 pub struct OvGenaiCbEngine {
-    // Declared before `pipe`: CbHandles must drop before their pipeline.
     active: Vec<ActiveCbTask>,
     pipe: CbPipeline,
     prompt_pretemplated: bool,
@@ -562,7 +561,7 @@ impl Engine for OvGenaiCbEngine {
         );
         // u64::MAX cannot collide with the sequential request-id counter.
         match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
-            Ok(handle) => {
+            Ok(mut handle) => {
                 // Only a terminal status means the pipeline actually served a
                 // request. Reporting "ok" after a failed step told operators
                 // the worker was healthy when it was not, and dropped the
@@ -573,7 +572,7 @@ impl Engine for OvGenaiCbEngine {
                         warn!(error = %err, "cb warmup step failed");
                         break;
                     }
-                    match self.pipe.read(&handle) {
+                    match handle.read() {
                         Ok(r) if r.status != CbStatus::Running => {
                             reached_terminal = true;
                             break;
@@ -700,7 +699,7 @@ impl Engine for OvGenaiCbEngine {
         let mut out = Vec::new();
         let mut idx = 0;
         while idx < self.active.len() {
-            let read = match self.pipe.read(&self.active[idx].handle) {
+            let read = match self.active[idx].handle.read() {
                 Ok(r) => r,
                 Err(err) => {
                     let t = self.active.swap_remove(idx);

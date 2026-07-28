@@ -681,18 +681,50 @@ pub struct CbRead {
 /// the pipeline they came from.
 pub struct CbPipeline {
     #[cfg(feature = "openvino")]
-    handle: *mut sys::cascadia_cb_pipeline_t,
+    inner: std::sync::Arc<CbInner>,
 }
 
-// Serialised behind the runner's engine mutex, like LlmPipeline.
+/// Shared owner of the native pipeline. Both [`CbPipeline`] and every
+/// [`CbHandle`] it mints hold an `Arc` of this, so the native
+/// `ContinuousBatchingPipeline` outlives its handles by construction.
+///
+/// The C header requires handles be destroyed before the pipeline; previously
+/// that was upheld only by the declaration order of two fields in a struct in
+/// another crate, where reordering them — something reviewers read as cosmetic
+/// — would have been a use-after-free with no compiler complaint.
+#[cfg(feature = "openvino")]
+struct CbInner {
+    ptr: *mut sys::cascadia_cb_pipeline_t,
+}
+
+// SAFETY: `CbInner` owns the native pipeline exclusively and OV GenAI
+// pipelines have no thread affinity, so moving one between threads is sound.
+// `Sync` is required only because `Arc<T>` demands `T: Send + Sync` to be
+// `Send`; nothing hands out `&CbInner`, and every call that reaches the native
+// pipeline goes through `&mut`-gated engine methods serialised behind the
+// runner's engine mutex. The shim itself is NOT thread-safe (see shim.h).
+#[cfg(feature = "openvino")]
+unsafe impl Send for CbInner {}
+#[cfg(feature = "openvino")]
+unsafe impl Sync for CbInner {}
+
+// SAFETY: as above — exclusive ownership, no thread affinity. Deliberately not
+// `Sync`: `&CbPipeline` must not cross threads.
 unsafe impl Send for CbPipeline {}
 
 /// Owned per-request generation handle from [`CbPipeline::add_request`].
+///
+/// Holds an `Arc` on the pipeline that minted it, so it can neither outlive it
+/// nor be read through a different one.
 pub struct CbHandle {
+    #[cfg(feature = "openvino")]
+    inner: std::sync::Arc<CbInner>,
     #[cfg(feature = "openvino")]
     handle: *mut sys::cascadia_cb_handle_t,
 }
 
+// SAFETY: as `CbPipeline`. A handle and its pipeline must stay on the same
+// thread; both are reached only through the engine, which the runner serialises.
 unsafe impl Send for CbHandle {}
 
 impl CbPipeline {
@@ -744,7 +776,9 @@ impl CbPipeline {
         if rc != 0 {
             return Err(Error::Native(last_native_error()));
         }
-        Ok(Self { handle })
+        Ok(Self {
+            inner: std::sync::Arc::new(CbInner { ptr: handle }),
+        })
     }
 
     #[cfg(not(feature = "openvino"))]
@@ -766,7 +800,7 @@ impl CbPipeline {
             let raw_cfg = native_genconfig(cfg)?;
             let mut handle: *mut sys::cascadia_cb_handle_t = ptr::null_mut();
             let rc = sys::cascadia_cb_add_request(
-                self.handle,
+                self.inner.ptr,
                 request_id,
                 prompt_c.as_ptr(),
                 raw_cfg,
@@ -776,7 +810,10 @@ impl CbPipeline {
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
             }
-            Ok(CbHandle { handle })
+            Ok(CbHandle {
+                inner: std::sync::Arc::clone(&self.inner),
+                handle,
+            })
         }
     }
 
@@ -790,7 +827,7 @@ impl CbPipeline {
     /// when the pipeline has no non-finished requests.
     #[cfg(feature = "openvino")]
     pub fn step(&self) -> Result<()> {
-        let rc = unsafe { sys::cascadia_cb_step(self.handle) };
+        let rc = unsafe { sys::cascadia_cb_step(self.inner.ptr) };
         if rc != 0 {
             return Err(Error::Native(last_native_error()));
         }
@@ -805,7 +842,7 @@ impl CbPipeline {
     #[cfg(feature = "openvino")]
     pub fn has_unfinished(&self) -> Result<bool> {
         let mut has: i32 = 0;
-        let rc = unsafe { sys::cascadia_cb_has_unfinished(self.handle, &mut has) };
+        let rc = unsafe { sys::cascadia_cb_has_unfinished(self.inner.ptr, &mut has) };
         if rc != 0 {
             return Err(Error::Native(last_native_error()));
         }
@@ -813,20 +850,55 @@ impl CbPipeline {
     }
 
     #[cfg(not(feature = "openvino"))]
-    pub fn read(&self, _handle: &CbHandle) -> Result<CbRead> {
+    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+        None
+    }
+
+    /// Best-effort token count via the pipeline's tokenizer.
+    #[cfg(feature = "openvino")]
+    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+        let text_c = cstr(text).ok()?;
+        let mut out: u32 = 0;
+        let rc =
+            unsafe { sys::cascadia_cb_count_tokens(self.inner.ptr, text_c.as_ptr(), &mut out) };
+        if rc != 0 {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for CbInner {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { sys::cascadia_cb_pipeline_destroy(self.ptr) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+impl CbHandle {
+    #[cfg(not(feature = "openvino"))]
+    pub fn read(&mut self) -> Result<CbRead> {
         Err(Error::Stub)
     }
 
-    /// Drain newly generated text for one request since the previous read.
+    /// Drain newly generated text for this request since the previous read.
+    ///
+    /// Lives on the handle rather than the pipeline so it cannot be called
+    /// with a handle minted by a different pipeline — that decoded the text
+    /// with the wrong tokenizer and returned success.
     #[cfg(feature = "openvino")]
-    pub fn read(&self, handle: &CbHandle) -> Result<CbRead> {
+    pub fn read(&mut self) -> Result<CbRead> {
         unsafe {
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut new_tokens: u32 = 0;
             let mut status: i32 = 0;
             let rc = sys::cascadia_cb_handle_read(
+                self.inner.ptr,
                 self.handle,
-                handle.handle,
                 &mut text_p,
                 &mut new_tokens,
                 &mut status,
@@ -848,36 +920,6 @@ impl CbPipeline {
         }
     }
 
-    #[cfg(not(feature = "openvino"))]
-    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
-        None
-    }
-
-    /// Best-effort token count via the pipeline's tokenizer.
-    #[cfg(feature = "openvino")]
-    pub fn count_tokens(&self, text: &str) -> Option<u32> {
-        let text_c = cstr(text).ok()?;
-        let mut out: u32 = 0;
-        let rc = unsafe { sys::cascadia_cb_count_tokens(self.handle, text_c.as_ptr(), &mut out) };
-        if rc != 0 {
-            None
-        } else {
-            Some(out)
-        }
-    }
-}
-
-#[cfg(feature = "openvino")]
-impl Drop for CbPipeline {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { sys::cascadia_cb_pipeline_destroy(self.handle) };
-            self.handle = ptr::null_mut();
-        }
-    }
-}
-
-impl CbHandle {
     #[cfg(not(feature = "openvino"))]
     pub fn cancel(&self) -> Result<()> {
         Err(Error::Stub)
