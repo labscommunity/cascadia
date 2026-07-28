@@ -1806,6 +1806,15 @@ impl Qwen36Engine {
             return false;
         }
         for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
+            // Restore must land on a CLEAN request. `reset_state` leaves residue on this model
+            // (see reset_all), and the warm path skips it entirely, so `set_state_blob` here would
+            // otherwise apply over the prior turn's live folded state — the resumed continuation then
+            // loses context and regurgitates the user prompt (cross-chain DIVERGE). Rebuild first.
+            if let Err(e) = st.recreate_request() {
+                warn!(error = %e, "qwen36: recreate_request before restore failed; cold reprefill");
+                self.state_restored = true;
+                return false;
+            }
             if let Err(e) = st.set_state_blob(part) {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
                 // A partial apply still dirtied earlier stages — make the next reset scrub properly.
