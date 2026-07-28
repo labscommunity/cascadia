@@ -417,6 +417,13 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub prompt_lookup: u32,
 
+    /// Packed multi-slot continuous batching (NPU, ov-runtime static exports):
+    /// serve N concurrent requests in ONE inference by packing them into the
+    /// sequence dimension with a per-row mask. Requires a packed variant beside
+    /// the decode IR (`tools/packed_variant.py --slots N`). 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub packed_slots: u32,
+
     /// Continuous batching (#20, ov-genai only): serve concurrent requests
     /// through one ContinuousBatchingPipeline (paged attention; CPU/GPU
     /// plugins) instead of one generation at a time. Incompatible with
@@ -653,6 +660,7 @@ impl WorkerArgs {
             draft_device: None,
             spec_k: 5,
             prompt_lookup: 0,
+            packed_slots: 0,
             cb: false,
             cb_cache_size: 0,
             cb_max_num_seqs: 0,
@@ -1236,6 +1244,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 b = b.with_prefill_device(dev);
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
+            b.packed_slots = args.packed_slots;
             b = b.with_prefill_parking(args.park_prefill);
             b = b.with_gemv_offload(args.gemv_offload);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
@@ -1491,7 +1500,27 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
     }
-    // Continuous batching (#20) lives in the ov-genai CBP path only.
+    // Packed multi-slot decode lives in the ov-runtime static (NPU-target) path.
+    if args.packed_slots > 0 {
+        if args.engine != EngineKind::OvRuntime {
+            return Err(anyhow!(
+                "--packed-slots requires --engine ov-runtime (packed multi-slot decode is a \
+                 static-KV path feature)"
+            ));
+        }
+        if args.packed_slots < 2 {
+            return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
+        }
+        if args.total != 1 {
+            return Err(anyhow!(
+                "--packed-slots is single-stage only for now (--total 1); the multi-stage wire \
+                 does not yet carry [1, S, hidden] + per-slot positions"
+            ));
+        }
+    }
+    // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
+    // different mechanism to --packed-slots above: OV's paged attention on the
+    // CPU/GPU plugins, versus our sequence-packing on the NPU static path.
     if (args.cb
         || args.cb_cache_size > 0
         || args.cb_max_num_seqs > 0
@@ -2337,6 +2366,31 @@ mod python_tests {
         a.no_chunked_prefill = true;
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains("conflict"), "{err}");
+    }
+
+    /// Packed multi-slot decode is an ov-runtime static-path feature; using it
+    /// on another engine, at N<2, or multi-stage is rejected loudly.
+    #[test]
+    fn worker_flags_gate_packed_slots() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 1;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains(">= 2"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 8;
+        a.total = 2;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("single-stage"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 8;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 
     /// A valid phase split (ov-runtime + prefill device, chunked enabled) passes.

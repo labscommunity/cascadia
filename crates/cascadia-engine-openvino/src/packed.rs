@@ -169,6 +169,14 @@ impl PackedKv {
         &self.val_buf[li]
     }
 
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     pub fn present_layer_bytes(&self) -> usize {
         self.kv_heads * self.context * self.head_dim * self.elem_bytes
     }
