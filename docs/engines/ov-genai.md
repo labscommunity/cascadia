@@ -89,9 +89,11 @@ Sweet spot is K=5 for short factual prompts; drop to K=3 for long-creative outpu
 ## Continuous batching (`--cb`, #20)
 
 `--cb` swaps the `LLMPipeline` for ov-genai's `ContinuousBatchingPipeline`:
-concurrent requests join one paged-attention batch, each `step()` advances
-every in-flight request by one scheduler iteration, and each request streams
-incremental text deltas (unlike the default engine's one-chunk-per-task).
+concurrent requests join one paged-attention batch, each `step()` advances the
+batch by one scheduler iteration, and each request streams incremental text
+deltas (unlike the default engine's one-chunk-per-task). Which requests run in
+a given iteration is the scheduler's choice, bounded by `--cb-max-num-seqs` /
+`--cb-max-batched-tokens` and KV-cache pressure.
 `cancel()` aborts a single request mid-generation without touching the rest
 of the batch. Tune with `--cb-cache-size`, `--cb-max-num-seqs`,
 `--cb-max-batched-tokens`, `--cb-dynamic-split-fuse`, `--cb-prefix-caching`
@@ -102,9 +104,11 @@ ov-genai serves the static NPUW pipeline — `--cb` will fail at compile
 there; run NPU workers without `--cb` (requests queue sequentially).
 
 ```bash
-cascadia worker --engine ov-genai --model ~/models/qwen3-8b-int4-ov \
-  --device GPU --cb --cb-cache-size 4 --cb-max-num-seqs 32 \
-  --cb-prefix-caching true --listen :8000
+cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
+              --model /models/qwen3-8b-int4-ov \
+              --cb --cb-cache-size 4 --cb-max-num-seqs 32 \
+              --cb-prefix-caching true \
+              --api :8000
 ```
 
 ## Limitations

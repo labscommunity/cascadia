@@ -498,11 +498,19 @@ struct ActiveCbTask {
 
 /// Continuous-batching ov-genai engine (#20). Unlike [`OvGenaiEngine`]'s
 /// monolithic step (one whole generation per call), every `step()` advances
-/// ALL in-flight requests by one scheduler iteration and emits one text
-/// delta per progressed request — the runner's per-task chunk buffers route
-/// each delta to its owner. `submit()` enrolls into the running batch
-/// immediately, so a request arriving mid-generation joins the next
-/// iteration instead of waiting for the batch to drain.
+/// the batch by one scheduler iteration and emits one text delta per request
+/// that progressed — the runner's per-task chunk buffers route each delta to
+/// its owner. Which enrolled requests actually run in a given iteration is the
+/// scheduler's choice, bounded by `max_num_seqs` / `max_num_batched_tokens`
+/// and KV-cache pressure; a request may sit out a step entirely. `submit()`
+/// enrolls into the running batch immediately, so a request arriving
+/// mid-generation joins the next iteration instead of waiting for the batch
+/// to drain.
+///
+/// A step that progresses the batch without producing any token — every
+/// iteration of a chunked prefill does this — still emits a zero-token chunk.
+/// An empty Vec from `step()` means "nothing in flight", and the runner's
+/// no-progress guard relies on that distinction.
 pub struct OvGenaiCbEngine {
     // Declared before `pipe`: CbHandles must drop before their pipeline.
     active: Vec<ActiveCbTask>,
@@ -748,18 +756,10 @@ fn build_gen_config(
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
         //
-        // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
-        // forwarded to GenerationConfig.rng_seed, but it does NOT make
-        // ov-genai reproducible across requests on this reused
-        // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
-        // the seed VALUE CHANGES between consecutive generate() calls
-        // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
-        // and never calls `clear_request_info`, so two identical seeds in a
-        // row reuse the advanced RNG and diverge. Different seeds DO change
-        // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
-        // honor seed fully (they re-seed per request). Per-request
-        // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
-        // request context per request) — tracked with #20.
+        // `seed` maps to GenerationConfig.rng_seed. What that buys you differs
+        // per pipeline, so the caveat lives on the monolithic engine's
+        // gen_config (the pipeline it applies to) rather than here — this
+        // function also builds configs for the continuous-batching path.
         top_p: if sampling.top_p > 0.0 {
             sampling.top_p.min(1.0)
         } else {
@@ -781,6 +781,21 @@ fn build_gen_config(
 }
 
 impl OvGenaiEngine {
+    /// SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1; not re-checked on
+    /// the current 2026.2 floor): `seed` is forwarded to
+    /// `GenerationConfig.rng_seed`, but it does NOT make ov-genai reproducible
+    /// across requests on this reused `LLMPipeline`. OV-GenAI's
+    /// `StatefulLLMPipeline` only re-seeds when the seed VALUE CHANGES between
+    /// consecutive `generate()` calls (`if (m_sampler.get_seed() !=
+    /// config.rng_seed) set_seed(...)`) and never calls `clear_request_info`,
+    /// so two identical seeds in a row reuse the advanced RNG and diverge.
+    /// Different seeds DO change the output, and the Rust-sampler engines
+    /// (ov-runtime/sparse-moe) honor seed fully — they re-seed per request.
+    ///
+    /// This is a property of `StatefulLLMPipeline`, so it does not describe
+    /// [`OvGenaiCbEngine`]: `ContinuousBatchingPipeline` builds a fresh request
+    /// context per request. Whether that yields per-request reproducibility in
+    /// practice is untested here.
     fn gen_config(
         &self,
         max_tokens: u32,

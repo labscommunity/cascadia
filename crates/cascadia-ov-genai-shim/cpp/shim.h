@@ -120,9 +120,9 @@ void cascadia_free_string(char* s);
 // ---- Continuous batching (ContinuousBatchingPipeline, issue #20) ----------
 //
 // One pipeline serves many concurrent requests: add_request() enrolls a
-// prompt into the running batch, step() advances every enrolled request by
-// one scheduler iteration, and per-request handles surface incremental
-// text. NOT thread-safe (like everything else here) — serialise from Rust.
+// prompt into the running batch, step() advances the batch by one scheduler
+// iteration, and per-request handles surface incremental text. NOT
+// thread-safe (like everything else here) — serialise from Rust.
 
 typedef struct cascadia_cb_pipeline_t cascadia_cb_pipeline_t;
 typedef struct cascadia_cb_handle_t cascadia_cb_handle_t;
@@ -153,8 +153,10 @@ int32_t cascadia_cb_add_request(
     const cascadia_genconfig_t* cfg,
     cascadia_cb_handle_t** out_handle);
 
-/// Advance every enrolled request by one scheduler iteration. A no-op
-/// (returns 0) when nothing is enrolled.
+/// Advance the batch by one scheduler iteration. The scheduler picks which
+/// enrolled requests run, subject to max_num_seqs / max_num_batched_tokens
+/// and KV pressure, so a given request may not progress. A no-op (returns 0)
+/// when the pipeline has no non-finished requests.
 int32_t cascadia_cb_step(cascadia_cb_pipeline_t* handle);
 
 int32_t cascadia_cb_has_unfinished(

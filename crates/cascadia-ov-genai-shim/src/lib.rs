@@ -637,9 +637,19 @@ impl Drop for LlmPipeline {
     }
 }
 
-/// Scheduler knobs for [`CbPipeline`]. Zero / `None` keep ov-genai defaults
-/// (cache_size 0 = dynamic KV allocation, max_num_seqs 256,
-/// max_num_batched_tokens 256, dynamic_split_fuse on, prefix caching off).
+/// Scheduler knobs for [`CbPipeline`]. Zero / `None` leaves the field at
+/// `ov::genai::SchedulerConfig`'s own default — the shim simply does not
+/// assign it.
+///
+/// Those defaults, verified against OV GenAI 2026.2
+/// (`runtime/include/openvino/genai/scheduler_config.hpp`): `max_num_seqs`
+/// 256, `max_num_batched_tokens` 256, `dynamic_split_fuse` on,
+/// `enable_prefix_caching` off, and `cache_size` 0 — which, together with
+/// `num_kv_blocks` 0, turns on dynamic cache allocation. Re-check these on an
+/// SDK bump; upstream retunes scheduler defaults between releases.
+///
+/// Note `dynamic_split_fuse`: with it OFF, a prompt longer than
+/// `max_num_batched_tokens` is a hard error upstream, not a slow path.
 #[derive(Clone, Debug, Default)]
 pub struct CbSchedulerConfig {
     pub cache_size_gb: u64,
@@ -775,7 +785,9 @@ impl CbPipeline {
         Err(Error::Stub)
     }
 
-    /// Advance every enrolled request by one scheduler iteration.
+    /// Advance the batch by one scheduler iteration. The scheduler picks which
+    /// enrolled requests run, so a given request may not progress. A no-op
+    /// when the pipeline has no non-finished requests.
     #[cfg(feature = "openvino")]
     pub fn step(&self) -> Result<()> {
         let rc = unsafe { sys::cascadia_cb_step(self.handle) };
