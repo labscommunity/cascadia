@@ -114,15 +114,36 @@ context shrinks as slots rise; a deployment wanting 8 x 1024 should export with
 `--static-context 8193`. KV traffic then scales with the slot count, but there is
 room: 8 x 29.3 MB = 234 MB still sits under the 458 MB weight stream.
 
-## Status
+## End-to-end
 
-Shipped here: the IR variant (hardware-verified — the emitted graph compiles on
-NPU and passes isolation + teeth) and the host-side primitives (unit-tested for
-mask layout, region-local scatter, in-region slide, and per-slot reset).
+`--packed-slots N` on the ov-runtime engine turns a static single-stage export
+into a slot-served worker: admission tokenizes into a free slot, one inference
+prefills a chunk or decodes a row per ready slot, and a finished slot retires
+immediately — freeing its KV region for the next admission rather than waiting
+for the batch.
 
-Not yet wired: the engine execution path — slot admission/eviction in
-`OvRuntimeEngine`, per-slot sampling and chunk emission, and the multi-stage wire
-carrying `[1, S, hidden]` plus per-slot positions.
+Validated on Llama-3.2-1B-Instruct (single-stage int4 static export) on the
+**CPU** device, which runs the stateless static path just as the NPU does — so
+the concurrency semantics are exercised without contending for an NPU:
+
+```
+packed, 4 slots   first tokens 2.12-2.93 s   all complete  9.32 s   overlap yes
+baseline (off)    first tokens 0.57-12.53 s  all complete 18.34 s   overlap no
+```
+
+Baseline serializes: each request's first token lands only after the previous
+one finishes. Packed admits all four at once (log shows slots 0/1/2/3), and the
+two that hit EOS early retired at 5.5 s and 5.9 s while the others ran on —
+continuous, not batch-synchronous. Wall clock ~2.0x; worst-case time-to-first-
+token 12.53 s -> 2.93 s (4.3x). Both configurations return identical text for
+the same prompt ("The capital of France is Paris."), which is an end-to-end
+parity check between the packed and single-task paths.
+
+Note these CPU ratios measure scheduling behaviour, not the weight-amortization
+win — that is the NPU property (16:1 weight:KV) measured in the table above.
+
+Not yet wired: the multi-stage wire carrying `[1, S, hidden]` plus per-slot
+positions, so `--packed-slots` is gated to `--total 1`.
 
 Side benefit worth remembering: at ~0.21-0.29 ms marginal per row, speculative
 decode verification is nearly free on the NPU.
