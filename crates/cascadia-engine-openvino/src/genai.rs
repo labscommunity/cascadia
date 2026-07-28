@@ -709,6 +709,13 @@ impl Engine for OvGenaiCbEngine {
                     continue;
                 }
             };
+            if read.resynced {
+                warn!(
+                    task = %self.active[idx].task_id,
+                    "cb detokenizer re-decode stopped extending the emitted text; \
+                     re-anchored (a short run of output may be missing)"
+                );
+            }
             self.active[idx].total_tokens += read.new_tokens;
             match read.status {
                 CbStatus::Running => {

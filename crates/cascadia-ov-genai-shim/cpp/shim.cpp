@@ -409,45 +409,14 @@ struct cascadia_cb_pipeline_t {
 
 struct cascadia_cb_handle_t {
     ov::genai::GenerationHandle handle;
-    // Accumulated token ids + how many bytes of their decode we have already
-    // handed to the caller. Re-decoding the full sequence each read (instead
-    // of decoding the delta ids alone) keeps multi-byte codepoints whole when
-    // a codepoint's tokens land in different reads.
+    // Accumulated token ids. The whole sequence is re-decoded on every read
+    // (decoding only the delta ids would split multi-byte codepoints whose
+    // tokens land in different reads) and the FULL decode is returned; the
+    // caller owns the emitted-prefix bookkeeping. Tracking it here as a byte
+    // count that was never checked against the decode meant a re-decode that
+    // shrank desynced the stream permanently and silently.
     std::vector<int64_t> acc_ids;
-    size_t emitted_bytes = 0;
 };
-
-namespace {
-
-// Hold back a trailing incomplete UTF-8 sequence (and the U+FFFD the
-// detokenizer substitutes for a half-decoded codepoint) while the request
-// is still running — the completing bytes arrive with the next tokens.
-size_t utf8_hold_back(const std::string& s) {
-    size_t hold = 0;
-    static const char kReplacement[] = "\xEF\xBF\xBD";
-    if (s.size() >= 3 && s.compare(s.size() - 3, 3, kReplacement) == 0) {
-        hold += 3;
-    }
-    size_t end = s.size() - hold;
-    size_t cont = 0;
-    while (cont < 3 && cont < end &&
-           (static_cast<unsigned char>(s[end - 1 - cont]) & 0xC0) == 0x80) {
-        ++cont;
-    }
-    if (cont < end) {
-        unsigned char lead = static_cast<unsigned char>(s[end - 1 - cont]);
-        size_t need = (lead & 0xF8) == 0xF0   ? 4
-                      : (lead & 0xF0) == 0xE0 ? 3
-                      : (lead & 0xE0) == 0xC0 ? 2
-                                              : 1;
-        if (need > cont + 1) {
-            hold += cont + 1;
-        }
-    }
-    return hold;
-}
-
-}  // namespace
 
 int32_t cascadia_cb_pipeline_create(
     const char* model_path, const char* device, uint64_t cache_size_gb,
@@ -547,14 +516,17 @@ int32_t cascadia_cb_has_unfinished(cascadia_cb_pipeline_t* handle, int32_t* out_
 
 int32_t cascadia_cb_handle_read(
     cascadia_cb_pipeline_t* pipeline, cascadia_cb_handle_t* handle,
-    char** out_text_delta, uint32_t* out_new_tokens, int32_t* out_status) {
-    if (!pipeline || !pipeline->tok || !handle || !handle->handle ||
-        !out_text_delta || !out_new_tokens || !out_status) {
+    char** out_text, size_t* out_text_len, uint32_t* out_new_tokens,
+    int32_t* out_status) {
+    if (!pipeline || !pipeline->tok || !handle || !handle->handle || !out_text ||
+        !out_text_len || !out_new_tokens || !out_status) {
         set_last_error("null arg in cb_handle_read");
         return 1;
     }
     try {
         const size_t before = handle->acc_ids.size();
+        // can_read() first: read() asserts on a stopped/cancelled handle, and
+        // pulling from an empty stream would block.
         if (handle->handle->can_read()) {
             // read() surfaces tokens generated since the previous read().
             // Single sequence per request (n / best_of are not exposed), so
@@ -572,28 +544,26 @@ int32_t cascadia_cb_handle_read(
                       : status == ov::genai::GenerationStatus::FINISHED ? 1
                                                                         : 2;
 
+        // Return the whole decode, not a delta. The caller diffs it against
+        // what it has already emitted, which lets it notice a non-monotonic
+        // re-decode instead of silently slicing at a stale offset.
         std::string full = pipeline->tok->decode(handle->acc_ids);
-        std::string delta;
-        if (full.size() > handle->emitted_bytes) {
-            delta = full.substr(handle->emitted_bytes);
-            if (running) {
-                const size_t hold = utf8_hold_back(delta);
-                delta.resize(delta.size() - hold);
-            }
-            handle->emitted_bytes += delta.size();
-        }
-        if (delta.size() > MAX_GENERATED_TEXT_BYTES) {
-            set_last_error("cb read delta exceeds MAX_GENERATED_TEXT_BYTES");
+        if (full.size() > MAX_GENERATED_TEXT_BYTES) {
+            set_last_error("cb decoded text exceeds MAX_GENERATED_TEXT_BYTES");
             return 1;
         }
-        char* buf = static_cast<char*>(std::malloc(delta.size() + 1));
+        char* buf = static_cast<char*>(std::malloc(full.size() + 1));
         if (!buf) {
-            set_last_error("malloc failure for cb delta");
+            set_last_error("malloc failure for cb text");
             return 1;
         }
-        std::memcpy(buf, delta.data(), delta.size());
-        buf[delta.size()] = 0;
-        *out_text_delta = buf;
+        std::memcpy(buf, full.data(), full.size());
+        buf[full.size()] = 0;
+        // Length is explicit: a byte-level vocabulary can decode a token to
+        // 0x00, and a NUL-terminated read would truncate there for the rest of
+        // the request.
+        *out_text = buf;
+        *out_text_len = full.size();
         *out_new_tokens = static_cast<uint32_t>(handle->acc_ids.size() - before);
         return 0;
     } catch (const std::exception& e) {

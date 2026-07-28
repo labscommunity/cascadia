@@ -173,7 +173,8 @@ mod sys {
         pub fn cascadia_cb_handle_read(
             pipeline: *mut cascadia_cb_pipeline_t,
             handle: *mut cascadia_cb_handle_t,
-            out_text_delta: *mut *mut c_char,
+            out_text: *mut *mut c_char,
+            out_text_len: *mut usize,
             out_new_tokens: *mut u32,
             out_status: *mut i32,
         ) -> c_int;
@@ -671,9 +672,51 @@ pub enum CbStatus {
 /// One incremental read: the newly generated text suffix plus its token count.
 #[derive(Clone, Debug)]
 pub struct CbRead {
+    /// Newly emittable text. NOT the text of `new_tokens` tokens — see below.
     pub text_delta: String,
+    /// Tokens appended to this request's accumulated sequence by this read.
+    ///
+    /// This is deliberately not the token count of `text_delta`: the UTF-8
+    /// hold-back can return an empty delta while reporting tokens, because the
+    /// bytes those tokens decoded to are not safe to emit yet. Callers must
+    /// count tokens even when the delta is empty, or usage under-reports.
     pub new_tokens: u32,
     pub status: CbStatus,
+    /// Set once per request when the detokenizer's re-decode stopped extending
+    /// what had already been emitted and the handle had to re-anchor. The
+    /// shim takes no logging dependency, so the caller reports it — with the
+    /// task context the shim does not have.
+    pub resynced: bool,
+}
+
+/// How many bytes of `full` are safe to hand to the caller.
+///
+/// While the request is still running this holds back anything that the next
+/// token may complete or replace:
+///
+/// * a trailing incomplete UTF-8 sequence, and
+/// * a trailing RUN of U+FFFD. A byte-level detokenizer emits one U+FFFD per
+///   undecodable byte, so a 4-byte codepoint arriving over three reads shows up
+///   as one, then two replacement chars before resolving. Holding only the last
+///   one (as the C++ this replaces did) emitted the earlier ones as real text
+///   and then desynced the byte offset permanently.
+///
+/// Nothing is held on the terminal read, so a U+FFFD the model genuinely
+/// produced is delayed, never dropped.
+#[allow(dead_code)]
+fn emittable_len(full: &[u8], running: bool) -> usize {
+    if !running {
+        return full.len();
+    }
+    const REPLACEMENT: [u8; 3] = [0xEF, 0xBF, 0xBD];
+    let mut end = match std::str::from_utf8(full) {
+        Ok(_) => full.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    while end >= REPLACEMENT.len() && full[end - REPLACEMENT.len()..end] == REPLACEMENT {
+        end -= REPLACEMENT.len();
+    }
+    end
 }
 
 /// Owned `ContinuousBatchingPipeline` handle (issue #20). One pipeline
@@ -721,6 +764,12 @@ pub struct CbHandle {
     inner: std::sync::Arc<CbInner>,
     #[cfg(feature = "openvino")]
     handle: *mut sys::cascadia_cb_handle_t,
+    /// Bytes of this request's decode already handed to the caller.
+    #[cfg(feature = "openvino")]
+    emitted: Vec<u8>,
+    /// Latches the one-per-request divergence warning.
+    #[cfg(feature = "openvino")]
+    warned_divergence: bool,
 }
 
 // SAFETY: as `CbPipeline`. A handle and its pipeline must stay on the same
@@ -813,6 +862,8 @@ impl CbPipeline {
             Ok(CbHandle {
                 inner: std::sync::Arc::clone(&self.inner),
                 handle,
+                emitted: Vec::new(),
+                warned_divergence: false,
             })
         }
     }
@@ -894,23 +945,28 @@ impl CbHandle {
     pub fn read(&mut self) -> Result<CbRead> {
         unsafe {
             let mut text_p: *mut c_char = ptr::null_mut();
+            let mut text_len: usize = 0;
             let mut new_tokens: u32 = 0;
             let mut status: i32 = 0;
             let rc = sys::cascadia_cb_handle_read(
                 self.inner.ptr,
                 self.handle,
                 &mut text_p,
+                &mut text_len,
                 &mut new_tokens,
                 &mut status,
             );
             if rc != 0 || text_p.is_null() {
                 return Err(Error::Native(last_native_error()));
             }
-            let text_delta = CStr::from_ptr(text_p).to_string_lossy().into_owned();
+            let full = std::slice::from_raw_parts(text_p as *const u8, text_len);
+            let running = status == 0;
+            let (text_delta, resynced) = self.take_delta(full, running);
             sys::cascadia_free_string(text_p);
             Ok(CbRead {
                 text_delta,
                 new_tokens,
+                resynced,
                 status: match status {
                     0 => CbStatus::Running,
                     1 => CbStatus::Finished,
@@ -918,6 +974,31 @@ impl CbHandle {
                 },
             })
         }
+    }
+
+    /// Advance `emitted` over `full` and return the newly emittable text.
+    ///
+    /// Detokenizers are not guaranteed prefix-stable — appending a token can
+    /// rewrite earlier bytes, and a decode can get SHORTER when a run of
+    /// U+FFFD collapses into the codepoint it was standing in for. Slicing at
+    /// a remembered byte offset without checking assumes it never happens; when
+    /// it does the offset is wrong for the rest of the request and the client
+    /// silently receives garbage. Re-anchor instead, emitting nothing for the
+    /// divergent region: the already-emitted bytes cannot be recalled, and
+    /// re-emitting the corrected suffix would duplicate text.
+    #[cfg(feature = "openvino")]
+    fn take_delta(&mut self, full: &[u8], running: bool) -> (String, bool) {
+        if !full.starts_with(&self.emitted) {
+            let first = !self.warned_divergence;
+            self.warned_divergence = true;
+            self.emitted.clear();
+            self.emitted.extend_from_slice(full);
+            return (String::new(), first);
+        }
+        let end = emittable_len(full, running).max(self.emitted.len());
+        let bytes = &full[self.emitted.len()..end];
+        self.emitted.extend_from_slice(bytes);
+        (String::from_utf8_lossy(bytes).into_owned(), false)
     }
 
     #[cfg(not(feature = "openvino"))]
@@ -1484,6 +1565,103 @@ where
     }
     buf.truncate(len);
     String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
+#[cfg(test)]
+mod holdback_tests {
+    use super::emittable_len;
+
+    const FFFD: &[u8] = &[0xEF, 0xBF, 0xBD];
+    const EURO: &[u8] = &[0xE2, 0x82, 0xAC]; // U+20AC, 3 bytes
+    const GRIN: &[u8] = &[0xF0, 0x9F, 0x98, 0x80]; // U+1F600, 4 bytes
+
+    fn run(bytes: &[u8]) -> usize {
+        emittable_len(bytes, true)
+    }
+
+    #[test]
+    fn empty_and_ascii_are_fully_emittable() {
+        assert_eq!(run(b""), 0);
+        assert_eq!(run(b"abc"), 3);
+    }
+
+    #[test]
+    fn complete_multibyte_codepoints_are_emittable() {
+        assert_eq!(run(EURO), EURO.len());
+        assert_eq!(run(GRIN), GRIN.len());
+        let mixed = [b"hi".as_slice(), GRIN, b"!".as_slice()].concat();
+        assert_eq!(run(&mixed), mixed.len());
+    }
+
+    #[test]
+    fn truncated_sequences_are_held_at_every_offset() {
+        // Every proper prefix of a multi-byte codepoint holds back entirely.
+        for cp in [EURO, GRIN] {
+            for take in 1..cp.len() {
+                let buf = [b"ok".as_slice(), &cp[..take]].concat();
+                assert_eq!(
+                    run(&buf),
+                    2,
+                    "prefix of {take} bytes should hold back, buf={buf:02x?}"
+                );
+            }
+        }
+    }
+
+    /// The bug this replaced: a byte-level detokenizer emits one U+FFFD per
+    /// undecodable byte, so a 4-byte codepoint split across reads appears as a
+    /// growing RUN of them. Holding only the last one emitted the earlier ones
+    /// as real text and desynced every later read.
+    #[test]
+    fn a_run_of_trailing_replacements_is_held_whole() {
+        for n in 1..=3 {
+            let buf = [b"ok".as_slice(), &FFFD.repeat(n)].concat();
+            assert_eq!(run(&buf), 2, "{n} trailing U+FFFD should all be held");
+        }
+    }
+
+    /// A U+FFFD the model really produced is delayed, never dropped: once
+    /// non-replacement text follows it, it becomes emittable, and the terminal
+    /// read releases everything regardless.
+    #[test]
+    fn a_genuine_replacement_char_is_delayed_not_lost() {
+        let followed = [b"a".as_slice(), FFFD, b"b".as_slice()].concat();
+        assert_eq!(run(&followed), followed.len());
+
+        let trailing = [b"a".as_slice(), FFFD].concat();
+        assert_eq!(run(&trailing), 1);
+        assert_eq!(emittable_len(&trailing, false), trailing.len());
+    }
+
+    #[test]
+    fn terminal_read_releases_even_invalid_bytes() {
+        let torn = [b"ok".as_slice(), &GRIN[..2]].concat();
+        assert_eq!(emittable_len(&torn, false), torn.len());
+    }
+
+    /// Walking one emoji through three reads must never emit a partial or a
+    /// replacement char, and must emit the codepoint exactly once.
+    #[test]
+    fn emoji_split_across_reads_emits_once_and_whole() {
+        // Read 1 and 2 decode to a growing run of U+FFFD; read 3 resolves.
+        let steps: [Vec<u8>; 3] = [
+            [b"hi ".as_slice(), FFFD].concat(),
+            [b"hi ".as_slice(), &FFFD.repeat(2)].concat(),
+            [b"hi ".as_slice(), GRIN].concat(),
+        ];
+        let mut emitted = 0usize;
+        let mut out: Vec<u8> = Vec::new();
+        for (i, full) in steps.iter().enumerate() {
+            let running = i < steps.len() - 1;
+            let end = emittable_len(full, running).max(emitted);
+            out.extend_from_slice(&full[emitted..end]);
+            emitted = end;
+        }
+        assert_eq!(
+            String::from_utf8(out).expect("emitted bytes must be valid utf8"),
+            "hi \u{1F600}"
+        );
+    }
 }
 
 #[cfg(test)]
