@@ -24,6 +24,7 @@
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
+#include <openvino/genai/chat_history.hpp>
 
 namespace {
 
@@ -471,8 +472,29 @@ int32_t cascadia_cb_add_request(
     }
     try {
         auto h = std::make_unique<cascadia_cb_handle_t>();
-        h->handle =
-            handle->pipe->add_request(request_id, std::string(prompt), cfg->cfg);
+        // ContinuousBatchingPipeline's string add_request() overload does NOT
+        // honour GenerationConfig::apply_chat_template — verified on OV GenAI
+        // 2026.2 by an A/B against LLMPipeline, where the same flag through the
+        // same GenerationConfig changes the output and here it changed nothing.
+        // So when the caller asked for templating we render it ourselves;
+        // otherwise the untouched string overload keeps its exact behaviour.
+        const bool want_template =
+            cfg->cfg.apply_chat_template && !handle->tok->get_chat_template().empty();
+        if (want_template) {
+            ov::genai::ChatHistory history(std::vector<ov::AnyMap>{
+                {{"role", std::string("user")}, {"content", std::string(prompt)}}});
+            const std::string rendered =
+                handle->tok->apply_chat_template(history, /*add_generation_prompt=*/true);
+            // The rendered template already carries BOS. Encoding it again with
+            // special tokens would prepend a second one — a silently degraded
+            // prompt, invisible in the output unless compared side by side.
+            auto enc = handle->tok->encode(
+                rendered, ov::AnyMap{{"add_special_tokens", false}});
+            h->handle = handle->pipe->add_request(request_id, enc.input_ids, cfg->cfg);
+        } else {
+            h->handle =
+                handle->pipe->add_request(request_id, std::string(prompt), cfg->cfg);
+        }
         *out_handle = h.release();
         return 0;
     } catch (const std::exception& e) {
