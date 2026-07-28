@@ -503,23 +503,6 @@ int32_t cascadia_cb_step(cascadia_cb_pipeline_t* handle) {
     }
 }
 
-int32_t cascadia_cb_has_unfinished(cascadia_cb_pipeline_t* handle, int32_t* out_has) {
-    if (!handle || !handle->pipe || !out_has) {
-        set_last_error("null arg in cb_has_unfinished");
-        return 1;
-    }
-    try {
-        *out_has = handle->pipe->has_non_finished_requests() ? 1 : 0;
-        return 0;
-    } catch (const std::exception& e) {
-        set_last_error(e);
-        return 1;
-    } catch (...) {
-        set_last_error("unknown C++ exception in cb_has_unfinished");
-        return 1;
-    }
-}
-
 int32_t cascadia_cb_handle_read(
     cascadia_cb_pipeline_t* pipeline, cascadia_cb_handle_t* handle,
     char** out_text, size_t* out_text_len, uint32_t* out_new_tokens,

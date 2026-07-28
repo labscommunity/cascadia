@@ -166,10 +166,6 @@ mod sys {
             out_handle: *mut *mut cascadia_cb_handle_t,
         ) -> c_int;
         pub fn cascadia_cb_step(handle: *mut cascadia_cb_pipeline_t) -> c_int;
-        pub fn cascadia_cb_has_unfinished(
-            handle: *mut cascadia_cb_pipeline_t,
-            out_has: *mut i32,
-        ) -> c_int;
         pub fn cascadia_cb_handle_read(
             pipeline: *mut cascadia_cb_pipeline_t,
             handle: *mut cascadia_cb_handle_t,
@@ -900,21 +896,6 @@ impl CbPipeline {
             return Err(Error::Native(last_native_error()));
         }
         Ok(())
-    }
-
-    #[cfg(not(feature = "openvino"))]
-    pub fn has_unfinished(&self) -> Result<bool> {
-        Err(Error::Stub)
-    }
-
-    #[cfg(feature = "openvino")]
-    pub fn has_unfinished(&self) -> Result<bool> {
-        let mut has: i32 = 0;
-        let rc = unsafe { sys::cascadia_cb_has_unfinished(self.inner.ptr, &mut has) };
-        if rc != 0 {
-            return Err(Error::Native(last_native_error()));
-        }
-        Ok(has != 0)
     }
 
     #[cfg(not(feature = "openvino"))]
