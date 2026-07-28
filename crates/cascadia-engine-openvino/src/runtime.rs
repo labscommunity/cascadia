@@ -1361,6 +1361,11 @@ impl OvRuntimeEngine {
         res
     }
 
+    /// Upper bound on inferences one packed `step()` may run before returning.
+    /// Sized for the worst case: a full-region prompt consumed `packed_seq`
+    /// tokens at a time, plus slack. Purely a runaway guard.
+    const PACKED_MAX_INFERS_PER_STEP: usize = 4096;
+
     /// Packed multi-slot step: admit what fits, run ONE inference (a prefill
     /// chunk for one slot, or a decode row for every ready slot), then sample
     /// and emit per slot. Unlike the single-task path this returns chunks for
@@ -1405,13 +1410,33 @@ impl OvRuntimeEngine {
             self.packed.as_mut().unwrap().admit(slot, task, prompt_ids);
         }
 
-        let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
-            return Ok(Vec::new());
-        };
-        let logits = bytes_to_f32(odt, &obytes)?;
-
-        // ---- sample the rows this step produced, emit per slot ----
+        // Keep inferring until this call produces at least one chunk. A prompt
+        // wider than `packed_seq` takes several prefill inferences that emit
+        // nothing, and the runner closes a stream that makes no progress for
+        // three consecutive steps — so prefill must complete inside one step(),
+        // exactly as the single-task static path already does.
         let mut out = Vec::new();
+        for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
+            let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
+                break;
+            };
+            self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            if !out.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Sample the rows one packed inference produced and append their chunks.
+    fn emit_packed_rows(
+        &mut self,
+        odt: ShimDType,
+        oshape: &[usize],
+        obytes: &[u8],
+        kind: crate::packed_exec::PackedStepKind,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<()> {
         let sampled: Vec<(usize, usize)> = match kind {
             crate::packed_exec::PackedStepKind::Prefill {
                 slot,
@@ -1428,13 +1453,17 @@ impl OvRuntimeEngine {
             }
             crate::packed_exec::PackedStepKind::Decode { rows } => rows,
         };
+        if sampled.is_empty() {
+            return Ok(());
+        }
+        let logits = bytes_to_f32(odt, obytes)?;
         for (row, slot) in sampled {
-            let token = argmax_logits_row(&logits, &oshape, row)?;
+            let token = argmax_logits_row(&logits, oshape, row)?;
             if let Some(chunk) = self.emit_packed_token(slot, token)? {
                 out.push(chunk);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Append `token` to `slot`'s sequence, decode its text delta, and build the
@@ -1482,9 +1511,11 @@ impl OvRuntimeEngine {
             )));
         }
         let n_tokens = t.generated.len() as u32;
+        let prompt_tokens = t.prompt_ids.len() as u32;
         let elapsed = t.started.elapsed();
         let chunk = Chunk::final_marker(task_id.clone(), delta)
             .with_n_tokens(n_tokens)
+            .with_prompt_tokens(prompt_tokens)
             .with_finish_reason(if is_eos {
                 cascadia_types::FinishReason::Stop
             } else {
