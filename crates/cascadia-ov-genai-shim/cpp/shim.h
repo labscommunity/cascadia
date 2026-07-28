@@ -157,9 +157,11 @@ int32_t cascadia_cb_pipeline_create(
 
 void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle);
 
-/// Enroll a prompt. `request_id` is caller-chosen and must be unique among
-/// live requests. The returned handle must be destroyed AFTER the request
-/// finishes or is cancelled, and before the pipeline is destroyed.
+/// Enroll a prompt. `request_id` is caller-chosen; upstream requires it be
+/// unique for EVERY add_request() call, not merely among live requests. The
+/// returned handle must be destroyed AFTER the request finishes or is
+/// cancelled, and before the pipeline is destroyed — the Rust wrapper enforces
+/// the ordering by having each handle hold an Arc on its pipeline.
 int32_t cascadia_cb_add_request(
     cascadia_cb_pipeline_t* handle,
     uint64_t request_id,

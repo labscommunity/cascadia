@@ -603,8 +603,12 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
         return 1;
     }
     try {
-        // cancel() (vs stop()) frees the request's KV blocks and marks the
-        // handle CANCEL — right semantics for a client that went away.
+        // cancel() vs stop(): both end the request and let the scheduler
+        // reclaim its KV blocks. The difference is what is kept — STOP retains
+        // the output produced so far, CANCEL discards it (and drops the turn
+        // from chat history). Discarding is right for a client that went away.
+        // Verified against OV GenAI 2026.2, where GenerationHandle::drop() was
+        // replaced by cancel().
         handle->handle->cancel();
         return 0;
     } catch (const std::exception& e) {
