@@ -482,6 +482,10 @@ impl Engine for OvGenaiEngine {
     }
 }
 
+/// Scheduler iterations the CB warmup will drive before giving up. The warmup
+/// request asks for 4 tokens, so a healthy pipeline terminates in a handful.
+const WARMUP_MAX_STEPS: usize = 64;
+
 /// Per-request generation state on the continuous-batching engine.
 struct ActiveCbTask {
     task_id: TaskId,
@@ -522,17 +526,36 @@ impl Engine for OvGenaiCbEngine {
         // u64::MAX cannot collide with the sequential request-id counter.
         match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
             Ok(handle) => {
-                for _ in 0..64 {
-                    if self.pipe.step().is_err() {
+                // Only a terminal status means the pipeline actually served a
+                // request. Reporting "ok" after a failed step told operators
+                // the worker was healthy when it was not, and dropped the
+                // native OV message that says why.
+                let mut reached_terminal = false;
+                for _ in 0..WARMUP_MAX_STEPS {
+                    if let Err(err) = self.pipe.step() {
+                        warn!(error = %err, "cb warmup step failed");
                         break;
                     }
                     match self.pipe.read(&handle) {
-                        Ok(r) if r.status != CbStatus::Running => break,
-                        Err(_) => break,
-                        _ => {}
+                        Ok(r) if r.status != CbStatus::Running => {
+                            reached_terminal = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(error = %err, "cb warmup read failed");
+                            break;
+                        }
                     }
                 }
-                info!("ov-genai continuous-batching warmup ok");
+                if reached_terminal {
+                    info!("ov-genai continuous-batching warmup ok");
+                } else {
+                    warn!(
+                        max_steps = WARMUP_MAX_STEPS,
+                        "cb warmup never reached a terminal status; pipeline may be unhealthy"
+                    );
+                }
             }
             Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
         }
