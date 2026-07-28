@@ -627,11 +627,17 @@ impl Engine for OvGenaiCbEngine {
             self.active[idx].total_tokens += read.new_tokens;
             match read.status {
                 CbStatus::Running => {
-                    if !read.text_delta.is_empty() {
+                    // Every chunk carries ITS OWN token increment in n_tokens
+                    // — the API sums per-chunk counts, so a cumulative total
+                    // here double-counts (measured 2N-1 on-HW). Emit even
+                    // when the text delta is empty (UTF-8 hold-back) so those
+                    // tokens are still counted.
+                    if !read.text_delta.is_empty() || read.new_tokens > 0 {
                         let t = &self.active[idx];
                         out.push((
                             t.task_id.clone(),
-                            Chunk::token(t.task_id.clone(), 0, read.text_delta),
+                            Chunk::token(t.task_id.clone(), 0, read.text_delta)
+                                .with_n_tokens(read.new_tokens),
                         ));
                     }
                     idx += 1;
@@ -657,8 +663,10 @@ impl Engine for OvGenaiCbEngine {
                     } else {
                         FinishReason::Stop
                     };
+                    // n_tokens is this chunk's increment, not the cumulative
+                    // total — interim chunks already carried theirs.
                     let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
-                        .with_n_tokens(t.total_tokens)
+                        .with_n_tokens(read.new_tokens)
                         .with_finish_reason(finish);
                     if let Some(prompt_tokens) = t.prompt_tokens {
                         chunk = chunk.with_prompt_tokens(prompt_tokens);
