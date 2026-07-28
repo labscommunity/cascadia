@@ -611,7 +611,9 @@ int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
         return 1;
     }
     try {
-        handle->handle->drop();
+        // cancel() (vs stop()) frees the request's KV blocks and marks the
+        // handle CANCEL — right semantics for a client that went away.
+        handle->handle->cancel();
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e);
