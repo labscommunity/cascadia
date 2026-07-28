@@ -1487,6 +1487,15 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     {
         return Err(anyhow!("--cb-* tuning flags require --cb"));
     }
+    // Paged attention is a CPU/GPU-plugin capability; on NPU ov-genai serves
+    // the static NPUW pipeline. Without this gate the operator waits out a
+    // full model compile only to get a raw OpenVINO exception.
+    if args.cb && device_is_npu(&args.device) {
+        return Err(anyhow!(
+            "--cb requires a CPU or GPU device; NPU serves ov-genai's static NPUW \
+             pipeline and cannot continuous-batch — drop --cb for NPU workers"
+        ));
+    }
     Ok(())
 }
 
@@ -2335,6 +2344,25 @@ mod python_tests {
         a.cb_cache_size = 4;
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains("--cb"), "{err}");
+    }
+
+    /// `--cb` on an NPU device is rejected up front. The docs say paged
+    /// attention cannot work there; without the gate the operator pays a full
+    /// model compile before OpenVINO throws.
+    #[test]
+    fn worker_flags_reject_cb_on_npu() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.device = "NPU".to_string();
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("NPU"), "{err}");
+
+        // A compound AUTO/HETERO string that merely mentions NPU is not an
+        // NPU target (matches device_is_npu's documented contract).
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.device = "HETERO:NPU,CPU".to_string();
+        assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 
     /// The full CB flag set on ov-genai passes validation.
