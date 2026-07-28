@@ -54,6 +54,8 @@ struct PipelineConfig {
     num_stages: u32,
     #[serde(default)]
     num_layers: u32,
+    #[serde(default)]
+    num_kv_shared_layers: u32,
 }
 
 fn default_true() -> bool {
@@ -409,6 +411,12 @@ struct ActiveTask {
 
 pub struct Gemma4Engine {
     spec: ShardSpec,
+    /// Count of layers whose own KV lives entirely in stage_0 and is SHARED by later stages
+    /// (Gemma 4 E2B/E4B KV-sharing). Own-KV layers are `[0, total_layers - num_kv_shared_layers)`.
+    /// Zero for dense models (every stage bears its own KV).
+    num_kv_shared_layers: u32,
+    /// Total pipeline stages (= `Gemma4Builder::total`). Used to map own-KV layers → KV-bearing ranks.
+    num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
     /// All EOS token ids configured for the model. Generation stops on
@@ -1374,9 +1382,15 @@ impl Gemma4Engine {
                 // No warm flag needed: gemma4 workers reset on the carried frame position, so the
                 // head's warm prefill (position = warm_len > 0) skips reset, and a cold turn
                 // (position 0) resets everyone — restored or not.
-                let local_ok = match self.kv.take_capture(epoch) {
-                    Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
-                    None => false,
+                let local_ok = if !self.has_own_kv() {
+                    // KV-sharing tail: this stage holds no own KV (all shared upstream), so there is
+                    // nothing to restore — a trivial success (never abort the chain on this rank).
+                    true
+                } else {
+                    match self.kv.take_capture(epoch) {
+                        Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+                        None => false,
+                    }
                 };
                 let down_ok = if self.spec.is_last_stage {
                     true
@@ -1413,6 +1427,12 @@ impl Gemma4Engine {
         buf.extend_from_slice(&s.layer_end.to_le_bytes());
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
         crate::kv_coordination::fnv1a64(&buf)
+    }
+    /// Whether this stage bears any OWN KV: true iff its layer range starts before the own-KV
+    /// layers `[0, total_layers - num_kv_shared_layers)`. Dense stages are always true (shared = 0);
+    /// gemma4's KV-sharing tail (all own-KV upstream in stage_0) is false.
+    fn has_own_kv(&self) -> bool {
+        self.spec.layer_start < self.spec.total_layers.saturating_sub(self.num_kv_shared_layers)
     }
 }
 
@@ -1470,6 +1490,23 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
             None => false,
         }
     }
+
+    fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
+        // A stage bears own KV iff its layer range starts before the own-KV layers [0, own).
+        // Layers split ceil(total/num_stages) per stage (matches export_gemma4.py).
+        let own = self.spec.total_layers.saturating_sub(self.num_kv_shared_layers);
+        if own == 0 || self.num_stages == 0 {
+            return total_ranks;
+        }
+        let per_stage = self.spec.total_layers.div_ceil(self.num_stages);
+        if per_stage == 0 {
+            return total_ranks;
+        }
+        let n = (0..self.num_stages)
+            .filter(|k| (k * per_stage) < own)
+            .count();
+        n.max(1).min(total_ranks)
+    }
 }
 
 // -------- Builder --------
@@ -1487,6 +1524,9 @@ pub struct Gemma4Builder {
     pub ov_properties: Vec<(String, String)>,
     runtime: Option<OvRuntime>,
     spec: Option<ShardSpec>,
+    /// KV-sharing layer count from pipeline_config.json, stashed in load() for build(). See
+    /// [`Gemma4Engine::num_kv_shared_layers`].
+    num_kv_shared_layers: u32,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -1683,6 +1723,7 @@ impl Builder for Gemma4Builder {
             tp_rank: 0,
         };
         self.spec = Some(spec);
+        self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
 
         events.push(LoadProgress::message(format!(
             "compiling stage {} on {}",
@@ -1810,6 +1851,8 @@ impl Builder for Gemma4Builder {
 
         Ok(Box::new(Gemma4Engine {
             spec,
+            num_kv_shared_layers: self.num_kv_shared_layers,
+            num_stages: self.total,
             runtime,
             tokenizer: self.tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),

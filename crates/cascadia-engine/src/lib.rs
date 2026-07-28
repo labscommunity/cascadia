@@ -236,6 +236,12 @@ pub trait KvCoordination {
     fn apply_warm_resume(&mut self, _epoch: u64) -> bool {
         false
     }
+    /// Number of ranks in an N-stage chain that bear OWN KV (the cross-chain pull must GET + restore
+    /// only these). Default: all `total_ranks` (every rank has its own KV — ov-runtime/qwen36/dist-spec).
+    /// KV-sharing engines (gemma4: all own-KV in stage_0) override to return fewer.
+    fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
+        total_ranks
+    }
 }
 
 /// Issue-34 Option C: the **holder-serve** half of [`KvCoordination`], decoupled from the engine
