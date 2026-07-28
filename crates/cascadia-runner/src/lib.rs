@@ -1120,6 +1120,101 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    /// Engine that holds a task and makes real progress for several steps
+    /// without producing a token — a chunked continuous-batching prefill —
+    /// signalling liveness with zero-token chunks, then emits output.
+    struct SlowPrefillEngine {
+        task: Option<TaskId>,
+        prefill_steps: usize,
+    }
+
+    impl Engine for SlowPrefillEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.task = Some(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            let Some(id) = self.task.clone() else {
+                return Ok(Vec::new());
+            };
+            if self.prefill_steps > 0 {
+                self.prefill_steps -= 1;
+                return Ok(vec![(
+                    id.clone(),
+                    Chunk::token(id, 0, String::new()).with_n_tokens(0),
+                )]);
+            }
+            self.task = None;
+            Ok(vec![(
+                id.clone(),
+                Chunk::final_marker(id, "done").with_n_tokens(1),
+            )])
+        }
+    }
+
+    struct SlowPrefillBuilder {
+        prefill_steps: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for SlowPrefillBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(SlowPrefillEngine {
+                task: None,
+                prefill_steps: self.prefill_steps,
+            }))
+        }
+    }
+
+    /// The no-progress guard must not fire on an engine that IS progressing
+    /// but has no token to show yet. A continuous-batching prefill spans
+    /// ceil(prompt_tokens / max_num_batched_tokens) scheduler iterations
+    /// producing nothing, which is far more than MAX_CONSECUTIVE_EMPTY_STEPS
+    /// for an ordinary prompt — so such an engine must signal liveness with a
+    /// zero-token chunk rather than returning an empty Vec, and the stream
+    /// must survive it. (Empty Vec is reserved for "nothing in flight".)
+    #[tokio::test]
+    async fn zero_token_liveness_chunks_survive_the_no_progress_guard() {
+        let runner = Runner::new(Box::new(SlowPrefillBuilder {
+            prefill_steps: MAX_CONSECUTIVE_EMPTY_STEPS * 3,
+        }));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t1", "a long prompt").with_max_tokens(8))
+            .unwrap();
+        let mut last_text = String::new();
+        let mut saw_final = false;
+        while let Some(c) = stream.next().await {
+            assert!(
+                c.error.is_none(),
+                "a progressing prefill must not trip the stall guard: {:?}",
+                c.error
+            );
+            if c.is_final {
+                saw_final = true;
+                last_text = c.text.clone();
+            }
+        }
+        assert!(saw_final, "stream ended without a final chunk");
+        assert_eq!(last_text, "done");
+    }
+
     /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
     /// (clearing each — a correctly-behaving engine), then serves the polled
     /// task a final chunk. Models concurrent serving where several other

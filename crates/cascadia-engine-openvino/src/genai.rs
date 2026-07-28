@@ -675,6 +675,25 @@ impl Engine for OvGenaiCbEngine {
                 }
             }
         }
+        // Liveness. Every other engine returns an empty Vec only when nothing
+        // is in flight, so the runner reads three consecutive empty steps as a
+        // wedged engine and fails the stream (MAX_CONSECUTIVE_EMPTY_STEPS,
+        // cascadia-runner). A CB prefill legitimately spans
+        // ceil(prompt_tokens / max_num_batched_tokens) iterations that produce
+        // no token for ANY request, so without this a prompt longer than ~3x
+        // the batch window is killed mid-prefill before its first token
+        // (reproduced on-HW: 1211 tokens at the default 256-token window).
+        // One chunk is enough — any non-empty step resets the counter for
+        // every stream. n_tokens MUST be Some(0): the SSE path does
+        // `n_tokens.unwrap_or(1)` and would otherwise inflate reported usage.
+        if out.is_empty() {
+            if let Some(t) = self.active.first() {
+                out.push((
+                    t.task_id.clone(),
+                    Chunk::token(t.task_id.clone(), 0, String::new()).with_n_tokens(0),
+                ));
+            }
+        }
         Ok(out)
     }
 }
