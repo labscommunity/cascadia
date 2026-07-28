@@ -1511,12 +1511,11 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         if args.packed_slots < 2 {
             return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
         }
-        if args.total != 1 {
-            return Err(anyhow!(
-                "--packed-slots is single-stage only for now (--total 1); the multi-stage wire \
-                 does not yet carry [1, S, hidden] + per-slot positions"
-            ));
-        }
+        // Multi-stage is supported: stage 0 ships an I64 [1,2,S] plan frame
+        // (slot + absolute position per row) ahead of the [1,S,hidden] block,
+        // and the tail replies with one token per row. EVERY stage must be
+        // started with the same --packed-slots, since the slot count is baked
+        // into each stage's IR shape.
     }
     // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
     // different mechanism to --packed-slots above: OV's paged attention on the
@@ -2382,11 +2381,11 @@ mod python_tests {
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains(">= 2"), "{err}");
 
+        // multi-stage packed is allowed (plan + token frames carry per-row state)
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
         a.total = 2;
-        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
-        assert!(err.contains("single-stage"), "{err}");
+        assert!(validate_worker_runtime_flags(&a).is_ok());
 
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;

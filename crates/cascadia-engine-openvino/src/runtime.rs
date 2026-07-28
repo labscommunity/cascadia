@@ -183,7 +183,7 @@ fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     use half::f16;
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -314,6 +314,101 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
 /// `decode_wire_position` — keep the two in sync.
 fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
+}
+
+/// Encode a packed step's per-row `(slot, position)` assignment as one framed
+/// I64 `[1, 2, S]` tensor: row 0 holds slot ids (`-1` = idle row), row 1 holds
+/// absolute positions. This is the packed analogue of `encode_wire_position` —
+/// downstream stages need per-ROW routing, not one scalar, to rebuild the
+/// block-diagonal mask and scatter each row into the right slot's ring.
+fn encode_wire_plan(rows: &[Option<(usize, i64)>]) -> WireTensor {
+    let s = rows.len();
+    let mut data = Vec::with_capacity(s * 2 * 8);
+    for r in rows {
+        let slot: i64 = r.map(|(sl, _)| sl as i64).unwrap_or(-1);
+        data.extend_from_slice(&slot.to_le_bytes());
+    }
+    for r in rows {
+        let pos: i64 = r.map(|(_, p)| p).unwrap_or(0);
+        data.extend_from_slice(&pos.to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, 2, s as u32], data)
+}
+
+/// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
+/// length/shape disagreement, out-of-range slot ids, and negative positions —
+/// each of which would otherwise index or wrap somewhere downstream.
+fn decode_wire_plan(t: &WireTensor, slots: usize) -> EngineResult<Vec<Option<(usize, i64)>>> {
+    let s = t.shape[2] as usize;
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 2 || s == 0 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,2,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
+             packed/non-packed pipeline mismatch or a desynced activation stream",
+            t.dtype, t.shape
+        )));
+    }
+    if t.data.len() != s * 2 * 8 {
+        return Err(EngineError::Backend(format!(
+            "packed plan frame payload {} bytes does not match shape {:?}",
+            t.data.len(),
+            t.shape
+        )));
+    }
+    let rd = |i: usize| -> i64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&t.data[i * 8..i * 8 + 8]);
+        i64::from_le_bytes(b)
+    };
+    let mut out = Vec::with_capacity(s);
+    for r in 0..s {
+        let slot = rd(r);
+        let pos = rd(s + r);
+        if slot < 0 {
+            out.push(None);
+            continue;
+        }
+        if slot as usize >= slots {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} names slot {slot} but this stage has {slots} slots"
+            )));
+        }
+        if pos < 0 {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has negative position {pos}"
+            )));
+        }
+        out.push(Some((slot as usize, pos)));
+    }
+    Ok(out)
+}
+
+/// Encode the head stage's per-row sampled tokens as I64 `[1, 1, S]`. The
+/// non-packed path returns one token; packed returns one per active row, in
+/// row order, with 0 for idle rows (never read).
+fn encode_wire_tokens(tokens: &[i32]) -> WireTensor {
+    let mut data = Vec::with_capacity(tokens.len() * 8);
+    for &t in tokens {
+        data.extend_from_slice(&(t as i64).to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, 1, tokens.len() as u32], data)
+}
+
+fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
+    if t.dtype != WireDType::I64 || t.data.len() % 8 != 0 || t.data.is_empty() {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 packed token frame, got dtype={:?} len={}",
+            t.dtype,
+            t.data.len()
+        )));
+    }
+    Ok(t.data
+        .chunks_exact(8)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(c);
+            i64::from_le_bytes(b) as i32
+        })
+        .collect())
 }
 
 /// Decode + strictly validate a wire position frame. Must be I64 with exactly
@@ -1415,17 +1510,189 @@ impl OvRuntimeEngine {
         // nothing, and the runner closes a stream that makes no progress for
         // three consecutive steps — so prefill must complete inside one step(),
         // exactly as the single-task static path already does.
+        let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
         let mut out = Vec::new();
         for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
             let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
                 break;
             };
-            self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            if single_stage {
+                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            } else {
+                // Pipeline: this stage produced hidden rows. Ship the plan (so
+                // every downstream stage can rebuild the same mask and route
+                // rows to the same slots) plus the hidden block, then take back
+                // one sampled token per row from the tail.
+                let hidden = bytes_to_f32(odt, &obytes)?;
+                let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
+                let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                self.emit_packed_tokens(&tokens, kind, &mut out)?;
+            }
             if !out.is_empty() {
                 break;
             }
         }
         Ok(out)
+    }
+
+    /// Send `[1, S, hidden]` + the packed plan downstream and wait for the tail
+    /// stage's per-row tokens.
+    fn exchange_packed_downstream(
+        &mut self,
+        hidden: &[f32],
+        shape: &[usize],
+        plan_rows: &[Option<(usize, i64)>],
+    ) -> EngineResult<Vec<i32>> {
+        let down = self.downstream.clone().ok_or_else(|| {
+            EngineError::Backend("packed pipeline stage has no downstream".into())
+        })?;
+        let s3 = to_shape3(shape);
+        let plan_frame = encode_wire_plan(plan_rows);
+        let hidden_frame = WireTensor::new(
+            WireDType::F32,
+            [s3[0] as u32, s3[1] as u32, s3[2] as u32],
+            hidden.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+        let rt = self.runtime_handle.clone();
+        rt.block_on(async {
+            let mut guard = down.lock().await;
+            guard
+                .send(&plan_frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed plan send: {e}")))?;
+            guard
+                .send(&hidden_frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
+            let (reply, _) = guard
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?;
+            decode_wire_tokens(&reply)
+        })
+    }
+
+    /// Emit chunks from a pipeline tail's per-row tokens.
+    fn emit_packed_tokens(
+        &mut self,
+        tokens: &[i32],
+        kind: crate::packed_exec::PackedStepKind,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<()> {
+        let sampled: Vec<(usize, usize)> = match kind {
+            crate::packed_exec::PackedStepKind::Prefill {
+                slot,
+                last_row,
+                finished_prompt,
+            } => {
+                if finished_prompt {
+                    vec![(last_row, slot)]
+                } else {
+                    Vec::new()
+                }
+            }
+            crate::packed_exec::PackedStepKind::Decode { rows } => rows,
+        };
+        for (row, slot) in sampled {
+            let token = tokens.get(row).copied().ok_or_else(|| {
+                EngineError::Backend(format!(
+                    "packed tail returned {} tokens, need row {row}",
+                    tokens.len()
+                ))
+            })?;
+            if let Some(chunk) = self.emit_packed_token(slot, token)? {
+                out.push(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// Relay/head stage: consume one packed (plan, hidden) pair. The head
+    /// samples every active row and replies with the token vector; a middle
+    /// stage forwards both frames on and passes the reply back up.
+    fn step_relay_packed(&mut self) -> EngineResult<()> {
+        let up = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
+        let slots = self.packed.as_ref().unwrap().kv.slots;
+        let rt = self.runtime_handle.clone();
+        let (plan_rows, hidden, hshape) = rt.block_on(async {
+            let mut guard = up.lock().await;
+            let (pf, _) = guard
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed plan recv: {e}")))?;
+            let plan_rows = decode_wire_plan(&pf, slots)?;
+            let (hf, _) = guard
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
+            let hidden: Vec<f32> = hf
+                .data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok::<_, EngineError>((plan_rows, hidden, hf.shape))
+        })?;
+
+        let hidden_size = hshape[2] as usize;
+        let plan = crate::packed::PackedPlan {
+            rows: plan_rows
+                .iter()
+                .map(|r| r.map(|(slot, _)| crate::packed::PackedRow { slot, order: 0 }))
+                .collect(),
+        };
+        // Same-slot rows in one frame are a prefill chunk: restore their causal
+        // order so this stage masks them exactly as the sender did.
+        let mut plan = plan;
+        let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for row in plan.rows.iter_mut().flatten() {
+            let n = seen.entry(row.slot).or_insert(0);
+            row.order = *n;
+            *n += 1;
+        }
+        let positions: Vec<i64> = plan_rows
+            .iter()
+            .map(|r| r.map(|(_, p)| p).unwrap_or(0))
+            .collect();
+        let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
+            &plan,
+            crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
+            &positions,
+        )?;
+
+        if self.spec.is_last_stage {
+            let logits = bytes_to_f32(odt, &obytes)?;
+            let mut tokens = Vec::with_capacity(plan.rows.len());
+            for (r, row) in plan.rows.iter().enumerate() {
+                tokens.push(if row.is_some() {
+                    argmax_logits_row(&logits, &oshape, r)?
+                } else {
+                    0
+                });
+            }
+            let frame = encode_wire_tokens(&tokens);
+            rt.block_on(async {
+                let mut guard = up.lock().await;
+                guard
+                    .send(&frame)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+            })?;
+        } else {
+            let hidden_out = bytes_to_f32(odt, &obytes)?;
+            let tokens = self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)?;
+            let frame = encode_wire_tokens(&tokens);
+            rt.block_on(async {
+                let mut guard = up.lock().await;
+                guard
+                    .send(&frame)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+            })?;
+        }
+        Ok(())
     }
 
     /// Sample the rows one packed inference produced and append their chunks.
@@ -2164,6 +2431,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_last(&mut self) -> EngineResult<()> {
+        if self.packed.is_some() {
+            return self.step_relay_packed();
+        }
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
         // A seq=1 static frame means this task's prefill chunks are done —
         // with --park-prefill, release the prefill model's weights now.
@@ -2190,6 +2460,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
+        if self.packed.is_some() {
+            return self.step_relay_packed();
+        }
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
         // Multi-token hidden = prefill work downstream: a stateful
         // whole-prompt frame, or (static path) a prefill CHUNK — either way
@@ -2368,6 +2641,22 @@ impl Engine for OvRuntimeEngine {
 
     fn cancel(&mut self, task_id: &TaskId) {
         self.pending.retain(|t| t.task_id != *task_id);
+        // Packed path: drop just this request's slot. Its KV region is cleared
+        // and returned to the free pool immediately, so a disconnecting client
+        // frees capacity for the next admission without disturbing the other
+        // in-flight slots sharing the inference.
+        if let Some(packed) = self.packed.as_mut() {
+            if let Some(slot) = packed
+                .slots
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.task.task_id == *task_id))
+            {
+                packed.retire(slot);
+                info!(task = %task_id, slot, in_flight = packed.occupied(),
+                      "packed cancel: slot released");
+            }
+            return;
+        }
         // Abandoning the active task mirrors the step-failure recovery:
         // clear it and reset generation state so the next pending task
         // activates immediately instead of waiting for this one to
@@ -3295,13 +3584,6 @@ impl Builder for OvRuntimeBuilder {
         let packed = match self.packed_params {
             None => None,
             Some((slots, pseq, _pctx)) => {
-                if !(spec.is_first_stage && spec.is_last_stage) {
-                    return Err(EngineError::ShardRejected(
-                        "--packed-slots is single-stage only for now; the multi-stage wire \
-                         does not yet carry [1, S, hidden] + per-slot positions"
-                            .into(),
-                    ));
-                }
                 let (ctx, kvh, hd) = self.static_params.expect("checked in load");
                 let past_len = (ctx - 1) as usize;
                 let prt = OvRuntime::compile(
@@ -3320,9 +3602,13 @@ impl Builder for OvRuntimeBuilder {
                     })
                     .collect::<Vec<_>>();
                 let pcanon = resolve_canonical_inputs(&prt)?;
-                let ids_in = pcanon.get("input_ids").cloned().ok_or_else(|| {
-                    EngineError::Backend("packed variant missing input_ids".into())
-                })?;
+                let ids_in = pcanon.get("input_ids").cloned().unwrap_or_default();
+                let hidden_in = pcanon.get("hidden_states").cloned().unwrap_or_default();
+                if ids_in.is_empty() && hidden_in.is_empty() {
+                    return Err(EngineError::Backend(
+                        "packed variant has neither input_ids nor hidden_states".into(),
+                    ));
+                }
                 let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
                     EngineError::Backend("packed variant missing position_ids".into())
                 })?;
@@ -3361,7 +3647,7 @@ impl Builder for OvRuntimeBuilder {
                     "packed multi-slot decode active"
                 );
                 Some(crate::packed_exec::PackedState::new(
-                    prt, kv, players, ids_in, mask_in, pos_in, mask_dtype,
+                    prt, kv, players, ids_in, hidden_in, mask_in, pos_in, mask_dtype,
                 ))
             }
         };
@@ -3488,6 +3774,40 @@ mod tests {
     /// after the window fills and slides. This is what makes the chunked
     /// (possibly other-device) prefill hand exactly the same KV state to the
     /// seq=1 decode loop as the legacy path.
+    #[test]
+    fn packed_plan_frame_round_trips() {
+        let rows = vec![Some((0usize, 7i64)), None, Some((3, 0)), Some((1, 129))];
+        let frame = encode_wire_plan(&rows);
+        assert_eq!(frame.shape, [1, 2, 4]);
+        let back = decode_wire_plan(&frame, 4).expect("round trip");
+        assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn packed_plan_frame_rejects_bad_frames() {
+        // wrong rank/shape (a scalar position frame from a non-packed peer)
+        let pos = encode_wire_position(5);
+        assert!(decode_wire_plan(&pos, 4).is_err());
+        // slot id beyond this stage's slot count
+        let frame = encode_wire_plan(&[Some((9usize, 0i64))]);
+        let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
+        assert!(err.contains("slot 9"), "{err}");
+        // negative position would wrap in the ring math
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64))]);
+        bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
+        assert!(decode_wire_plan(&bad, 4).is_err());
+    }
+
+    #[test]
+    fn packed_token_frame_round_trips() {
+        let toks = vec![5i32, 0, 128009, 42];
+        let back = decode_wire_tokens(&encode_wire_tokens(&toks)).expect("round trip");
+        assert_eq!(back, toks);
+        // a hidden (F32) frame where tokens were expected is a hard error
+        let wrong = WireTensor::new(WireDType::F32, [1, 1, 2], vec![0u8; 8]);
+        assert!(decode_wire_tokens(&wrong).is_err());
+    }
+
     #[test]
     fn chunked_absorb_matches_sequential() {
         // past_len=4 forces sliding early; prompt=11 with C=3 exercises a

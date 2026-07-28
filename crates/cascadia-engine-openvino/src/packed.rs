@@ -485,6 +485,40 @@ mod tests {
         assert_eq!(k.position(2), 99);
     }
 
+    /// A relay stage rebuilds `order` from row arrival order; same-slot rows
+    /// must come out causally masked exactly as the sender masked them.
+    #[test]
+    fn rebuilt_chunk_order_masks_identically_to_the_sender() {
+        let mut k = kv(2, 8, 4);
+        k.advance(1, 2);
+        let sender = PackedPlan::chunk(4, 1, 3);
+        let mut a = Vec::new();
+        k.fill_mask(&sender, &mut a, ShimDType::F16);
+
+        // What a relay reconstructs from the wire: slots only, order re-derived.
+        let mut rebuilt = PackedPlan {
+            rows: sender
+                .rows
+                .iter()
+                .map(|r| {
+                    r.map(|p| PackedRow {
+                        slot: p.slot,
+                        order: 0,
+                    })
+                })
+                .collect(),
+        };
+        let mut seen = std::collections::HashMap::new();
+        for row in rebuilt.rows.iter_mut().flatten() {
+            let n = seen.entry(row.slot).or_insert(0usize);
+            row.order = *n;
+            *n += 1;
+        }
+        let mut b = Vec::new();
+        k.fill_mask(&rebuilt, &mut b, ShimDType::F16);
+        assert_eq!(a, b, "relay-rebuilt plan must mask identically");
+    }
+
     #[test]
     fn f32_mask_uses_four_byte_elements() {
         let k = kv(2, 8, 2);

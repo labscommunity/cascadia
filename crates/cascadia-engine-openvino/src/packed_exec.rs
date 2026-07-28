@@ -17,6 +17,14 @@ use cascadia_types::GenerationTask;
 
 use crate::packed::{PackedKv, PackedPlan};
 
+/// Primary input of a packed inference: prompt/decode token ids on the embed
+/// stage, upstream hidden rows on relay + head stages.
+pub(crate) enum PackedPrimary<'a> {
+    Ids(&'a [i64]),
+    /// `rows * hidden_size` f32 in row-major order, converted to the IR's f16.
+    Hidden(&'a [f32], usize),
+}
+
 /// One request occupying a packed slot.
 pub(crate) struct PackedSlot {
     pub(crate) task: GenerationTask,
@@ -64,10 +72,12 @@ pub(crate) struct PackedState {
     pub(crate) kv: PackedKv,
     pub(crate) slots: Vec<Option<PackedSlot>>,
     pub(crate) ids_in: String,
+    pub(crate) hidden_in: String,
     pub(crate) mask_in: String,
     pub(crate) pos_in: String,
     pub(crate) mask_dtype: ShimDType,
     pub(crate) layers: Vec<PackedLayer>,
+    last_plan_rows: Vec<Option<(usize, i64)>>,
     mask_bytes: Vec<u8>,
     ids_bytes: Vec<u8>,
     pos_bytes: Vec<u8>,
@@ -79,6 +89,7 @@ impl PackedState {
         kv: PackedKv,
         layers: Vec<PackedLayer>,
         ids_in: String,
+        hidden_in: String,
         mask_in: String,
         pos_in: String,
         mask_dtype: ShimDType,
@@ -89,10 +100,12 @@ impl PackedState {
             kv,
             slots: (0..slots).map(|_| None).collect(),
             ids_in,
+            hidden_in,
             mask_in,
             pos_in,
             mask_dtype,
             layers,
+            last_plan_rows: Vec::new(),
             mask_bytes: Vec::new(),
             ids_bytes: Vec::new(),
             pos_bytes: Vec::new(),
@@ -101,6 +114,12 @@ impl PackedState {
 
     pub(crate) fn free_slot(&self) -> Option<usize> {
         self.slots.iter().position(|s| s.is_none())
+    }
+
+    /// Per-row `(slot, position)` of the most recent inference — what a
+    /// pipeline stage ships downstream so every stage masks identically.
+    pub(crate) fn last_plan_rows(&self) -> Vec<Option<(usize, i64)>> {
+        self.last_plan_rows.clone()
     }
 
     pub(crate) fn occupied(&self) -> usize {
@@ -187,6 +206,47 @@ impl PackedState {
         if plan.is_empty() {
             return Ok(None);
         }
+        let (odt, oshape, obytes) = self.run_plan(&plan, PackedPrimary::Ids(&ids), &positions)?;
+        if let PackedStepKind::Prefill { slot, .. } = &kind {
+            if let Some(t) = self.slots[*slot].as_mut() {
+                t.prompt_fed += plan.active_rows().count();
+            }
+        }
+        Ok(Some((odt, oshape, obytes, kind)))
+    }
+
+    /// Run one packed inference for a caller-supplied plan. Stage 0 builds the
+    /// plan from its slot table; relay and head stages decode it off the wire,
+    /// which is what keeps every stage's per-slot rings in lockstep.
+    ///
+    /// A row at absolute position 0 resets its slot first — the same in-band
+    /// "new sequence" signal the single-task static path already uses, so a
+    /// downstream stage needs no separate admission message.
+    pub(crate) fn run_plan(
+        &mut self,
+        plan: &PackedPlan,
+        primary: PackedPrimary<'_>,
+        positions: &[i64],
+    ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
+        let s = self.kv.packed_seq;
+        for (r, pr) in plan.active_rows() {
+            if positions.get(r).copied().unwrap_or(0) == 0 {
+                self.kv.reset_slot(pr.slot);
+            }
+        }
+        self.last_plan_rows = (0..s)
+            .map(|r| {
+                plan.rows
+                    .get(r)
+                    .copied()
+                    .flatten()
+                    .map(|pr| (pr.slot, positions.get(r).copied().unwrap_or(0)))
+            })
+            .collect();
+        let ids: Vec<i64> = match primary {
+            PackedPrimary::Ids(v) => v.to_vec(),
+            PackedPrimary::Hidden(_, _) => Vec::new(),
+        };
 
         // ---- feed ----
         self.kv
@@ -207,9 +267,29 @@ impl PackedState {
             self.ids_bytes.extend_from_slice(&id.to_le_bytes());
             self.pos_bytes.extend_from_slice(&pos.to_le_bytes());
         }
-        self.runtime
-            .set_input(&self.ids_in, ShimDType::I64, &[1, s], &self.ids_bytes)
-            .map_err(crate::runtime::map_ov_err)?;
+        match primary {
+            PackedPrimary::Ids(_) => {
+                self.runtime
+                    .set_input(&self.ids_in, ShimDType::I64, &[1, s], &self.ids_bytes)
+                    .map_err(crate::runtime::map_ov_err)?;
+            }
+            PackedPrimary::Hidden(rows, hidden_size) => {
+                // Pad idle rows with zeros so the tensor is always [1, S, H];
+                // their outputs are masked to self and never read.
+                let mut buf = vec![0f32; s * hidden_size];
+                let n = (rows.len() / hidden_size).min(s);
+                buf[..n * hidden_size].copy_from_slice(&rows[..n * hidden_size]);
+                let bytes = crate::runtime::f32_to_f16_bytes(&buf);
+                self.runtime
+                    .set_input(
+                        &self.hidden_in,
+                        ShimDType::F16,
+                        &[1, s, hidden_size],
+                        &bytes,
+                    )
+                    .map_err(crate::runtime::map_ov_err)?;
+            }
+        }
         self.runtime
             .set_input(
                 &self.mask_in,
@@ -295,14 +375,7 @@ impl PackedState {
         }
         for (slot, n) in consumed {
             self.kv.advance(slot, n);
-            if let PackedStepKind::Prefill { slot: ps, .. } = &kind {
-                if *ps == slot {
-                    if let Some(t) = self.slots[slot].as_mut() {
-                        t.prompt_fed += n;
-                    }
-                }
-            }
         }
-        Ok(Some((odt, oshape, obytes, kind)))
+        Ok((odt, oshape, obytes))
     }
 }
