@@ -732,6 +732,36 @@ fn emittable_len(full: &[u8], running: bool) -> usize {
     end
 }
 
+/// Advance `emitted` over the latest full decode, returning the newly
+/// emittable text and whether the stream had to re-anchor.
+///
+/// Detokenizers are not guaranteed prefix-stable: appending a token can rewrite
+/// earlier bytes, and a decode gets SHORTER when a run of U+FFFD collapses into
+/// the codepoint it stood in for. Slicing at a remembered byte offset without
+/// checking assumes that never happens; when it does, the offset is wrong for
+/// the rest of the request and the client silently receives garbage — which is
+/// exactly what the C++ this replaces did.
+///
+/// On divergence, re-anchor and emit nothing for the divergent region. The
+/// bytes already handed out cannot be recalled, and emitting the corrected
+/// suffix would duplicate text; re-anchoring at least stops the error
+/// compounding and is reportable.
+#[allow(dead_code)]
+fn advance_emitted(emitted: &mut Vec<u8>, full: &[u8], running: bool) -> (String, bool) {
+    if !full.starts_with(emitted) {
+        emitted.clear();
+        emitted.extend_from_slice(full);
+        return (String::new(), true);
+    }
+    // max(): a re-decode may legitimately hold back MORE than last time (a
+    // completed codepoint replaced by a shorter U+FFFD run), and the emitted
+    // prefix must never go backwards.
+    let end = emittable_len(full, running).max(emitted.len());
+    let bytes = &full[emitted.len()..end];
+    emitted.extend_from_slice(bytes);
+    (String::from_utf8_lossy(bytes).into_owned(), false)
+}
+
 /// Owned `ContinuousBatchingPipeline` handle (issue #20). One pipeline
 /// serves many concurrent requests; [`CbHandle`]s must be dropped before
 /// the pipeline they came from.
@@ -1001,17 +1031,10 @@ impl CbHandle {
     /// re-emitting the corrected suffix would duplicate text.
     #[cfg(feature = "openvino")]
     fn take_delta(&mut self, full: &[u8], running: bool) -> (String, bool) {
-        if !full.starts_with(&self.emitted) {
-            let first = !self.warned_divergence;
-            self.warned_divergence = true;
-            self.emitted.clear();
-            self.emitted.extend_from_slice(full);
-            return (String::new(), first);
-        }
-        let end = emittable_len(full, running).max(self.emitted.len());
-        let bytes = &full[self.emitted.len()..end];
-        self.emitted.extend_from_slice(bytes);
-        (String::from_utf8_lossy(bytes).into_owned(), false)
+        let (delta, diverged) = advance_emitted(&mut self.emitted, full, running);
+        let first_divergence = diverged && !self.warned_divergence;
+        self.warned_divergence |= diverged;
+        (delta, first_divergence)
     }
 
     #[cfg(not(feature = "openvino"))]
@@ -1578,6 +1601,107 @@ where
     }
     buf.truncate(len);
     String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::advance_emitted;
+
+    const FFFD: &[u8] = &[0xEF, 0xBF, 0xBD];
+    const GRIN: &[u8] = &[0xF0, 0x9F, 0x98, 0x80];
+
+    /// The ordinary case: each read extends the last, and concatenating the
+    /// deltas reproduces the final decode exactly once.
+    #[test]
+    fn monotonic_reads_emit_each_byte_exactly_once() {
+        let mut emitted = Vec::new();
+        let mut out = String::new();
+        for full in [
+            b"He".as_slice(),
+            b"Hello".as_slice(),
+            b"Hello wo".as_slice(),
+        ] {
+            let (d, diverged) = advance_emitted(&mut emitted, full, true);
+            assert!(!diverged);
+            out.push_str(&d);
+        }
+        let (d, _) = advance_emitted(&mut emitted, b"Hello world", false);
+        out.push_str(&d);
+        assert_eq!(out, "Hello world");
+    }
+
+    /// A decode that gets SHORTER cannot be a prefix extension. Before the
+    /// rewrite this silently emitted nothing and left the byte offset stale for
+    /// the rest of the request; now it re-anchors and says so.
+    #[test]
+    fn a_shorter_redecode_reanchors_and_reports() {
+        let mut emitted = Vec::new();
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcdef", true);
+        assert_eq!(d, "abcdef");
+        assert!(!diverged);
+
+        let (d, diverged) = advance_emitted(&mut emitted, b"abc", true);
+        assert!(diverged, "a shorter decode must be reported");
+        assert_eq!(d, "", "must not re-emit or emit a bogus slice");
+        assert_eq!(emitted, b"abc", "must re-anchor onto the new decode");
+    }
+
+    /// Same length, different content — the case a byte-count check cannot see
+    /// at all.
+    #[test]
+    fn a_rewritten_prefix_of_equal_length_reanchors() {
+        let mut emitted = Vec::new();
+        advance_emitted(&mut emitted, b"abcdef", true);
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcXef", true);
+        assert!(diverged);
+        assert_eq!(d, "");
+        assert_eq!(emitted, b"abcXef");
+    }
+
+    /// After re-anchoring, the stream must keep working rather than staying
+    /// desynced — this is the compounding-corruption case.
+    #[test]
+    fn growth_after_a_reanchor_still_emits_correctly() {
+        let mut emitted = Vec::new();
+        advance_emitted(&mut emitted, b"abcdef", true);
+        let (_, diverged) = advance_emitted(&mut emitted, b"abc", true);
+        assert!(diverged);
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcXYZ", true);
+        assert!(!diverged, "growth from the new anchor is not a divergence");
+        assert_eq!(d, "XYZ");
+    }
+
+    /// The real-world shape: a 4-byte codepoint arrives as a growing run of
+    /// U+FFFD, then resolves — which SHRINKS the decode. Nothing partial may
+    /// reach the caller, and the codepoint must arrive exactly once.
+    #[test]
+    fn emoji_resolving_from_a_replacement_run_never_leaks_a_partial() {
+        let mut emitted = Vec::new();
+        let mut out = String::new();
+        let steps: [(Vec<u8>, bool); 3] = [
+            ([b"hi ".as_slice(), FFFD].concat(), true),
+            ([b"hi ".as_slice(), &FFFD.repeat(2)].concat(), true),
+            ([b"hi ".as_slice(), GRIN].concat(), false),
+        ];
+        for (full, running) in steps {
+            let (d, _) = advance_emitted(&mut emitted, &full, running);
+            out.push_str(&d);
+        }
+        assert_eq!(out, "hi \u{1F600}");
+    }
+
+    /// Held-back bytes must be released on the terminal read, not lost.
+    #[test]
+    fn terminal_read_flushes_held_bytes() {
+        let mut emitted = Vec::new();
+        let partial = [b"ok".as_slice(), &GRIN[..2]].concat();
+        let (d, _) = advance_emitted(&mut emitted, &partial, true);
+        assert_eq!(d, "ok", "incomplete tail held while running");
+        // A tail that is genuinely torn (the request ended mid-codepoint)
+        // surfaces as exactly one replacement char rather than being dropped.
+        let (d, _) = advance_emitted(&mut emitted, &partial, false);
+        assert_eq!(d, "\u{FFFD}");
+    }
 }
 
 #[cfg(test)]
