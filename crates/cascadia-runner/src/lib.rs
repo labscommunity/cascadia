@@ -192,9 +192,17 @@ impl Runner {
 
     /// Cooperatively cancel a task.
     pub fn cancel(&self, task_id: &TaskId) {
-        let mut bufs = self.buffers.lock();
-        bufs.cancelled.insert(task_id.clone());
-        bufs.chunks.remove(task_id);
+        // Lock order is engine-before-buffers everywhere (ChunkStream::poll_next
+        // holds both while distributing a step). Taking buffers first here and
+        // then reaching for the engine would invert that and deadlock, so the
+        // tombstone is written and released before the engine is touched. A
+        // chunk that lands in between is dropped by the cancelled-check on the
+        // distribution path, which is the behaviour either way.
+        {
+            let mut bufs = self.buffers.lock();
+            bufs.cancelled.insert(task_id.clone());
+            bufs.chunks.remove(task_id);
+        }
         if let Some(engine) = self.engine.lock().as_mut() {
             engine.cancel(task_id);
         }
@@ -342,16 +350,34 @@ impl Stream for ChunkStream {
             //    and keep polling — ending our healthy stream would kill the
             //    wrong request. An error for our task, or a task-less /
             //    engine-level error, ends this stream.
+            //    Distribution happens while the engine lock is still held.
+            //    Releasing it first and buffering afterwards leaves a window in
+            //    which another stream completes a LATER step and buffers its
+            //    round before this one lands — reordering a single request's
+            //    own text. Step and distribute have to be one critical section.
             let step_result = {
                 let mut guard = this.engine.lock();
                 let Some(engine) = guard.as_mut() else {
                     this.done = true;
                     return Poll::Ready(None);
                 };
-                engine.step()
+                match engine.step() {
+                    Ok(produced) => {
+                        let empty = produced.is_empty();
+                        let mut bufs = this.buffers.lock();
+                        for (tid, chunk) in produced {
+                            if bufs.cancelled.contains(&tid) {
+                                continue;
+                            }
+                            bufs.chunks.entry(tid).or_default().push_back(chunk);
+                        }
+                        Ok(empty)
+                    }
+                    Err(e) => Err(e),
+                }
             };
-            let produced = match step_result {
-                Ok(v) => v,
+            let produced_empty = match step_result {
+                Ok(empty) => empty,
                 Err(e) => match e.task_id() {
                     Some(failed) if failed != &this.task_id => {
                         // Misattribution guard: fail the named task's stream,
@@ -442,7 +468,7 @@ impl Stream for ChunkStream {
                 },
             };
 
-            if produced.is_empty() {
+            if produced_empty {
                 this.consecutive_empty += 1;
                 if this.consecutive_empty >= MAX_CONSECUTIVE_EMPTY_STEPS {
                     // An engine that wedges by stalling (Ok-empty forever)
@@ -470,32 +496,18 @@ impl Stream for ChunkStream {
             this.last_errored_task = None;
             this.consecutive_foreign_err = 0;
 
-            // 3) Distribute produced chunks: ours go to caller; others to
-            //    their owners' buffers. We may then loop to attempt the
-            //    cancelled-check or buffered-drain again.
-            let mut bufs = this.buffers.lock();
-            let mut ours: Option<Chunk> = None;
-            for (tid, chunk) in produced {
-                if bufs.cancelled.contains(&tid) {
-                    continue;
-                }
-                if tid == this.task_id && ours.is_none() {
-                    ours = Some(chunk);
-                } else {
-                    bufs.chunks.entry(tid).or_default().push_back(chunk);
-                }
-            }
-            drop(bufs);
-            if let Some(c) = ours {
-                let is_final = c.is_final;
-                if is_final {
-                    this.done = true;
-                    let mut bufs = this.buffers.lock();
-                    bufs.chunks.remove(&this.task_id);
-                }
-                return Poll::Ready(Some(c));
-            }
-            // else loop: nothing for us this round.
+            // 3) Everything this round produced — including our own chunks —
+            //    is already in its owner's buffer, so loop and let step 1 hand
+            //    ours back in FIFO order.
+            //
+            //    Returning our chunk straight from the step instead would jump
+            //    it ahead of anything another stream buffered for us while we
+            //    were blocked on the engine lock, delivering one request's own
+            //    text out of order. That was unreachable until an engine emitted
+            //    chunks for several tasks in a single step — every other engine
+            //    produces for at most the one task it is working on. Continuous
+            //    batching does, and with it six identical concurrent prompts
+            //    came back as six different permutations of the right answer.
         }
     }
 }
@@ -1213,6 +1225,122 @@ mod tests {
         }
         assert!(saw_final, "stream ended without a final chunk");
         assert_eq!(last_text, "done");
+    }
+
+    /// Engine that emits a chunk for EVERY in-flight task on every step — the
+    /// shape continuous batching introduces, and the one no engine had before
+    /// it. Chunks are numbered so a consumer can tell order from content.
+    struct MultiTaskEngine {
+        tasks: Vec<TaskId>,
+        seq: usize,
+        total: usize,
+    }
+
+    impl Engine for MultiTaskEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            if self.seq >= self.total {
+                return Ok(Vec::new());
+            }
+            let n = self.seq;
+            self.seq += 1;
+            let last = self.seq == self.total;
+            // Widen the window in which the other stream can be mid-poll while
+            // this round is distributed; the race is otherwise rare enough on a
+            // fast machine to make the test toothless.
+            std::thread::yield_now();
+            Ok(self
+                .tasks
+                .iter()
+                .map(|t| {
+                    let text = format!("{n},");
+                    let c = if last {
+                        Chunk::final_marker(t.clone(), text)
+                    } else {
+                        Chunk::token(t.clone(), 0, text)
+                    };
+                    (t.clone(), c)
+                })
+                .collect())
+        }
+    }
+
+    struct MultiTaskBuilder {
+        tasks: Vec<TaskId>,
+        total: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for MultiTaskBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(MultiTaskEngine {
+                tasks: self.tasks.clone(),
+                seq: 0,
+                total: self.total,
+            }))
+        }
+    }
+
+    /// A stream must deliver ITS OWN chunks in the order the engine produced
+    /// them, even while another stream is driving the same engine.
+    ///
+    /// The failure this guards: poll_next used to return a chunk taken straight
+    /// from its own step() call. A stream that found its buffer empty, then
+    /// blocked on the engine lock, could have a chunk buffered for it by the
+    /// stream holding that lock — and would then return its newer chunk first.
+    /// On hardware this turned six identical concurrent prompts into six
+    /// different permutations of the right answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_streams_receive_their_own_chunks_in_order() {
+        const N: usize = 40;
+        let ids: Vec<TaskId> = vec!["a".to_string(), "b".to_string()];
+        let runner = Arc::new(Runner::new(Box::new(MultiTaskBuilder {
+            tasks: ids.clone(),
+            total: N,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+
+        let expected: String = (0..N).map(|i| format!("{i},")).collect();
+        let mut handles = Vec::new();
+        for id in ids {
+            let r = runner.clone();
+            handles.push(tokio::spawn(async move {
+                let mut stream = r
+                    .generate(GenerationTask::new(id.clone(), "x").with_max_tokens(64))
+                    .unwrap();
+                let mut got = String::new();
+                while let Some(c) = stream.next().await {
+                    assert!(c.error.is_none(), "unexpected error chunk: {:?}", c.error);
+                    got.push_str(&c.text);
+                }
+                (id, got)
+            }));
+        }
+        for h in handles {
+            let (id, got) = h.await.unwrap();
+            assert_eq!(
+                got, expected,
+                "stream {id} received its chunks out of order"
+            );
+        }
     }
 
     /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
