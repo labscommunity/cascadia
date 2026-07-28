@@ -326,6 +326,7 @@ impl Builder for OvGenaiBuilder {
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
                 max_tokens_default: 256,
+                idle_steps: 0,
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -486,6 +487,22 @@ impl Engine for OvGenaiEngine {
 /// request asks for 4 tokens, so a healthy pipeline terminates in a handful.
 const WARMUP_MAX_STEPS: usize = 64;
 
+/// Consecutive scheduler iterations in which NO in-flight request produced a
+/// token before the engine declares the batch stalled.
+///
+/// The liveness chunk emitted on such an iteration (see [`OvGenaiCbEngine`])
+/// deliberately hides them from the runner's no-progress guard, so this is the
+/// engine's own replacement for it — without a bound, a genuinely wedged
+/// pipeline that keeps returning success would stream empty chunks until every
+/// request hit max_tokens.
+///
+/// The counter only advances while the WHOLE batch is quiet (any request
+/// producing a token resets it), so the largest legitimate run is one request's
+/// chunked prefill: ceil(prompt_tokens / max_num_batched_tokens). At the
+/// ov-genai default 256-token window this covers a ~512K-token prompt, which is
+/// far beyond any supported context, while still terminating.
+const MAX_IDLE_STEPS: u32 = 2048;
+
 /// Per-request generation state on the continuous-batching engine.
 struct ActiveCbTask {
     task_id: TaskId,
@@ -518,6 +535,8 @@ pub struct OvGenaiCbEngine {
     prompt_pretemplated: bool,
     next_request_id: u64,
     max_tokens_default: u32,
+    /// Consecutive iterations in which the whole batch produced nothing.
+    idle_steps: u32,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -717,13 +736,43 @@ impl Engine for OvGenaiCbEngine {
         // One chunk is enough — any non-empty step resets the counter for
         // every stream. n_tokens MUST be Some(0): the SSE path does
         // `n_tokens.unwrap_or(1)` and would otherwise inflate reported usage.
-        if out.is_empty() {
-            if let Some(t) = self.active.first() {
-                out.push((
-                    t.task_id.clone(),
-                    Chunk::token(t.task_id.clone(), 0, String::new()).with_n_tokens(0),
-                ));
+        //
+        // Hiding these iterations from the runner's guard means the engine owes
+        // it a replacement, or a truly wedged pipeline would heartbeat until
+        // every request hit max_tokens: MAX_IDLE_STEPS bounds the quiet run and
+        // fails the batch loudly past it.
+        if out.is_empty() && !self.active.is_empty() {
+            self.idle_steps += 1;
+            if self.idle_steps > MAX_IDLE_STEPS {
+                warn!(
+                    idle_steps = self.idle_steps,
+                    in_flight = self.active.len(),
+                    "cb pipeline produced no tokens for {MAX_IDLE_STEPS} consecutive \
+                     iterations; failing in-flight requests"
+                );
+                self.idle_steps = 0;
+                return Ok(self
+                    .active
+                    .drain(..)
+                    .map(|t| {
+                        let chunk = Chunk::error(
+                            t.task_id.clone(),
+                            format!(
+                                "cb pipeline stalled: no tokens produced for \
+                                 {MAX_IDLE_STEPS} scheduler iterations"
+                            ),
+                        );
+                        (t.task_id, chunk)
+                    })
+                    .collect());
             }
+            let t = &self.active[0];
+            out.push((
+                t.task_id.clone(),
+                Chunk::token(t.task_id.clone(), 0, String::new()).with_n_tokens(0),
+            ));
+        } else {
+            self.idle_steps = 0;
         }
         Ok(out)
     }
