@@ -77,7 +77,13 @@ pub(crate) struct PackedState {
     pub(crate) pos_in: String,
     pub(crate) mask_dtype: ShimDType,
     pub(crate) layers: Vec<PackedLayer>,
-    last_plan_rows: Vec<Option<(usize, i64)>>,
+    /// Token ids whose K/V now sit in the shared prefix region. Only the
+    /// driver stage matches against these; relay stages are told the reuse
+    /// length on the wire.
+    pub(crate) prefix_ids: Vec<i64>,
+    /// Slot currently populating the shared prefix, if any.
+    populating: Option<usize>,
+    last_plan_rows: Vec<Option<(usize, i64, usize)>>,
     mask_bytes: Vec<u8>,
     ids_bytes: Vec<u8>,
     pos_bytes: Vec<u8>,
@@ -105,6 +111,8 @@ impl PackedState {
             pos_in,
             mask_dtype,
             layers,
+            prefix_ids: Vec::new(),
+            populating: None,
             last_plan_rows: Vec::new(),
             mask_bytes: Vec::new(),
             ids_bytes: Vec::new(),
@@ -118,7 +126,7 @@ impl PackedState {
 
     /// Per-row `(slot, position)` of the most recent inference — what a
     /// pipeline stage ships downstream so every stage masks identically.
-    pub(crate) fn last_plan_rows(&self) -> Vec<Option<(usize, i64)>> {
+    pub(crate) fn last_plan_rows(&self) -> Vec<Option<(usize, i64, usize)>> {
         self.last_plan_rows.clone()
     }
 
@@ -126,13 +134,37 @@ impl PackedState {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
 
-    /// Place a task into `slot`, clearing that slot's KV region only.
+    /// Longest prefix of `prompt_ids` whose K/V is already cached in the shared
+    /// region. Reusing it means those tokens are never prefilled again.
+    pub(crate) fn prefix_reuse(&self, prompt_ids: &[i64]) -> usize {
+        let cap = self.kv.prefix_valid.min(self.prefix_ids.len());
+        let mut n = 0;
+        while n < cap && n < prompt_ids.len() && self.prefix_ids[n] == prompt_ids[n] {
+            n += 1;
+        }
+        // Never reuse the WHOLE prompt: the slot needs at least one token to
+        // run through the model to produce logits for its first output.
+        n.min(prompt_ids.len().saturating_sub(1))
+    }
+
+    /// Place a task into `slot`, reusing `shared` cached prefix tokens and
+    /// clearing only that slot's own KV region.
     pub(crate) fn admit(&mut self, slot: usize, task: GenerationTask, prompt_ids: Vec<i64>) {
-        self.kv.reset_slot(slot);
+        let shared = self.prefix_reuse(&prompt_ids);
+        self.kv.reset_slot_reusing(slot, shared);
+        // Nothing cached yet? This request populates the shared prefix.
+        if self.kv.prefix_valid == 0 && self.populating.is_none() && self.kv.prefix_capacity > 0 {
+            self.populating = Some(slot);
+            self.prefix_ids = prompt_ids
+                .iter()
+                .copied()
+                .take(self.kv.prefix_capacity)
+                .collect();
+        }
         self.slots[slot] = Some(PackedSlot {
             task,
             prompt_ids,
-            prompt_fed: 0,
+            prompt_fed: shared,
             generated: Vec::new(),
             last_text: String::new(),
             last_token: 0,
@@ -143,6 +175,12 @@ impl PackedState {
 
     pub(crate) fn retire(&mut self, slot: usize) -> Option<PackedSlot> {
         let taken = self.slots[slot].take();
+        // A slot that was going to populate the shared prefix but left first
+        // must release the claim, or nothing would ever populate it.
+        if self.populating == Some(slot) && self.kv.prefix_valid == 0 {
+            self.populating = None;
+            self.prefix_ids.clear();
+        }
         self.kv.reset_slot(slot);
         taken
     }
@@ -206,7 +244,13 @@ impl PackedState {
         if plan.is_empty() {
             return Ok(None);
         }
-        let (odt, oshape, obytes) = self.run_plan(&plan, PackedPrimary::Ids(&ids), &positions)?;
+        let reuse: Vec<usize> = plan
+            .rows
+            .iter()
+            .map(|r| r.map(|pr| self.kv.shared_use(pr.slot)).unwrap_or(0))
+            .collect();
+        let (odt, oshape, obytes) =
+            self.run_plan(&plan, PackedPrimary::Ids(&ids), &positions, &reuse)?;
         if let PackedStepKind::Prefill { slot, .. } = &kind {
             if let Some(t) = self.slots[*slot].as_mut() {
                 t.prompt_fed += plan.active_rows().count();
@@ -227,20 +271,28 @@ impl PackedState {
         plan: &PackedPlan,
         primary: PackedPrimary<'_>,
         positions: &[i64],
+        reuse: &[usize],
     ) -> EngineResult<(ShimDType, Vec<usize>, Vec<u8>)> {
         let s = self.kv.packed_seq;
+        // A row whose absolute position equals its reuse length is the FIRST
+        // row of that slot's sequence — the in-band new-sequence signal, which
+        // generalises the old "position == 0" rule to prefix reuse.
         for (r, pr) in plan.active_rows() {
-            if positions.get(r).copied().unwrap_or(0) == 0 {
-                self.kv.reset_slot(pr.slot);
+            let pos = positions.get(r).copied().unwrap_or(0) as usize;
+            let shared = reuse.get(r).copied().unwrap_or(0);
+            if pos == shared {
+                self.kv.reset_slot_reusing(pr.slot, shared);
             }
         }
         self.last_plan_rows = (0..s)
             .map(|r| {
-                plan.rows
-                    .get(r)
-                    .copied()
-                    .flatten()
-                    .map(|pr| (pr.slot, positions.get(r).copied().unwrap_or(0)))
+                plan.rows.get(r).copied().flatten().map(|pr| {
+                    (
+                        pr.slot,
+                        positions.get(r).copied().unwrap_or(0),
+                        self.kv.shared_use(pr.slot),
+                    )
+                })
             })
             .collect();
         let ids: Vec<i64> = match primary {
@@ -375,6 +427,18 @@ impl PackedState {
         }
         for (slot, n) in consumed {
             self.kv.advance(slot, n);
+        }
+        // Once the populating request has enough tokens in its own region, copy
+        // them into the shared prefix so later requests can skip re-prefilling
+        // them. Deterministic from `pos` alone, so every pipeline stage does it
+        // at the same step without extra signalling.
+        if let Some(src) = self.populating {
+            let want = self.kv.prefix_capacity.min(self.prefix_ids.len().max(1));
+            if self.kv.prefix_valid == 0 && self.kv.valid(src) >= want && want > 0 {
+                self.kv.populate_prefix_from(src, want);
+                self.prefix_ids.truncate(self.kv.prefix_valid);
+                self.populating = None;
+            }
         }
         Ok((odt, oshape, obytes))
     }

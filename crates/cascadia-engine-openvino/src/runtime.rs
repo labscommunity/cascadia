@@ -316,38 +316,49 @@ fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
-/// Encode a packed step's per-row `(slot, position)` assignment as one framed
-/// I64 `[1, 2, S]` tensor: row 0 holds slot ids (`-1` = idle row), row 1 holds
-/// absolute positions. This is the packed analogue of `encode_wire_position` —
-/// downstream stages need per-ROW routing, not one scalar, to rebuild the
-/// block-diagonal mask and scatter each row into the right slot's ring.
-fn encode_wire_plan(rows: &[Option<(usize, i64)>]) -> WireTensor {
+/// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
+/// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
+/// the shared-prefix reuse length. The packed analogue of
+/// `encode_wire_position` — downstream stages need per-ROW routing, not one
+/// scalar, to rebuild the mask and scatter each row into the right slot's ring.
+///
+/// The reuse length must travel: only the driver stage holds the prompt ids to
+/// match against the prefix cache, but EVERY stage has to open the same shared
+/// columns or its attention would disagree with stage 0's.
+fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
     let s = rows.len();
-    let mut data = Vec::with_capacity(s * 2 * 8);
+    let mut data = Vec::with_capacity(s * 3 * 8);
     for r in rows {
-        let slot: i64 = r.map(|(sl, _)| sl as i64).unwrap_or(-1);
+        let slot: i64 = r.map(|(sl, _, _)| sl as i64).unwrap_or(-1);
         data.extend_from_slice(&slot.to_le_bytes());
     }
     for r in rows {
-        let pos: i64 = r.map(|(_, p)| p).unwrap_or(0);
+        let pos: i64 = r.map(|(_, p, _)| p).unwrap_or(0);
         data.extend_from_slice(&pos.to_le_bytes());
     }
-    WireTensor::new(WireDType::I64, [1, 2, s as u32], data)
+    for r in rows {
+        let sh: i64 = r.map(|(_, _, sh)| sh as i64).unwrap_or(0);
+        data.extend_from_slice(&sh.to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, 3, s as u32], data)
 }
 
 /// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
 /// length/shape disagreement, out-of-range slot ids, and negative positions —
 /// each of which would otherwise index or wrap somewhere downstream.
-fn decode_wire_plan(t: &WireTensor, slots: usize) -> EngineResult<Vec<Option<(usize, i64)>>> {
+fn decode_wire_plan(
+    t: &WireTensor,
+    slots: usize,
+) -> EngineResult<Vec<Option<(usize, i64, usize)>>> {
     let s = t.shape[2] as usize;
-    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 2 || s == 0 {
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 3 || s == 0 {
         return Err(EngineError::Backend(format!(
-            "expected an I64 [1,2,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
+            "expected an I64 [1,3,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
              packed/non-packed pipeline mismatch or a desynced activation stream",
             t.dtype, t.shape
         )));
     }
-    if t.data.len() != s * 2 * 8 {
+    if t.data.len() != s * 3 * 8 {
         return Err(EngineError::Backend(format!(
             "packed plan frame payload {} bytes does not match shape {:?}",
             t.data.len(),
@@ -363,9 +374,15 @@ fn decode_wire_plan(t: &WireTensor, slots: usize) -> EngineResult<Vec<Option<(us
     for r in 0..s {
         let slot = rd(r);
         let pos = rd(s + r);
+        let shared = rd(2 * s + r);
         if slot < 0 {
             out.push(None);
             continue;
+        }
+        if shared < 0 || shared > pos {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has shared_use={shared} inconsistent with position {pos}"
+            )));
         }
         if slot as usize >= slots {
             return Err(EngineError::Backend(format!(
@@ -377,7 +394,7 @@ fn decode_wire_plan(t: &WireTensor, slots: usize) -> EngineResult<Vec<Option<(us
                 "packed plan row {r} has negative position {pos}"
             )));
         }
-        out.push(Some((slot as usize, pos)));
+        out.push(Some((slot as usize, pos, shared as usize)));
     }
     Ok(out)
 }
@@ -1541,7 +1558,7 @@ impl OvRuntimeEngine {
         &mut self,
         hidden: &[f32],
         shape: &[usize],
-        plan_rows: &[Option<(usize, i64)>],
+        plan_rows: &[Option<(usize, i64, usize)>],
     ) -> EngineResult<Vec<i32>> {
         let down = self.downstream.clone().ok_or_else(|| {
             EngineError::Backend("packed pipeline stage has no downstream".into())
@@ -1638,7 +1655,7 @@ impl OvRuntimeEngine {
         let plan = crate::packed::PackedPlan {
             rows: plan_rows
                 .iter()
-                .map(|r| r.map(|(slot, _)| crate::packed::PackedRow { slot, order: 0 }))
+                .map(|r| r.map(|(slot, _, _)| crate::packed::PackedRow { slot, order: 0 }))
                 .collect(),
         };
         // Same-slot rows in one frame are a prefill chunk: restore their causal
@@ -1652,12 +1669,17 @@ impl OvRuntimeEngine {
         }
         let positions: Vec<i64> = plan_rows
             .iter()
-            .map(|r| r.map(|(_, p)| p).unwrap_or(0))
+            .map(|r| r.map(|(_, p, _)| p).unwrap_or(0))
+            .collect();
+        let reuse: Vec<usize> = plan_rows
+            .iter()
+            .map(|r| r.map(|(_, _, sh)| sh).unwrap_or(0))
             .collect();
         let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
             &plan,
             crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
             &positions,
+            &reuse,
         )?;
 
         if self.spec.is_last_stage {
@@ -2867,6 +2889,10 @@ pub struct OvRuntimeBuilder {
     /// the packed multi-slot variant (continuous batching on a device that
     /// rejects batch > 1). 0 = off.
     pub packed_slots: u32,
+    /// `--packed-prefix N`: reserve N KV slots as a read-only SHARED prefix
+    /// that every packed slot may attend to — prefix caching without paging.
+    /// Taken out of the same window, so it costs per-slot context. 0 = off.
+    pub packed_prefix: u32,
     /// `--park-prefill`: drop the prefill CompiledModel after each task's
     /// prefill (freeing its resident weight copy — the structural cost of
     /// the two-model split) and re-create it on the next prefill from the
@@ -3649,11 +3675,13 @@ impl Builder for OvRuntimeBuilder {
                     kvh as usize,
                     hd as usize,
                     ShimDType::F16,
+                    self.packed_prefix as usize,
                 );
                 info!(
                     slots,
                     packed_seq = pseq,
                     region = kv.region,
+                    shared_prefix = kv.prefix_capacity,
                     "packed multi-slot decode active"
                 );
                 Some(crate::packed_exec::PackedState::new(
@@ -3786,9 +3814,14 @@ mod tests {
     /// seq=1 decode loop as the legacy path.
     #[test]
     fn packed_plan_frame_round_trips() {
-        let rows = vec![Some((0usize, 7i64)), None, Some((3, 0)), Some((1, 129))];
+        let rows = vec![
+            Some((0usize, 7i64, 0usize)),
+            None,
+            Some((3, 12, 12)),
+            Some((1, 129, 40)),
+        ];
         let frame = encode_wire_plan(&rows);
-        assert_eq!(frame.shape, [1, 2, 4]);
+        assert_eq!(frame.shape, [1, 3, 4]);
         let back = decode_wire_plan(&frame, 4).expect("round trip");
         assert_eq!(back, rows);
     }
@@ -3799,11 +3832,11 @@ mod tests {
         let pos = encode_wire_position(5);
         assert!(decode_wire_plan(&pos, 4).is_err());
         // slot id beyond this stage's slot count
-        let frame = encode_wire_plan(&[Some((9usize, 0i64))]);
+        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
         let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
         assert!(err.contains("slot 9"), "{err}");
         // negative position would wrap in the ring math
-        let mut bad = encode_wire_plan(&[Some((0usize, 1i64))]);
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))]);
         bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
         assert!(decode_wire_plan(&bad, 4).is_err());
     }

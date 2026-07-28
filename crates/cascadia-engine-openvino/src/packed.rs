@@ -87,7 +87,13 @@ impl PackedPlan {
 /// Host-side KV for `slots` independent sequences sharing one static IR window.
 pub struct PackedKv {
     pub slots: usize,
-    /// Past KV slots owned by each packed slot.
+    /// Read-only shared prefix at the FRONT of the window, `[0, prefix_capacity)`.
+    /// Any number of slots may open these columns at once — attention over past
+    /// KV is a read, so sharing needs no copy and no paging. 0 disables it.
+    pub prefix_capacity: usize,
+    /// How much of the shared prefix currently holds real K/V.
+    pub prefix_valid: usize,
+    /// Past KV slots owned by each packed slot (after the shared prefix).
     pub region: usize,
     pub past_len: usize,
     /// Query rows per inference (the IR's static seq length).
@@ -100,10 +106,16 @@ pub struct PackedKv {
     key_buf: Vec<Vec<u8>>,
     val_buf: Vec<Vec<u8>>,
     /// Absolute tokens consumed by each slot's sequence (drives RoPE position).
+    /// A slot reusing `k` shared-prefix tokens starts at `pos = k`, because the
+    /// cached K/V were computed at absolute positions `0..k` — which is exactly
+    /// what makes reuse RoPE-correct.
     pos: Vec<usize>,
+    /// Shared-prefix columns each slot may read (its reuse length).
+    shared_use: Vec<usize>,
 }
 
 impl PackedKv {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         slots: usize,
         past_len: usize,
@@ -112,6 +124,7 @@ impl PackedKv {
         kv_heads: usize,
         head_dim: usize,
         kv_dtype: ShimDType,
+        prefix_capacity: usize,
     ) -> Self {
         let elem_bytes = match kv_dtype {
             ShimDType::F32 | ShimDType::I32 => 4,
@@ -119,9 +132,12 @@ impl PackedKv {
             _ => 2,
         };
         let per_layer = kv_heads * past_len * head_dim * elem_bytes;
+        let prefix_capacity = prefix_capacity.min(past_len.saturating_sub(slots));
         Self {
             slots,
-            region: past_len / slots,
+            prefix_capacity,
+            prefix_valid: 0,
+            region: (past_len - prefix_capacity) / slots,
             past_len,
             packed_seq,
             context: past_len + packed_seq,
@@ -131,13 +147,26 @@ impl PackedKv {
             key_buf: vec![vec![0u8; per_layer]; layers],
             val_buf: vec![vec![0u8; per_layer]; layers],
             pos: vec![0; slots],
+            shared_use: vec![0; slots],
         }
+    }
+
+    /// First KV column owned by `s` (its region sits after the shared prefix).
+    fn region_start(&self, s: usize) -> usize {
+        self.prefix_capacity + s * self.region
+    }
+
+    /// Shared-prefix columns slot `s` is reusing.
+    pub fn shared_use(&self, s: usize) -> usize {
+        self.shared_use[s]
     }
 
     /// Real past tokens currently visible to slot `s` (its region is a bounded
     /// window, so this saturates at `region`).
     pub fn valid(&self, s: usize) -> usize {
-        self.pos[s].min(self.region)
+        self.pos[s]
+            .saturating_sub(self.shared_use[s])
+            .min(self.region)
     }
 
     /// Absolute position of the next token for slot `s` (RoPE input).
@@ -148,17 +177,54 @@ impl PackedKv {
     /// Clear one slot without disturbing its neighbours — an admitted request
     /// starts from an empty region.
     pub fn reset_slot(&mut self, s: usize) {
+        self.reset_slot_reusing(s, 0);
+    }
+
+    /// Clear slot `s` and start it reusing `shared` cached prefix tokens: its
+    /// sequence then begins at absolute position `shared`, and its mask opens
+    /// the first `shared` shared-prefix columns.
+    pub fn reset_slot_reusing(&mut self, s: usize, shared: usize) {
+        let shared = shared.min(self.prefix_valid);
         let (region, kv_heads, past_len) = (self.region, self.kv_heads, self.past_len);
         let slot_bytes = self.head_dim * self.elem_bytes;
         let buf_row = past_len * slot_bytes;
-        let start = s * region * slot_bytes;
+        let start = self.region_start(s) * slot_bytes;
         for buf in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
             for h in 0..kv_heads {
                 let base = h * buf_row + start;
                 buf[base..base + region * slot_bytes].fill(0);
             }
         }
-        self.pos[s] = 0;
+        self.pos[s] = shared;
+        self.shared_use[s] = shared;
+    }
+
+    /// Copy the first `n` tokens of `src` slot's region into the shared prefix,
+    /// making them reusable by every slot. Called once, after the request that
+    /// populates the cache has prefilled that far.
+    pub fn populate_prefix_from(&mut self, src: usize, n: usize) {
+        let n = n.min(self.prefix_capacity).min(self.valid(src));
+        if n == 0 || self.prefix_valid > 0 {
+            return;
+        }
+        let slot_bytes = self.head_dim * self.elem_bytes;
+        let buf_row = self.past_len * slot_bytes;
+        let src_start = self.region_start(src) * slot_bytes;
+        let kv_heads = self.kv_heads;
+        for buf in self.key_buf.iter_mut().chain(self.val_buf.iter_mut()) {
+            for h in 0..kv_heads {
+                let base = h * buf_row;
+                let from = base + src_start;
+                let to = base;
+                // Non-overlapping by construction: the shared region is
+                // [0, prefix_capacity) and every slot region starts at or after
+                // prefix_capacity.
+                buf.copy_within(from..from + n * slot_bytes, to);
+            }
+        }
+        self.prefix_valid = n;
+        // The populating slot keeps its own copy; it does not retroactively
+        // "reuse" what it already computed.
     }
 
     pub fn key_bytes(&self, li: usize) -> &[u8] {
@@ -210,7 +276,7 @@ impl PackedKv {
         let kv_heads = self.kv_heads;
         let src_slot = self.past_len + row;
         let full = at >= region;
-        let region_start = slot * region * slot_bytes;
+        let region_start = self.region_start(slot) * slot_bytes;
         let buf: &mut [u8] = if is_value {
             &mut self.val_buf[li]
         } else {
@@ -265,8 +331,14 @@ impl PackedKv {
                     None => c == past_len + r, // idle: self only, keeps softmax finite
                     Some(pr) => {
                         if c < past_len {
-                            let start = pr.slot * region;
-                            c >= start && c < start + self.valid(pr.slot)
+                            // shared prefix this slot is reusing ...
+                            if c < self.shared_use[pr.slot] {
+                                true
+                            } else {
+                                // ... plus its own occupied region
+                                let start = self.region_start(pr.slot);
+                                c >= start && c < start + self.valid(pr.slot)
+                            }
                         } else {
                             let q = c - past_len;
                             match plan.rows.get(q).copied().flatten() {
@@ -290,7 +362,11 @@ mod tests {
     use super::*;
 
     fn kv(slots: usize, past_len: usize, packed_seq: usize) -> PackedKv {
-        PackedKv::new(slots, past_len, packed_seq, 1, 1, 2, ShimDType::F16)
+        PackedKv::new(slots, past_len, packed_seq, 1, 1, 2, ShimDType::F16, 0)
+    }
+
+    fn kv_prefix(slots: usize, past_len: usize, packed_seq: usize, prefix: usize) -> PackedKv {
+        PackedKv::new(slots, past_len, packed_seq, 1, 1, 2, ShimDType::F16, prefix)
     }
 
     fn mask_allows(buf: &[u8], ctx: usize, r: usize, c: usize) -> bool {
@@ -517,6 +593,101 @@ mod tests {
         let mut b = Vec::new();
         k.fill_mask(&rebuilt, &mut b, ShimDType::F16);
         assert_eq!(a, b, "relay-rebuilt plan must mask identically");
+    }
+
+    /// Two slots reusing the same cached prefix must both see those columns,
+    /// while still being blind to each other's own regions.
+    #[test]
+    fn shared_prefix_is_readable_by_every_reusing_slot() {
+        let mut k = kv_prefix(2, 12, 2, 4); // prefix 4, region (12-4)/2 = 4
+        assert_eq!(k.region, 4);
+        k.prefix_valid = 3; // 3 cached tokens
+        k.reset_slot_reusing(0, 3);
+        k.reset_slot_reusing(1, 3);
+        k.advance(0, 1); // one own token each
+        k.advance(1, 1);
+        let plan = PackedPlan::decode(2, &[0, 1]);
+        let mut buf = Vec::new();
+        k.fill_mask(&plan, &mut buf, ShimDType::F16);
+        for r in 0..2 {
+            // shared prefix columns 0..3 open for BOTH rows
+            for c in 0..3 {
+                assert!(mask_allows(&buf, k.context, r, c), "row {r} shared col {c}");
+            }
+            assert!(
+                !mask_allows(&buf, k.context, r, 3),
+                "unpopulated prefix col"
+            );
+        }
+        // row 0 sees its own region (4..5) but not slot 1's (8..9)
+        assert!(mask_allows(&buf, k.context, 0, 4));
+        assert!(!mask_allows(&buf, k.context, 0, 8));
+        assert!(mask_allows(&buf, k.context, 1, 8));
+        assert!(!mask_allows(&buf, k.context, 1, 4));
+    }
+
+    /// Reuse means the slot's own token count excludes the shared tokens, and
+    /// its absolute position starts after them (so RoPE stays correct).
+    #[test]
+    fn reuse_shifts_position_and_own_valid() {
+        let mut k = kv_prefix(2, 12, 2, 4);
+        k.prefix_valid = 4;
+        k.reset_slot_reusing(0, 4);
+        assert_eq!(k.position(0), 4, "sequence resumes after the cached prefix");
+        assert_eq!(k.valid(0), 0, "no OWN tokens yet");
+        k.advance(0, 2);
+        assert_eq!(k.position(0), 6);
+        assert_eq!(k.valid(0), 2);
+        assert_eq!(k.shared_use(0), 4);
+    }
+
+    /// Populating the cache copies a slot's first tokens to the front of the
+    /// window without touching any other slot's region.
+    #[test]
+    fn populate_prefix_copies_out_of_the_owning_slot() {
+        let mut k = kv_prefix(2, 12, 1, 4);
+        let mk = |tag: u16, plb: usize, ctx: usize| {
+            let mut p = vec![0u8; plb];
+            for c in 0..ctx {
+                for e in 0..2 {
+                    let off = (c * 2 + e) * 2;
+                    p[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+                }
+            }
+            p
+        };
+        let (plb, ctx) = (k.present_layer_bytes(), k.context);
+        // slot 1 sentinel must survive
+        k.absorb_row(0, false, &mk(999, plb, ctx), 0, 1, 0);
+        let slot1 = k.key_bytes(0)[(4 + 4) * 4..(4 + 4) * 4 + 4].to_vec();
+        for (i, tag) in [21u16, 22].iter().enumerate() {
+            k.absorb_row(0, false, &mk(*tag, plb, ctx), 0, 0, i);
+        }
+        k.advance(0, 2);
+        k.populate_prefix_from(0, 2);
+        assert_eq!(k.prefix_valid, 2);
+        let read = |slot_idx: usize| {
+            let off = slot_idx * 4;
+            u16::from_le_bytes([k.key_bytes(0)[off], k.key_bytes(0)[off + 1]])
+        };
+        assert_eq!(
+            [read(0), read(1)],
+            [21, 22],
+            "prefix holds the copied tokens"
+        );
+        assert_eq!(
+            k.key_bytes(0)[(4 + 4) * 4..(4 + 4) * 4 + 4].to_vec(),
+            slot1,
+            "another slot's region must be untouched"
+        );
+    }
+
+    #[test]
+    fn prefix_capacity_shrinks_per_slot_region() {
+        let plain = kv(4, 1024, 4);
+        let with_prefix = kv_prefix(4, 1024, 4, 256);
+        assert_eq!(plain.region, 256);
+        assert_eq!(with_prefix.region, 192); // (1024-256)/4
     }
 
     #[test]

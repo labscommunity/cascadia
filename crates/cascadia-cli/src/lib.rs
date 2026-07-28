@@ -424,6 +424,14 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub packed_slots: u32,
 
+    /// Reserve N KV slots as a read-only SHARED prefix that every packed slot
+    /// may attend to — prefix caching without paged attention. The first
+    /// admitted request populates it; later requests sharing that prompt prefix
+    /// skip re-prefilling those tokens. Taken from the same window, so it costs
+    /// per-slot context. Requires --packed-slots. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub packed_prefix: u32,
+
     /// Continuous batching (#20, ov-genai only): serve concurrent requests
     /// through one ContinuousBatchingPipeline (paged attention; CPU/GPU
     /// plugins) instead of one generation at a time. Incompatible with
@@ -661,6 +669,7 @@ impl WorkerArgs {
             spec_k: 5,
             prompt_lookup: 0,
             packed_slots: 0,
+            packed_prefix: 0,
             cb: false,
             cb_cache_size: 0,
             cb_max_num_seqs: 0,
@@ -1245,6 +1254,7 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
             b.packed_slots = args.packed_slots;
+            b.packed_prefix = args.packed_prefix;
             b = b.with_prefill_parking(args.park_prefill);
             b = b.with_gemv_offload(args.gemv_offload);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
@@ -1498,6 +1508,12 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     if (args.prefill_device.is_some() || args.park_prefill) && args.no_chunked_prefill {
         return Err(anyhow!(
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
+        ));
+    }
+    if args.packed_prefix > 0 && args.packed_slots == 0 {
+        return Err(anyhow!(
+            "--packed-prefix requires --packed-slots (the shared prefix lives in the packed \
+             KV window)"
         ));
     }
     // Packed multi-slot decode lives in the ov-runtime static (NPU-target) path.
@@ -2389,6 +2405,17 @@ mod python_tests {
 
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+
+        // the shared prefix lives inside the packed window, so it needs slots
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_prefix = 128;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--packed-slots"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
         assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 

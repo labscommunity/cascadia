@@ -176,6 +176,48 @@ loopback): `"The capital of France is Paris."`, usage `35 + 15`; and 4
 concurrent requests across the pipeline with first tokens at 2.09-2.26 s, slot 2
 retiring at 5.9 s while the rest ran to 7.5 s.
 
+### Prefix caching (`--packed-prefix N`)
+
+Paged attention is what usually buys prefix sharing, and the NPU has none. But
+sharing does not actually need paging — it needs a *mask that can open the same
+columns for several rows*, which this design already has. So reserve the first
+`N` columns of the KV window as a read-only **shared prefix** and let every
+slot's mask open them:
+
+```
+[ shared prefix (N) ][ slot 0 region ][ slot 1 region ] ... [ slot S-1 region ]
+       read-only,          private          private              private
+    any slot may attend
+```
+
+The first admitted request populates it (its first `N` tokens' K/V are copied to
+the front of the window, together with their token ids). Later requests are
+matched by longest common prefix against those ids; a request reusing `k` tokens
+starts its sequence at absolute position `k` and never prefills them again.
+RoPE stays correct precisely because the cached K/V were computed at their true
+absolute positions `0..k`, and attention over past KV is a read — so many rows
+sharing those columns needs no copy and no reference counting.
+
+Measured on NPU, 4 slots, four sequential requests sharing a ~96-token system
+prompt (Llama-3.2-1B, 105-token prompts):
+
+| | first request | later requests | speedup |
+|---|---|---|---|
+| `--packed-prefix 96` | 2.26 s | **0.38 s** | **5.95x** |
+| off | 2.81 s | 2.09 s | 1.34x (warmup only) |
+
+All four answers stayed correct (Paris / Tokyo / Rome / Madrid), which is the
+check that matters: reuse must not corrupt attention.
+
+The cost is honest and visible: the shared region is taken from the same fixed
+window, so `region = (static_context - 1 - N) / slots`. Prefix capacity trades
+directly against per-slot context.
+
+Limits versus real paged prefix caching: one cache entry (not an LRU of many),
+populated by whichever request arrives first; no block-level dedup between
+partially-overlapping prompts beyond that single shared run; and the cached
+prefix persists for the worker's lifetime rather than being evicted by pressure.
+
 ### Per-slot cancel
 
 A disconnecting client's slot is retired and its KV region returned to the free
