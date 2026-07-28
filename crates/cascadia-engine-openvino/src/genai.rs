@@ -327,6 +327,7 @@ impl Builder for OvGenaiBuilder {
                 next_request_id: 0,
                 max_tokens_default: 256,
                 idle_steps: 0,
+                step_failures: 0,
             }));
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
@@ -503,6 +504,12 @@ const WARMUP_MAX_STEPS: usize = 64;
 /// far beyond any supported context, while still terminating.
 const MAX_IDLE_STEPS: u32 = 2048;
 
+/// Consecutive `pipe.step()` failures after which the CB pipeline is treated as
+/// unusable and new work is refused at `submit()`. Low, because a scheduler
+/// iteration failing repeatedly means the device or the paged-attention cache
+/// is gone, not that one request was unlucky.
+const MAX_STEP_FAILURES: u32 = 3;
+
 /// Per-request generation state on the continuous-batching engine.
 struct ActiveCbTask {
     task_id: TaskId,
@@ -537,6 +544,9 @@ pub struct OvGenaiCbEngine {
     max_tokens_default: u32,
     /// Consecutive iterations in which the whole batch produced nothing.
     idle_steps: u32,
+    /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
+    /// is treated as unusable and `submit()` stops admitting work.
+    step_failures: u32,
 }
 
 impl Engine for OvGenaiCbEngine {
@@ -592,7 +602,24 @@ impl Engine for OvGenaiCbEngine {
         if self.active.iter().any(|t| t.task_id == task.task_id) {
             return Ok(());
         }
+        // A pipeline that has failed every recent scheduler iteration will fail
+        // this request too. Admitting it means paying add_request and a step
+        // before returning the same 503, forever, with nothing distinguishing a
+        // transient hiccup from a dead device. Refuse up front instead; a
+        // single successful step clears this.
+        if self.step_failures >= MAX_STEP_FAILURES {
+            return Err(EngineError::Backend(format!(
+                "cb pipeline unusable: {} consecutive scheduler iterations failed; \
+                 restart the worker",
+                self.step_failures
+            )));
+        }
         if self.active.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            tracing::warn!(
+                queued = self.active.len(),
+                cap = crate::dist_spec::MAX_PENDING_TASKS,
+                "ov-genai cb: pending queue at cap; rejecting task"
+            );
             return Err(EngineError::QueueFull {
                 queued: self.active.len(),
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
@@ -649,7 +676,15 @@ impl Engine for OvGenaiCbEngine {
         if let Err(err) = self.pipe.step() {
             // A failed scheduler iteration poisons every in-flight request:
             // fail them all explicitly rather than spinning on a broken batch.
-            warn!(error = %err, in_flight = self.active.len(), "cb step failed");
+            // Each drained task still gets its own error chunk — that per-task
+            // routing is why this returns Ok rather than an engine-level Err.
+            self.step_failures += 1;
+            warn!(
+                error = %err,
+                in_flight = self.active.len(),
+                consecutive = self.step_failures,
+                "cb step failed"
+            );
             let failed = self
                 .active
                 .drain(..)
@@ -660,6 +695,7 @@ impl Engine for OvGenaiCbEngine {
                 .collect();
             return Ok(failed);
         }
+        self.step_failures = 0;
 
         let mut out = Vec::new();
         let mut idx = 0;
