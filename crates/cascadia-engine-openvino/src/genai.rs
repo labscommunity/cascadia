@@ -18,8 +18,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    CbHandle, CbPipeline, CbSchedulerConfig, CbStatus, Error as OvError, GenConfig, LlmPipeline,
-    PluginConfig,
+    CbFinish, CbHandle, CbPipeline, CbSchedulerConfig, CbStatus, Error as OvError, GenConfig,
+    LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -734,7 +734,31 @@ impl Engine for OvGenaiCbEngine {
                     }
                     idx += 1;
                 }
-                CbStatus::Finished | CbStatus::Dropped => {
+                CbStatus::Ignored => {
+                    // OpenVINO ran out of KV cache and abandoned the request.
+                    // Finalising it like a normal completion handed the client
+                    // HTTP 200, finish_reason "stop" and a truncated body —
+                    // indistinguishable from a model that chose to stop. Fail
+                    // it loudly and name the knobs that fix it.
+                    let t = self.active.swap_remove(idx);
+                    warn!(
+                        task = %t.task_id,
+                        tokens = t.total_tokens,
+                        in_flight = self.active.len(),
+                        "cb scheduler dropped a request: KV cache exhausted"
+                    );
+                    let chunk = Chunk::error(
+                        t.task_id.clone(),
+                        format!(
+                            "continuous-batching scheduler dropped this request after {} \
+                             tokens: KV cache exhausted. Raise --cb-cache-size or lower \
+                             --cb-max-num-seqs.",
+                            t.total_tokens
+                        ),
+                    );
+                    out.push((t.task_id, chunk));
+                }
+                CbStatus::Finished | CbStatus::Cancelled => {
                     let t = self.active.swap_remove(idx);
                     let elapsed = t.started.elapsed().as_secs_f64();
                     let tok_s = if elapsed > 0.0 {
@@ -750,10 +774,18 @@ impl Engine for OvGenaiCbEngine {
                         in_flight = self.active.len(),
                         "cb task done"
                     );
-                    let finish = if t.total_tokens >= t.max_tokens {
-                        FinishReason::Length
-                    } else {
-                        FinishReason::Stop
+                    // Prefer OpenVINO's own reason. It reports NONE when the
+                    // terminal read carried no new output, so keep the
+                    // token-count inference as the fallback — it is what the
+                    // monolithic path uses and is right for the common case.
+                    let finish = match (read.status, read.finish) {
+                        (CbStatus::Cancelled, _) => FinishReason::Cancelled,
+                        (_, CbFinish::Stop) => FinishReason::Stop,
+                        (_, CbFinish::Length) => FinishReason::Length,
+                        (_, CbFinish::Unknown) if t.total_tokens >= t.max_tokens => {
+                            FinishReason::Length
+                        }
+                        (_, CbFinish::Unknown) => FinishReason::Stop,
                     };
                     // n_tokens is this chunk's increment, not the cumulative
                     // total — interim chunks already carried theirs.

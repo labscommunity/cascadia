@@ -177,6 +177,7 @@ mod sys {
             out_text_len: *mut usize,
             out_new_tokens: *mut u32,
             out_status: *mut i32,
+            out_finish_reason: *mut i32,
         ) -> c_int;
         pub fn cascadia_cb_handle_cancel(handle: *mut cascadia_cb_handle_t) -> c_int;
         pub fn cascadia_cb_handle_destroy(handle: *mut cascadia_cb_handle_t);
@@ -664,9 +665,23 @@ pub struct CbSchedulerConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CbStatus {
     Running,
+    /// Completed normally (EOS, stop sequence, or the token cap).
     Finished,
-    /// Dropped/ignored by the pipeline (cancelled, or evicted by OV).
-    Dropped,
+    /// Aborted via [`CbHandle::cancel`].
+    Cancelled,
+    /// OpenVINO could not continue the request — it ran out of KV cache and
+    /// abandoned it. Distinct from [`CbStatus::Finished`] because the caller
+    /// must report it as a failure, not as a completed answer.
+    Ignored,
+}
+
+/// Why generation stopped, as reported by OpenVINO. `Unknown` means it has not
+/// said, and the caller should fall back to its own inference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CbFinish {
+    Unknown,
+    Stop,
+    Length,
 }
 
 /// One incremental read: the newly generated text suffix plus its token count.
@@ -682,6 +697,8 @@ pub struct CbRead {
     /// count tokens even when the delta is empty, or usage under-reports.
     pub new_tokens: u32,
     pub status: CbStatus,
+    /// OpenVINO's own reason for stopping, once it reports one.
+    pub finish: CbFinish,
     /// Set once per request when the detokenizer's re-decode stopped extending
     /// what had already been emitted and the handle had to re-anchor. The
     /// shim takes no logging dependency, so the caller reports it — with the
@@ -948,6 +965,7 @@ impl CbHandle {
             let mut text_len: usize = 0;
             let mut new_tokens: u32 = 0;
             let mut status: i32 = 0;
+            let mut finish: i32 = 0;
             let rc = sys::cascadia_cb_handle_read(
                 self.inner.ptr,
                 self.handle,
@@ -955,6 +973,7 @@ impl CbHandle {
                 &mut text_len,
                 &mut new_tokens,
                 &mut status,
+                &mut finish,
             );
             if rc != 0 || text_p.is_null() {
                 return Err(Error::Native(last_native_error()));
@@ -963,14 +982,27 @@ impl CbHandle {
             let running = status == 0;
             let (text_delta, resynced) = self.take_delta(full, running);
             sys::cascadia_free_string(text_p);
+            // An unrecognised code means the C ABI grew a state this build does
+            // not know how to treat. Guessing "finished" would report a failure
+            // as an answer, which is the bug this widening exists to fix.
+            let status = match status {
+                0 => CbStatus::Running,
+                1 => CbStatus::Finished,
+                2 => CbStatus::Cancelled,
+                3 => CbStatus::Ignored,
+                other => {
+                    return Err(Error::Native(format!("unknown cb status {other}")));
+                }
+            };
             Ok(CbRead {
                 text_delta,
                 new_tokens,
                 resynced,
-                status: match status {
-                    0 => CbStatus::Running,
-                    1 => CbStatus::Finished,
-                    _ => CbStatus::Dropped,
+                status,
+                finish: match finish {
+                    1 => CbFinish::Stop,
+                    2 => CbFinish::Length,
+                    _ => CbFinish::Unknown,
                 },
             })
         }

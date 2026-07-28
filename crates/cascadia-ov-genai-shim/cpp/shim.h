@@ -127,6 +127,20 @@ void cascadia_free_string(char* s);
 typedef struct cascadia_cb_pipeline_t cascadia_cb_pipeline_t;
 typedef struct cascadia_cb_handle_t cascadia_cb_handle_t;
 
+// Values for cascadia_cb_handle_read's out_status. IGNORED is distinct from
+// FINISHED on purpose: it means OpenVINO could not continue the request (KV
+// cache exhausted), which is a failure, not an answer.
+#define CASCADIA_CB_STATUS_RUNNING 0
+#define CASCADIA_CB_STATUS_FINISHED 1
+#define CASCADIA_CB_STATUS_CANCELLED 2
+#define CASCADIA_CB_STATUS_IGNORED 3
+
+// Values for cascadia_cb_handle_read's out_finish_reason. NONE means OpenVINO
+// has not reported one yet; the caller falls back to its own inference.
+#define CASCADIA_CB_FINISH_NONE 0
+#define CASCADIA_CB_FINISH_STOP 1
+#define CASCADIA_CB_FINISH_LENGTH 2
+
 /// Scheduler knobs: 0 keeps the ov-genai default for the size fields;
 /// -1 keeps the default for the two tri-state booleans (0/1 = explicit).
 int32_t cascadia_cb_pipeline_create(
@@ -175,14 +189,17 @@ int32_t cascadia_cb_has_unfinished(
 /// sequence by THIS call. It is not the token count of any text delta the
 /// caller derives: a call can add tokens whose bytes are not yet emittable.
 ///
-/// `out_status` 0 = running, 1 = finished, 2 = dropped/ignored.
+/// `out_status` is one of CASCADIA_CB_STATUS_*; `out_finish_reason` one of
+/// CASCADIA_CB_FINISH_*, latched from GenerationOutput as soon as OpenVINO
+/// reports it (the terminal read may carry no new output).
 int32_t cascadia_cb_handle_read(
     cascadia_cb_pipeline_t* pipeline,
     cascadia_cb_handle_t* handle,
     char** out_text,
     size_t* out_text_len,
     uint32_t* out_new_tokens,
-    int32_t* out_status);
+    int32_t* out_status,
+    int32_t* out_finish_reason);
 
 /// Abort a running request (client disconnect / cancel). Safe on finished
 /// handles.

@@ -416,6 +416,12 @@ struct cascadia_cb_handle_t {
     // count that was never checked against the decode meant a re-decode that
     // shrank desynced the stream permanently and silently.
     std::vector<int64_t> acc_ids;
+    // Latched from GenerationOutput. The terminal read can return no new
+    // output at all (the last tokens were consumed by an earlier read, and an
+    // evicted request produces none), so the reason has to be remembered when
+    // it appears rather than looked for at the end.
+    ov::genai::GenerationFinishReason finish_reason =
+        ov::genai::GenerationFinishReason::NONE;
 };
 
 int32_t cascadia_cb_pipeline_create(
@@ -517,9 +523,9 @@ int32_t cascadia_cb_has_unfinished(cascadia_cb_pipeline_t* handle, int32_t* out_
 int32_t cascadia_cb_handle_read(
     cascadia_cb_pipeline_t* pipeline, cascadia_cb_handle_t* handle,
     char** out_text, size_t* out_text_len, uint32_t* out_new_tokens,
-    int32_t* out_status) {
+    int32_t* out_status, int32_t* out_finish_reason) {
     if (!pipeline || !pipeline->tok || !handle || !handle->handle || !out_text ||
-        !out_text_len || !out_new_tokens || !out_status) {
+        !out_text_len || !out_new_tokens || !out_status || !out_finish_reason) {
         set_last_error("null arg in cb_handle_read");
         return 1;
     }
@@ -533,16 +539,49 @@ int32_t cascadia_cb_handle_read(
             // take the first (only) sequence output.
             ov::genai::GenerationOutputs outs = handle->handle->read();
             if (!outs.empty()) {
-                const auto& ids = outs.begin()->second.generated_ids;
-                handle->acc_ids.insert(handle->acc_ids.end(), ids.begin(), ids.end());
+                const auto& out = outs.begin()->second;
+                handle->acc_ids.insert(
+                    handle->acc_ids.end(), out.generated_ids.begin(), out.generated_ids.end());
+                if (out.finish_reason != ov::genai::GenerationFinishReason::NONE) {
+                    handle->finish_reason = out.finish_reason;
+                }
             }
         }
 
         const auto status = handle->handle->get_status();
         const bool running = status == ov::genai::GenerationStatus::RUNNING;
-        *out_status = running ? 0
-                      : status == ov::genai::GenerationStatus::FINISHED ? 1
-                                                                        : 2;
+        // IGNORED is kept distinct from a normal finish: it means the request
+        // ran out of KV cache and could not be continued, which the caller must
+        // report as a failure rather than as a completed answer. STOP (early
+        // stop, output kept) is a normal completion.
+        switch (status) {
+            case ov::genai::GenerationStatus::RUNNING:
+                *out_status = CASCADIA_CB_STATUS_RUNNING;
+                break;
+            case ov::genai::GenerationStatus::FINISHED:
+            case ov::genai::GenerationStatus::STOP:
+                *out_status = CASCADIA_CB_STATUS_FINISHED;
+                break;
+            case ov::genai::GenerationStatus::CANCEL:
+                *out_status = CASCADIA_CB_STATUS_CANCELLED;
+                break;
+            default:
+                *out_status = CASCADIA_CB_STATUS_IGNORED;
+                break;
+        }
+        switch (handle->finish_reason) {
+            case ov::genai::GenerationFinishReason::STOP:
+            // A tool call is a normal stop as far as the wire format goes.
+            case ov::genai::GenerationFinishReason::TOOL_CALL:
+                *out_finish_reason = CASCADIA_CB_FINISH_STOP;
+                break;
+            case ov::genai::GenerationFinishReason::LENGTH:
+                *out_finish_reason = CASCADIA_CB_FINISH_LENGTH;
+                break;
+            default:
+                *out_finish_reason = CASCADIA_CB_FINISH_NONE;
+                break;
+        }
 
         // Return the whole decode, not a delta. The caller diffs it against
         // what it has already emitted, which lets it notice a non-monotonic
