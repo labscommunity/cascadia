@@ -1553,8 +1553,7 @@ impl OvRuntimeEngine {
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
             hidden.iter().flat_map(|v| v.to_le_bytes()).collect(),
         );
-        let rt = self.runtime_handle.clone();
-        rt.block_on(async {
+        self.block_on(async {
             let mut guard = down.lock().await;
             guard
                 .send(&plan_frame)
@@ -1616,8 +1615,7 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let rt = self.runtime_handle.clone();
-        let (plan_rows, hidden, hshape) = rt.block_on(async {
+        let (plan_rows, hidden, hshape) = self.block_on(async {
             let mut guard = up.lock().await;
             let (pf, _) = guard
                 .recv()
@@ -1673,7 +1671,7 @@ impl OvRuntimeEngine {
                 });
             }
             let frame = encode_wire_tokens(&tokens);
-            rt.block_on(async {
+            self.block_on(async {
                 let mut guard = up.lock().await;
                 guard
                     .send(&frame)
@@ -1684,7 +1682,7 @@ impl OvRuntimeEngine {
             let hidden_out = bytes_to_f32(odt, &obytes)?;
             let tokens = self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)?;
             let frame = encode_wire_tokens(&tokens);
-            rt.block_on(async {
+            self.block_on(async {
                 let mut guard = up.lock().await;
                 guard
                     .send(&frame)

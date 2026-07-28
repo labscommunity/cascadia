@@ -142,8 +142,29 @@ parity check between the packed and single-task paths.
 Note these CPU ratios measure scheduling behaviour, not the weight-amortization
 win — that is the NPU property (16:1 weight:KV) measured in the table above.
 
-Not yet wired: the multi-stage wire carrying `[1, S, hidden]` plus per-slot
-positions, so `--packed-slots` is gated to `--total 1`.
+### Multi-stage
+
+Packing works across a pipeline. Stage 0 ships an I64 `[1, 2, S]` **plan frame**
+(slot id per row, `-1` for idle; absolute position per row) ahead of the
+`[1, S, hidden]` block; relay and head stages decode it, re-derive same-slot
+causal order, run their own packed inference over their own per-slot rings, and
+the tail replies with one token per row. A row at position 0 resets its slot —
+the same in-band new-sequence signal the single-task static path already uses,
+so no separate admission message is needed. Every stage must be started with the
+same `--packed-slots`, since the slot count is baked into each stage's IR shape.
+
+Validated on TinyLlama 2-stage static (CPU, both ranks on one box over
+loopback): `"The capital of France is Paris."`, usage `35 + 15`; and 4
+concurrent requests across the pipeline with first tokens at 2.09-2.26 s, slot 2
+retiring at 5.9 s while the rest ran to 7.5 s.
+
+### Per-slot cancel
+
+A disconnecting client's slot is retired and its KV region returned to the free
+pool immediately, leaving the other in-flight slots untouched — the single-task
+path can only drop *queued* tasks, never reclaim a running one. Observed in the
+2-stage run: four disconnects released slots one at a time
+(`in_flight=3, 2, 1, 0`).
 
 Side benefit worth remembering: at ~0.21-0.29 ms marginal per row, speculative
 decode verification is nearly free on the NPU.
