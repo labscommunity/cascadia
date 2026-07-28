@@ -1766,6 +1766,16 @@ def main():
         "decode on CPU).",
     )
     parser.add_argument(
+        "--packed-slots",
+        type=int,
+        default=0,
+        help="NPU only: also emit a packed multi-slot IR variant "
+        "(openvino_packed_model.xml) that serves N concurrent requests in ONE "
+        "inference by packing them into the sequence dim with a per-row 4D "
+        "attention mask (continuous batching on a device that rejects batch>1). "
+        "Each slot owns (static-context - 1)/N of the KV window. 0 = off.",
+    )
+    parser.add_argument(
         "--partial-rotary-factor",
         type=float,
         default=None,
@@ -1825,6 +1835,24 @@ def main():
                 f"--static-context - 1 ({args.static_context - 1}) — a chunk wider than "
                 f"the KV window would evict its own tokens mid-chunk"
             )
+        if args.packed_slots and args.packed_slots < 2:
+            parser.error("--packed-slots must be 0 (off) or >= 2")
+        if args.packed_slots:
+            past_len = args.static_context - args.static_seq
+            if args.packed_slots > past_len:
+                parser.error(
+                    f"--packed-slots ({args.packed_slots}) exceeds the KV window "
+                    f"({past_len}); each slot needs at least one past slot"
+                )
+            region = past_len // args.packed_slots
+            if region < 8:
+                parser.error(
+                    f"--packed-slots {args.packed_slots} leaves only {region} KV "
+                    f"slots per request; raise --static-context or lower the slot "
+                    f"count (N x per-slot-context <= static-context - 1)"
+                )
+    elif args.packed_slots:
+        parser.error("--packed-slots requires --target npu")
     elif args.static_prefill_seq:
         parser.error("--static-prefill-seq requires --target npu")
     elif args.static_seq != 1 or args.static_context != 1024:
@@ -2203,6 +2231,15 @@ def main():
             static_context=args.static_context,
             static_prefill_seq=args.static_prefill_seq,
         )
+        # Packed multi-slot variant is built by RE-READING the saved seq=1 IR:
+        # the prefill reshape above mutates the in-memory model in place, so
+        # deriving it from that handle would silently pack the wrong shape.
+        if args.packed_slots:
+            from packed_variant import write_packed_variant
+
+            write_packed_variant(
+                os.path.join(output_dir, f"stage_{s['stage']}"), args.packed_slots
+            )
         total_mb += size
         gc.collect()
 

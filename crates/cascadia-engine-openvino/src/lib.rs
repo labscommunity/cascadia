@@ -13,6 +13,7 @@
 pub mod dist_spec;
 pub mod gemma4;
 pub mod genai;
+pub mod packed;
 pub mod qwen36;
 pub mod rotary;
 pub mod runtime;
