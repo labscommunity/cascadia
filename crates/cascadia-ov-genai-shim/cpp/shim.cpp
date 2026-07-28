@@ -23,6 +23,7 @@
 #include <openvino/genai/generation_config.hpp>
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
+#include <openvino/genai/continuous_batching_pipeline.hpp>
 
 namespace {
 
@@ -398,6 +399,250 @@ int32_t cascadia_pipeline_generate(
 }
 
 void cascadia_free_string(char* s) { std::free(s); }
+
+// ---- Continuous batching (issue #20) ---------------------------------------
+
+struct cascadia_cb_pipeline_t {
+    std::unique_ptr<ov::genai::ContinuousBatchingPipeline> pipe;
+    std::unique_ptr<ov::genai::Tokenizer> tok;
+};
+
+struct cascadia_cb_handle_t {
+    ov::genai::GenerationHandle handle;
+    // Accumulated token ids + how many bytes of their decode we have already
+    // handed to the caller. Re-decoding the full sequence each read (instead
+    // of decoding the delta ids alone) keeps multi-byte codepoints whole when
+    // a codepoint's tokens land in different reads.
+    std::vector<int64_t> acc_ids;
+    size_t emitted_bytes = 0;
+};
+
+namespace {
+
+// Hold back a trailing incomplete UTF-8 sequence (and the U+FFFD the
+// detokenizer substitutes for a half-decoded codepoint) while the request
+// is still running — the completing bytes arrive with the next tokens.
+size_t utf8_hold_back(const std::string& s) {
+    size_t hold = 0;
+    static const char kReplacement[] = "\xEF\xBF\xBD";
+    if (s.size() >= 3 && s.compare(s.size() - 3, 3, kReplacement) == 0) {
+        hold += 3;
+    }
+    size_t end = s.size() - hold;
+    size_t cont = 0;
+    while (cont < 3 && cont < end &&
+           (static_cast<unsigned char>(s[end - 1 - cont]) & 0xC0) == 0x80) {
+        ++cont;
+    }
+    if (cont < end) {
+        unsigned char lead = static_cast<unsigned char>(s[end - 1 - cont]);
+        size_t need = (lead & 0xF8) == 0xF0   ? 4
+                      : (lead & 0xF0) == 0xE0 ? 3
+                      : (lead & 0xE0) == 0xC0 ? 2
+                                              : 1;
+        if (need > cont + 1) {
+            hold += cont + 1;
+        }
+    }
+    return hold;
+}
+
+}  // namespace
+
+int32_t cascadia_cb_pipeline_create(
+    const char* model_path, const char* device, uint64_t cache_size_gb,
+    uint64_t max_num_seqs, uint64_t max_num_batched_tokens,
+    int32_t dynamic_split_fuse, int32_t enable_prefix_caching,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_cb_pipeline_t** out_handle) {
+    if (!model_path || !device || !out_handle) {
+        set_last_error("null arg in cb_pipeline_create");
+        return 1;
+    }
+    try {
+        ov::genai::SchedulerConfig sched;
+        if (cache_size_gb > 0) sched.cache_size = static_cast<size_t>(cache_size_gb);
+        if (max_num_seqs > 0) sched.max_num_seqs = static_cast<size_t>(max_num_seqs);
+        if (max_num_batched_tokens > 0)
+            sched.max_num_batched_tokens = static_cast<size_t>(max_num_batched_tokens);
+        if (dynamic_split_fuse >= 0) sched.dynamic_split_fuse = dynamic_split_fuse != 0;
+        if (enable_prefix_caching >= 0)
+            sched.enable_prefix_caching = enable_prefix_caching != 0;
+
+        ov::AnyMap props = collect_properties(properties_kv, properties_count);
+        auto p = std::make_unique<cascadia_cb_pipeline_t>();
+        p->pipe = std::make_unique<ov::genai::ContinuousBatchingPipeline>(
+            std::filesystem::path(model_path), sched, std::string(device), props);
+        p->tok = std::make_unique<ov::genai::Tokenizer>(p->pipe->get_tokenizer());
+        *out_handle = p.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_pipeline_create");
+        return 1;
+    }
+}
+
+void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle) { delete handle; }
+
+int32_t cascadia_cb_add_request(
+    cascadia_cb_pipeline_t* handle, uint64_t request_id, const char* prompt,
+    const cascadia_genconfig_t* cfg, cascadia_cb_handle_t** out_handle) {
+    if (!handle || !handle->pipe || !prompt || !cfg || !out_handle) {
+        set_last_error("null arg in cb_add_request");
+        return 1;
+    }
+    try {
+        auto h = std::make_unique<cascadia_cb_handle_t>();
+        h->handle =
+            handle->pipe->add_request(request_id, std::string(prompt), cfg->cfg);
+        *out_handle = h.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_add_request");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_step(cascadia_cb_pipeline_t* handle) {
+    if (!handle || !handle->pipe) {
+        set_last_error("null arg in cb_step");
+        return 1;
+    }
+    try {
+        if (handle->pipe->has_non_finished_requests()) {
+            handle->pipe->step();
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_step");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_has_unfinished(cascadia_cb_pipeline_t* handle, int32_t* out_has) {
+    if (!handle || !handle->pipe || !out_has) {
+        set_last_error("null arg in cb_has_unfinished");
+        return 1;
+    }
+    try {
+        *out_has = handle->pipe->has_non_finished_requests() ? 1 : 0;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_has_unfinished");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_handle_read(
+    cascadia_cb_pipeline_t* pipeline, cascadia_cb_handle_t* handle,
+    char** out_text_delta, uint32_t* out_new_tokens, int32_t* out_status) {
+    if (!pipeline || !pipeline->tok || !handle || !handle->handle ||
+        !out_text_delta || !out_new_tokens || !out_status) {
+        set_last_error("null arg in cb_handle_read");
+        return 1;
+    }
+    try {
+        const size_t before = handle->acc_ids.size();
+        if (handle->handle->can_read()) {
+            // read() surfaces tokens generated since the previous read().
+            // Single sequence per request (n / best_of are not exposed), so
+            // take the first (only) sequence output.
+            ov::genai::GenerationOutputs outs = handle->handle->read();
+            if (!outs.empty()) {
+                const auto& ids = outs.begin()->second.generated_ids;
+                handle->acc_ids.insert(handle->acc_ids.end(), ids.begin(), ids.end());
+            }
+        }
+
+        const auto status = handle->handle->get_status();
+        const bool running = status == ov::genai::GenerationStatus::RUNNING;
+        *out_status = running ? 0
+                      : status == ov::genai::GenerationStatus::FINISHED ? 1
+                                                                        : 2;
+
+        std::string full = pipeline->tok->decode(handle->acc_ids);
+        std::string delta;
+        if (full.size() > handle->emitted_bytes) {
+            delta = full.substr(handle->emitted_bytes);
+            if (running) {
+                const size_t hold = utf8_hold_back(delta);
+                delta.resize(delta.size() - hold);
+            }
+            handle->emitted_bytes += delta.size();
+        }
+        if (delta.size() > MAX_GENERATED_TEXT_BYTES) {
+            set_last_error("cb read delta exceeds MAX_GENERATED_TEXT_BYTES");
+            return 1;
+        }
+        char* buf = static_cast<char*>(std::malloc(delta.size() + 1));
+        if (!buf) {
+            set_last_error("malloc failure for cb delta");
+            return 1;
+        }
+        std::memcpy(buf, delta.data(), delta.size());
+        buf[delta.size()] = 0;
+        *out_text_delta = buf;
+        *out_new_tokens = static_cast<uint32_t>(handle->acc_ids.size() - before);
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_read");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
+    if (!handle || !handle->handle) {
+        set_last_error("null arg in cb_handle_cancel");
+        return 1;
+    }
+    try {
+        handle->handle->drop();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_cancel");
+        return 1;
+    }
+}
+
+void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle) { delete handle; }
+
+int32_t cascadia_cb_count_tokens(
+    cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count) {
+    if (!handle || !handle->tok || !text || !out_count) {
+        set_last_error("null arg in cb_count_tokens");
+        return 1;
+    }
+    try {
+        auto enc = handle->tok->encode(std::string(text));
+        const auto& shape = enc.input_ids.get_shape();
+        *out_count = shape.empty() ? 0 : static_cast<uint32_t>(shape.back());
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_count_tokens");
+        return 1;
+    }
+}
 
 // Tokenizer ownership: the returned handle is heap-allocated and the
 // caller MUST free it via cascadia_tokenizer_destroy() before destroying

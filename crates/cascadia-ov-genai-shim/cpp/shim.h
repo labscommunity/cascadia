@@ -117,6 +117,72 @@ int32_t cascadia_pipeline_generate(
 
 void cascadia_free_string(char* s);
 
+// ---- Continuous batching (ContinuousBatchingPipeline, issue #20) ----------
+//
+// One pipeline serves many concurrent requests: add_request() enrolls a
+// prompt into the running batch, step() advances every enrolled request by
+// one scheduler iteration, and per-request handles surface incremental
+// text. NOT thread-safe (like everything else here) — serialise from Rust.
+
+typedef struct cascadia_cb_pipeline_t cascadia_cb_pipeline_t;
+typedef struct cascadia_cb_handle_t cascadia_cb_handle_t;
+
+/// Scheduler knobs: 0 keeps the ov-genai default for the size fields;
+/// -1 keeps the default for the two tri-state booleans (0/1 = explicit).
+int32_t cascadia_cb_pipeline_create(
+    const char* model_path,
+    const char* device,
+    uint64_t cache_size_gb,
+    uint64_t max_num_seqs,
+    uint64_t max_num_batched_tokens,
+    int32_t dynamic_split_fuse,
+    int32_t enable_prefix_caching,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_cb_pipeline_t** out_handle);
+
+void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle);
+
+/// Enroll a prompt. `request_id` is caller-chosen and must be unique among
+/// live requests. The returned handle must be destroyed AFTER the request
+/// finishes or is cancelled, and before the pipeline is destroyed.
+int32_t cascadia_cb_add_request(
+    cascadia_cb_pipeline_t* handle,
+    uint64_t request_id,
+    const char* prompt,
+    const cascadia_genconfig_t* cfg,
+    cascadia_cb_handle_t** out_handle);
+
+/// Advance every enrolled request by one scheduler iteration. A no-op
+/// (returns 0) when nothing is enrolled.
+int32_t cascadia_cb_step(cascadia_cb_pipeline_t* handle);
+
+int32_t cascadia_cb_has_unfinished(
+    cascadia_cb_pipeline_t* handle, int32_t* out_has);
+
+/// Drain newly generated text for one request. `out_text_delta` receives
+/// the UTF-8 suffix generated since the previous read (possibly empty; free
+/// via cascadia_free_string); `out_new_tokens` the token count of that
+/// delta; `out_status` 0 = running, 1 = finished, 2 = dropped/ignored.
+/// Decodes the full accumulated sequence each call and emits the byte
+/// suffix, so multi-byte codepoints split across steps stay intact.
+int32_t cascadia_cb_handle_read(
+    cascadia_cb_pipeline_t* pipeline,
+    cascadia_cb_handle_t* handle,
+    char** out_text_delta,
+    uint32_t* out_new_tokens,
+    int32_t* out_status);
+
+/// Abort a running request (client disconnect / cancel). Safe on finished
+/// handles.
+int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle);
+
+void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle);
+
+/// Token count via the CB pipeline's tokenizer (usage reporting).
+int32_t cascadia_cb_count_tokens(
+    cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count);
+
 // ---- Tokenizer (workaround for missing C API) -----------------------------
 
 /// Borrow the pipeline's tokenizer. The returned handle is heap-allocated

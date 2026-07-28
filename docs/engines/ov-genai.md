@@ -86,9 +86,31 @@ Sweet spot is K=5 for short factual prompts; drop to K=3 for long-creative outpu
 - `--ov-cache-dir <path>` — persists kernel JIT compile results across runs. Cuts cold-start by ~62% on second+ launches. **Recommended for any non-throwaway deployment.**
 - `--ov-kv-precision {u8,f16}` and `--ov-dyn-quant-group <N>` — exposed for debugging only; defaults are already optimal on Battlemage / Lunar Lake.
 
+## Continuous batching (`--cb`, #20)
+
+`--cb` swaps the `LLMPipeline` for ov-genai's `ContinuousBatchingPipeline`:
+concurrent requests join one paged-attention batch, each `step()` advances
+every in-flight request by one scheduler iteration, and each request streams
+incremental text deltas (unlike the default engine's one-chunk-per-task).
+`cancel()` aborts a single request mid-generation without touching the rest
+of the batch. Tune with `--cb-cache-size`, `--cb-max-num-seqs`,
+`--cb-max-batched-tokens`, `--cb-dynamic-split-fuse`, `--cb-prefix-caching`
+(zeros/unset keep ov-genai defaults).
+
+Device note: paged attention is a CPU/GPU-plugin capability. On NPU,
+ov-genai serves the static NPUW pipeline — `--cb` will fail at compile
+there; run NPU workers without `--cb` (requests queue sequentially).
+
+```bash
+cascadia worker --engine ov-genai --model ~/models/qwen3-8b-int4-ov \
+  --device GPU --cb --cb-cache-size 4 --cb-max-num-seqs 32 \
+  --cb-prefix-caching true --listen :8000
+```
+
 ## Limitations
 
 - **Single-stage only.** No pipeline parallelism (`--total 1` enforced).
-- **Streaming**: yields one chunk per task with `is_final=True`. Per-token streaming is a follow-up.
+- **Streaming**: the default path yields one chunk per task with `is_final=True`; `--cb` streams per-iteration text deltas.
 - **Draft / target tokeniser must match.** FastDraft companions are trained per target family; mixing across families won't work.
 - **`--draft-model` and `--prompt-lookup` are mutually exclusive.** Both set `GenerationConfig.num_assistant_tokens`; the validator rejects the combination.
+- **`--cb` is incompatible with `--draft-model` / `--prompt-lookup` and with VLM-layout exports.** The CB scheduler owns batch composition; speculative CB is a follow-up.

@@ -417,6 +417,37 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub prompt_lookup: u32,
 
+    /// Continuous batching (#20, ov-genai only): serve concurrent requests
+    /// through one ContinuousBatchingPipeline (paged attention; CPU/GPU
+    /// plugins) instead of one generation at a time. Incompatible with
+    /// --draft-model / --prompt-lookup.
+    #[arg(long)]
+    pub cb: bool,
+
+    /// KV-cache size in GB for --cb (0 = ov-genai dynamic allocation).
+    #[arg(long, default_value_t = 0)]
+    pub cb_cache_size: u64,
+
+    /// Max sequences batched per iteration for --cb (0 = ov-genai default,
+    /// 256).
+    #[arg(long, default_value_t = 0)]
+    pub cb_max_num_seqs: u64,
+
+    /// Max tokens batched per iteration for --cb (0 = ov-genai default,
+    /// 256).
+    #[arg(long, default_value_t = 0)]
+    pub cb_max_batched_tokens: u64,
+
+    /// Override the dynamic-split-fuse scheduler toggle for --cb
+    /// (unset = ov-genai default, on).
+    #[arg(long)]
+    pub cb_dynamic_split_fuse: Option<bool>,
+
+    /// Enable KV-block prefix caching across requests for --cb
+    /// (unset = ov-genai default, off).
+    #[arg(long)]
+    pub cb_prefix_caching: Option<bool>,
+
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
@@ -622,6 +653,12 @@ impl WorkerArgs {
             draft_device: None,
             spec_k: 5,
             prompt_lookup: 0,
+            cb: false,
+            cb_cache_size: 0,
+            cb_max_num_seqs: 0,
+            cb_max_batched_tokens: 0,
+            cb_dynamic_split_fuse: None,
+            cb_prefix_caching: None,
             max_tokens: 64,
             advertise_engines: Vec::new(),
             advertise_device: None,
@@ -1126,7 +1163,21 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                     "--draft-model and --prompt-lookup are mutually exclusive"
                 ));
             }
+            if args.cb && (args.draft_model.is_some() || args.prompt_lookup > 0) {
+                return Err(anyhow!(
+                    "--cb is incompatible with --draft-model / --prompt-lookup"
+                ));
+            }
             let mut b = OvGenaiBuilder::new(&args.model, &args.device);
+            if args.cb {
+                b = b.with_continuous_batching(cascadia_ov_genai_shim::CbSchedulerConfig {
+                    cache_size_gb: args.cb_cache_size,
+                    max_num_seqs: args.cb_max_num_seqs,
+                    max_num_batched_tokens: args.cb_max_batched_tokens,
+                    dynamic_split_fuse: args.cb_dynamic_split_fuse,
+                    enable_prefix_caching: args.cb_prefix_caching,
+                });
+            }
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1412,6 +1463,29 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         return Err(anyhow!(
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
+    }
+    // Continuous batching (#20) lives in the ov-genai CBP path only.
+    if (args.cb
+        || args.cb_cache_size > 0
+        || args.cb_max_num_seqs > 0
+        || args.cb_max_batched_tokens > 0
+        || args.cb_dynamic_split_fuse.is_some()
+        || args.cb_prefix_caching.is_some())
+        && args.engine != EngineKind::OvGenai
+    {
+        return Err(anyhow!(
+            "--cb / --cb-* flags require --engine ov-genai (continuous batching is \
+             served by ov-genai's ContinuousBatchingPipeline)"
+        ));
+    }
+    if !args.cb
+        && (args.cb_cache_size > 0
+            || args.cb_max_num_seqs > 0
+            || args.cb_max_batched_tokens > 0
+            || args.cb_dynamic_split_fuse.is_some()
+            || args.cb_prefix_caching.is_some())
+    {
+        return Err(anyhow!("--cb-* tuning flags require --cb"));
     }
     Ok(())
 }
@@ -2234,6 +2308,45 @@ mod python_tests {
     fn worker_flags_accept_valid_phase_split() {
         let mut a = worker("m", EngineKind::OvRuntime);
         a.prefill_device = Some("NPU".into());
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// Continuous batching lives in ov-genai's CBP path; --cb on any other
+    /// engine is rejected loudly, not silently ignored.
+    #[test]
+    fn worker_flags_reject_cb_without_ov_genai() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.cb = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
+
+        // Tuning flags alone (without --cb) trip the same engine gate.
+        let mut a = worker("m", EngineKind::Mock);
+        a.cb_max_num_seqs = 32;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
+    }
+
+    /// --cb-* tuning knobs without --cb are a misconfiguration, even on
+    /// ov-genai — the operator believes batching is on when it is not.
+    #[test]
+    fn worker_flags_reject_cb_tuning_without_cb() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb_cache_size = 4;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--cb"), "{err}");
+    }
+
+    /// The full CB flag set on ov-genai passes validation.
+    #[test]
+    fn worker_flags_accept_cb_on_ov_genai() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.cb_cache_size = 4;
+        a.cb_max_num_seqs = 32;
+        a.cb_max_batched_tokens = 2048;
+        a.cb_dynamic_split_fuse = Some(true);
+        a.cb_prefix_caching = Some(true);
         assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 

@@ -17,7 +17,10 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_ov_genai_shim::{Error as OvError, GenConfig, LlmPipeline, PluginConfig};
+use cascadia_ov_genai_shim::{
+    CbHandle, CbPipeline, CbSchedulerConfig, CbStatus, Error as OvError, GenConfig, LlmPipeline,
+    PluginConfig,
+};
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
     TaskId,
@@ -42,7 +45,11 @@ pub struct OvGenaiBuilder {
     /// True when the API pre-renders the model's chat template (so the engine
     /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
     pub prompt_pretemplated: bool,
+    /// Continuous batching (#20): serve concurrent requests through one
+    /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
+    pub continuous_batching: Option<CbSchedulerConfig>,
     pipe: Option<LlmPipeline>,
+    cb_pipe: Option<CbPipeline>,
 }
 
 impl OvGenaiBuilder {
@@ -59,8 +66,16 @@ impl OvGenaiBuilder {
             speculative_k: 0,
             prompt_lookup_ngram: 0,
             prompt_pretemplated: false,
+            continuous_batching: None,
             pipe: None,
+            cb_pipe: None,
         }
+    }
+
+    /// Enable continuous batching (#20) with the given scheduler knobs.
+    pub fn with_continuous_batching(mut self, sched: CbSchedulerConfig) -> Self {
+        self.continuous_batching = Some(sched);
+        self
     }
 
     /// Set when the API renders the chat template itself (template loaded).
@@ -191,6 +206,15 @@ impl Builder for OvGenaiBuilder {
                     .into(),
             ));
         }
+        if self.continuous_batching.is_some()
+            && (self.draft_model_path.is_some() || self.prompt_lookup_ngram > 0)
+        {
+            return Err(EngineError::InvalidConfig(
+                "--cb is incompatible with --draft-model / --prompt-lookup: the \
+                 continuous-batching scheduler owns batch composition. Drop one."
+                    .into(),
+            ));
+        }
 
         if !PathBuf::from(&self.model_path).exists() {
             return Err(EngineError::ModelNotFound(self.model_path.clone()));
@@ -219,6 +243,25 @@ impl Builder for OvGenaiBuilder {
         let model_dir = PathBuf::from(&self.model_path);
         let is_vlm_layout = model_dir.join("openvino_language_model.xml").exists()
             && !model_dir.join("openvino_model.xml").exists();
+        if let Some(sched) = &self.continuous_batching {
+            if is_vlm_layout {
+                return Err(EngineError::InvalidConfig(
+                    "--cb is not supported on VLM-layout exports; \
+                     ContinuousBatchingPipeline needs a plain LM export"
+                        .into(),
+                ));
+            }
+            progress.push(LoadProgress::message(format!(
+                "compiling ContinuousBatchingPipeline on {} (cache {} GB, max_num_seqs {}, \
+                 max_batched_tokens {})",
+                self.device, sched.cache_size_gb, sched.max_num_seqs, sched.max_num_batched_tokens,
+            )));
+            let pipe = CbPipeline::new(&self.model_path, &self.device, sched, &plugin)
+                .map_err(map_ov_err)?;
+            progress.push(LoadProgress::ready());
+            self.cb_pipe = Some(pipe);
+            return Ok(Box::pin(stream::iter(progress)));
+        }
         let pipe = if is_vlm_layout {
             if self.draft_model_path.is_some() {
                 return Err(EngineError::InvalidConfig(
@@ -276,6 +319,15 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(pipe) = self.cb_pipe {
+            return Ok(Box::new(OvGenaiCbEngine {
+                active: Vec::new(),
+                pipe,
+                prompt_pretemplated: self.prompt_pretemplated,
+                next_request_id: 0,
+                max_tokens_default: 256,
+            }));
+        }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
@@ -430,6 +482,254 @@ impl Engine for OvGenaiEngine {
     }
 }
 
+/// Per-request generation state on the continuous-batching engine.
+struct ActiveCbTask {
+    task_id: TaskId,
+    handle: CbHandle,
+    total_tokens: u32,
+    max_tokens: u32,
+    prompt_tokens: Option<u32>,
+    started: Instant,
+}
+
+/// Continuous-batching ov-genai engine (#20). Unlike [`OvGenaiEngine`]'s
+/// monolithic step (one whole generation per call), every `step()` advances
+/// ALL in-flight requests by one scheduler iteration and emits one text
+/// delta per progressed request — the runner's per-task chunk buffers route
+/// each delta to its owner. `submit()` enrolls into the running batch
+/// immediately, so a request arriving mid-generation joins the next
+/// iteration instead of waiting for the batch to drain.
+pub struct OvGenaiCbEngine {
+    // Declared before `pipe`: CbHandles must drop before their pipeline.
+    active: Vec<ActiveCbTask>,
+    pipe: CbPipeline,
+    prompt_pretemplated: bool,
+    next_request_id: u64,
+    max_tokens_default: u32,
+}
+
+impl Engine for OvGenaiCbEngine {
+    fn warmup(&mut self) {
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            /*max_tokens*/ 4,
+            /*temperature*/ 0.0,
+            /*enable_thinking*/ false,
+            &SamplingParams::default(),
+        );
+        // u64::MAX cannot collide with the sequential request-id counter.
+        match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
+            Ok(handle) => {
+                for _ in 0..64 {
+                    if self.pipe.step().is_err() {
+                        break;
+                    }
+                    match self.pipe.read(&handle) {
+                        Ok(r) if r.status != CbStatus::Running => break,
+                        Err(_) => break,
+                        _ => {}
+                    }
+                }
+                info!("ov-genai continuous-batching warmup ok");
+            }
+            Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
+        }
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.active.iter().any(|t| t.task_id == task.task_id) {
+            return Ok(());
+        }
+        if self.active.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            return Err(EngineError::QueueFull {
+                queued: self.active.len(),
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            });
+        }
+        let max_tokens = if task.max_tokens > 0 {
+            task.max_tokens
+        } else {
+            self.max_tokens_default
+        };
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            max_tokens,
+            task.temperature,
+            task.enable_thinking,
+            &task.sampling,
+        );
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let handle = self
+            .pipe
+            .add_request(request_id, &task.prompt, &cfg)
+            .map_err(map_ov_err)?;
+        self.active.push(ActiveCbTask {
+            prompt_tokens: self.pipe.count_tokens(&task.prompt),
+            task_id: task.task_id,
+            handle,
+            total_tokens: 0,
+            max_tokens,
+            started: Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Per-request abort — the CB scheduler frees the request's KV blocks
+        // on the next iteration; every other in-flight request is untouched.
+        // (The monolithic engine can only drop queued tasks; see
+        // OvGenaiEngine::cancel.)
+        if let Some(idx) = self.active.iter().position(|t| &t.task_id == task_id) {
+            let t = self.active.swap_remove(idx);
+            if let Err(err) = t.handle.cancel() {
+                warn!(task = %task_id, error = %err, "cb cancel failed");
+            }
+        }
+    }
+
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.active.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Err(err) = self.pipe.step() {
+            // A failed scheduler iteration poisons every in-flight request:
+            // fail them all explicitly rather than spinning on a broken batch.
+            warn!(error = %err, in_flight = self.active.len(), "cb step failed");
+            let failed = self
+                .active
+                .drain(..)
+                .map(|t| {
+                    let chunk = Chunk::error(t.task_id.clone(), format!("cb step failed: {err}"));
+                    (t.task_id, chunk)
+                })
+                .collect();
+            return Ok(failed);
+        }
+
+        let mut out = Vec::new();
+        let mut idx = 0;
+        while idx < self.active.len() {
+            let read = match self.pipe.read(&self.active[idx].handle) {
+                Ok(r) => r,
+                Err(err) => {
+                    let t = self.active.swap_remove(idx);
+                    warn!(task = %t.task_id, error = %err, "cb read failed");
+                    let chunk = Chunk::error(t.task_id.clone(), format!("cb read failed: {err}"));
+                    out.push((t.task_id, chunk));
+                    continue;
+                }
+            };
+            self.active[idx].total_tokens += read.new_tokens;
+            match read.status {
+                CbStatus::Running => {
+                    if !read.text_delta.is_empty() {
+                        let t = &self.active[idx];
+                        out.push((
+                            t.task_id.clone(),
+                            Chunk::token(t.task_id.clone(), 0, read.text_delta),
+                        ));
+                    }
+                    idx += 1;
+                }
+                CbStatus::Finished | CbStatus::Dropped => {
+                    let t = self.active.swap_remove(idx);
+                    let elapsed = t.started.elapsed().as_secs_f64();
+                    let tok_s = if elapsed > 0.0 {
+                        t.total_tokens as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        task = %t.task_id,
+                        tokens = t.total_tokens,
+                        elapsed_s = elapsed,
+                        tok_s,
+                        in_flight = self.active.len(),
+                        "cb task done"
+                    );
+                    let finish = if t.total_tokens >= t.max_tokens {
+                        FinishReason::Length
+                    } else {
+                        FinishReason::Stop
+                    };
+                    let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
+                        .with_n_tokens(t.total_tokens)
+                        .with_finish_reason(finish);
+                    if let Some(prompt_tokens) = t.prompt_tokens {
+                        chunk = chunk.with_prompt_tokens(prompt_tokens);
+                    }
+                    out.push((t.task_id, chunk));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
+/// passes 0 for the speculative knobs — the CB scheduler owns batching).
+fn build_gen_config(
+    speculative_k: u32,
+    prompt_lookup_ngram: u32,
+    prompt_pretemplated: bool,
+    max_tokens: u32,
+    temperature: f32,
+    enable_thinking: bool,
+    sampling: &SamplingParams,
+) -> GenConfig {
+    let do_sample = temperature > 0.0;
+    let mut cfg = GenConfig {
+        max_new_tokens: max_tokens,
+        do_sample,
+        temperature: if do_sample { temperature } else { 0.0 },
+        num_assistant_tokens: 0,
+        max_ngram_size: 0,
+        // Hybrid: only when the API rendered the template for us — i.e. a
+        // template loaded AND this request is thinking-OFF — do we tell
+        // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
+        // native templating (the legacy join the API emitted), untouched.
+        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // OpenAI sampling knobs (#14). top_p/top_k take effect in the
+        // sampling regime (do_sample, i.e. temperature > 0); penalties and
+        // seed are forwarded regardless.
+        //
+        // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
+        // forwarded to GenerationConfig.rng_seed, but it does NOT make
+        // ov-genai reproducible across requests on this reused
+        // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
+        // the seed VALUE CHANGES between consecutive generate() calls
+        // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
+        // and never calls `clear_request_info`, so two identical seeds in a
+        // row reuse the advanced RNG and diverge. Different seeds DO change
+        // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
+        // honor seed fully (they re-seed per request). Per-request
+        // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
+        // request context per request) — tracked with #20.
+        top_p: if sampling.top_p > 0.0 {
+            sampling.top_p.min(1.0)
+        } else {
+            1.0
+        },
+        top_k: sampling.top_k,
+        frequency_penalty: sampling.frequency_penalty,
+        presence_penalty: sampling.presence_penalty,
+        seed: sampling.seed,
+    };
+    if speculative_k > 0 {
+        cfg.num_assistant_tokens = speculative_k;
+    }
+    if prompt_lookup_ngram > 0 {
+        cfg.num_assistant_tokens = speculative_k.max(5);
+        cfg.max_ngram_size = prompt_lookup_ngram;
+    }
+    cfg
+}
+
 impl OvGenaiEngine {
     fn gen_config(
         &self,
@@ -438,52 +738,15 @@ impl OvGenaiEngine {
         enable_thinking: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
-        let do_sample = temperature > 0.0;
-        let mut cfg = GenConfig {
-            max_new_tokens: max_tokens,
-            do_sample,
-            temperature: if do_sample { temperature } else { 0.0 },
-            num_assistant_tokens: 0,
-            max_ngram_size: 0,
-            // Hybrid: only when the API rendered the template for us — i.e. a
-            // template loaded AND this request is thinking-OFF — do we tell
-            // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
-            // native templating (the legacy join the API emitted), untouched.
-            skip_chat_template: self.prompt_pretemplated && !enable_thinking,
-            // OpenAI sampling knobs (#14). top_p/top_k take effect in the
-            // sampling regime (do_sample, i.e. temperature > 0); penalties and
-            // seed are forwarded regardless.
-            //
-            // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
-            // forwarded to GenerationConfig.rng_seed, but it does NOT make
-            // ov-genai reproducible across requests on this reused
-            // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
-            // the seed VALUE CHANGES between consecutive generate() calls
-            // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
-            // and never calls `clear_request_info`, so two identical seeds in a
-            // row reuse the advanced RNG and diverge. Different seeds DO change
-            // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
-            // honor seed fully (they re-seed per request). Per-request
-            // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
-            // request context per request) — tracked with #20.
-            top_p: if sampling.top_p > 0.0 {
-                sampling.top_p.min(1.0)
-            } else {
-                1.0
-            },
-            top_k: sampling.top_k,
-            frequency_penalty: sampling.frequency_penalty,
-            presence_penalty: sampling.presence_penalty,
-            seed: sampling.seed,
-        };
-        if self.speculative_k > 0 {
-            cfg.num_assistant_tokens = self.speculative_k;
-        }
-        if self.prompt_lookup_ngram > 0 {
-            cfg.num_assistant_tokens = self.speculative_k.max(5);
-            cfg.max_ngram_size = self.prompt_lookup_ngram;
-        }
-        cfg
+        build_gen_config(
+            self.speculative_k,
+            self.prompt_lookup_ngram,
+            self.prompt_pretemplated,
+            max_tokens,
+            temperature,
+            enable_thinking,
+            sampling,
+        )
     }
 }
 
@@ -554,6 +817,68 @@ mod tests {
         let shard = ShardSpec::single_stage("model", "CPU");
         let res = b.load(shard).await;
         assert!(matches!(res, Err(EngineError::ModelNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn cb_rejects_draft_and_prompt_lookup() {
+        for b in [
+            OvGenaiBuilder::new("/missing", "CPU")
+                .with_continuous_batching(CbSchedulerConfig::default())
+                .with_draft("/draft/missing", "CPU", 5),
+            OvGenaiBuilder::new("/missing", "CPU")
+                .with_continuous_batching(CbSchedulerConfig::default())
+                .with_prompt_lookup(3),
+        ] {
+            let mut b = b;
+            let shard = ShardSpec::single_stage("model", "CPU");
+            let err = b.load(shard).await.err().expect("must reject");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, EngineError::InvalidConfig(_)) && msg.contains("--cb"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cb_rejects_vlm_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "openvino_language_model.xml",
+            "openvino_tokenizer.xml",
+            "openvino_detokenizer.xml",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
+            .with_continuous_batching(CbSchedulerConfig::default());
+        let shard = ShardSpec::single_stage("model", "CPU");
+        let err = b.load(shard).await.err().expect("must reject");
+        assert!(err.to_string().contains("VLM-layout"), "{err}");
+    }
+
+    /// Stub builds surface a Backend error from CbPipeline::new — proves the
+    /// CB branch is reached with a valid LM-layout dir (and on the AI-PC lane
+    /// with `--features openvino` this same path compiles a real pipeline).
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn cb_load_reaches_pipeline_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "openvino_model.xml",
+            "openvino_tokenizer.xml",
+            "openvino_detokenizer.xml",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
+            .with_continuous_batching(CbSchedulerConfig::default());
+        let shard = ShardSpec::single_stage("model", "CPU");
+        let err = b.load(shard).await.err().expect("stub must error");
+        assert!(
+            matches!(err, EngineError::Backend(_)),
+            "expected stub Backend error, got {err}"
+        );
     }
 
     #[tokio::test]

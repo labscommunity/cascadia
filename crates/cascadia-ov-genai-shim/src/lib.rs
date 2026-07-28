@@ -60,6 +60,14 @@ mod sys {
     pub struct cascadia_runtime_t {
         _private: [u8; 0],
     }
+    #[repr(C)]
+    pub struct cascadia_cb_pipeline_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct cascadia_cb_handle_t {
+        _private: [u8; 0],
+    }
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
@@ -136,6 +144,46 @@ mod sys {
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
+
+        pub fn cascadia_cb_pipeline_create(
+            model_path: *const c_char,
+            device: *const c_char,
+            cache_size_gb: u64,
+            max_num_seqs: u64,
+            max_num_batched_tokens: u64,
+            dynamic_split_fuse: i32,
+            enable_prefix_caching: i32,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_cb_pipeline_t,
+        ) -> c_int;
+        pub fn cascadia_cb_pipeline_destroy(handle: *mut cascadia_cb_pipeline_t);
+        pub fn cascadia_cb_add_request(
+            handle: *mut cascadia_cb_pipeline_t,
+            request_id: u64,
+            prompt: *const c_char,
+            cfg: *const cascadia_genconfig_t,
+            out_handle: *mut *mut cascadia_cb_handle_t,
+        ) -> c_int;
+        pub fn cascadia_cb_step(handle: *mut cascadia_cb_pipeline_t) -> c_int;
+        pub fn cascadia_cb_has_unfinished(
+            handle: *mut cascadia_cb_pipeline_t,
+            out_has: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_cb_handle_read(
+            pipeline: *mut cascadia_cb_pipeline_t,
+            handle: *mut cascadia_cb_handle_t,
+            out_text_delta: *mut *mut c_char,
+            out_new_tokens: *mut u32,
+            out_status: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_cb_handle_cancel(handle: *mut cascadia_cb_handle_t) -> c_int;
+        pub fn cascadia_cb_handle_destroy(handle: *mut cascadia_cb_handle_t);
+        pub fn cascadia_cb_count_tokens(
+            handle: *mut cascadia_cb_pipeline_t,
+            text: *const c_char,
+            out_count: *mut u32,
+        ) -> c_int;
 
         pub fn cascadia_pipeline_get_tokenizer(
             handle: *mut cascadia_pipeline_t,
@@ -286,6 +334,46 @@ mod sys {
             out_len: *mut usize,
         ) -> c_int;
     }
+}
+
+/// Build a native genconfig from `cfg`. The caller owns the returned pointer
+/// and must release it with `cascadia_genconfig_destroy`.
+///
+/// # Safety
+/// Caller must be on the `openvino` build (native shim linked).
+#[cfg(feature = "openvino")]
+unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconfig_t> {
+    let raw_cfg = sys::cascadia_genconfig_new();
+    if raw_cfg.is_null() {
+        return Err(Error::Native("genconfig allocation failed".into()));
+    }
+    sys::cascadia_genconfig_set_max_new_tokens(raw_cfg, cfg.max_new_tokens.max(1));
+    sys::cascadia_genconfig_set_do_sample(raw_cfg, if cfg.do_sample { 1 } else { 0 });
+    sys::cascadia_genconfig_set_temperature(raw_cfg, cfg.temperature.max(0.0));
+    if cfg.num_assistant_tokens > 0 {
+        sys::cascadia_genconfig_set_num_assistant_tokens(raw_cfg, cfg.num_assistant_tokens);
+    }
+    if cfg.max_ngram_size > 0 {
+        sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
+    }
+    sys::cascadia_genconfig_set_apply_chat_template(
+        raw_cfg,
+        if cfg.skip_chat_template { 0 } else { 1 },
+    );
+    // OpenAI-compatible sampling knobs (#14). top_p / penalties take
+    // their OV defaults (1.0 / 0.0) when unset, so setting them is a
+    // no-op; top_k=0 and seed=None mean "disabled" so only forward
+    // when explicitly chosen (OV treats top_k=0 as no truncation).
+    sys::cascadia_genconfig_set_top_p(raw_cfg, cfg.top_p);
+    if cfg.top_k > 0 {
+        sys::cascadia_genconfig_set_top_k(raw_cfg, cfg.top_k);
+    }
+    sys::cascadia_genconfig_set_frequency_penalty(raw_cfg, cfg.frequency_penalty);
+    sys::cascadia_genconfig_set_presence_penalty(raw_cfg, cfg.presence_penalty);
+    if let Some(seed) = cfg.seed {
+        sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
+    }
+    Ok(raw_cfg)
 }
 
 #[cfg(feature = "openvino")]
@@ -487,36 +575,7 @@ impl LlmPipeline {
     pub fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
         unsafe {
-            let raw_cfg = sys::cascadia_genconfig_new();
-            if raw_cfg.is_null() {
-                return Err(Error::Native("genconfig allocation failed".into()));
-            }
-            sys::cascadia_genconfig_set_max_new_tokens(raw_cfg, cfg.max_new_tokens.max(1));
-            sys::cascadia_genconfig_set_do_sample(raw_cfg, if cfg.do_sample { 1 } else { 0 });
-            sys::cascadia_genconfig_set_temperature(raw_cfg, cfg.temperature.max(0.0));
-            if cfg.num_assistant_tokens > 0 {
-                sys::cascadia_genconfig_set_num_assistant_tokens(raw_cfg, cfg.num_assistant_tokens);
-            }
-            if cfg.max_ngram_size > 0 {
-                sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
-            }
-            sys::cascadia_genconfig_set_apply_chat_template(
-                raw_cfg,
-                if cfg.skip_chat_template { 0 } else { 1 },
-            );
-            // OpenAI-compatible sampling knobs (#14). top_p / penalties take
-            // their OV defaults (1.0 / 0.0) when unset, so setting them is a
-            // no-op; top_k=0 and seed=None mean "disabled" so only forward
-            // when explicitly chosen (OV treats top_k=0 as no truncation).
-            sys::cascadia_genconfig_set_top_p(raw_cfg, cfg.top_p);
-            if cfg.top_k > 0 {
-                sys::cascadia_genconfig_set_top_k(raw_cfg, cfg.top_k);
-            }
-            sys::cascadia_genconfig_set_frequency_penalty(raw_cfg, cfg.frequency_penalty);
-            sys::cascadia_genconfig_set_presence_penalty(raw_cfg, cfg.presence_penalty);
-            if let Some(seed) = cfg.seed {
-                sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
-            }
+            let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
@@ -573,6 +632,262 @@ impl Drop for LlmPipeline {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { sys::cascadia_pipeline_destroy(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+/// Scheduler knobs for [`CbPipeline`]. Zero / `None` keep ov-genai defaults
+/// (cache_size 0 = dynamic KV allocation, max_num_seqs 256,
+/// max_num_batched_tokens 256, dynamic_split_fuse on, prefix caching off).
+#[derive(Clone, Debug, Default)]
+pub struct CbSchedulerConfig {
+    pub cache_size_gb: u64,
+    pub max_num_seqs: u64,
+    pub max_num_batched_tokens: u64,
+    pub dynamic_split_fuse: Option<bool>,
+    pub enable_prefix_caching: Option<bool>,
+}
+
+/// Per-request generation state reported by [`CbPipeline::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CbStatus {
+    Running,
+    Finished,
+    /// Dropped/ignored by the pipeline (cancelled, or evicted by OV).
+    Dropped,
+}
+
+/// One incremental read: the newly generated text suffix plus its token count.
+#[derive(Clone, Debug)]
+pub struct CbRead {
+    pub text_delta: String,
+    pub new_tokens: u32,
+    pub status: CbStatus,
+}
+
+/// Owned `ContinuousBatchingPipeline` handle (issue #20). One pipeline
+/// serves many concurrent requests; [`CbHandle`]s must be dropped before
+/// the pipeline they came from.
+pub struct CbPipeline {
+    #[cfg(feature = "openvino")]
+    handle: *mut sys::cascadia_cb_pipeline_t,
+}
+
+// Serialised behind the runner's engine mutex, like LlmPipeline.
+unsafe impl Send for CbPipeline {}
+
+/// Owned per-request generation handle from [`CbPipeline::add_request`].
+pub struct CbHandle {
+    #[cfg(feature = "openvino")]
+    handle: *mut sys::cascadia_cb_handle_t,
+}
+
+unsafe impl Send for CbHandle {}
+
+impl CbPipeline {
+    #[cfg(not(feature = "openvino"))]
+    pub fn new(
+        _model_path: &str,
+        _device: &str,
+        _sched: &CbSchedulerConfig,
+        _plugin: &PluginConfig,
+    ) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    pub fn new(
+        model_path: &str,
+        device: &str,
+        sched: &CbSchedulerConfig,
+        plugin: &PluginConfig,
+    ) -> Result<Self> {
+        let model_c = cstr(model_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        let tri = |v: Option<bool>| match v {
+            None => -1i32,
+            Some(false) => 0,
+            Some(true) => 1,
+        };
+        let mut handle: *mut sys::cascadia_cb_pipeline_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::cascadia_cb_pipeline_create(
+                model_c.as_ptr(),
+                device_c.as_ptr(),
+                sched.cache_size_gb,
+                sched.max_num_seqs,
+                sched.max_num_batched_tokens,
+                tri(sched.dynamic_split_fuse),
+                tri(sched.enable_prefix_caching),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self { handle })
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn add_request(
+        &self,
+        _request_id: u64,
+        _prompt: &str,
+        _cfg: &GenConfig,
+    ) -> Result<CbHandle> {
+        Err(Error::Stub)
+    }
+
+    /// Enroll a prompt into the running batch. `request_id` must be unique
+    /// among live requests on this pipeline.
+    #[cfg(feature = "openvino")]
+    pub fn add_request(&self, request_id: u64, prompt: &str, cfg: &GenConfig) -> Result<CbHandle> {
+        let prompt_c = cstr(prompt)?;
+        unsafe {
+            let raw_cfg = native_genconfig(cfg)?;
+            let mut handle: *mut sys::cascadia_cb_handle_t = ptr::null_mut();
+            let rc = sys::cascadia_cb_add_request(
+                self.handle,
+                request_id,
+                prompt_c.as_ptr(),
+                raw_cfg,
+                &mut handle,
+            );
+            sys::cascadia_genconfig_destroy(raw_cfg);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(CbHandle { handle })
+        }
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn step(&self) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Advance every enrolled request by one scheduler iteration.
+    #[cfg(feature = "openvino")]
+    pub fn step(&self) -> Result<()> {
+        let rc = unsafe { sys::cascadia_cb_step(self.handle) };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn has_unfinished(&self) -> Result<bool> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    pub fn has_unfinished(&self) -> Result<bool> {
+        let mut has: i32 = 0;
+        let rc = unsafe { sys::cascadia_cb_has_unfinished(self.handle, &mut has) };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(has != 0)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn read(&self, _handle: &CbHandle) -> Result<CbRead> {
+        Err(Error::Stub)
+    }
+
+    /// Drain newly generated text for one request since the previous read.
+    #[cfg(feature = "openvino")]
+    pub fn read(&self, handle: &CbHandle) -> Result<CbRead> {
+        unsafe {
+            let mut text_p: *mut c_char = ptr::null_mut();
+            let mut new_tokens: u32 = 0;
+            let mut status: i32 = 0;
+            let rc = sys::cascadia_cb_handle_read(
+                self.handle,
+                handle.handle,
+                &mut text_p,
+                &mut new_tokens,
+                &mut status,
+            );
+            if rc != 0 || text_p.is_null() {
+                return Err(Error::Native(last_native_error()));
+            }
+            let text_delta = CStr::from_ptr(text_p).to_string_lossy().into_owned();
+            sys::cascadia_free_string(text_p);
+            Ok(CbRead {
+                text_delta,
+                new_tokens,
+                status: match status {
+                    0 => CbStatus::Running,
+                    1 => CbStatus::Finished,
+                    _ => CbStatus::Dropped,
+                },
+            })
+        }
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+        None
+    }
+
+    /// Best-effort token count via the pipeline's tokenizer.
+    #[cfg(feature = "openvino")]
+    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+        let text_c = cstr(text).ok()?;
+        let mut out: u32 = 0;
+        let rc = unsafe { sys::cascadia_cb_count_tokens(self.handle, text_c.as_ptr(), &mut out) };
+        if rc != 0 {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for CbPipeline {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sys::cascadia_cb_pipeline_destroy(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+impl CbHandle {
+    #[cfg(not(feature = "openvino"))]
+    pub fn cancel(&self) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Abort this request (client disconnect / cancel). Safe when already
+    /// finished.
+    #[cfg(feature = "openvino")]
+    pub fn cancel(&self) -> Result<()> {
+        let rc = unsafe { sys::cascadia_cb_handle_cancel(self.handle) };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for CbHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sys::cascadia_cb_handle_destroy(self.handle) };
             self.handle = ptr::null_mut();
         }
     }
