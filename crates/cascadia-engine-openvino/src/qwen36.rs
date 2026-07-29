@@ -55,6 +55,30 @@ const PREFILL_CHUNK: usize = 256;
 /// traverse the identical kernel ⇒ bit-identical states ⇒ byte-identical greedy (cross-chain warm==cold
 /// cert passes). Opt-in only — production keeps chunked prefill; warm-resume there stays
 /// greedy-equivalent, not bit-identical. Read per chunk (a handful of times per prefill; negligible).
+/// `CASCADIA_QWEN36_FP_AT=<pos>` ⇒ fingerprint the declared state whenever a fold reaches `pos`,
+/// on BOTH the warm path (right after restore) and the cold one (mid-prefill). Warm resumes at
+/// `pos` and cold passes through it, so the pair isolates where they part: equal at `pos` but
+/// unequal later ⇒ the divergence comes from state OUTSIDE the declared blob (set_state_blob
+/// round-trips exactly, so a declared-level restore alone cannot explain it); unequal already at
+/// `pos` ⇒ the captured turn-1 state itself differs from a cold fold of the same tokens.
+fn fp_at() -> Option<usize> {
+    std::env::var("CASCADIA_QWEN36_FP_AT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+/// `CASCADIA_QWEN36_SELFCHK=<pos>` ⇒ on a COLD prefill, when the fold reaches `pos`, capture the
+/// state, recreate the request, restore the capture, and carry on. Same tokens, same code path, same
+/// positions as a plain cold run — the ONLY difference is that the state made a round trip through
+/// capture→recreate→restore. If the continuation still diverges from an untouched cold run, the
+/// restore machinery itself is unfaithful (and this is a minimal OV repro, with zero warm-path
+/// confounders). If it matches, restore is sound and the warm path's *inputs* are the problem.
+fn selfchk_at() -> Option<usize> {
+    std::env::var("CASCADIA_QWEN36_SELFCHK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
 fn prefill_chunk() -> usize {
     if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
         1
@@ -147,9 +171,32 @@ pub struct Qwen36Builder {
     tokenizer: Option<Tokenizer>,
     eos: Option<u32>,
     last_logits_only: bool,
+    /// Issue-34: KV-cache STORAGE precision. Distinct from the compute-precision hints noted at the
+    /// PluginConfig site (those are f16-only on the fused MoE gemm and fail to compile). A quantized
+    /// KV cache makes `set_state` LOSSY at the internal level even though get/set round-trips the
+    /// DECLARED bytes exactly — which is precisely the warm!=cold signature this engine shows. Every
+    /// other engine (runtime/gemma4/dist_spec) already plumbs this; qwen36 was the only one that did not.
+    pub kv_cache_precision: Option<String>,
+    pub dyn_quant_group: Option<String>,
+    /// OV compiled-blob cache. Without it this 35B MoE recompiles from scratch on EVERY spawn (and any
+    /// plugin-property change forces a full uncached rebuild that can exceed the rig's serve window).
+    /// runtime/gemma4/dist_spec all set this; qwen36 did not.
+    pub cache_dir: Option<String>,
 }
 
 impl Qwen36Builder {
+    pub fn with_cache_dir(mut self, dir: impl Into<String>) -> Self {
+        self.cache_dir = Some(dir.into());
+        self
+    }
+    pub fn with_kv_cache_precision(mut self, prec: impl Into<String>) -> Self {
+        self.kv_cache_precision = Some(prec.into());
+        self
+    }
+    pub fn with_dyn_quant_group(mut self, group: impl Into<String>) -> Self {
+        self.dyn_quant_group = Some(group.into());
+        self
+    }
     pub fn new(shards_dir: impl Into<String>, device: impl Into<String>) -> Self {
         Self {
             shards_dir: shards_dir.into(),
@@ -168,6 +215,9 @@ impl Qwen36Builder {
             tokenizer: None,
             eos: None,
             last_logits_only: false,
+            kv_cache_precision: None,
+            dyn_quant_group: None,
+            cache_dir: None,
         }
     }
 
@@ -279,7 +329,21 @@ impl Builder for Qwen36Builder {
         // compile ("No layout format available ... data_type: f32"). The
         // multi-stage long-generation drift is therefore mitigated by config
         // (single-box / 2-stage, aligned GPU drivers), not a precision hint.
-        let plugin = PluginConfig::new();
+        // KV-cache STORAGE precision is a DIFFERENT property from the compute hints above: it does not
+        // touch the MoE gemm kernel, so it compiles where INFERENCE_PRECISION_HINT/EXECUTION_MODE_HINT
+        // do not. With a quantized KV cache, set_state re-quantizes and loses the internal low bits, so
+        // a RESTORED state does not behave like a NATURALLY-folded one — while get/set still round-trips
+        // the declared bytes exactly. That is exactly this engine's warm!=cold signature.
+        let mut plugin = PluginConfig::new();
+        if let Some(d) = &self.cache_dir {
+            plugin = plugin.with("CACHE_DIR", d);
+        }
+        if let Some(p2) = &self.kv_cache_precision {
+            plugin = plugin.with("KV_CACHE_PRECISION", p2);
+        }
+        if let Some(g) = &self.dyn_quant_group {
+            plugin = plugin.with("DYNAMIC_QUANTIZATION_GROUP_SIZE", g);
+        }
 
         // Embeddings + tokenizer + eos live with the decode driver only.
         if self.rank == 0 {
@@ -1134,12 +1198,62 @@ impl Qwen36Engine {
                         t.next_token = Some(tok);
                         t.prefill_idx = end;
                         t.step += n;
+                        let reached = t.step;
+                        // Cold self-checkpoint control (see selfchk_at). `state_restored` is only set
+                        // by a real warm restore, so this never fires on the warm path.
+                        #[cfg(feature = "kv_coord")]
+                        if selfchk_at() == Some(reached) && !self.state_restored {
+                            match self.blob_local_stages() {
+                                Some(blob) => {
+                                    let ok = self.restore_local_stages(&blob);
+                                    info!(task = %task_id, pos = reached, ok,
+                                        "qwen36_selfchk (cold capture->recreate->restore)");
+                                }
+                                None => warn!(task = %task_id, pos = reached,
+                                    "qwen36_selfchk: capture failed"),
+                            }
+                        }
+                        #[cfg(feature = "kv_coord")]
+                        if fp_at() == Some(reached) {
+                            let fps: Vec<u64> = self
+                                .stages
+                                .iter_mut()
+                                .map(|st| {
+                                    st.get_state_blob()
+                                        .map(|b| crate::kv_coordination::fnv1a64(&b))
+                                        .unwrap_or(0)
+                                })
+                                .collect();
+                            info!(task = %task_id, pos = reached, ?fps, "qwen36_fp_at (cold fold)");
+                        }
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "pipeline prefill failed");
                         return self.finalize_error(format!("pipeline prefill failed: {e}"));
                     }
                 }
+            }
+            // Issue-34 bar-#1 diag: fingerprint the post-prefill state. A warm-resumed turn and a
+            // cold one run the SAME turn-2 prompt, so they reach this point at the same `pos` — if
+            // `fps` differs between them, restore+suffix-prefill does not reproduce a cold fold and
+            // the divergence is upstream of decode. If `fps` matches yet the text still differs, the
+            // fold is faithful and the flip is in decode. The two cases need different fixes.
+            #[cfg(feature = "kv_coord")]
+            {
+                let (pos, first) = {
+                    let t = self.active.as_ref().unwrap();
+                    (t.step, t.next_token)
+                };
+                let fps: Vec<u64> = self
+                    .stages
+                    .iter_mut()
+                    .map(|st| {
+                        st.get_state_blob()
+                            .map(|b| crate::kv_coordination::fnv1a64(&b))
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                info!(task = %task_id, pos, first_token = ?first, ?fps, "qwen36_postprefill_state");
             }
             Vec::new()
         } else {
@@ -1432,6 +1546,24 @@ impl Qwen36Engine {
                 let infer_started = Instant::now();
                 let t0 = pos as usize;
                 let out = self.chain_pass(&hidden, t0, t0 + n)?;
+                // rank>0 counterpart of the head's `qwen36_fp_at (cold fold)`. The tail folds via this
+                // frame, not the prefill loop, so without this its COLD state at `pos` is unmeasurable
+                // and only its warm-RESTORED state (logged by restore_local_stages) is visible. Single-box
+                // proved local restore faithful, so any remaining bar-#1 divergence must show up as a
+                // tail warm-vs-cold mismatch here.
+                #[cfg(feature = "kv_coord")]
+                if fp_at() == Some(t0 + n) {
+                    let fps: Vec<u64> = self
+                        .stages
+                        .iter_mut()
+                        .map(|st| {
+                            st.get_state_blob()
+                                .map(|b| crate::kv_coordination::fnv1a64(&b))
+                                .unwrap_or(0)
+                        })
+                        .collect();
+                    info!(pos = t0 + n, ?fps, "qwen36_fp_at (tail fold)");
+                }
                 // Own infer only — the downstream wait is wire + their
                 // infer; they report their own share, so rank 0's
                 // RTT-minus-infer stays the chain's true wire share.
@@ -1610,12 +1742,65 @@ impl Qwen36Engine {
                         t.logits = l;
                         t.prefill_idx = end;
                         t.step += toks.len();
+                        // Same diagnostics as the multi-stage loop, mirrored onto the SINGLE-STAGE
+                        // path. On a 1-stage (single-box) topology every stage is local, so these
+                        // fingerprints cover the WHOLE model state — the 2-stage head-only view left
+                        // the tail unmeasured, and head/tail disagreed there.
+                        let reached = t.step;
+                        #[cfg(feature = "kv_coord")]
+                        if selfchk_at() == Some(reached) && !self.state_restored {
+                            match self.blob_local_stages() {
+                                Some(blob) => {
+                                    let ok = self.restore_local_stages(&blob);
+                                    info!(task = %task_id, pos = reached, ok,
+                                        "qwen36_selfchk (cold capture->recreate->restore)");
+                                }
+                                None => warn!(task = %task_id, pos = reached,
+                                    "qwen36_selfchk: capture failed"),
+                            }
+                        }
+                        #[cfg(feature = "kv_coord")]
+                        if fp_at() == Some(reached) {
+                            let fps: Vec<u64> = self
+                                .stages
+                                .iter_mut()
+                                .map(|st| {
+                                    st.get_state_blob()
+                                        .map(|b| crate::kv_coordination::fnv1a64(&b))
+                                        .unwrap_or(0)
+                                })
+                                .collect();
+                            info!(task = %task_id, pos = reached, ?fps, "qwen36_fp_at (cold fold)");
+                        }
                     }
                     Err(e) => {
                         warn!(task = %task_id, error = %e, "prefill failed");
                         return self.finalize_error(format!("prefill failed: {e}"));
                     }
                 }
+            }
+            #[cfg(feature = "kv_coord")]
+            {
+                let (pos, first) = {
+                    let t = self.active.as_ref().unwrap();
+                    let n = t
+                        .logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(i, _)| i as u32);
+                    (t.step, n)
+                };
+                let fps: Vec<u64> = self
+                    .stages
+                    .iter_mut()
+                    .map(|st| {
+                        st.get_state_blob()
+                            .map(|b| crate::kv_coordination::fnv1a64(&b))
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                info!(task = %task_id, pos, first_token = ?first, ?fps, "qwen36_postprefill_state");
             }
             Vec::new()
         } else {
@@ -1839,6 +2024,20 @@ impl Qwen36Engine {
                 }
                 Err(e) => warn!(error = %e, "qwen36: get_state_blob for round-trip diag failed"),
             }
+        }
+        // Warm side of CASCADIA_QWEN36_FP_AT: the state as restored, before any suffix fold. Compare
+        // against the cold path's "qwen36_fp_at (cold fold)" at the same pos.
+        if fp_at().is_some() {
+            let fps: Vec<u64> = self
+                .stages
+                .iter_mut()
+                .map(|st| {
+                    st.get_state_blob()
+                        .map(|b| crate::kv_coordination::fnv1a64(&b))
+                        .unwrap_or(0)
+                })
+                .collect();
+            info!(?fps, "qwen36_fp_at (warm restored)");
         }
         self.state_restored = true;
         true
