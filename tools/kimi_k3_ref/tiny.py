@@ -42,8 +42,15 @@ def tiny_cfg():
     }
 
 
+def _bf16(t):
+    """Round to bf16 and back. Real exports only ever carry bf16-representable
+    weights, so the reference and the Rust shell (which stores bf16) must agree
+    on weight precision or the end-to-end golden drifts."""
+    return t.to(torch.bfloat16).to(torch.float32)
+
+
 def _r(*shape, scale=0.05):
-    return torch.randn(*shape) * scale
+    return _bf16(torch.randn(*shape) * scale)
 
 
 def tiny_weights(cfg, seed=0):
@@ -69,16 +76,16 @@ def tiny_weights(cfg, seed=0):
                 "dt_bias": _r(proj),
                 "b_proj": _r(nh, h),
                 "g_proj": _r(proj, h),
-                "o_norm": torch.ones(hd) + _r(hd),
+                "o_norm": _bf16(torch.ones(hd) + _r(hd)),
                 "o_proj": _r(h, proj),
             }
         else:
             attn = {
                 "q_a_proj": _r(cfg["q_lora_rank"], h),
-                "q_a_layernorm": torch.ones(cfg["q_lora_rank"]) + _r(cfg["q_lora_rank"]),
+                "q_a_layernorm": _bf16(torch.ones(cfg["q_lora_rank"]) + _r(cfg["q_lora_rank"])),
                 "q_b_proj": _r(nh * qh, cfg["q_lora_rank"]),
                 "kv_a_proj_with_mqa": _r(cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"], h),
-                "kv_a_layernorm": torch.ones(cfg["kv_lora_rank"]) + _r(cfg["kv_lora_rank"]),
+                "kv_a_layernorm": _bf16(torch.ones(cfg["kv_lora_rank"]) + _r(cfg["kv_lora_rank"])),
                 "kv_b_proj": _r(nh * (cfg["qk_nope_head_dim"] + cfg["v_head_dim"]),
                                 cfg["kv_lora_rank"]),
                 "g_proj": _r(nh * cfg["v_head_dim"], h),
@@ -87,10 +94,10 @@ def tiny_weights(cfg, seed=0):
 
         lw = {
             "attn": attn,
-            "input_layernorm": torch.ones(h) + _r(h),
-            "post_attention_layernorm": torch.ones(h) + _r(h),
-            "attn_res_proj": _r(1, h), "attn_res_norm": torch.ones(h) + _r(h),
-            "mlp_res_proj": _r(1, h), "mlp_res_norm": torch.ones(h) + _r(h),
+            "input_layernorm": _bf16(torch.ones(h) + _r(h)),
+            "post_attention_layernorm": _bf16(torch.ones(h) + _r(h)),
+            "attn_res_proj": _r(1, h), "attn_res_norm": _bf16(torch.ones(h) + _r(h)),
+            "mlp_res_proj": _r(1, h), "mlp_res_norm": _bf16(torch.ones(h) + _r(h)),
         }
         if i >= cfg["first_k_dense_replace"]:
             lw["moe"] = {
@@ -98,7 +105,7 @@ def tiny_weights(cfg, seed=0):
                 "e_score_correction_bias": _r(cfg["num_experts"]),
                 "routed_expert_down_proj": _r(lat, h),
                 "routed_expert_up_proj": _r(h, lat),
-                "routed_expert_norm": torch.ones(lat) + _r(lat),
+                "routed_expert_norm": _bf16(torch.ones(lat) + _r(lat)),
                 "experts": [
                     {"w1": _r(mi, lat), "w3": _r(mi, lat), "w2": _r(lat, mi)}
                     for _ in range(cfg["num_experts"])
@@ -116,7 +123,7 @@ def tiny_weights(cfg, seed=0):
         "embed": _r(cfg["vocab_size"], h, scale=0.5),
         "layers": layers,
         "output_attn_res_proj": _r(1, h),
-        "output_attn_res_norm": torch.ones(h) + _r(h),
-        "norm": torch.ones(h) + _r(h),
+        "output_attn_res_norm": _bf16(torch.ones(h) + _r(h)),
+        "norm": _bf16(torch.ones(h) + _r(h)),
         "lm_head": _r(cfg["vocab_size"], h),
     }
