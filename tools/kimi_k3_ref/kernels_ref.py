@@ -341,3 +341,85 @@ def latent_moe_ref(x, w, cfg):
 
     shared = mlp_ref(x, w["shared_w1"], w["shared_w3"], w["shared_w2"], beta, lbeta)
     return _bf16(y.to(torch.float32) + shared.to(torch.float32))
+
+
+# --------------------------------------------------------------------------
+# Decoder layer + full model
+# --------------------------------------------------------------------------
+
+
+def is_kda_layer(cfg, idx: int) -> bool:
+    """Layer 0 appears in neither `kda_layers` nor `full_attn_layers`, so it
+    falls through to MLA. (`full_attn_layers` also lists 93, which is out of
+    range for `num_hidden_layers=93` and simply unused.) 69 KDA + 24 MLA = 93.
+    """
+    return idx in cfg["kda_layers"]
+
+
+def layer_ref(x, block_residual, w, cfg, idx, state=None, conv_state=None,
+              kv_cache=None):
+    """One decoder layer with Attention Residuals (`_forward_attn_residual`).
+
+    Returns (prefix_sum [T,H], block_residual [T,nb,H], state, conv_state, kv).
+    Note the layer's output IS the prefix sum, not a plain residual stream.
+    """
+    eps = cfg["rms_norm_eps"]
+    beta, lbeta = cfg["situ_beta"], cfg["situ_linear_beta"]
+    prefix_sum = x
+
+    if block_residual.shape[1] > 0:
+        h = apply_attn_res(prefix_sum, block_residual,
+                           w["attn_res_proj"], w["attn_res_norm"], eps)
+    else:
+        h = x
+
+    if idx % cfg["attn_res_block_size"] == 0:
+        block_residual = torch.cat(
+            [block_residual, prefix_sum.unsqueeze(1)], dim=1)
+        prefix_sum = None
+
+    h = _rms(h, w["input_layernorm"], eps)
+    if is_kda_layer(cfg, idx):
+        h, state, conv_state = kda_ref(h, w["attn"], cfg, state, conv_state)
+    else:
+        h, kv_cache = mla_ref(h, w["attn"], cfg, kv_cache)
+
+    prefix_sum = h if prefix_sum is None else _bf16(
+        prefix_sum.to(torch.float32) + h.to(torch.float32))
+
+    h = apply_attn_res(prefix_sum, block_residual,
+                       w["mlp_res_proj"], w["mlp_res_norm"], eps)
+    h = _rms(h, w["post_attention_layernorm"], eps)
+    if idx >= cfg["first_k_dense_replace"]:
+        h = latent_moe_ref(h, w["moe"], cfg)
+    else:
+        h = mlp_ref(h, w["w1"], w["w3"], w["w2"], beta, lbeta)
+
+    prefix_sum = _bf16(prefix_sum.to(torch.float32) + h.to(torch.float32))
+    return prefix_sum, block_residual, state, conv_state, kv_cache
+
+
+def model_ref(tokens, w, cfg, caches=None):
+    """embed -> layers -> output AttnRes -> final norm -> lm_head.
+
+    `caches` is an optional per-layer dict for incremental decode; pass None
+    for a fresh sequence. Returns (logits [T, vocab], caches).
+    """
+    eps = cfg["rms_norm_eps"]
+    n = cfg["num_hidden_layers"]
+    x = w["embed"][tokens].to(torch.float32)
+    t, h = x.shape
+    block_residual = x.new_zeros(t, 0, h)
+    caches = caches or [{} for _ in range(n)]
+
+    for i in range(n):
+        c = caches[i]
+        x, block_residual, c["state"], c["conv"], c["kv"] = layer_ref(
+            x, block_residual, w["layers"][i], cfg, i,
+            c.get("state"), c.get("conv"), c.get("kv"))
+
+    # one final mixture over the block stack, then the output norm
+    x = apply_attn_res(x, block_residual,
+                       w["output_attn_res_proj"], w["output_attn_res_norm"], eps)
+    x = _rms(x, w["norm"], eps)
+    return _lin(x, w["lm_head"]), caches
