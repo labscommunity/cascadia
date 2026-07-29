@@ -102,17 +102,12 @@ mod tests {
     #[test]
     fn output_is_a_convex_combination() {
         // Every output element must lie within the range of the input rows.
-        let h = 4;
         let ps = [1.0f32, 1.0, 1.0, 1.0];
         let blocks = [0.0f32, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0, 2.0];
         let mut out = [0.0f32; 4];
         apply_attn_res(&ps, &blocks, &[0.7; 4], &[1.0; 4], 1e-5, &mut out);
-        for i in 0..h {
-            assert!(
-                (0.0..=2.0).contains(&out[i]),
-                "out[{i}] = {} escaped",
-                out[i]
-            );
+        for (i, &v) in out.iter().enumerate() {
+            assert!((0.0..=2.0).contains(&v), "out[{i}] = {v} escaped");
         }
     }
 }

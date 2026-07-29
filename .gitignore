@@ -57,6 +57,7 @@ crates/cascadia-engine-sparse-moe/tests/fixtures/**/.*.done
 .swarm/
 ruvector.db
 crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_big_export/
+crates/cascadia-engine-sparse-moe/tests/fixtures/kimi_k3_export/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_ckpt/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_boundary/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_windowed/

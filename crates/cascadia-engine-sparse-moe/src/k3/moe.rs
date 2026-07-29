@@ -245,9 +245,8 @@ mod tests {
         w.e_score_correction_bias = vec![0.0, 0.0, 0.0, 100.0];
         let x: Vec<f32> = (0..d.hidden).map(|i| (i as f32 * 0.29).cos()).collect();
         let mut logits = vec![0.0f32; d.n_experts];
-        for e in 0..d.n_experts {
-            let row = &w.gate[e * d.hidden..(e + 1) * d.hidden];
-            logits[e] = row.iter().zip(&x).map(|(&a, &b)| a * b).sum();
+        for (lg, row) in logits.iter_mut().zip(w.gate.chunks_exact(d.hidden)) {
+            *lg = row.iter().zip(&x).map(|(&a, &b)| a * b).sum();
         }
         let sel = moe_gate(&logits, &w.e_score_correction_bias, d.top_k, d.scale, true);
         assert!(

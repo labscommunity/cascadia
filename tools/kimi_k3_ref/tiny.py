@@ -53,6 +53,26 @@ def _r(*shape, scale=0.05):
     return _bf16(torch.randn(*shape) * scale)
 
 
+def _fp4(t):
+    """Round onto the mxfp4 grid the exporter writes (e2m1 values + power-of-two
+    E8M0 group-32 scales).
+
+    The Rust shell dispatches QUANTIZED experts, so the reference has to
+    quantize as well — otherwise the end-to-end golden compares two different
+    sets of weights and drifts by ~13% per expert. MiniMax-M2 dodged this with
+    a --no-quant tiny export; quantizing the reference instead keeps the fp4
+    dispatch path under test.
+    """
+    from deepseek_v4_ref.kernels_ref import _pow2_round_up, _quantize_e2m1
+
+    out, inn = t.shape
+    g = t.reshape(out, inn // 32, 32)
+    amax = g.abs().amax(-1).clamp_min(1e-30)
+    s = _pow2_round_up(amax / 6.0)
+    q = _quantize_e2m1((g / s.unsqueeze(-1)).clamp(-6.0, 6.0))
+    return (q * s.unsqueeze(-1)).reshape(out, inn)
+
+
 def tiny_weights(cfg, seed=0):
     torch.manual_seed(seed)
     h = cfg["hidden_size"]
@@ -107,7 +127,11 @@ def tiny_weights(cfg, seed=0):
                 "routed_expert_up_proj": _r(h, lat),
                 "routed_expert_norm": _bf16(torch.ones(lat) + _r(lat)),
                 "experts": [
-                    {"w1": _r(mi, lat), "w3": _r(mi, lat), "w2": _r(lat, mi)}
+                    {
+                        "w1": _fp4(_r(mi, lat)),
+                        "w3": _fp4(_r(mi, lat)),
+                        "w2": _fp4(_r(lat, mi)),
+                    }
                     for _ in range(cfg["num_experts"])
                 ],
                 "shared_w1": _r(mi * cfg["num_shared_experts"], h),
