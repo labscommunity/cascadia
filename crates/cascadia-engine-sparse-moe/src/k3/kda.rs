@@ -204,6 +204,44 @@ mod tests {
     }
 
     #[test]
+    fn zero_a_log_means_no_decay_which_is_why_padding_must_be_dropped() {
+        // The released checkpoint zero-pads A_log from num_heads to head_dim.
+        // exp(0) = 1, so a padded entry decays by exactly nothing: consuming the
+        // padding would leave those heads' states accumulating forever. This
+        // pins WHY loader.rs truncates rather than accepting the longer tensor.
+        let mut out = [0.0f32; 2];
+        kda_gate(&[0.0, 0.0], &[0.0], &[0.0, 0.0], Some(-5.0), 1, 2, &mut out);
+        // a real (trained) A_log gives a strictly negative decay exponent
+        assert!(
+            out.iter().all(|&v| v < 0.0),
+            "trained gate must decay: {out:?}"
+        );
+
+        // whereas exp(g) == 1 (g == 0) is the no-decay case the padding would
+        // silently produce in the recurrence
+        let (h, kd, vd) = (1, 2, 2);
+        let mut s = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut o = vec![0.0f32; vd];
+        kda_step(
+            &[1.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0],
+            &mut s,
+            h,
+            kd,
+            vd,
+            &mut o,
+        );
+        assert_eq!(
+            s,
+            vec![1.0, 2.0, 3.0, 4.0],
+            "g=0 must leave the state untouched"
+        );
+    }
+
+    #[test]
     fn zero_beta_leaves_state_decayed_only() {
         // beta = 0 removes the delta term, so S just decays and o = S^T q.
         let (h, kd, vd) = (1, 2, 2);

@@ -216,28 +216,35 @@ pub fn load_layers(
             .map_err(|e| K3LoadError::Tensor(format!("shell {idx}"), e.to_string()))?;
 
         let (attn, state) = if m.is_kda(idx) {
-            let a_log = f32s(&f, "attn.A_log")?;
-            // UNRESOLVED upstream discrepancy — see docs/architectures/kimi-k3.md.
-            // The HF modeling file declares A_log as `torch.empty(num_heads)`
-            // (96) and fla's gate does `A_log.view(H, 1)` with H taken from
-            // g.shape[-2] (also 96). The released checkpoint ships A_log with
-            // head_dim (128) elements, which `view(96, 1)` cannot accept. Until
-            // it is known whether the decay is per-head or per-dimension in the
-            // real model, refuse the weights rather than silently compute the
-            // wrong thing.
+            // A_log carries one decay per HEAD (96), but the checkpoint stores it
+            // zero-padded to head_dim (128). Verified from the released weights:
+            // indices 0..95 are trained (exp(A_log) in [0.47, 11.8], matching the
+            // log(uniform(1,16)) init) and 96..127 are exactly 0.
+            //
+            // The padding must be dropped, not consumed: exp(0) = 1 is NO decay,
+            // so treating the tail as real would leave those states undecayed —
+            // output that looks fine and degrades with context length.
+            let mut a_log = f32s(&f, "attn.A_log")?;
             if a_log.len() != m.num_heads {
-                return Err(K3LoadError::Tensor(
-                    format!("layer {idx} attn.A_log"),
-                    format!(
-                        "expected {} entries (num_heads) but found {}. If this is \
-                         head_dim ({}), the KDA decay axis differs from the HF \
-                         modeling reference and src/k3/kda.rs must be resolved \
-                         against Moonshot's serving code before use",
-                        m.num_heads,
-                        a_log.len(),
-                        m.head_dim
-                    ),
-                ));
+                let (head, tail) = a_log.split_at(m.num_heads.min(a_log.len()));
+                let padded_ok = a_log.len() == m.head_dim
+                    && head.len() == m.num_heads
+                    && tail.iter().all(|&v| v == 0.0);
+                if !padded_ok {
+                    return Err(K3LoadError::Tensor(
+                        format!("layer {idx} attn.A_log"),
+                        format!(
+                            "expected {} entries (num_heads), or {} (head_dim) \
+                             zero-padded past {}, but found {} with a non-zero \
+                             tail — the KDA decay axis does not match this shell",
+                            m.num_heads,
+                            m.head_dim,
+                            m.num_heads,
+                            a_log.len()
+                        ),
+                    ));
+                }
+                a_log.truncate(m.num_heads);
             }
             let w = KdaWeights {
                 q_proj: bf16s(&f, "attn.q_proj")?,

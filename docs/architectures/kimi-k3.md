@@ -3,7 +3,7 @@
 Moonshot **Kimi-K3** (`moonshotai/Kimi-K3`, ~2.8T MoE, 1M ctx) analysed against the
 `cascadia-engine-sparse-moe` engine.
 
-**Status: implemented; blocked on an unresolved `A_log` shape discrepancy.** The shell
+**Status: implemented, not yet run on real weights.** The shell
 (`crates/cascadia-engine-sparse-moe/src/k3/`), the exporter
 (`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`) are
 complete and golden-tested; `{1,2,3,4,6}`-rank pipelines are bit-identical to a
@@ -286,32 +286,35 @@ The HF reference caches expanded k/v; we use glm5's absorbed-latent decode
 instead (**576 floats/token** = 512 latent + 64 shared rot), which is
 mathematically equivalent and the only memory-feasible form at long context.
 
-## Blockers found by checkpoint verification
+## Findings from checkpoint verification
 
 Both were found by validating against the real checkpoint's metadata (the
 tensor index and the safetensors headers — ~1.6 MB fetched, no weights).
 
-### 1. `A_log` shape contradicts the modeling reference — BLOCKER
+### 1. `A_log` is zero-padded in the checkpoint — RESOLVED
 
-| source | says |
-|---|---|
-| `modeling_kimi_linear.py` | `A_log = torch.empty(self.num_heads)` → **96** |
-| `fla` gate kernel | `H, _ = g.shape[-2:]` then `A_log.view(H, 1)`, and `g` is `[..., 96, 128]` → needs **96** |
-| **the released checkpoint** | `A_log: [128]`, on every KDA layer |
+The released weights ship `A_log` as `[128]` on every KDA layer, while
+`modeling_kimi_linear.py` declares `torch.empty(num_heads)` = **96** and fla's
+gate does `A_log.view(H, 1)` with `H = g.shape[-2] = 96`. vLLM's Kimi-Linear
+implementation also stores it per head. `view(96, 1)` cannot take 128 elements,
+so on the face of it the published modeling file cannot run the published
+weights.
 
-`A_log.view(96, 1)` cannot accept a 128-element tensor, so the published
-modeling file cannot run the published weights as written. 128 is `head_dim`,
-and `o_norm` — which is `head_dim` by construction — is also `[128]`, so the
-released model appears to apply the KDA decay **per dimension, shared across
-heads**, rather than per head.
+Reading the actual 512 bytes settles it — the tensor is **96 real values
+zero-padded to `head_dim`**:
 
-`num_heads = 96` is not in doubt: `b_proj` is `[96, 7168]` and `dt_bias` is
-`[12288] = 96 x 128`.
+```
+idx 0..95  : nonzero 96/96, exp(A_log) in [0.471, 11.776]   (init: log(uniform(1,16)))
+idx 96..127: nonzero 0/32,  all exactly 0.0
+```
 
-This changes the decay axis in the recurrence, so `src/k3/kda.rs` cannot be
-called correct for real weights until it is resolved against Moonshot's own
-serving code. `loader.rs` hard-fails on the mismatch rather than truncating to
-96 and silently computing the wrong thing.
+So the decay is per HEAD, as every implementation says, and the shell is
+correct as written. The loader drops the padding.
+
+Dropping it is not cosmetic: `exp(0) = 1` is *no decay*, so consuming the tail
+would leave 32 heads' recurrent state never decaying — output that looks
+plausible and degrades as context grows. `kda.rs` has a test pinning that
+rationale so the truncation is not "simplified away" later.
 
 ### 2. No `tokenizer.json` — blocks serving, not loading
 
