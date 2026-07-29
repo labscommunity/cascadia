@@ -31,8 +31,9 @@ def tiny_cfg():
         "num_experts": 8,
         "top_k": 2,
         "num_shared_experts": 2,
+        # both must be multiples of the fp4 group (32), as in the real config
         "routed_expert_hidden_size": 32,
-        "moe_intermediate_size": 16,
+        "moe_intermediate_size": 32,
         "routed_scaling_factor": 1.0,
         "moe_renormalize": True,
         "latent_moe_use_norm": True,

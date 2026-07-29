@@ -63,7 +63,7 @@
     "top_k": 2,
     "num_shared_experts": 2,
     "routed_expert_hidden_size": 32,
-    "moe_intermediate_size": 16,
+    "moe_intermediate_size": 32,
     "routed_scaling_factor": 1.0,
     "moe_renormalize": true,
     "latent_moe_use_norm": true,
