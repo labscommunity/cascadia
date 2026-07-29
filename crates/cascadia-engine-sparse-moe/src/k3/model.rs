@@ -23,6 +23,7 @@ use crate::k3::attn::{mla_step, MlaDims, MlaKv, MlaWeights};
 use crate::k3::attn_res::apply_attn_res;
 use crate::k3::kda::{kda_gate, kda_step, l2norm_heads, short_conv};
 use crate::k3::moe::{moe_forward, moe_forward_batch, ExpertSource, MoeDims, MoeWeights};
+use crate::k3::prof;
 use crate::k3::situ::situ;
 
 /// True when `layer` (0-indexed) is a KDA layer.
@@ -243,6 +244,7 @@ pub fn forward_slice<E: ExpertSource>(
     let mut ffn_out = vec![0.0f32; h];
 
     for (layer, state) in layers.iter_mut().zip(states.iter_mut()) {
+        let t_ar = std::time::Instant::now();
         // pre-attention mixture (skipped while the stack is empty)
         if nb > 0 {
             apply_attn_res(
@@ -265,13 +267,17 @@ pub fn forward_slice<E: ExpertSource>(
             carry = false;
         }
 
+        prof::add(prof::ATTNRES, t_ar);
         rmsnorm(&mut buf, &layer.input_layernorm, d.eps);
+        let t_at = std::time::Instant::now();
         match (&mut layer.attn, &mut *state) {
             (LayerAttn::Kda(w, kd), LayerState::Kda(st)) => {
-                kda_layer_step(&buf, w, *kd, st, &mut attn_out)
+                kda_layer_step(&buf, w, *kd, st, &mut attn_out);
+                prof::add(prof::KDA, t_at);
             }
             (LayerAttn::Mla(w, md), LayerState::Mla(kv)) => {
-                mla_step(&buf, w, *md, kv, &mut attn_out)
+                mla_step(&buf, w, *md, kv, &mut attn_out);
+                prof::add(prof::MLA, t_at);
             }
             _ => panic!("k3: layer {} attention/state kind mismatch", layer.idx),
         }
@@ -285,6 +291,7 @@ pub fn forward_slice<E: ExpertSource>(
         }
 
         // pre-FFN mixture (the stack is never empty here: layer 0 pushed)
+        let t_ar2 = std::time::Instant::now();
         apply_attn_res(
             prefix_sum,
             &blocks[..nb * h],
@@ -293,6 +300,7 @@ pub fn forward_slice<E: ExpertSource>(
             d.eps,
             &mut buf,
         );
+        prof::add(prof::ATTNRES, t_ar2);
         rmsnorm(&mut buf, &layer.post_attention_layernorm, d.eps);
 
         match &layer.ffn {

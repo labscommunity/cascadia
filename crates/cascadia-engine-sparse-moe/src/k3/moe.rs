@@ -17,11 +17,14 @@
 use crate::dsv4::math::{linear_bf16_w, rmsnorm, to_bf16};
 use crate::glm::gate::moe_gate;
 use crate::k3::expert_fp4;
+use crate::k3::prof;
 use crate::k3::situ::situ;
 
 /// Shape contract for one LatentMoE layer.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeDims {
+    /// Global layer index — only used to attribute profiler routing records.
+    pub layer: u32,
     pub hidden: usize,
     pub latent: usize,
     pub inter: usize,
@@ -51,6 +54,8 @@ pub struct MoeWeights {
 /// Source of one expert's packed fp4 bytes (`w1`, `w3`, `w2` back to back).
 pub trait ExpertSource {
     fn expert_bytes(&self, expert: usize) -> &[u8];
+    /// Bytes per expert — what one routed selection streams on a cache miss.
+    fn stride(&self) -> usize;
 }
 
 /// A flat in-memory expert set — `n_experts * expert_bytes(latent, inter)`.
@@ -64,6 +69,9 @@ pub struct FlatExperts {
 impl ExpertSource for FlatExperts {
     fn expert_bytes(&self, expert: usize) -> &[u8] {
         &self.data[expert * self.stride..(expert + 1) * self.stride]
+    }
+    fn stride(&self) -> usize {
+        self.stride
     }
 }
 
@@ -116,11 +124,26 @@ impl MmapExperts {
     pub fn bytes(&self) -> usize {
         self.n * self.stride
     }
+
+    /// Sampled page residency `(resident, probed)` of this layer's map.
+    ///
+    /// The real expert-cache hit signal: mmap faults are not billed to the
+    /// process read counter, so an I/O-counter delta reports a bogus 100%.
+    pub fn resident_pages_sampled(&self, samples: usize) -> (usize, usize) {
+        crate::dsv4::expert_mmap::resident_pages_sampled_ptr(
+            self.mmap.as_ptr() as usize,
+            self.mmap.len(),
+            samples,
+        )
+    }
 }
 
 impl ExpertSource for MmapExperts {
     fn expert_bytes(&self, expert: usize) -> &[u8] {
         &self.mmap[expert * self.stride..(expert + 1) * self.stride]
+    }
+    fn stride(&self) -> usize {
+        self.stride
     }
 }
 
@@ -151,6 +174,7 @@ pub fn moe_forward<E: ExpertSource>(
     experts: &E,
     out: &mut [f32],
 ) {
+    let _t0 = std::time::Instant::now();
     // router reads the HIDDEN stream
     let mut logits = vec![0.0f32; d.n_experts];
     for (lg, row) in logits.iter_mut().zip(w.gate.chunks_exact(d.hidden)) {
@@ -163,7 +187,10 @@ pub fn moe_forward<E: ExpertSource>(
         d.scale,
         d.renormalize,
     );
+    prof::add(prof::ROUTER, _t0);
+    prof::record_routing(d.layer, &sel.idx, experts.stride());
 
+    let _t1 = std::time::Instant::now();
     // down-project once, then accumulate the selected experts in latent space
     let mut x_lat = vec![0.0f32; d.latent];
     linear_bf16_w(x, &w.down_proj, d.latent, d.hidden, &mut x_lat);
@@ -203,6 +230,7 @@ pub fn moe_forward<E: ExpertSource>(
             *o = to_bf16(*o + v);
         }
     }
+    prof::add(prof::EXPERTS, _t1);
 }
 
 /// Batch-union MoE: `rows` tokens through the block, loading each distinct
@@ -252,6 +280,10 @@ pub fn moe_forward_batch<E: ExpertSource>(
             d.hidden,
             &mut lat[r * d.latent..(r + 1) * d.latent],
         );
+    }
+
+    for s in &sel {
+        prof::record_routing(d.layer, &s.idx, experts.stride());
     }
 
     // invert the selection: expert -> the (row, slot) pairs that chose it
@@ -326,6 +358,7 @@ mod tests {
 
     fn dims() -> MoeDims {
         MoeDims {
+            layer: 0,
             hidden: 8,
             latent: 32,
             inter: 32,
@@ -397,6 +430,9 @@ mod tests {
         fn expert_bytes(&self, expert: usize) -> &[u8] {
             self.hits.borrow_mut()[expert] += 1;
             self.inner.expert_bytes(expert)
+        }
+        fn stride(&self) -> usize {
+            self.inner.stride()
         }
     }
 

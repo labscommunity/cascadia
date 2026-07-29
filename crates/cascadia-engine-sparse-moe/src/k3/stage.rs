@@ -20,6 +20,7 @@ use crate::k3::model::{
     blocks_at, forward_slice, forward_slice_batch, max_blocks, K3Dims, K3Layer, LayerState,
 };
 use crate::k3::moe::MmapExperts;
+use crate::k3::prof;
 use crate::staged::StagedRunner;
 
 /// Default context budget when `CASCADIA_K3_MAX_SEQ` is unset. K3's
@@ -37,6 +38,8 @@ pub struct K3Runner {
     /// First layer index of this rank's slice — fixes how many block slots are
     /// already live when the wire arrives.
     lo: usize,
+    /// This rank's id, so profiler lines identify which slice they describe.
+    rank: u32,
     hidden: usize,
     wire: usize,
     max_blocks: usize,
@@ -71,12 +74,26 @@ impl K3Runner {
             embed,
             head,
             lo,
+            rank,
             hidden,
             wire: (1 + mb) * hidden,
             max_blocks: mb,
             max_seq,
             eos,
         })
+    }
+
+    /// Fold this rank's expert-map residency into the profiler. Sampled, not
+    /// exhaustive — probing every page of a 15.7 GB layer per token would cost
+    /// more than the decode.
+    fn sample_residency(&self) {
+        const SAMPLES_PER_LAYER: usize = 64;
+        for l in &self.layers {
+            if let crate::k3::model::LayerFfn::Moe(_, _, ex) = &l.ffn {
+                let (r, p) = ex.resident_pages_sampled(SAMPLES_PER_LAYER);
+                prof::record_residency(r, p);
+            }
+        }
     }
 
     /// Split a wire buffer into `(prefix_sum, blocks)`.
@@ -108,6 +125,7 @@ impl StagedRunner for K3Runner {
         for s in self.states.iter_mut() {
             s.clear();
         }
+        prof::new_sequence();
     }
 
     /// Rank 0: the embedding row becomes the prefix sum; the stack starts empty.
@@ -129,6 +147,7 @@ impl StagedRunner for K3Runner {
         let (prefix, blocks) = w.split_at_mut(h);
         // how many slots are already live when this rank's slice begins
         let nb = blocks_at(self.lo, self.m.attn_res_block_size);
+        let t = std::time::Instant::now();
         forward_slice(
             &mut self.layers,
             &mut self.states,
@@ -137,6 +156,11 @@ impl StagedRunner for K3Runner {
             blocks,
             nb,
         );
+        prof::add(prof::WALL, t);
+        if prof::enabled() {
+            self.sample_residency();
+            prof::dump(&format!("rank{}", self.rank));
+        }
         w
     }
 

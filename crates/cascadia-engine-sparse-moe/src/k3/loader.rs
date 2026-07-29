@@ -128,8 +128,9 @@ impl K3Manifest {
         }
     }
 
-    pub fn moe_dims(&self) -> MoeDims {
+    pub fn moe_dims(&self, layer: u32) -> MoeDims {
         MoeDims {
+            layer,
             hidden: self.hidden_size,
             latent: self.routed_expert_hidden_size,
             inter: self.moe_intermediate_size,
@@ -264,7 +265,11 @@ pub fn load_layers(
                 shared_w3: bf16s(&f, "moe.shared_w3")?,
                 shared_w2: bf16s(&f, "moe.shared_w2")?,
             };
-            LayerFfn::Moe(Box::new(w), m.moe_dims(), load_experts(dir, idx, m)?)
+            LayerFfn::Moe(
+                Box::new(w),
+                m.moe_dims(idx as u32),
+                load_experts(dir, idx, m)?,
+            )
         } else {
             LayerFfn::Dense {
                 w1: bf16s(&f, "w1")?,

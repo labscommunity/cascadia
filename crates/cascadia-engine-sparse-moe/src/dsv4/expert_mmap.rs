@@ -224,72 +224,7 @@ impl MmapExpert {
     /// is charged elsewhere), so residency is probed directly — `QueryWorkingSetEx`
     /// on Windows, `mincore` on unix. Best-effort and read-only.
     pub fn resident_pages_sampled(&self, samples: usize) -> (usize, usize) {
-        const PAGE: usize = 4096;
-        let len = self.mmap.len();
-        if len == 0 || samples == 0 {
-            return (0, 0);
-        }
-        let base = self.mmap.as_ptr() as usize;
-        let npages = len.div_ceil(PAGE);
-        let want = samples.min(npages);
-        let step = (npages / want).max(1);
-        let addrs: Vec<usize> = (0..npages)
-            .step_by(step)
-            .take(want)
-            .map(|p| base + p * PAGE)
-            .collect();
-
-        #[cfg(windows)]
-        {
-            use core::ffi::c_void;
-            let mut buf: Vec<winmem::WorkingSetExInfo> = addrs
-                .iter()
-                .map(|&a| winmem::WorkingSetExInfo {
-                    virtual_address: a as *mut c_void,
-                    virtual_attributes: 0,
-                })
-                .collect();
-            let bytes = (buf.len() * core::mem::size_of::<winmem::WorkingSetExInfo>()) as u32;
-            // SAFETY: `buf` is a valid array of `buf.len()` entries; QueryWorkingSetEx
-            // writes only the `virtual_attributes` field of each. Read-only otherwise.
-            let ok = unsafe {
-                winmem::QueryWorkingSetEx(
-                    winmem::GetCurrentProcess(),
-                    buf.as_mut_ptr() as *mut c_void,
-                    bytes,
-                )
-            };
-            if ok == 0 {
-                return (0, 0);
-            }
-            let res = buf.iter().filter(|e| e.virtual_attributes & 1 == 1).count();
-            (res, buf.len())
-        }
-        #[cfg(unix)]
-        {
-            use core::ffi::c_void;
-            extern "C" {
-                fn mincore(addr: *mut c_void, length: usize, vec: *mut u8) -> i32;
-            }
-            let (mut resident, mut probed) = (0usize, 0usize);
-            for &a in &addrs {
-                let mut v = [0u8; 1];
-                // SAFETY: [a, a+PAGE) lies within the mapped region (npages pages
-                // from base); mincore writes one residency byte into `v`.
-                let r = unsafe { mincore(a as *mut c_void, PAGE, v.as_mut_ptr()) };
-                if r == 0 {
-                    probed += 1;
-                    if v[0] & 1 == 1 {
-                        resident += 1;
-                    }
-                }
-            }
-            (resident, probed)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            (0, 0)
-        }
+        resident_pages_sampled_ptr(self.mmap.as_ptr() as usize, self.mmap.len(), samples)
     }
 
     /// SwiGLU FFN over an explicitly-read byte buffer (the R1 path). Mirrors
@@ -670,5 +605,76 @@ mod tests {
         let got = dequant_row_dot(&packed, &scales, &x, in_dim) as f64;
         let rel = (got - refv).abs() / refv.abs().max(1e-6);
         assert!(rel < 1e-4, "fused={got} ref={refv} rel={rel}");
+    }
+}
+
+/// Sampled page-residency of an arbitrary mapping — `(resident, probed)`.
+///
+/// Shared leaf: the k3 fp4 expert maps use this too. Extracted from
+/// [`MmapExpert::resident_pages_sampled`], which now delegates here.
+pub fn resident_pages_sampled_ptr(base: usize, len: usize, samples: usize) -> (usize, usize) {
+    const PAGE: usize = 4096;
+    if len == 0 || samples == 0 {
+        return (0, 0);
+    }
+    let npages = len.div_ceil(PAGE);
+    let want = samples.min(npages);
+    let step = (npages / want).max(1);
+    let addrs: Vec<usize> = (0..npages)
+        .step_by(step)
+        .take(want)
+        .map(|p| base + p * PAGE)
+        .collect();
+
+    #[cfg(windows)]
+    {
+        use core::ffi::c_void;
+        let mut buf: Vec<winmem::WorkingSetExInfo> = addrs
+            .iter()
+            .map(|&a| winmem::WorkingSetExInfo {
+                virtual_address: a as *mut c_void,
+                virtual_attributes: 0,
+            })
+            .collect();
+        let bytes = (buf.len() * core::mem::size_of::<winmem::WorkingSetExInfo>()) as u32;
+        // SAFETY: `buf` is a valid array of `buf.len()` entries; QueryWorkingSetEx
+        // writes only the `virtual_attributes` field of each. Read-only otherwise.
+        let ok = unsafe {
+            winmem::QueryWorkingSetEx(
+                winmem::GetCurrentProcess(),
+                buf.as_mut_ptr() as *mut c_void,
+                bytes,
+            )
+        };
+        if ok == 0 {
+            return (0, 0);
+        }
+        let res = buf.iter().filter(|e| e.virtual_attributes & 1 == 1).count();
+        (res, buf.len())
+    }
+    #[cfg(unix)]
+    {
+        use core::ffi::c_void;
+        extern "C" {
+            fn mincore(addr: *mut c_void, length: usize, vec: *mut u8) -> i32;
+        }
+        let (mut resident, mut probed) = (0usize, 0usize);
+        for &a in &addrs {
+            let mut v = [0u8; 1];
+            // SAFETY: [a, a+PAGE) lies within the mapped region (npages pages
+            // from base); mincore writes one residency byte into `v`.
+            let r = unsafe { mincore(a as *mut c_void, PAGE, v.as_mut_ptr()) };
+            if r == 0 {
+                probed += 1;
+                if v[0] & 1 == 1 {
+                    resident += 1;
+                }
+            }
+        }
+        (resident, probed)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (0, 0)
     }
 }

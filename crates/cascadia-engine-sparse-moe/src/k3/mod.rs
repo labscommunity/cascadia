@@ -18,5 +18,7 @@ pub mod kda;
 pub mod loader;
 pub mod model;
 pub mod moe;
+pub mod prof;
+pub mod residency;
 pub mod situ;
 pub mod stage;
