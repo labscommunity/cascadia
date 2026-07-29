@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.1.4](https://github.com/labscommunity/cascadia/compare/v0.1.3...v0.1.4) (2026-07-29)
+
+
+### Features
+
+* **cli:** warn when --cb is enabled on a CPU device ([c8b6c63](https://github.com/labscommunity/cascadia/commit/c8b6c63fa64915916b6f5a3ff4cdd8874872577a))
+* **ov-genai:** continuous batching via ContinuousBatchingPipeline ([#20](https://github.com/labscommunity/cascadia/issues/20)) ([2229af0](https://github.com/labscommunity/cascadia/commit/2229af0576d0d82caec279ac0b3eb3033064779d))
+
+
+### Bug Fixes
+
+* **cli:** reject --cb on an NPU device ([280e1b5](https://github.com/labscommunity/cascadia/commit/280e1b5ff11212f6ed0cdb410db56635b6e4fe90))
+* **ov-genai:** bound the cb liveness heartbeat so a wedged batch still fails ([2a83442](https://github.com/labscommunity/cascadia/commit/2a83442649ac2df4b6f04c4f710895abbe2b56c6))
+* **ov-genai:** cb step() signals liveness so long prefills survive the stall guard ([c7f14f1](https://github.com/labscommunity/cascadia/commit/c7f14f12768262a0f14ad7eb44ee9bac2a072b95))
+* **ov-genai:** cb warmup reports failure instead of always logging ok ([6420243](https://github.com/labscommunity/cascadia/commit/642024311a0480154050b91852b4ca938fabd2ba))
+* **ov-genai:** report a cb scheduler eviction as an error, not a clean stop ([48a342b](https://github.com/labscommunity/cascadia/commit/48a342b0ddffc8703ca8d06fa1d0bd8cb725e191))
+* **ov-genai:** stop admitting work onto a dead cb pipeline ([3b2812c](https://github.com/labscommunity/cascadia/commit/3b2812c73fe1186d32154b5d6d4cc63d98e046c2))
+* **runner:** deliver a stream's chunks in the order the engine produced them ([abccce5](https://github.com/labscommunity/cascadia/commit/abccce53e677d5356ff173ae0db4873fc5c68197))
+* **shim:** apply the chat template on the cb path ([88a3a76](https://github.com/labscommunity/cascadia/commit/88a3a762df7c4f61d56e1f4523505c5509b9a8dc))
+* **shim:** move the cb UTF-8 hold-back to Rust and make it resync ([e24e2c8](https://github.com/labscommunity/cascadia/commit/e24e2c8d2605e9dc68d7a7454e2a75ba19581b35))
+
+
+### Refactor
+
+* **shim:** drop the unused cb has_unfinished entry point ([13320a4](https://github.com/labscommunity/cascadia/commit/13320a4e4301a444026a69c36a9c66dd0eb13c57))
+* **shim:** tie a CbHandle's lifetime to its pipeline via Arc ([da219dd](https://github.com/labscommunity/cascadia/commit/da219dd3ea90d76950d6f2a01853def3da2e5fe0))
+
+
+### Documentation
+
+* **ov-genai:** characterise when --cb helps and when it hurts ([b55c754](https://github.com/labscommunity/cascadia/commit/b55c754df44d4aaade7ea042259c14b594bd9e9b))
+* **ov-genai:** correct the --cb example and three overstated claims ([951a13b](https://github.com/labscommunity/cascadia/commit/951a13b39ad65f3bf28778e3ab324c632818a5aa))
+* **shim:** correct the cancel-vs-stop and request_id claims ([8e1c824](https://github.com/labscommunity/cascadia/commit/8e1c8246deff30f8f2314f06c6a62e094c6a4cf3))
+
+
+### Testing
+
+* **ov-genai:** cover the cb engine state machine behind a pipeline seam ([f28dad0](https://github.com/labscommunity/cascadia/commit/f28dad0f0b8bb1035d969bc406124e5e51933f31))
+* **ov-genai:** pin cb/LLMPipeline chat-template parity ([cb34bb9](https://github.com/labscommunity/cascadia/commit/cb34bb9d8078de600fef73dfa999a1a4139b2f2f))
+* **shim:** cover the cb resync path with unit tests ([b06158d](https://github.com/labscommunity/cascadia/commit/b06158d5462101a5c9358fd9eae920ea50eafff7))
+
 ## [0.1.3](https://github.com/labscommunity/cascadia/compare/v0.1.2...v0.1.3) (2026-07-25)
 
 
