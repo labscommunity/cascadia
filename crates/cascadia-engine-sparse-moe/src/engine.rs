@@ -305,6 +305,7 @@ pub struct SparseMoEBuilder {
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
     /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
     glm_runner: Option<crate::glm::stage::GlmRunner>,
+    k3_runner: Option<crate::k3::stage::K3Runner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -319,6 +320,7 @@ impl SparseMoEBuilder {
             ov_runner: None,
             dsv4_runner: None,
             glm_runner: None,
+            k3_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -528,6 +530,45 @@ impl Builder for SparseMoEBuilder {
             self.glm_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded glm5 stage (glm5 Rust shell)",
+            )])));
+        }
+
+        // Kimi-K3: hybrid KDA (linear attention) + gated NoPE MLA, LatentMoE
+        // experts in fp4. Rust shell; the inter-stage wire is WIDENED to carry
+        // the AttnRes block-residual stack alongside the prefix sum.
+        let is_k3 = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("kimi_k3"))
+            .unwrap_or(false);
+        if is_k3 {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = std::env::var("CASCADIA_K3_MAX_SEQ")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::k3::stage::K3_DEFAULT_MAX_SEQ);
+            let runner =
+                crate::k3::stage::K3Runner::load(&self.config.model_dir, rank, total, max_seq)
+                    .map_err(|e| EngineError::Backend(format!("kimi_k3 load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — k3 engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.k3_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded kimi_k3 stage (k3 Rust shell)",
             )])));
         }
 
@@ -746,6 +787,26 @@ impl Builder for SparseMoEBuilder {
                 // Same value the per-rank SliceKvCache got, so the rank-0 index
                 // and the per-rank caches stay in lockstep.
                 self.config.prefix_cache_depth.map(|d| d as usize),
+            )));
+        }
+        if let Some(runner) = self.k3_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the kimi_k3 API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built kimi_k3 engine");
+            return Ok(Box::new(PipelineEngine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
             )));
         }
         if let Some(ov) = self.ov_runner {

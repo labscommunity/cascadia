@@ -19,3 +19,4 @@ pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod situ;
+pub mod stage;
