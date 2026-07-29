@@ -11,7 +11,9 @@
 //! Every primitive here is golden-tested against `tools/kimi_k3_ref`, which is
 //! itself validated against the vendored upstream sources.
 
+pub mod attn;
 pub mod attn_res;
 pub mod expert_fp4;
 pub mod kda;
+pub mod moe;
 pub mod situ;
