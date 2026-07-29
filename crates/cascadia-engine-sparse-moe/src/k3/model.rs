@@ -225,7 +225,7 @@ pub fn forward_slice<E: ExpertSource>(
     layers: &mut [K3Layer<E>],
     states: &mut [LayerState],
     d: K3Dims,
-    prefix_sum: &mut Vec<f32>,
+    prefix_sum: &mut [f32],
     blocks: &mut [f32],
     mut nb: usize,
 ) -> usize {
