@@ -60,6 +60,14 @@ mod sys {
     pub struct cascadia_runtime_t {
         _private: [u8; 0],
     }
+    #[repr(C)]
+    pub struct cascadia_cb_pipeline_t {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct cascadia_cb_handle_t {
+        _private: [u8; 0],
+    }
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
@@ -136,6 +144,44 @@ mod sys {
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
+
+        pub fn cascadia_cb_pipeline_create(
+            model_path: *const c_char,
+            device: *const c_char,
+            cache_size_gb: u64,
+            max_num_seqs: u64,
+            max_num_batched_tokens: u64,
+            dynamic_split_fuse: i32,
+            enable_prefix_caching: i32,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_cb_pipeline_t,
+        ) -> c_int;
+        pub fn cascadia_cb_pipeline_destroy(handle: *mut cascadia_cb_pipeline_t);
+        pub fn cascadia_cb_add_request(
+            handle: *mut cascadia_cb_pipeline_t,
+            request_id: u64,
+            prompt: *const c_char,
+            cfg: *const cascadia_genconfig_t,
+            out_handle: *mut *mut cascadia_cb_handle_t,
+        ) -> c_int;
+        pub fn cascadia_cb_step(handle: *mut cascadia_cb_pipeline_t) -> c_int;
+        pub fn cascadia_cb_handle_read(
+            pipeline: *mut cascadia_cb_pipeline_t,
+            handle: *mut cascadia_cb_handle_t,
+            out_text: *mut *mut c_char,
+            out_text_len: *mut usize,
+            out_new_tokens: *mut u32,
+            out_status: *mut i32,
+            out_finish_reason: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_cb_handle_cancel(handle: *mut cascadia_cb_handle_t) -> c_int;
+        pub fn cascadia_cb_handle_destroy(handle: *mut cascadia_cb_handle_t);
+        pub fn cascadia_cb_count_tokens(
+            handle: *mut cascadia_cb_pipeline_t,
+            text: *const c_char,
+            out_count: *mut u32,
+        ) -> c_int;
 
         pub fn cascadia_pipeline_get_tokenizer(
             handle: *mut cascadia_pipeline_t,
@@ -286,6 +332,46 @@ mod sys {
             out_len: *mut usize,
         ) -> c_int;
     }
+}
+
+/// Build a native genconfig from `cfg`. The caller owns the returned pointer
+/// and must release it with `cascadia_genconfig_destroy`.
+///
+/// # Safety
+/// Caller must be on the `openvino` build (native shim linked).
+#[cfg(feature = "openvino")]
+unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconfig_t> {
+    let raw_cfg = sys::cascadia_genconfig_new();
+    if raw_cfg.is_null() {
+        return Err(Error::Native("genconfig allocation failed".into()));
+    }
+    sys::cascadia_genconfig_set_max_new_tokens(raw_cfg, cfg.max_new_tokens.max(1));
+    sys::cascadia_genconfig_set_do_sample(raw_cfg, if cfg.do_sample { 1 } else { 0 });
+    sys::cascadia_genconfig_set_temperature(raw_cfg, cfg.temperature.max(0.0));
+    if cfg.num_assistant_tokens > 0 {
+        sys::cascadia_genconfig_set_num_assistant_tokens(raw_cfg, cfg.num_assistant_tokens);
+    }
+    if cfg.max_ngram_size > 0 {
+        sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
+    }
+    sys::cascadia_genconfig_set_apply_chat_template(
+        raw_cfg,
+        if cfg.skip_chat_template { 0 } else { 1 },
+    );
+    // OpenAI-compatible sampling knobs (#14). top_p / penalties take
+    // their OV defaults (1.0 / 0.0) when unset, so setting them is a
+    // no-op; top_k=0 and seed=None mean "disabled" so only forward
+    // when explicitly chosen (OV treats top_k=0 as no truncation).
+    sys::cascadia_genconfig_set_top_p(raw_cfg, cfg.top_p);
+    if cfg.top_k > 0 {
+        sys::cascadia_genconfig_set_top_k(raw_cfg, cfg.top_k);
+    }
+    sys::cascadia_genconfig_set_frequency_penalty(raw_cfg, cfg.frequency_penalty);
+    sys::cascadia_genconfig_set_presence_penalty(raw_cfg, cfg.presence_penalty);
+    if let Some(seed) = cfg.seed {
+        sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
+    }
+    Ok(raw_cfg)
 }
 
 #[cfg(feature = "openvino")]
@@ -487,36 +573,7 @@ impl LlmPipeline {
     pub fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult> {
         let prompt_c = cstr(prompt)?;
         unsafe {
-            let raw_cfg = sys::cascadia_genconfig_new();
-            if raw_cfg.is_null() {
-                return Err(Error::Native("genconfig allocation failed".into()));
-            }
-            sys::cascadia_genconfig_set_max_new_tokens(raw_cfg, cfg.max_new_tokens.max(1));
-            sys::cascadia_genconfig_set_do_sample(raw_cfg, if cfg.do_sample { 1 } else { 0 });
-            sys::cascadia_genconfig_set_temperature(raw_cfg, cfg.temperature.max(0.0));
-            if cfg.num_assistant_tokens > 0 {
-                sys::cascadia_genconfig_set_num_assistant_tokens(raw_cfg, cfg.num_assistant_tokens);
-            }
-            if cfg.max_ngram_size > 0 {
-                sys::cascadia_genconfig_set_max_ngram_size(raw_cfg, cfg.max_ngram_size);
-            }
-            sys::cascadia_genconfig_set_apply_chat_template(
-                raw_cfg,
-                if cfg.skip_chat_template { 0 } else { 1 },
-            );
-            // OpenAI-compatible sampling knobs (#14). top_p / penalties take
-            // their OV defaults (1.0 / 0.0) when unset, so setting them is a
-            // no-op; top_k=0 and seed=None mean "disabled" so only forward
-            // when explicitly chosen (OV treats top_k=0 as no truncation).
-            sys::cascadia_genconfig_set_top_p(raw_cfg, cfg.top_p);
-            if cfg.top_k > 0 {
-                sys::cascadia_genconfig_set_top_k(raw_cfg, cfg.top_k);
-            }
-            sys::cascadia_genconfig_set_frequency_penalty(raw_cfg, cfg.frequency_penalty);
-            sys::cascadia_genconfig_set_presence_penalty(raw_cfg, cfg.presence_penalty);
-            if let Some(seed) = cfg.seed {
-                sys::cascadia_genconfig_set_rng_seed(raw_cfg, seed);
-            }
+            let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
@@ -573,6 +630,435 @@ impl Drop for LlmPipeline {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { sys::cascadia_pipeline_destroy(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
+/// Scheduler knobs for [`CbPipeline`]. Zero / `None` leaves the field at
+/// `ov::genai::SchedulerConfig`'s own default — the shim simply does not
+/// assign it.
+///
+/// Those defaults, verified against OV GenAI 2026.2
+/// (`runtime/include/openvino/genai/scheduler_config.hpp`): `max_num_seqs`
+/// 256, `max_num_batched_tokens` 256, `dynamic_split_fuse` on,
+/// `enable_prefix_caching` off, and `cache_size` 0 — which, together with
+/// `num_kv_blocks` 0, turns on dynamic cache allocation. Re-check these on an
+/// SDK bump; upstream retunes scheduler defaults between releases.
+///
+/// Note `dynamic_split_fuse`: with it OFF, a prompt longer than
+/// `max_num_batched_tokens` is a hard error upstream, not a slow path.
+#[derive(Clone, Debug, Default)]
+pub struct CbSchedulerConfig {
+    pub cache_size_gb: u64,
+    pub max_num_seqs: u64,
+    pub max_num_batched_tokens: u64,
+    pub dynamic_split_fuse: Option<bool>,
+    pub enable_prefix_caching: Option<bool>,
+}
+
+/// Per-request generation state reported by [`CbPipeline::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CbStatus {
+    Running,
+    /// Completed normally (EOS, stop sequence, or the token cap).
+    Finished,
+    /// Aborted via [`CbHandle::cancel`].
+    Cancelled,
+    /// OpenVINO could not continue the request — it ran out of KV cache and
+    /// abandoned it. Distinct from [`CbStatus::Finished`] because the caller
+    /// must report it as a failure, not as a completed answer.
+    Ignored,
+}
+
+/// Why generation stopped, as reported by OpenVINO. `Unknown` means it has not
+/// said, and the caller should fall back to its own inference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CbFinish {
+    Unknown,
+    Stop,
+    Length,
+}
+
+/// One incremental read: the newly generated text suffix plus its token count.
+#[derive(Clone, Debug)]
+pub struct CbRead {
+    /// Newly emittable text. NOT the text of `new_tokens` tokens — see below.
+    pub text_delta: String,
+    /// Tokens appended to this request's accumulated sequence by this read.
+    ///
+    /// This is deliberately not the token count of `text_delta`: the UTF-8
+    /// hold-back can return an empty delta while reporting tokens, because the
+    /// bytes those tokens decoded to are not safe to emit yet. Callers must
+    /// count tokens even when the delta is empty, or usage under-reports.
+    pub new_tokens: u32,
+    pub status: CbStatus,
+    /// OpenVINO's own reason for stopping, once it reports one.
+    pub finish: CbFinish,
+    /// Set once per request when the detokenizer's re-decode stopped extending
+    /// what had already been emitted and the handle had to re-anchor. The
+    /// shim takes no logging dependency, so the caller reports it — with the
+    /// task context the shim does not have.
+    pub resynced: bool,
+}
+
+/// How many bytes of `full` are safe to hand to the caller.
+///
+/// While the request is still running this holds back anything that the next
+/// token may complete or replace:
+///
+/// * a trailing incomplete UTF-8 sequence, and
+/// * a trailing RUN of U+FFFD. A byte-level detokenizer emits one U+FFFD per
+///   undecodable byte, so a 4-byte codepoint arriving over three reads shows up
+///   as one, then two replacement chars before resolving. Holding only the last
+///   one (as the C++ this replaces did) emitted the earlier ones as real text
+///   and then desynced the byte offset permanently.
+///
+/// Nothing is held on the terminal read, so a U+FFFD the model genuinely
+/// produced is delayed, never dropped.
+#[allow(dead_code)]
+fn emittable_len(full: &[u8], running: bool) -> usize {
+    if !running {
+        return full.len();
+    }
+    const REPLACEMENT: [u8; 3] = [0xEF, 0xBF, 0xBD];
+    let mut end = match std::str::from_utf8(full) {
+        Ok(_) => full.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    while end >= REPLACEMENT.len() && full[end - REPLACEMENT.len()..end] == REPLACEMENT {
+        end -= REPLACEMENT.len();
+    }
+    end
+}
+
+/// Advance `emitted` over the latest full decode, returning the newly
+/// emittable text and whether the stream had to re-anchor.
+///
+/// Detokenizers are not guaranteed prefix-stable: appending a token can rewrite
+/// earlier bytes, and a decode gets SHORTER when a run of U+FFFD collapses into
+/// the codepoint it stood in for. Slicing at a remembered byte offset without
+/// checking assumes that never happens; when it does, the offset is wrong for
+/// the rest of the request and the client silently receives garbage — which is
+/// exactly what the C++ this replaces did.
+///
+/// On divergence, re-anchor and emit nothing for the divergent region. The
+/// bytes already handed out cannot be recalled, and emitting the corrected
+/// suffix would duplicate text; re-anchoring at least stops the error
+/// compounding and is reportable.
+#[allow(dead_code)]
+fn advance_emitted(emitted: &mut Vec<u8>, full: &[u8], running: bool) -> (String, bool) {
+    if !full.starts_with(emitted) {
+        emitted.clear();
+        emitted.extend_from_slice(full);
+        return (String::new(), true);
+    }
+    // max(): a re-decode may legitimately hold back MORE than last time (a
+    // completed codepoint replaced by a shorter U+FFFD run), and the emitted
+    // prefix must never go backwards.
+    let end = emittable_len(full, running).max(emitted.len());
+    let bytes = &full[emitted.len()..end];
+    emitted.extend_from_slice(bytes);
+    (String::from_utf8_lossy(bytes).into_owned(), false)
+}
+
+/// Owned `ContinuousBatchingPipeline` handle (issue #20). One pipeline
+/// serves many concurrent requests; [`CbHandle`]s must be dropped before
+/// the pipeline they came from.
+pub struct CbPipeline {
+    #[cfg(feature = "openvino")]
+    inner: std::sync::Arc<CbInner>,
+}
+
+/// Shared owner of the native pipeline. Both [`CbPipeline`] and every
+/// [`CbHandle`] it mints hold an `Arc` of this, so the native
+/// `ContinuousBatchingPipeline` outlives its handles by construction.
+///
+/// The C header requires handles be destroyed before the pipeline; previously
+/// that was upheld only by the declaration order of two fields in a struct in
+/// another crate, where reordering them — something reviewers read as cosmetic
+/// — would have been a use-after-free with no compiler complaint.
+#[cfg(feature = "openvino")]
+struct CbInner {
+    ptr: *mut sys::cascadia_cb_pipeline_t,
+}
+
+// SAFETY: `CbInner` owns the native pipeline exclusively and OV GenAI
+// pipelines have no thread affinity, so moving one between threads is sound.
+// `Sync` is required only because `Arc<T>` demands `T: Send + Sync` to be
+// `Send`; nothing hands out `&CbInner`, and every call that reaches the native
+// pipeline goes through `&mut`-gated engine methods serialised behind the
+// runner's engine mutex. The shim itself is NOT thread-safe (see shim.h).
+#[cfg(feature = "openvino")]
+unsafe impl Send for CbInner {}
+#[cfg(feature = "openvino")]
+unsafe impl Sync for CbInner {}
+
+// SAFETY: as above — exclusive ownership, no thread affinity. Deliberately not
+// `Sync`: `&CbPipeline` must not cross threads.
+unsafe impl Send for CbPipeline {}
+
+/// Owned per-request generation handle from [`CbPipeline::add_request`].
+///
+/// Holds an `Arc` on the pipeline that minted it, so it can neither outlive it
+/// nor be read through a different one.
+pub struct CbHandle {
+    #[cfg(feature = "openvino")]
+    inner: std::sync::Arc<CbInner>,
+    #[cfg(feature = "openvino")]
+    handle: *mut sys::cascadia_cb_handle_t,
+    /// Bytes of this request's decode already handed to the caller.
+    #[cfg(feature = "openvino")]
+    emitted: Vec<u8>,
+    /// Latches the one-per-request divergence warning.
+    #[cfg(feature = "openvino")]
+    warned_divergence: bool,
+}
+
+// SAFETY: as `CbPipeline`. A handle and its pipeline must stay on the same
+// thread; both are reached only through the engine, which the runner serialises.
+unsafe impl Send for CbHandle {}
+
+impl CbPipeline {
+    #[cfg(not(feature = "openvino"))]
+    pub fn new(
+        _model_path: &str,
+        _device: &str,
+        _sched: &CbSchedulerConfig,
+        _plugin: &PluginConfig,
+    ) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    pub fn new(
+        model_path: &str,
+        device: &str,
+        sched: &CbSchedulerConfig,
+        plugin: &PluginConfig,
+    ) -> Result<Self> {
+        let model_c = cstr(model_path)?;
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        let tri = |v: Option<bool>| match v {
+            None => -1i32,
+            Some(false) => 0,
+            Some(true) => 1,
+        };
+        let mut handle: *mut sys::cascadia_cb_pipeline_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::cascadia_cb_pipeline_create(
+                model_c.as_ptr(),
+                device_c.as_ptr(),
+                sched.cache_size_gb,
+                sched.max_num_seqs,
+                sched.max_num_batched_tokens,
+                tri(sched.dynamic_split_fuse),
+                tri(sched.enable_prefix_caching),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self {
+            inner: std::sync::Arc::new(CbInner { ptr: handle }),
+        })
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn add_request(
+        &self,
+        _request_id: u64,
+        _prompt: &str,
+        _cfg: &GenConfig,
+    ) -> Result<CbHandle> {
+        Err(Error::Stub)
+    }
+
+    /// Enroll a prompt into the running batch. `request_id` must be unique
+    /// among live requests on this pipeline.
+    #[cfg(feature = "openvino")]
+    pub fn add_request(&self, request_id: u64, prompt: &str, cfg: &GenConfig) -> Result<CbHandle> {
+        let prompt_c = cstr(prompt)?;
+        unsafe {
+            let raw_cfg = native_genconfig(cfg)?;
+            let mut handle: *mut sys::cascadia_cb_handle_t = ptr::null_mut();
+            let rc = sys::cascadia_cb_add_request(
+                self.inner.ptr,
+                request_id,
+                prompt_c.as_ptr(),
+                raw_cfg,
+                &mut handle,
+            );
+            sys::cascadia_genconfig_destroy(raw_cfg);
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(CbHandle {
+                inner: std::sync::Arc::clone(&self.inner),
+                handle,
+                emitted: Vec::new(),
+                warned_divergence: false,
+            })
+        }
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn step(&self) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Advance the batch by one scheduler iteration. The scheduler picks which
+    /// enrolled requests run, so a given request may not progress. A no-op
+    /// when the pipeline has no non-finished requests.
+    #[cfg(feature = "openvino")]
+    pub fn step(&self) -> Result<()> {
+        let rc = unsafe { sys::cascadia_cb_step(self.inner.ptr) };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+        None
+    }
+
+    /// Best-effort token count via the pipeline's tokenizer.
+    #[cfg(feature = "openvino")]
+    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+        let text_c = cstr(text).ok()?;
+        let mut out: u32 = 0;
+        let rc =
+            unsafe { sys::cascadia_cb_count_tokens(self.inner.ptr, text_c.as_ptr(), &mut out) };
+        if rc != 0 {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for CbInner {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { sys::cascadia_cb_pipeline_destroy(self.ptr) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
+impl CbHandle {
+    #[cfg(not(feature = "openvino"))]
+    pub fn read(&mut self) -> Result<CbRead> {
+        Err(Error::Stub)
+    }
+
+    /// Drain newly generated text for this request since the previous read.
+    ///
+    /// Lives on the handle rather than the pipeline so it cannot be called
+    /// with a handle minted by a different pipeline — that decoded the text
+    /// with the wrong tokenizer and returned success.
+    #[cfg(feature = "openvino")]
+    pub fn read(&mut self) -> Result<CbRead> {
+        unsafe {
+            let mut text_p: *mut c_char = ptr::null_mut();
+            let mut text_len: usize = 0;
+            let mut new_tokens: u32 = 0;
+            let mut status: i32 = 0;
+            let mut finish: i32 = 0;
+            let rc = sys::cascadia_cb_handle_read(
+                self.inner.ptr,
+                self.handle,
+                &mut text_p,
+                &mut text_len,
+                &mut new_tokens,
+                &mut status,
+                &mut finish,
+            );
+            if rc != 0 || text_p.is_null() {
+                return Err(Error::Native(last_native_error()));
+            }
+            let full = std::slice::from_raw_parts(text_p as *const u8, text_len);
+            let running = status == 0;
+            let (text_delta, resynced) = self.take_delta(full, running);
+            sys::cascadia_free_string(text_p);
+            // An unrecognised code means the C ABI grew a state this build does
+            // not know how to treat. Guessing "finished" would report a failure
+            // as an answer, which is the bug this widening exists to fix.
+            let status = match status {
+                0 => CbStatus::Running,
+                1 => CbStatus::Finished,
+                2 => CbStatus::Cancelled,
+                3 => CbStatus::Ignored,
+                other => {
+                    return Err(Error::Native(format!("unknown cb status {other}")));
+                }
+            };
+            Ok(CbRead {
+                text_delta,
+                new_tokens,
+                resynced,
+                status,
+                finish: match finish {
+                    1 => CbFinish::Stop,
+                    2 => CbFinish::Length,
+                    _ => CbFinish::Unknown,
+                },
+            })
+        }
+    }
+
+    /// Advance `emitted` over `full` and return the newly emittable text.
+    ///
+    /// Detokenizers are not guaranteed prefix-stable — appending a token can
+    /// rewrite earlier bytes, and a decode can get SHORTER when a run of
+    /// U+FFFD collapses into the codepoint it was standing in for. Slicing at
+    /// a remembered byte offset without checking assumes it never happens; when
+    /// it does the offset is wrong for the rest of the request and the client
+    /// silently receives garbage. Re-anchor instead, emitting nothing for the
+    /// divergent region: the already-emitted bytes cannot be recalled, and
+    /// re-emitting the corrected suffix would duplicate text.
+    #[cfg(feature = "openvino")]
+    fn take_delta(&mut self, full: &[u8], running: bool) -> (String, bool) {
+        let (delta, diverged) = advance_emitted(&mut self.emitted, full, running);
+        let first_divergence = diverged && !self.warned_divergence;
+        self.warned_divergence |= diverged;
+        (delta, first_divergence)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    pub fn cancel(&self) -> Result<()> {
+        Err(Error::Stub)
+    }
+
+    /// Abort this request (client disconnect / cancel). Safe when already
+    /// finished.
+    #[cfg(feature = "openvino")]
+    pub fn cancel(&self) -> Result<()> {
+        let rc = unsafe { sys::cascadia_cb_handle_cancel(self.handle) };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "openvino")]
+impl Drop for CbHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sys::cascadia_cb_handle_destroy(self.handle) };
             self.handle = ptr::null_mut();
         }
     }
@@ -1115,6 +1601,204 @@ where
     }
     buf.truncate(len);
     String::from_utf8(buf).map_err(|e| Error::Utf8(e.to_string()))
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::advance_emitted;
+
+    const FFFD: &[u8] = &[0xEF, 0xBF, 0xBD];
+    const GRIN: &[u8] = &[0xF0, 0x9F, 0x98, 0x80];
+
+    /// The ordinary case: each read extends the last, and concatenating the
+    /// deltas reproduces the final decode exactly once.
+    #[test]
+    fn monotonic_reads_emit_each_byte_exactly_once() {
+        let mut emitted = Vec::new();
+        let mut out = String::new();
+        for full in [
+            b"He".as_slice(),
+            b"Hello".as_slice(),
+            b"Hello wo".as_slice(),
+        ] {
+            let (d, diverged) = advance_emitted(&mut emitted, full, true);
+            assert!(!diverged);
+            out.push_str(&d);
+        }
+        let (d, _) = advance_emitted(&mut emitted, b"Hello world", false);
+        out.push_str(&d);
+        assert_eq!(out, "Hello world");
+    }
+
+    /// A decode that gets SHORTER cannot be a prefix extension. Before the
+    /// rewrite this silently emitted nothing and left the byte offset stale for
+    /// the rest of the request; now it re-anchors and says so.
+    #[test]
+    fn a_shorter_redecode_reanchors_and_reports() {
+        let mut emitted = Vec::new();
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcdef", true);
+        assert_eq!(d, "abcdef");
+        assert!(!diverged);
+
+        let (d, diverged) = advance_emitted(&mut emitted, b"abc", true);
+        assert!(diverged, "a shorter decode must be reported");
+        assert_eq!(d, "", "must not re-emit or emit a bogus slice");
+        assert_eq!(emitted, b"abc", "must re-anchor onto the new decode");
+    }
+
+    /// Same length, different content — the case a byte-count check cannot see
+    /// at all.
+    #[test]
+    fn a_rewritten_prefix_of_equal_length_reanchors() {
+        let mut emitted = Vec::new();
+        advance_emitted(&mut emitted, b"abcdef", true);
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcXef", true);
+        assert!(diverged);
+        assert_eq!(d, "");
+        assert_eq!(emitted, b"abcXef");
+    }
+
+    /// After re-anchoring, the stream must keep working rather than staying
+    /// desynced — this is the compounding-corruption case.
+    #[test]
+    fn growth_after_a_reanchor_still_emits_correctly() {
+        let mut emitted = Vec::new();
+        advance_emitted(&mut emitted, b"abcdef", true);
+        let (_, diverged) = advance_emitted(&mut emitted, b"abc", true);
+        assert!(diverged);
+        let (d, diverged) = advance_emitted(&mut emitted, b"abcXYZ", true);
+        assert!(!diverged, "growth from the new anchor is not a divergence");
+        assert_eq!(d, "XYZ");
+    }
+
+    /// The real-world shape: a 4-byte codepoint arrives as a growing run of
+    /// U+FFFD, then resolves — which SHRINKS the decode. Nothing partial may
+    /// reach the caller, and the codepoint must arrive exactly once.
+    #[test]
+    fn emoji_resolving_from_a_replacement_run_never_leaks_a_partial() {
+        let mut emitted = Vec::new();
+        let mut out = String::new();
+        let steps: [(Vec<u8>, bool); 3] = [
+            ([b"hi ".as_slice(), FFFD].concat(), true),
+            ([b"hi ".as_slice(), &FFFD.repeat(2)].concat(), true),
+            ([b"hi ".as_slice(), GRIN].concat(), false),
+        ];
+        for (full, running) in steps {
+            let (d, _) = advance_emitted(&mut emitted, &full, running);
+            out.push_str(&d);
+        }
+        assert_eq!(out, "hi \u{1F600}");
+    }
+
+    /// Held-back bytes must be released on the terminal read, not lost.
+    #[test]
+    fn terminal_read_flushes_held_bytes() {
+        let mut emitted = Vec::new();
+        let partial = [b"ok".as_slice(), &GRIN[..2]].concat();
+        let (d, _) = advance_emitted(&mut emitted, &partial, true);
+        assert_eq!(d, "ok", "incomplete tail held while running");
+        // A tail that is genuinely torn (the request ended mid-codepoint)
+        // surfaces as exactly one replacement char rather than being dropped.
+        let (d, _) = advance_emitted(&mut emitted, &partial, false);
+        assert_eq!(d, "\u{FFFD}");
+    }
+}
+
+#[cfg(test)]
+mod holdback_tests {
+    use super::emittable_len;
+
+    const FFFD: &[u8] = &[0xEF, 0xBF, 0xBD];
+    const EURO: &[u8] = &[0xE2, 0x82, 0xAC]; // U+20AC, 3 bytes
+    const GRIN: &[u8] = &[0xF0, 0x9F, 0x98, 0x80]; // U+1F600, 4 bytes
+
+    fn run(bytes: &[u8]) -> usize {
+        emittable_len(bytes, true)
+    }
+
+    #[test]
+    fn empty_and_ascii_are_fully_emittable() {
+        assert_eq!(run(b""), 0);
+        assert_eq!(run(b"abc"), 3);
+    }
+
+    #[test]
+    fn complete_multibyte_codepoints_are_emittable() {
+        assert_eq!(run(EURO), EURO.len());
+        assert_eq!(run(GRIN), GRIN.len());
+        let mixed = [b"hi".as_slice(), GRIN, b"!".as_slice()].concat();
+        assert_eq!(run(&mixed), mixed.len());
+    }
+
+    #[test]
+    fn truncated_sequences_are_held_at_every_offset() {
+        // Every proper prefix of a multi-byte codepoint holds back entirely.
+        for cp in [EURO, GRIN] {
+            for take in 1..cp.len() {
+                let buf = [b"ok".as_slice(), &cp[..take]].concat();
+                assert_eq!(
+                    run(&buf),
+                    2,
+                    "prefix of {take} bytes should hold back, buf={buf:02x?}"
+                );
+            }
+        }
+    }
+
+    /// The bug this replaced: a byte-level detokenizer emits one U+FFFD per
+    /// undecodable byte, so a 4-byte codepoint split across reads appears as a
+    /// growing RUN of them. Holding only the last one emitted the earlier ones
+    /// as real text and desynced every later read.
+    #[test]
+    fn a_run_of_trailing_replacements_is_held_whole() {
+        for n in 1..=3 {
+            let buf = [b"ok".as_slice(), &FFFD.repeat(n)].concat();
+            assert_eq!(run(&buf), 2, "{n} trailing U+FFFD should all be held");
+        }
+    }
+
+    /// A U+FFFD the model really produced is delayed, never dropped: once
+    /// non-replacement text follows it, it becomes emittable, and the terminal
+    /// read releases everything regardless.
+    #[test]
+    fn a_genuine_replacement_char_is_delayed_not_lost() {
+        let followed = [b"a".as_slice(), FFFD, b"b".as_slice()].concat();
+        assert_eq!(run(&followed), followed.len());
+
+        let trailing = [b"a".as_slice(), FFFD].concat();
+        assert_eq!(run(&trailing), 1);
+        assert_eq!(emittable_len(&trailing, false), trailing.len());
+    }
+
+    #[test]
+    fn terminal_read_releases_even_invalid_bytes() {
+        let torn = [b"ok".as_slice(), &GRIN[..2]].concat();
+        assert_eq!(emittable_len(&torn, false), torn.len());
+    }
+
+    /// Walking one emoji through three reads must never emit a partial or a
+    /// replacement char, and must emit the codepoint exactly once.
+    #[test]
+    fn emoji_split_across_reads_emits_once_and_whole() {
+        // Read 1 and 2 decode to a growing run of U+FFFD; read 3 resolves.
+        let steps: [Vec<u8>; 3] = [
+            [b"hi ".as_slice(), FFFD].concat(),
+            [b"hi ".as_slice(), &FFFD.repeat(2)].concat(),
+            [b"hi ".as_slice(), GRIN].concat(),
+        ];
+        let mut emitted = 0usize;
+        let mut out: Vec<u8> = Vec::new();
+        for (i, full) in steps.iter().enumerate() {
+            let running = i < steps.len() - 1;
+            let end = emittable_len(full, running).max(emitted);
+            out.extend_from_slice(&full[emitted..end]);
+            emitted = end;
+        }
+        assert_eq!(
+            String::from_utf8(out).expect("emitted bytes must be valid utf8"),
+            "hi \u{1F600}"
+        );
+    }
 }
 
 #[cfg(test)]

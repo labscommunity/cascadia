@@ -417,6 +417,37 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub prompt_lookup: u32,
 
+    /// Continuous batching (#20, ov-genai only): serve concurrent requests
+    /// through one ContinuousBatchingPipeline (paged attention; CPU/GPU
+    /// plugins) instead of one generation at a time. Incompatible with
+    /// --draft-model / --prompt-lookup.
+    #[arg(long)]
+    pub cb: bool,
+
+    /// KV-cache size in GB for --cb (0 = ov-genai dynamic allocation).
+    #[arg(long, default_value_t = 0)]
+    pub cb_cache_size: u64,
+
+    /// Max sequences batched per iteration for --cb (0 = ov-genai default,
+    /// 256).
+    #[arg(long, default_value_t = 0)]
+    pub cb_max_num_seqs: u64,
+
+    /// Max tokens batched per iteration for --cb (0 = ov-genai default,
+    /// 256).
+    #[arg(long, default_value_t = 0)]
+    pub cb_max_batched_tokens: u64,
+
+    /// Override the dynamic-split-fuse scheduler toggle for --cb
+    /// (unset = ov-genai default, on).
+    #[arg(long)]
+    pub cb_dynamic_split_fuse: Option<bool>,
+
+    /// Enable KV-block prefix caching across requests for --cb
+    /// (unset = ov-genai default, off).
+    #[arg(long)]
+    pub cb_prefix_caching: Option<bool>,
+
     /// Max new tokens for stdin mode.
     #[arg(long, default_value_t = 64)]
     pub max_tokens: u32,
@@ -622,6 +653,12 @@ impl WorkerArgs {
             draft_device: None,
             spec_k: 5,
             prompt_lookup: 0,
+            cb: false,
+            cb_cache_size: 0,
+            cb_max_num_seqs: 0,
+            cb_max_batched_tokens: 0,
+            cb_dynamic_split_fuse: None,
+            cb_prefix_caching: None,
             max_tokens: 64,
             advertise_engines: Vec::new(),
             advertise_device: None,
@@ -987,6 +1024,15 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
 /// ignored for the chosen engine/device, so an ineffective flag is visible at
 /// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
 /// warning in `build_builder`'s sparse-moe arm).
+/// `--cb` targeting the CPU plugin specifically.
+///
+/// Deliberately an exact match rather than a prefix: `AUTO`/`HETERO` strings
+/// that may resolve to CPU are not flagged, because we cannot tell at
+/// parse time what the plugin will pick.
+fn cb_on_plain_cpu(args: &WorkerArgs) -> bool {
+    args.cb && args.device.trim().eq_ignore_ascii_case("CPU")
+}
+
 fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
     // NPU LLM knobs apply only to ov-genai on an NPU device (see
     // `ov_perf_properties`). If the user set one but that gate won't fire, the
@@ -1012,6 +1058,24 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         tracing::warn!(
             "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
              with a fixed plugin config and does not apply them"
+        );
+    }
+
+    // --cb on CPU is a narrow win and has a severe failure mode. Measured on
+    // Lunar Lake across Phi-3.5-mini and Qwen3-8B: short prompts at concurrency
+    // gain 1.6-2.1x, but a ~1200-token prompt collapses to ~0.2x — a five-fold
+    // loss, on both models, and NOT recoverable by raising
+    // --cb-max-batched-tokens (which does help on GPU). Nothing in the output
+    // says why, so an operator serving RAG-style traffic from a CPU worker
+    // would just see it get slower. Warn rather than reject: CPU + short
+    // prompts is a legitimate configuration.
+    if cb_on_plain_cpu(args) {
+        tracing::warn!(
+            device = %args.device,
+            "--cb on CPU only pays off for short prompts under concurrency; \
+             long-context workloads measure ~5x SLOWER than without --cb, and \
+             --cb-max-batched-tokens does not recover it. Benchmark your own \
+             prompt shape — see docs/engines/ov-genai.md"
         );
     }
 }
@@ -1126,7 +1190,21 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                     "--draft-model and --prompt-lookup are mutually exclusive"
                 ));
             }
+            if args.cb && (args.draft_model.is_some() || args.prompt_lookup > 0) {
+                return Err(anyhow!(
+                    "--cb is incompatible with --draft-model / --prompt-lookup"
+                ));
+            }
             let mut b = OvGenaiBuilder::new(&args.model, &args.device);
+            if args.cb {
+                b = b.with_continuous_batching(cascadia_ov_genai_shim::CbSchedulerConfig {
+                    cache_size_gb: args.cb_cache_size,
+                    max_num_seqs: args.cb_max_num_seqs,
+                    max_num_batched_tokens: args.cb_max_batched_tokens,
+                    dynamic_split_fuse: args.cb_dynamic_split_fuse,
+                    enable_prefix_caching: args.cb_prefix_caching,
+                });
+            }
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }
@@ -1411,6 +1489,38 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     if (args.prefill_device.is_some() || args.park_prefill) && args.no_chunked_prefill {
         return Err(anyhow!(
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
+        ));
+    }
+    // Continuous batching (#20) lives in the ov-genai CBP path only.
+    if (args.cb
+        || args.cb_cache_size > 0
+        || args.cb_max_num_seqs > 0
+        || args.cb_max_batched_tokens > 0
+        || args.cb_dynamic_split_fuse.is_some()
+        || args.cb_prefix_caching.is_some())
+        && args.engine != EngineKind::OvGenai
+    {
+        return Err(anyhow!(
+            "--cb / --cb-* flags require --engine ov-genai (continuous batching is \
+             served by ov-genai's ContinuousBatchingPipeline)"
+        ));
+    }
+    if !args.cb
+        && (args.cb_cache_size > 0
+            || args.cb_max_num_seqs > 0
+            || args.cb_max_batched_tokens > 0
+            || args.cb_dynamic_split_fuse.is_some()
+            || args.cb_prefix_caching.is_some())
+    {
+        return Err(anyhow!("--cb-* tuning flags require --cb"));
+    }
+    // Paged attention is a CPU/GPU-plugin capability; on NPU ov-genai serves
+    // the static NPUW pipeline. Without this gate the operator waits out a
+    // full model compile only to get a raw OpenVINO exception.
+    if args.cb && device_is_npu(&args.device) {
+        return Err(anyhow!(
+            "--cb requires a CPU or GPU device; NPU serves ov-genai's static NPUW \
+             pipeline and cannot continuous-batch — drop --cb for NPU workers"
         ));
     }
     Ok(())
@@ -2234,6 +2344,91 @@ mod python_tests {
     fn worker_flags_accept_valid_phase_split() {
         let mut a = worker("m", EngineKind::OvRuntime);
         a.prefill_device = Some("NPU".into());
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// Continuous batching lives in ov-genai's CBP path; --cb on any other
+    /// engine is rejected loudly, not silently ignored.
+    #[test]
+    fn worker_flags_reject_cb_without_ov_genai() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.cb = true;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
+
+        // Tuning flags alone (without --cb) trip the same engine gate.
+        let mut a = worker("m", EngineKind::Mock);
+        a.cb_max_num_seqs = 32;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
+    }
+
+    /// --cb-* tuning knobs without --cb are a misconfiguration, even on
+    /// ov-genai — the operator believes batching is on when it is not.
+    #[test]
+    fn worker_flags_reject_cb_tuning_without_cb() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb_cache_size = 4;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--cb"), "{err}");
+    }
+
+    /// The CPU long-prompt collapse is a documented hazard with no runtime
+    /// signal of its own, so the worker says something at startup. Warn, not
+    /// reject — CPU with short prompts is a real 1.6-2.1x win.
+    #[test]
+    fn cb_on_cpu_is_flagged_but_gpu_and_npu_are_not() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        for (device, want) in [
+            ("CPU", true),
+            ("cpu", true),
+            (" CPU ", true),
+            ("GPU", false),
+            ("GPU.0", false),
+            ("NPU", false),
+            // Compound strings may resolve to CPU at runtime; we cannot know.
+            ("AUTO", false),
+            ("HETERO:CPU,GPU", false),
+        ] {
+            a.device = device.to_string();
+            assert_eq!(cb_on_plain_cpu(&a), want, "device={device}");
+        }
+        // Without --cb there is nothing to warn about.
+        a.cb = false;
+        a.device = "CPU".to_string();
+        assert!(!cb_on_plain_cpu(&a));
+    }
+
+    /// `--cb` on an NPU device is rejected up front. The docs say paged
+    /// attention cannot work there; without the gate the operator pays a full
+    /// model compile before OpenVINO throws.
+    #[test]
+    fn worker_flags_reject_cb_on_npu() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.device = "NPU".to_string();
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("NPU"), "{err}");
+
+        // A compound AUTO/HETERO string that merely mentions NPU is not an
+        // NPU target (matches device_is_npu's documented contract).
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.device = "HETERO:NPU,CPU".to_string();
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// The full CB flag set on ov-genai passes validation.
+    #[test]
+    fn worker_flags_accept_cb_on_ov_genai() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.cb_cache_size = 4;
+        a.cb_max_num_seqs = 32;
+        a.cb_max_batched_tokens = 2048;
+        a.cb_dynamic_split_fuse = Some(true);
+        a.cb_prefix_caching = Some(true);
         assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 

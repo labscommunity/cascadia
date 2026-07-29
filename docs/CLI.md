@@ -166,6 +166,12 @@ dropped, with a warning in the log.
 | `--draft-device <DEVICE>` | same as `--device` | Device for the draft model. |
 | `--spec-k <K>` | `5` | Draft length per round. |
 | `--prompt-lookup <N>` | `0` | Prompt Lookup decoding with n-gram size N. Mutually exclusive with `--draft-model`. |
+| `--cb` | off | Continuous batching (#20, ov-genai only): concurrent requests share one `ContinuousBatchingPipeline` (paged attention, CPU/GPU plugins) instead of serializing one generation at a time. Incompatible with `--draft-model` / `--prompt-lookup`. NPU serves the static NPUW pipeline and cannot continuous-batch. |
+| `--cb-cache-size <GB>` | `0` | KV-cache GB for `--cb` (0 = ov-genai dynamic allocation). |
+| `--cb-max-num-seqs <N>` | `0` | Max sequences per batch iteration (0 = ov-genai default 256). |
+| `--cb-max-batched-tokens <N>` | `0` | Max tokens per batch iteration (0 = ov-genai default 256). |
+| `--cb-dynamic-split-fuse <BOOL>` | ov-genai default (on) | Dynamic-split-fuse scheduler toggle for `--cb`. |
+| `--cb-prefix-caching <BOOL>` | ov-genai default (off) | KV-block prefix reuse across requests for `--cb`. |
 
 For distributed speculative decode, every rank needs `--engine ov-dist-spec` —
 they share a wire protocol. See [engines/ov-dist-spec.md](engines/ov-dist-spec.md).

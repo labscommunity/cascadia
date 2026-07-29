@@ -17,7 +17,10 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
-use cascadia_ov_genai_shim::{Error as OvError, GenConfig, LlmPipeline, PluginConfig};
+use cascadia_ov_genai_shim::{
+    CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
+    GenConfig, LlmPipeline, PluginConfig,
+};
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
     TaskId,
@@ -42,7 +45,11 @@ pub struct OvGenaiBuilder {
     /// True when the API pre-renders the model's chat template (so the engine
     /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
     pub prompt_pretemplated: bool,
+    /// Continuous batching (#20): serve concurrent requests through one
+    /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
+    pub continuous_batching: Option<CbSchedulerConfig>,
     pipe: Option<LlmPipeline>,
+    cb_pipe: Option<CbPipeline>,
 }
 
 impl OvGenaiBuilder {
@@ -59,8 +66,16 @@ impl OvGenaiBuilder {
             speculative_k: 0,
             prompt_lookup_ngram: 0,
             prompt_pretemplated: false,
+            continuous_batching: None,
             pipe: None,
+            cb_pipe: None,
         }
+    }
+
+    /// Enable continuous batching (#20) with the given scheduler knobs.
+    pub fn with_continuous_batching(mut self, sched: CbSchedulerConfig) -> Self {
+        self.continuous_batching = Some(sched);
+        self
     }
 
     /// Set when the API renders the chat template itself (template loaded).
@@ -191,6 +206,15 @@ impl Builder for OvGenaiBuilder {
                     .into(),
             ));
         }
+        if self.continuous_batching.is_some()
+            && (self.draft_model_path.is_some() || self.prompt_lookup_ngram > 0)
+        {
+            return Err(EngineError::InvalidConfig(
+                "--cb is incompatible with --draft-model / --prompt-lookup: the \
+                 continuous-batching scheduler owns batch composition. Drop one."
+                    .into(),
+            ));
+        }
 
         if !PathBuf::from(&self.model_path).exists() {
             return Err(EngineError::ModelNotFound(self.model_path.clone()));
@@ -219,6 +243,25 @@ impl Builder for OvGenaiBuilder {
         let model_dir = PathBuf::from(&self.model_path);
         let is_vlm_layout = model_dir.join("openvino_language_model.xml").exists()
             && !model_dir.join("openvino_model.xml").exists();
+        if let Some(sched) = &self.continuous_batching {
+            if is_vlm_layout {
+                return Err(EngineError::InvalidConfig(
+                    "--cb is not supported on VLM-layout exports; \
+                     ContinuousBatchingPipeline needs a plain LM export"
+                        .into(),
+                ));
+            }
+            progress.push(LoadProgress::message(format!(
+                "compiling ContinuousBatchingPipeline on {} (cache {} GB, max_num_seqs {}, \
+                 max_batched_tokens {})",
+                self.device, sched.cache_size_gb, sched.max_num_seqs, sched.max_num_batched_tokens,
+            )));
+            let pipe = CbPipeline::new(&self.model_path, &self.device, sched, &plugin)
+                .map_err(map_ov_err)?;
+            progress.push(LoadProgress::ready());
+            self.cb_pipe = Some(pipe);
+            return Ok(Box::pin(stream::iter(progress)));
+        }
         let pipe = if is_vlm_layout {
             if self.draft_model_path.is_some() {
                 return Err(EngineError::InvalidConfig(
@@ -276,6 +319,17 @@ impl Builder for OvGenaiBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        if let Some(pipe) = self.cb_pipe {
+            return Ok(Box::new(OvGenaiCbEngine {
+                active: Vec::new(),
+                pipe: Box::new(pipe),
+                prompt_pretemplated: self.prompt_pretemplated,
+                next_request_id: 0,
+                max_tokens_default: 256,
+                idle_steps: 0,
+                step_failures: 0,
+            }));
+        }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
             pipe,
@@ -430,7 +484,493 @@ impl Engine for OvGenaiEngine {
     }
 }
 
+/// Scheduler iterations the CB warmup will drive before giving up. The warmup
+/// request asks for 4 tokens, so a healthy pipeline terminates in a handful.
+const WARMUP_MAX_STEPS: usize = 64;
+
+/// Consecutive scheduler iterations in which NO in-flight request produced a
+/// token before the engine declares the batch stalled.
+///
+/// The liveness chunk emitted on such an iteration (see [`OvGenaiCbEngine`])
+/// deliberately hides them from the runner's no-progress guard, so this is the
+/// engine's own replacement for it — without a bound, a genuinely wedged
+/// pipeline that keeps returning success would stream empty chunks until every
+/// request hit max_tokens.
+///
+/// The counter only advances while the WHOLE batch is quiet (any request
+/// producing a token resets it), so the largest legitimate run is one request's
+/// chunked prefill: ceil(prompt_tokens / max_num_batched_tokens). At the
+/// ov-genai default 256-token window this covers a ~512K-token prompt, which is
+/// far beyond any supported context, while still terminating.
+const MAX_IDLE_STEPS: u32 = 2048;
+
+/// Consecutive `pipe.step()` failures after which the CB pipeline is treated as
+/// unusable and new work is refused at `submit()`. Low, because a scheduler
+/// iteration failing repeatedly means the device or the paged-attention cache
+/// is gone, not that one request was unlucky.
+const MAX_STEP_FAILURES: u32 = 3;
+
+/// The slice of [`CbPipeline`] the continuous-batching engine actually uses.
+///
+/// Exists so the engine's state machine is testable without OpenVINO. The real
+/// implementation is the FFI type; tests drive a scripted mock. Without it the
+/// engine is untestable in a stub build — `CbPipeline::new` returns
+/// `Error::Stub`, and every method on a stub pipeline errors, so `step()` can
+/// only ever reach its failure branch.
+trait CbPipe: Send {
+    fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        cfg: &GenConfig,
+    ) -> Result<Box<dyn CbReq>, OvError>;
+    fn step(&self) -> Result<(), OvError>;
+    fn count_tokens(&self, text: &str) -> Option<u32>;
+}
+
+/// One enrolled request, as the engine sees it.
+trait CbReq: Send {
+    fn read(&mut self) -> Result<CbRead, OvError>;
+    fn cancel(&self) -> Result<(), OvError>;
+}
+
+impl CbPipe for CbPipeline {
+    fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        cfg: &GenConfig,
+    ) -> Result<Box<dyn CbReq>, OvError> {
+        Ok(Box::new(CbPipeline::add_request(
+            self, request_id, prompt, cfg,
+        )?))
+    }
+    fn step(&self) -> Result<(), OvError> {
+        CbPipeline::step(self)
+    }
+    fn count_tokens(&self, text: &str) -> Option<u32> {
+        CbPipeline::count_tokens(self, text)
+    }
+}
+
+impl CbReq for CbHandle {
+    fn read(&mut self) -> Result<CbRead, OvError> {
+        CbHandle::read(self)
+    }
+    fn cancel(&self) -> Result<(), OvError> {
+        CbHandle::cancel(self)
+    }
+}
+
+/// Per-request generation state on the continuous-batching engine.
+struct ActiveCbTask {
+    task_id: TaskId,
+    handle: Box<dyn CbReq>,
+    total_tokens: u32,
+    max_tokens: u32,
+    prompt_tokens: Option<u32>,
+    started: Instant,
+}
+
+/// Continuous-batching ov-genai engine (#20). Unlike [`OvGenaiEngine`]'s
+/// monolithic step (one whole generation per call), every `step()` advances
+/// the batch by one scheduler iteration and emits one text delta per request
+/// that progressed — the runner's per-task chunk buffers route each delta to
+/// its owner. Which enrolled requests actually run in a given iteration is the
+/// scheduler's choice, bounded by `max_num_seqs` / `max_num_batched_tokens`
+/// and KV-cache pressure; a request may sit out a step entirely. `submit()`
+/// enrolls into the running batch immediately, so a request arriving
+/// mid-generation joins the next iteration instead of waiting for the batch
+/// to drain.
+///
+/// A step that progresses the batch without producing any token — every
+/// iteration of a chunked prefill does this — still emits a zero-token chunk.
+/// An empty Vec from `step()` means "nothing in flight", and the runner's
+/// no-progress guard relies on that distinction.
+pub struct OvGenaiCbEngine {
+    active: Vec<ActiveCbTask>,
+    pipe: Box<dyn CbPipe>,
+    prompt_pretemplated: bool,
+    next_request_id: u64,
+    max_tokens_default: u32,
+    /// Consecutive iterations in which the whole batch produced nothing.
+    idle_steps: u32,
+    /// Consecutive `pipe.step()` failures. Past MAX_STEP_FAILURES the pipeline
+    /// is treated as unusable and `submit()` stops admitting work.
+    step_failures: u32,
+}
+
+impl Engine for OvGenaiCbEngine {
+    fn warmup(&mut self) {
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            /*max_tokens*/ 4,
+            /*temperature*/ 0.0,
+            /*enable_thinking*/ false,
+            &SamplingParams::default(),
+        );
+        // u64::MAX cannot collide with the sequential request-id counter.
+        match self.pipe.add_request(u64::MAX, "Hi", &cfg) {
+            Ok(mut handle) => {
+                // Only a terminal status means the pipeline actually served a
+                // request. Reporting "ok" after a failed step told operators
+                // the worker was healthy when it was not, and dropped the
+                // native OV message that says why.
+                let mut reached_terminal = false;
+                for _ in 0..WARMUP_MAX_STEPS {
+                    if let Err(err) = self.pipe.step() {
+                        warn!(error = %err, "cb warmup step failed");
+                        break;
+                    }
+                    match handle.read() {
+                        Ok(r) if r.status != CbStatus::Running => {
+                            reached_terminal = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(error = %err, "cb warmup read failed");
+                            break;
+                        }
+                    }
+                }
+                if reached_terminal {
+                    info!("ov-genai continuous-batching warmup ok");
+                } else {
+                    warn!(
+                        max_steps = WARMUP_MAX_STEPS,
+                        "cb warmup never reached a terminal status; pipeline may be unhealthy"
+                    );
+                }
+            }
+            Err(err) => warn!(error = %err, "ov-genai cb warmup failed"),
+        }
+    }
+
+    fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        if self.active.iter().any(|t| t.task_id == task.task_id) {
+            return Ok(());
+        }
+        // A pipeline that has failed every recent scheduler iteration will fail
+        // this request too. Admitting it means paying add_request and a step
+        // before returning the same 503, forever, with nothing distinguishing a
+        // transient hiccup from a dead device. Refuse up front instead; a
+        // single successful step clears this.
+        if self.step_failures >= MAX_STEP_FAILURES {
+            return Err(EngineError::Backend(format!(
+                "cb pipeline unusable: {} consecutive scheduler iterations failed; \
+                 restart the worker",
+                self.step_failures
+            )));
+        }
+        if self.active.len() >= crate::dist_spec::MAX_PENDING_TASKS {
+            tracing::warn!(
+                queued = self.active.len(),
+                cap = crate::dist_spec::MAX_PENDING_TASKS,
+                "ov-genai cb: pending queue at cap; rejecting task"
+            );
+            return Err(EngineError::QueueFull {
+                queued: self.active.len(),
+                cap: crate::dist_spec::MAX_PENDING_TASKS,
+            });
+        }
+        let max_tokens = if task.max_tokens > 0 {
+            task.max_tokens
+        } else {
+            self.max_tokens_default
+        };
+        let cfg = build_gen_config(
+            0,
+            0,
+            self.prompt_pretemplated,
+            max_tokens,
+            task.temperature,
+            task.enable_thinking,
+            &task.sampling,
+        );
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let handle = self
+            .pipe
+            .add_request(request_id, &task.prompt, &cfg)
+            .map_err(map_ov_err)?;
+        self.active.push(ActiveCbTask {
+            prompt_tokens: self.pipe.count_tokens(&task.prompt),
+            task_id: task.task_id,
+            handle,
+            total_tokens: 0,
+            max_tokens,
+            started: Instant::now(),
+        });
+        Ok(())
+    }
+
+    fn cancel(&mut self, task_id: &TaskId) {
+        // Per-request abort — the CB scheduler frees the request's KV blocks
+        // on the next iteration; every other in-flight request is untouched.
+        // (The monolithic engine can only drop queued tasks; see
+        // OvGenaiEngine::cancel.)
+        if let Some(idx) = self.active.iter().position(|t| &t.task_id == task_id) {
+            let t = self.active.swap_remove(idx);
+            if let Err(err) = t.handle.cancel() {
+                warn!(task = %task_id, error = %err, "cb cancel failed");
+            }
+        }
+    }
+
+    fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.active.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Err(err) = self.pipe.step() {
+            // A failed scheduler iteration poisons every in-flight request:
+            // fail them all explicitly rather than spinning on a broken batch.
+            // Each drained task still gets its own error chunk — that per-task
+            // routing is why this returns Ok rather than an engine-level Err.
+            self.step_failures += 1;
+            warn!(
+                error = %err,
+                in_flight = self.active.len(),
+                consecutive = self.step_failures,
+                "cb step failed"
+            );
+            let failed = self
+                .active
+                .drain(..)
+                .map(|t| {
+                    let chunk = Chunk::error(t.task_id.clone(), format!("cb step failed: {err}"));
+                    (t.task_id, chunk)
+                })
+                .collect();
+            return Ok(failed);
+        }
+        self.step_failures = 0;
+
+        let mut out = Vec::new();
+        let mut idx = 0;
+        while idx < self.active.len() {
+            let read = match self.active[idx].handle.read() {
+                Ok(r) => r,
+                Err(err) => {
+                    let t = self.active.swap_remove(idx);
+                    warn!(task = %t.task_id, error = %err, "cb read failed");
+                    let chunk = Chunk::error(t.task_id.clone(), format!("cb read failed: {err}"));
+                    out.push((t.task_id, chunk));
+                    continue;
+                }
+            };
+            if read.resynced {
+                warn!(
+                    task = %self.active[idx].task_id,
+                    "cb detokenizer re-decode stopped extending the emitted text; \
+                     re-anchored (a short run of output may be missing)"
+                );
+            }
+            self.active[idx].total_tokens += read.new_tokens;
+            match read.status {
+                CbStatus::Running => {
+                    // Every chunk carries ITS OWN token increment in n_tokens
+                    // — the API sums per-chunk counts, so a cumulative total
+                    // here double-counts (measured 2N-1 on-HW). Emit even
+                    // when the text delta is empty (UTF-8 hold-back) so those
+                    // tokens are still counted.
+                    if !read.text_delta.is_empty() || read.new_tokens > 0 {
+                        let t = &self.active[idx];
+                        out.push((
+                            t.task_id.clone(),
+                            Chunk::token(t.task_id.clone(), 0, read.text_delta)
+                                .with_n_tokens(read.new_tokens),
+                        ));
+                    }
+                    idx += 1;
+                }
+                CbStatus::Ignored => {
+                    // OpenVINO ran out of KV cache and abandoned the request.
+                    // Finalising it like a normal completion handed the client
+                    // HTTP 200, finish_reason "stop" and a truncated body —
+                    // indistinguishable from a model that chose to stop. Fail
+                    // it loudly and name the knobs that fix it.
+                    let t = self.active.swap_remove(idx);
+                    warn!(
+                        task = %t.task_id,
+                        tokens = t.total_tokens,
+                        in_flight = self.active.len(),
+                        "cb scheduler dropped a request: KV cache exhausted"
+                    );
+                    let chunk = Chunk::error(
+                        t.task_id.clone(),
+                        format!(
+                            "continuous-batching scheduler dropped this request after {} \
+                             tokens: KV cache exhausted. Raise --cb-cache-size or lower \
+                             --cb-max-num-seqs.",
+                            t.total_tokens
+                        ),
+                    );
+                    out.push((t.task_id, chunk));
+                }
+                CbStatus::Finished | CbStatus::Cancelled => {
+                    let t = self.active.swap_remove(idx);
+                    let elapsed = t.started.elapsed().as_secs_f64();
+                    let tok_s = if elapsed > 0.0 {
+                        t.total_tokens as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    info!(
+                        task = %t.task_id,
+                        tokens = t.total_tokens,
+                        elapsed_s = elapsed,
+                        tok_s,
+                        in_flight = self.active.len(),
+                        "cb task done"
+                    );
+                    // Prefer OpenVINO's own reason. It reports NONE when the
+                    // terminal read carried no new output, so keep the
+                    // token-count inference as the fallback — it is what the
+                    // monolithic path uses and is right for the common case.
+                    let finish = match (read.status, read.finish) {
+                        (CbStatus::Cancelled, _) => FinishReason::Cancelled,
+                        (_, CbFinish::Stop) => FinishReason::Stop,
+                        (_, CbFinish::Length) => FinishReason::Length,
+                        (_, CbFinish::Unknown) if t.total_tokens >= t.max_tokens => {
+                            FinishReason::Length
+                        }
+                        (_, CbFinish::Unknown) => FinishReason::Stop,
+                    };
+                    // n_tokens is this chunk's increment, not the cumulative
+                    // total — interim chunks already carried theirs.
+                    let mut chunk = Chunk::final_marker(t.task_id.clone(), read.text_delta)
+                        .with_n_tokens(read.new_tokens)
+                        .with_finish_reason(finish);
+                    if let Some(prompt_tokens) = t.prompt_tokens {
+                        chunk = chunk.with_prompt_tokens(prompt_tokens);
+                    }
+                    out.push((t.task_id, chunk));
+                }
+            }
+        }
+        // Liveness. Every other engine returns an empty Vec only when nothing
+        // is in flight, so the runner reads three consecutive empty steps as a
+        // wedged engine and fails the stream (MAX_CONSECUTIVE_EMPTY_STEPS,
+        // cascadia-runner). A CB prefill legitimately spans
+        // ceil(prompt_tokens / max_num_batched_tokens) iterations that produce
+        // no token for ANY request, so without this a prompt longer than ~3x
+        // the batch window is killed mid-prefill before its first token
+        // (reproduced on-HW: 1211 tokens at the default 256-token window).
+        // One chunk is enough — any non-empty step resets the counter for
+        // every stream. n_tokens MUST be Some(0): the SSE path does
+        // `n_tokens.unwrap_or(1)` and would otherwise inflate reported usage.
+        //
+        // Hiding these iterations from the runner's guard means the engine owes
+        // it a replacement, or a truly wedged pipeline would heartbeat until
+        // every request hit max_tokens: MAX_IDLE_STEPS bounds the quiet run and
+        // fails the batch loudly past it.
+        if out.is_empty() && !self.active.is_empty() {
+            self.idle_steps += 1;
+            if self.idle_steps > MAX_IDLE_STEPS {
+                warn!(
+                    idle_steps = self.idle_steps,
+                    in_flight = self.active.len(),
+                    "cb pipeline produced no tokens for {MAX_IDLE_STEPS} consecutive \
+                     iterations; failing in-flight requests"
+                );
+                self.idle_steps = 0;
+                return Ok(self
+                    .active
+                    .drain(..)
+                    .map(|t| {
+                        let chunk = Chunk::error(
+                            t.task_id.clone(),
+                            format!(
+                                "cb pipeline stalled: no tokens produced for \
+                                 {MAX_IDLE_STEPS} scheduler iterations"
+                            ),
+                        );
+                        (t.task_id, chunk)
+                    })
+                    .collect());
+            }
+            let t = &self.active[0];
+            out.push((
+                t.task_id.clone(),
+                Chunk::token(t.task_id.clone(), 0, String::new()).with_n_tokens(0),
+            ));
+        } else {
+            self.idle_steps = 0;
+        }
+        Ok(out)
+    }
+}
+
+/// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
+/// passes 0 for the speculative knobs — the CB scheduler owns batching).
+fn build_gen_config(
+    speculative_k: u32,
+    prompt_lookup_ngram: u32,
+    prompt_pretemplated: bool,
+    max_tokens: u32,
+    temperature: f32,
+    enable_thinking: bool,
+    sampling: &SamplingParams,
+) -> GenConfig {
+    let do_sample = temperature > 0.0;
+    let mut cfg = GenConfig {
+        max_new_tokens: max_tokens,
+        do_sample,
+        temperature: if do_sample { temperature } else { 0.0 },
+        num_assistant_tokens: 0,
+        max_ngram_size: 0,
+        // Hybrid: only when the API rendered the template for us — i.e. a
+        // template loaded AND this request is thinking-OFF — do we tell
+        // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
+        // native templating (the legacy join the API emitted), untouched.
+        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // OpenAI sampling knobs (#14). top_p/top_k take effect in the
+        // sampling regime (do_sample, i.e. temperature > 0); penalties and
+        // seed are forwarded regardless.
+        //
+        // `seed` maps to GenerationConfig.rng_seed. What that buys you differs
+        // per pipeline, so the caveat lives on the monolithic engine's
+        // gen_config (the pipeline it applies to) rather than here — this
+        // function also builds configs for the continuous-batching path.
+        top_p: if sampling.top_p > 0.0 {
+            sampling.top_p.min(1.0)
+        } else {
+            1.0
+        },
+        top_k: sampling.top_k,
+        frequency_penalty: sampling.frequency_penalty,
+        presence_penalty: sampling.presence_penalty,
+        seed: sampling.seed,
+    };
+    if speculative_k > 0 {
+        cfg.num_assistant_tokens = speculative_k;
+    }
+    if prompt_lookup_ngram > 0 {
+        cfg.num_assistant_tokens = speculative_k.max(5);
+        cfg.max_ngram_size = prompt_lookup_ngram;
+    }
+    cfg
+}
+
 impl OvGenaiEngine {
+    /// SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1; not re-checked on
+    /// the current 2026.2 floor): `seed` is forwarded to
+    /// `GenerationConfig.rng_seed`, but it does NOT make ov-genai reproducible
+    /// across requests on this reused `LLMPipeline`. OV-GenAI's
+    /// `StatefulLLMPipeline` only re-seeds when the seed VALUE CHANGES between
+    /// consecutive `generate()` calls (`if (m_sampler.get_seed() !=
+    /// config.rng_seed) set_seed(...)`) and never calls `clear_request_info`,
+    /// so two identical seeds in a row reuse the advanced RNG and diverge.
+    /// Different seeds DO change the output, and the Rust-sampler engines
+    /// (ov-runtime/sparse-moe) honor seed fully — they re-seed per request.
+    ///
+    /// This is a property of `StatefulLLMPipeline`, so it does not describe
+    /// [`OvGenaiCbEngine`]: `ContinuousBatchingPipeline` builds a fresh request
+    /// context per request. Whether that yields per-request reproducibility in
+    /// practice is untested here.
     fn gen_config(
         &self,
         max_tokens: u32,
@@ -438,58 +978,397 @@ impl OvGenaiEngine {
         enable_thinking: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
-        let do_sample = temperature > 0.0;
-        let mut cfg = GenConfig {
-            max_new_tokens: max_tokens,
-            do_sample,
-            temperature: if do_sample { temperature } else { 0.0 },
-            num_assistant_tokens: 0,
-            max_ngram_size: 0,
-            // Hybrid: only when the API rendered the template for us — i.e. a
-            // template loaded AND this request is thinking-OFF — do we tell
-            // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
-            // native templating (the legacy join the API emitted), untouched.
-            skip_chat_template: self.prompt_pretemplated && !enable_thinking,
-            // OpenAI sampling knobs (#14). top_p/top_k take effect in the
-            // sampling regime (do_sample, i.e. temperature > 0); penalties and
-            // seed are forwarded regardless.
-            //
-            // SEED CAVEAT (validated on-HW, OpenVINO GenAI 2026.1): `seed` is
-            // forwarded to GenerationConfig.rng_seed, but it does NOT make
-            // ov-genai reproducible across requests on this reused
-            // `LLMPipeline`. OV-GenAI's StatefulLLMPipeline only re-seeds when
-            // the seed VALUE CHANGES between consecutive generate() calls
-            // (`if (m_sampler.get_seed() != config.rng_seed) set_seed(...)`)
-            // and never calls `clear_request_info`, so two identical seeds in a
-            // row reuse the advanced RNG and diverge. Different seeds DO change
-            // the output, and the Rust-sampler engines (ov-runtime/sparse-moe)
-            // honor seed fully (they re-seed per request). Per-request
-            // reproducible ov-genai needs the ContinuousBatchingPipeline (fresh
-            // request context per request) — tracked with #20.
-            top_p: if sampling.top_p > 0.0 {
-                sampling.top_p.min(1.0)
-            } else {
-                1.0
-            },
-            top_k: sampling.top_k,
-            frequency_penalty: sampling.frequency_penalty,
-            presence_penalty: sampling.presence_penalty,
-            seed: sampling.seed,
-        };
-        if self.speculative_k > 0 {
-            cfg.num_assistant_tokens = self.speculative_k;
-        }
-        if self.prompt_lookup_ngram > 0 {
-            cfg.num_assistant_tokens = self.speculative_k.max(5);
-            cfg.max_ngram_size = self.prompt_lookup_ngram;
-        }
-        cfg
+        build_gen_config(
+            self.speculative_k,
+            self.prompt_lookup_ngram,
+            self.prompt_pretemplated,
+            max_tokens,
+            temperature,
+            enable_thinking,
+            sampling,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    // ---- CB engine state machine -------------------------------------------
+    //
+    // Driven through the CbPipe seam with a scripted mock, so the whole state
+    // machine runs without OpenVINO. Before the seam none of this was reachable:
+    // a stub CbPipeline errors on every call, so step() could only ever take its
+    // failure branch.
+
+    #[derive(Default)]
+    struct MockState {
+        /// Scripted reads per enrolled request, in enrollment order.
+        reads: Vec<VecDeque<Result<CbRead, OvError>>>,
+        /// Returned once a request's script runs out.
+        default_read: Option<CbRead>,
+        step_fails: bool,
+        steps: usize,
+        added: Vec<u64>,
+        cancelled: Vec<u64>,
+    }
+
+    struct MockPipe {
+        st: Arc<Mutex<MockState>>,
+    }
+    struct MockReq {
+        st: Arc<Mutex<MockState>>,
+        idx: usize,
+        id: u64,
+    }
+
+    impl CbPipe for MockPipe {
+        fn add_request(
+            &self,
+            request_id: u64,
+            _prompt: &str,
+            _cfg: &GenConfig,
+        ) -> Result<Box<dyn CbReq>, OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.added.push(request_id);
+            let idx = st.added.len() - 1;
+            while st.reads.len() <= idx {
+                st.reads.push(VecDeque::new());
+            }
+            Ok(Box::new(MockReq {
+                st: self.st.clone(),
+                idx,
+                id: request_id,
+            }))
+        }
+        fn step(&self) -> Result<(), OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.steps += 1;
+            if st.step_fails {
+                Err(OvError::Native("mock step failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn count_tokens(&self, _text: &str) -> Option<u32> {
+            Some(7)
+        }
+    }
+
+    impl CbReq for MockReq {
+        fn read(&mut self) -> Result<CbRead, OvError> {
+            let mut st = self.st.lock().unwrap();
+            if let Some(r) = st.reads.get_mut(self.idx).and_then(|q| q.pop_front()) {
+                return r;
+            }
+            match &st.default_read {
+                Some(r) => Ok(r.clone()),
+                None => Err(OvError::Native("mock: script exhausted".into())),
+            }
+        }
+        fn cancel(&self) -> Result<(), OvError> {
+            self.st.lock().unwrap().cancelled.push(self.id);
+            Ok(())
+        }
+    }
+
+    fn read_of(status: CbStatus, tokens: u32, text: &str, finish: CbFinish) -> CbRead {
+        CbRead {
+            text_delta: text.to_string(),
+            new_tokens: tokens,
+            status,
+            finish,
+            resynced: false,
+        }
+    }
+
+    /// A read that reports progress but no output — every iteration of a
+    /// chunked prefill looks like this.
+    fn idle_read() -> CbRead {
+        read_of(CbStatus::Running, 0, "", CbFinish::Unknown)
+    }
+
+    fn mock_engine(st: &Arc<Mutex<MockState>>) -> OvGenaiCbEngine {
+        OvGenaiCbEngine {
+            active: Vec::new(),
+            pipe: Box::new(MockPipe { st: st.clone() }),
+            prompt_pretemplated: false,
+            next_request_id: 0,
+            max_tokens_default: 256,
+            idle_steps: 0,
+            step_failures: 0,
+        }
+    }
+
+    fn task(id: &str, max_tokens: u32) -> GenerationTask {
+        GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
+    }
+
+    /// The B1 fix: a step that progressed the batch without producing a token
+    /// must still report progress, or the runner's no-progress guard kills a
+    /// perfectly healthy request mid-prefill. n_tokens must be an explicit 0 —
+    /// the SSE path does `n_tokens.unwrap_or(1)`.
+    #[test]
+    fn cb_step_emits_a_zero_token_liveness_chunk_when_nothing_was_produced() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1, "must not return an empty Vec while in flight");
+        let (tid, chunk) = &out[0];
+        assert_eq!(tid, "t1");
+        assert!(chunk.text.is_empty());
+        assert!(!chunk.is_final);
+        assert_eq!(chunk.n_tokens, Some(0), "explicit 0, not None");
+        assert!(chunk.error.is_none());
+    }
+
+    /// ...but the liveness chunk hides those iterations from the runner's
+    /// guard, so the engine owes it a bound. At the real MAX_IDLE_STEPS.
+    #[test]
+    fn cb_liveness_is_bounded_so_a_wedged_batch_still_fails() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+
+        for i in 0..MAX_IDLE_STEPS {
+            let out = e.step().unwrap();
+            assert!(
+                out[0].1.error.is_none(),
+                "failed early at idle step {i} of {MAX_IDLE_STEPS}"
+            );
+        }
+        // One past the bound: the batch is declared stalled.
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let err = out[0].1.error.as_deref().expect("must fail past the bound");
+        assert!(err.contains("stalled"), "{err}");
+        assert!(e.active.is_empty(), "stalled requests must be dropped");
+    }
+
+    /// A single producing iteration resets the idle run — otherwise a long but
+    /// healthy generation would eventually trip the bound.
+    #[test]
+    fn cb_progress_resets_the_idle_counter() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        {
+            let mut g = st.lock().unwrap();
+            g.reads.push(VecDeque::new());
+            for _ in 0..MAX_IDLE_STEPS {
+                g.reads[0].push_back(Ok(idle_read()));
+            }
+            g.reads[0].push_back(Ok(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown)));
+            for _ in 0..MAX_IDLE_STEPS {
+                g.reads[0].push_back(Ok(idle_read()));
+            }
+        }
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+        for i in 0..(2 * MAX_IDLE_STEPS + 1) {
+            let out = e.step().unwrap();
+            assert!(
+                out[0].1.error.is_none(),
+                "tripped at step {i} despite progress"
+            );
+        }
+    }
+
+    /// The B2 fix: a request OpenVINO abandoned for want of KV cache must not
+    /// be finalised like a normal completion.
+    #[test]
+    fn cb_ignored_status_is_reported_as_an_error() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Ignored,
+                0,
+                "",
+                CbFinish::Unknown,
+            ))]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let c = &out[0].1;
+        let err = c
+            .error
+            .as_deref()
+            .expect("eviction must surface as an error");
+        assert!(err.contains("KV cache exhausted"), "{err}");
+        assert!(c.is_final);
+        assert!(e.active.is_empty());
+    }
+
+    /// Prefer OpenVINO's own reason over guessing from token counts.
+    #[test]
+    fn cb_final_chunk_prefers_the_reported_finish_reason() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                1,
+                "!",
+                CbFinish::Length,
+            ))]));
+        let mut e = mock_engine(&st);
+        // Only 1 token against a cap of 4096 — inference alone would say Stop.
+        e.submit(task("t1", 4096)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Length));
+    }
+
+    /// ...and fall back to the token-count inference when it reports nothing,
+    /// which is what happens when the terminal read carries no new output.
+    #[test]
+    fn cb_final_chunk_falls_back_to_token_inference() {
+        for (max_tokens, produced, want) in [
+            (4u32, 4u32, FinishReason::Length),
+            (4096, 1, FinishReason::Stop),
+        ] {
+            let st = Arc::new(Mutex::new(MockState::default()));
+            st.lock()
+                .unwrap()
+                .reads
+                .push(VecDeque::from(vec![Ok(read_of(
+                    CbStatus::Finished,
+                    produced,
+                    "x",
+                    CbFinish::Unknown,
+                ))]));
+            let mut e = mock_engine(&st);
+            e.submit(task("t1", max_tokens)).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out[0].1.finish_reason, Some(want), "max={max_tokens}");
+        }
+    }
+
+    /// Regression for the token accounting fixed in 7c8e6db: the API SUMS
+    /// per-chunk counts, so each chunk must carry its own increment. Emitting
+    /// the running total here measured 2N-1 on hardware.
+    #[test]
+    fn cb_chunks_carry_per_chunk_token_increments_not_the_total() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock().unwrap().reads.push(VecDeque::from(vec![
+            Ok(read_of(CbStatus::Running, 3, "abc", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Running, 4, "defg", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Finished, 2, "hi", CbFinish::Unknown)),
+        ]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+
+        let mut counts = Vec::new();
+        let mut text = String::new();
+        for _ in 0..3 {
+            for (_, c) in e.step().unwrap() {
+                counts.push(c.n_tokens.unwrap());
+                text.push_str(&c.text);
+            }
+        }
+        assert_eq!(counts, vec![3, 4, 2], "must be increments, not 3,7,9");
+        assert_eq!(text, "abcdefghi");
+    }
+
+    /// A failed scheduler iteration poisons the whole batch: every in-flight
+    /// request gets its own error chunk rather than one stream eating it.
+    #[test]
+    fn cb_step_failure_fails_every_in_flight_request() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, c)| c.error.is_some() && c.is_final));
+        assert!(e.active.is_empty());
+    }
+
+    /// ...and once it keeps failing, stop admitting work onto a dead pipeline
+    /// instead of 503-ing every new request forever.
+    #[test]
+    fn cb_submit_refuses_work_after_repeated_step_failures() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_STEP_FAILURES {
+            e.submit(task(&format!("t{i}"), 8)).unwrap();
+            let _ = e.step().unwrap();
+        }
+        let err = e.submit(task("late", 8)).expect_err("must refuse");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn cb_submit_is_idempotent_and_honours_the_queue_cap() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t1", 8)).unwrap();
+        assert_eq!(
+            e.active.len(),
+            1,
+            "resubmitting a live task must be a no-op"
+        );
+        assert_eq!(
+            st.lock().unwrap().added.len(),
+            1,
+            "and must not re-enroll it"
+        );
+
+        for i in 1..crate::dist_spec::MAX_PENDING_TASKS {
+            e.submit(task(&format!("f{i}"), 8)).unwrap();
+        }
+        let err = e.submit(task("overflow", 8)).expect_err("cap must reject");
+        assert!(matches!(err, EngineError::QueueFull { .. }), "{err:?}");
+    }
+
+    /// The trait contract: after cancel returns, step emits nothing more for
+    /// that task.
+    #[test]
+    fn cb_cancel_drops_the_task_and_aborts_it_upstream() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+        e.cancel(&"t1".to_string());
+
+        assert_eq!(e.active.len(), 1);
+        assert_eq!(st.lock().unwrap().cancelled, vec![0], "must abort upstream");
+        for _ in 0..5 {
+            for (tid, _) in e.step().unwrap() {
+                assert_ne!(tid, "t1", "cancelled task must not emit chunks");
+            }
+        }
+    }
     use cascadia_engine::EngineError;
     use cascadia_types::{PeerEndpoint, PeerLayout, ShardSpec};
 
@@ -554,6 +1433,68 @@ mod tests {
         let shard = ShardSpec::single_stage("model", "CPU");
         let res = b.load(shard).await;
         assert!(matches!(res, Err(EngineError::ModelNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn cb_rejects_draft_and_prompt_lookup() {
+        for b in [
+            OvGenaiBuilder::new("/missing", "CPU")
+                .with_continuous_batching(CbSchedulerConfig::default())
+                .with_draft("/draft/missing", "CPU", 5),
+            OvGenaiBuilder::new("/missing", "CPU")
+                .with_continuous_batching(CbSchedulerConfig::default())
+                .with_prompt_lookup(3),
+        ] {
+            let mut b = b;
+            let shard = ShardSpec::single_stage("model", "CPU");
+            let err = b.load(shard).await.err().expect("must reject");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, EngineError::InvalidConfig(_)) && msg.contains("--cb"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cb_rejects_vlm_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "openvino_language_model.xml",
+            "openvino_tokenizer.xml",
+            "openvino_detokenizer.xml",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
+            .with_continuous_batching(CbSchedulerConfig::default());
+        let shard = ShardSpec::single_stage("model", "CPU");
+        let err = b.load(shard).await.err().expect("must reject");
+        assert!(err.to_string().contains("VLM-layout"), "{err}");
+    }
+
+    /// Stub builds surface a Backend error from CbPipeline::new — proves the
+    /// CB branch is reached with a valid LM-layout dir (and on the AI-PC lane
+    /// with `--features openvino` this same path compiles a real pipeline).
+    #[cfg(not(feature = "openvino"))]
+    #[tokio::test]
+    async fn cb_load_reaches_pipeline_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "openvino_model.xml",
+            "openvino_tokenizer.xml",
+            "openvino_detokenizer.xml",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let mut b = OvGenaiBuilder::new(dir.path().to_str().unwrap(), "CPU")
+            .with_continuous_batching(CbSchedulerConfig::default());
+        let shard = ShardSpec::single_stage("model", "CPU");
+        let err = b.load(shard).await.err().expect("stub must error");
+        assert!(
+            matches!(err, EngineError::Backend(_)),
+            "expected stub Backend error, got {err}"
+        );
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ pub use dist_spec::{
     OvDistSpecWorkerBuilder, OvDistSpecWorkerEngine, SpecDecodeStats,
 };
 pub use gemma4::{Gemma4Builder, Gemma4Engine};
-pub use genai::{OvGenaiBuilder, OvGenaiEngine};
+pub use genai::{OvGenaiBuilder, OvGenaiCbEngine, OvGenaiEngine};
 pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};

@@ -23,6 +23,8 @@
 #include <openvino/genai/generation_config.hpp>
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
+#include <openvino/genai/continuous_batching_pipeline.hpp>
+#include <openvino/genai/chat_history.hpp>
 
 namespace {
 
@@ -398,6 +400,269 @@ int32_t cascadia_pipeline_generate(
 }
 
 void cascadia_free_string(char* s) { std::free(s); }
+
+// ---- Continuous batching (issue #20) ---------------------------------------
+
+struct cascadia_cb_pipeline_t {
+    std::unique_ptr<ov::genai::ContinuousBatchingPipeline> pipe;
+    std::unique_ptr<ov::genai::Tokenizer> tok;
+};
+
+struct cascadia_cb_handle_t {
+    ov::genai::GenerationHandle handle;
+    // Accumulated token ids. The whole sequence is re-decoded on every read
+    // (decoding only the delta ids would split multi-byte codepoints whose
+    // tokens land in different reads) and the FULL decode is returned; the
+    // caller owns the emitted-prefix bookkeeping. Tracking it here as a byte
+    // count that was never checked against the decode meant a re-decode that
+    // shrank desynced the stream permanently and silently.
+    std::vector<int64_t> acc_ids;
+    // Latched from GenerationOutput. The terminal read can return no new
+    // output at all (the last tokens were consumed by an earlier read, and an
+    // evicted request produces none), so the reason has to be remembered when
+    // it appears rather than looked for at the end.
+    ov::genai::GenerationFinishReason finish_reason =
+        ov::genai::GenerationFinishReason::NONE;
+};
+
+int32_t cascadia_cb_pipeline_create(
+    const char* model_path, const char* device, uint64_t cache_size_gb,
+    uint64_t max_num_seqs, uint64_t max_num_batched_tokens,
+    int32_t dynamic_split_fuse, int32_t enable_prefix_caching,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_cb_pipeline_t** out_handle) {
+    if (!model_path || !device || !out_handle) {
+        set_last_error("null arg in cb_pipeline_create");
+        return 1;
+    }
+    try {
+        ov::genai::SchedulerConfig sched;
+        if (cache_size_gb > 0) sched.cache_size = static_cast<size_t>(cache_size_gb);
+        if (max_num_seqs > 0) sched.max_num_seqs = static_cast<size_t>(max_num_seqs);
+        if (max_num_batched_tokens > 0)
+            sched.max_num_batched_tokens = static_cast<size_t>(max_num_batched_tokens);
+        if (dynamic_split_fuse >= 0) sched.dynamic_split_fuse = dynamic_split_fuse != 0;
+        if (enable_prefix_caching >= 0)
+            sched.enable_prefix_caching = enable_prefix_caching != 0;
+
+        ov::AnyMap props = collect_properties(properties_kv, properties_count);
+        auto p = std::make_unique<cascadia_cb_pipeline_t>();
+        p->pipe = std::make_unique<ov::genai::ContinuousBatchingPipeline>(
+            std::filesystem::path(model_path), sched, std::string(device), props);
+        p->tok = std::make_unique<ov::genai::Tokenizer>(p->pipe->get_tokenizer());
+        *out_handle = p.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_pipeline_create");
+        return 1;
+    }
+}
+
+void cascadia_cb_pipeline_destroy(cascadia_cb_pipeline_t* handle) { delete handle; }
+
+int32_t cascadia_cb_add_request(
+    cascadia_cb_pipeline_t* handle, uint64_t request_id, const char* prompt,
+    const cascadia_genconfig_t* cfg, cascadia_cb_handle_t** out_handle) {
+    if (!handle || !handle->pipe || !prompt || !cfg || !out_handle) {
+        set_last_error("null arg in cb_add_request");
+        return 1;
+    }
+    try {
+        auto h = std::make_unique<cascadia_cb_handle_t>();
+        // ContinuousBatchingPipeline's string add_request() overload does NOT
+        // honour GenerationConfig::apply_chat_template — verified on OV GenAI
+        // 2026.2 by an A/B against LLMPipeline, where the same flag through the
+        // same GenerationConfig changes the output and here it changed nothing.
+        // So when the caller asked for templating we render it ourselves;
+        // otherwise the untouched string overload keeps its exact behaviour.
+        const bool want_template =
+            cfg->cfg.apply_chat_template && !handle->tok->get_chat_template().empty();
+        if (want_template) {
+            ov::genai::ChatHistory history(std::vector<ov::AnyMap>{
+                {{"role", std::string("user")}, {"content", std::string(prompt)}}});
+            const std::string rendered =
+                handle->tok->apply_chat_template(history, /*add_generation_prompt=*/true);
+            // The rendered template already carries BOS. Encoding it again with
+            // special tokens would prepend a second one — a silently degraded
+            // prompt, invisible in the output unless compared side by side.
+            auto enc = handle->tok->encode(
+                rendered, ov::AnyMap{{"add_special_tokens", false}});
+            h->handle = handle->pipe->add_request(request_id, enc.input_ids, cfg->cfg);
+        } else {
+            h->handle =
+                handle->pipe->add_request(request_id, std::string(prompt), cfg->cfg);
+        }
+        *out_handle = h.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_add_request");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_step(cascadia_cb_pipeline_t* handle) {
+    if (!handle || !handle->pipe) {
+        set_last_error("null arg in cb_step");
+        return 1;
+    }
+    try {
+        if (handle->pipe->has_non_finished_requests()) {
+            handle->pipe->step();
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_step");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_handle_read(
+    cascadia_cb_pipeline_t* pipeline, cascadia_cb_handle_t* handle,
+    char** out_text, size_t* out_text_len, uint32_t* out_new_tokens,
+    int32_t* out_status, int32_t* out_finish_reason) {
+    if (!pipeline || !pipeline->tok || !handle || !handle->handle || !out_text ||
+        !out_text_len || !out_new_tokens || !out_status || !out_finish_reason) {
+        set_last_error("null arg in cb_handle_read");
+        return 1;
+    }
+    try {
+        const size_t before = handle->acc_ids.size();
+        // can_read() first: read() asserts on a stopped/cancelled handle, and
+        // pulling from an empty stream would block.
+        if (handle->handle->can_read()) {
+            // read() surfaces tokens generated since the previous read().
+            // Single sequence per request (n / best_of are not exposed), so
+            // take the first (only) sequence output.
+            ov::genai::GenerationOutputs outs = handle->handle->read();
+            if (!outs.empty()) {
+                const auto& out = outs.begin()->second;
+                handle->acc_ids.insert(
+                    handle->acc_ids.end(), out.generated_ids.begin(), out.generated_ids.end());
+                if (out.finish_reason != ov::genai::GenerationFinishReason::NONE) {
+                    handle->finish_reason = out.finish_reason;
+                }
+            }
+        }
+
+        const auto status = handle->handle->get_status();
+        const bool running = status == ov::genai::GenerationStatus::RUNNING;
+        // IGNORED is kept distinct from a normal finish: it means the request
+        // ran out of KV cache and could not be continued, which the caller must
+        // report as a failure rather than as a completed answer. STOP (early
+        // stop, output kept) is a normal completion.
+        switch (status) {
+            case ov::genai::GenerationStatus::RUNNING:
+                *out_status = CASCADIA_CB_STATUS_RUNNING;
+                break;
+            case ov::genai::GenerationStatus::FINISHED:
+            case ov::genai::GenerationStatus::STOP:
+                *out_status = CASCADIA_CB_STATUS_FINISHED;
+                break;
+            case ov::genai::GenerationStatus::CANCEL:
+                *out_status = CASCADIA_CB_STATUS_CANCELLED;
+                break;
+            default:
+                *out_status = CASCADIA_CB_STATUS_IGNORED;
+                break;
+        }
+        switch (handle->finish_reason) {
+            case ov::genai::GenerationFinishReason::STOP:
+            // A tool call is a normal stop as far as the wire format goes.
+            case ov::genai::GenerationFinishReason::TOOL_CALL:
+                *out_finish_reason = CASCADIA_CB_FINISH_STOP;
+                break;
+            case ov::genai::GenerationFinishReason::LENGTH:
+                *out_finish_reason = CASCADIA_CB_FINISH_LENGTH;
+                break;
+            default:
+                *out_finish_reason = CASCADIA_CB_FINISH_NONE;
+                break;
+        }
+
+        // Return the whole decode, not a delta. The caller diffs it against
+        // what it has already emitted, which lets it notice a non-monotonic
+        // re-decode instead of silently slicing at a stale offset.
+        std::string full = pipeline->tok->decode(handle->acc_ids);
+        if (full.size() > MAX_GENERATED_TEXT_BYTES) {
+            set_last_error("cb decoded text exceeds MAX_GENERATED_TEXT_BYTES");
+            return 1;
+        }
+        char* buf = static_cast<char*>(std::malloc(full.size() + 1));
+        if (!buf) {
+            set_last_error("malloc failure for cb text");
+            return 1;
+        }
+        std::memcpy(buf, full.data(), full.size());
+        buf[full.size()] = 0;
+        // Length is explicit: a byte-level vocabulary can decode a token to
+        // 0x00, and a NUL-terminated read would truncate there for the rest of
+        // the request.
+        *out_text = buf;
+        *out_text_len = full.size();
+        *out_new_tokens = static_cast<uint32_t>(handle->acc_ids.size() - before);
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_read");
+        return 1;
+    }
+}
+
+int32_t cascadia_cb_handle_cancel(cascadia_cb_handle_t* handle) {
+    if (!handle || !handle->handle) {
+        set_last_error("null arg in cb_handle_cancel");
+        return 1;
+    }
+    try {
+        // cancel() vs stop(): both end the request and let the scheduler
+        // reclaim its KV blocks. The difference is what is kept — STOP retains
+        // the output produced so far, CANCEL discards it (and drops the turn
+        // from chat history). Discarding is right for a client that went away.
+        // Verified against OV GenAI 2026.2, where GenerationHandle::drop() was
+        // replaced by cancel().
+        handle->handle->cancel();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_handle_cancel");
+        return 1;
+    }
+}
+
+void cascadia_cb_handle_destroy(cascadia_cb_handle_t* handle) { delete handle; }
+
+int32_t cascadia_cb_count_tokens(
+    cascadia_cb_pipeline_t* handle, const char* text, uint32_t* out_count) {
+    if (!handle || !handle->tok || !text || !out_count) {
+        set_last_error("null arg in cb_count_tokens");
+        return 1;
+    }
+    try {
+        auto enc = handle->tok->encode(std::string(text));
+        const auto& shape = enc.input_ids.get_shape();
+        *out_count = shape.empty() ? 0 : static_cast<uint32_t>(shape.back());
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e);
+        return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in cb_count_tokens");
+        return 1;
+    }
+}
 
 // Tokenizer ownership: the returned handle is heap-allocated and the
 // caller MUST free it via cascadia_tokenizer_destroy() before destroying
