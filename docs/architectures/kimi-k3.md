@@ -3,7 +3,7 @@
 Moonshot **Kimi-K3** (`moonshotai/Kimi-K3`, ~2.8T MoE, 1M ctx) analysed against the
 `cascadia-engine-sparse-moe` engine.
 
-**Status: implemented, not yet run on real weights.** The shell
+**Status: implemented; blocked on an unresolved `A_log` shape discrepancy.** The shell
 (`crates/cascadia-engine-sparse-moe/src/k3/`), the exporter
 (`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`) are
 complete and golden-tested; `{1,2,3,4,6}`-rank pipelines are bit-identical to a
@@ -285,6 +285,48 @@ attn_out = o_proj(attn_out)
 The HF reference caches expanded k/v; we use glm5's absorbed-latent decode
 instead (**576 floats/token** = 512 latent + 64 shared rot), which is
 mathematically equivalent and the only memory-feasible form at long context.
+
+## Blockers found by checkpoint verification
+
+Both were found by validating against the real checkpoint's metadata (the
+tensor index and the safetensors headers — ~1.6 MB fetched, no weights).
+
+### 1. `A_log` shape contradicts the modeling reference — BLOCKER
+
+| source | says |
+|---|---|
+| `modeling_kimi_linear.py` | `A_log = torch.empty(self.num_heads)` → **96** |
+| `fla` gate kernel | `H, _ = g.shape[-2:]` then `A_log.view(H, 1)`, and `g` is `[..., 96, 128]` → needs **96** |
+| **the released checkpoint** | `A_log: [128]`, on every KDA layer |
+
+`A_log.view(96, 1)` cannot accept a 128-element tensor, so the published
+modeling file cannot run the published weights as written. 128 is `head_dim`,
+and `o_norm` — which is `head_dim` by construction — is also `[128]`, so the
+released model appears to apply the KDA decay **per dimension, shared across
+heads**, rather than per head.
+
+`num_heads = 96` is not in doubt: `b_proj` is `[96, 7168]` and `dt_bias` is
+`[12288] = 96 x 128`.
+
+This changes the decay axis in the recurrence, so `src/k3/kda.rs` cannot be
+called correct for real weights until it is resolved against Moonshot's own
+serving code. `loader.rs` hard-fails on the mismatch rather than truncating to
+96 and silently computing the wrong thing.
+
+### 2. No `tokenizer.json` — blocks serving, not loading
+
+K3 ships `tiktoken.model` plus a custom `TikTokenTokenizer`, and **no chat
+template**. Every engine in this crate loads `tokenizer.json` via the HF
+`tokenizers` crate, and there is no tiktoken support in the Rust tree, so the
+API rank refuses to start. Pre-tokenized input and benchmarking are unaffected.
+
+The exporter now copies the tokenizer artifacts into the export but
+deliberately does **not** synthesise a `tokenizer.json`: the tiktoken `pat_str`
+relies on Java/ICU character-class intersection (`&&` against `\p{Han}`), which
+neither the HF tokenizers nor Rust regex engines accept. A naive translation
+mis-splits text and presents as a model quality problem rather than a tokenizer
+one. Converting it correctly, and validating token-for-token against the Python
+tokenizer, is a prerequisite for serving.
 
 ## Open risks
 

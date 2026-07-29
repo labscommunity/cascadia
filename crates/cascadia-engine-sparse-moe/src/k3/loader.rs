@@ -216,6 +216,29 @@ pub fn load_layers(
             .map_err(|e| K3LoadError::Tensor(format!("shell {idx}"), e.to_string()))?;
 
         let (attn, state) = if m.is_kda(idx) {
+            let a_log = f32s(&f, "attn.A_log")?;
+            // UNRESOLVED upstream discrepancy — see docs/architectures/kimi-k3.md.
+            // The HF modeling file declares A_log as `torch.empty(num_heads)`
+            // (96) and fla's gate does `A_log.view(H, 1)` with H taken from
+            // g.shape[-2] (also 96). The released checkpoint ships A_log with
+            // head_dim (128) elements, which `view(96, 1)` cannot accept. Until
+            // it is known whether the decay is per-head or per-dimension in the
+            // real model, refuse the weights rather than silently compute the
+            // wrong thing.
+            if a_log.len() != m.num_heads {
+                return Err(K3LoadError::Tensor(
+                    format!("layer {idx} attn.A_log"),
+                    format!(
+                        "expected {} entries (num_heads) but found {}. If this is \
+                         head_dim ({}), the KDA decay axis differs from the HF \
+                         modeling reference and src/k3/kda.rs must be resolved \
+                         against Moonshot's serving code before use",
+                        m.num_heads,
+                        a_log.len(),
+                        m.head_dim
+                    ),
+                ));
+            }
             let w = KdaWeights {
                 q_proj: bf16s(&f, "attn.q_proj")?,
                 k_proj: bf16s(&f, "attn.k_proj")?,
@@ -225,7 +248,7 @@ pub fn load_layers(
                 v_conv1d: f32s(&f, "attn.v_conv1d")?,
                 f_a_proj: bf16s(&f, "attn.f_a_proj")?,
                 f_b_proj: bf16s(&f, "attn.f_b_proj")?,
-                a_log: f32s(&f, "attn.A_log")?,
+                a_log,
                 dt_bias: f32s(&f, "attn.dt_bias")?,
                 b_proj: bf16s(&f, "attn.b_proj")?,
                 g_proj: bf16s(&f, "attn.g_proj")?,

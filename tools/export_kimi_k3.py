@@ -399,6 +399,44 @@ def _f32(t) -> np.ndarray:
     return t.to(torch.float32).numpy()
 
 
+# Serving sidecars copied verbatim beside the weights, so an export is
+# self-contained and a node never has to re-fetch from the hub.
+SIDECARS = [
+    "tiktoken.model",
+    "tokenizer_config.json",
+    "tokenization_kimi.py",
+    "generation_config.json",
+    "config.json",
+]
+
+
+def copy_sidecars(model_dir: Path, out: Path):
+    r"""Carry the tokenizer + generation config into the export.
+
+    K3 ships a tiktoken BPE (`tiktoken.model` + a `TikTokenTokenizer` class),
+    NOT a HF `tokenizer.json`, and no chat template. The engine's API rank loads
+    `tokenizer.json`, so a converted one is still required before this model can
+    serve text — see docs/architectures/kimi-k3.md. We deliberately do not
+    synthesise it here: the tiktoken `pat_str` uses Java/ICU character-class
+    intersection (`&&[^\p{Han}]`), which the HF tokenizers and Rust regex
+    engines do not accept, so a naive translation silently mis-splits text and
+    looks like a model bug rather than a tokenizer bug.
+    """
+    copied = []
+    for name in SIDECARS:
+        src = model_dir / name
+        if src.exists():
+            (out / name).write_bytes(src.read_bytes())
+            copied.append(name)
+    print(f"[sidecars] copied {len(copied)}: {', '.join(copied) or 'none'}", flush=True)
+    if not (out / "tokenizer.json").exists():
+        print(
+            "[sidecars] NOTE no tokenizer.json — the API rank needs one; convert "
+            "tiktoken.model before serving (pre-tokenized input works without it)",
+            flush=True,
+        )
+
+
 def export_real(model_dir: Path, out: Path, cfg: dict):
     """Stream the checkpoint into the sparse-moe layout, one layer at a time.
 
@@ -406,6 +444,7 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
     completed layers are skipped on a re-run.
     """
     src = CkptSource(model_dir)
+    copy_sidecars(model_dir, out)
     n = cfg["num_hidden_layers"]
     kda = set(cfg["kda_layers"])
     (out / "shells").mkdir(parents=True, exist_ok=True)
