@@ -1821,6 +1821,24 @@ impl Qwen36Engine {
                 self.state_restored = true;
                 return false;
             }
+            // Issue-34 diag: does the OV state round-trip at the DECLARED level? get_state_blob right
+            // after set — if it differs from `part`, set_state is lossy (fixable serialization). If it
+            // matches yet warm still flips vs cold, the delta is OV-internal (blocked layout / higher
+            // precision not captured by the declared blob) = a floor at this OV version.
+            match st.get_state_blob() {
+                Ok(rt) => {
+                    let set_fnv = crate::kv_coordination::fnv1a64(part);
+                    let rt_fnv = crate::kv_coordination::fnv1a64(&rt);
+                    if set_fnv != rt_fnv {
+                        warn!(set_fnv, rt_fnv, set_len = part.len(), rt_len = rt.len(),
+                            "qwen36_state_roundtrip_mismatch (set_state lossy at declared level)");
+                    } else {
+                        info!(fnv = set_fnv, len = part.len(),
+                            "qwen36_state_roundtrip_exact (declared state faithful)");
+                    }
+                }
+                Err(e) => warn!(error = %e, "qwen36: get_state_blob for round-trip diag failed"),
+            }
         }
         self.state_restored = true;
         true

@@ -409,6 +409,22 @@ struct ActiveTask {
     t_wire: std::time::Duration,
 }
 
+/// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
+///
+/// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
+/// SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens at 0) otherwise hit
+/// different GEMM batch shapes; over int4 weights the rounding delta flips a token, so cross-chain
+/// warm != cold byte-identical. Under T=1 both traverse the identical per-token kernel ⇒ bit-identical.
+/// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
+/// not bit-identical). Mirrors `qwen36::prefill_chunk`.
+fn prefill_chunk() -> usize {
+    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
+        1
+    } else {
+        usize::MAX
+    }
+}
+
 pub struct Gemma4Engine {
     spec: ShardSpec,
     /// Count of layers whose own KV lives entirely in stage_0 and is SHARED by later stages
@@ -426,6 +442,11 @@ pub struct Gemma4Engine {
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
     runtime_handle: tokio::runtime::Handle,
     position: i64,
+    /// Issue-34: a warm restore (`set_state_blob`) leaves residue this model's cheap
+    /// `reset_state` cannot scrub (see shim.cpp). Track it so the next reset rebuilds the
+    /// request instead — mirrors qwen36. Without it, restore-over-live-state corrupts the
+    /// warm continuation AND leaks (reasoning-channel `***`) into the following cold turn.
+    state_restored: bool,
     /// Map of canonical name (e.g. "input_ids", "attention_mask") to the
     /// IR's primary port name. Resolved at engine build time via the
     /// alias lookup (the IR's primary name is sometimes an internal
@@ -627,6 +648,20 @@ impl Gemma4Engine {
         let mut cross_frames = Vec::with_capacity(outs.len());
         for o in &outs {
             let (dt, oshape, bytes) = self.runtime.output(o.out_idx).map_err(map_ov_err)?;
+            // Issue-34 diag: on a PREFILL send (multi-token), log this shared-KV frame's context
+            // depth. Warm-resume must ship cat(restored_prefix, suffix) — i.e. ctx == full prompt
+            // len. If warm ctx == suffix len only, the cross_kv side-output is NOT reading the
+            // set_state-restored variable (stale/unfused copy) ⇒ that is the warm≠cold root cause.
+            if shape[1] > 1 && oshape.len() == 4 {
+                info!(
+                    tag = o.tag,
+                    ctx = oshape[2],
+                    tokens = shape[1],
+                    position,
+                    fnv = crate::kv_coordination::fnv1a64(&bytes),
+                    "gemma4_cross_kv_prefill_ctx"
+                );
+            }
             cross_frames.push(pack_cross_kv_frame(dt, &oshape, bytes)?);
             tags.push(o.tag);
         }
@@ -832,7 +867,34 @@ impl Gemma4Engine {
             {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
                 if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
-                    if self.runtime.set_state_blob(&blob).is_ok() {
+                    // Restore must land on a CLEAN request: this model's `reset_state` leaves residue
+                    // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
+                    // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
+                    // the following cold reset upgrades to a rebuild too.
+                    let _ = self.runtime.recreate_request();
+                    self.state_restored = true;
+                    let set_ok = self.runtime.set_state_blob(&blob).is_ok();
+                    // Issue-34 diag (mirror qwen36 70687b9): does set_state round-trip at the DECLARED
+                    // level on THIS device? gemma4's head IR uniquely has cross_kv side-consumers on the
+                    // KV concat. Mismatch ⇒ plugin set_state infidelity (mode A); exact ⇒ the warm≠cold
+                    // delta is the cross_kv side-output reading a stale buffer (mode B, exporter fix).
+                    if set_ok {
+                        match self.runtime.get_state_blob() {
+                            Ok(rt) => {
+                                let a = crate::kv_coordination::fnv1a64(&blob);
+                                let b = crate::kv_coordination::fnv1a64(&rt);
+                                if a != b {
+                                    warn!(set_fnv = a, rt_fnv = b, set_len = blob.len(), rt_len = rt.len(),
+                                        "gemma4_state_roundtrip_mismatch (set_state lossy at declared level)");
+                                } else {
+                                    info!(fnv = a, len = blob.len(),
+                                        "gemma4_state_roundtrip_exact (declared state faithful)");
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "gemma4: get_state_blob round-trip diag failed"),
+                        }
+                    }
+                    if set_ok {
                         // Multi-stage: RESTORE the whole downstream chain (all-or-nothing); any rank
                         // short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
                         let multi = self.downstream.is_some() && !self.spec.is_last_stage;
@@ -864,7 +926,15 @@ impl Gemma4Engine {
                 }
             }
             if warm_prefix == 0 {
-                self.runtime.reset_state().map_err(map_ov_err)?;
+                // A prior restore leaves residue cheap reset_state can't scrub — rebuild the request so
+                // this cold turn (incl. a fresh session after a warm-migrated turn on the same runtime)
+                // starts truly clean, not in the donor's reasoning-channel trajectory.
+                if self.state_restored {
+                    self.runtime.recreate_request().map_err(map_ov_err)?;
+                    self.state_restored = false;
+                } else {
+                    self.runtime.reset_state().map_err(map_ov_err)?;
+                }
             }
             self.position = warm_prefix as i64;
             info!(
@@ -948,21 +1018,57 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = whole span (one pass,
+        // unchanged/fastest). CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
+        // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
+        // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
+        // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
+        let chunk = prefill_chunk();
+        let mut alpha = std::time::Duration::ZERO;
+        let mut wire = std::time::Duration::ZERO;
+        let mut next_token: i32;
         let position = self.position;
-        let ts = std::time::Instant::now();
-        let (out, shape) = self.run_first(&tokens, position)?;
-        let alpha = ts.elapsed();
-        self.position += tokens.len() as i64;
-        // 1-token prompt prefill costs the same downstream as a decode step —
-        // keep the strict deadline (mirrors step_middle's shape[1] > 1) so
-        // wedge eviction stays fast.
-        let (next_token, wire) = self.resolve_next_token(
-            &out,
-            &shape,
-            single_stage,
-            position,
-            prefill && tokens.len() > 1,
-        )?;
+        if prefill && tokens.len() > 1 && chunk < tokens.len() {
+            let mut i = 0usize;
+            loop {
+                let end = (i + chunk).min(tokens.len());
+                let span = &tokens[i..end];
+                let pos = self.position;
+                let ts = std::time::Instant::now();
+                let (out, shape) = self.run_first(span, pos)?;
+                alpha += ts.elapsed();
+                self.position += span.len() as i64;
+                // Every span goes downstream so each stage folds the same way; the tokens from all but
+                // the final span are discarded (the last one is the first decode token).
+                // Always use the PREFILL (widened) deadline here even for T=1 spans: this is a prefill,
+                // and the first span after a warm RESTORE follows a heavy set_state on the downstream
+                // stage — the strict decode budget wedges there and the turn returns empty.
+                let (tok, w) = self.resolve_next_token(&out, &shape, single_stage, pos, true)?;
+                wire += w;
+                next_token = tok;
+                i = end;
+                if i >= tokens.len() {
+                    break;
+                }
+            }
+        } else {
+            let ts = std::time::Instant::now();
+            let (out, shape) = self.run_first(&tokens, position)?;
+            alpha = ts.elapsed();
+            self.position += tokens.len() as i64;
+            // 1-token prompt prefill costs the same downstream as a decode step —
+            // keep the strict deadline (mirrors step_middle's shape[1] > 1) so
+            // wedge eviction stays fast.
+            let (tok, w) = self.resolve_next_token(
+                &out,
+                &shape,
+                single_stage,
+                position,
+                prefill && tokens.len() > 1,
+            )?;
+            wire = w;
+            next_token = tok;
+        }
         if let Some(a) = self.active.as_mut() {
             a.t_alpha_compute += alpha;
             a.t_wire += wire;
@@ -1860,6 +1966,7 @@ impl Builder for Gemma4Builder {
             downstream: self.downstream,
             runtime_handle: tokio::runtime::Handle::current(),
             position: 0,
+            state_restored: false,
             canonical_inputs,
             pending: Vec::new(),
             active: None,
