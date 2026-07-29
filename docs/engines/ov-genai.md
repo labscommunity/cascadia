@@ -111,6 +111,41 @@ cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
               --api :8000
 ```
 
+### When `--cb` helps — and when it hurts
+
+**`--cb` is not a free win. Measure before enabling it.** It trades
+single-request latency for batch throughput, and on some shapes that trade is
+very bad. Aggregate tokens/s, Phi-3.5-mini-int4 and Qwen3-8B-int4 on a Lunar
+Lake box (Arc 140V iGPU + CPU), `max_tokens=64`, warm kernel cache:
+
+| workload | device | without `--cb` | with `--cb` |
+|---|---|---|---|
+| short prompt, 1 request | GPU | 39.9 | 36.9 (**0.92×**) |
+| short prompt, 8 concurrent | GPU | 39.8 | 141.8 (**3.6×**) |
+| short prompt, 16 concurrent | GPU | 36.2 | 176.3 (**4.9×**) |
+| short prompt, 8 concurrent | CPU | 22.7 | 36.8 (1.6×) |
+| ~1200-token prompt, 8 concurrent | GPU | 33.4 | 20.7 (**0.6×**) |
+| ~1200-token prompt, 4 concurrent | CPU | 15.9 | 3.3 (**0.2×**) |
+
+Three rules follow:
+
+- **Enable it for short-prompt concurrent serving, preferably on GPU.** That is
+  where the 3–5× lives. The win grows with concurrency and needs at least 4
+  in-flight requests to appear at all.
+- **Do not enable it for a single-user worker.** Every configuration measured
+  costs 8–15% at concurrency 1 — paged-attention bookkeeping with no batch to
+  amortise it over.
+- **Do not enable it on CPU for long-context workloads.** A ~1200-token prompt
+  collapses to ~0.2× — a five-fold throughput loss, reproduced on both models,
+  and *not* recoverable by raising `--cb-max-batched-tokens`. RAG-style traffic
+  on a CPU worker is the worst case for this flag.
+
+On GPU, long prompts are model-dependent rather than uniformly bad: Qwen3-8B
+gained (1.6× at 8 concurrent) where Phi-3.5-mini lost (0.6×). If your prompts
+are long, benchmark your own model. Raising `--cb-max-batched-tokens` above the
+prompt length recovers much of the GPU loss (Phi-3.5-mini went 0.6× → 1.1× at 4
+concurrent) because it stops splitting the prefill; it does nothing on CPU.
+
 ## Limitations
 
 - **Single-stage only.** No pipeline parallelism (`--total 1` enforced).
@@ -118,3 +153,4 @@ cascadia worker --rank 0 --total 1 --engine ov-genai --device GPU \
 - **Draft / target tokeniser must match.** FastDraft companions are trained per target family; mixing across families won't work.
 - **`--draft-model` and `--prompt-lookup` are mutually exclusive.** Both set `GenerationConfig.num_assistant_tokens`; the validator rejects the combination.
 - **`--cb` is incompatible with `--draft-model` / `--prompt-lookup` and with VLM-layout exports.** The CB scheduler owns batch composition; speculative CB is a follow-up.
+- **`--cb` is a throughput/latency trade, not a strict upgrade.** It costs ~10% at concurrency 1 and up to 5x on CPU with long prompts — see [When `--cb` helps](#when---cb-helps--and-when-it-hurts).
