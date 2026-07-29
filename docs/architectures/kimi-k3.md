@@ -3,12 +3,17 @@
 Moonshot **Kimi-K3** (`moonshotai/Kimi-K3`, ~2.8T MoE, 1M ctx) analysed against the
 `cascadia-engine-sparse-moe` engine.
 
-**Status: NOT STARTED — blocked on a platform decision.** The architecture is
-tractable and the port path is clear (below), but K3 does **not fit the 4× 32 GB
-AI-PC fleet** that dsv4 and glm5 target: the always-resident bf16 shell alone is
-~112 GB against 128 GB of total fleet RAM. K3 is a single-big-host target
-(the K2.6 / MiniMax-M2 deployment model) or it is parked. See
-[Feasibility](#feasibility).
+**Status: implemented, not yet run on real weights.** The shell
+(`crates/cascadia-engine-sparse-moe/src/k3/`), the exporter
+(`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`) are
+complete and golden-tested; `{1,2,3,4,6}`-rank pipelines are bit-identical to a
+single process. What remains is the real 1.56 TB export and bring-up.
+
+**That is blocked on hardware.** K3 does **not fit the 4× 32 GB AI-PC fleet**
+that dsv4 and glm5 target — the always-resident bf16 shell alone is ~112 GB
+against 128 GB of total fleet RAM — and the Xeon bench host has neither the RAM
+nor the disk. K3 is a single-big-host target (the K2.6 / MiniMax-M2 deployment
+model) or it is parked. See [Feasibility](#feasibility).
 
 ## Architecture
 
@@ -50,16 +55,16 @@ RAM-resident before a single routed expert is pinned:
 | Component | Derivation | bf16 |
 |---|---|---:|
 | KDA attention | 69 × (4×7168×12288 qkvo + 7168×12288 full-rank gate) = 30.4B | **60.7 GB** |
-| shared experts | 92 × 2 × 3 × 7168 × 3072 = 12.2B | **24.3 GB** ⚠ |
+| shared experts | 92 × 2 × 3 × 7168 × 3072 = 12.2B | **24.3 GB** |
 | gated MLA | 24 × ~232M = 5.6B | 11.1 GB |
 | LatentMoE projections | 92 × 2 × 7168 × 3584 = 4.7B | 9.4 GB |
 | embed + lm_head | 2 × 163,840 × 7168 = 2.35B | 4.7 GB |
 | dense layer 0 | 3 × 7168 × 33,792 = 727M | 1.5 GB |
 | | | **~112 GB** |
 
-⚠ Unresolved: whether the 2 shared experts run on hidden (7168, as costed) or in
-the 3584 latent (→ ~12 GB). Needs `modeling_kimi_linear.py`. Either way the
-verdict below is unchanged.
+Confirmed from the modeling source: `shared_experts` is built with no
+`hidden_size` override, so it runs at 7168 rather than in the 3584 latent —
+the more expensive of the two possibilities.
 
 ### Verdict
 
@@ -228,6 +233,17 @@ out   = y + shared_experts(x)               # shared on HIDDEN 7168, inter = 307
 Shared experts take **no `hidden_size` override** → they run at 7168, confirming
 the 24.3 GB line in the shell table (an earlier revision flagged 3584 as
 possible; it is not).
+
+### Layer indexing — `linear_attn_config` is 1-indexed
+
+`kda_layers` and `full_attn_layers` list layers **1-indexed**. Subtracting 1
+yields an exact partition of `0..92` (69 KDA + 24 MLA), which the checkpoint's
+tensor index confirms directly: layer 0 carries `self_attn.A_log` (KDA) and
+layer 3 carries `self_attn.kv_b_proj` (MLA).
+
+Read as 0-indexed the lists look wrong in two ways — layer 0 appears in neither
+and `full_attn_layers` ends at 93, out of range — which is exactly the shape of
+an off-by-one. The exporter shifts on load, so `manifest.json` is 0-indexed.
 
 ### KDA (Kimi Delta Attention)
 

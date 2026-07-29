@@ -25,6 +25,14 @@ use crate::k3::kda::{kda_gate, kda_step, l2norm_heads, short_conv};
 use crate::k3::moe::{moe_forward, ExpertSource, MoeDims, MoeWeights};
 use crate::k3::situ::situ;
 
+/// True when `layer` (0-indexed) is a KDA layer.
+///
+/// The manifest's `kda_layers` is already 0-indexed — the exporter shifts it,
+/// because `linear_attn_config` in the HF config lists layers 1-INDEXED.
+/// Shifted, `kda_layers` and `full_attn_layers` partition 0..n-1 exactly
+/// (69 KDA + 24 MLA = 93), which the tensor index confirms: layer 0 carries
+/// KDA weights and layer 3 carries MLA ones.
+///
 /// Number of block-residual slots live at the entry to layer `i`.
 #[inline]
 pub fn blocks_at(layer: usize, block_size: usize) -> usize {

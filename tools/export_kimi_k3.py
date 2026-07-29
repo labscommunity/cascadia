@@ -144,10 +144,20 @@ def load_and_validate_config(path: Path) -> dict:
     _require(int(c.get("num_nextn_predict_layers", 0)) == 0, "MTP layers not supported")
 
     n = int(g("num_hidden_layers"))
-    kda = set(int(i) for i in la.get("kda_layers", []))
+    # `linear_attn_config` lists layers 1-INDEXED: kda_layers starts at 1 and
+    # full_attn_layers runs to num_hidden_layers. Subtracting 1 yields a clean
+    # partition of 0..n-1. Verified against the checkpoint's tensor index --
+    # layer 0 carries KDA tensors (A_log) and layer 3 carries MLA ones.
+    kda = set(int(i) - 1 for i in la.get("kda_layers", []))
+    full = set(int(i) - 1 for i in la.get("full_attn_layers", []))
     _require(kda, "linear_attn_config.kda_layers is empty")
-    # layer 0 appears in neither list and falls through to MLA; ids >= n are unused
-    _require(max(kda) < n, f"kda_layers has an id >= num_hidden_layers ({n})")
+    _require(not (kda & full), "kda_layers and full_attn_layers overlap")
+    _require(
+        kda | full == set(range(n)),
+        f"kda_layers + full_attn_layers must partition 0..{n - 1} after the "
+        f"1-indexed shift (got {len(kda)} + {len(full)} covering "
+        f"{len(kda | full)} of {n})",
+    )
 
     q = raw.get("quantization_config", c.get("quantization_config", {})) or {}
     fmt = q.get("format")
@@ -285,9 +295,216 @@ def export_tiny(out: Path):
     print(f"[tiny] wrote {cfg['num_hidden_layers']} layers -> {out}", flush=True)
 
 
+
+# --------------------------------------------------------------------------
+# Real checkpoint export (streaming, resumable)
+# --------------------------------------------------------------------------
+
+# Text model lives under `language_model.`; `vision_tower.` / `mm_projector.`
+# are the ViT and are dropped. Verified against the checkpoint's
+# model.safetensors.index.json (497,220 tensors, 1.56 TB).
+PREFIX = "language_model.model."
+LM_HEAD = "language_model.lm_head.weight"
+
+# per-layer shell tensors: source suffix -> our shell key
+COMMON = {
+    "input_layernorm.weight": "input_layernorm",
+    "post_attention_layernorm.weight": "post_attention_layernorm",
+    "self_attention_res_proj.weight": "attn_res_proj",
+    "self_attention_res_norm.weight": "attn_res_norm",
+    "mlp_res_proj.weight": "mlp_res_proj",
+    "mlp_res_norm.weight": "mlp_res_norm",
+    "self_attn.g_proj.weight": "attn.g_proj",
+    "self_attn.o_proj.weight": "attn.o_proj",
+}
+KDA_ONLY = {
+    "self_attn.q_proj.weight": "attn.q_proj",
+    "self_attn.k_proj.weight": "attn.k_proj",
+    "self_attn.v_proj.weight": "attn.v_proj",
+    "self_attn.q_conv1d.weight": "attn.q_conv1d",
+    "self_attn.k_conv1d.weight": "attn.k_conv1d",
+    "self_attn.v_conv1d.weight": "attn.v_conv1d",
+    "self_attn.f_a_proj.weight": "attn.f_a_proj",
+    "self_attn.f_b_proj.weight": "attn.f_b_proj",
+    "self_attn.b_proj.weight": "attn.b_proj",
+    "self_attn.o_norm.weight": "attn.o_norm",
+    "self_attn.A_log": "attn.A_log",
+    "self_attn.dt_bias": "attn.dt_bias",
+}
+MLA_ONLY = {
+    "self_attn.q_a_proj.weight": "attn.q_a_proj",
+    "self_attn.q_a_layernorm.weight": "attn.q_a_layernorm",
+    "self_attn.q_b_proj.weight": "attn.q_b_proj",
+    "self_attn.kv_a_proj_with_mqa.weight": "attn.kv_a_proj_with_mqa",
+    "self_attn.kv_a_layernorm.weight": "attn.kv_a_layernorm",
+    "self_attn.kv_b_proj.weight": "attn.kv_b_proj",
+}
+MOE = {
+    "block_sparse_moe.gate.weight": "moe.gate_weight",
+    "block_sparse_moe.gate.e_score_correction_bias": "moe.e_score_correction_bias",
+    "block_sparse_moe.routed_expert_down_proj.weight": "moe.routed_expert_down_proj",
+    "block_sparse_moe.routed_expert_up_proj.weight": "moe.routed_expert_up_proj",
+    "block_sparse_moe.routed_expert_norm.weight": "moe.routed_expert_norm",
+    "block_sparse_moe.shared_experts.gate_proj.weight": "moe.shared_w1",
+    "block_sparse_moe.shared_experts.up_proj.weight": "moe.shared_w3",
+    "block_sparse_moe.shared_experts.down_proj.weight": "moe.shared_w2",
+}
+DENSE = {
+    "mlp.gate_proj.weight": "w1",
+    "mlp.up_proj.weight": "w3",
+    "mlp.down_proj.weight": "w2",
+}
+
+
+class CkptSource:
+    """Lazily-opened safetensors shards, keyed by the index's weight_map."""
+
+    def __init__(self, model_dir: Path):
+        from safetensors import safe_open
+
+        self._open = safe_open
+        self.dir = model_dir
+        idx = model_dir / "model.safetensors.index.json"
+        if not idx.exists():
+            raise SystemExit(f"[export_kimi_k3] missing {idx}")
+        self.map = json.loads(idx.read_text())["weight_map"]
+        self._handles = {}
+
+    def _h(self, shard: str):
+        h = self._handles.get(shard)
+        if h is None:
+            h = self._open(str(self.dir / shard), framework="pt")
+            self._handles[shard] = h
+        return h
+
+    def has(self, name: str) -> bool:
+        return name in self.map
+
+    def get(self, name: str):
+        if name not in self.map:
+            raise ConfigError(f"tensor missing from the checkpoint index: {name}")
+        return self._h(self.map[name]).get_tensor(name)
+
+    def close(self):
+        self._handles.clear()
+
+
+def _f32(t) -> np.ndarray:
+    return t.to(torch.float32).numpy()
+
+
+def export_real(model_dir: Path, out: Path, cfg: dict):
+    """Stream the checkpoint into the sparse-moe layout, one layer at a time.
+
+    Resumable: a `.layer_NN.done` marker is written after each layer and
+    completed layers are skipped on a re-run.
+    """
+    src = CkptSource(model_dir)
+    n = cfg["num_hidden_layers"]
+    kda = set(cfg["kda_layers"])
+    (out / "shells").mkdir(parents=True, exist_ok=True)
+
+    # embed + head
+    if not (out / ".head.done").exists():
+        save_file({"embed": src.get(PREFIX + "embed_tokens.weight").to(torch.float32)},
+                  str(out / "embed.safetensors"))
+        save_file({
+            "norm": src.get(PREFIX + "norm.weight").to(torch.float32),
+            "lm_head": src.get(LM_HEAD).to(torch.float32),
+            "output_attn_res_proj": src.get(PREFIX + "output_attn_res_proj.weight").to(torch.float32),
+            "output_attn_res_norm": src.get(PREFIX + "output_attn_res_norm.weight").to(torch.float32),
+        }, str(out / "head.safetensors"))
+        (out / ".head.done").write_text("ok\n")
+        print("[head] embed + head written", flush=True)
+
+    for li in range(n):
+        marker = out / f".layer_{li:02d}.done"
+        if marker.exists():
+            continue
+        base = f"{PREFIX}layers.{li}."
+        flat = {}
+        table = dict(COMMON)
+        table.update(KDA_ONLY if li in kda else MLA_ONLY)
+        table.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
+
+        for suffix, key in table.items():
+            t = src.get(base + suffix).to(torch.float32)
+            # conv1d ships as [D, 1, K] (depthwise); the shell wants [D, K]
+            if key.endswith("_conv1d") and t.dim() == 3:
+                t = t.squeeze(1)
+            flat[key] = t.contiguous()
+        save_file(flat, str(out / "shells" / f"layer_{li:02d}.safetensors"))
+
+        # routed experts: already mxfp4 -> repack the packed/scale pairs as-is
+        if li >= cfg["first_k_dense_replace"]:
+            edir = out / "experts" / f"layer_{li:02d}"
+            eb = f"{base}block_sparse_moe.experts."
+            for e in range(cfg["num_experts"]):
+                sections = []
+                for w in ("w1", "w3", "w2"):
+                    packed = src.get(f"{eb}{e}.{w}.weight_packed")
+                    scale = src.get(f"{eb}{e}.{w}.weight_scale")
+                    sections.append((
+                        packed.view(torch.uint8).numpy(),
+                        scale.view(torch.uint8).numpy(),
+                    ))
+                repack_expert_bin(sections, edir / f"expert_{e:03d}.bin")
+        marker.write_text("ok\n")
+        print(f"[layer {li:02d}/{n - 1}] {'kda' if li in kda else 'mla'} done", flush=True)
+
+    src.close()
+    print(f"[done] {n} layers -> {out}", flush=True)
+
+
 # --------------------------------------------------------------------------
 # Self-test
 # --------------------------------------------------------------------------
+
+
+def check_index(index_path: Path, cfg: dict):
+    """Verify every tensor the streaming pass will ask for exists in the
+    checkpoint's index — a pre-flight that needs the index only, not the
+    1.56 TB of weights. Catches a name-mapping mistake before a multi-day
+    download rather than after it.
+    """
+    wm = json.loads(Path(index_path).read_text())["weight_map"]
+    have = set(wm)
+    want, missing = [], []
+
+    want += [PREFIX + "embed_tokens.weight", PREFIX + "norm.weight", LM_HEAD,
+             PREFIX + "output_attn_res_proj.weight", PREFIX + "output_attn_res_norm.weight"]
+    kda = set(cfg["kda_layers"])
+    for li in range(cfg["num_hidden_layers"]):
+        base = f"{PREFIX}layers.{li}."
+        table = dict(COMMON)
+        table.update(KDA_ONLY if li in kda else MLA_ONLY)
+        table.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
+        want += [base + sfx for sfx in table]
+        if li >= cfg["first_k_dense_replace"]:
+            eb = f"{base}block_sparse_moe.experts."
+            for e in range(cfg["num_experts"]):
+                for w in ("w1", "w3", "w2"):
+                    want += [f"{eb}{e}.{w}.weight_packed", f"{eb}{e}.{w}.weight_scale"]
+
+    for nme in want:
+        if nme not in have:
+            missing.append(nme)
+
+    text = {k for k in have if k.startswith("language_model.")}
+    unused = text - set(want)
+    print(f"[check-index] requested {len(want):,} tensors, {len(missing)} missing")
+    print(f"[check-index] text-model tensors in index: {len(text):,}")
+    print(f"[check-index] dropped (vision/projector): {len(have) - len(text):,}")
+    if unused:
+        print(f"[check-index] WARNING {len(unused)} text tensors unused, e.g.:")
+        for k in sorted(unused)[:5]:
+            print(f"    {k}")
+    if missing:
+        print("[check-index] MISSING, e.g.:")
+        for k in missing[:10]:
+            print(f"    {k}")
+        raise SystemExit("[export_kimi_k3] index pre-flight FAILED")
+    print("[check-index] OK — every required tensor is present")
 
 
 def selftest():
@@ -324,10 +541,19 @@ def main():
     ap.add_argument("--model", type=Path, help="real checkpoint dir (with --out)")
     ap.add_argument("--out", type=Path, help="output dir for --model")
     ap.add_argument("--selftest", action="store_true", help="fp4 round-trip self-test")
+    ap.add_argument("--check-index", type=Path,
+                    help="verify tensor names against model.safetensors.index.json "
+                         "(needs --config); no weights required")
+    ap.add_argument("--config", type=Path, help="config.json for --check-index")
     a = ap.parse_args()
 
     if a.selftest:
         selftest()
+        return
+    if a.check_index:
+        if not a.config:
+            raise SystemExit("--check-index requires --config CONFIG.json")
+        check_index(a.check_index, load_and_validate_config(a.config))
         return
     if a.validate:
         cfg = load_and_validate_config(a.validate)
@@ -343,11 +569,7 @@ def main():
         a.out.mkdir(parents=True, exist_ok=True)
         check_space(a.out, cfg)
         write_manifest(cfg, a.out)
-        raise SystemExit(
-            "[export_kimi_k3] config + manifest OK. The streaming weight pass is "
-            "not implemented yet: it needs the real checkpoint's tensor names to "
-            "verify against, and this exporter hard-fails rather than guessing "
-            "them. Run --validate against the real config.json first.")
+        export_real(a.model, a.out, cfg)
     ap.print_help()
 
 
