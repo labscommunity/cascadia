@@ -18,8 +18,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    CbFinish, CbHandle, CbPipeline, CbSchedulerConfig, CbStatus, Error as OvError, GenConfig,
-    LlmPipeline, PluginConfig,
+    CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
+    GenConfig, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -322,7 +322,7 @@ impl Builder for OvGenaiBuilder {
         if let Some(pipe) = self.cb_pipe {
             return Ok(Box::new(OvGenaiCbEngine {
                 active: Vec::new(),
-                pipe,
+                pipe: Box::new(pipe),
                 prompt_pretemplated: self.prompt_pretemplated,
                 next_request_id: 0,
                 max_tokens_default: 256,
@@ -510,10 +510,62 @@ const MAX_IDLE_STEPS: u32 = 2048;
 /// is gone, not that one request was unlucky.
 const MAX_STEP_FAILURES: u32 = 3;
 
+/// The slice of [`CbPipeline`] the continuous-batching engine actually uses.
+///
+/// Exists so the engine's state machine is testable without OpenVINO. The real
+/// implementation is the FFI type; tests drive a scripted mock. Without it the
+/// engine is untestable in a stub build — `CbPipeline::new` returns
+/// `Error::Stub`, and every method on a stub pipeline errors, so `step()` can
+/// only ever reach its failure branch.
+trait CbPipe: Send {
+    fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        cfg: &GenConfig,
+    ) -> Result<Box<dyn CbReq>, OvError>;
+    fn step(&self) -> Result<(), OvError>;
+    fn count_tokens(&self, text: &str) -> Option<u32>;
+}
+
+/// One enrolled request, as the engine sees it.
+trait CbReq: Send {
+    fn read(&mut self) -> Result<CbRead, OvError>;
+    fn cancel(&self) -> Result<(), OvError>;
+}
+
+impl CbPipe for CbPipeline {
+    fn add_request(
+        &self,
+        request_id: u64,
+        prompt: &str,
+        cfg: &GenConfig,
+    ) -> Result<Box<dyn CbReq>, OvError> {
+        Ok(Box::new(CbPipeline::add_request(
+            self, request_id, prompt, cfg,
+        )?))
+    }
+    fn step(&self) -> Result<(), OvError> {
+        CbPipeline::step(self)
+    }
+    fn count_tokens(&self, text: &str) -> Option<u32> {
+        CbPipeline::count_tokens(self, text)
+    }
+}
+
+impl CbReq for CbHandle {
+    fn read(&mut self) -> Result<CbRead, OvError> {
+        CbHandle::read(self)
+    }
+    fn cancel(&self) -> Result<(), OvError> {
+        CbHandle::cancel(self)
+    }
+}
+
 /// Per-request generation state on the continuous-batching engine.
 struct ActiveCbTask {
     task_id: TaskId,
-    handle: CbHandle,
+    handle: Box<dyn CbReq>,
     total_tokens: u32,
     max_tokens: u32,
     prompt_tokens: Option<u32>,
@@ -537,7 +589,7 @@ struct ActiveCbTask {
 /// no-progress guard relies on that distinction.
 pub struct OvGenaiCbEngine {
     active: Vec<ActiveCbTask>,
-    pipe: CbPipeline,
+    pipe: Box<dyn CbPipe>,
     prompt_pretemplated: bool,
     next_request_id: u64,
     max_tokens_default: u32,
@@ -941,6 +993,382 @@ impl OvGenaiEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    // ---- CB engine state machine -------------------------------------------
+    //
+    // Driven through the CbPipe seam with a scripted mock, so the whole state
+    // machine runs without OpenVINO. Before the seam none of this was reachable:
+    // a stub CbPipeline errors on every call, so step() could only ever take its
+    // failure branch.
+
+    #[derive(Default)]
+    struct MockState {
+        /// Scripted reads per enrolled request, in enrollment order.
+        reads: Vec<VecDeque<Result<CbRead, OvError>>>,
+        /// Returned once a request's script runs out.
+        default_read: Option<CbRead>,
+        step_fails: bool,
+        steps: usize,
+        added: Vec<u64>,
+        cancelled: Vec<u64>,
+    }
+
+    struct MockPipe {
+        st: Arc<Mutex<MockState>>,
+    }
+    struct MockReq {
+        st: Arc<Mutex<MockState>>,
+        idx: usize,
+        id: u64,
+    }
+
+    impl CbPipe for MockPipe {
+        fn add_request(
+            &self,
+            request_id: u64,
+            _prompt: &str,
+            _cfg: &GenConfig,
+        ) -> Result<Box<dyn CbReq>, OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.added.push(request_id);
+            let idx = st.added.len() - 1;
+            while st.reads.len() <= idx {
+                st.reads.push(VecDeque::new());
+            }
+            Ok(Box::new(MockReq {
+                st: self.st.clone(),
+                idx,
+                id: request_id,
+            }))
+        }
+        fn step(&self) -> Result<(), OvError> {
+            let mut st = self.st.lock().unwrap();
+            st.steps += 1;
+            if st.step_fails {
+                Err(OvError::Native("mock step failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn count_tokens(&self, _text: &str) -> Option<u32> {
+            Some(7)
+        }
+    }
+
+    impl CbReq for MockReq {
+        fn read(&mut self) -> Result<CbRead, OvError> {
+            let mut st = self.st.lock().unwrap();
+            if let Some(r) = st.reads.get_mut(self.idx).and_then(|q| q.pop_front()) {
+                return r;
+            }
+            match &st.default_read {
+                Some(r) => Ok(r.clone()),
+                None => Err(OvError::Native("mock: script exhausted".into())),
+            }
+        }
+        fn cancel(&self) -> Result<(), OvError> {
+            self.st.lock().unwrap().cancelled.push(self.id);
+            Ok(())
+        }
+    }
+
+    fn read_of(status: CbStatus, tokens: u32, text: &str, finish: CbFinish) -> CbRead {
+        CbRead {
+            text_delta: text.to_string(),
+            new_tokens: tokens,
+            status,
+            finish,
+            resynced: false,
+        }
+    }
+
+    /// A read that reports progress but no output — every iteration of a
+    /// chunked prefill looks like this.
+    fn idle_read() -> CbRead {
+        read_of(CbStatus::Running, 0, "", CbFinish::Unknown)
+    }
+
+    fn mock_engine(st: &Arc<Mutex<MockState>>) -> OvGenaiCbEngine {
+        OvGenaiCbEngine {
+            active: Vec::new(),
+            pipe: Box::new(MockPipe { st: st.clone() }),
+            prompt_pretemplated: false,
+            next_request_id: 0,
+            max_tokens_default: 256,
+            idle_steps: 0,
+            step_failures: 0,
+        }
+    }
+
+    fn task(id: &str, max_tokens: u32) -> GenerationTask {
+        GenerationTask::new(id, "hello").with_max_tokens(max_tokens)
+    }
+
+    /// The B1 fix: a step that progressed the batch without producing a token
+    /// must still report progress, or the runner's no-progress guard kills a
+    /// perfectly healthy request mid-prefill. n_tokens must be an explicit 0 —
+    /// the SSE path does `n_tokens.unwrap_or(1)`.
+    #[test]
+    fn cb_step_emits_a_zero_token_liveness_chunk_when_nothing_was_produced() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1, "must not return an empty Vec while in flight");
+        let (tid, chunk) = &out[0];
+        assert_eq!(tid, "t1");
+        assert!(chunk.text.is_empty());
+        assert!(!chunk.is_final);
+        assert_eq!(chunk.n_tokens, Some(0), "explicit 0, not None");
+        assert!(chunk.error.is_none());
+    }
+
+    /// ...but the liveness chunk hides those iterations from the runner's
+    /// guard, so the engine owes it a bound. At the real MAX_IDLE_STEPS.
+    #[test]
+    fn cb_liveness_is_bounded_so_a_wedged_batch_still_fails() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+
+        for i in 0..MAX_IDLE_STEPS {
+            let out = e.step().unwrap();
+            assert!(
+                out[0].1.error.is_none(),
+                "failed early at idle step {i} of {MAX_IDLE_STEPS}"
+            );
+        }
+        // One past the bound: the batch is declared stalled.
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let err = out[0].1.error.as_deref().expect("must fail past the bound");
+        assert!(err.contains("stalled"), "{err}");
+        assert!(e.active.is_empty(), "stalled requests must be dropped");
+    }
+
+    /// A single producing iteration resets the idle run — otherwise a long but
+    /// healthy generation would eventually trip the bound.
+    #[test]
+    fn cb_progress_resets_the_idle_counter() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        {
+            let mut g = st.lock().unwrap();
+            g.reads.push(VecDeque::new());
+            for _ in 0..MAX_IDLE_STEPS {
+                g.reads[0].push_back(Ok(idle_read()));
+            }
+            g.reads[0].push_back(Ok(read_of(CbStatus::Running, 1, "x", CbFinish::Unknown)));
+            for _ in 0..MAX_IDLE_STEPS {
+                g.reads[0].push_back(Ok(idle_read()));
+            }
+        }
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+        for i in 0..(2 * MAX_IDLE_STEPS + 1) {
+            let out = e.step().unwrap();
+            assert!(
+                out[0].1.error.is_none(),
+                "tripped at step {i} despite progress"
+            );
+        }
+    }
+
+    /// The B2 fix: a request OpenVINO abandoned for want of KV cache must not
+    /// be finalised like a normal completion.
+    #[test]
+    fn cb_ignored_status_is_reported_as_an_error() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Ignored,
+                0,
+                "",
+                CbFinish::Unknown,
+            ))]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        let c = &out[0].1;
+        let err = c
+            .error
+            .as_deref()
+            .expect("eviction must surface as an error");
+        assert!(err.contains("KV cache exhausted"), "{err}");
+        assert!(c.is_final);
+        assert!(e.active.is_empty());
+    }
+
+    /// Prefer OpenVINO's own reason over guessing from token counts.
+    #[test]
+    fn cb_final_chunk_prefers_the_reported_finish_reason() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock()
+            .unwrap()
+            .reads
+            .push(VecDeque::from(vec![Ok(read_of(
+                CbStatus::Finished,
+                1,
+                "!",
+                CbFinish::Length,
+            ))]));
+        let mut e = mock_engine(&st);
+        // Only 1 token against a cap of 4096 — inference alone would say Stop.
+        e.submit(task("t1", 4096)).unwrap();
+        let out = e.step().unwrap();
+        assert_eq!(out[0].1.finish_reason, Some(FinishReason::Length));
+    }
+
+    /// ...and fall back to the token-count inference when it reports nothing,
+    /// which is what happens when the terminal read carries no new output.
+    #[test]
+    fn cb_final_chunk_falls_back_to_token_inference() {
+        for (max_tokens, produced, want) in [
+            (4u32, 4u32, FinishReason::Length),
+            (4096, 1, FinishReason::Stop),
+        ] {
+            let st = Arc::new(Mutex::new(MockState::default()));
+            st.lock()
+                .unwrap()
+                .reads
+                .push(VecDeque::from(vec![Ok(read_of(
+                    CbStatus::Finished,
+                    produced,
+                    "x",
+                    CbFinish::Unknown,
+                ))]));
+            let mut e = mock_engine(&st);
+            e.submit(task("t1", max_tokens)).unwrap();
+            let out = e.step().unwrap();
+            assert_eq!(out[0].1.finish_reason, Some(want), "max={max_tokens}");
+        }
+    }
+
+    /// Regression for the token accounting fixed in 7c8e6db: the API SUMS
+    /// per-chunk counts, so each chunk must carry its own increment. Emitting
+    /// the running total here measured 2N-1 on hardware.
+    #[test]
+    fn cb_chunks_carry_per_chunk_token_increments_not_the_total() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        st.lock().unwrap().reads.push(VecDeque::from(vec![
+            Ok(read_of(CbStatus::Running, 3, "abc", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Running, 4, "defg", CbFinish::Unknown)),
+            Ok(read_of(CbStatus::Finished, 2, "hi", CbFinish::Unknown)),
+        ]));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 4096)).unwrap();
+
+        let mut counts = Vec::new();
+        let mut text = String::new();
+        for _ in 0..3 {
+            for (_, c) in e.step().unwrap() {
+                counts.push(c.n_tokens.unwrap());
+                text.push_str(&c.text);
+            }
+        }
+        assert_eq!(counts, vec![3, 4, 2], "must be increments, not 3,7,9");
+        assert_eq!(text, "abcdefghi");
+    }
+
+    /// A failed scheduler iteration poisons the whole batch: every in-flight
+    /// request gets its own error chunk rather than one stream eating it.
+    #[test]
+    fn cb_step_failure_fails_every_in_flight_request() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+
+        let out = e.step().unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, c)| c.error.is_some() && c.is_final));
+        assert!(e.active.is_empty());
+    }
+
+    /// ...and once it keeps failing, stop admitting work onto a dead pipeline
+    /// instead of 503-ing every new request forever.
+    #[test]
+    fn cb_submit_refuses_work_after_repeated_step_failures() {
+        let st = Arc::new(Mutex::new(MockState {
+            step_fails: true,
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        for i in 0..MAX_STEP_FAILURES {
+            e.submit(task(&format!("t{i}"), 8)).unwrap();
+            let _ = e.step().unwrap();
+        }
+        let err = e.submit(task("late", 8)).expect_err("must refuse");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+    }
+
+    #[test]
+    fn cb_submit_is_idempotent_and_honours_the_queue_cap() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t1", 8)).unwrap();
+        assert_eq!(
+            e.active.len(),
+            1,
+            "resubmitting a live task must be a no-op"
+        );
+        assert_eq!(
+            st.lock().unwrap().added.len(),
+            1,
+            "and must not re-enroll it"
+        );
+
+        for i in 1..crate::dist_spec::MAX_PENDING_TASKS {
+            e.submit(task(&format!("f{i}"), 8)).unwrap();
+        }
+        let err = e.submit(task("overflow", 8)).expect_err("cap must reject");
+        assert!(matches!(err, EngineError::QueueFull { .. }), "{err:?}");
+    }
+
+    /// The trait contract: after cancel returns, step emits nothing more for
+    /// that task.
+    #[test]
+    fn cb_cancel_drops_the_task_and_aborts_it_upstream() {
+        let st = Arc::new(Mutex::new(MockState {
+            default_read: Some(idle_read()),
+            ..Default::default()
+        }));
+        let mut e = mock_engine(&st);
+        e.submit(task("t1", 8)).unwrap();
+        e.submit(task("t2", 8)).unwrap();
+        e.cancel(&"t1".to_string());
+
+        assert_eq!(e.active.len(), 1);
+        assert_eq!(st.lock().unwrap().cancelled, vec![0], "must abort upstream");
+        for _ in 0..5 {
+            for (tid, _) in e.step().unwrap() {
+                assert_ne!(tid, "t1", "cancelled task must not emit chunks");
+            }
+        }
+    }
     use cascadia_engine::EngineError;
     use cascadia_types::{PeerEndpoint, PeerLayout, ShardSpec};
 
