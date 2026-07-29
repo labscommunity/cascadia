@@ -20,7 +20,7 @@ use crate::k3::expert_fp4;
 use crate::k3::model::{
     K3Dims, K3Layer, KdaDims, KdaState, KdaWeights, LayerAttn, LayerFfn, LayerState,
 };
-use crate::k3::moe::{FlatExperts, MoeDims, MoeWeights};
+use crate::k3::moe::{MmapExperts, MoeDims, MoeWeights};
 
 #[derive(Debug, Error)]
 pub enum K3LoadError {
@@ -191,25 +191,13 @@ fn shell_path(dir: &Path, layer: usize) -> PathBuf {
         .join(format!("layer_{layer:02}.safetensors"))
 }
 
-/// Load every expert of one MoE layer into one flat buffer.
-fn load_experts(dir: &Path, layer: usize, m: &K3Manifest) -> Result<FlatExperts, K3LoadError> {
+/// Map one MoE layer's expert bin. Never reads it into RAM — a real layer is
+/// ~15.7 GB and the model is ~1.45 TB.
+fn load_experts(dir: &Path, layer: usize, m: &K3Manifest) -> Result<MmapExperts, K3LoadError> {
     let stride = expert_fp4::expert_bytes(m.routed_expert_hidden_size, m.moe_intermediate_size);
-    let mut data = Vec::with_capacity(stride * m.num_experts);
-    for e in 0..m.num_experts {
-        let p = dir
-            .join("experts")
-            .join(format!("layer_{layer:02}"))
-            .join(format!("expert_{e:03}.bin"));
-        let b = std::fs::read(&p)?;
-        if b.len() != stride {
-            return Err(K3LoadError::Tensor(
-                p.display().to_string(),
-                format!("expected {stride} bytes, got {}", b.len()),
-            ));
-        }
-        data.extend_from_slice(&b);
-    }
-    Ok(FlatExperts { data, stride })
+    let p = dir.join("experts").join(format!("layer_{layer:02}.bin"));
+    MmapExperts::open(&p, stride, m.num_experts)
+        .map_err(|e| K3LoadError::Tensor(p.display().to_string(), e.to_string()))
 }
 
 /// Load layers `lo..hi` of an export.
@@ -218,7 +206,7 @@ pub fn load_layers(
     m: &K3Manifest,
     lo: usize,
     hi: usize,
-) -> Result<(Vec<K3Layer<FlatExperts>>, Vec<LayerState>), K3LoadError> {
+) -> Result<(Vec<K3Layer<MmapExperts>>, Vec<LayerState>), K3LoadError> {
     let mut layers = Vec::with_capacity(hi - lo);
     let mut states = Vec::with_capacity(hi - lo);
 

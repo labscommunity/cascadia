@@ -10,7 +10,7 @@ Usage:
 Layout written:
   <out>/manifest.json
   <out>/shells/layer_NN.safetensors     bf16 attention + norms + LatentMoE proj
-  <out>/experts/layer_NN/expert_EEE.bin fp4 e2m1 + u8 E8M0 scales
+  <out>/experts/layer_NN.bin            all experts of a layer, concatenated
   <out>/embed.safetensors, <out>/head.safetensors
 
 K3's routed experts already ship as mxfp4 (e2m1 values + E8M0 group-32 scales),
@@ -86,23 +86,27 @@ def section_bytes(out: int, inn: int) -> int:
     return out * inn // 2 + out * (inn // FP4_GROUP)
 
 
-def export_expert_bin(w1: np.ndarray, w3: np.ndarray, w2: np.ndarray, path: Path):
+# One packed file per LAYER, experts concatenated at a fixed stride.
+#
+# Per-expert files would mean 896 x 92 = 82,432 of them, and the runtime maps
+# each expert set -- Linux's default vm.max_map_count is 65,530, so per-expert
+# mappings fail outright at this scale. Per layer it is 92 mappings, and
+# residency still works: mlock/madvise take sub-ranges of a mapping.
+
+
+def append_expert_bin(w1: np.ndarray, w3: np.ndarray, w2: np.ndarray, f):
     """SiTU FFN: gate(w1), up(w3), down(w2) — nibbles then E8M0 scales each."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        for w in (w1, w3, w2):
-            packed, scale = pack_fp4_from_f32(w)
-            f.write(packed)
-            f.write(scale)
+    for w in (w1, w3, w2):
+        packed, scale = pack_fp4_from_f32(w)
+        f.write(packed)
+        f.write(scale)
 
 
-def repack_expert_bin(sections, path: Path):
+def append_repacked_expert(sections, f):
     """Real path: write already-mxfp4 (packed, scale) pairs straight through."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        for packed, scale in sections:
-            f.write(np.ascontiguousarray(packed, dtype=np.uint8).tobytes())
-            f.write(np.ascontiguousarray(scale, dtype=np.uint8).tobytes())
+    for packed, scale in sections:
+        f.write(np.ascontiguousarray(packed, dtype=np.uint8).tobytes())
+        f.write(np.ascontiguousarray(scale, dtype=np.uint8).tobytes())
 
 
 # --------------------------------------------------------------------------
@@ -285,10 +289,12 @@ def export_tiny(out: Path):
                       "routed_expert_down_proj", "routed_expert_up_proj",
                       "routed_expert_norm", "shared_w1", "shared_w3", "shared_w2"):
                 flat[f"moe.{k}"] = moe[k].contiguous()
-            edir = out / "experts" / f"layer_{i:02d}"
-            for e, ew in enumerate(moe["experts"]):
-                export_expert_bin(ew["w1"].numpy(), ew["w3"].numpy(),
-                                  ew["w2"].numpy(), edir / f"expert_{e:03d}.bin")
+            edir = out / "experts"
+            edir.mkdir(parents=True, exist_ok=True)
+            with open(edir / f"layer_{i:02d}.bin", "wb") as ef:
+                for ew in moe["experts"]:
+                    append_expert_bin(ew["w1"].numpy(), ew["w3"].numpy(),
+                                      ew["w2"].numpy(), ef)
         (out / "shells").mkdir(parents=True, exist_ok=True)
         save_file(flat, str(out / "shells" / f"layer_{i:02d}.safetensors"))
 
@@ -437,18 +443,23 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
 
         # routed experts: already mxfp4 -> repack the packed/scale pairs as-is
         if li >= cfg["first_k_dense_replace"]:
-            edir = out / "experts" / f"layer_{li:02d}"
+            edir = out / "experts"
+            edir.mkdir(parents=True, exist_ok=True)
             eb = f"{base}block_sparse_moe.experts."
-            for e in range(cfg["num_experts"]):
-                sections = []
-                for w in ("w1", "w3", "w2"):
-                    packed = src.get(f"{eb}{e}.{w}.weight_packed")
-                    scale = src.get(f"{eb}{e}.{w}.weight_scale")
-                    sections.append((
-                        packed.view(torch.uint8).numpy(),
-                        scale.view(torch.uint8).numpy(),
-                    ))
-                repack_expert_bin(sections, edir / f"expert_{e:03d}.bin")
+            tmp = edir / f"layer_{li:02d}.bin.part"
+            with open(tmp, "wb") as ef:
+                for e in range(cfg["num_experts"]):
+                    sections = []
+                    for w in ("w1", "w3", "w2"):
+                        packed = src.get(f"{eb}{e}.{w}.weight_packed")
+                        scale = src.get(f"{eb}{e}.{w}.weight_scale")
+                        sections.append((
+                            packed.view(torch.uint8).numpy(),
+                            scale.view(torch.uint8).numpy(),
+                        ))
+                    append_repacked_expert(sections, ef)
+            # rename only once complete, so a killed run never leaves a short bin
+            tmp.rename(edir / f"layer_{li:02d}.bin")
         marker.write_text("ok\n")
         print(f"[layer {li:02d}/{n - 1}] {'kda' if li in kda else 'mla'} done", flush=True)
 

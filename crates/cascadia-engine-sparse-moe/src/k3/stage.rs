@@ -16,8 +16,10 @@ use crate::dsv4::math::{linear_bf16_w, rmsnorm};
 use crate::dsv4::stage::even_layer_split;
 use crate::k3::attn_res::apply_attn_res;
 use crate::k3::loader::{load_embed, load_head, load_layers, K3Head, K3LoadError, K3Manifest};
-use crate::k3::model::{blocks_at, forward_slice, max_blocks, K3Dims, K3Layer, LayerState};
-use crate::k3::moe::FlatExperts;
+use crate::k3::model::{
+    blocks_at, forward_slice, forward_slice_batch, max_blocks, K3Dims, K3Layer, LayerState,
+};
+use crate::k3::moe::MmapExperts;
 use crate::staged::StagedRunner;
 
 /// Default context budget when `CASCADIA_K3_MAX_SEQ` is unset. K3's
@@ -28,7 +30,7 @@ pub const K3_DEFAULT_MAX_SEQ: usize = 4096;
 pub struct K3Runner {
     m: K3Manifest,
     d: K3Dims,
-    layers: Vec<K3Layer<FlatExperts>>,
+    layers: Vec<K3Layer<MmapExperts>>,
     states: Vec<LayerState>,
     embed: Option<Vec<f32>>,
     head: Option<K3Head>,
@@ -136,6 +138,50 @@ impl StagedRunner for K3Runner {
             nb,
         );
         w
+    }
+
+    /// Batch-union prefill is mandatory at K3's scale, not an optimisation:
+    /// per-token prefill re-streams the whole active expert set at every
+    /// position, which at realistic residency is tens of TB for a few-thousand
+    /// token prompt.
+    fn supports_batched_prefill(&self) -> bool {
+        true
+    }
+
+    fn forward_layers_batch(&mut self, hidden: Vec<f32>, _base: usize, rows: usize) -> Vec<f32> {
+        assert_eq!(hidden.len(), rows * self.wire, "k3: bad batch wire width");
+        let h = self.hidden;
+        let mb = self.max_blocks;
+
+        // the wire interleaves [prefix | blocks] per row; the batched layer loop
+        // wants them contiguous, so split into row-major planes and rejoin after
+        let mut prefix = vec![0.0f32; rows * h];
+        let mut blocks = vec![0.0f32; rows * mb * h];
+        for r in 0..rows {
+            let src = r * self.wire;
+            prefix[r * h..(r + 1) * h].copy_from_slice(&hidden[src..src + h]);
+            blocks[r * mb * h..(r + 1) * mb * h].copy_from_slice(&hidden[src + h..src + self.wire]);
+        }
+
+        let nb = blocks_at(self.lo, self.m.attn_res_block_size);
+        forward_slice_batch(
+            &mut self.layers,
+            &mut self.states,
+            self.d,
+            &mut prefix,
+            &mut blocks,
+            rows,
+            mb,
+            nb,
+        );
+
+        let mut out = vec![0.0f32; rows * self.wire];
+        for r in 0..rows {
+            let dst = r * self.wire;
+            out[dst..dst + h].copy_from_slice(&prefix[r * h..(r + 1) * h]);
+            out[dst + h..dst + self.wire].copy_from_slice(&blocks[r * mb * h..(r + 1) * mb * h]);
+        }
+        out
     }
 
     /// Last rank: the model-level AttnRes mixture, final norm, then lm_head.

@@ -92,3 +92,43 @@ fn reset_between_runs_is_clean() {
     let b = run_chain(&dir, 2, &toks);
     assert_eq!(a, b, "two fresh chains must agree");
 }
+
+#[test]
+fn batched_prefill_is_bit_exact_vs_per_token() {
+    let Some(dir) = export_dir() else { return };
+    let toks: Vec<u32> = vec![3, 17, 5, 28, 11, 2, 19];
+
+    // per-token: the default StagedRunner path
+    let mut a = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    a.reset();
+    let w = a.hidden_size();
+    let mut per_token = vec![0.0f32; toks.len() * w];
+    for (pos, &t) in toks.iter().enumerate() {
+        let h = a.embed_token(t);
+        let o = a.forward_layers(h, pos, Some(t));
+        per_token[pos * w..(pos + 1) * w].copy_from_slice(&o);
+    }
+
+    // batched: one call over all rows, batch-union MoE inside
+    let mut b = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    b.reset();
+    assert!(
+        b.supports_batched_prefill(),
+        "k3 must opt into batched prefill"
+    );
+    let mut batch = vec![0.0f32; toks.len() * w];
+    for (r, &t) in toks.iter().enumerate() {
+        batch[r * w..(r + 1) * w].copy_from_slice(&b.embed_token(t));
+    }
+    let batched = b.forward_layers_batch(batch, 0, toks.len());
+
+    assert_eq!(
+        batched, per_token,
+        "batched prefill must be bit-identical to the per-token loop"
+    );
+
+    // and the head must agree on the final row
+    let la = a.head_logits(&per_token[(toks.len() - 1) * w..]);
+    let lb = b.head_logits(&batched[(toks.len() - 1) * w..]);
+    assert_eq!(la, lb, "head logits differ after batched prefill");
+}

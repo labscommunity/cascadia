@@ -22,7 +22,7 @@ use crate::dsv4::math::{linear_bf16_w, rmsnorm, to_bf16};
 use crate::k3::attn::{mla_step, MlaDims, MlaKv, MlaWeights};
 use crate::k3::attn_res::apply_attn_res;
 use crate::k3::kda::{kda_gate, kda_step, l2norm_heads, short_conv};
-use crate::k3::moe::{moe_forward, ExpertSource, MoeDims, MoeWeights};
+use crate::k3::moe::{moe_forward, moe_forward_batch, ExpertSource, MoeDims, MoeWeights};
 use crate::k3::situ::situ;
 
 /// True when `layer` (0-indexed) is a KDA layer.
@@ -312,6 +312,135 @@ pub fn forward_slice<E: ExpertSource>(
 
         for (p, &f) in prefix_sum.iter_mut().zip(ffn_out.iter()) {
             *p = to_bf16(*p + f);
+        }
+    }
+    nb
+}
+
+/// Batched prefill: `rows` contiguous positions through a layer slice.
+///
+/// Attention still runs per position — KDA's recurrence and the MLA KV cache
+/// are both order-dependent — but the MoE is batch-unioned across rows, so each
+/// distinct expert's bytes are touched once per layer instead of once per
+/// token. That is the difference between a long prompt costing one sweep of the
+/// expert set and costing one sweep PER POSITION.
+///
+/// Bit-exact against looping [`forward_slice`] over the same rows.
+///
+/// `prefix`: `[rows * H]`; `blocks`: `[rows * max_blocks * H]`.
+/// Returns the live block count after the slice.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_slice_batch<E: ExpertSource>(
+    layers: &mut [K3Layer<E>],
+    states: &mut [LayerState],
+    d: K3Dims,
+    prefix: &mut [f32],
+    blocks: &mut [f32],
+    rows: usize,
+    maxb: usize,
+    mut nb: usize,
+) -> usize {
+    let h = d.hidden;
+    debug_assert_eq!(prefix.len(), rows * h);
+    debug_assert_eq!(blocks.len(), rows * maxb * h);
+
+    let mut buf = vec![0.0f32; rows * h];
+    let mut attn_out = vec![0.0f32; rows * h];
+    let mut ffn_out = vec![0.0f32; rows * h];
+    let mut one = vec![0.0f32; h];
+
+    for (layer, state) in layers.iter_mut().zip(states.iter_mut()) {
+        // pre-attention mixture, per row
+        for r in 0..rows {
+            let ps = &prefix[r * h..(r + 1) * h];
+            if nb > 0 {
+                let br = &blocks[r * maxb * h..r * maxb * h + nb * h];
+                apply_attn_res(
+                    ps,
+                    br,
+                    &layer.attn_res_proj,
+                    &layer.attn_res_norm,
+                    d.eps,
+                    &mut one,
+                );
+                buf[r * h..(r + 1) * h].copy_from_slice(&one);
+            } else {
+                buf[r * h..(r + 1) * h].copy_from_slice(ps);
+            }
+        }
+
+        let mut carry = true;
+        if layer.idx % d.block_size == 0 {
+            for r in 0..rows {
+                let dst = r * maxb * h + nb * h;
+                blocks[dst..dst + h].copy_from_slice(&prefix[r * h..(r + 1) * h]);
+            }
+            nb += 1;
+            carry = false;
+        }
+
+        // attention: strictly per position, in order
+        for r in 0..rows {
+            one.copy_from_slice(&buf[r * h..(r + 1) * h]);
+            rmsnorm(&mut one, &layer.input_layernorm, d.eps);
+            let dst = &mut attn_out[r * h..(r + 1) * h];
+            match (&mut layer.attn, &mut *state) {
+                (LayerAttn::Kda(w, kd), LayerState::Kda(st)) => {
+                    kda_layer_step(&one, w, *kd, st, dst)
+                }
+                (LayerAttn::Mla(w, md), LayerState::Mla(kv)) => mla_step(&one, w, *md, kv, dst),
+                _ => panic!("k3: layer {} attention/state kind mismatch", layer.idx),
+            }
+        }
+
+        for r in 0..rows {
+            let (ps, ao) = (r * h, r * h);
+            if carry {
+                for i in 0..h {
+                    prefix[ps + i] = to_bf16(prefix[ps + i] + attn_out[ao + i]);
+                }
+            } else {
+                prefix[ps..ps + h].copy_from_slice(&attn_out[ao..ao + h]);
+            }
+        }
+
+        // pre-FFN mixture, per row
+        for r in 0..rows {
+            let ps = &prefix[r * h..(r + 1) * h];
+            let br = &blocks[r * maxb * h..r * maxb * h + nb * h];
+            apply_attn_res(
+                ps,
+                br,
+                &layer.mlp_res_proj,
+                &layer.mlp_res_norm,
+                d.eps,
+                &mut one,
+            );
+            rmsnorm(&mut one, &layer.post_attention_layernorm, d.eps);
+            buf[r * h..(r + 1) * h].copy_from_slice(&one);
+        }
+
+        match &layer.ffn {
+            LayerFfn::Dense { w1, w3, w2, inter } => {
+                let (mut g, mut u) = (vec![0.0; *inter], vec![0.0; *inter]);
+                let mut hid = vec![0.0; *inter];
+                for r in 0..rows {
+                    let x = &buf[r * h..(r + 1) * h];
+                    linear_bf16_w(x, w1, *inter, h, &mut g);
+                    linear_bf16_w(x, w3, *inter, h, &mut u);
+                    situ(&g, &u, &mut hid, d.situ_beta, d.situ_linear_beta);
+                    for v in hid.iter_mut() {
+                        *v = to_bf16(*v);
+                    }
+                    linear_bf16_w(&hid, w2, h, *inter, &mut ffn_out[r * h..(r + 1) * h]);
+                }
+            }
+            // the win: each distinct expert loaded once for the whole batch
+            LayerFfn::Moe(w, md, ex) => moe_forward_batch(&buf, w, *md, ex, rows, &mut ffn_out),
+        }
+
+        for i in 0..rows * h {
+            prefix[i] = to_bf16(prefix[i] + ffn_out[i]);
         }
     }
     nb

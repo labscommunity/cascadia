@@ -54,6 +54,8 @@ pub trait ExpertSource {
 }
 
 /// A flat in-memory expert set — `n_experts * expert_bytes(latent, inter)`.
+/// Fine for tests and tiny models; a real layer is ~15.7 GB, so the runtime
+/// uses [`MmapExperts`] instead.
 pub struct FlatExperts {
     pub data: Vec<u8>,
     pub stride: usize,
@@ -62,6 +64,63 @@ pub struct FlatExperts {
 impl ExpertSource for FlatExperts {
     fn expert_bytes(&self, expert: usize) -> &[u8] {
         &self.data[expert * self.stride..(expert + 1) * self.stride]
+    }
+}
+
+/// One layer's experts, memory-mapped and demand-paged by the OS.
+///
+/// This is the only viable form at real scale: a layer holds 896 experts of
+/// ~17.5 MB (~15.7 GB), and the full model is ~1.45 TB — far past what can be
+/// read into RAM. Mapping lets the page cache hold whatever fits and stream the
+/// rest from NVMe, which is also what makes throughput residency-bound rather
+/// than compute-bound.
+///
+/// One mapping per LAYER, not per expert: 896 x 92 per-expert mappings would
+/// exceed Linux's default `vm.max_map_count` (65,530) outright.
+pub struct MmapExperts {
+    mmap: memmap2::Mmap,
+    stride: usize,
+    n: usize,
+}
+
+impl MmapExperts {
+    /// Map `path`, which must hold exactly `n * stride` bytes.
+    pub fn open(path: &std::path::Path, stride: usize, n: usize) -> std::io::Result<Self> {
+        let f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len() as usize;
+        if len != n * stride {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: expected {} bytes ({n} experts x {stride}), got {len}",
+                    path.display(),
+                    n * stride
+                ),
+            ));
+        }
+        // SAFETY: the file is opened read-only and the mapping is never written.
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        Ok(Self { mmap, stride, n })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Bytes this layer streams if nothing is resident — the per-token IO floor
+    /// when every routed expert misses the page cache.
+    pub fn bytes(&self) -> usize {
+        self.n * self.stride
+    }
+}
+
+impl ExpertSource for MmapExperts {
+    fn expert_bytes(&self, expert: usize) -> &[u8] {
+        &self.mmap[expert * self.stride..(expert + 1) * self.stride]
     }
 }
 
@@ -146,6 +205,121 @@ pub fn moe_forward<E: ExpertSource>(
     }
 }
 
+/// Batch-union MoE: `rows` tokens through the block, loading each distinct
+/// expert's bytes ONCE instead of once per row.
+///
+/// This is what makes prefill affordable. Per-token prefill re-streams the full
+/// active set at every position — at low residency a few-thousand-token prompt
+/// reads tens of TB. A batched pass touches each expert once, so a long prompt
+/// costs about one sweep of the layer's expert set.
+///
+/// Bit-exact against looping [`moe_forward`]: each expert's contribution is
+/// staged at its gate slot and the slots are summed in GATE order, because
+/// float addition is not associative and expert-id order would reassociate it.
+///
+/// `xs`, `outs`: `[rows * hidden]`.
+pub fn moe_forward_batch<E: ExpertSource>(
+    xs: &[f32],
+    w: &MoeWeights,
+    d: MoeDims,
+    experts: &E,
+    rows: usize,
+    outs: &mut [f32],
+) {
+    debug_assert_eq!(xs.len(), rows * d.hidden);
+    debug_assert_eq!(outs.len(), rows * d.hidden);
+
+    // gate every row, and down-project every row into the latent
+    let mut sel = Vec::with_capacity(rows);
+    let mut lat = vec![0.0f32; rows * d.latent];
+    let mut logits = vec![0.0f32; d.n_experts];
+    for r in 0..rows {
+        let x = &xs[r * d.hidden..(r + 1) * d.hidden];
+        for (lg, row) in logits.iter_mut().zip(w.gate.chunks_exact(d.hidden)) {
+            *lg = row.iter().zip(x).map(|(&a, &b)| a * b).sum();
+        }
+        sel.push(moe_gate(
+            &logits,
+            &w.e_score_correction_bias,
+            d.top_k,
+            d.scale,
+            d.renormalize,
+        ));
+        linear_bf16_w(
+            x,
+            &w.down_proj,
+            d.latent,
+            d.hidden,
+            &mut lat[r * d.latent..(r + 1) * d.latent],
+        );
+    }
+
+    // invert the selection: expert -> the (row, slot) pairs that chose it
+    let mut want: Vec<Vec<(usize, usize)>> = vec![Vec::new(); d.n_experts];
+    for (r, s) in sel.iter().enumerate() {
+        for (k, &e) in s.idx.iter().enumerate() {
+            want[e as usize].push((r, k));
+        }
+    }
+
+    // one pass per distinct expert; stage results at their gate slots
+    let mut slots = vec![0.0f32; rows * d.top_k * d.latent];
+    let mut eo = vec![0.0f32; d.latent];
+    for (e, hits) in want.iter().enumerate() {
+        if hits.is_empty() {
+            continue;
+        }
+        let bytes = experts.expert_bytes(e);
+        for &(r, k) in hits {
+            fp4_expert_forward(bytes, &lat[r * d.latent..(r + 1) * d.latent], d, &mut eo);
+            let base = (r * d.top_k + k) * d.latent;
+            slots[base..base + d.latent].copy_from_slice(&eo);
+        }
+    }
+
+    // reduce in gate order, then norm / up-proj / shared per row
+    let mut acc = vec![0.0f32; d.latent];
+    let si = d.inter * d.n_shared;
+    let (mut g, mut u, mut hid, mut sh) = (
+        vec![0.0f32; si],
+        vec![0.0f32; si],
+        vec![0.0f32; si],
+        vec![0.0f32; d.hidden],
+    );
+    for r in 0..rows {
+        acc.fill(0.0);
+        for k in 0..d.top_k {
+            let wt = sel[r].weight[k];
+            let base = (r * d.top_k + k) * d.latent;
+            for (a, &v) in acc.iter_mut().zip(&slots[base..base + d.latent]) {
+                *a += wt * v;
+            }
+        }
+        for v in acc.iter_mut() {
+            *v = to_bf16(*v);
+        }
+        if d.use_norm {
+            rmsnorm(&mut acc, &w.norm, d.eps);
+        }
+        let out = &mut outs[r * d.hidden..(r + 1) * d.hidden];
+        linear_bf16_w(&acc, &w.up_proj, d.hidden, d.latent, out);
+
+        if d.n_shared > 0 {
+            let x = &xs[r * d.hidden..(r + 1) * d.hidden];
+            linear_bf16_w(x, &w.shared_w1, si, d.hidden, &mut g);
+            linear_bf16_w(x, &w.shared_w3, si, d.hidden, &mut u);
+            situ(&g, &u, &mut hid, d.situ_beta, d.situ_linear_beta);
+            for v in hid.iter_mut() {
+                *v = to_bf16(*v);
+            }
+            linear_bf16_w(&hid, &w.shared_w2, d.hidden, si, &mut sh);
+            for (o, &v) in out.iter_mut().zip(sh.iter()) {
+                *o = to_bf16(*o + v);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +385,67 @@ mod tests {
             }
         }
         FlatExperts { data, stride }
+    }
+
+    /// Counts how many times each expert's bytes are fetched.
+    struct Counting {
+        inner: FlatExperts,
+        hits: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl ExpertSource for Counting {
+        fn expert_bytes(&self, expert: usize) -> &[u8] {
+            self.hits.borrow_mut()[expert] += 1;
+            self.inner.expert_bytes(expert)
+        }
+    }
+
+    #[test]
+    fn batch_union_loads_each_expert_once_and_matches_per_token() {
+        let d = dims();
+        let w = weights(d);
+        let rows = 8usize;
+        let xs: Vec<f32> = (0..rows * d.hidden)
+            .map(|i| ((i as f32) * 0.19).cos())
+            .collect();
+
+        // per-token reference
+        let ex = experts(d);
+        let mut want = vec![0.0f32; rows * d.hidden];
+        for r in 0..rows {
+            moe_forward(
+                &xs[r * d.hidden..(r + 1) * d.hidden],
+                &w,
+                d,
+                &ex,
+                &mut want[r * d.hidden..(r + 1) * d.hidden],
+            );
+        }
+
+        // batched, counting fetches
+        let c = Counting {
+            inner: experts(d),
+            hits: std::cell::RefCell::new(vec![0; d.n_experts]),
+        };
+        let mut got = vec![0.0f32; rows * d.hidden];
+        moe_forward_batch(&xs, &w, d, &c, rows, &mut got);
+
+        assert_eq!(got, want, "batch-union must be bit-exact vs per-token");
+
+        let hits = c.hits.borrow();
+        let touched = hits.iter().filter(|&&h| h > 0).count();
+        // each DISTINCT expert is fetched exactly once, however many rows chose it
+        assert!(
+            hits.iter().all(|&h| h <= 1),
+            "an expert was fetched more than once: {hits:?}"
+        );
+        // and per-token would have fetched rows * top_k times in total
+        assert!(
+            touched <= d.n_experts && touched < rows * d.top_k,
+            "no dedup: touched {touched} of {} experts for {} per-token fetches",
+            d.n_experts,
+            rows * d.top_k
+        );
     }
 
     #[test]
