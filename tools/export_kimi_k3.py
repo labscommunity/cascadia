@@ -267,10 +267,16 @@ def export_tiny(out: Path):
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(cfg, out)
 
-    save_file({"embed": w["embed"].contiguous()}, str(out / "embed.safetensors"))
+    # Store the big matrices bf16, matching the real export, so the loader's
+    # BF16 decode path is covered by the tiny fixtures. tiny_weights are already
+    # bf16-rounded, so nothing is lost.
+    def bf(t):
+        return t.to(torch.bfloat16).contiguous()
+
+    save_file({"embed": bf(w["embed"])}, str(out / "embed.safetensors"))
     save_file({
         "norm": w["norm"].contiguous(),
-        "lm_head": w["lm_head"].contiguous(),
+        "lm_head": bf(w["lm_head"]),
         "output_attn_res_proj": w["output_attn_res_proj"].contiguous(),
         "output_attn_res_norm": w["output_attn_res_norm"].contiguous(),
     }, str(out / "head.safetensors"))
@@ -282,13 +288,15 @@ def export_tiny(out: Path):
                 continue
             flat[k] = v.contiguous()
         for k, v in lw["attn"].items():
-            flat[f"attn.{k}"] = v.contiguous()
+            # norms / A_log / dt_bias stay f32, as they do in the checkpoint
+            flat[f"attn.{k}"] = v.contiguous() if v.ndim <= 1 else bf(v)
         if "moe" in lw:
             moe = lw["moe"]
             for k in ("gate_weight", "e_score_correction_bias",
                       "routed_expert_down_proj", "routed_expert_up_proj",
                       "routed_expert_norm", "shared_w1", "shared_w3", "shared_w2"):
-                flat[f"moe.{k}"] = moe[k].contiguous()
+                v = moe[k]
+                flat[f"moe.{k}"] = v.contiguous() if v.ndim <= 1 else bf(v)
             edir = out / "experts"
             edir.mkdir(parents=True, exist_ok=True)
             with open(edir / f"layer_{i:02d}.bin", "wb") as ef:
@@ -395,9 +403,6 @@ class CkptSource:
         self._handles.clear()
 
 
-def _f32(t) -> np.ndarray:
-    return t.to(torch.float32).numpy()
-
 
 # Serving sidecars copied verbatim beside the weights, so an export is
 # self-contained and a node never has to re-fetch from the hub.
@@ -449,15 +454,18 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
     kda = set(cfg["kda_layers"])
     (out / "shells").mkdir(parents=True, exist_ok=True)
 
-    # embed + head
+    # embed + head. Dtypes are PRESERVED, not upcast: the source matrices are
+    # already bf16 and the shell stores bf16, so widening to f32 would double
+    # ~114 GB of shell for nothing — and push the export past the disk it has to
+    # fit in. Norms / A_log / dt_bias stay f32 because that is how they ship.
     if not (out / ".head.done").exists():
-        save_file({"embed": src.get(PREFIX + "embed_tokens.weight").to(torch.float32)},
+        save_file({"embed": src.get(PREFIX + "embed_tokens.weight").contiguous()},
                   str(out / "embed.safetensors"))
         save_file({
-            "norm": src.get(PREFIX + "norm.weight").to(torch.float32),
-            "lm_head": src.get(LM_HEAD).to(torch.float32),
-            "output_attn_res_proj": src.get(PREFIX + "output_attn_res_proj.weight").to(torch.float32),
-            "output_attn_res_norm": src.get(PREFIX + "output_attn_res_norm.weight").to(torch.float32),
+            "norm": src.get(PREFIX + "norm.weight").contiguous(),
+            "lm_head": src.get(LM_HEAD).contiguous(),
+            "output_attn_res_proj": src.get(PREFIX + "output_attn_res_proj.weight").contiguous(),
+            "output_attn_res_norm": src.get(PREFIX + "output_attn_res_norm.weight").contiguous(),
         }, str(out / "head.safetensors"))
         (out / ".head.done").write_text("ok\n")
         print("[head] embed + head written", flush=True)
@@ -473,7 +481,7 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
         table.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
 
         for suffix, key in table.items():
-            t = src.get(base + suffix).to(torch.float32)
+            t = src.get(base + suffix)
             # conv1d ships as [D, 1, K] (depthwise); the shell wants [D, K]
             if key.endswith("_conv1d") and t.dim() == 3:
                 t = t.squeeze(1)
