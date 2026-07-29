@@ -1024,6 +1024,15 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
 /// ignored for the chosen engine/device, so an ineffective flag is visible at
 /// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
 /// warning in `build_builder`'s sparse-moe arm).
+/// `--cb` targeting the CPU plugin specifically.
+///
+/// Deliberately an exact match rather than a prefix: `AUTO`/`HETERO` strings
+/// that may resolve to CPU are not flagged, because we cannot tell at
+/// parse time what the plugin will pick.
+fn cb_on_plain_cpu(args: &WorkerArgs) -> bool {
+    args.cb && args.device.trim().eq_ignore_ascii_case("CPU")
+}
+
 fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
     // NPU LLM knobs apply only to ov-genai on an NPU device (see
     // `ov_perf_properties`). If the user set one but that gate won't fire, the
@@ -1049,6 +1058,24 @@ fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
         tracing::warn!(
             "ignoring --ov-* performance flags: the qwen36-moe engine compiles \
              with a fixed plugin config and does not apply them"
+        );
+    }
+
+    // --cb on CPU is a narrow win and has a severe failure mode. Measured on
+    // Lunar Lake across Phi-3.5-mini and Qwen3-8B: short prompts at concurrency
+    // gain 1.6-2.1x, but a ~1200-token prompt collapses to ~0.2x — a five-fold
+    // loss, on both models, and NOT recoverable by raising
+    // --cb-max-batched-tokens (which does help on GPU). Nothing in the output
+    // says why, so an operator serving RAG-style traffic from a CPU worker
+    // would just see it get slower. Warn rather than reject: CPU + short
+    // prompts is a legitimate configuration.
+    if cb_on_plain_cpu(args) {
+        tracing::warn!(
+            device = %args.device,
+            "--cb on CPU only pays off for short prompts under concurrency; \
+             long-context workloads measure ~5x SLOWER than without --cb, and \
+             --cb-max-batched-tokens does not recover it. Benchmark your own \
+             prompt shape — see docs/engines/ov-genai.md"
         );
     }
 }
@@ -2344,6 +2371,33 @@ mod python_tests {
         a.cb_cache_size = 4;
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains("--cb"), "{err}");
+    }
+
+    /// The CPU long-prompt collapse is a documented hazard with no runtime
+    /// signal of its own, so the worker says something at startup. Warn, not
+    /// reject — CPU with short prompts is a real 1.6-2.1x win.
+    #[test]
+    fn cb_on_cpu_is_flagged_but_gpu_and_npu_are_not() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        for (device, want) in [
+            ("CPU", true),
+            ("cpu", true),
+            (" CPU ", true),
+            ("GPU", false),
+            ("GPU.0", false),
+            ("NPU", false),
+            // Compound strings may resolve to CPU at runtime; we cannot know.
+            ("AUTO", false),
+            ("HETERO:CPU,GPU", false),
+        ] {
+            a.device = device.to_string();
+            assert_eq!(cb_on_plain_cpu(&a), want, "device={device}");
+        }
+        // Without --cb there is nothing to warn about.
+        a.cb = false;
+        a.device = "CPU".to_string();
+        assert!(!cb_on_plain_cpu(&a));
     }
 
     /// `--cb` on an NPU device is rejected up front. The docs say paged
