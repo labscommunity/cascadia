@@ -3,11 +3,18 @@
 Moonshot **Kimi-K3** (`moonshotai/Kimi-K3`, ~2.8T MoE, 1M ctx) analysed against the
 `cascadia-engine-sparse-moe` engine.
 
-**Status: implemented, not yet run on real weights.** The shell
-(`crates/cascadia-engine-sparse-moe/src/k3/`), the exporter
-(`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`) are
-complete and golden-tested; `{1,2,3,4,6}`-rank pipelines are bit-identical to a
-single process. What remains is the real 1.56 TB export and bring-up.
+**Status: running on real weights.** The full 1.56 TB export is built and
+verified, and the model generates correct text — `"The capital of France is"` ->
+`" Paris. The E"`. The shell (`crates/cascadia-engine-sparse-moe/src/k3/`), the
+exporter (`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`)
+are golden-tested, and `{1,2,3,4,6}`-rank pipelines are bit-identical to a single
+process.
+
+What remains is throughput, not correctness. Decode is dominated by fetching
+expert weights; see [Measured on that host](#measured-on-that-host) for the real
+numbers and [Where the remaining speed is](#where-the-remaining-speed-is) for what
+is left. Multi-rank has only ever been exercised in-process — the layer split is
+bit-identical, but K3 over the network transport is untested.
 
 K3 **does** run on the 4× 32 GB AI-PC fleet that dsv4 and glm5 target: the bf16
 shell is ~29 GB per node of 32, and the routed experts stream from NVMe as
@@ -241,6 +248,38 @@ shell validated against a Python CPU reference, not OpenVINO-traced graphs.
 
 The export and first-token bring-up are done — see the measured run above.
 
+### Devices: CPU, iGPU, NPU — measured, not assumed
+
+Benchmarked on a Core Ultra 7 258V AI-PC (Arc 140V iGPU, AI Boost NPU) with a 4-bit
+decompress+MatMul at K3's real expert dims, via OpenVINO. GFLOP/s:
+
+```
+w1/w3 [3072,3584]
+ batch    CPU     GPU     NPU
+     1  293.1   125.7    18.9      decode  -> CPU wins 2.3x
+     8  871.6   496.7    73.1      CPU still wins
+    32 1019.0  1799.2   288.9      prefill -> GPU wins 1.8x
+```
+
+**Decode belongs on the CPU.** At batch 1 the iGPU cannot fill its occupancy on a
+single-row GEMV. Note this is NOT the shared-bus explanation that has been passed
+around: at batch 1 the CPU moves 82 GB/s and the GPU 35 GB/s, both far below the
+~137 GB/s bus, so bandwidth is not the limiter for either. The conclusion (use the
+CPU) was right; the reason usually given for it is not.
+
+**Prefill is a real iGPU opportunity.** The crossover lands by batch 32, and prefill
+is minutes of first-token latency on this model. Unbuilt.
+
+**The NPU is out.** 15x slower than CPU at batch 1 and still 3.5x slower at batch
+32, before accounting for the static-shape work needed to compile a dynamic MoE at
+all. Not worth pursuing.
+
+**CPU compute is not free once I/O is fixed.** fp4 weights give ~3.8 flop/byte,
+above this machine's ~1.5 flop/byte balance, so a resident deployment is compute
+bound rather than bandwidth bound. That is why `expert_fp4.rs` has an AVX2 path:
+the AI-PCs have no AVX-512, so every AVX-512 kernel in the tree falls back to
+scalar there.
+
 ### Where the remaining speed is
 
 Decode is 99% expert I/O, so every worthwhile change is an I/O change. Ranked by
@@ -248,8 +287,10 @@ measured impact rather than by how interesting the code is:
 
 | | Status | Expected |
 |---|---|---|
-| `madvise(MADV_RANDOM)` on expert maps | done | removes the ~4x readahead over-fetch |
-| autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | mlock the hot set; free to measure |
+| `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
+| AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
+| `madvise(MADV_RANDOM)` | **off by default** | cut amplification 4x -> 1x but killed intra-slice readahead: 133 -> 23 MB/s, a net loss on rotational disk. `CASCADIA_K3_RANDOM=1` to re-test on NVMe, where the seek penalty that sank it does not exist |
+| autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
 | prefix cache | trait defaults, not implemented | a repeated prompt re-pays ~129 GB of prefill |
 | lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
