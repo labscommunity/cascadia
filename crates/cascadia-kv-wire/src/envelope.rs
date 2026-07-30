@@ -67,7 +67,18 @@ pub enum KvMessage {
         epoch: u64,
         ok: bool,
     },
-    /// Head→rank-N: drop the armed warm-resume for `epoch`, go cold.
+    /// Head→rank-N: COMMIT the staged warm-resume for `epoch` — apply it to the engine.
+    ///
+    /// Two-phase on purpose. The trigger only STAGES the pulled slice (it lands in the engine's
+    /// capture cache and touches no engine state); the head sends this only once every rank has
+    /// confirmed. Applying inside the trigger made the "all-or-nothing" verdict a lie: a rank that
+    /// applied and then lost/late-delivered its Confirm stayed warm while the head went cold, and its
+    /// stale arm corrupted the head's cold reprefill or the next request entirely. Staging is
+    /// side-effect-free, so a rank that is never committed simply ages out of the capture cache.
+    WarmResumeCommit {
+        epoch: u64,
+    },
+    /// Head→rank-N: drop the staged/armed warm-resume for `epoch`, go cold.
     WarmResumeAbort {
         epoch: u64,
     },
@@ -114,6 +125,7 @@ mod tests {
                 epoch: 42,
                 ok: true,
             },
+            KvMessage::WarmResumeCommit { epoch: 41 },
             KvMessage::WarmResumeAbort { epoch: 42 },
         ];
         for m in msgs {
