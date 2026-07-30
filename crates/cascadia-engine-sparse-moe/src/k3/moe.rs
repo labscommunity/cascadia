@@ -112,11 +112,18 @@ impl MmapExperts {
         }
         // SAFETY: the file is opened read-only and the mapping is never written.
         let mmap = unsafe { memmap2::Mmap::map(&f)? };
-        // Routed-expert access is random: 16 scattered slices out of `n`. Left to
-        // its sequential-readahead default the kernel fetches far past each slice
-        // (measured ~4x the bytes actually used). `CASCADIA_K3_READAHEAD=1` keeps
-        // the default, for A/B measurement.
-        if std::env::var("CASCADIA_K3_READAHEAD").as_deref() != Ok("1") {
+        // MADV_RANDOM is OFF by default because it MEASURED AS A NET LOSS.
+        //
+        // It does what it promises — expert read amplification fell from ~4x to
+        // ~1x — but it also kills the readahead *within* each 17.6 MB expert
+        // slice, which is contiguous and wants a large sequential transfer. On
+        // the 7200 RPM host, throughput collapsed 133 -> 23 MB/s: 4x fewer bytes
+        // fetched 5.8x more slowly. MADV_WILLNEED (below, on by default) gets the
+        // byte reduction AND keeps the large transfers, which is why it wins.
+        //
+        // Kept behind `CASCADIA_K3_RANDOM=1` because the trade may invert on a
+        // drive with no seek penalty.
+        if std::env::var("CASCADIA_K3_RANDOM").as_deref() == Ok("1") {
             crate::k3::residency::advise_random(mmap.as_ptr() as usize, mmap.len());
         }
         Ok(Self { mmap, stride, n })

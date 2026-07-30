@@ -198,6 +198,27 @@ pub fn pin_range(addr: usize, len: usize) -> bool {
     }
 }
 
+/// Round a byte range out to whole pages.
+///
+/// `madvise` on Linux rejects a non-page-aligned address with EINVAL, while
+/// macOS quietly accepts it — so an unaligned call is a hint that silently does
+/// nothing on the platform we actually deploy to. K3's expert stride happens to
+/// be 4284 pages exactly, so today every expert offset is aligned by luck; a
+/// change to moe_intermediate_size or the group size would break that with no
+/// error, just the speedup gone. Aligning here removes the landmine.
+#[cfg(unix)]
+fn page_range(addr: usize, len: usize) -> (usize, usize) {
+    extern "C" {
+        fn getpagesize() -> i32;
+    }
+    // SAFETY: getpagesize takes no arguments and cannot fail.
+    let ps = unsafe { getpagesize() } as usize;
+    debug_assert!(ps.is_power_of_two());
+    let start = addr & !(ps - 1);
+    let end = (addr + len + ps - 1) & !(ps - 1);
+    (start, end - start)
+}
+
 /// Tell the kernel this mapping is read in random order, disabling readahead.
 ///
 /// An expert is a ~17.6 MB contiguous slice, but the 16 experts a layer routes to
@@ -216,9 +237,10 @@ pub fn advise_random(addr: usize, len: usize) -> bool {
         extern "C" {
             fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         }
-        // SAFETY: [addr, addr+len) is a live mapping owned by the caller. madvise
-        // only changes kernel readahead policy; it never writes to the range.
-        unsafe { madvise(addr as *mut c_void, len, MADV_RANDOM) == 0 }
+        let (a, l) = page_range(addr, len);
+        // SAFETY: [a, a+l) covers the caller's live mapping, rounded out to whole
+        // pages. madvise only changes kernel readahead policy; it never writes.
+        unsafe { madvise(a as *mut c_void, l, MADV_RANDOM) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -245,9 +267,10 @@ pub fn advise_willneed(addr: usize, len: usize) -> bool {
         extern "C" {
             fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         }
-        // SAFETY: [addr, addr+len) is a live mapping owned by the caller. madvise
-        // only starts read-ahead; it never writes to the range.
-        unsafe { madvise(addr as *mut c_void, len, MADV_WILLNEED) == 0 }
+        let (a, l) = page_range(addr, len);
+        // SAFETY: [a, a+l) covers the caller's live mapping, rounded out to whole
+        // pages. madvise only starts read-ahead; it never writes to the range.
+        unsafe { madvise(a as *mut c_void, l, MADV_WILLNEED) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -334,6 +357,21 @@ mod advise_tests {
             super::advise_willneed(addr, len),
             "madvise(MADV_WILLNEED) failed"
         );
+    }
+
+    #[test]
+    fn advise_works_on_a_deliberately_unaligned_address() {
+        // The regression this guards: Linux madvise rejects an unaligned addr
+        // with EINVAL while macOS accepts it, so this only ever failed on the
+        // platform we deploy to.
+        let len = 1 << 20;
+        let mut v = vec![0u8; len];
+        let base = v.as_mut_ptr() as usize;
+        assert!(
+            super::advise_willneed(base + 3, len - 8),
+            "unaligned WILLNEED must still be applied"
+        );
+        assert!(super::advise_random(base + 1, len - 8));
     }
 
     #[test]
