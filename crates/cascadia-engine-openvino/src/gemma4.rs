@@ -763,6 +763,9 @@ impl Gemma4Engine {
     /// Read one frame from upstream, transparently handling any I8 control frame (CAPTURE/RESTORE/
     /// ABORT) and looping until a real (non-control) frame — the position tensor — arrives.
     fn recv_position_or_control(&mut self) -> EngineResult<WireTensor> {
+        // Re-iterates only on the kv_coord control-frame path (I8 → continue); without kv_coord
+        // that branch is compiled out and the body runs exactly once.
+        #[cfg_attr(not(feature = "kv_coord"), allow(clippy::never_loop))]
         loop {
             let upstream = self
                 .upstream
