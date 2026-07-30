@@ -69,7 +69,9 @@ def generate(base, prompt, max_tokens=MAX_TOKENS):
     }
 
 
-def capture(base, label):
+def capture(base, label, solo_only=False):
+    """`solo_only` skips the concurrent pass — needed when the config under test
+    cannot serve concurrent requests (e.g. the non-packed multi-stage path)."""
     rec = {"label": label, "max_tokens": MAX_TOKENS, "solo": {}, "solo2": {}, "batched": {}}
 
     print(f"[{label}] solo pass (1/3)", flush=True)
@@ -79,6 +81,13 @@ def capture(base, label):
     print(f"[{label}] solo repeat pass (2/3) - determinism", flush=True)
     for p in PROMPTS:
         rec["solo2"][p] = generate(base, p)
+
+    if solo_only:
+        rec["batched"] = rec["solo"]
+        with open(f"{label}.json", "w") as fh:
+            json.dump(rec, fh, indent=1)
+        print(f"[{label}] captured (solo only) -> {label}.json")
+        return
 
     print(f"[{label}] batched pass (3/3) - each prompt shares the batch", flush=True)
     for p in PROMPTS:
@@ -155,6 +164,6 @@ def compare(la, lb):
 
 if __name__ == "__main__":
     if sys.argv[1] == "capture":
-        capture(sys.argv[2], sys.argv[3])
+        capture(sys.argv[2], sys.argv[3], solo_only=(len(sys.argv) > 4 and sys.argv[4] == "solo"))
     else:
         compare(sys.argv[2], sys.argv[3])
