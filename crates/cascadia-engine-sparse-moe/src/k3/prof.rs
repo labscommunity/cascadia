@@ -50,6 +50,24 @@ static PAGES_PROBED: AtomicU64 = AtomicU64::new(0);
 static REUSED: AtomicU64 = AtomicU64::new(0);
 static SELECTED: AtomicU64 = AtomicU64::new(0);
 
+/// Snapshots taken at the previous `dump`, so each line reports what THIS token
+/// cost rather than a running average. Reporting cumulative/toks made the first
+/// line include the whole prefill and every later line shrink towards the mean —
+/// per-token figures that fell as decoding progressed and were ~6x the real cost.
+static LAST_NS: [AtomicU64; N] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static LAST_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAST_RESIDENT: AtomicU64 = AtomicU64::new(0);
+static LAST_PROBED: AtomicU64 = AtomicU64::new(0);
+static LAST_REUSED: AtomicU64 = AtomicU64::new(0);
+static LAST_SELECTED: AtomicU64 = AtomicU64::new(0);
+
 fn last_set() -> &'static Mutex<HashSet<(u32, u32)>> {
     static S: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashSet::new()))
@@ -105,41 +123,61 @@ pub fn new_sequence() {
     }
 }
 
-/// Dump cumulative counters. Called once per forwarded token.
+/// Report what the token just decoded cost. Called once per forwarded token.
+///
+/// Every figure is a DELTA since the previous call, not a running average. The
+/// first line therefore also carries the prefill, which is what `(+prefill)`
+/// marks — prefill fetches a distinct expert per row per layer and dwarfs a
+/// single decode step, so folding it into an average is misleading.
 pub fn dump(tag: &str) {
     if !enabled() {
         return;
     }
     let toks = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
-    let wall = NS[WALL].load(Ordering::Relaxed).max(1);
+
+    let mut d_ns = [0u64; N];
+    for i in 0..N {
+        let cur = NS[i].load(Ordering::Relaxed);
+        d_ns[i] = cur.saturating_sub(LAST_NS[i].swap(cur, Ordering::Relaxed));
+    }
+    let wall = d_ns[WALL].max(1);
     let mut split = String::new();
     for i in 0..N {
-        let ns = NS[i].load(Ordering::Relaxed);
         split.push_str(&format!(
             " {}={:.1}ms({:.0}%)",
             NAMES[i],
-            ns as f64 / 1e6 / toks as f64,
-            100.0 * ns as f64 / wall as f64
+            d_ns[i] as f64 / 1e6,
+            100.0 * d_ns[i] as f64 / wall as f64
         ));
     }
 
-    let bytes = ROUTED_BYTES.load(Ordering::Relaxed);
-    let gb_tok = bytes as f64 / 1e9 / toks as f64;
-    let exp_ns = NS[EXPERTS].load(Ordering::Relaxed).max(1);
-    let eff_mbs = bytes as f64 / 1e6 / (exp_ns as f64 / 1e9);
+    let cur_bytes = ROUTED_BYTES.load(Ordering::Relaxed);
+    let d_bytes = cur_bytes.saturating_sub(LAST_BYTES.swap(cur_bytes, Ordering::Relaxed));
+    let gb = d_bytes as f64 / 1e9;
+    let eff_mbs = d_bytes as f64 / 1e6 / (d_ns[EXPERTS].max(1) as f64 / 1e9);
 
-    let probed = PAGES_PROBED.load(Ordering::Relaxed);
-    let hit = if probed > 0 {
-        100.0 * PAGES_RESIDENT.load(Ordering::Relaxed) as f64 / probed as f64
+    let cur_probed = PAGES_PROBED.load(Ordering::Relaxed);
+    let cur_res = PAGES_RESIDENT.load(Ordering::Relaxed);
+    let d_probed = cur_probed.saturating_sub(LAST_PROBED.swap(cur_probed, Ordering::Relaxed));
+    let d_res = cur_res.saturating_sub(LAST_RESIDENT.swap(cur_res, Ordering::Relaxed));
+    let hit = if d_probed > 0 {
+        100.0 * d_res as f64 / d_probed as f64
     } else {
         f64::NAN
     };
-    let sel = SELECTED.load(Ordering::Relaxed).max(1);
-    let reuse = 100.0 * REUSED.load(Ordering::Relaxed) as f64 / sel as f64;
 
+    let cur_sel = SELECTED.load(Ordering::Relaxed);
+    let cur_reu = REUSED.load(Ordering::Relaxed);
+    let d_sel = cur_sel.saturating_sub(LAST_SELECTED.swap(cur_sel, Ordering::Relaxed));
+    let d_reu = cur_reu.saturating_sub(LAST_REUSED.swap(cur_reu, Ordering::Relaxed));
+    let reuse = 100.0 * d_reu as f64 / d_sel.max(1) as f64;
+
+    let note = if toks == 1 { "(+prefill)" } else { "" };
     eprintln!(
-        "K3_PROF [{tag}] tok={toks}{split} | routed={gb_tok:.2}GB/tok \
-         eff={eff_mbs:.0}MB/s hit={hit:.1}% reuse={reuse:.1}%"
+        "K3_PROF [{tag}] tok={toks}{note}{split} | routed={gb:.2}GB \
+         eff={eff_mbs:.0}MB/s hit={hit:.1}% reuse={reuse:.1}% \
+         total={:.1}GB",
+        cur_bytes as f64 / 1e9
     );
 }
 

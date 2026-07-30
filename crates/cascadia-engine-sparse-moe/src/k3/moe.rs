@@ -109,6 +109,13 @@ impl MmapExperts {
         }
         // SAFETY: the file is opened read-only and the mapping is never written.
         let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        // Routed-expert access is random: 16 scattered slices out of `n`. Left to
+        // its sequential-readahead default the kernel fetches far past each slice
+        // (measured ~4x the bytes actually used). `CASCADIA_K3_READAHEAD=1` keeps
+        // the default, for A/B measurement.
+        if std::env::var("CASCADIA_K3_READAHEAD").as_deref() != Ok("1") {
+            crate::k3::residency::advise_random(mmap.as_ptr() as usize, mmap.len());
+        }
         Ok(Self { mmap, stride, n })
     }
 
