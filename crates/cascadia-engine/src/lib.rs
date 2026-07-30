@@ -275,6 +275,22 @@ pub trait KvSnapshotHolder: Send + Sync {
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
 }
 
+/// Issue-34 plane warm-resume: the **hand-off** half, decoupled from the engine lock in the other
+/// direction from [`KvSnapshotHolder`]. The plane's commit path runs while the engine is usually
+/// parked inside `step()` holding the engine mutex, so it cannot reach the engine to apply a pulled
+/// slice — that is the deadlock this exists to avoid. Instead it parks the slice behind this handle's
+/// own lock and the engine drains it from inside its recv loop, before the turn's forward.
+#[cfg(feature = "kv_coord")]
+pub trait KvWarmHandoff: Send + Sync {
+    /// Park a pulled slice for the engine to apply. Never blocks on engine work.
+    fn put(
+        &self,
+        epoch: u64,
+        manifest: cascadia_kv_wire::Manifest,
+        payloads: Vec<(Vec<u8>, Vec<u8>)>,
+    );
+}
+
 pub trait Engine: Send {
     /// One short forward to compile kernels and warm device caches.
     fn warmup(&mut self);
@@ -333,6 +349,13 @@ pub trait Engine: Send {
     /// shares the cache rather than mutating engine state.
     #[cfg(feature = "kv_coord")]
     fn kv_holder(&self) -> Option<std::sync::Arc<dyn KvSnapshotHolder>> {
+        None
+    }
+
+    /// Issue-34 plane warm-resume: the mailbox a plane commit parks a pulled slice in, if this engine
+    /// applies one itself. Default `None`. Grabbed once at engine load, like [`Self::kv_holder`].
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn KvWarmHandoff>> {
         None
     }
 
