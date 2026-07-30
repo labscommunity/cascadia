@@ -133,7 +133,11 @@ bool cpu_has_avx2_fma() {
 }
 
 bool cpu_has_avx_vnni() {
-    static const bool ok = [] {
+    // Explicit `-> bool`: GCC's __builtin_cpu_supports returns int (Clang
+    // returns bool), so a deduced return type collides with the `return false`
+    // above and fails to compile on GCC. Only the #else branch is affected,
+    // and MSVC builds never reach it.
+    static const bool ok = []() -> bool {
         if (!cpu_has_avx2_fma()) return false;
 #if defined(_MSC_VER)
         int r[4] = {0};
