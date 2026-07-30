@@ -1615,7 +1615,9 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         }
     }
 
-    fn abort_warm_resume(&mut self, _epoch: u64) {
+    fn abort_warm_resume(&mut self, epoch: u64) {
+        // Drop a STAGED slice first so a later commit cannot resurrect it.
+        let _ = self.kv.take_capture(epoch);
         // Verdict rejected after this rank applied — rebuild the request to drop the restored state.
         // gemma4 keeps no warm flag, so the rebuild alone returns it to cold; `state_restored` makes
         // the following cold reset upgrade to a rebuild too (this model's reset_state leaves residue).

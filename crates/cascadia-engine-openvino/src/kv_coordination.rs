@@ -663,9 +663,11 @@ impl KvCoordination for OvRuntimeEngine {
         self.apply_warm_resume_blob(&blob)
     }
 
-    fn abort_warm_resume(&mut self, _epoch: u64) {
-        // The head rejected the chain-wide verdict after this rank already applied; drop back to cold
-        // so it cannot serve (or contaminate the next request with) a half-committed warm state.
+    fn abort_warm_resume(&mut self, epoch: u64) {
+        // Two cases, both handled: the slice is still STAGED (trigger ran, no commit) ⇒ drop it from the
+        // capture cache so a later commit can't resurrect it; or it was already APPLIED (legacy/raced
+        // commit) ⇒ scrub the engine back to cold. Safe for an epoch this rank never armed.
+        let _ = self.kv_cache_mut().take_capture(epoch);
         self.abort_warm_resume_local();
     }
 }

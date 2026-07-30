@@ -2181,10 +2181,11 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         }
     }
 
-    fn abort_warm_resume(&mut self, _epoch: u64) {
-        // Verdict rejected after this rank applied — scrub back to cold. `reset_all` is the same
-        // scrub the cold-admit path uses, and `state_restored` makes it upgrade to a request rebuild
-        // (this model's `reset_state` alone leaves residue).
+    fn abort_warm_resume(&mut self, epoch: u64) {
+        // Drop a STAGED slice (trigger ran, no commit) so a later commit can't resurrect it, and scrub
+        // an APPLIED one back to cold. `reset_all` is the same scrub the cold-admit path uses;
+        // `state_restored` upgrades the following reset to a rebuild (reset_state alone leaves residue).
+        let _ = self.kv.take_capture(epoch);
         self.state_restored = true;
         self.reset_all();
     }
