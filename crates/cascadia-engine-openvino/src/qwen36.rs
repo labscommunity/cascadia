@@ -79,6 +79,21 @@ fn selfchk_at() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
+/// `CASCADIA_QWEN36_RESTORE_RESET=1` ⇒ clear state with `reset_state` (VariableState::reset over every
+/// `query_state()` entry) instead of `recreate_request` before `set_state_blob`.
+///
+/// Measured motivation: on the 1-stage whole-model export, capture→`recreate_request`→restore is
+/// bit-identical, but on the sharded **stage-0** export the same round trip perturbs subsequent folds —
+/// which is precisely why single-box certifies 3/3 while 2-stage DIVERGEs. `reset_state` clears variable
+/// state without discarding the InferRequest, so it avoids whatever the rebuild changes.
+///
+/// OFF by default: `recreate_request` is load-bearing. Restoring over LIVE folded state made the model
+/// regurgitate the user prompt, and `reset_state` alone was found not to clear that residue. So this arm
+/// must be validated on BOTH counts — warm==cold *and* no regurgitation — before it can become the default.
+fn restore_reset() -> bool {
+    std::env::var("CASCADIA_QWEN36_RESTORE_RESET").ok().as_deref() == Some("1")
+}
+
 fn prefill_chunk() -> usize {
     if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
         1
@@ -1995,8 +2010,14 @@ impl Qwen36Engine {
             // (see reset_all), and the warm path skips it entirely, so `set_state_blob` here would
             // otherwise apply over the prior turn's live folded state — the resumed continuation then
             // loses context and regurgitates the user prompt (cross-chain DIVERGE). Rebuild first.
-            if let Err(e) = st.recreate_request() {
-                warn!(error = %e, "qwen36: recreate_request before restore failed; cold reprefill");
+            let clear = if restore_reset() {
+                st.reset_state()
+            } else {
+                st.recreate_request()
+            };
+            if let Err(e) = clear {
+                warn!(error = %e, reset = restore_reset(),
+                    "qwen36: pre-restore state clear failed; cold reprefill");
                 self.state_restored = true;
                 return false;
             }
