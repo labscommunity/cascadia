@@ -252,6 +252,19 @@ near-tie, and the five failures are the model's own and identical in both. This
 is the measurement behind "no accuracy loss" — the parity suites above only
 establish equality against a reference, never whether either answer is right.
 
+**Scored long-form accuracy** (7 tasks, 18-110 generated tokens each, scored on
+ORDERED ATOM RECALL so omission, reordering, truncation and repetition loops all
+cost): baseline **89.5%**, packed **89.5%**, delta **+0.0 pts**, identical text
+on 7/7, identical repetition ratio (0.081). At every length with ground truth
+available, packed and baseline agree exactly; the single-token divergences
+appear only in free-form generation at 128 tokens.
+
+One reporting difference remains and is deliberate: packed counts the EOS token
+in `completion_tokens`, the non-packed path does not, so an EOS-terminated
+completion reads +1 against baseline (length-capped completions match exactly).
+Packed's count is the accurate one — every generated token counted once — and
+matches the wider ecosystem; the non-packed path under-reports by one.
+
 **So: treat exact text equality across different packed shapes as unavailable,
 not as a bug.** The properties that must hold, and do, are determinism and
 batch-composition invariance. Magnitude is model-dependent — Llama-3.2-1B

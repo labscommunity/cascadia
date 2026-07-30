@@ -63,6 +63,20 @@ python packed_scored_accuracy.py score sc_base sc_packed
 
 Recorded on NPU: 15/20 both configs, delta +0, identical text on 20/20.
 
+`packed_longform_accuracy.py` covers the regime short answers cannot reach —
+generations of 18-110 tokens scored on **ordered atom recall**, so omission,
+reordering, truncation and repetition loops all cost score:
+
+```bash
+python packed_longform_accuracy.py http://127.0.0.1:18090 lf_base
+python packed_longform_accuracy.py http://127.0.0.1:18090 lf_packed
+python packed_longform_accuracy.py score lf_base lf_packed
+```
+
+Recorded on NPU: 89.5% both, delta +0.0 pts, identical text 7/7. Keep prompt +
+generation inside the per-slot region (255 tokens at 4 slots) or this measures
+context eviction instead of drift.
+
 ## Recorded results (Llama-3.2-1B int4 static, Lunar Lake NPU, OV 2026.2.1)
 
 - determinism 10/10, batch-composition invariance **10/10** (packed and baseline)
