@@ -652,6 +652,9 @@ impl Gemma4Engine {
             // depth. Warm-resume must ship cat(restored_prefix, suffix) — i.e. ctx == full prompt
             // len. If warm ctx == suffix len only, the cross_kv side-output is NOT reading the
             // set_state-restored variable (stale/unfused copy) ⇒ that is the warm≠cold root cause.
+            // `kv_coordination` (and so `fnv1a64`) only exists under the `kv_coord` feature, so this
+            // diagnostic must be gated with it — ungated it broke `cargo check` with default features.
+            #[cfg(feature = "kv_coord")]
             if shape[1] > 1 && oshape.len() == 4 {
                 info!(
                     tag = o.tag,
@@ -871,9 +874,7 @@ impl Gemma4Engine {
                     // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
                     // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
                     // the following cold reset upgrades to a rebuild too.
-                    let _ = self.runtime.recreate_request();
-                    self.state_restored = true;
-                    let set_ok = self.runtime.set_state_blob(&blob).is_ok();
+                    let set_ok = self.restore_blob_clean(&blob);
                     // Issue-34 diag (mirror qwen36 70687b9): does set_state round-trip at the DECLARED
                     // level on THIS device? gemma4's head IR uniquely has cross_kv side-consumers on the
                     // KV concat. Mismatch ⇒ plugin set_state infidelity (mode A); exact ⇒ the warm≠cold
@@ -1494,7 +1495,7 @@ impl Gemma4Engine {
                     true
                 } else {
                     match self.kv.take_capture(epoch) {
-                        Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+                        Some((_, blob)) => self.restore_blob_clean(&blob),
                         None => false,
                     }
                 };
@@ -1537,6 +1538,23 @@ impl Gemma4Engine {
     /// Whether this stage bears any OWN KV: true iff its layer range starts before the own-KV
     /// layers `[0, total_layers - num_kv_shared_layers)`. Dense stages are always true (shared = 0);
     /// gemma4's KV-sharing tail (all own-KV upstream in stage_0) is false.
+    /// `set_state_blob` onto a CLEAN request. gemma4's `reset_state` leaves residue (shim.cpp), so a
+    /// bare set over the prior turn's live state corrupts the warm continuation AND leaks into the next
+    /// cold turn. The head path established this as load-bearing, but the worker RESTORE handler and the
+    /// plane `apply_warm_resume` were doing a bare set — so any non-head rank that bears own KV restored
+    /// over dirty state. Returns false (⇒ that rank votes cold) if the rebuild fails, instead of
+    /// proceeding into exactly the corruption the rebuild exists to prevent.
+    #[cfg(feature = "kv_coord")]
+    fn restore_blob_clean(&mut self, blob: &[u8]) -> bool {
+        if let Err(e) = self.runtime.recreate_request() {
+            warn!(error = %e, "gemma4: recreate_request before restore failed; cold reprefill");
+            self.state_restored = true;
+            return false;
+        }
+        self.state_restored = true;
+        self.runtime.set_state_blob(blob).is_ok()
+    }
+
     fn has_own_kv(&self) -> bool {
         self.spec.layer_start < self.spec.total_layers.saturating_sub(self.num_kv_shared_layers)
     }
@@ -1592,9 +1610,19 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         // re-warms + sets position (idempotent double-set; gemma4 keeps no warm flag). Not on the
         // total=1 path (the head warms its own rank-0 slice via take_warm).
         match self.kv.take_capture(epoch) {
-            Some((_, blob)) => self.runtime.set_state_blob(&blob).is_ok(),
+            Some((_, blob)) => self.restore_blob_clean(&blob),
             None => false,
         }
+    }
+
+    fn abort_warm_resume(&mut self, _epoch: u64) {
+        // Verdict rejected after this rank applied — rebuild the request to drop the restored state.
+        // gemma4 keeps no warm flag, so the rebuild alone returns it to cold; `state_restored` makes
+        // the following cold reset upgrade to a rebuild too (this model's reset_state leaves residue).
+        if let Err(e) = self.runtime.recreate_request() {
+            warn!(error = %e, "gemma4: recreate_request on warm-resume abort failed");
+        }
+        self.state_restored = true;
     }
 
     fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {

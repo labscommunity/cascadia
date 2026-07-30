@@ -1017,7 +1017,15 @@ impl Qwen36Engine {
         // locally, so ship it inline — that rank has no CAPTURE stash for a foreign chain's epoch and
         // would otherwise vote cold, collapsing the all-or-nothing verdict. Empty on the same-chain
         // path (the rank restores from its own stash).
-        let blob = self.kv.take_downstream(kv_epoch).unwrap_or_default();
+        // Take THIS frame's recipient (self.rank + 1), not "whatever was stashed for this epoch":
+        // every rank of one pull shares the content epoch, so an epoch-only take returned the
+        // last-stashed rank's tensors — wrong state for any chain deeper than 2 stages.
+        let down_rank = (self.rank + 1) as u16;
+        let blob = self
+            .kv
+            .take_downstream(kv_epoch, down_rank)
+            .or_else(|| self.kv.take_downstream_single(down_rank))
+            .unwrap_or_default();
         if !blob.is_empty() {
             info!(
                 kv_epoch,
@@ -1135,11 +1143,21 @@ impl Qwen36Engine {
                             // stash for a foreign chain's epoch — and the all-or-nothing check
                             // cold-resets a chain whose rank 0 warmed fine.
                             let local_ok = self.restore_local_stages(&blob);
-                            let chain_ok = local_ok
-                                && (self.plane_restore
-                                    || self
-                                        .forward_restore_downstream(self.epoch, kv_epoch)
-                                        .unwrap_or(false));
+                            // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
+                            // the warm path that advances the downstream ranks' `peer_epoch` (their
+                            // InFrame::Restore sets it) and `self.epoch` was already bumped at
+                            // admission — short-circuiting it left every subsequent FORWARD dropped as
+                            // "stale frame". It is also the real restore on the same-chain path, where
+                            // no plane pull ever armed the downstream ranks.
+                            let chain_ok = local_ok && {
+                                let down = self
+                                    .forward_restore_downstream(self.epoch, kv_epoch)
+                                    .unwrap_or(false);
+                                // Only the verdict is advisory under plane_restore: there the ranks arm
+                                // themselves over the KV plane, so `false` just means "no CAPTURE under
+                                // the donor chain's epoch", which is expected cross-chain.
+                                down || self.plane_restore
+                            };
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                                 // kv_seq_from_framed_blob now ignores the fixed-shape DeltaNet conv/ssm
@@ -2138,7 +2156,7 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
 
     fn stash_downstream_rank(
         &mut self,
-        _rank: u16,
+        rank: u16,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
@@ -2149,7 +2167,7 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         // ranks, so a middle rank has nothing to carry to ITS downstream (3+ stages stay cold).
         let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
-        self.kv.stash_downstream(epoch, blob);
+        self.kv.stash_downstream(epoch, rank, blob);
         Ok(())
     }
 
@@ -2161,6 +2179,14 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
             Some((_, blob)) => self.restore_local_stages(&blob),
             None => false,
         }
+    }
+
+    fn abort_warm_resume(&mut self, _epoch: u64) {
+        // Verdict rejected after this rank applied — scrub back to cold. `reset_all` is the same
+        // scrub the cold-admit path uses, and `state_restored` makes it upgrade to a request rebuild
+        // (this model's `reset_state` alone leaves residue).
+        self.state_restored = true;
+        self.reset_all();
     }
 }
 

@@ -2620,8 +2620,9 @@ impl OvDistSpecEngine {
         // from its own CAPTURE).
         let carried = self
             .kv
-            .take_downstream(epoch)
-            .or_else(|| self.kv.take_downstream_single())
+            // Driver is rank 0 (rank>0 runs the worker engine), so this RESTORE addresses rank 1.
+            .take_downstream(epoch, 1)
+            .or_else(|| self.kv.take_downstream_single(1))
             .unwrap_or_default();
         let ok = self.draft.kv_restore(&parts[0])
             && self.target.stage0_restore(&parts[1])
@@ -2720,13 +2721,13 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
     // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
     fn stash_downstream_rank(
         &mut self,
-        _rank: u16,
+        rank: u16,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
-        self.kv.stash_downstream(epoch, blob);
+        self.kv.stash_downstream(epoch, rank, blob);
         Ok(())
     }
 }
@@ -2851,13 +2852,13 @@ impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
     // the pull votes cold (no hit), and the tail never receives a carried slice. Mirrors ov-runtime/qwen36.
     fn stash_downstream_rank(
         &mut self,
-        _rank: u16,
+        rank: u16,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (_tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
-        self.kv.stash_downstream(epoch, blob);
+        self.kv.stash_downstream(epoch, rank, blob);
         Ok(())
     }
 }

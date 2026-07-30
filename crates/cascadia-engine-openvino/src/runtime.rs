@@ -2100,17 +2100,20 @@ impl OvRuntimeEngine {
                             // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
                             // plane_restore: downstream ranks warm-resume over the KV plane, so skip
                             // the chain RESTORE (multi=false ⇒ chain_ok stays true, no downstream call).
-                            let multi = self.downstream.is_some()
-                                && !self.spec.is_last_stage
-                                && !self.plane_restore;
-                            info!(
-                                plane_restore = self.plane_restore,
-                                "ov_step_first_warm_mode"
-                            );
+                            // `plane_restore` no longer suppresses the RESTORE itself — only its verdict.
+                            // Dropping the frame skipped the SAME-CHAIN restore too (where no plane pull
+                            // ever armed the downstream ranks), leaving head-warm/tail-cold with no
+                            // verdict and no fallback; it also starved the downstream `peer_epoch`.
+                            let multi = self.downstream.is_some() && !self.spec.is_last_stage;
+                            info!(plane_restore = self.plane_restore, "ov_step_first_warm_mode");
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                                 match self.send_restore_downstream(epoch) {
                                     Ok(true) => true,
+                                    // Under plane_restore a false verdict is expected cross-chain (the
+                                    // rank has no CAPTURE for the donor epoch and arms itself over the
+                                    // plane), so do not abort the chain on it.
+                                    _ if self.plane_restore => true,
                                     _ => {
                                         let _ = self.send_abort_downstream();
                                         false
@@ -3806,6 +3809,14 @@ impl OvRuntimeEngine {
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
+    /// Undo a plane arm: identical to the chain `OPCODE_ABORT` handler, which is the established
+    /// rollback for exactly this state. Idempotent — safe when nothing was armed.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn abort_warm_resume_local(&mut self) {
+        let _ = self.runtime.reset_state();
+        self.kv_warm_pending = false;
+        self.position = 0;
+    }
     /// Plane warm-resume (§0(B)): set_state a pulled rank blob directly + arm warm, off the inference
     /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
     #[cfg(feature = "kv_coord")]
@@ -4077,9 +4088,12 @@ impl OvRuntimeEngine {
         // stash/restore epoch-key drift: the head keys the stash by the pulled rank's manifest tokens
         // while restore keys by its own warm prefix; log both so the residual drift is diagnosable
         // (3+-stage needs per-(epoch,rank) keying — follow-up).
-        let carried = self.kv.take_downstream(epoch).or_else(|| {
+        // This engine is the DRIVER, which is rank 0 by construction (rank>0 runs the worker engine),
+        // so the RESTORE it sends always addresses rank 1.
+        let down_rank: u16 = 1;
+        let carried = self.kv.take_downstream(epoch, down_rank).or_else(|| {
             let n = self.kv.downstream_len();
-            let single = self.kv.take_downstream_single();
+            let single = self.kv.take_downstream_single(down_rank);
             warn!(
                 epoch,
                 stashed = n,
