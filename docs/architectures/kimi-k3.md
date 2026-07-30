@@ -136,20 +136,46 @@ root planner holds back the shell bytes on whichever root shares a filesystem
 with `<out>`, plus budgets per filesystem rather than per directory so two roots
 on one mount cannot each claim its free space.
 
-Running there: 172 GB RAM − 113.5 GB shell leaves ~48 GB of page cache against
-1.446 TB of experts, ~4% resident. The storage modules are 7200 RPM HDDs, not
-NVMe, so each 17.6 MB expert read costs ~96 ms (8 ms seek + 88 ms transfer):
+### Measured on that host
+
+The numbers below are from a real run of the full export, not arithmetic. An
+earlier revision of this section predicted `45 s/token` from a seek-plus-transfer
+model and credited it to spreading the roots over three spindles; both were
+wrong, and the run is recorded here in their place.
 
 ```
-1 HDD                135 s/token
-3 HDDs in parallel    45 s/token   <- what spreading the roots buys
-NVMe, for contrast     8 s/token
+load                1010.8 s      113.5 GB of shells, read() not mmap
+prompt 5 tok        "The capital of France is" -> " Paris. The E"
+decode              ~745 s/token steady state
+per token           25.8 GB of expert weights = 16 x 92 x 17.547 MB
+                    ~100 GB actually read from disk   <- ~4x amplification
+page-cache hit      4.4-4.7%      (the ~4% estimate above held)
+reuse               28% -> 37%    experts repeated from the previous token
+time split          experts 99%   kda 1%   mla/router/attnres ~0%
 ```
 
-That is a correctness harness, not a throughput measurement — a 20-token run
-takes ~15 minutes. Use `examples/k3_run.rs`, which reports which devices are
-backing the experts and works identically for a single-directory or a split
-export:
+Two things that model got wrong:
+
+**Spreading layers across mounts buys no read parallelism.** A layer's 16 expert
+reads all live in one bin on one spindle, and layers are visited serially, so the
+concurrency is one disk deep no matter how many roots there are. Aggregate
+throughput peaked at 204 MB/s — about what a single one of these drives does. The
+spread is still worth having for *capacity*, which is why it exists, and it lets
+a later prefetch overlap layer N+1 with layer N; it is not a bandwidth multiplier
+today.
+
+**Compute is free.** KDA, MLA, AttnRes and the router together are ~1% of wall
+time. Nothing on the CPU side is worth optimising until the I/O is fixed; the
+whole cost is fetching expert weights.
+
+The ~4x amplification is readahead over-fetching past each 17.6 MB slice inside a
+15.7 GB mapping — the expert set is scattered, not streamed. `MmapExperts::open`
+now issues `madvise(MADV_RANDOM)`; `CASCADIA_K3_READAHEAD=1` restores the old
+behaviour for comparison.
+
+This is a correctness harness, not a throughput benchmark. Use
+`examples/k3_run.rs`, which reports which devices are backing the experts and
+works identically for a single-directory or a split export:
 
 ```
 cargo run --release --example k3_run -- <export> "The capital of France is" 20
@@ -213,10 +239,30 @@ shell validated against a Python CPU reference, not OpenVINO-traced graphs.
 | `src/k3/` | SiTU, AttnRes, KDA, absorbed gated-NoPE MLA, LatentMoE, fp4 kernel, loader, stage, profiler, residency |
 | tests | e2e argmax-exact vs the reference; `{1,2,3,4,6}`-rank bit-identical; batched prefill bit-exact |
 
-Remaining: the real export and bring-up. Not implemented, and not needed for a
-first run — chunked-scan KDA prefill (per-position recurrence inside the batched
-layer loop is correct and the recurrence is noise beside the MoE) and the
-prefix cache (`restore_prefix`/`cache_prefix` are still trait defaults).
+The export and first-token bring-up are done — see the measured run above.
+
+### Where the remaining speed is
+
+Decode is 99% expert I/O, so every worthwhile change is an I/O change. Ranked by
+measured impact rather than by how interesting the code is:
+
+| | Status | Expected |
+|---|---|---|
+| `madvise(MADV_RANDOM)` on expert maps | done | removes the ~4x readahead over-fetch |
+| autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | mlock the hot set; free to measure |
+| prefix cache | trait defaults, not implemented | a repeated prompt re-pays ~129 GB of prefill |
+| lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
+| n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
+
+`ngram_draft.rs` and the `spec_decode.rs` primitives are already generic and pure,
+but K3 rejection has to rewind *both* the KDA recurrent state and the MLA cache,
+where K2.6 rewinds KV slots only. The per-channel FFN sparsity work in
+`cascadia-int4-gemm` (CHESS) is a compute win there and would be an I/O win here,
+which is the more valuable half — but it needs K3 calibration data and a reader
+that can skip byte ranges.
+
+Chunked-scan KDA prefill stays deferred: the recurrence is 1% of wall time, so
+there is nothing to win.
 
 ## Resolved math
 
