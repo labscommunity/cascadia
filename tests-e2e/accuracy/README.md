@@ -49,6 +49,20 @@ python packed_prefix_accuracy.py compare pfx_off pfx_on
 Both suites also work against a multi-stage pipeline — point them at rank 0's
 API port.
 
+## Scored accuracy
+
+The parity suites report *equality against a reference*; they never judge whether
+an answer is correct. `packed_scored_accuracy.py` closes that gap with 20
+ground-truth questions:
+
+```bash
+python packed_scored_accuracy.py http://127.0.0.1:18090 sc_base    # --packed-slots 0
+python packed_scored_accuracy.py http://127.0.0.1:18090 sc_packed  # --packed-slots 4
+python packed_scored_accuracy.py score sc_base sc_packed
+```
+
+Recorded on NPU: 15/20 both configs, delta +0, identical text on 20/20.
+
 ## Recorded results (Llama-3.2-1B int4 static, Lunar Lake NPU, OV 2026.2.1)
 
 - determinism 10/10, batch-composition invariance **10/10** (packed and baseline)

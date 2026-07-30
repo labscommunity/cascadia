@@ -245,6 +245,13 @@ the same sensitivity `chunk_take` already documents for `--static-prefill-seq`
 ("forks observed as early as token 2"). The baseline here also has no prefill
 variant, so it prefills tokenwise against packed's 4-wide chunks.
 
+**Scored task accuracy** (20 factual questions with ground truth, NPU
+single-stage, Llama-3.2-1B): baseline **15/20**, packed **15/20**, delta **+0**,
+identical text on 20/20. Short answers do not accumulate enough drift to flip a
+near-tie, and the five failures are the model's own and identical in both. This
+is the measurement behind "no accuracy loss" — the parity suites above only
+establish equality against a reference, never whether either answer is right.
+
 **So: treat exact text equality across different packed shapes as unavailable,
 not as a bug.** The properties that must hold, and do, are determinism and
 batch-composition invariance. Magnitude is model-dependent — Llama-3.2-1B
