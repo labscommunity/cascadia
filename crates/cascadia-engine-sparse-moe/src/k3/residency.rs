@@ -227,6 +227,35 @@ pub fn advise_random(addr: usize, len: usize) -> bool {
     }
 }
 
+/// Queue a read of `[addr, addr+len)` and return without waiting for it.
+///
+/// The expert loop is serial — read one expert, compute it, read the next — so
+/// the drive sits idle for a seek between every expert. Advising all of a layer's
+/// routed slices up front lets the block layer queue and reorder them, which is
+/// where the win comes from: not overlapping I/O with compute (compute is 1% of
+/// wall time here) but keeping the request queue deep.
+///
+/// `MADV_WILLNEED` is 3 on Linux and on the BSDs/macOS. Best-effort and purely a
+/// hint — it can never change what the model computes.
+pub fn advise_willneed(addr: usize, len: usize) -> bool {
+    #[cfg(unix)]
+    {
+        use core::ffi::c_void;
+        const MADV_WILLNEED: i32 = 3;
+        extern "C" {
+            fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        }
+        // SAFETY: [addr, addr+len) is a live mapping owned by the caller. madvise
+        // only starts read-ahead; it never writes to the range.
+        unsafe { madvise(addr as *mut c_void, len, MADV_WILLNEED) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +323,17 @@ mod advise_tests {
         let mut v = vec![0u8; len];
         let addr = v.as_mut_ptr() as usize;
         assert!(advise_random(addr, len), "madvise(MADV_RANDOM) failed");
+    }
+
+    #[test]
+    fn advise_willneed_succeeds_on_a_real_mapping() {
+        let len = 1 << 20;
+        let mut v = vec![0u8; len];
+        let addr = v.as_mut_ptr() as usize;
+        assert!(
+            super::advise_willneed(addr, len),
+            "madvise(MADV_WILLNEED) failed"
+        );
     }
 
     #[test]

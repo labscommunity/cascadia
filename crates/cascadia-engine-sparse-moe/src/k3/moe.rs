@@ -57,6 +57,9 @@ pub trait ExpertSource {
     fn expert_bytes(&self, expert: usize) -> &[u8];
     /// Bytes per expert — what one routed selection streams on a cache miss.
     fn stride(&self) -> usize;
+    /// Hint that these experts are about to be read, without blocking on them.
+    /// Default is a no-op: in-memory sources have nothing to fetch.
+    fn prefetch(&self, _experts: &[u32]) {}
 }
 
 /// A flat in-memory expert set — `n_experts * expert_bytes(latent, inter)`.
@@ -133,6 +136,15 @@ impl MmapExperts {
         self.n * self.stride
     }
 
+    /// Queue this expert's slice for read-ahead. Returns without waiting.
+    pub fn prefetch_expert(&self, expert: usize) -> bool {
+        if expert >= self.n {
+            return false;
+        }
+        let base = self.mmap.as_ptr() as usize + expert * self.stride;
+        crate::k3::residency::advise_willneed(base, self.stride)
+    }
+
     /// `mlock` one expert's slice of the layer mapping. Best-effort.
     pub fn pin_expert(&self, expert: usize) -> bool {
         if expert >= self.n {
@@ -162,6 +174,21 @@ impl ExpertSource for MmapExperts {
     fn stride(&self) -> usize {
         self.stride
     }
+    fn prefetch(&self, experts: &[u32]) {
+        if !prefetch_enabled() {
+            return;
+        }
+        for &e in experts {
+            self.prefetch_expert(e as usize);
+        }
+    }
+}
+
+/// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.
+fn prefetch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_PREFETCH").as_deref() != Ok("0"))
 }
 
 /// SiTU FFN over fp4-packed weights: `w2(SiTU(w1(x), w3(x)))`.
@@ -207,6 +234,9 @@ pub fn moe_forward<E: ExpertSource>(
     prof::add(prof::ROUTER, _t0);
     prof::record_routing(d.layer, &sel.idx, experts.stride());
     residency::record_selection(d.layer, &sel.idx);
+    // Queue every routed expert before touching the first one, so the drive has
+    // all of this layer's reads outstanding instead of one seek at a time.
+    experts.prefetch(&sel.idx);
 
     let _t1 = std::time::Instant::now();
     // down-project once, then accumulate the selected experts in latent space
@@ -308,6 +338,16 @@ pub fn moe_forward_batch<E: ExpertSource>(
         }
     }
 
+    // Queue every distinct expert this batch needs before reading any of them.
+    // Prefill unions the rows, so this is where the deepest queue is available.
+    let distinct: Vec<u32> = want
+        .iter()
+        .enumerate()
+        .filter(|(_, hits)| !hits.is_empty())
+        .map(|(e, _)| e as u32)
+        .collect();
+    experts.prefetch(&distinct);
+
     // one pass per distinct expert; stage results at their gate slots
     let mut slots = vec![0.0f32; rows * d.top_k * d.latent];
     let mut eo = vec![0.0f32; d.latent];
@@ -407,6 +447,28 @@ mod tests {
             shared_w3: bf(d.inter * d.n_shared * d.hidden, 0.19),
             shared_w2: bf(d.hidden * d.inter * d.n_shared, 0.23),
         }
+    }
+
+    #[test]
+    fn prefetch_is_bounds_checked_and_never_panics() {
+        // Mirrors pin_expert's contract: out-of-range is reported, not fatal.
+        // A prefetch is a hint, so a bad index must degrade to "did nothing"
+        // rather than take the run down mid-decode.
+        let dir = std::env::temp_dir().join("k3_prefetch_bounds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layer.bin");
+        let stride = 64usize;
+        std::fs::write(&path, vec![0u8; stride * 4]).unwrap();
+
+        let ex = MmapExperts::open(&path, stride, 4).unwrap();
+        assert!(ex.prefetch_expert(0));
+        assert!(ex.prefetch_expert(3));
+        assert!(!ex.prefetch_expert(4), "out-of-range must report false");
+        assert!(!ex.prefetch_expert(usize::MAX));
+        // the trait entry point must tolerate a bad id in the middle of a list
+        ex.prefetch(&[0, 99, 2]);
+
+        std::fs::remove_file(&path).ok();
     }
 
     fn experts(d: MoeDims) -> FlatExperts {
