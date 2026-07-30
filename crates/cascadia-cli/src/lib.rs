@@ -1527,11 +1527,11 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         if args.packed_slots < 2 {
             return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
         }
-        // Multi-stage is supported: stage 0 ships an I64 [1,2,S] plan frame
-        // (slot + absolute position per row) ahead of the [1,S,hidden] block,
-        // and the tail replies with one token per row. EVERY stage must be
-        // started with the same --packed-slots, since the slot count is baked
-        // into each stage's IR shape.
+        // Multi-stage is supported: stage 0 ships an I64 [1,3,S] plan frame
+        // (slot, absolute position and prefix-reuse length per row) ahead of the
+        // [1,S,hidden] block, and the tail replies with one token per row. EVERY
+        // stage must be started with the same --packed-slots, since the slot
+        // count is baked into each stage's IR shape.
     }
     // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
     // different mechanism to --packed-slots above: OV's paged attention on the
@@ -1560,11 +1560,13 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     }
     // Paged attention is a CPU/GPU-plugin capability; on NPU ov-genai serves
     // the static NPUW pipeline. Without this gate the operator waits out a
-    // full model compile only to get a raw OpenVINO exception.
+    // full model compile only to get a raw OpenVINO exception. (NPU operators
+    // wanting concurrency use --engine ov-runtime --packed-slots instead.)
     if args.cb && device_is_npu(&args.device) {
         return Err(anyhow!(
             "--cb requires a CPU or GPU device; NPU serves ov-genai's static NPUW \
-             pipeline and cannot continuous-batch — drop --cb for NPU workers"
+             pipeline and cannot continuous-batch — use --engine ov-runtime with \
+             --packed-slots for NPU concurrency"
         ));
     }
     Ok(())
@@ -2417,6 +2419,25 @@ mod python_tests {
         a.packed_slots = 4;
         a.packed_prefix = 128;
         assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// The two continuous-batching mechanisms target different engines, so
+    /// asking for both at once is always rejected — whichever engine is named,
+    /// the other flag's gate fires. Pins that the ov-genai (#116) and
+    /// ov-runtime packed paths stay mutually exclusive.
+    #[test]
+    fn worker_flags_reject_cb_and_packed_slots_together() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.cb = true;
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
     }
 
     /// A valid phase split (ov-runtime + prefill device, chunked enabled) passes.
