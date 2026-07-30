@@ -9,11 +9,11 @@ Moonshot **Kimi-K3** (`moonshotai/Kimi-K3`, ~2.8T MoE, 1M ctx) analysed against 
 complete and golden-tested; `{1,2,3,4,6}`-rank pipelines are bit-identical to a
 single process. What remains is the real 1.56 TB export and bring-up.
 
-**That is blocked on hardware.** K3 does **not fit the 4× 32 GB AI-PC fleet**
-that dsv4 and glm5 target — the always-resident bf16 shell alone is ~112 GB
-against 128 GB of total fleet RAM — and the Xeon bench host has neither the RAM
-nor the disk. K3 is a single-big-host target (the K2.6 / MiniMax-M2 deployment
-model) or it is parked. See [Feasibility](#feasibility).
+K3 **does** run on the 4× 32 GB AI-PC fleet that dsv4 and glm5 target: the bf16
+shell is ~29 GB per node of 32, and the routed experts stream from NVMe as
+GLM-5.2's do. What it does not get there is speed — ~0.15% expert residency, so
+roughly 0.05–0.1 tok/s. More nodes improve that steeply. See
+[Feasibility](#feasibility).
 
 ## Architecture
 
@@ -47,7 +47,7 @@ on disk @fp4  = 2.72T * 0.5 B * 1.0625     =  ~1.45 TB       (E8M0 u8 scales = +
 active/token  = 16 * 92 * 33.0M            =  48.6B params   = ~24 GB streamed/token at 0% hit
 ```
 
-### Always-resident bf16 shell — the blocker
+### Always-resident bf16 shell
 
 Everything below is in the quantization `ignore` list, so it is bf16 and must be
 RAM-resident before a single routed expert is pinned:
@@ -68,52 +68,72 @@ the more expensive of the two possibilities.
 
 ### Verdict
 
-| Target | Result |
-|---|---|
-| **4 × 32 GB AI-PC fleet** | **infeasible** — 112 GB of resident shell vs 128 GB total fleet RAM; ~29 GB/node of shell against a 32 GB budget leaves nothing for experts |
-| 8 × 32 GB | ~15 GB/node shell, ~15 GB/node for experts against a 181 GB/node slice → **~8% residency**, ~22 GB/token → **~0.2 tok/s**, worse than GLM-5.2 at N=4 |
-| N for true residency | ~1.45 TB experts + shell over 32 GB nodes → **N ≈ 55** |
-| **Xeon bench host** (~172 GB RAM, ~1.6 TB free) | **export: does not fit; run: ~0.1 tok/s** — see below |
-| single host, ≥768 GB RAM + ~2 TB striped NVMe ≥10 GB/s | **viable** — 45–60% residency, ~10–13 GB/token → ~0.5–1 tok/s |
+The shell is split across ranks with the layers, so what matters is the PER-NODE
+figure, not a fleet total. A KDA+MoE layer costs ~1.25 GB of bf16 shell, an
+MLA+MoE layer ~0.83 GB; embed and head add 4.7 GB spread over the two edge ranks.
+Allowing ~2.5 GB per node for the OS and the KV/recurrent state:
 
-For scale: GLM-5.2 is ~386 GB int4 and already only reaches 0.4–0.6 tok/s at N=4
-with ~35% residency. K3 is ~3.8× larger with 2× the active experts per token.
+| Nodes (32 GB each) | layers/node | shell/node | left for expert cache | resident |
+|---|---:|---:|---:|---:|
+| **4** | ~23 | 29.0 GB | 0.5 GB | ~0.15% |
+| 6 | ~16 | 20.1 GB | 9.4 GB | ~3.9% |
+| 8 | ~12 | 15.7 GB | 13.8 GB | ~7.6% |
+| ~53 | ~2 | ~2 GB | ~27 GB | ~100% |
+
+**K3 runs on 4 nodes.** It fits — 29 GB of 32 — and the routed experts stream
+from NVMe exactly as GLM-5.2's do. Expect roughly **0.05–0.1 tok/s**: each rank
+streams ~6 GB per token and the pipeline is serial across ranks. Correctness is
+fully testable there; the throughput number will be poor but real.
+
+Two caveats at N=4. 29 GB of 32 leaves little for the OS, so whether it stays
+stable or starts swapping is empirical, not something the arithmetic settles. And
+with ~0.5 GB of page cache against a 1.45 TB expert set, `CASCADIA_K3_AUTOPIN` is
+doing real work rather than a marginal optimisation.
+
+More nodes help steeply, because the shell shrinks as the cache grows: N=6 and
+N=8 reach ~3.9% and ~7.6% residency. The split is parameterised by `total`, so
+no code change is needed.
+
+| Other targets | Result |
+|---|---|
+| **Xeon bench host** (~172 GB RAM, ~1.6 TB free) | export fits with `--free-source-shards`; run ~4% resident → **~0.1 tok/s** |
+| single host, ≥768 GB RAM + ~2 TB striped NVMe ≥10 GB/s | 45–60% residency → ~0.5–1 tok/s |
+
+For scale: GLM-5.2 is ~386 GB int4 and reaches 0.4–0.6 tok/s at N=4 with ~35%
+residency. K3 is ~3.8× larger with 2× the active experts per token, so at the
+same node count it sits two orders of magnitude lower on residency. That is the
+real difference between them — not whether K3 fits.
 
 #### On the Xeon bench host
 
-The same host produced the GLM-5.2 export (source FP8 755 GB + int4 output
-386 GB = 1.14 TB, comfortably inside 1.6 TB). K3 does not have that headroom:
+The same host produced the GLM-5.2 export (FP8 source 755 GB + int4 output
+386 GB = 1.14 TB, comfortably inside 1.6 TB). K3 has no such headroom:
 
 ```
-source checkpoint  = 1.45 TB routed (native mxfp4) + ~112 GB bf16  = ~1.57 TB
-export output      = ~same (fp4 repack, no regrind)                = ~1.57 TB
+source checkpoint  = 1.45 TB routed (native mxfp4) + ~112 GB bf16  = ~1.56 TB
+export output      = ~same (fp4 repack, no regrind)                = ~1.56 TB
 both concurrently                                                  = ~3.1 TB   vs 1.6 TB free
+with --free-source-shards (delete as consumed)                     = ~1.58 TB  peak
 ```
 
-The source **alone** is ~98% of free space. Even streaming with
-`--free-source-shards`-style deletion there is no room for the output, and any
-re-run means re-downloading ~1.57 TB. **Export needs roughly +2 TB of storage.**
+So the export **does** fit, but only with `--free-source-shards`, and only just —
+~20 GB of margin, with nothing else on the disk. Storing shells at their source
+bf16 rather than upcasting to f32 is what makes the difference; f32 shells put
+the output at 1.68 TB, which does not fit at all.
 
-Running is separately blocked: 172 GB RAM − ~112 GB resident shell leaves ~60 GB
-for experts against 1.45 TB → **~4% residency** → ~23 GB streamed/token → at a
-few GB/s **≈ 8–12 s/token ≈ 0.1 tok/s**. More storage fixes the export; only more
-RAM fixes the run.
+Running there is ~4% resident (172 GB − 112 GB shell leaves ~60 GB against
+1.45 TB) → **~0.1 tok/s**, comparable to N=4 on the fleet.
 
-**K3 is a single-big-host model (the K2.6 / M2 deployment class), not a fleet
-model — and no host currently in reach clears the bar.** The gap is ~2× on the
-bench host's disk and ~4.5× on its RAM.
-
-## Port plan (if the platform gate clears)
+## Implementation
 
 Follows the established sibling-shell pattern (`src/dsv4/`, `src/glm/`) — a Rust
-shell validated bit-for-bit against a Python CPU reference, not OpenVINO-traced
-graphs.
+shell validated against a Python CPU reference, not OpenVINO-traced graphs.
 
 ### Reuse map
 
 | Reuse as-is | Adapt | Net-new |
 |---|---|---|
-| `dsv4::math` (bf16/linear/dot/rmsnorm), `staged::StagedRunner`, `sampling`, the dsv4 TCP pipeline wire, `glm::residency` (pin/mlock), `glm::gate::moe_gate` — sigmoid + `noaux_tc` + norm-topk is an **exact** match for K3's router | `glm::attn` **absorbed-decode structure only** (`qabs = W_UKᵀ·q`; `score = qabs·Lc`; `ctx = W_UV·clat`) — rewritten, not flagged: NoPE deletes the whole `Rc`/`k_pe` path, and the output gate has no hook | KDA layer (short conv + gated delta recurrence + full-rank gate), SiTU, LatentMoE block + projections, AttnRes block carry, **fp4 e2m1 expert kernel** |
+| `dsv4::math` (bf16/linear/dot/rmsnorm), `staged::StagedRunner`, `sampling`, the dsv4 TCP pipeline wire, `glm::gate::moe_gate` — sigmoid + `noaux_tc` + norm-topk is an **exact** match for K3's router | `glm::attn` **absorbed-decode structure only** (`qabs = W_UKᵀ·q`; `score = qabs·Lc`; `ctx = W_UV·clat`) — rewritten, not flagged: NoPE deletes the whole `Rc`/`k_pe` path, and the output gate has no hook | KDA layer (short conv + gated delta recurrence + full-rank gate), SiTU, LatentMoE block + projections, AttnRes block carry, **fp4 e2m1 expert kernel** |
 
 ### Corrections to the obvious-but-wrong approach
 
@@ -151,23 +171,20 @@ graphs.
    already the in-tree precedent (`glm/attn.rs` uses `dsv4::math`; `glm/stage.rs`
    uses `dsv4::stage::even_layer_split`).
 
-### Phases
+### What is built
 
-1. **Platform gate** — confirm a ≥768 GB host exists, or stop.
-2. **`tools/kimi_k3_ref/`** — CPU reference + fixtures ported from the HF
-   modeling source. Pins the AttnRes anchor semantics, the SiTU formula, the
-   shared-expert width, and the MLA cache form *before* any Rust is written.
-3. **`tools/export_kimi_k3.py`** — unwrap the multimodal wrapper / drop the ViT;
-   routed experts to the new fp4 bin format (no regrind); bf16 shells incl. the
-   LatentMoE projections; hard-fail on config surprises; resumable.
-4. **`src/k3/` primitives**, each golden-tested against the ref: fp4 LUT expert
-   kernel, SiTU, LatentMoE block, KDA layer, gated NoPE-MLA, AttnRes carry.
-5. **Runner** — `forward_layers_batch` + batch-union MoE from the start;
-   `block_aligned_split`; `reset()` must clear conv + recurrent state;
-   `arch == "kimi_k3"` sniff in `engine.rs`.
-6. **Parity** — tiny/med synthetic end-to-end; {1,2,4}-rank pipeline bit-match.
-7. **Real export + single-host bring-up**, then residency tuning per the glm5
-   playbook.
+| | |
+|---|---|
+| `tools/kimi_k3_ref/` | CPU reference; 11/11 checks against the vendored upstream, 7 bit-exact |
+| `tools/export_kimi_k3.py` | config contract, fp4 repack, streaming + resumable, `--check-index`, `--free-source-shards`, tokenizer.json |
+| `tools/kimi_k3_tokenizer.py` | tiktoken → `tokenizer.json`, validated identical to reference tiktoken |
+| `src/k3/` | SiTU, AttnRes, KDA, absorbed gated-NoPE MLA, LatentMoE, fp4 kernel, loader, stage, profiler, residency |
+| tests | e2e argmax-exact vs the reference; `{1,2,3,4,6}`-rank bit-identical; batched prefill bit-exact |
+
+Remaining: the real export and bring-up. Not implemented, and not needed for a
+first run — chunked-scan KDA prefill (per-position recurrence inside the batched
+layer loop is correct and the recurrence is noise beside the MoE) and the
+prefix cache (`restore_prefix`/`cache_prefix` are still trait defaults).
 
 ## Resolved math
 
@@ -333,14 +350,20 @@ tokenizer, is a prerequisite for serving.
 
 ## Open risks
 
-- **Platform (highest)** — see the verdict. Everything else is moot until it clears.
-- **KDA numerics** — the gated delta rule is the #1 correctness hazard and has no
-  precedent in this crate; lock it against the CPU ref before anything else.
-- **fp4 e2m1 kernel** — new quant grid, new bin format; needs its own round-trip test.
-- **Linear-attention state cannot rewind.** The current append-only generate loop
-  is fine, but any future spec-decode / MTP accept-reject needs *state
+- **Residency (highest)** — at N=4 there is ~0.5 GB of page cache for a 1.45 TB
+  expert set. Throughput follows residency, so more nodes and `CASCADIA_K3_AUTOPIN`
+  are the levers; the arithmetic cannot predict whether 29 GB of 32 stays stable
+  under load.
+- **Never run on real weights.** Everything is validated against a 6-layer
+  synthetic model. The numerics are golden-tested against upstream, but no real
+  tensor has passed through the shell.
+- **Export margin** — ~20 GB spare on a 1.6 TB disk, and only with
+  `--free-source-shards`, which is destructive: a freed layer cannot be
+  re-exported without re-downloading.
+- **Linear-attention state cannot rewind.** The append-only generate loop is
+  fine, but any future spec-decode / MTP accept-reject needs *state
   checkpointing*, not KV truncation.
 - **Prefix cache** — a K3 snapshot must carry the KDA recurrent state
-  (96×128×128 f32 × 69 layers ≈ 430 MB) plus conv windows, not just KV. Defer.
-- `max_seq` sizing actually *improves* vs glm5: only the 24 full-attn layers
-  scale with context (512-float latent/token).
+  (96×128×128 f32 × 69 layers ≈ 430 MB) plus conv windows, not just KV.
+- `max_seq` sizing is *better* than glm5's: only the 24 full-attn layers scale
+  with context (576 floats/token).
