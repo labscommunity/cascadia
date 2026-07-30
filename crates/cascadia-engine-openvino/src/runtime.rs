@@ -1488,6 +1488,11 @@ pub struct OvRuntimeEngine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks a pulled slice in. Drained inside
+    /// `recv_hidden_from_upstream` — its lock is independent of the engine lock, which is what lets the
+    /// commit path deposit while this engine is mid-`step()`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     /// Issue-34 consume: set by a `RESTORE` control frame; suppresses the next prefill's implicit
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
@@ -2004,6 +2009,13 @@ impl OvRuntimeEngine {
             if !want_pos && lead.dtype == WireDType::I8 {
                 self.handle_inbound_control(&lead)?;
                 continue;
+            }
+            // Same instant the chain path's `OPCODE_RESTORE` arm applies its carried blob — the
+            // ordering that is already certified byte-identical — but for a slice that arrived over
+            // the plane instead of the chain. See `drain_kv_handoff`.
+            #[cfg(feature = "kv_coord")]
+            if !want_pos {
+                self.drain_kv_handoff();
             }
             // `lead` is an activation lead frame: the hidden it promises is a
             // mid-group frame the peer owes promptly, so it is deadlined.
@@ -3804,6 +3816,12 @@ impl Engine for OvRuntimeEngine {
             model_fp: self.kv_model_fingerprint(),
         }))
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
 }
 
 #[cfg(feature = "kv_coord")]
@@ -3825,6 +3843,67 @@ impl OvRuntimeEngine {
         self.kv_warm_pending = false;
         self.position = 0;
     }
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any.
+    ///
+    /// Applied from inside the recv loop, not from the node's relay loop: the relay only iterates once
+    /// `step()` has returned, by which point this rank has already cold-prefilled the whole turn and
+    /// zeroed `position`, so a `set_state` there snaps the state backwards mid-turn and the output
+    /// diverges. Here the arm lands before the forward, so `kv_consume_warm_pending()` sees it and the
+    /// prefill skips its implicit `reset_state`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn drain_kv_handoff(&mut self) {
+        let Some(slot) = self.kv_handoff.take() else {
+            return;
+        };
+        // Structural validation MUST happen here. The driver-loop apply this replaced ran
+        // `KvSnapshotCodec::validate` before inserting; the handoff path skips the consumer-insert
+        // entirely, so without this nothing on the plane path would check layout_version, engine_rev or
+        // model_fingerprint — a slice from a drifted build, or another model, would be `set_state`d
+        // silently. Note the holder's own serve check is LENGTH-only (`tokens.len() == len`, never token
+        // equality), so it cannot be relied on as the content bind either. Validating in-engine is also
+        // strictly better than where it used to live: here the layout/rev come from THIS engine rather
+        // than from an adapter reading them through the mutex.
+        let refs: Vec<(&[u8], &[u8])> = slot
+            .payloads
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        if cascadia_kv_wire::KvSnapshotCodec::validate(
+            &slot.manifest,
+            &refs,
+            cascadia_kv_wire::OPAQUE_KV_LAYOUT,
+            crate::kv_coordination::KV_ENGINE_REV,
+            self.kv_model_fingerprint(),
+            &slot.manifest.token_ids,
+        )
+        .is_err()
+        {
+            warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                epoch = slot.epoch, rev = crate::kv_coordination::KV_ENGINE_REV,
+                fp = self.kv_model_fingerprint());
+            return;
+        }
+        let Some((_tokens, blob)) =
+            crate::kv_coordination::wire_to_blob(&slot.manifest, &slot.payloads)
+        else {
+            warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+            return;
+        };
+        // Snapping back is what produced the two-item divergence: a slice shallower than where this
+        // rank already is cannot be resumed into, so drop it and let the turn stay cold.
+        let depth = crate::kv_coordination::kv_seq_from_blob(&blob).unwrap_or(0) as i64;
+        if self.position > depth {
+            warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                epoch = slot.epoch, position = self.position, depth);
+            return;
+        }
+        if self.apply_warm_resume_blob(&blob) {
+            info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
+                epoch = slot.epoch, position = self.position,
+                blob_digest = crate::kv_coordination::byte_digest(&blob));
+        }
+    }
+
     /// Plane warm-resume (§0(B)): set_state a pulled rank blob directly + arm warm, off the inference
     /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
     #[cfg(feature = "kv_coord")]
@@ -3849,6 +3928,7 @@ impl OvRuntimeEngine {
                     mode = "plane",
                     "ov-runtime: apply_warm_resume set position"
                 );
+                crate::kv_coordination::log_blob_tensors("apply_plane", 0, blob);
                 self.kv_warm_pending = true;
                 true
             }
@@ -4223,6 +4303,8 @@ impl OvRuntimeEngine {
                                 mode = "chain",
                                 "ov_tail_restore_carried"
                             );
+                            crate::kv_coordination::log_blob_tensors(
+                                "restore_chain", epoch, blob);
                             true
                         }
                         Err(e) => {
@@ -5134,6 +5216,8 @@ impl Builder for OvRuntimeBuilder {
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
             #[cfg(feature = "kv_coord")]
             kv_warm_pending: false,
             #[cfg(feature = "kv_coord")]

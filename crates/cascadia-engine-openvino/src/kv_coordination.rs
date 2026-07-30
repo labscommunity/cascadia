@@ -79,6 +79,73 @@ pub(crate) fn tokens_digest(tokens: &[i32]) -> u64 {
     h
 }
 
+/// Per-tensor dump of a state blob: `(name, rank, shape[2], nbytes, digest)` for every state.
+///
+/// For the qwen36 bar-#1 divergence. qwen36 is byte-identical single-box but diverges on the SHARDED
+/// cross-chain move, and four blind fixes (key-name mapping, attention depth off-by-one, T=1 prefill,
+/// reset-vs-recreate) have already been spent on it. Whole-blob digests only say "differs"; this says
+/// WHICH tensor differs, which discriminates the live hypotheses in one run:
+///   - mismatch confined to `conv`/`ssm` names ⇒ fixed-size recurrent state is being sliced as if it
+///     were sequence-addressable at the shard boundary (fits single-box-clean / sharded-diverges)
+///   - mismatch in attention KV only ⇒ rank/layer layout mapping on the sharded path
+///   - no mismatch at all ⇒ the divergence is post-restore numerics, not the transfer
+///
+/// Off by default — `CASCADIA_KV_TENSOR_DUMP=1`. One line per tensor is far too loud for the certified
+/// path, and the certified path must stay byte-identical to what ships.
+pub(crate) fn log_blob_tensors(tag: &str, epoch: u64, blob: &[u8]) {
+    if std::env::var("CASCADIA_KV_TENSOR_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(b.get(p..p + 8)?.try_into().ok()?))
+    }
+    let mut p = 0usize;
+    let Some(count) = u32_at(blob, p) else { return };
+    p += 4;
+    for _ in 0..count {
+        let Some(name_len) = u32_at(blob, p).map(|v| v as usize) else {
+            return;
+        };
+        let Some(name_at) = p.checked_add(4) else { return };
+        let name = blob
+            .get(name_at..name_at.saturating_add(name_len))
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let Some(np) = name_at.checked_add(name_len) else {
+            return;
+        };
+        p = np;
+        let Some(&_dtype) = blob.get(p) else { return };
+        let Some(rank) = blob.get(p + 1).map(|r| *r as usize) else {
+            return;
+        };
+        p += 2;
+        let mut seq_dim = 0usize;
+        for i in 0..rank {
+            let Some(d) = u64_at(blob, p).map(|v| v as usize) else {
+                return;
+            };
+            p += 8;
+            if i == 2 {
+                seq_dim = d;
+            }
+        }
+        let Some(nb) = u64_at(blob, p).map(|v| v as usize) else {
+            return;
+        };
+        p += 8;
+        let data = blob.get(p..p.saturating_add(nb)).unwrap_or(&[]);
+        tracing::info!(target: "cascadia::kv", event = "kv_tensor_dump",
+            tag, epoch, name = %name, rank, seq = seq_dim, nbytes = nb,
+            digest = byte_digest(data));
+        let Some(np) = p.checked_add(nb) else { return };
+        p = np;
+    }
+}
+
 /// Restored KV depth (max `shape[2]` over rank≥3 states) from a `get_state_blob` blob — `[u32 count]`
 /// then per state `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nb][data]` (LE).
 ///
@@ -472,6 +539,7 @@ impl OvKvCache {
         tracing::info!(target: "cascadia::kv", event = "kv_serve_digest",
             epoch, len, blob_digest = byte_digest(&blob), tok_digest = tokens_digest(&tokens),
             n_tokens = tokens.len(), blob_len = blob.len());
+        log_blob_tensors("serve", epoch, &blob);
         // Head/offers path carries tokens ⇒ length must match what was negotiated. Worker captures
         // also carry the head-broadcast tokens, so the same check holds for both.
         if tokens.len() as u32 != len {
@@ -708,6 +776,60 @@ impl KvCoordination for OvRuntimeEngine {
 /// Shared handle to a captured-snapshot cache. The engine mirrors its captures here; the holder reads
 /// it without ever taking the engine lock (so a busy node can still answer a pull).
 pub(crate) type SharedKvCache = Arc<Mutex<OvKvCache>>;
+
+/// A plane-pulled slice parked for the engine to apply itself.
+pub struct KvHandoffSlot {
+    pub epoch: u64,
+    pub manifest: Manifest,
+    pub payloads: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// One-slot mailbox handing a pulled warm-resume slice from the KV plane to the engine's recv loop.
+///
+/// Its mutex is INDEPENDENT of the engine mutex, and the producer side never touches the engine at
+/// all. The confirm/commit path runs on the node's control task while the tail is typically parked
+/// inside `step()` holding the engine mutex — reaching the engine from there deadlocks (proven
+/// on-rig). So the producer only parks bytes here; the engine drains the mailbox from inside its own
+/// recv loop, where it already owns its lock and can still apply ahead of the turn's forward.
+pub struct KvHandoffMailbox {
+    slot: Mutex<Option<KvHandoffSlot>>,
+}
+
+impl KvHandoffMailbox {
+    pub fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// Overwrites any unconsumed slice: only the newest pull can still be ahead of the engine's
+    /// position, and an older one would only be rejected by the apply-site depth guard anyway.
+    pub fn put(&self, epoch: u64, manifest: Manifest, payloads: Vec<(Vec<u8>, Vec<u8>)>) {
+        let n_payloads = payloads.len();
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(KvHandoffSlot {
+            epoch,
+            manifest,
+            payloads,
+        });
+        tracing::info!(target: "cascadia::kv", event = "kv_handoff_put", epoch, n_payloads);
+    }
+
+    pub fn take(&self) -> Option<KvHandoffSlot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl Default for KvHandoffMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl cascadia_engine::KvWarmHandoff for KvHandoffMailbox {
+    fn put(&self, epoch: u64, manifest: Manifest, payloads: Vec<(Vec<u8>, Vec<u8>)>) {
+        KvHandoffMailbox::put(self, epoch, manifest, payloads);
+    }
+}
 
 /// Lock-free [`KvSnapshotHolder`] over a [`SharedKvCache`]. Serves NEGOTIATE/GET by locking ONLY the
 /// snapshot cache — which inference touches only briefly at capture, not across the forward pass — so
