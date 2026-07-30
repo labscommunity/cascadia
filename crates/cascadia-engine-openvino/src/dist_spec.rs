@@ -2784,6 +2784,14 @@ impl OvDistSpecWorkerEngine {
             g.send_raw(&(FrameKind::Restore as u32).to_be_bytes())
                 .await?;
             g.send_raw(&epoch.to_le_bytes()).await?;
+            // MUST match the reader's [epoch:8][carried_len:8 LE][carried]. Omitting carried_len made
+            // every rank1→rank2 hop malformed: the receiver blocks reading a length that never arrives
+            // while this side blocks on the ack (or, if any later bytes land, reads them AS the length).
+            // Zero-length is the correct value here — a mid-chain rank only ever receives its OWN
+            // carried slice, never the next rank's, so downstream restores from its own CAPTURE. On a
+            // cross-chain move a 3rd+ rank has no capture under the donor epoch, so it verdicts 0 and
+            // the chain cold-resets: correct-and-cold rather than a desynced stream.
+            g.send_raw(&0u64.to_le_bytes()).await?;
             let kb = g.recv_raw(4).await?;
             if u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]) != FrameKind::RestoreAck as u32 {
                 return Err(cascadia_transport::TransportError::SocketClosed);
