@@ -1565,10 +1565,13 @@ impl OvRuntimeEngine {
         })?;
         let s3 = to_shape3(shape);
         let plan_frame = encode_wire_plan(plan_rows);
+        // f16 on the wire, matching the non-packed path: the receiving stage
+        // converts to f16 before feeding the IR regardless, so f32 doubled the
+        // bytes per stage hop and bought nothing.
         let hidden_frame = WireTensor::new(
-            WireDType::F32,
+            WireDType::F16,
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
-            hidden.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            f32_to_f16_bytes(hidden),
         );
         self.block_on(async {
             let mut guard = down.lock().await;
@@ -1643,11 +1646,14 @@ impl OvRuntimeEngine {
                 .recv()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
-            let hidden: Vec<f32> = hf
-                .data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            let hidden: Vec<f32> = match hf.dtype {
+                WireDType::F16 => f16_bytes_to_f32(&hf.data),
+                _ => hf
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            };
             Ok::<_, EngineError>((plan_rows, hidden, hf.shape))
         })?;
 
@@ -1792,16 +1798,24 @@ impl OvRuntimeEngine {
         let task_id = t.task.task_id.clone();
 
         if !is_final {
+            // Explicit count for the same reason: a token whose text lands in
+            // the next chunk (BPE splitting a glyph) would otherwise count 0.
             return Ok(Some((
                 task_id.clone(),
-                Chunk::token(task_id, token as i64, delta),
+                Chunk::token(task_id, token as i64, delta).with_n_tokens(1),
             )));
         }
         let n_tokens = t.generated.len() as u32;
         let prompt_tokens = t.prompt_ids.len() as u32;
         let elapsed = t.started.elapsed();
+        // n_tokens is THIS chunk's increment, not the running total. The API
+        // sums per-chunk counts (falling back to 1 per non-empty chunk), so a
+        // cumulative value here double-counts every interim token — measured as
+        // completion_tokens = 2N-1. This chunk carries exactly one token, and
+        // it is set explicitly so an empty final delta (EOS decoding to "")
+        // still counts.
         let chunk = Chunk::final_marker(task_id.clone(), delta)
-            .with_n_tokens(n_tokens)
+            .with_n_tokens(1)
             .with_prompt_tokens(prompt_tokens)
             .with_finish_reason(if is_eos {
                 cascadia_types::FinishReason::Stop

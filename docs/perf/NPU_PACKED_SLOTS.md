@@ -218,6 +218,38 @@ populated by whichever request arrives first; no block-level dedup between
 partially-overlapping prompts beyond that single shared run; and the cached
 prefix persists for the worker's lifetime rather than being evicted by pressure.
 
+### Accuracy parity
+
+Harness and method: [tests-e2e/accuracy](../../tests-e2e/accuracy). Full-text
+exact comparison at 128 tokens, never a substring match.
+
+**Single-stage, NPU** (Llama-3.2-1B): determinism 10/10, **batch-composition
+invariance 10/10** (a request's output does not depend on its batch-mates),
+prefix cache on-vs-off **8/8 exact**, packed-vs-baseline 8/10 with both diffs a
+single re-converging token ("about"/"approximately", "1,143"/"1,145") at 66-73%
+depth.
+
+**Multi-stage** (TinyLlama 2-stage): determinism and batch-composition
+invariance are 10/10 in every config, but packed-vs-baseline is only 5/10 with
+EARLY divergences. That is **not** a wire fault — the control settles it:
+
+| comparison | exact |
+|---|---|
+| baseline vs packed (slots=4) | 5/10 |
+| packed slots=4 vs packed slots=2 | **3/10** |
+
+Two configurations of the same code, differing only in slot count, agree *less*
+than packed agrees with baseline. Changing `packed_slots` changes the compiled
+graph shape and the prefill chunk width, and this model forks early on that —
+the same sensitivity `chunk_take` already documents for `--static-prefill-seq`
+("forks observed as early as token 2"). The baseline here also has no prefill
+variant, so it prefills tokenwise against packed's 4-wide chunks.
+
+**So: treat exact text equality across different packed shapes as unavailable,
+not as a bug.** The properties that must hold, and do, are determinism and
+batch-composition invariance. Magnitude is model-dependent — Llama-3.2-1B
+diverged on 2/10 prompts, TinyLlama on 5/10.
+
 ### Per-slot cancel
 
 A disconnecting client's slot is retired and its KV region returned to the free
