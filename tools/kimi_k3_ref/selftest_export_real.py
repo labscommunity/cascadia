@@ -16,6 +16,8 @@ over it, then checks the parts that are easy to get wrong:
   * the pre-flight sizes `<out>` for what actually lands there
   * roots sharing one filesystem do not double-count its free space
   * a root on `<out>`'s filesystem leaves room for the shells
+  * an export whose shells/markers were lost rebuilds without rewriting the
+    expert bins, and lands byte-identical
   * resuming into an export built from a different config is refused
 
 `--with-loader` adds the check that closes the loop: it runs the exported tree
@@ -388,6 +390,28 @@ def main() -> int:
         results.append(check(
             "shell space reserved on <out>'s filesystem",
             len(plain) == n_moe and reserved))
+
+        # 10. the recovery path: shells, markers and the root plan are gone but
+        # the expert bins survive (they live on the roots, and <out>/experts only
+        # holds symlinks). Re-running must reuse the bins, not rewrite them, and
+        # still produce an export identical to a clean one.
+        k = tmp / "out_recover"
+        kr1, kr2 = tmp / "kr1", tmp / "kr2"
+        X.export_real(ck, k, cfg, expert_roots=[(kr1, 2), (kr2, None)])
+        before = {p.name: p.stat().st_mtime_ns for p in sorted(kr1.glob("*.bin"))}
+        before.update({p.name: p.stat().st_mtime_ns for p in sorted(kr2.glob("*.bin"))})
+        digest_ok = tree_digest(k) == da
+        # simulate the rm -rf: everything in <out> goes, bins on the roots stay
+        shutil.rmtree(k)
+        X.export_real(ck, k, cfg, expert_roots=[(kr1, 2), (kr2, None)])
+        after = {p.name: p.stat().st_mtime_ns for p in sorted(kr1.glob("*.bin"))}
+        after.update({p.name: p.stat().st_mtime_ns for p in sorted(kr2.glob("*.bin"))})
+        results.append(check(
+            "recovery reuses expert bins (not rewritten)",
+            before == after and len(before) == n_moe,
+            f": {sum(1 for x in before if before[x] == after.get(x))}/{len(before)} untouched"))
+        results.append(check(
+            "recovered export == clean export", digest_ok and tree_digest(k) == da))
 
         # 5. the export actually loads and generates in the engine
         if "--with-loader" in sys.argv:

@@ -815,33 +815,42 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
             wdir = roots[li] if roots else edir
             wdir.mkdir(parents=True, exist_ok=True)
             eb = f"{base}block_sparse_moe.experts."
-            tmp = wdir / f"layer_{li:02d}.bin.part"
-            with open(tmp, "wb") as ef:
-                for e in range(cfg["num_experts"]):
-                    sections = []
-                    for w in ("w1", "w3", "w2"):
-                        packed = src.get(f"{eb}{e}.{w}.weight_packed")
-                        scale = src.get(f"{eb}{e}.{w}.weight_scale")
-                        sections.append((
-                            packed.view(torch.uint8).numpy(),
-                            scale.view(torch.uint8).numpy(),
-                        ))
-                    append_repacked_expert(sections, ef)
-            # The loader indexes this bin by a fixed stride from the manifest, so a
-            # size mismatch means an unexpected expert shape or dtype upstream and
-            # every read after the first expert would be misaligned. Catch it here
-            # rather than as garbage logits.
-            got = tmp.stat().st_size
-            if got != bin_bytes:
-                tmp.unlink()
-                raise SystemExit(
-                    f"[export_kimi_k3] layer {li} expert bin is {got} bytes, expected "
-                    f"{bin_bytes} ({cfg['num_experts']} x "
-                    f"{bin_bytes // cfg['num_experts']}) — expert tensor shapes or "
-                    "dtypes are not what the config describes")
-            # rename only once complete, so a killed run never leaves a short bin
             final = wdir / f"layer_{li:02d}.bin"
-            tmp.rename(final)
+            # A bin of exactly the right size is reused rather than rewritten.
+            # The repack is a byte copy, so a rewrite would reproduce the same
+            # bytes for ~16 GB of I/O per layer. This is what lets an export whose
+            # shells or markers were lost be rebuilt without redoing the expensive
+            # half. Any other size is not trusted — it is rewritten below.
+            if final.exists() and final.stat().st_size == bin_bytes:
+                print(f"[layer {li:02d}/{n - 1}] expert bin present, reusing",
+                      flush=True)
+            else:
+                tmp = wdir / f"layer_{li:02d}.bin.part"
+                with open(tmp, "wb") as ef:
+                    for e in range(cfg["num_experts"]):
+                        sections = []
+                        for w in ("w1", "w3", "w2"):
+                            packed = src.get(f"{eb}{e}.{w}.weight_packed")
+                            scale = src.get(f"{eb}{e}.{w}.weight_scale")
+                            sections.append((
+                                packed.view(torch.uint8).numpy(),
+                                scale.view(torch.uint8).numpy(),
+                            ))
+                        append_repacked_expert(sections, ef)
+                # The loader indexes this bin by a fixed stride from the manifest,
+                # so a size mismatch means an unexpected expert shape or dtype
+                # upstream and every read after the first expert would be
+                # misaligned. Catch it here rather than as garbage logits.
+                got = tmp.stat().st_size
+                if got != bin_bytes:
+                    tmp.unlink()
+                    raise SystemExit(
+                        f"[export_kimi_k3] layer {li} expert bin is {got} bytes, "
+                        f"expected {bin_bytes} ({cfg['num_experts']} x "
+                        f"{bin_bytes // cfg['num_experts']}) — expert tensor shapes "
+                        "or dtypes are not what the config describes")
+                # rename only once complete, so a killed run never leaves a short bin
+                tmp.rename(final)
             if roots:
                 link = edir / f"layer_{li:02d}.bin"
                 if link.is_symlink() or link.exists():
