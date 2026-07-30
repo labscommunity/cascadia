@@ -129,6 +129,13 @@ capacity 97 layers vs 92 needed
 Note the shells need their own mount. Three mounts is 2 layers SHORT once the
 116 GB of shells takes a bite out of one of them — four is the working plan.
 
+The exporter enforces both halves of that on its own rather than trusting the
+operator to have done the arithmetic: the pre-flight sizes `<out>` for the shells
+only when `--expert-roots` is given (the bins are not landing there), and the
+root planner holds back the shell bytes on whichever root shares a filesystem
+with `<out>`, plus budgets per filesystem rather than per directory so two roots
+on one mount cannot each claim its free space.
+
 Running there: 172 GB RAM − 113.5 GB shell leaves ~48 GB of page cache against
 1.446 TB of experts, ~4% resident. The storage modules are 7200 RPM HDDs, not
 NVMe, so each 17.6 MB expert read costs ~96 ms (8 ms seek + 88 ms transfer):

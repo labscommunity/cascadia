@@ -30,7 +30,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from deepseek_v4_ref.kernels_ref import (_pow2_round_up, _quantize_e2m1,
-                                         dequant_fp4_weight, e8m0_to_f32)
+                                         dequant_fp4_weight)
 
 FP4_GROUP = 32
 FP4_MAX = 6.0
@@ -146,6 +146,10 @@ def load_and_validate_config(path: Path) -> dict:
     _require(int(c.get("topk_group", 1)) == 1, "topk_group must be 1")
     _require(c.get("attn_res_block_size") is not None, "attn_res_block_size required")
     _require(int(c.get("num_nextn_predict_layers", 0)) == 0, "MTP layers not supported")
+    # the export treats every layer >= first_k_dense_replace as MoE; a freq != 1
+    # would interleave dense layers and silently mis-export them
+    _require(c.get("moe_layer_freq", 1) == 1,
+             f"moe_layer_freq must be 1, got {c.get('moe_layer_freq')!r}")
 
     n = int(g("num_hidden_layers"))
     # `linear_attn_config` lists layers 1-INDEXED: kda_layers starts at 1 and
@@ -204,13 +208,18 @@ def load_and_validate_config(path: Path) -> dict:
         moe_renormalize=bool(c.get("moe_renormalize", True)),
         intermediate_size=int(g("intermediate_size")),
         vocab_size=int(g("vocab_size")),
-        eos_token_ids=[int(c.get("eos_token_id", 0))],
+        eos_token_ids=_eos_ids(c.get("eos_token_id", 0)),
     )
     _require(cfg["routed_expert_hidden_size"] % FP4_GROUP == 0,
              "routed_expert_hidden_size must be a multiple of 32")
     _require(cfg["moe_intermediate_size"] % FP4_GROUP == 0,
              "moe_intermediate_size must be a multiple of 32")
     return cfg
+
+
+def _eos_ids(v) -> list:
+    """`eos_token_id` is a scalar in the release but a list in other HF configs."""
+    return [int(x) for x in v] if isinstance(v, (list, tuple)) else [int(v)]
 
 
 def build_manifest(cfg: dict) -> dict:
@@ -228,7 +237,15 @@ def build_manifest(cfg: dict) -> dict:
 
 def write_manifest(cfg: dict, out: Path):
     out.mkdir(parents=True, exist_ok=True)
-    (out / "manifest.json").write_text(json.dumps(build_manifest(cfg), indent=2) + "\n")
+    m = build_manifest(cfg)
+    prev = out / "manifest.json"
+    # Resuming with a changed config would mix two geometries into one export and
+    # the mismatch would only surface as wrong logits at run time.
+    if prev.exists() and json.loads(prev.read_text()) != m:
+        raise SystemExit(
+            f"[export_kimi_k3] {prev} was written from a different config. Export "
+            "to a fresh directory, or delete this one to start over.")
+    prev.write_text(json.dumps(m, indent=2) + "\n")
     print(f"[manifest] {out / 'manifest.json'}", flush=True)
 
 
@@ -237,17 +254,56 @@ def write_manifest(cfg: dict, out: Path):
 # --------------------------------------------------------------------------
 
 
-def check_space(out: Path, cfg: dict):
-    import shutil
-    per_expert = build_manifest(cfg)["expert_bin_bytes"]
+def expert_bytes(cfg: dict) -> int:
+    """Total bytes of every routed-expert bin."""
     n_moe = cfg["num_hidden_layers"] - cfg["first_k_dense_replace"]
-    need = per_expert * cfg["num_experts"] * n_moe
+    return build_manifest(cfg)["expert_bin_bytes"] * cfg["num_experts"] * n_moe
+
+
+def shell_bytes(model_dir: Path, cfg: dict) -> int | None:
+    """Bytes the shells will take, from the index's own total.
+
+    The index reports the whole checkpoint, so subtracting the expert bytes
+    leaves the shells plus the dropped vision tower — an over-estimate, which is
+    the safe direction for a pre-flight. Returns None if the index has no total.
+    """
+    idx = model_dir / "model.safetensors.index.json"
+    if not idx.exists():
+        return None
+    total = json.loads(idx.read_text()).get("metadata", {}).get("total_size")
+    return max(0, int(total) - expert_bytes(cfg)) if total else None
+
+
+def check_space(out: Path, cfg: dict, model_dir: Path | None = None,
+                expert_roots: list | None = None):
+    """Pre-flight the OUTPUT volume only.
+
+    With `--expert-roots` the expert bins are written to those roots, not to
+    `<out>`, so demanding the full expert size here would reject exactly the
+    multi-filesystem layout the flag exists to enable. `plan_expert_roots` does
+    the per-root capacity check in that case.
+    """
+    import shutil
+    shell = shell_bytes(model_dir, cfg) if model_dir else None
+    need = shell or 0
+    what = ["shells"]
+    if not expert_roots:
+        need += expert_bytes(cfg)
+        what.append("experts")
     free = shutil.disk_usage(out).free
-    print(f"[preflight] experts ~{need / 1e9:.1f} GB, free {free / 1e9:.1f} GB", flush=True)
+    print(f"[preflight] {' + '.join(what)} ~{need / 1e9:.1f} GB on {out}, "
+          f"free {free / 1e9:.1f} GB", flush=True)
+    if shell is None:
+        print("[preflight] NOTE index has no total_size — shell size not checked",
+              flush=True)
     if need > free:
         raise SystemExit(
-            f"[export_kimi_k3] not enough space: need ~{need / 1e9:.1f} GB for routed "
-            f"experts alone, {free / 1e9:.1f} GB free")
+            f"[export_kimi_k3] not enough space on {out}: need ~{need / 1e9:.1f} GB "
+            f"for {' + '.join(what)}, {free / 1e9:.1f} GB free"
+            + ("" if expert_roots else
+               "\n  the experts alone are "
+               f"~{expert_bytes(cfg) / 1e9:.0f} GB — use --expert-roots to spread "
+               "them over several filesystems"))
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +322,7 @@ def export_tiny(out: Path, expert_roots: list | None = None):
     cfg.setdefault("eos_token_ids", [0])
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(cfg, out)
+    # no shell reserve: the tiny model's shells are a few MB
     roots = plan_expert_roots(out, expert_roots, cfg) if expert_roots else None
 
     # Store the big matrices bf16, matching the real export, so the loader's
@@ -534,7 +591,7 @@ def parse_expert_roots(spec: str) -> list:
     return out
 
 
-def plan_expert_roots(out: Path, roots: list, cfg: dict) -> dict:
+def plan_expert_roots(out: Path, roots: list, cfg: dict, reserve: int = 0) -> dict:
     """Assign each MoE layer's expert bin to one of `roots`. Returns {layer: dir}.
 
     K3's experts are ~1.45 TB and a host may not have that on any single
@@ -542,16 +599,30 @@ def plan_expert_roots(out: Path, roots: list, cfg: dict) -> dict:
     back to `<out>/experts/layer_NN.bin`, so the export still looks like one
     directory and the loader (which just opens that path) is unaffected.
 
+    `reserve` is space that must stay free on `<out>`'s own filesystem for the
+    shells. A root on that same filesystem competes with them, and the shells are
+    written as the export goes, so the space they will take is not free yet at
+    plan time.
+
     The plan is persisted to `<out>/.expert_roots.json` and reused on resume:
     recomputing it would give different answers as free space changes, and a
     layer must not move between runs.
     """
     plan_p = out / ".expert_roots.json"
     if plan_p.exists():
-        saved = json.loads(plan_p.read_text())
+        saved = {int(k): Path(v) for k, v in json.loads(plan_p.read_text()).items()}
+        want = [li for li in range(cfg["num_hidden_layers"])
+                if li >= cfg["first_k_dense_replace"]]
+        gap = [li for li in want if li not in saved]
+        if gap:
+            raise SystemExit(
+                f"[export_kimi_k3] {plan_p} covers {len(saved)} layers but "
+                f"{len(want)} are needed (missing {gap[:5]}...). It was written for "
+                "a different config — delete it to replan, but note that already "
+                "exported bins stay where the old plan put them.")
         print(f"[roots] reusing plan for {len(saved)} layers from {plan_p.name}",
               flush=True)
-        return {int(k): Path(v) for k, v in saved.items()}
+        return saved
 
     import shutil
     # a LAYER's bin holds every expert, not one — expert_bin_bytes is per expert
@@ -560,13 +631,27 @@ def plan_expert_roots(out: Path, roots: list, cfg: dict) -> dict:
     moe = [li for li in range(cfg["num_hidden_layers"])
            if li >= cfg["first_k_dense_replace"]]
 
+    # Budget per FILESYSTEM, not per directory: two roots on the same mount share
+    # one pool of free space, and summing disk_usage() per root would promise
+    # twice the room that exists and run dry mid-export.
+    out.mkdir(parents=True, exist_ok=True)
+    out_dev = out.stat().st_dev
+    budget: dict = {}
     caps = []
     for r, want in roots:
         r.mkdir(parents=True, exist_ok=True)
-        free = shutil.disk_usage(r).free
-        cap = max(0, (free - headroom) // per)
-        # an explicit cap can only lower what free space allows
-        caps.append((r, min(cap, want) if want is not None else cap))
+        dev = r.stat().st_dev
+        if dev not in budget:
+            keep = headroom + (reserve if dev == out_dev else 0)
+            budget[dev] = max(0, shutil.disk_usage(r).free - keep)
+            if dev == out_dev and reserve:
+                print(f"[roots] {r} shares a filesystem with {out} — holding back "
+                      f"{reserve / 1e9:.0f} GB for the shells", flush=True)
+        cap = budget[dev] // per
+        if want is not None:
+            cap = min(cap, want)
+        budget[dev] -= cap * per
+        caps.append((r, cap))
     total = sum(c for _, c in caps)
     if total < len(moe):
         raise SystemExit(
@@ -643,7 +728,9 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(cfg, out)
     copy_sidecars(model_dir, out)
-    roots = plan_expert_roots(out, expert_roots, cfg) if expert_roots else None
+    roots = (plan_expert_roots(out, expert_roots, cfg,
+                               reserve=shell_bytes(model_dir, cfg) or 0)
+             if expert_roots else None)
     spare = unused_shards(src, cfg)
     if spare:
         print(f"[free] {len(spare)} shard(s) hold only vision tensors and are never "
@@ -654,6 +741,18 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
     if free_source:
         print(f"[free] --free-source-shards ON: {len(usage)} source shards will be "
               f"DELETED as they are consumed", flush=True)
+        # Shards are normally freed right after the layer that last reads them.
+        # On resume those layers are skipped, so their shards would sit on disk
+        # forever — and the whole point of the flag is that the disk is too small
+        # for that. Release them up front.
+        done = [-1] if (out / ".head.done").exists() else []
+        done += [li for li in range(cfg["num_hidden_layers"])
+                 if (out / f".layer_{li:02d}.done").exists()]
+        if done:
+            print(f"[free] resuming: releasing shards for {len(done)} finished "
+                  "group(s)", flush=True)
+            for li in done:
+                free_consumed_shards(model_dir, src, usage, li)
         # never-read shards can go immediately
         for shard in spare:
             sp = model_dir / shard
@@ -663,6 +762,7 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
                 print(f"[free] removed vision-only {shard}", flush=True)
     n = cfg["num_hidden_layers"]
     kda = set(cfg["kda_layers"])
+    bin_bytes = build_manifest(cfg)["expert_bin_bytes"] * cfg["num_experts"]
     (out / "shells").mkdir(parents=True, exist_ok=True)
 
     # embed + head. Dtypes are PRESERVED, not upcast: the source matrices are
@@ -721,6 +821,18 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
                             scale.view(torch.uint8).numpy(),
                         ))
                     append_repacked_expert(sections, ef)
+            # The loader indexes this bin by a fixed stride from the manifest, so a
+            # size mismatch means an unexpected expert shape or dtype upstream and
+            # every read after the first expert would be misaligned. Catch it here
+            # rather than as garbage logits.
+            got = tmp.stat().st_size
+            if got != bin_bytes:
+                tmp.unlink()
+                raise SystemExit(
+                    f"[export_kimi_k3] layer {li} expert bin is {got} bytes, expected "
+                    f"{bin_bytes} ({cfg['num_experts']} x "
+                    f"{bin_bytes // cfg['num_experts']}) — expert tensor shapes or "
+                    "dtypes are not what the config describes")
             # rename only once complete, so a killed run never leaves a short bin
             final = wdir / f"layer_{li:02d}.bin"
             tmp.rename(final)
@@ -848,8 +960,8 @@ def main():
             raise SystemExit("--model requires --out")
         cfg = load_and_validate_config(a.model / "config.json")
         a.out.mkdir(parents=True, exist_ok=True)
-        check_space(a.out, cfg)
         er = parse_expert_roots(a.expert_roots) if a.expert_roots else None
+        check_space(a.out, cfg, model_dir=a.model, expert_roots=er)
         export_real(a.model, a.out, cfg, free_source=a.free_source_shards,
                     expert_roots=er)
         return

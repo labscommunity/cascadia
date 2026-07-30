@@ -10,7 +10,13 @@ over it, then checks the parts that are easy to get wrong:
   * full export produces the expected tree
   * a killed run resumes and lands byte-identical to a clean one
   * `--expert-roots` places bins off-volume and symlinks them back
-  * `--free-source-shards` deletes only shards no later layer reads
+  * `--free-source-shards` deletes only shards no later layer reads, including
+    on resume, where the layers that consumed them are skipped
+  * every expert bin is exactly the size the manifest promises
+  * the pre-flight sizes `<out>` for what actually lands there
+  * roots sharing one filesystem do not double-count its free space
+  * a root on `<out>`'s filesystem leaves room for the shells
+  * resuming into an export built from a different config is refused
 
 `--with-loader` adds the check that closes the loop: it runs the exported tree
 through the Rust `k3_run` example, so a drift between what the exporter writes
@@ -21,6 +27,7 @@ Run:  python tools/kimi_k3_ref/selftest_export_real.py [--with-loader]
 import json
 import shutil
 import sys
+from unittest import mock
 import tempfile
 from pathlib import Path
 
@@ -196,6 +203,13 @@ def build_checkpoint(root: Path, shards: int = 4) -> None:
     )
 
 
+def os_statvfs_like(free: int):
+    """Minimal stand-in for `shutil.disk_usage`'s named tuple."""
+    from collections import namedtuple
+
+    return namedtuple("usage", "total used free")(free * 2, free, free)
+
+
 def tree_digest(out: Path) -> dict:
     """Content hash of every produced file, following symlinks."""
     import hashlib
@@ -279,6 +293,101 @@ def main() -> int:
         results.append(check(
             "source shards freed", len(left) == 0, f": {len(left)} left"))
         results.append(check("freed-run export == clean export", tree_digest(d) == da))
+
+        # 4b. resume + --free-source-shards: shards consumed by the layers that
+        # are now skipped must still be released, or a too-small disk fills up
+        ck3, e = tmp / "ckpt3", tmp / "out_part"
+        shutil.copytree(ck, ck3)
+        X.export_real(ck3, e, cfg)                       # full run, no freeing
+        before = len(list(ck3.glob("*.safetensors")))
+        X.export_real(ck3, e, cfg, free_source=True)     # every layer already done
+        after = len(list(ck3.glob("*.safetensors")))
+        results.append(check(
+            "resume frees shards of finished layers",
+            before > 0 and after == 0, f": {before} -> {after}"))
+
+        # 5. an expert bin of the wrong size must not be committed
+        real_append = X.append_repacked_expert
+
+        def short_write(sections, f):
+            real_append(sections, f)
+            f.write(b"\x00")                             # one byte too many
+
+        f = tmp / "out_badsize"
+        X.append_repacked_expert = short_write
+        try:
+            X.export_real(ck, f, cfg)
+            caught = False
+        except SystemExit as ex:
+            caught = "expert bin is" in str(ex)
+        finally:
+            X.append_repacked_expert = real_append
+        results.append(check(
+            "wrong-size expert bin rejected",
+            caught and not list((f / "experts").glob("*"))))
+
+        # 6. resuming with a changed config must be refused, not silently mixed
+        cfg2 = dict(cfg, vocab_size=cfg["vocab_size"] + 1)
+        try:
+            X.export_real(ck, a, cfg2)
+            caught = False
+        except SystemExit as ex:
+            caught = "different config" in str(ex)
+        results.append(check("config drift on resume refused", caught))
+
+        # 7. the pre-flight must size <out> for what lands there: with
+        # --expert-roots the bins go elsewhere, so demanding room for them would
+        # reject the very layout the flag exists to enable
+        need_shell = X.shell_bytes(ck, cfg)
+        free = need_shell + X.expert_bytes(cfg) // 2      # fits shells, not experts
+        with mock.patch("shutil.disk_usage",
+                        return_value=os_statvfs_like(free)):
+            try:
+                X.check_space(tmp, cfg, model_dir=ck)
+                no_roots_failed = False
+            except SystemExit:
+                no_roots_failed = True
+            try:
+                X.check_space(tmp, cfg, model_dir=ck, expert_roots=[(tmp, None)])
+                with_roots_ok = True
+            except SystemExit:
+                with_roots_ok = False
+        results.append(check(
+            "preflight: experts counted only without --expert-roots",
+            no_roots_failed and with_roots_ok))
+
+        # 8. two roots on one filesystem share its free space
+        per = X.build_manifest(cfg)["expert_bin_bytes"] * cfg["num_experts"]
+        n_moe = NL - 1
+        # room for fewer layers than needed, but enough that double-counting
+        # two roots would look sufficient
+        room = (n_moe - 1) * per
+        g = tmp / "out_samefs"
+        with mock.patch("shutil.disk_usage",
+                        return_value=os_statvfs_like(40 * 1024**3 + room)):
+            try:
+                X.plan_expert_roots(g, [(tmp / "s1", None), (tmp / "s2", None)], cfg)
+                shared = False
+            except SystemExit as ex:
+                shared = "expert roots hold" in str(ex)
+        results.append(check("same-filesystem roots not double-counted", shared))
+
+        # 9. a root on <out>'s own filesystem must leave room for the shells,
+        # which are not written yet and so still look like free space
+        room = (n_moe + 2) * per                  # enough for every layer...
+        h = tmp / "out_reserve"
+        with mock.patch("shutil.disk_usage",
+                        return_value=os_statvfs_like(40 * 1024**3 + room)):
+            plain = X.plan_expert_roots(h, [(h / "e", None)], cfg)
+            h2 = tmp / "out_reserve2"
+            try:                                  # ...but not once 3 layers' worth
+                X.plan_expert_roots(h2, [(h2 / "e", None)], cfg, reserve=3 * per)
+                reserved = False
+            except SystemExit as ex:
+                reserved = "expert roots hold" in str(ex)
+        results.append(check(
+            "shell space reserved on <out>'s filesystem",
+            len(plain) == n_moe and reserved))
 
         # 5. the export actually loads and generates in the engine
         if "--with-loader" in sys.argv:
