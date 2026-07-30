@@ -179,6 +179,35 @@ pub fn usage_path(model_dir: &Path) -> std::path::PathBuf {
     model_dir.join(".k3_usage")
 }
 
+/// Windows equivalents of the Unix memory hints.
+///
+/// The fleet deployment target is Windows, where `madvise`/`mlock` do not exist.
+/// Without these every hint below was a silent no-op on exactly the machines they
+/// were written for. Mirrors the block `dsv4::expert_mmap` already proves, kept
+/// local so the k3 shell does not reach into a sibling backend for platform glue.
+#[cfg(windows)]
+mod win {
+    use core::ffi::c_void;
+
+    #[repr(C)]
+    pub struct Win32MemoryRangeEntry {
+        pub virtual_address: *mut c_void,
+        pub number_of_bytes: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn VirtualLock(address: *const c_void, size: usize) -> i32;
+        pub fn GetCurrentProcess() -> isize;
+        pub fn PrefetchVirtualMemory(
+            process: isize,
+            number_of_entries: usize,
+            addresses: *const Win32MemoryRangeEntry,
+            flags: u32,
+        ) -> i32;
+    }
+}
+
 /// Lock `len` bytes at `addr` into RAM. Best-effort: a failure (rlimit, lack of
 /// privilege) is reported, never fatal — the run still works, just colder.
 pub fn pin_range(addr: usize, len: usize) -> bool {
@@ -191,7 +220,13 @@ pub fn pin_range(addr: usize, len: usize) -> bool {
         // SAFETY: [addr, addr+len) is a live read-only mapping owned by the caller.
         unsafe { mlock(addr as *const c_void, len) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // SAFETY: a live mapping owned by the caller. VirtualLock pins it into
+        // the working set; the process quota bounds how much can be locked.
+        unsafe { win::VirtualLock(addr as *const core::ffi::c_void, len) != 0 }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (addr, len);
         false
@@ -272,7 +307,20 @@ pub fn advise_willneed(addr: usize, len: usize) -> bool {
         // pages. madvise only starts read-ahead; it never writes to the range.
         unsafe { madvise(a as *mut c_void, l, MADV_WILLNEED) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // PrefetchVirtualMemory is the analogue: an async read-ahead over an
+        // explicit range, which is in fact a closer fit than madvise's advisory
+        // flag. No page alignment requirement.
+        let entry = win::Win32MemoryRangeEntry {
+            virtual_address: addr as *mut core::ffi::c_void,
+            number_of_bytes: len,
+        };
+        // SAFETY: `entry` describes a live mapping owned by the caller;
+        // PrefetchVirtualMemory only reads the descriptor and queues a read.
+        unsafe { win::PrefetchVirtualMemory(win::GetCurrentProcess(), 1, &entry, 0) != 0 }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (addr, len);
         false
