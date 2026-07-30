@@ -2125,9 +2125,17 @@ impl OvRuntimeEngine {
                                 warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
+                                // Probe A on the HEAD. Every probe so far looked only at the tail; in
+                                // plane mode the head self-pulls (possibly from a different store than
+                                // chain mode negotiates against), so if the head's digest differs
+                                // between modes the defect is one rank up from where we have been
+                                // looking.
                                 info!(
                                     warm_prefix,
                                     matched = len,
+                                    blob_digest = crate::kv_coordination::byte_digest(&blob),
+                                    blob_len = blob.len(),
+                                    plane = self.plane_restore,
                                     "ov-runtime warm-resumed from KV blob"
                                 );
                             } else {
@@ -3821,9 +3829,26 @@ impl OvRuntimeEngine {
     /// chain. Mirrors the carried-blob RESTORE path; the holder loop drives it via `apply_warm_resume`.
     #[cfg(feature = "kv_coord")]
     pub(crate) fn apply_warm_resume_blob(&mut self, blob: &[u8]) -> bool {
+        // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past
+        // the resume depth when this landed — the timing candidate's signature.
+        let pos_before = self.position;
         match self.runtime.set_state_blob(blob) {
             Ok(()) => {
                 self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
+                // Probe A+B (PLANE apply site). `position` settled the depth question (head 97 == tail
+                // 97, mismatch refuted). What remains is whether the BYTES differ from the chain path's
+                // and WHEN this lands relative to the turn — hence the digest plus the pre-apply
+                // position. Compare `blob_digest` here against `ov_tail_restore_carried`'s for the same
+                // prompt: equal ⇒ blob-content refuted and the timing ledger decides; unequal ⇒ the two
+                // modes are applying different state and the keying/store path is the defect.
+                info!(
+                    position = self.position,
+                    position_before = pos_before,
+                    blob_digest = crate::kv_coordination::byte_digest(blob),
+                    blob_len = blob.len(),
+                    mode = "plane",
+                    "ov-runtime: apply_warm_resume set position"
+                );
                 self.kv_warm_pending = true;
                 true
             }
@@ -4181,12 +4206,23 @@ impl OvRuntimeEngine {
                 // stash (the same-chain path, where the rank captured its own slice).
                 let carried = t.data.get(9..).filter(|b| !b.is_empty());
                 let local_ok = if let Some(blob) = carried {
+                    let pos_before = self.position;
                     match self.runtime.set_state_blob(blob) {
                         Ok(()) => {
                             self.position =
                                 crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
                             self.kv_warm_pending = true;
-                            info!(epoch, blob_len = blob.len(), "ov_tail_restore_carried");
+                            // Probe A REFERENCE point: this is the certified byte-identical path, so
+                            // its digest is the known-good value the plane apply must match.
+                            info!(
+                                epoch,
+                                blob_len = blob.len(),
+                                blob_digest = crate::kv_coordination::byte_digest(blob),
+                                position = self.position,
+                                position_before = pos_before,
+                                mode = "chain",
+                                "ov_tail_restore_carried"
+                            );
                             true
                         }
                         Err(e) => {

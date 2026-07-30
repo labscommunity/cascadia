@@ -2633,12 +2633,25 @@ impl OvDistSpecEngine {
             // feeding the draft the gap token(s) (their KV is exactly what the target already holds), so
             // `start_task`'s single shared suffix feed lands at the right position on both. Draft ahead,
             // or a wider gap, can't be reconciled by one suffix ⇒ cold.
-            let d_pos = crate::kv_coordination::kv_seq_from_blob(&parts[0])
-                .map(|s| s.min(len))
-                .unwrap_or(len);
-            let t_pos = crate::kv_coordination::kv_seq_from_blob(&parts[1])
-                .map(|s| s.min(len))
-                .unwrap_or(len);
+            // Neither position may be CLAMPED or GUESSED. The guard below exists to reject a draft that
+            // is ahead of the target, and both `.min(len)` and `unwrap_or(len)` erased exactly that
+            // signal: a draft deeper than the matched prefix — or one whose depth failed to parse — came
+            // back as `d_pos == len == t_pos`, which reads as a legal zero gap. `kv_set_pos` then pointed
+            // the draft past what its tensors actually hold and the next shared-suffix feed died inside
+            // OpenVINO's eltwise broadcast ("Argument shapes are inconsistent"), taking the turn (and the
+            // engine) with it. Rig: warm_prefix=98/d_pos=97 resumed cleanly; warm_prefix=154/d_pos=154
+            // faulted. Unknown depth is now cold, not a fabricated position — cold is always recoverable.
+            let (Some(d_pos), Some(t_raw)) = (
+                crate::kv_coordination::kv_seq_from_blob(&parts[0]),
+                crate::kv_coordination::kv_seq_from_blob(&parts[1]),
+            ) else {
+                warn!("ov-dist-spec: draft/target KV depth unreadable; cold reprefill");
+                let _ = self.target.reset();
+                let _ = self.draft.reset();
+                return 0;
+            };
+            // The target defines the resume point, so it alone clamps to the matched prefix.
+            let t_pos = t_raw.min(len);
             if d_pos <= t_pos && t_pos - d_pos <= 1 {
                 self.target.kv_set_pos(t_pos);
                 self.draft.kv_set_pos(d_pos);
@@ -2656,10 +2669,7 @@ impl OvDistSpecEngine {
                 );
                 t_pos
             } else {
-                warn!(
-                    d_pos,
-                    t_pos, "ov-dist-spec: draft/target KV depth out of range; cold reprefill"
-                );
+                warn!(d_pos, t_pos, len, "ov-dist-spec: draft/target KV depth out of range; cold reprefill");
                 let _ = self.target.reset();
                 let _ = self.draft.reset();
                 0
