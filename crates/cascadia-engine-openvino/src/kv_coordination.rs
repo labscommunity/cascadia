@@ -327,11 +327,16 @@ pub(crate) struct OvKvCache {
     /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
     captures: HashMap<u64, (Vec<i32>, Vec<u8>)>,
-    /// Issue-34 multi-stage cross-chain warm-resume: `epoch → downstream rank's pulled blob`. The head
+    /// Issue-34 multi-stage cross-chain warm-resume: `(epoch, rank) → that rank's pulled blob`. The head
     /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
-    /// ships it inline in the `RESTORE(epoch)` frame to that rank (which `set_state`s it). 2-stage today
-    /// (one downstream); keyed by the content epoch so it matches the head's RESTORE epoch. Bounded.
-    downstream: HashMap<u64, Vec<u8>>,
+    /// ships it inline in the `RESTORE(epoch)` frame to that rank (which `set_state`s it).
+    ///
+    /// Keyed by (epoch, rank), NOT epoch alone: `pull_on_miss` fans out `for rank in 0..num_ranks` and
+    /// every rank shares one content epoch, so an epoch-only key made each rank's blob overwrite the
+    /// previous one and the head shipped the LAST rank's KV to rank 1 — silently wrong state rather
+    /// than a cold fallback. Invisible at 2 stages (exactly one downstream rank, nothing to overwrite),
+    /// which is why the rig certs never caught it. Bounded.
+    downstream: HashMap<(u64, u16), Vec<u8>>,
 }
 
 impl OvKvCache {
@@ -378,23 +383,26 @@ impl OvKvCache {
     }
 
     /// Head: stash a pulled DOWNSTREAM rank's blob for inline delivery in `RESTORE(epoch)`. Bounded.
-    pub(crate) fn stash_downstream(&mut self, epoch: u64, blob: Vec<u8>) {
+    pub(crate) fn stash_downstream(&mut self, epoch: u64, rank: u16, blob: Vec<u8>) {
         if blob.is_empty() {
             return;
         }
-        if self.downstream.len() >= KV_MAX_ENTRIES && !self.downstream.contains_key(&epoch) {
+        let key = (epoch, rank);
+        if self.downstream.len() >= KV_MAX_ENTRIES && !self.downstream.contains_key(&key) {
             if let Some(k) = self.downstream.keys().next().copied() {
                 self.downstream.remove(&k);
             }
         }
         tracing::info!(target: "cascadia::kv", event = "kv_stash_downstream",
-            epoch, blob = blob.len(), n = self.downstream.len() + 1);
-        self.downstream.insert(epoch, blob);
+            epoch, rank, blob = blob.len(), n = self.downstream.len() + 1);
+        self.downstream.insert(key, blob);
     }
 
-    /// Head: take the downstream blob to ship in `RESTORE(epoch)`. Removed on take (one per turn).
-    pub(crate) fn take_downstream(&mut self, epoch: u64) -> Option<Vec<u8>> {
-        self.downstream.remove(&epoch)
+    /// Head: take a specific downstream RANK's blob to ship in its `RESTORE(epoch)`. Removed on take.
+    /// `rank` must be the recipient of that frame — taking by epoch alone returned whichever rank was
+    /// stashed last, which is the wrong tensor set for any chain deeper than 2 stages.
+    pub(crate) fn take_downstream(&mut self, epoch: u64, rank: u16) -> Option<Vec<u8>> {
+        self.downstream.remove(&(epoch, rank))
     }
 
     /// Count of stashed downstream blobs (diagnostic + single-slot fallback guard).
@@ -402,15 +410,18 @@ impl OvKvCache {
         self.downstream.len()
     }
 
-    /// Head: take the ONLY stashed downstream blob, epoch-agnostic. A 2-stage cross-chain move stashes
-    /// exactly one downstream slice per turn, so when the epoch lookup misses (stash/restore key drift)
-    /// the single slot is unambiguously the right blob. Returns None if 0 or >1 are stashed (3+-stage
-    /// must key per (epoch,rank) — see follow-up). Removed on take.
-    pub(crate) fn take_downstream_single(&mut self) -> Option<Vec<u8>> {
+    /// Head: epoch-agnostic fallback for the ONE stashed blob belonging to `rank`. Covers stash/restore
+    /// epoch-key drift (the stash keys by the pulled rank's manifest tokens, restore by the head's warm
+    /// prefix). Returns None unless exactly one blob is stashed AND it is that rank's, so a deeper chain
+    /// can never recover the wrong rank's tensors through this path — it goes cold instead.
+    pub(crate) fn take_downstream_single(&mut self, rank: u16) -> Option<Vec<u8>> {
         if self.downstream.len() != 1 {
             return None;
         }
         let k = *self.downstream.keys().next()?;
+        if k.1 != rank {
+            return None;
+        }
         self.downstream.remove(&k)
     }
 
@@ -631,7 +642,7 @@ impl KvCoordination for OvRuntimeEngine {
 
     fn stash_downstream_rank(
         &mut self,
-        _rank: u16,
+        rank: u16,
         manifest: &Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
@@ -639,7 +650,7 @@ impl KvCoordination for OvRuntimeEngine {
         // stash it under the content epoch so `send_restore_downstream` ships it inline to that rank.
         let (_tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
         let epoch = synth_epoch(&manifest.token_ids);
-        self.kv_cache_mut().stash_downstream(epoch, blob);
+        self.kv_cache_mut().stash_downstream(epoch, rank, blob);
         Ok(())
     }
 
@@ -650,6 +661,12 @@ impl KvCoordination for OvRuntimeEngine {
             None => return false,
         };
         self.apply_warm_resume_blob(&blob)
+    }
+
+    fn abort_warm_resume(&mut self, _epoch: u64) {
+        // The head rejected the chain-wide verdict after this rank already applied; drop back to cold
+        // so it cannot serve (or contaminate the next request with) a half-committed warm state.
+        self.abort_warm_resume_local();
     }
 }
 
