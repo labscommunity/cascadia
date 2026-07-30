@@ -201,3 +201,81 @@ fn generation_matches_across_single_and_split_sources() {
         "split export generated different tokens"
     );
 }
+
+/// Restoring a cached prefix and prefilling only the suffix must land on exactly
+/// the same state as prefilling the whole prompt.
+///
+/// This is the assertion the feature lives or dies on. A restore swaps every
+/// layer's state at once — the KDA recurrence and the MLA latent cache — and if
+/// they disagree about position the run is silently wrong rather than broken, so
+/// only an exact comparison catches it. The hit counter is checked too: without
+/// it a green assertion could just mean the cache never engaged.
+#[test]
+fn prefix_restore_plus_suffix_matches_full_prefill() {
+    let Some(dir) = export_dir() else { return };
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let split = 3; // cache covers [0,3), suffix is [3,5)
+
+    // Asserted here rather than in its own test: the setting is an env var, and
+    // cargo runs tests in the same process in parallel, so a sibling test that
+    // sets it would race this one.
+    std::env::remove_var("CASCADIA_K3_PREFIX_CACHE");
+    assert!(
+        !K3Runner::load(&dir, 0, 1, 64)
+            .expect("load")
+            .prefix_cache_enabled(),
+        "cache must be off unless a byte budget is set"
+    );
+
+    std::env::set_var("CASCADIA_K3_PREFIX_CACHE", "268435456"); // 256 MiB
+    let hs = {
+        let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
+        r.hidden_size()
+    };
+
+    // reference: one uninterrupted prefill over the whole prompt
+    let mut a = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    a.reset();
+    let mut batch = vec![0.0f32; prompt.len() * hs];
+    for (r, &t) in prompt.iter().enumerate() {
+        batch[r * hs..(r + 1) * hs].copy_from_slice(&a.embed_token(t));
+    }
+    let full = a.forward_layers_batch(batch, 0, prompt.len());
+    let want = a.head_logits(&full[(prompt.len() - 1) * hs..prompt.len() * hs]);
+
+    // cached: prefill the head, snapshot, reset, restore, prefill only the suffix
+    let mut b = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    assert!(b.prefix_cache_enabled(), "budget should enable the cache");
+    b.reset();
+    let mut head = vec![0.0f32; split * hs];
+    for (r, &t) in prompt[..split].iter().enumerate() {
+        head[r * hs..(r + 1) * hs].copy_from_slice(&b.embed_token(t));
+    }
+    b.forward_layers_batch(head, 0, split);
+    b.cache_prefix(0xC0FFEE);
+
+    let (hits_before, _) = cascadia_engine_sparse_moe::k3::prof::prefix_stats();
+    b.reset();
+    let reused = b.restore_prefix(0xC0FFEE).expect("cache should hit");
+    assert_eq!(reused, split, "restore must report the covered length");
+    let (hits_after, toks) = cascadia_engine_sparse_moe::k3::prof::prefix_stats();
+    assert_eq!(hits_after, hits_before + 1, "a real hit must be recorded");
+    assert!(toks >= split as u64);
+
+    let n = prompt.len() - split;
+    let mut tail = vec![0.0f32; n * hs];
+    for (r, &t) in prompt[split..].iter().enumerate() {
+        tail[r * hs..(r + 1) * hs].copy_from_slice(&b.embed_token(t));
+    }
+    let out = b.forward_layers_batch(tail, split, n);
+    let got = b.head_logits(&out[(n - 1) * hs..n * hs]);
+    std::env::remove_var("CASCADIA_K3_PREFIX_CACHE");
+
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+            "logit {i}: restored+suffix {g} vs full prefill {w}"
+        );
+    }
+}

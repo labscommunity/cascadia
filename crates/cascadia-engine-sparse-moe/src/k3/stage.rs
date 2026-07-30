@@ -51,6 +51,80 @@ pub struct K3Runner {
     /// Where the learned routing histogram is kept.
     usage_path: std::path::PathBuf,
     pinned: usize,
+    /// Tokens this rank's state has consumed.
+    ///
+    /// K3 otherwise carries position implicitly — `forward_layers` ignores the
+    /// `pos` argument because the KDA recurrence and the MLA cache each advance
+    /// themselves. The prefix cache needs it explicitly: a rank slice can be all
+    /// KDA, and KDA state has no length to read back off it.
+    pos: usize,
+    /// Cached post-prefill state, keyed by the caller's prefix key.
+    ///
+    /// Prefill is the expensive half — batch-union touches up to `rows * top_k`
+    /// distinct experts per layer, measured at ~129 GB for a 5-token prompt — so a
+    /// shared system prompt is worth not re-paying. Off unless
+    /// `CASCADIA_K3_PREFIX_CACHE` sets a byte budget.
+    prefix: PrefixStore,
+}
+
+/// A tiny LRU over whole-model state snapshots, bounded by bytes.
+///
+/// One entry is every layer's state at some position, so entries are large and
+/// few: the budget is in bytes rather than count because a long-context entry can
+/// be orders of magnitude bigger than a short one.
+#[derive(Default)]
+struct PrefixStore {
+    budget: usize,
+    bytes: usize,
+    /// `(key, states, covered_tokens)`, insertion order (see `get`).
+    entries: Vec<(u64, Vec<LayerState>, usize)>,
+}
+
+impl PrefixStore {
+    fn new() -> Self {
+        let budget = std::env::var("CASCADIA_K3_PREFIX_CACHE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        Self {
+            budget,
+            ..Default::default()
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.budget > 0
+    }
+
+    /// Clone rather than take-and-reinsert: a hit must NOT reorder the LRU.
+    /// Rank 0's token index and every rank's store evict in lockstep, which only
+    /// holds if eviction is pure insertion order with no refresh on read — the
+    /// same constraint glm's slice cache documents.
+    fn get(&self, key: u64) -> Option<(Vec<LayerState>, usize)> {
+        let (_, states, covered) = self.entries.iter().find(|(k, ..)| *k == key)?;
+        Some((states.clone(), *covered))
+    }
+
+    fn put(&mut self, key: u64, states: &[LayerState], covered: usize) {
+        if !self.enabled() || self.entries.iter().any(|(k, ..)| *k == key) {
+            return;
+        }
+        let sz: usize = states.iter().map(|s| s.approx_bytes()).sum();
+        if sz > self.budget {
+            return; // one entry alone blows the budget; caching it is pointless
+        }
+        while self.bytes + sz > self.budget {
+            match self.entries.first() {
+                Some(_) => {
+                    let old = self.entries.remove(0);
+                    self.bytes -= old.1.iter().map(|s| s.approx_bytes()).sum::<usize>();
+                }
+                None => break,
+            }
+        }
+        self.entries.push((key, states.to_vec(), covered));
+        self.bytes += sz;
+    }
 }
 
 impl Drop for K3Runner {
@@ -145,6 +219,8 @@ impl K3Runner {
             eos,
             usage_path: usage_p,
             pinned,
+            pos: 0,
+            prefix: PrefixStore::new(),
         })
     }
 
@@ -202,7 +278,44 @@ impl StagedRunner for K3Runner {
         for s in self.states.iter_mut() {
             s.clear();
         }
+        self.pos = 0;
         prof::new_sequence();
+    }
+
+    fn prefix_cache_enabled(&self) -> bool {
+        self.prefix.enabled()
+    }
+
+    /// Restore every layer's state as it stood after the cached prefix, and
+    /// report how many prompt tokens that covers so the caller can skip them.
+    ///
+    /// Restoring is a whole-model swap because K3 carries state in both layer
+    /// kinds — the KDA recurrence and the MLA latent cache — and they must agree
+    /// on position or the run is silently wrong.
+    /// Restore every layer's state as it stood after the cached prefix and report
+    /// how many tokens that covers, so the caller prefills only the suffix.
+    ///
+    /// This is a whole-slice swap because K3 carries state in both layer kinds —
+    /// the KDA recurrence and the MLA latent cache — and they must agree on
+    /// position, or the run is silently wrong rather than obviously broken.
+    fn restore_prefix(&mut self, key: u64) -> Option<usize> {
+        let (states, covered) = self.prefix.get(key)?;
+        if states.len() != self.states.len() {
+            return None; // a different rank slice; not ours to restore
+        }
+        self.states = states;
+        self.pos = covered;
+        prof::note_prefix_hit(covered);
+        Some(covered)
+    }
+
+    fn cache_prefix(&mut self, key: u64) {
+        if self.pos == 0 {
+            return;
+        }
+        let states = std::mem::take(&mut self.states);
+        self.prefix.put(key, &states, self.pos);
+        self.states = states;
     }
 
     /// Rank 0: the embedding row becomes the prefix sum; the stack starts empty.
@@ -218,6 +331,7 @@ impl StagedRunner for K3Runner {
     }
 
     fn forward_layers(&mut self, hidden: Vec<f32>, _pos: usize, _token: Option<u32>) -> Vec<f32> {
+        self.pos += 1;
         assert_eq!(hidden.len(), self.wire, "k3: bad wire width");
         let mut w = hidden;
         let (h, _) = self.split_wire(&mut w);
@@ -251,6 +365,7 @@ impl StagedRunner for K3Runner {
 
     fn forward_layers_batch(&mut self, hidden: Vec<f32>, _base: usize, rows: usize) -> Vec<f32> {
         assert_eq!(hidden.len(), rows * self.wire, "k3: bad batch wire width");
+        self.pos += rows;
         let h = self.hidden;
         let mb = self.max_blocks;
 

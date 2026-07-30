@@ -67,6 +67,10 @@ static LAST_RESIDENT: AtomicU64 = AtomicU64::new(0);
 static LAST_PROBED: AtomicU64 = AtomicU64::new(0);
 static LAST_REUSED: AtomicU64 = AtomicU64::new(0);
 static LAST_SELECTED: AtomicU64 = AtomicU64::new(0);
+/// Prompt tokens served from the prefix cache, so a test can prove a hit
+/// happened rather than inferring it from a green assertion.
+static PREFIX_HITS: AtomicU64 = AtomicU64::new(0);
+static PREFIX_TOKENS: AtomicU64 = AtomicU64::new(0);
 
 fn last_set() -> &'static Mutex<HashSet<(u32, u32)>> {
     static S: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
@@ -179,6 +183,20 @@ pub fn dump(tag: &str) {
          total={:.1}GB",
         cur_bytes as f64 / 1e9
     );
+}
+
+/// Record that a prefix-cache hit served `consumed` prompt tokens.
+pub fn note_prefix_hit(consumed: usize) {
+    PREFIX_HITS.fetch_add(1, Ordering::Relaxed);
+    PREFIX_TOKENS.fetch_add(consumed as u64, Ordering::Relaxed);
+}
+
+/// `(hits, tokens_served)` since process start.
+pub fn prefix_stats() -> (u64, u64) {
+    (
+        PREFIX_HITS.load(Ordering::Relaxed),
+        PREFIX_TOKENS.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]

@@ -76,6 +76,12 @@ pub struct KdaDims {
 }
 
 /// Carried KDA state: the `[heads, K, V]` recurrence plus three conv windows.
+///
+/// `Clone` is what makes prefix caching and speculative rollback possible: the
+/// recurrence is destructive (`kda_step` overwrites `recurrent` in place), so the
+/// only way back to an earlier position is to have kept a copy. It is fixed-size
+/// regardless of sequence length, which is what makes keeping one cheap.
+#[derive(Clone)]
 pub struct KdaState {
     pub recurrent: Vec<f32>,
     pub conv_q: Vec<f32>,
@@ -200,6 +206,7 @@ pub struct K3Layer<E: ExpertSource> {
 }
 
 /// Mutable per-layer state (KDA recurrence or MLA KV).
+#[derive(Clone)]
 pub enum LayerState {
     Kda(Box<KdaState>),
     Mla(MlaKv),
@@ -210,6 +217,21 @@ impl LayerState {
         match self {
             LayerState::Kda(s) => s.clear(),
             LayerState::Mla(kv) => kv.clear(),
+        }
+    }
+
+    /// Bytes this state currently occupies — the cost of snapshotting it.
+    ///
+    /// KDA is fixed-size; only the MLA latent cache grows with position, so a
+    /// long-prefix snapshot is dominated by the 24 MLA layers, not the 69 KDA
+    /// ones.
+    pub fn approx_bytes(&self) -> usize {
+        const F: usize = std::mem::size_of::<f32>();
+        match self {
+            LayerState::Kda(s) => {
+                (s.recurrent.len() + s.conv_q.len() + s.conv_k.len() + s.conv_v.len()) * F
+            }
+            LayerState::Mla(kv) => kv.latent.len() * F,
         }
     }
 }

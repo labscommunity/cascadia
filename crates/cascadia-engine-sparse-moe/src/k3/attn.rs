@@ -83,7 +83,7 @@ impl MlaDims {
 ///
 /// `Lc` is stored ALREADY RMS-normalised, so the norm is paid once per token
 /// instead of once per cached position per step.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MlaKv {
     pub latent: Vec<f32>,
     pub len: usize,
