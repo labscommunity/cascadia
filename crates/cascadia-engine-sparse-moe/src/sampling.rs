@@ -322,4 +322,36 @@ mod tests {
         let r = sample(&l, &[], &cfg, &mut s);
         assert_eq!(r, 0);
     }
+
+    // The invariant the discarded-prefill-sample fix rests on: a temperature-0 draw must not consume
+    // RNG. `engine.rs` routes DISCARDED prefill samples through a temperature-0 config precisely so a
+    // warm-resumed run — which skips `warm_prefix` forwards — leaves the RNG at the same offset a cold
+    // run does. If temperature 0 ever starts drawing, warm and cold silently diverge for every
+    // temperature > 0 request, which no greedy cert can observe.
+    #[test]
+    fn temperature_zero_does_not_advance_the_rng() {
+        let mut l = vec![0.1_f32; 32];
+        l[7] = 9.0;
+        let mut cfg = SamplingConfig::default();
+        cfg.temperature = 0.0;
+        let mut s = 0xDEAD_BEEF_u64;
+        let before = s;
+        for _ in 0..16 {
+            assert_eq!(sample(&l, &[], &cfg, &mut s), 7);
+        }
+        assert_eq!(s, before, "temperature-0 sampling must not touch the RNG state");
+    }
+
+    #[test]
+    fn temperature_above_zero_does_advance_the_rng() {
+        // Guards the test above from passing vacuously (e.g. if `sample` stopped using this state at
+        // all): the >0 path must move what the 0 path leaves alone.
+        let l = vec![1.0_f32; 32];
+        let mut cfg = SamplingConfig::default();
+        cfg.temperature = 1.0;
+        let mut s = 0xDEAD_BEEF_u64;
+        let before = s;
+        let _ = sample(&l, &[], &cfg, &mut s);
+        assert_ne!(s, before, "temperature>0 sampling must advance the RNG state");
+    }
 }

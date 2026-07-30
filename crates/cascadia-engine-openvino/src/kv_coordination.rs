@@ -53,6 +53,32 @@ pub(crate) fn synth_epoch(prefix: &[i32]) -> u64 {
     fnv1a64(&buf)
 }
 
+/// FNV-1a digest of raw bytes — identity only, for cross-rank / cross-mode comparison in the logs.
+///
+/// Deliberately over RAW BYTES, never over lengths or manifest fields: an earlier probe compared the
+/// manifest's token COUNT on both sides, found 98 == 98, and read that as confirmation when the two
+/// numbers were trivially equal by construction. Hash what actually gets applied.
+pub(crate) fn byte_digest(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Same digest over a token slice, so a rank's token identity can be compared without dumping it.
+pub(crate) fn tokens_digest(tokens: &[i32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in tokens {
+        for &b in &t.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
 /// Restored KV depth (max `shape[2]` over rank≥3 states) from a `get_state_blob` blob — `[u32 count]`
 /// then per state `[u32 name_len][name][u8 dtype][u8 rank][u64×rank shape][u64 nb][data]` (LE).
 ///
@@ -439,6 +465,13 @@ impl OvKvCache {
         } else {
             return None;
         };
+        // Probe A (serve side): identity of exactly what this holder is about to hand out, plus which
+        // store it came from. NOTE the check below is LENGTH-only — it never compares tokens — so a
+        // capture stored under a colliding synthesized epoch with the same length but different tokens
+        // would serve silently. `tok_digest` is what makes that visible.
+        tracing::info!(target: "cascadia::kv", event = "kv_serve_digest",
+            epoch, len, blob_digest = byte_digest(&blob), tok_digest = tokens_digest(&tokens),
+            n_tokens = tokens.len(), blob_len = blob.len());
         // Head/offers path carries tokens ⇒ length must match what was negotiated. Worker captures
         // also carry the head-broadcast tokens, so the same check holds for both.
         if tokens.len() as u32 != len {
