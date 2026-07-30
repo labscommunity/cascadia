@@ -1984,6 +1984,9 @@ impl OvRuntimeEngine {
         // is recv'd on its own here rather than through `recv_hidden_frames`:
         // I8 => handle the control and loop to the next activation.
         let want_pos = self.static_kv.is_some();
+        // Re-iterates only on the kv_coord control-frame path (I8 CAPTURE → continue); without
+        // kv_coord that branch is compiled out and the body runs exactly once.
+        #[cfg_attr(not(feature = "kv_coord"), allow(clippy::never_loop))]
         loop {
             let upstream = self
                 .upstream
