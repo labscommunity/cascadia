@@ -85,6 +85,10 @@ def read_ranks(model_dir: Path) -> dict:
             continue
         tok, rank = line.split()
         ranks[base64.b64decode(tok)] = int(rank)
+    if not ranks:
+        raise SystemExit(
+            f"[k3-tok] {p} is empty — a truncated download, most likely. "
+            "Re-fetch it or remove it to export without a tokenizer.")
     return ranks
 
 

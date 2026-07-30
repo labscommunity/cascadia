@@ -476,6 +476,7 @@ def copy_sidecars(model_dir: Path, out: Path):
     engines do not accept, so a naive translation silently mis-splits text and
     looks like a model bug rather than a tokenizer bug.
     """
+    out.mkdir(parents=True, exist_ok=True)
     copied = []
     for name in SIDECARS:
         src = model_dir / name
@@ -639,6 +640,8 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
     completed layers are skipped on a re-run.
     """
     src = CkptSource(model_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    write_manifest(cfg, out)
     copy_sidecars(model_dir, out)
     roots = plan_expert_roots(out, expert_roots, cfg) if expert_roots else None
     spare = unused_shards(src, cfg)
@@ -846,10 +849,10 @@ def main():
         cfg = load_and_validate_config(a.model / "config.json")
         a.out.mkdir(parents=True, exist_ok=True)
         check_space(a.out, cfg)
-        write_manifest(cfg, a.out)
         er = parse_expert_roots(a.expert_roots) if a.expert_roots else None
         export_real(a.model, a.out, cfg, free_source=a.free_source_shards,
                     expert_roots=er)
+        return
     ap.print_help()
 
 
