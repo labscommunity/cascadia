@@ -147,3 +147,68 @@ fn reset_reproduces_a_fresh_sequence() {
         "clear() left KDA recurrence / conv / KV state behind"
     );
 }
+
+#[test]
+fn split_expert_roots_load_identically() {
+    // --expert-roots puts each layer's expert bin on a different filesystem and
+    // symlinks it back into <out>/experts/. The loader opens that path, so a
+    // split export must be indistinguishable from a normal one.
+    //
+    //   python tools/export_kimi_k3.py --tiny <dir> --expert-roots <a>:2,<b>
+    let plain = need!(
+        fixtures_dir().join("kimi_k3_export"),
+        "run tools/export_kimi_k3.py --tiny"
+    );
+    let split = need!(
+        fixtures_dir().join("kimi_k3_export_split"),
+        "run tools/export_kimi_k3.py --tiny … --expert-roots a:2,b"
+    );
+
+    // the split export's expert bins must actually be symlinks elsewhere,
+    // otherwise this test would silently pass on a normal export
+    let l1 = split.join("experts/layer_01.bin");
+    let meta = std::fs::symlink_metadata(&l1).expect("layer_01.bin");
+    assert!(
+        meta.file_type().is_symlink(),
+        "{} is not a symlink — the split export was not produced",
+        l1.display()
+    );
+
+    let toks: Vec<u32> = vec![3, 17, 5, 28, 11];
+    let run = |dir: &std::path::Path| -> Vec<Vec<f32>> {
+        let m = K3Manifest::load(dir).expect("manifest");
+        let d = m.dims();
+        let embed = load_embed(dir).expect("embed");
+        let head = load_head(dir).expect("head");
+        let (mut layers, mut states) =
+            load_layers(dir, &m, 0, m.num_hidden_layers).expect("layers");
+        let h = m.hidden_size;
+        let maxb = max_blocks(m.num_hidden_layers, m.attn_res_block_size);
+        toks.iter()
+            .map(|&t| {
+                let mut prefix = embed[t as usize * h..(t as usize + 1) * h].to_vec();
+                let mut blocks = vec![0.0f32; maxb * h];
+                let nb = forward_slice(&mut layers, &mut states, d, &mut prefix, &mut blocks, 0);
+                let mut x = vec![0.0f32; h];
+                apply_attn_res(
+                    &prefix,
+                    &blocks[..nb * h],
+                    &head.out_res_proj,
+                    &head.out_res_norm,
+                    m.rms_norm_eps,
+                    &mut x,
+                );
+                rmsnorm(&mut x, &head.norm, m.rms_norm_eps);
+                let mut lg = vec![0.0f32; m.vocab_size];
+                linear_bf16_w(&x, &head.lm_head, m.vocab_size, h, &mut lg);
+                lg
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        run(&plain),
+        run(&split),
+        "split export produced different logits"
+    );
+}

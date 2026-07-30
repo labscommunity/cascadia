@@ -255,7 +255,7 @@ def check_space(out: Path, cfg: dict):
 # --------------------------------------------------------------------------
 
 
-def export_tiny(out: Path):
+def export_tiny(out: Path, expert_roots: list | None = None):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from kimi_k3_ref.tiny import tiny_cfg, tiny_weights
 
@@ -266,6 +266,7 @@ def export_tiny(out: Path):
     cfg.setdefault("eos_token_ids", [0])
     out.mkdir(parents=True, exist_ok=True)
     write_manifest(cfg, out)
+    roots = plan_expert_roots(out, expert_roots, cfg) if expert_roots else None
 
     # Store the big matrices bf16, matching the real export, so the loader's
     # BF16 decode path is covered by the tiny fixtures. tiny_weights are already
@@ -299,10 +300,18 @@ def export_tiny(out: Path):
                 flat[f"moe.{k}"] = v.contiguous() if v.ndim <= 1 else bf(v)
             edir = out / "experts"
             edir.mkdir(parents=True, exist_ok=True)
-            with open(edir / f"layer_{i:02d}.bin", "wb") as ef:
+            wdir = roots[i] if roots else edir
+            wdir.mkdir(parents=True, exist_ok=True)
+            final = wdir / f"layer_{i:02d}.bin"
+            with open(final, "wb") as ef:
                 for ew in moe["experts"]:
                     append_expert_bin(ew["w1"].numpy(), ew["w3"].numpy(),
                                       ew["w2"].numpy(), ef)
+            if roots:
+                link = edir / f"layer_{i:02d}.bin"
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(final)
         (out / "shells").mkdir(parents=True, exist_ok=True)
         save_file(flat, str(out / "shells" / f"layer_{i:02d}.safetensors"))
 
@@ -509,6 +518,78 @@ def unused_shards(src: "CkptSource", cfg: dict) -> list:
     return sorted(set(src.map.values()) - used)
 
 
+def parse_expert_roots(spec: str) -> list:
+    """`dir[:max_layers],dir[:max_layers],...` -> [(Path, cap|None)]."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part and part.rsplit(":", 1)[1].isdigit():
+            d, n = part.rsplit(":", 1)
+            out.append((Path(d), int(n)))
+        else:
+            out.append((Path(part), None))
+    return out
+
+
+def plan_expert_roots(out: Path, roots: list, cfg: dict) -> dict:
+    """Assign each MoE layer's expert bin to one of `roots`. Returns {layer: dir}.
+
+    K3's experts are ~1.45 TB and a host may not have that on any single
+    filesystem. Each layer's bin is written to its assigned root and symlinked
+    back to `<out>/experts/layer_NN.bin`, so the export still looks like one
+    directory and the loader (which just opens that path) is unaffected.
+
+    The plan is persisted to `<out>/.expert_roots.json` and reused on resume:
+    recomputing it would give different answers as free space changes, and a
+    layer must not move between runs.
+    """
+    plan_p = out / ".expert_roots.json"
+    if plan_p.exists():
+        saved = json.loads(plan_p.read_text())
+        print(f"[roots] reusing plan for {len(saved)} layers from {plan_p.name}",
+              flush=True)
+        return {int(k): Path(v) for k, v in saved.items()}
+
+    import shutil
+    # a LAYER's bin holds every expert, not one — expert_bin_bytes is per expert
+    per = build_manifest(cfg)["expert_bin_bytes"] * cfg["num_experts"]
+    headroom = 40 * 1024**3
+    moe = [li for li in range(cfg["num_hidden_layers"])
+           if li >= cfg["first_k_dense_replace"]]
+
+    caps = []
+    for r, want in roots:
+        r.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(r).free
+        cap = max(0, (free - headroom) // per)
+        # an explicit cap can only lower what free space allows
+        caps.append((r, min(cap, want) if want is not None else cap))
+    total = sum(c for _, c in caps)
+    if total < len(moe):
+        raise SystemExit(
+            f"[export_kimi_k3] expert roots hold {total} layers, need {len(moe)}.\n"
+            + "\n".join(f"    {r}: room for {c} ({c * per / 1e9:.0f} GB)"
+                         for r, c in caps)
+            + f"\n  short by {(len(moe) - total) * per / 1e9:.0f} GB")
+
+    plan, it = {}, iter(moe)
+    for r, cap in caps:
+        for _ in range(cap):
+            li = next(it, None)
+            if li is None:
+                break
+            plan[li] = r
+    out.mkdir(parents=True, exist_ok=True)
+    plan_p.write_text(json.dumps({str(k): str(v) for k, v in plan.items()}, indent=1))
+    for r, cap in caps:
+        n = sum(1 for v in plan.values() if v == r)
+        if n:
+            print(f"[roots] {n:>3} layers ({n * per / 1e9:6.1f} GB) -> {r}", flush=True)
+    return plan
+
+
 def build_shard_usage(src: "CkptSource", cfg: dict) -> dict:
     """shard -> the highest layer index that still reads it.
 
@@ -550,7 +631,8 @@ def free_consumed_shards(model_dir: Path, src: "CkptSource", last: dict, done_li
               flush=True)
 
 
-def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False):
+def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False,
+                expert_roots: list | None = None):
     """Stream the checkpoint into the sparse-moe layout, one layer at a time.
 
     Resumable: a `.layer_NN.done` marker is written after each layer and
@@ -558,6 +640,7 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
     """
     src = CkptSource(model_dir)
     copy_sidecars(model_dir, out)
+    roots = plan_expert_roots(out, expert_roots, cfg) if expert_roots else None
     spare = unused_shards(src, cfg)
     if spare:
         print(f"[free] {len(spare)} shard(s) hold only vision tensors and are never "
@@ -617,8 +700,13 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
         if li >= cfg["first_k_dense_replace"]:
             edir = out / "experts"
             edir.mkdir(parents=True, exist_ok=True)
+            # with --expert-roots the bin lives on another filesystem; the .part
+            # is created THERE so the rename stays atomic and no transient data
+            # lands on the export volume
+            wdir = roots[li] if roots else edir
+            wdir.mkdir(parents=True, exist_ok=True)
             eb = f"{base}block_sparse_moe.experts."
-            tmp = edir / f"layer_{li:02d}.bin.part"
+            tmp = wdir / f"layer_{li:02d}.bin.part"
             with open(tmp, "wb") as ef:
                 for e in range(cfg["num_experts"]):
                     sections = []
@@ -631,7 +719,13 @@ def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False
                         ))
                     append_repacked_expert(sections, ef)
             # rename only once complete, so a killed run never leaves a short bin
-            tmp.rename(edir / f"layer_{li:02d}.bin")
+            final = wdir / f"layer_{li:02d}.bin"
+            tmp.rename(final)
+            if roots:
+                link = edir / f"layer_{li:02d}.bin"
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(final)
         marker.write_text("ok\n")
         print(f"[layer {li:02d}/{n - 1}] {'kda' if li in kda else 'mla'} done", flush=True)
         if usage is not None:
@@ -715,6 +809,11 @@ def main():
     ap.add_argument("--model", type=Path, help="real checkpoint dir (with --out)")
     ap.add_argument("--out", type=Path, help="output dir for --model")
     ap.add_argument("--selftest", action="store_true", help="fp4 round-trip self-test")
+    ap.add_argument("--expert-roots",
+                    help="comma-separated dirs to spread the expert bins over, for "
+                         "hosts with no single filesystem big enough. Each bin is "
+                         "symlinked back into <out>/experts/. Append :N to cap a "
+                         "dir at N layers, e.g. /mnt/a:33,/mnt/b")
     ap.add_argument("--free-source-shards", action="store_true",
                     help="DELETE each source shard once no remaining layer needs it. "
                          "Required to fit source+output on one disk; the freed "
@@ -738,7 +837,8 @@ def main():
         print(json.dumps(build_manifest(cfg), indent=2))
         return
     if a.tiny:
-        export_tiny(a.tiny)
+        er = parse_expert_roots(a.expert_roots) if a.expert_roots else None
+        export_tiny(a.tiny, expert_roots=er)
         return
     if a.model:
         if not a.out:
@@ -747,7 +847,9 @@ def main():
         a.out.mkdir(parents=True, exist_ok=True)
         check_space(a.out, cfg)
         write_manifest(cfg, a.out)
-        export_real(a.model, a.out, cfg, free_source=a.free_source_shards)
+        er = parse_expert_roots(a.expert_roots) if a.expert_roots else None
+        export_real(a.model, a.out, cfg, free_source=a.free_source_shards,
+                    expert_roots=er)
     ap.print_help()
 
 
