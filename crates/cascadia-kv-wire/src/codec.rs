@@ -300,10 +300,15 @@ mod tests {
         // them and validates on length + crc.
         let blob = vec![1u8, 2, 3, 4, 5];
         let m = opaque(&blob);
-        assert!(
-            KvSnapshotCodec::validate(&m, &[(&blob, &[])], OPAQUE_KV_LAYOUT, 100, 7, &[11, 22, 33])
-                .is_ok()
-        );
+        assert!(KvSnapshotCodec::validate(
+            &m,
+            &[(&blob, &[])],
+            OPAQUE_KV_LAYOUT,
+            100,
+            7,
+            &[11, 22, 33]
+        )
+        .is_ok());
     }
     #[test]
     fn opaque_still_checks_crc() {

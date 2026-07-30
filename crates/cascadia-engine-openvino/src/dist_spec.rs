@@ -2550,10 +2550,18 @@ impl OvDistSpecEngine {
                     let _ = self.draft.reset();
                     return 0;
                 }
-                info!(warm_prefix = t_pos, d_pos, matched = len, "ov-dist-spec pipeline warm-resumed");
+                info!(
+                    warm_prefix = t_pos,
+                    d_pos,
+                    matched = len,
+                    "ov-dist-spec pipeline warm-resumed"
+                );
                 t_pos
             } else {
-                warn!(d_pos, t_pos, "ov-dist-spec: draft/target KV depth out of range; cold reprefill");
+                warn!(
+                    d_pos,
+                    t_pos, "ov-dist-spec: draft/target KV depth out of range; cold reprefill"
+                );
                 let _ = self.target.reset();
                 let _ = self.draft.reset();
                 0

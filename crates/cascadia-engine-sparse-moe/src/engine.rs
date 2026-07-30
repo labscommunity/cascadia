@@ -1480,7 +1480,8 @@ impl SparseMoEEngine {
                 Ok(()) => {
                     if let Ok(snap) = self.runner.snapshot_kv() {
                         let fp = self.runner.fingerprint();
-                        let prompt64: Vec<i64> = full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        let prompt64: Vec<i64> =
+                            full_tokens.iter().map(|&t| i64::from(t)).collect();
                         self.kv_prefix_cache.insert(prompt64, &fp, snap);
                     }
                 }
@@ -2115,7 +2116,10 @@ impl SparseMoEEngine {
         let snap = match self.runner.snapshot_kv() {
             Ok(s) => s,
             Err(e) => {
-                warn!(rank = self.rank, epoch, "kv capture: snapshot_kv failed: {e}");
+                warn!(
+                    rank = self.rank,
+                    epoch, "kv capture: snapshot_kv failed: {e}"
+                );
                 return;
             }
         };

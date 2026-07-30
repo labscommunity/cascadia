@@ -2,6 +2,7 @@
 name = "cascadia-kv-wire"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 description = "Wire contract for the KV coordination plane (/cascadia/state/kv/v1). Pure-Rust, no engine deps."
 
 [dependencies]
