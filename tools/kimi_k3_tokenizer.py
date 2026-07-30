@@ -242,8 +242,15 @@ SAMPLES = [
 
 def validate(ranks: dict, out: Path) -> int:
     """Encode the corpus both ways and require identical ids."""
-    import tiktoken
-    from tokenizers import Tokenizer
+    try:
+        import tiktoken
+        from tokenizers import Tokenizer
+    except ImportError as ex:
+        # Validation is not optional: a subtly wrong tokenizer reads as a model
+        # quality problem. Fail here, before hours of export, not after.
+        raise SystemExit(
+            f"[k3-tok] cannot validate the tokenizer: {ex}. "
+            "Install tiktoken and tokenizers, then re-run.") from ex
 
     ref = tiktoken.Encoding(
         name="kimi_k3",

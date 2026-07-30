@@ -550,7 +550,13 @@ def copy_sidecars(model_dir: Path, out: Path):
             print("[sidecars] NOTE no tiktoken.model — cannot build tokenizer.json; "
                   "only pre-tokenized input will work", flush=True)
         else:
-            from kimi_k3_tokenizer import build_tokenizer_json, read_ranks, validate
+            try:
+                from kimi_k3_tokenizer import (build_tokenizer_json, read_ranks,
+                                               validate)
+            except ImportError as ex:
+                raise SystemExit(
+                    "[export_kimi_k3] cannot build tokenizer.json: kimi_k3_tokenizer "
+                    f"is not importable ({ex}). Ship it beside this script.") from ex
 
             ranks = read_ranks(model_dir)
             tj.write_text(json.dumps(build_tokenizer_json(ranks), ensure_ascii=False))
