@@ -164,3 +164,40 @@ fn routing_is_recorded_and_autopin_stays_off_by_default() {
     let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
     assert_eq!(r.pinned_experts(), 0, "experts pinned with autopin off");
 }
+
+#[test]
+fn generation_matches_across_single_and_split_sources() {
+    // The engine must not care whether the expert bins sit in one directory or
+    // are symlinked across several filesystems. Covers the full generate path,
+    // not just a single forward: state is carried across tokens.
+    let Some(plain) = export_dir() else { return };
+    let split =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi_k3_export_split");
+    if !split.exists() {
+        eprintln!(
+            "SKIP: {} absent (run --tiny with --expert-roots)",
+            split.display()
+        );
+        return;
+    }
+    // guard: the split fixture must really be symlinked, or this proves nothing
+    let l = split.join("experts/layer_01.bin");
+    assert!(
+        std::fs::symlink_metadata(&l)
+            .expect("layer_01.bin")
+            .file_type()
+            .is_symlink(),
+        "split fixture is not symlinked"
+    );
+
+    let gen = |dir: &std::path::Path| {
+        let mut r = K3Runner::load(dir, 0, 1, 64).expect("load");
+        r.reset();
+        r.generate_argmax(&[3, 17, 5, 28], 6)
+    };
+    assert_eq!(
+        gen(&plain),
+        gen(&split),
+        "split export generated different tokens"
+    );
+}

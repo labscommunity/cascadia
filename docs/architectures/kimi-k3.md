@@ -106,23 +106,48 @@ real difference between them — not whether K3 fits.
 
 #### On the Xeon bench host
 
-The same host produced the GLM-5.2 export (FP8 source 755 GB + int4 output
-386 GB = 1.14 TB, comfortably inside 1.6 TB). K3 has no such headroom:
+Source and export cannot coexist on one filesystem there, and no single mount is
+large enough for the export alone:
 
 ```
-source checkpoint  = 1.45 TB routed (native mxfp4) + ~112 GB bf16  = ~1.56 TB
-export output      = ~same (fp4 repack, no regrind)                = ~1.56 TB
-both concurrently                                                  = ~3.1 TB   vs 1.6 TB free
-with --free-source-shards (delete as consumed)                     = ~1.58 TB  peak
+source checkpoint  1.561 TB   (already downloaded and byte-verified)
+export output      1.560 TB   (1.446 TB experts + 116 GB shells; no shrink —
+                               the experts are native MXFP4, so the repack is
+                               byte-for-byte and there is nothing to requantise)
+largest single mount  ~567 GB
 ```
 
-So the export **does** fit, but only with `--free-source-shards`, and only just —
-~20 GB of margin, with nothing else on the disk. Storing shells at their source
-bf16 rather than upcasting to f32 is what makes the difference; f32 shells put
-the output at 1.68 TB, which does not fit at all.
+`--expert-roots` spreads the expert bins over several filesystems and symlinks
+them back into `<out>/experts/`, so nothing has to be deleted:
 
-Running there is ~4% resident (172 GB − 112 GB shell leaves ~60 GB against
-1.45 TB) → **~0.1 tok/s**, comparable to N=4 on the fleet.
+```
+shells (116 GB)  ->  a mount with ~150 GB spare
+33 / 32 / 32 expert layers  ->  three ~550 GB mounts
+capacity 97 layers vs 92 needed
+```
+
+Note the shells need their own mount. Three mounts is 2 layers SHORT once the
+116 GB of shells takes a bite out of one of them — four is the working plan.
+
+Running there: 172 GB RAM − 113.5 GB shell leaves ~48 GB of page cache against
+1.446 TB of experts, ~4% resident. The storage modules are 7200 RPM HDDs, not
+NVMe, so each 17.6 MB expert read costs ~96 ms (8 ms seek + 88 ms transfer):
+
+```
+1 HDD                135 s/token
+3 HDDs in parallel    45 s/token   <- what spreading the roots buys
+NVMe, for contrast     8 s/token
+```
+
+That is a correctness harness, not a throughput measurement — a 20-token run
+takes ~15 minutes. Use `examples/k3_run.rs`, which reports which devices are
+backing the experts and works identically for a single-directory or a split
+export:
+
+```
+cargo run --release --example k3_run -- <export> "The capital of France is" 20
+CASCADIA_K3_PROFILE=1 CASCADIA_K3_AUTOPIN=1 …
+```
 
 ## Implementation
 
