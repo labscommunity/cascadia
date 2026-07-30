@@ -63,9 +63,14 @@ pub enum KvMessage {
         rank: u16,
     },
     /// Rank-N→head: warm-resume armed (`ok=true`) or failed (`ok=false`) for `epoch`.
-    WarmResumeConfirm { epoch: u64, ok: bool },
+    WarmResumeConfirm {
+        epoch: u64,
+        ok: bool,
+    },
     /// Head→rank-N: drop the armed warm-resume for `epoch`, go cold.
-    WarmResumeAbort { epoch: u64 },
+    WarmResumeAbort {
+        epoch: u64,
+    },
 }
 
 #[cfg(test)]
@@ -105,7 +110,10 @@ mod tests {
                 prev_chain_id: [9u8; 32],
                 rank: 1,
             },
-            KvMessage::WarmResumeConfirm { epoch: 42, ok: true },
+            KvMessage::WarmResumeConfirm {
+                epoch: 42,
+                ok: true,
+            },
             KvMessage::WarmResumeAbort { epoch: 42 },
         ];
         for m in msgs {

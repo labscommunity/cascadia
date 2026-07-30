@@ -2100,7 +2100,10 @@ impl OvRuntimeEngine {
                             let multi = self.downstream.is_some()
                                 && !self.spec.is_last_stage
                                 && !self.plane_restore;
-                            info!(plane_restore = self.plane_restore, "ov_step_first_warm_mode");
+                            info!(
+                                plane_restore = self.plane_restore,
+                                "ov_step_first_warm_mode"
+                            );
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                                 match self.send_restore_downstream(epoch) {

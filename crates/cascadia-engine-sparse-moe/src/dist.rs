@@ -137,7 +137,7 @@ pub enum FrameKind {
     ForwardBatchPrefillNoSample = 0x53_4D_45_0B, // "SME\x0B"
     // Issue-34 Task 1.3 (multi-stage KV capture, §8). Appended codes only — never reorder existing
     // ones; an older peer that lacks these rejects them in `from_code` (loud, not silent corruption).
-    Capture = 0x53_4D_45_30,    // "SME\x30" — head→down: snapshot each stage's KV under epoch E
+    Capture = 0x53_4D_45_30, // "SME\x30" — head→down: snapshot each stage's KV under epoch E
     CaptureAck = 0x53_4D_45_31, // "SME\x31" — up: "captured @ E" (propagates head-ward like Token)
 }
 

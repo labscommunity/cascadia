@@ -836,7 +836,11 @@ impl Gemma4Engine {
                             warm_prefix = crate::kv_coordination::kv_seq_from_blob(&blob)
                                 .map(|s| s.min(len))
                                 .unwrap_or(len);
-                            info!(warm_prefix, matched = len, "gemma4 warm-resumed from KV blob");
+                            info!(
+                                warm_prefix,
+                                matched = len,
+                                "gemma4 warm-resumed from KV blob"
+                            );
                         } else {
                             let _ = self.runtime.reset_state();
                             warn!("gemma4: pipeline restore incomplete; cold reprefill");

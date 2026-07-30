@@ -630,7 +630,13 @@ impl KvSnapshotHolder for OvKvHolder {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .serve(expected_epoch, expected_len)?;
-        Some(blob_to_wire(&prefix, &blob, partner, self.model_fp, expected_epoch))
+        Some(blob_to_wire(
+            &prefix,
+            &blob,
+            partner,
+            self.model_fp,
+            expected_epoch,
+        ))
     }
 }
 
@@ -740,7 +746,7 @@ mod tests {
         blob.extend(state("past_key_values.0.key", &[1, 8, 85, 128], 16));
         blob.extend(state("past_key_values.0.value", &[1, 8, 85, 128], 16));
         assert_eq!(kv_seq_from_blob(&blob), Some(85)); // dim[2]
-        // Framed (qwen36 stages / dist-spec draft+target): max over parts, equal here.
+                                                       // Framed (qwen36 stages / dist-spec draft+target): max over parts, equal here.
         let framed = frame_blobs(&[blob.clone(), blob.clone()]);
         assert_eq!(kv_seq_from_framed_blob(&framed), Some(85));
         // Garbage/truncated ⇒ None so the caller falls back to the matched token count.
@@ -777,7 +783,10 @@ mod tests {
         // All-valid ⇒ identity (verbatim).
         assert_eq!(kv_compact_blob(&blob, &[1, 1, 1, 1]), Some(blob.clone()));
         // Mask shorter than seq ⇒ uncovered tail positions kept (here all kept ⇒ identity).
-        assert_eq!(kv_compact_blob(&blob, &[1, 0]).map(|b| kv_seq_from_blob(&b)), Some(Some(3)));
+        assert_eq!(
+            kv_compact_blob(&blob, &[1, 0]).map(|b| kv_seq_from_blob(&b)),
+            Some(Some(3))
+        );
 
         // rank<3 state (no seq dim) copies verbatim.
         let mut r2 = 1u32.to_le_bytes().to_vec();

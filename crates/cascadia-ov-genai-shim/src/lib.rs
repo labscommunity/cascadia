@@ -1357,8 +1357,7 @@ impl Runtime {
         }
         #[cfg(feature = "openvino")]
         unsafe {
-            let rc =
-                sys::cascadia_runtime_set_state_blob(self.handle, blob.as_ptr(), blob.len());
+            let rc = sys::cascadia_runtime_set_state_blob(self.handle, blob.as_ptr(), blob.len());
             if rc != 0 {
                 return Err(Error::Native(last_native_error()));
             }
