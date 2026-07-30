@@ -3463,12 +3463,29 @@ impl OvMoeEngine {
                 self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
                 self.last_rank_rng_seeded = true;
             }
-            let token = crate::sampling::sample(
-                &logits,
-                &self.last_rank_history,
-                &sampling_cfg,
-                &mut self.last_rank_rng,
-            );
+            // A DISCARDED prefill sample must not advance the RNG. `sample` draws one uniform per
+            // call when temperature > 0, and a warm-resumed run skips `warm_prefix` of these
+            // forwards — so drawing here left the warm run's RNG at a different offset and made
+            // warm != cold for every temperature > 0 request (invisible to the greedy cert). The
+            // head throws these tokens away, so take the deterministic argmax via a temperature-0
+            // config, which returns before touching the RNG.
+            let token = if push_history {
+                crate::sampling::sample(
+                    &logits,
+                    &self.last_rank_history,
+                    &sampling_cfg,
+                    &mut self.last_rank_rng,
+                )
+            } else {
+                let mut discard_cfg = sampling_cfg.clone();
+                discard_cfg.temperature = 0.0;
+                crate::sampling::sample(
+                    &logits,
+                    &self.last_rank_history,
+                    &discard_cfg,
+                    &mut self.last_rank_rng,
+                )
+            };
             // Only kept (generated) tokens enter the rep-penalty history — discarded prefill samples
             // do not. Keeps the window generated-only (matching single-stage) so a warm-resumed run,
             // which skips the prefill forwards, is byte-identical to a cold one.
@@ -3664,6 +3681,24 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
+        // Stage under the CONTENT EPOCH too. `apply_warm_resume` — the plane's commit — reads
+        // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
+        // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
+        // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
+        // staging even where the prefix cache is off (sharded/total>1). Bounded by the same cap as
+        // `capture_under_epoch` so staging cannot grow unbounded.
+        {
+            let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+            let cap = self.kv_prefix_cache.capacity().max(1);
+            while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+                let Some(k) = self.kv_capture.keys().next().copied() else {
+                    break;
+                };
+                self.kv_capture.remove(&k);
+            }
+            self.kv_capture
+                .insert(epoch, (manifest.token_ids.clone(), snap.clone()));
+        }
         if !self.kv_prefix_cache.enabled() {
             return Ok(());
         }
