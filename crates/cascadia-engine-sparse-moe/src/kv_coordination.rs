@@ -236,6 +236,24 @@ impl KvCoordination for SparseMoEEngine {
 
     fn insert(&mut self, manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ()> {
         let snap = wire_to_snapshot(manifest, payloads).ok_or(())?;
+        // Stage under the CONTENT EPOCH too. `apply_warm_resume` — the plane's commit — reads
+        // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
+        // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
+        // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
+        // staging even where the prefix cache is off (sharded/total>1). Bounded by the same cap as
+        // `capture_under_epoch` so staging cannot grow unbounded.
+        {
+            let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+            let cap = self.kv_prefix_cache.capacity().max(1);
+            while self.kv_capture.len() >= cap && !self.kv_capture.contains_key(&epoch) {
+                let Some(k) = self.kv_capture.keys().next().copied() else {
+                    break;
+                };
+                self.kv_capture.remove(&k);
+            }
+            self.kv_capture
+                .insert(epoch, (manifest.token_ids.clone(), snap.clone()));
+        }
         if !self.kv_prefix_cache.enabled() {
             return Ok(()); // sharded/total>1: cache disabled → no-op (warm path inert until rig)
         }
