@@ -370,6 +370,42 @@ DENSE = {
 }
 
 
+def layer_table(li: int, cfg: dict) -> dict:
+    """Source-suffix -> shell-key map for layer `li`.
+
+    One definition, shared by the export, the index pre-flight and the
+    shard-usage map: if they drifted, `--free-source-shards` could delete a
+    shard the export still needs.
+    """
+    t = dict(COMMON)
+    t.update(KDA_ONLY if li in set(cfg["kda_layers"]) else MLA_ONLY)
+    t.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
+    return t
+
+
+def layer_tensor_names(li: int, cfg: dict) -> list[str]:
+    """Every source tensor name the export reads for layer `li`."""
+    base = f"{PREFIX}layers.{li}."
+    names = [base + sfx for sfx in layer_table(li, cfg)]
+    if li >= cfg["first_k_dense_replace"]:
+        eb = f"{base}block_sparse_moe.experts."
+        for e in range(cfg["num_experts"]):
+            for w in ("w1", "w3", "w2"):
+                names += [f"{eb}{e}.{w}.weight_packed", f"{eb}{e}.{w}.weight_scale"]
+    return names
+
+
+def top_tensor_names() -> list[str]:
+    """Embed / head tensors, read before the layer loop."""
+    return [
+        PREFIX + "embed_tokens.weight",
+        PREFIX + "norm.weight",
+        LM_HEAD,
+        PREFIX + "output_attn_res_proj.weight",
+        PREFIX + "output_attn_res_norm.weight",
+    ]
+
+
 class CkptSource:
     """Lazily-opened safetensors shards, keyed by the index's weight_map."""
 
@@ -398,6 +434,10 @@ class CkptSource:
         if name not in self.map:
             raise ConfigError(f"tensor missing from the checkpoint index: {name}")
         return self._h(self.map[name]).get_tensor(name)
+
+    def close_shard(self, shard: str):
+        """Drop the handle so the file can be removed (required on Windows)."""
+        self._handles.pop(shard, None)
 
     def close(self):
         self._handles.clear()
@@ -434,15 +474,83 @@ def copy_sidecars(model_dir: Path, out: Path):
             (out / name).write_bytes(src.read_bytes())
             copied.append(name)
     print(f"[sidecars] copied {len(copied)}: {', '.join(copied) or 'none'}", flush=True)
-    if not (out / "tokenizer.json").exists():
-        print(
-            "[sidecars] NOTE no tokenizer.json — the API rank needs one; convert "
-            "tiktoken.model before serving (pre-tokenized input works without it)",
-            flush=True,
-        )
+
+    # Build the tokenizer.json the API rank needs. A validation failure is
+    # fatal: a subtly wrong tokenizer presents as a model quality problem.
+    tj = out / "tokenizer.json"
+    if not tj.exists():
+        if not (model_dir / "tiktoken.model").exists():
+            print("[sidecars] NOTE no tiktoken.model — cannot build tokenizer.json; "
+                  "only pre-tokenized input will work", flush=True)
+        else:
+            from kimi_k3_tokenizer import build_tokenizer_json, read_ranks, validate
+
+            ranks = read_ranks(model_dir)
+            tj.write_text(json.dumps(build_tokenizer_json(ranks), ensure_ascii=False))
+            print(f"[sidecars] built tokenizer.json ({len(ranks):,} ranks)", flush=True)
+            if validate(ranks, tj) != 0:
+                raise SystemExit(
+                    "[export_kimi_k3] tokenizer.json does not match reference "
+                    "tiktoken — refusing to ship it")
 
 
-def export_real(model_dir: Path, out: Path, cfg: dict):
+def unused_shards(src: "CkptSource", cfg: dict) -> list:
+    """Shards holding no text-model tensor — the ViT's own (95, 96 in the
+    release). A text-only export never opens them, so they can be excluded from
+    the download or freed up front."""
+    used = set()
+    for n in top_tensor_names():
+        if src.has(n):
+            used.add(src.map[n])
+    for li in range(cfg["num_hidden_layers"]):
+        for n in layer_tensor_names(li, cfg):
+            if src.has(n):
+                used.add(src.map[n])
+    return sorted(set(src.map.values()) - used)
+
+
+def build_shard_usage(src: "CkptSource", cfg: dict) -> dict:
+    """shard -> the highest layer index that still reads it.
+
+    `-1` marks the embed/head group, which is consumed before the layer loop.
+    Derived from the same `layer_tensor_names` the export uses.
+    """
+    last: dict = {}
+    for n in top_tensor_names():
+        if src.has(n):
+            last[src.map[n]] = max(last.get(src.map[n], -1), -1)
+    for li in range(cfg["num_hidden_layers"]):
+        for n in layer_tensor_names(li, cfg):
+            if src.has(n):
+                sh = src.map[n]
+                last[sh] = max(last.get(sh, -1), li)
+    return last
+
+
+def free_consumed_shards(model_dir: Path, src: "CkptSource", last: dict, done_li: int):
+    """Delete source shards no later layer will read. DESTRUCTIVE.
+
+    Called only after the layer's `.done` marker is written, so a killed run
+    never loses a shard whose output was not committed. A freed layer cannot be
+    re-exported without re-downloading.
+    """
+    freed = 0
+    for shard, last_li in list(last.items()):
+        if last_li != done_li:
+            continue
+        p = model_dir / shard
+        if p.exists():
+            src.close_shard(shard)
+            n = p.stat().st_size
+            p.unlink()
+            freed += n
+        last.pop(shard, None)
+    if freed:
+        print(f"[free] released {freed / 1e9:.1f} GB of consumed source shards",
+              flush=True)
+
+
+def export_real(model_dir: Path, out: Path, cfg: dict, free_source: bool = False):
     """Stream the checkpoint into the sparse-moe layout, one layer at a time.
 
     Resumable: a `.layer_NN.done` marker is written after each layer and
@@ -450,6 +558,23 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
     """
     src = CkptSource(model_dir)
     copy_sidecars(model_dir, out)
+    spare = unused_shards(src, cfg)
+    if spare:
+        print(f"[free] {len(spare)} shard(s) hold only vision tensors and are never "
+              f"read: {', '.join(spare)}", flush=True)
+        print("[free]   pass these to `hf download --exclude` to skip them entirely",
+              flush=True)
+    usage = build_shard_usage(src, cfg) if free_source else None
+    if free_source:
+        print(f"[free] --free-source-shards ON: {len(usage)} source shards will be "
+              f"DELETED as they are consumed", flush=True)
+        # never-read shards can go immediately
+        for shard in spare:
+            sp = model_dir / shard
+            if sp.exists():
+                src.close_shard(shard)
+                sp.unlink()
+                print(f"[free] removed vision-only {shard}", flush=True)
     n = cfg["num_hidden_layers"]
     kda = set(cfg["kda_layers"])
     (out / "shells").mkdir(parents=True, exist_ok=True)
@@ -469,6 +594,8 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
         }, str(out / "head.safetensors"))
         (out / ".head.done").write_text("ok\n")
         print("[head] embed + head written", flush=True)
+        if usage is not None:
+            free_consumed_shards(model_dir, src, usage, -1)
 
     for li in range(n):
         marker = out / f".layer_{li:02d}.done"
@@ -476,9 +603,7 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
             continue
         base = f"{PREFIX}layers.{li}."
         flat = {}
-        table = dict(COMMON)
-        table.update(KDA_ONLY if li in kda else MLA_ONLY)
-        table.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
+        table = layer_table(li, cfg)
 
         for suffix, key in table.items():
             t = src.get(base + suffix)
@@ -509,6 +634,8 @@ def export_real(model_dir: Path, out: Path, cfg: dict):
             tmp.rename(edir / f"layer_{li:02d}.bin")
         marker.write_text("ok\n")
         print(f"[layer {li:02d}/{n - 1}] {'kda' if li in kda else 'mla'} done", flush=True)
+        if usage is not None:
+            free_consumed_shards(model_dir, src, usage, li)
 
     src.close()
     print(f"[done] {n} layers -> {out}", flush=True)
@@ -529,20 +656,9 @@ def check_index(index_path: Path, cfg: dict):
     have = set(wm)
     want, missing = [], []
 
-    want += [PREFIX + "embed_tokens.weight", PREFIX + "norm.weight", LM_HEAD,
-             PREFIX + "output_attn_res_proj.weight", PREFIX + "output_attn_res_norm.weight"]
-    kda = set(cfg["kda_layers"])
+    want += top_tensor_names()
     for li in range(cfg["num_hidden_layers"]):
-        base = f"{PREFIX}layers.{li}."
-        table = dict(COMMON)
-        table.update(KDA_ONLY if li in kda else MLA_ONLY)
-        table.update(MOE if li >= cfg["first_k_dense_replace"] else DENSE)
-        want += [base + sfx for sfx in table]
-        if li >= cfg["first_k_dense_replace"]:
-            eb = f"{base}block_sparse_moe.experts."
-            for e in range(cfg["num_experts"]):
-                for w in ("w1", "w3", "w2"):
-                    want += [f"{eb}{e}.{w}.weight_packed", f"{eb}{e}.{w}.weight_scale"]
+        want += layer_tensor_names(li, cfg)
 
     for nme in want:
         if nme not in have:
@@ -599,6 +715,10 @@ def main():
     ap.add_argument("--model", type=Path, help="real checkpoint dir (with --out)")
     ap.add_argument("--out", type=Path, help="output dir for --model")
     ap.add_argument("--selftest", action="store_true", help="fp4 round-trip self-test")
+    ap.add_argument("--free-source-shards", action="store_true",
+                    help="DELETE each source shard once no remaining layer needs it. "
+                         "Required to fit source+output on one disk; the freed "
+                         "layers cannot be re-exported without re-downloading")
     ap.add_argument("--check-index", type=Path,
                     help="verify tensor names against model.safetensors.index.json "
                          "(needs --config); no weights required")
@@ -627,7 +747,7 @@ def main():
         a.out.mkdir(parents=True, exist_ok=True)
         check_space(a.out, cfg)
         write_manifest(cfg, a.out)
-        export_real(a.model, a.out, cfg)
+        export_real(a.model, a.out, cfg, free_source=a.free_source_shards)
     ap.print_help()
 
 
