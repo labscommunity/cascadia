@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/labscommunity/cascadia/compare/v0.1.4...v0.1.5) (2026-07-30)
+
+
+### Bug Fixes
+
+* **shim:** explicit bool return type in AVX-VNNI probe lambda ([828b401](https://github.com/labscommunity/cascadia/commit/828b401a45a414722f1d89c7a181008fd66b154d))
+* **shim:** explicit bool return type in AVX-VNNI probe lambda ([1cebab4](https://github.com/labscommunity/cascadia/commit/1cebab4d9e96c27fb100cce0918337869772a780))
+
 ## [0.1.4](https://github.com/labscommunity/cascadia/compare/v0.1.3...v0.1.4) (2026-07-29)
 
 
