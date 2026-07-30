@@ -15,12 +15,15 @@ use std::path::Path;
 use crate::dsv4::math::{linear_bf16_w, rmsnorm};
 use crate::dsv4::stage::even_layer_split;
 use crate::k3::attn_res::apply_attn_res;
+use crate::k3::expert_fp4;
 use crate::k3::loader::{load_embed, load_head, load_layers, K3Head, K3LoadError, K3Manifest};
+use crate::k3::model::LayerFfn;
 use crate::k3::model::{
     blocks_at, forward_slice, forward_slice_batch, max_blocks, K3Dims, K3Layer, LayerState,
 };
 use crate::k3::moe::MmapExperts;
 use crate::k3::prof;
+use crate::k3::residency;
 use crate::staged::StagedRunner;
 
 /// Default context budget when `CASCADIA_K3_MAX_SEQ` is unset. K3's
@@ -45,6 +48,19 @@ pub struct K3Runner {
     max_blocks: usize,
     max_seq: usize,
     eos: Vec<u32>,
+    /// Where the learned routing histogram is kept.
+    usage_path: std::path::PathBuf,
+    pinned: usize,
+}
+
+impl Drop for K3Runner {
+    fn drop(&mut self) {
+        // only write back when pinning is in use, so a plain run never touches
+        // the model dir
+        if self.pinned > 0 || std::env::var_os("CASCADIA_K3_AUTOPIN").is_some() {
+            self.save_usage();
+        }
+    }
 }
 
 impl K3Runner {
@@ -66,6 +82,53 @@ impl K3Runner {
         } else {
             m.eos_token_ids.clone()
         };
+        // Learned residency: throughput is decided by what stays resident, so
+        // the pin set comes from recorded traffic. Off unless
+        // CASCADIA_K3_AUTOPIN is set — an over-large pin set evicts the cache
+        // serving the cold tail and is worse than no pinning.
+        let usage_p = residency::usage_path(dir);
+        if usage_p.exists() {
+            if let Err(e) = residency::load_global(&usage_p) {
+                tracing::warn!("k3: could not read {}: {e}", usage_p.display());
+            }
+        }
+        let expert_bytes =
+            expert_fp4::expert_bytes(m.routed_expert_hidden_size, m.moe_intermediate_size) as u64;
+        // reserve for the bf16 shell this rank holds plus its KV/recurrent state
+        let reserve = layers.len() as u64 * 1_200_000_000;
+        let budget = residency::autopin_budget(expert_bytes, reserve);
+        let mut pinned = 0usize;
+        if budget > 0 {
+            crate::dsv4::expert_mmap::reserve_lockable(budget * expert_bytes as usize);
+            let u = residency::snapshot();
+            // spread the budget evenly over this rank's MoE layers
+            let moe_layers = layers
+                .iter()
+                .filter(|l| matches!(l.ffn, LayerFfn::Moe(..)))
+                .count()
+                .max(1);
+            let per_layer = budget / moe_layers;
+            if per_layer > 0 && !u.is_empty() {
+                for l in layers.iter() {
+                    if let LayerFfn::Moe(_, _, ex) = &l.ffn {
+                        for e in u.hottest_for(l.idx as u32, per_layer) {
+                            if ex.pin_expert(e as usize) {
+                                pinned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                rank,
+                budget,
+                pinned,
+                "k3 autopin: mlock'd {pinned} of a {budget}-expert budget \
+                 ({} recorded selections)",
+                u.total()
+            );
+        }
+
         Ok(Self {
             d: m.dims(),
             m,
@@ -80,7 +143,21 @@ impl K3Runner {
             max_blocks: mb,
             max_seq,
             eos,
+            usage_path: usage_p,
+            pinned,
         })
+    }
+
+    /// Persist the routing histogram so the next run starts warm. Best-effort.
+    pub fn save_usage(&self) {
+        if let Err(e) = residency::save_global(&self.usage_path) {
+            tracing::debug!("k3: could not persist {}: {e}", self.usage_path.display());
+        }
+    }
+
+    /// Experts this rank managed to lock into RAM.
+    pub fn pinned_experts(&self) -> usize {
+        self.pinned
     }
 
     /// Fold this rank's expert-map residency into the profiler. Sampled, not

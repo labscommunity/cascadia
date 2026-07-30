@@ -327,11 +327,9 @@ pub fn forward_slice<E: ExpertSource>(
 
 /// Batched prefill: `rows` contiguous positions through a layer slice.
 ///
-/// Attention still runs per position — KDA's recurrence and the MLA KV cache
-/// are both order-dependent — but the MoE is batch-unioned across rows, so each
-/// distinct expert's bytes are touched once per layer instead of once per
-/// token. That is the difference between a long prompt costing one sweep of the
-/// expert set and costing one sweep PER POSITION.
+/// Attention stays per position (KDA's recurrence and the MLA cache are
+/// order-dependent); the MoE is batch-unioned, so each distinct expert is
+/// fetched once per layer rather than once per token.
 ///
 /// Bit-exact against looping [`forward_slice`] over the same rows.
 ///

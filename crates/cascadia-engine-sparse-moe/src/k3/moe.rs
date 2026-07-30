@@ -18,6 +18,7 @@ use crate::dsv4::math::{linear_bf16_w, rmsnorm, to_bf16};
 use crate::glm::gate::moe_gate;
 use crate::k3::expert_fp4;
 use crate::k3::prof;
+use crate::k3::residency;
 use crate::k3::situ::situ;
 
 /// Shape contract for one LatentMoE layer.
@@ -125,6 +126,15 @@ impl MmapExperts {
         self.n * self.stride
     }
 
+    /// `mlock` one expert's slice of the layer mapping. Best-effort.
+    pub fn pin_expert(&self, expert: usize) -> bool {
+        if expert >= self.n {
+            return false;
+        }
+        let base = self.mmap.as_ptr() as usize + expert * self.stride;
+        crate::k3::residency::pin_range(base, self.stride)
+    }
+
     /// Sampled page residency `(resident, probed)` of this layer's map.
     ///
     /// The real expert-cache hit signal: mmap faults are not billed to the
@@ -189,6 +199,7 @@ pub fn moe_forward<E: ExpertSource>(
     );
     prof::add(prof::ROUTER, _t0);
     prof::record_routing(d.layer, &sel.idx, experts.stride());
+    residency::record_selection(d.layer, &sel.idx);
 
     let _t1 = std::time::Instant::now();
     // down-project once, then accumulate the selected experts in latent space
@@ -233,17 +244,12 @@ pub fn moe_forward<E: ExpertSource>(
     prof::add(prof::EXPERTS, _t1);
 }
 
-/// Batch-union MoE: `rows` tokens through the block, loading each distinct
-/// expert's bytes ONCE instead of once per row.
+/// Batch-union MoE: `rows` tokens through the block, fetching each distinct
+/// expert once instead of once per row. Per-token prefill would re-stream the
+/// whole active set at every position — tens of TB for a long prompt.
 ///
-/// This is what makes prefill affordable. Per-token prefill re-streams the full
-/// active set at every position — at low residency a few-thousand-token prompt
-/// reads tens of TB. A batched pass touches each expert once, so a long prompt
-/// costs about one sweep of the layer's expert set.
-///
-/// Bit-exact against looping [`moe_forward`]: each expert's contribution is
-/// staged at its gate slot and the slots are summed in GATE order, because
-/// float addition is not associative and expert-id order would reassociate it.
+/// Bit-exact against looping [`moe_forward`]: contributions are staged at their
+/// gate slot and summed in GATE order, since float addition is not associative.
 ///
 /// `xs`, `outs`: `[rows * hidden]`.
 pub fn moe_forward_batch<E: ExpertSource>(
@@ -284,6 +290,7 @@ pub fn moe_forward_batch<E: ExpertSource>(
 
     for s in &sel {
         prof::record_routing(d.layer, &s.idx, experts.stride());
+        residency::record_selection(d.layer, &s.idx);
     }
 
     // invert the selection: expert -> the (row, slot) pairs that chose it

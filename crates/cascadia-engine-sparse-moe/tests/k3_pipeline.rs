@@ -132,3 +132,35 @@ fn batched_prefill_is_bit_exact_vs_per_token() {
     let lb = b.head_logits(&batched[(toks.len() - 1) * w..]);
     assert_eq!(la, lb, "head logits differ after batched prefill");
 }
+
+#[test]
+fn routing_is_recorded_and_autopin_stays_off_by_default() {
+    use cascadia_engine_sparse_moe::k3::residency;
+    let Some(dir) = export_dir() else { return };
+
+    // decode a few tokens so the router actually fires
+    let _ = run_chain(&dir, 1, &[3, 17, 5, 28]);
+
+    // the histogram is process-global, so assert shape rather than exact counts
+    let u = residency::snapshot();
+    assert!(!u.is_empty(), "no routed selections recorded");
+    assert!(u.total() > 0, "histogram total is zero");
+
+    // a MoE layer must have a hottest set, and it must be within the expert count
+    let hot = u.hottest_for(1, 4);
+    assert!(!hot.is_empty(), "layer 1 recorded nothing");
+    assert!(
+        hot.iter().all(|&e| (e as usize) < 8),
+        "expert id out of range: {hot:?}"
+    );
+
+    // autopin must not engage unless asked: an over-large pin set evicts the
+    // cache serving the cold tail, so it is never on by default
+    assert_eq!(
+        residency::autopin_budget(17_547_264, 0),
+        0,
+        "autopin engaged without CASCADIA_K3_AUTOPIN"
+    );
+    let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    assert_eq!(r.pinned_experts(), 0, "experts pinned with autopin off");
+}

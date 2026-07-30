@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 /// Physically-available RAM in bytes, or 0 when it cannot be determined.
 pub fn mem_available() -> u64 {
@@ -132,6 +133,50 @@ impl UsageStats {
         }
         Ok(())
     }
+}
+
+/// Process-global routing histogram — one model per process, so a global beats
+/// threading a handle through the whole layer API. Recorded unconditionally so
+/// autopin has data even on runs where pinning was off.
+fn global() -> &'static Mutex<UsageStats> {
+    static U: OnceLock<Mutex<UsageStats>> = OnceLock::new();
+    U.get_or_init(|| Mutex::new(UsageStats::new()))
+}
+
+/// Record one layer's routed selection.
+#[inline]
+pub fn record_selection(layer: u32, experts: &[u32]) {
+    if let Ok(mut u) = global().lock() {
+        for &e in experts {
+            u.record(layer, e);
+        }
+    }
+}
+
+/// Copy of the histogram so far.
+pub fn snapshot() -> UsageStats {
+    global().lock().map(|u| u.clone()).unwrap_or_default()
+}
+
+/// Merge a saved histogram into the global one (called at load).
+pub fn load_global(path: &Path) -> std::io::Result<()> {
+    let mut u = global()
+        .lock()
+        .map_err(|_| std::io::Error::other("usage lock poisoned"))?;
+    u.load(path)
+}
+
+/// Persist the global histogram so the next run starts warm.
+pub fn save_global(path: &Path) -> std::io::Result<()> {
+    let u = global()
+        .lock()
+        .map_err(|_| std::io::Error::other("usage lock poisoned"))?;
+    u.save(path)
+}
+
+/// Where a model dir keeps its learned histogram.
+pub fn usage_path(model_dir: &Path) -> std::path::PathBuf {
+    model_dir.join(".k3_usage")
 }
 
 /// Lock `len` bytes at `addr` into RAM. Best-effort: a failure (rlimit, lack of
