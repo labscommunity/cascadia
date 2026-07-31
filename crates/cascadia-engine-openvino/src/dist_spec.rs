@@ -1302,6 +1302,11 @@ struct ActiveSpec {
     prompt_ids: Vec<i64>,
     /// Accumulated accepted tokens (including the first sampled token).
     out: Vec<i64>,
+    /// Option B: length of the resume-seed prefix at the front of `out` (0 when
+    /// not resuming). Unconditional (not `kv_coord`-gated) so both builds see
+    /// the same `ActiveSpec` layout; used to keep the kv-capture key from
+    /// double-counting the resume ids (they're already in `prompt_ids`).
+    resume_seed_len: usize,
     /// Cumulative byte-length of the detokenized text emitted so far.
     /// Used to compute the streaming delta on each step.
     /// Bytes already handed to the client (see `decode_delta`).
@@ -1594,6 +1599,9 @@ impl OvDistSpecEngine {
         // only `full[emitted.len()..]` — the forced prefix is never re-emitted.
         // Empty on a normal turn ⇒ identical to today.
         let mut out = cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref());
+        // Captured BEFORE `out.push(first)`: the kv_coord capture key must count
+        // only the resumed prefix, not the freshly sampled token.
+        let resume_seed_len = out.len();
         let emitted: Vec<u8> = if out.is_empty() {
             Vec::new()
         } else {
@@ -1611,6 +1619,7 @@ impl OvDistSpecEngine {
             prompt_ids: prompt_ids.to_vec(),
             out,
             emitted,
+            resume_seed_len,
             prev_correction: first,
             d_last_logit,
             stats: SpecDecodeStats::default(),
@@ -1732,10 +1741,14 @@ impl OvDistSpecEngine {
         // resets. Best-effort + gated.
         #[cfg(feature = "kv_coord")]
         {
+            // `prompt_ids` already carries the resume ids (Option B appends them
+            // before start_task); `out` is seeded with the same ids so the fed
+            // sequence lines up round-to-round. Skip the seed here so the capture
+            // key matches the real fed depth instead of double-counting it.
             let tokens: Vec<i32> = active
                 .prompt_ids
                 .iter()
-                .chain(active.out.iter())
+                .chain(active.out.iter().skip(active.resume_seed_len))
                 .map(|&t| t as i32)
                 .collect();
             // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
