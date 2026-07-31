@@ -399,7 +399,7 @@ dropped, a `syscr` that moved — not merely that it was switched on.
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised, **needs a long run** | prior art finds static hot-set pinning helps cold start and loses in steady state. Two gotchas before measuring: the histogram is only persisted when autopin is enabled, so the FIRST enabled run always reports `pinned=0` and merely records; and the confidence ramp counts selections, of which K3 makes 92 layers x 16 = 1472 per token, so nothing pins below ~3.4 tokens and full confidence needs ~136. A 3-token run produces 4416 selections and stays under the floor — this cannot be evaluated at that scale |
 | prefix cache | working, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`), **needs >= 2 ranks** | **measured 2.45x** on a next-turn request: prefill bytes 142.06 -> 51.66 GB and prefill 649.4 -> 228.3 s at `reused=7 prompt=10`, saving in proportion to the reuse fraction. Byte-bounded LRU over the post-prefill layer states. Driven only from the pipeline path, so 1 rank takes `step_single_stage` and never reaches it — the budget is accepted and ignored (now warned about). Reuse needs a STRICT prefix, so resending an identical prompt never hits; the case it serves is the next turn, which resends the reply too |
-| lane-lazy expert reads | **dropped, measured** | 28.8% of lanes are dead at the most aggressive threshold, but only 5.5% of `w3` PAGES, and 0.0% losslessly. The sparsity is real and too scattered to skip a page. `CASCADIA_K3_CHESS_PROBE=1` re-measures |
+| lane-lazy expert reads | **dropped, measured** | 29.1% of lanes are dead at the most aggressive threshold, but only 5.7% of `w3` PAGES, and 0.0% losslessly. The sparsity is real and too scattered to skip a page. `CASCADIA_K3_CHESS_PROBE=1` re-measures |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
 `ngram_draft.rs` and the `spec_decode.rs` primitives are already generic and pure,
@@ -423,11 +423,11 @@ previous layer's hidden and see how much of the real top-16 lands in the top-`M`
 (`CASCADIA_K3_GATE_PROBE=1`):
 
 ```
-top16=40.0%  top20=44.6%  top24=49.0%  top32=55.9%
+top16=41.2%  top20=46.2%  top24=50.5%  top32=57.2%   (n=2912)
 ```
 
-The bar was 80% at `M = 24`. At the measured 49%, prefetching 24 experts catches
-`0.49 x 16` = 7.8 of them and the other 8.2 still miss — about 32 fetches where 16
+The bar was 80% at `M = 24`. At the measured 50.5%, prefetching 24 experts catches
+`0.505 x 16` = 8.1 of them and the other 7.9 still miss — about 32 fetches where 16
 were needed. Every width loses, and `M = 32` loses hardest. The published results
 come from models selecting a much larger fraction than 16 of 896, which is
 exactly why the numbers had to be taken here rather than assumed.
@@ -439,13 +439,13 @@ exactly why the numbers had to be taken here rather than assumed.
 t=0      lanes=0.0%   pages=0.0%
 t=0.001  lanes=0.4%   pages=0.0%
 t=0.01   lanes=3.4%   pages=0.0%
-t=0.1    lanes=28.8%  pages=5.5%
+t=0.1    lanes=29.1%  pages=5.7%
 ```
 
 The bar was 20% of pages. Losslessly nothing is skippable at all, and even at a
 threshold that costs real precision only 5.5% of pages clear. The lane column is
 the idea's promise and the page column is what the storage stack would deliver:
-28.8% of lanes dead frees 5.5% of pages, because the dead ones are scattered and
+29.1% of lanes dead frees 5.7% of pages, because the dead ones are scattered and
 a page with one live lane on it is read in full. Reporting only the lane figure
 would have justified building something that saves nearly nothing.
 
