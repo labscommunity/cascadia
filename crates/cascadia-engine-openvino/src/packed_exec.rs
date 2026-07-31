@@ -263,8 +263,9 @@ impl PackedState {
     /// plan from its slot table; relay and head stages decode it off the wire,
     /// which is what keeps every stage's per-slot rings in lockstep.
     ///
-    /// A row at absolute position 0 resets its slot first — the same in-band
-    /// "new sequence" signal the single-task static path already uses, so a
+    /// A row whose absolute position equals its reuse length resets its slot
+    /// first (position 0 when nothing is reused) — the same in-band "new
+    /// sequence" signal the single-task static path already uses, so a
     /// downstream stage needs no separate admission message.
     pub(crate) fn run_plan(
         &mut self,

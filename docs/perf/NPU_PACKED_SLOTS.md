@@ -162,14 +162,18 @@ saving a full NPU compile and a second resident weight copy.
 
 ### Multi-stage
 
-Packing works across a pipeline. Stage 0 ships an I64 `[1, 2, S]` **plan frame**
-(slot id per row, `-1` for idle; absolute position per row) ahead of the
-`[1, S, hidden]` block; relay and head stages decode it, re-derive same-slot
-causal order, run their own packed inference over their own per-slot rings, and
-the tail replies with one token per row. A row at position 0 resets its slot —
-the same in-band new-sequence signal the single-task static path already uses,
-so no separate admission message is needed. Every stage must be started with the
-same `--packed-slots`, since the slot count is baked into each stage's IR shape.
+Packing works across a pipeline. Stage 0 ships an I64 `[1, 3, S]` **plan frame**
+(per row: slot id with `-1` for idle, absolute position, and shared-prefix reuse
+length) ahead of the `[1, S, hidden]` block; relay and head stages decode it,
+re-derive same-slot causal order, run their own packed inference over their own
+per-slot rings, and the tail replies with one token per row. The reuse length
+must travel because only the driver stage holds the prompt ids to match against
+the prefix cache, yet every stage has to open the same shared columns. A row
+whose absolute position equals its reuse length starts its slot's sequence
+(position 0 when nothing is reused) — the same in-band new-sequence signal the
+single-task static path already uses, so no separate admission message is
+needed. Every stage must be started with the same `--packed-slots`, since the
+slot count is baked into each stage's IR shape.
 
 Validated on TinyLlama 2-stage static (CPU, both ranks on one box over
 loopback): `"The capital of France is Paris."`, usage `35 + 15`; and 4
