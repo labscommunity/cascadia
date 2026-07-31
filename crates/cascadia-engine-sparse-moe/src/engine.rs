@@ -1461,13 +1461,30 @@ impl SparseMoEEngine {
             }
         };
         let n_tokens = generated.len() as u32;
-        let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
-        let mut text = tokenizer
-            .decode(&ids_u32, true)
-            .unwrap_or_else(|_| String::new());
-        if let Some(stripped) = text.strip_prefix(&task.prompt) {
-            text = stripped.trim_start().to_string();
-        }
+        // Option B §17: decoding `generated` in isolation puts the first new
+        // token at sequence-start, so SentencePiece/Metaspace strips its
+        // leading space — fine for a fresh turn, but on a resumed turn the
+        // tail CONTINUES the prefix and that dropped space corrupts the seam
+        // ("hello" + "▁world" -> "helloworld" instead of "hello world").
+        // Decode prefix+tail together and slice off the prefix's decoded
+        // bytes so the tail keeps its seam spacing.
+        let text = if let Some(resume) = task.resume_token_ids.as_deref() {
+            let prefix_u32: Vec<u32> = resume.iter().map(|&i| i as u32).collect();
+            let prefix_text = tokenizer.decode(&prefix_u32, true).unwrap_or_default();
+            let mut full_u32 = prefix_u32;
+            full_u32.extend(generated.iter().map(|&i| i as u32));
+            let full_text = tokenizer.decode(&full_u32, true).unwrap_or_default();
+            full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+        } else {
+            let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
+            let mut t = tokenizer
+                .decode(&ids_u32, true)
+                .unwrap_or_else(|_| String::new());
+            if let Some(stripped) = t.strip_prefix(&task.prompt) {
+                t = stripped.trim_start().to_string();
+            }
+            t
+        };
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
@@ -1710,7 +1727,6 @@ impl SparseMoEEngine {
         }
 
         let n_tokens = result_tokens.len() as u32;
-        let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             warn!("tokenizer disappeared mid-task");
             return vec![(
@@ -1718,12 +1734,26 @@ impl SparseMoEEngine {
                 Chunk::error(task.task_id, "tokenizer disappeared mid-task".to_string()),
             )];
         };
-        let mut text = tokenizer
-            .decode(&ids_u32, true)
-            .unwrap_or_else(|_| String::new());
-        if let Some(stripped) = text.strip_prefix(&task.prompt) {
-            text = stripped.trim_start().to_string();
-        }
+        // Option B §17: see step_single_stage for why a resumed turn must
+        // decode prefix+tail together (preserves the seam space that a
+        // tail-only decode would strip at sequence-start).
+        let text = if let Some(resume) = task.resume_token_ids.as_deref() {
+            let prefix_u32: Vec<u32> = resume.iter().map(|&i| i as u32).collect();
+            let prefix_text = tokenizer.decode(&prefix_u32, true).unwrap_or_default();
+            let mut full_u32 = prefix_u32;
+            full_u32.extend(result_tokens.iter().map(|&i| i as u32));
+            let full_text = tokenizer.decode(&full_u32, true).unwrap_or_default();
+            full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+        } else {
+            let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
+            let mut t = tokenizer
+                .decode(&ids_u32, true)
+                .unwrap_or_else(|_| String::new());
+            if let Some(stripped) = t.strip_prefix(&task.prompt) {
+                t = stripped.trim_start().to_string();
+            }
+            t
+        };
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,
