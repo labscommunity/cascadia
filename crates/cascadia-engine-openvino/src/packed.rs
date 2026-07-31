@@ -31,13 +31,14 @@ use cascadia_ov_genai_shim::DType as ShimDType;
 const NEG_F16_BITS: u16 = 0xFBFF;
 const NEG_F32: f32 = -3.0e38;
 
-/// Leading KV columns of each slot's region that eviction must never drop —
-/// attention sinks. Transformer heads park a large share of their softmax mass
-/// on the first few tokens of a sequence; slide those out and the mass is
-/// forced onto ordinary content, which collapses generation into degenerate
-/// repetition rather than truncating it gracefully. Four is the width the
-/// StreamingLLM result found sufficient.
-const PACKED_SINK: usize = 4;
+/// Leading KV columns a bounded ring must never evict — attention sinks.
+/// Transformer heads park a large share of their softmax mass on the first few
+/// tokens of a sequence; slide those out and the mass is forced onto ordinary
+/// content, which collapses generation into degenerate repetition rather than
+/// truncating it gracefully. Four is the width the StreamingLLM result found
+/// sufficient. Shared with the single-task ring in `runtime.rs`, which has the
+/// same bounded-window shape at the full `past_len`.
+pub(crate) const KV_SINK: usize = 4;
 
 /// Which slot a query row belongs to, and its ordinal among that slot's rows in
 /// this same inference (0 for decode; 0..n for a prefill chunk). `order` drives
@@ -104,7 +105,7 @@ pub struct PackedKv {
     /// Past KV slots owned by each packed slot (after the shared prefix).
     pub region: usize,
     /// Leading columns of each slot's region that the slide never evicts (see
-    /// [`PACKED_SINK`]). Capped at half the region so pinning can never crowd
+    /// [`KV_SINK`]). Capped at half the region so pinning can never crowd
     /// out the sliding window itself.
     sink: usize,
     pub past_len: usize,
@@ -151,7 +152,7 @@ impl PackedKv {
             prefix_capacity,
             prefix_valid: 0,
             region,
-            sink: PACKED_SINK.min(region / 2),
+            sink: KV_SINK.min(region / 2),
             past_len,
             packed_seq,
             context: past_len + packed_seq,

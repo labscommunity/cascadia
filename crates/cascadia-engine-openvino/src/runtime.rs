@@ -492,6 +492,10 @@ struct StaticKvLayer {
 /// absolute `position` the first stage carries with each activation.
 struct StaticKv {
     past_len: usize,
+    /// Leading ring columns the slide never evicts (see
+    /// [`crate::packed::KV_SINK`]). Capped at half the window so pinning can
+    /// never crowd out the sliding portion.
+    sink: usize,
     context: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -580,6 +584,7 @@ impl StaticKv {
         let full = valid_now >= self.past_len;
         let kv_heads = self.kv_heads;
         let past_len = self.past_len;
+        let sink = self.sink;
         let buf: &mut [u8] = if is_value {
             &mut self.val_buf[li]
         } else {
@@ -590,7 +595,10 @@ impl StaticKv {
             let new = &present[src..src + slot];
             let base = h * buf_row;
             if full {
-                buf.copy_within(base + slot..base + buf_row, base); // drop oldest
+                // Drop the oldest EVICTABLE entry: the leading `sink` columns
+                // are pinned, so the shift starts past them. Without that the
+                // slide drops token 0 and attention collapses (see KV_SINK).
+                buf.copy_within(base + (sink + 1) * slot..base + buf_row, base + sink * slot);
                 let dst = base + (past_len - 1) * slot;
                 buf[dst..dst + slot].copy_from_slice(new);
             } else {
@@ -3560,6 +3568,7 @@ impl Builder for OvRuntimeBuilder {
             }
             Some(StaticKv {
                 past_len,
+                sink: crate::packed::KV_SINK.min(past_len / 2),
                 context: ctx as usize,
                 kv_heads: kvh,
                 head_dim: hd,
@@ -3805,6 +3814,7 @@ mod tests {
         let layer_bytes = kv_heads * past_len * head_dim * elem;
         StaticKv {
             past_len,
+            sink: crate::packed::KV_SINK.min(past_len / 2),
             context: past_len + 1,
             kv_heads,
             head_dim,
@@ -3908,6 +3918,43 @@ mod tests {
         // a hidden (F32) frame where tokens were expected is a hard error
         let wrong = WireTensor::new(WireDType::F32, [1, 1, 2], vec![0u8; 8]);
         assert!(decode_wire_tokens(&wrong).is_err());
+    }
+
+    /// Which token sits in each ring slot, recovered by matching the
+    /// deterministic per-token byte pattern back.
+    fn ring_tokens(ring: &StaticKv, n: usize) -> Vec<Option<usize>> {
+        let slot = ring.head_dim * ring.elem_bytes;
+        (0..ring.past_len)
+            .map(|i| {
+                (0..n).find(|&t| {
+                    (0..slot).all(|b| ring.key_buf[0][i * slot + b] == tok_byte(t, 0, b, false))
+                })
+            })
+            .collect()
+    }
+
+    /// The single-task ring drops its OLDEST entry once full, which evicts
+    /// token 0 — the attention sink. Same defect the packed ring had, at the
+    /// full window instead of a per-slot region, so it needs a conversation
+    /// past `past_len` rather than past `region` to show. Measured on CPU: a
+    /// run crossing 1023 total tokens degenerated into "ttettettett...".
+    #[test]
+    fn single_task_slide_preserves_the_attention_sink() {
+        let mut ring = test_ring(10, 1, 1, 1); // sink = min(4, 10/2) = 4
+        assert_eq!(ring.sink, 4);
+        for t in 0..16 {
+            ring.begin_token(t);
+            let k = present_seq1(&ring, t, false);
+            ring.absorb_layer(0, false, &k);
+        }
+        assert_eq!(
+            ring_tokens(&ring, 16),
+            vec![0, 1, 2, 3, 10, 11, 12, 13, 14, 15]
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>(),
+            "tokens 0-3 are the sinks and must survive; only the tail slides"
+        );
     }
 
     #[test]
