@@ -1203,7 +1203,7 @@ impl Qwen36Engine {
                                 let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
-                                info!(task = %task.task_id, warm_prefix = warm, matched = len, "qwen36 pipeline warm-resumed");
+                                info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, "qwen36 pipeline warm-resumed");
                                 warm
                             } else {
                                 warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
@@ -1776,7 +1776,7 @@ impl Qwen36Engine {
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&prompt_i32) {
-                        Some((blob, len, _)) if self.restore_local_stages(&blob) => {
+                        Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
                             // the true attention depth, so resume at `.min(len)` (matching ov-runtime).
@@ -1786,6 +1786,7 @@ impl Qwen36Engine {
                             info!(
                                 warm_prefix = warm,
                                 matched = len,
+                                plane_pulled,
                                 "qwen36 single-box warm-resumed from KV blob"
                             );
                             warm

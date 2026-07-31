@@ -2117,7 +2117,12 @@ impl OvRuntimeEngine {
                             let multi = self.downstream.is_some() && !self.spec.is_last_stage;
                             // Effective mode for THIS turn, not the process — what a cert should read.
                             let plane_turn = self.plane_restore && plane_pulled;
-                            info!(plane_restore = plane_turn, "ov_step_first_warm_mode");
+                            // Raw bit alongside: the AND is identically false in chain mode, which
+                            // hides whether this blob was pulled cross-chain or captured locally.
+                            info!(
+                                plane_restore = plane_turn,
+                                plane_pulled, "ov_step_first_warm_mode"
+                            );
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                                 let down = matches!(self.send_restore_downstream(epoch), Ok(true));
@@ -2147,6 +2152,7 @@ impl OvRuntimeEngine {
                                     blob_digest = crate::kv_coordination::byte_digest(&blob),
                                     blob_len = blob.len(),
                                     plane = plane_turn,
+                                    plane_pulled,
                                     "ov-runtime warm-resumed from KV blob"
                                 );
                             } else {
