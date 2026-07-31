@@ -44,6 +44,12 @@ pub enum EngineError {
     #[error("queue full ({queued} pending, cap {cap})")]
     QueueFull { queued: usize, cap: usize },
 
+    /// The prompt cannot fit this engine's per-request window. Distinct from
+    /// `QueueFull`: that one clears when load drops, this one never does, so
+    /// the API must answer 413 rather than a retryable 5xx.
+    #[error("prompt too long: {0}")]
+    PromptTooLong(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

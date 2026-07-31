@@ -322,7 +322,7 @@ fn encode_wire_position(position: i64) -> WireTensor {
 /// out. Serving an over-region prompt would answer from a silently truncated
 /// prompt — a request that looks successful and is wrong — so admission rejects
 /// it instead. Both remedies are the operator's, so name both.
-fn packed_admission_error(prompt_tokens: usize, region: usize) -> Option<String> {
+fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String> {
     (prompt_tokens > region).then(|| {
         format!(
             "prompt is {prompt_tokens} tokens but this worker's per-slot KV region holds \
@@ -1520,26 +1520,6 @@ impl OvRuntimeEngine {
                     "empty prompt: no tokens to prefill".into(),
                 ));
             }
-            let region = self.packed.as_ref().unwrap().kv.region;
-            if let Some(msg) = packed_admission_error(prompt_ids.len(), region) {
-                // Fail this request, not the step. A step-level Err carries no
-                // task id, so the runner would close whichever stream happened
-                // to poll — a healthy request dying for someone else's prompt.
-                // An error chunk routes to its owner through the same per-task
-                // buffers every other packed chunk uses. The slot is untouched
-                // (only `admit` occupies one), so the next task can still use it.
-                warn!(
-                    task = %task.task_id,
-                    prompt_tokens = prompt_ids.len(),
-                    region,
-                    "refusing over-region prompt"
-                );
-                out.push((
-                    task.task_id.clone(),
-                    Chunk::error(task.task_id.clone(), msg),
-                ));
-                continue;
-            }
             info!(
                 task = %task.task_id,
                 slot,
@@ -2660,6 +2640,26 @@ impl Engine for OvRuntimeEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        // Packed slots divide the KV window, so a prompt can be too long for a
+        // slot while the model itself could hold it. Reject here rather than at
+        // admission: submit() is synchronous with the HTTP request, so the
+        // caller gets a 413 before any stream is opened — a streaming client
+        // rejected mid-stream would already have had its 200 committed and
+        // would receive a non-standard error frame instead.
+        if let Some(packed) = self.packed.as_ref() {
+            if let Some(tok) = self.tokenizer.as_ref() {
+                let n = tok
+                    .encode(task.prompt.clone(), false)
+                    .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                    .get_ids()
+                    .len();
+                if let Some(msg) = packed_prompt_too_long(n, packed.kv.region) {
+                    warn!(task = %task.task_id, prompt_tokens = n,
+                          region = packed.kv.region, "refusing over-region prompt");
+                    return Err(EngineError::PromptTooLong(msg));
+                }
+            }
+        }
         self.pending.push(task);
         Ok(())
     }
@@ -3774,11 +3774,11 @@ mod tests {
     #[test]
     fn over_region_prompt_is_refused_at_admission() {
         assert!(
-            packed_admission_error(255, 255).is_none(),
+            packed_prompt_too_long(255, 255).is_none(),
             "a prompt that exactly fills the region is servable"
         );
-        assert!(packed_admission_error(1, 255).is_none());
-        let msg = packed_admission_error(256, 255).expect("over-region must be refused");
+        assert!(packed_prompt_too_long(1, 255).is_none());
+        let msg = packed_prompt_too_long(256, 255).expect("over-region must be refused");
         assert!(msg.contains("256") && msg.contains("255"), "{msg}");
         assert!(
             msg.contains("--static-context") && msg.contains("--packed-slots"),
