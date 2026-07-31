@@ -61,9 +61,10 @@ pub struct K3Runner {
     /// Cached post-prefill state, keyed by the caller's prefix key.
     ///
     /// Prefill is the expensive half — batch-union touches up to `rows * top_k`
-    /// distinct experts per layer, measured at ~129 GB for a 5-token prompt — so a
-    /// shared system prompt is worth not re-paying. Off unless
-    /// `CASCADIA_K3_PREFIX_CACHE` sets a byte budget.
+    /// distinct experts per layer, measured at ~155 GB for a 5-token prompt — so
+    /// a shared prefix is worth not re-paying: 2.45-2.60x on a next-turn
+    /// request. Budgeted from free RAM by default, or exactly by
+    /// `CASCADIA_K3_PREFIX_CACHE`, which also disables it at 0.
     prefix: PrefixStore,
 }
 
@@ -80,16 +81,37 @@ struct PrefixStore {
     entries: Vec<(u64, Vec<LayerState>, usize)>,
 }
 
+/// Share of currently-available RAM the prefix cache may hold by default.
+///
+/// Small on purpose. This memory competes directly with the expert page cache,
+/// which is what decides decode throughput, so the cache has to earn its keep
+/// out of headroom rather than out of residency. A few entries is all the reuse
+/// pattern needs — the engine caps the key index at a handful — so a large
+/// budget would buy nothing and cost the thing that matters.
+const PREFIX_CACHE_FRACTION: f64 = 0.05;
+
 impl PrefixStore {
     fn new() -> Self {
-        let budget = std::env::var("CASCADIA_K3_PREFIX_CACHE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
         Self {
-            budget,
+            budget: Self::budget_from_env_or_ram(),
             ..Default::default()
         }
+    }
+
+    /// Exact bytes from `CASCADIA_K3_PREFIX_CACHE`, else a slice of free RAM.
+    ///
+    /// Deriving it rather than defaulting to zero is what makes the cache work
+    /// out of the box, and deriving it from what is FREE is what keeps it from
+    /// hurting: on a node running K3 at 29 GB of 32 the share is a few tens of
+    /// MB, no snapshot fits, and `put` declines before it clones anything. On a
+    /// host with room it lands in the GBs and the cache does its job.
+    ///
+    /// `CASCADIA_K3_PREFIX_CACHE=0` still turns it off outright.
+    fn budget_from_env_or_ram() -> usize {
+        if let Ok(v) = std::env::var("CASCADIA_K3_PREFIX_CACHE") {
+            return v.trim().parse::<usize>().unwrap_or(0);
+        }
+        (residency::mem_available() as f64 * PREFIX_CACHE_FRACTION) as usize
     }
 
     fn enabled(&self) -> bool {
@@ -443,5 +465,67 @@ impl StagedRunner for K3Runner {
         let mut logits = vec![0.0f32; self.m.vocab_size];
         linear_bf16_w(&x, &head.lm_head, self.m.vocab_size, h, &mut logits);
         logits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_budget_wins_over_the_derived_one() {
+        // The env is the escape hatch for both directions: a deployment that
+        // knows its own headroom can raise it, and 0 must still mean off, or
+        // there is no way to take the cache out of the picture when debugging.
+        let derived = PrefixStore::budget_from_env_or_ram();
+        assert!(
+            derived > 0,
+            "a machine running tests has free RAM; deriving 0 would leave the \
+             cache off everywhere by accident"
+        );
+
+        let store = PrefixStore {
+            budget: 0,
+            ..Default::default()
+        };
+        assert!(!store.enabled(), "0 must disable the cache outright");
+    }
+
+    #[test]
+    fn a_budget_smaller_than_one_entry_declines_without_copying() {
+        // The constrained-node case, and the reason deriving from FREE RAM is
+        // safe: on a node with no headroom the share is tiny, nothing fits, and
+        // `put` has to bail BEFORE cloning. If it ever cloned first, enabling
+        // this by default would spend memory precisely where there is none.
+        let mut store = PrefixStore {
+            budget: 1,
+            ..Default::default()
+        };
+        let states = vec![LayerState::Kda(Box::new(crate::k3::model::KdaState {
+            recurrent: vec![0.0; 4096],
+            conv_q: vec![0.0; 256],
+            conv_k: vec![0.0; 256],
+            conv_v: vec![0.0; 256],
+        }))];
+        let before = store.bytes;
+        store.put(7, &states, 1);
+        assert!(
+            store.entries.is_empty(),
+            "an oversized entry must not be kept"
+        );
+        assert_eq!(store.bytes, before, "declining must not charge the budget");
+        assert!(store.get(7).is_none());
+    }
+
+    #[test]
+    fn the_derived_share_leaves_most_of_ram_to_the_page_cache() {
+        // This memory competes with expert residency, which is what decides
+        // throughput. If the fraction ever grows to where it could evict a
+        // meaningful slice of the expert cache, that trade needs measuring
+        // first -- it is not obviously the right one.
+        assert!(
+            PREFIX_CACHE_FRACTION > 0.0 && PREFIX_CACHE_FRACTION <= 0.10,
+            "fraction {PREFIX_CACHE_FRACTION} is outside the measured-safe range"
+        );
     }
 }
