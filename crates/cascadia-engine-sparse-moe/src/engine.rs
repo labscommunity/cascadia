@@ -753,6 +753,17 @@ impl Builder for SparseMoEBuilder {
             }
             let runtime_handle = tokio::runtime::Handle::try_current()
                 .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            // The prefix cache is driven from the pipeline path only
+            // (begin_generation restores, finalize_pipeline records). A single
+            // rank takes step_single_stage, which calls neither, so a configured
+            // budget is accepted and then silently never used — indistinguishable
+            // from a cache that only ever misses.
+            if total <= 1 && runner.prefix_cache_enabled() {
+                warn!(
+                    "prefix cache is configured but does nothing with 1 rank: it is \
+                     driven from the pipeline path, which needs total >= 2"
+                );
+            }
             info!(rank, total, "built DeepSeek-V4 dsv4 engine");
             return Ok(Box::new(Dsv4Engine::new(
                 runner,

@@ -390,7 +390,7 @@ measured impact rather than by how interesting the code is:
 | explicit concurrent reads | done, **default** (`CASCADIA_K3_READ=0` opts out) | **measured +8.5%** steady-state decode, -1.6% prefill, 2 runs per side. Both phases must use the same strategy — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
-| prefix cache | done, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`) | skips prefill on a repeated prefix, which is ~129 GB and minutes of it. Byte-bounded LRU over the post-prefill layer states. Not yet measured on the real model |
+| prefix cache | built, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`), **needs >= 2 ranks**, unmeasured | should skip prefill on a repeated prefix, ~155 GB and ~15 min of it. Byte-bounded LRU over the post-prefill layer states. Driven only from the pipeline path, so 1 rank takes `step_single_stage` and never reaches it — the budget is accepted and ignored (now warned about). Reuse needs a STRICT prefix, so resending an identical prompt never hits; the case it serves is the next turn, which resends the reply too |
 | lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
