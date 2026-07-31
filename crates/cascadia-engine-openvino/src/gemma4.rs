@@ -873,7 +873,11 @@ impl Gemma4Engine {
             let enc = tok
                 .encode(task.prompt.clone(), false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            cascadia_types::append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
@@ -969,11 +973,27 @@ impl Gemma4Engine {
                 warm_prefix,
                 "gemma4 task active"
             );
+            // Option B: pre-seed `generated` + `last_text` with the resumed
+            // tokens so the budget check bounds prefix+new (not just new) and
+            // the first NEW tail token decodes WITH the prefix as context.
+            // Empty seed on a normal turn ⇒ identical to today.
+            let resume_seed: Vec<i32> =
+                cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref())
+                    .into_iter()
+                    .map(|t| t as i32)
+                    .collect();
+            let resume_last_text = if resume_seed.is_empty() {
+                String::new()
+            } else {
+                let seed_u32: Vec<u32> = resume_seed.iter().map(|&t| t as u32).collect();
+                tok.decode(&seed_u32, true)
+                    .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?
+            };
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
-                generated: Vec::new(),
-                last_text: String::new(),
+                generated: resume_seed,
+                last_text: resume_last_text,
                 prefilled: false,
                 last_token: 0,
                 warm_prefix,
