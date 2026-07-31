@@ -322,6 +322,7 @@ pub fn moe_forward<E: ExpertSource>(
     );
     prof::add(prof::ROUTER, _t0);
     prof::record_routing(d.layer, &sel.idx, experts.stride());
+    crate::k3::gate_probe::observe(&sel.idx);
     residency::record_selection(d.layer, &sel.idx);
     // Queue every routed expert before touching the first one, so the drive has
     // all of this layer's reads outstanding instead of one seek at a time.

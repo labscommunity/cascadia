@@ -358,6 +358,9 @@ impl StagedRunner for K3Runner {
             self.sample_residency();
             prof::dump(&format!("rank{}", self.rank));
         }
+        if let Some(line) = crate::k3::gate_probe::report() {
+            eprintln!("{line}");
+        }
         w
     }
 

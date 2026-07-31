@@ -21,6 +21,7 @@
 use crate::dsv4::math::{linear_bf16_w, rmsnorm, to_bf16};
 use crate::k3::attn::{mla_step, MlaDims, MlaKv, MlaWeights};
 use crate::k3::attn_res::apply_attn_res;
+use crate::k3::gate_probe;
 use crate::k3::kda::{kda_gate, kda_step, l2norm_heads, short_conv};
 use crate::k3::moe::{moe_forward, moe_forward_batch, ExpertSource, MoeDims, MoeWeights};
 use crate::k3::prof;
@@ -264,6 +265,11 @@ pub fn forward_slice<E: ExpertSource>(
     let mut buf = vec![0.0f32; h];
     let mut attn_out = vec![0.0f32; h];
     let mut ffn_out = vec![0.0f32; h];
+    // The previous MoE layer's router input, kept only when the gate probe is
+    // on. Predicting from it is what makes the prediction EARLY enough to be
+    // worth anything — a prediction made from the layer's own hidden arrives
+    // after the fetch it was supposed to start.
+    let mut prev_hidden: Vec<f32> = Vec::new();
 
     for (layer, state) in layers.iter_mut().zip(states.iter_mut()) {
         let t_ar = std::time::Instant::now();
@@ -337,7 +343,20 @@ pub fn forward_slice<E: ExpertSource>(
                 }
                 linear_bf16_w(&hid, w2, h, *inter, &mut ffn_out);
             }
-            LayerFfn::Moe(w, md, ex) => moe_forward(&buf, w, *md, ex, &mut ffn_out),
+            LayerFfn::Moe(w, md, ex) => {
+                // Score THIS layer's router against the PREVIOUS layer's hidden
+                // and stage the result; `moe_forward` then reports the real
+                // selection and the probe counts the overlap. Observation only —
+                // routing and output are untouched either way.
+                if gate_probe::enabled() && !prev_hidden.is_empty() {
+                    gate_probe::predict(&w.gate, &prev_hidden, md.n_experts);
+                }
+                moe_forward(&buf, w, *md, ex, &mut ffn_out);
+                if gate_probe::enabled() {
+                    prev_hidden.clear();
+                    prev_hidden.extend_from_slice(&buf);
+                }
+            }
         }
 
         for (p, &f) in prefix_sum.iter_mut().zip(ffn_out.iter()) {
