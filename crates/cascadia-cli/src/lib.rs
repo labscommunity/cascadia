@@ -1364,9 +1364,25 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             }
             Ok(Box::new(SparseMoEBuilder::new(cfg)))
         }
-        EngineKind::Qwen36Moe => Ok(Box::new(
-            Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total),
-        )),
+        EngineKind::Qwen36Moe => {
+            // These three were added to Qwen36Builder (bd75446 / fdbc11e) but never wired HERE, so the
+            // setters had no caller and the "fix" has never executed in a cert run. Every other OV arm
+            // above plumbs all three. It matters for warm-resume specifically: a quantized KV cache
+            // re-quantizes on set_state, so a restored state is not bit-equal to a naturally folded one
+            // internally even though get_state_blob round-trips the declared bytes exactly — which is
+            // what qwen36's own `qwen36_state_roundtrip_exact` diag keeps reporting while bar #1 fails.
+            let mut b = Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total);
+            if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
+                b = b.with_cache_dir(&dir);
+            }
+            if let Some(prec) = &args.ov_kv_precision {
+                b = b.with_kv_cache_precision(prec);
+            }
+            if let Some(group) = &args.ov_dyn_quant_group {
+                b = b.with_dyn_quant_group(group);
+            }
+            Ok(Box::new(b))
+        }
     }
 }
 
