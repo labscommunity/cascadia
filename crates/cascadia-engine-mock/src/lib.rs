@@ -40,7 +40,11 @@ impl Engine for MockEngine {
         if self.pending.iter().any(|(t, _)| t.task_id == task.task_id) {
             return Ok(());
         }
-        self.pending.push((task, 0));
+        // Option B resume: the seed ids are already-emitted, so start the
+        // echo cursor past them. They are never re-emitted by step().
+        let seed_len =
+            cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref()).len();
+        self.pending.push((task, seed_len));
         Ok(())
     }
 
@@ -218,6 +222,43 @@ mod tests {
             .unwrap();
         // The very next step serves t2 — no draining of the abandoned t1.
         assert_eq!(e.step().unwrap()[0].0, "t2");
+    }
+
+    #[test]
+    fn resume_emits_only_tail_tokens() {
+        let mut e = MockEngine::new();
+        // Prompt echoes to [a b c d]; resume_token_ids covers [a b] (the
+        // mock's own ids for the first two positions), so only c/d are new.
+        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(64);
+        task.resume_token_ids = Some(vec![0, 1]);
+        e.submit(task).unwrap();
+        let mut emitted = Vec::new();
+        for _ in 0..8 {
+            for (_, chunk) in e.step().unwrap() {
+                emitted.push(chunk);
+            }
+        }
+        // Exactly 2 new tokens (c, d) then a final marker — the prefix a/b
+        // is never re-emitted.
+        assert_eq!(emitted.len(), 3);
+        assert!(emitted[0].text.starts_with('c'));
+        assert!(emitted[1].text.starts_with('d'));
+        assert!(emitted[2].is_final);
+    }
+
+    #[test]
+    fn resume_at_full_budget_emits_zero_new_tokens() {
+        let mut e = MockEngine::new();
+        // resume_token_ids covers the whole prompt and max_tokens equals
+        // the prefix length, so the task finals immediately with no new
+        // tokens.
+        let mut task = GenerationTask::new("t1", "a b c d").with_max_tokens(4);
+        task.resume_token_ids = Some(vec![0, 1, 2, 3]);
+        e.submit(task).unwrap();
+        let emitted = e.step().unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].1.is_final);
+        assert_eq!(emitted[0].1.token_id, 0);
     }
 
     #[test]
