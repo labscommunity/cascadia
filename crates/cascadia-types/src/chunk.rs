@@ -83,6 +83,12 @@ pub struct Chunk {
     /// falls back to `"stop"` (the historical behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    /// Every generated token-id in this chunk, in order. Multi-token chunks
+    /// (dist-spec spec-rounds, sparse-moe batches) fill this so a resume source
+    /// can accumulate EXACT ids; single-token chunks leave it empty and callers
+    /// fall back to `token_id`. `#[serde(default)]` keeps the wire additive.
+    #[serde(default)]
+    pub token_ids: Vec<i64>,
 }
 
 impl Chunk {
@@ -97,6 +103,7 @@ impl Chunk {
             prompt_tokens: None,
             error: None,
             finish_reason: None,
+            token_ids: Vec::new(),
         }
     }
 
@@ -111,6 +118,7 @@ impl Chunk {
             prompt_tokens: None,
             error: None,
             finish_reason: None,
+            token_ids: Vec::new(),
         }
     }
 
@@ -128,6 +136,7 @@ impl Chunk {
             prompt_tokens: None,
             error: Some(reason.into()),
             finish_reason: None,
+            token_ids: Vec::new(),
         }
     }
 
@@ -161,5 +170,39 @@ impl Chunk {
     pub fn token_count(&self) -> u32 {
         self.n_tokens
             .unwrap_or(if self.text.is_empty() { 0 } else { 1 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_token_ids_defaults_empty_and_is_additive() {
+        let c = Chunk {
+            task_id: "t1".to_string(),
+            token_id: 42,
+            text: "hi".to_string(),
+            is_final: false,
+            logprobs: None,
+            n_tokens: None,
+            prompt_tokens: None,
+            error: None,
+            finish_reason: None,
+            token_ids: Vec::new(),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: Chunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.token_ids, Vec::<i64>::new());
+
+        // Additivity: a payload encoded WITHOUT the field still decodes,
+        // defaulting to an empty vec.
+        let without_field = serde_json::json!({
+            "task_id": "t1",
+            "token_id": 42,
+            "text": "hi",
+        });
+        let back: Chunk = serde_json::from_value(without_field).unwrap();
+        assert_eq!(back.token_ids, Vec::<i64>::new());
     }
 }
