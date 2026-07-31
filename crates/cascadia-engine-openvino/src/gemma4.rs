@@ -1170,6 +1170,7 @@ impl Gemma4Engine {
                 n_tokens: None,
                 prompt_tokens: None,
                 error: None,
+                token_ids: Vec::new(),
                 finish_reason: None,
             }
         } else {
