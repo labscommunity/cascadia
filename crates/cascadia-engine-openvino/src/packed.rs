@@ -31,6 +31,14 @@ use cascadia_ov_genai_shim::DType as ShimDType;
 const NEG_F16_BITS: u16 = 0xFBFF;
 const NEG_F32: f32 = -3.0e38;
 
+/// Leading KV columns of each slot's region that eviction must never drop —
+/// attention sinks. Transformer heads park a large share of their softmax mass
+/// on the first few tokens of a sequence; slide those out and the mass is
+/// forced onto ordinary content, which collapses generation into degenerate
+/// repetition rather than truncating it gracefully. Four is the width the
+/// StreamingLLM result found sufficient.
+const PACKED_SINK: usize = 4;
+
 /// Which slot a query row belongs to, and its ordinal among that slot's rows in
 /// this same inference (0 for decode; 0..n for a prefill chunk). `order` drives
 /// causal masking within a slot.
@@ -95,6 +103,10 @@ pub struct PackedKv {
     pub prefix_valid: usize,
     /// Past KV slots owned by each packed slot (after the shared prefix).
     pub region: usize,
+    /// Leading columns of each slot's region that the slide never evicts (see
+    /// [`PACKED_SINK`]). Capped at half the region so pinning can never crowd
+    /// out the sliding window itself.
+    sink: usize,
     pub past_len: usize,
     /// Query rows per inference (the IR's static seq length).
     pub packed_seq: usize,
@@ -133,11 +145,13 @@ impl PackedKv {
         };
         let per_layer = kv_heads * past_len * head_dim * elem_bytes;
         let prefix_capacity = prefix_capacity.min(past_len.saturating_sub(slots));
+        let region = (past_len - prefix_capacity) / slots;
         Self {
             slots,
             prefix_capacity,
             prefix_valid: 0,
-            region: (past_len - prefix_capacity) / slots,
+            region,
+            sink: PACKED_SINK.min(region / 2),
             past_len,
             packed_seq,
             context: past_len + packed_seq,
@@ -273,6 +287,7 @@ impl PackedKv {
         let present_row = self.context * slot_bytes;
         let buf_row = self.past_len * slot_bytes;
         let region = self.region;
+        let sink = self.sink;
         let kv_heads = self.kv_heads;
         let src_slot = self.past_len + row;
         let full = at >= region;
@@ -287,8 +302,13 @@ impl PackedKv {
             let new = &present[src..src + slot_bytes];
             let base = h * buf_row + region_start;
             if full {
-                // drop this slot's oldest, keeping the copy inside the region
-                buf.copy_within(base + slot_bytes..base + region * slot_bytes, base);
+                // Drop this slot's oldest EVICTABLE entry — the leading `sink`
+                // columns are pinned, so the shift starts past them. The copy
+                // stays inside the region.
+                buf.copy_within(
+                    base + (sink + 1) * slot_bytes..base + region * slot_bytes,
+                    base + sink * slot_bytes,
+                );
                 let dst = base + (region - 1) * slot_bytes;
                 buf[dst..dst + slot_bytes].copy_from_slice(new);
             } else {
@@ -501,9 +521,11 @@ mod tests {
     }
 
     /// A full region slides within itself and must not consume a neighbour.
+    /// With region 4 the sink is capped at 2, so tags 11 and 12 are pinned and
+    /// the slide turns over only the last two columns.
     #[test]
     fn full_region_slides_without_crossing_into_the_next_slot() {
-        let mut k = kv(2, 8, 1); // region 4, packed_seq 1
+        let mut k = kv(2, 8, 1); // region 4, sink 2, packed_seq 1
                                  // Snapshot geometry first: the closure must not hold a borrow of `k`
                                  // across the &mut self absorb calls below.
         let (plb, ctx) = (k.present_layer_bytes(), k.context);
@@ -523,13 +545,13 @@ mod tests {
         for (i, tag) in [11u16, 12, 13, 14].iter().enumerate() {
             k.absorb_row(0, false, &mk(*tag), 0, 0, i);
         }
-        // region now full; one more slides 11 out
+        // region now full; one more slides the oldest EVICTABLE tag (13) out
         k.absorb_row(0, false, &mk(15), 0, 0, 4);
         let read = |slot_idx: usize| {
             let off = slot_idx * 4;
             u16::from_le_bytes([k.key_bytes(0)[off], k.key_bytes(0)[off + 1]])
         };
-        assert_eq!([read(0), read(1), read(2), read(3)], [12, 13, 14, 15]);
+        assert_eq!([read(0), read(1), read(2), read(3)], [11, 12, 14, 15]);
         assert_eq!(
             k.key_bytes(0)[16..20].to_vec(),
             slot1_before,
@@ -696,5 +718,66 @@ mod tests {
         let mut buf = Vec::new();
         k.fill_mask(&PackedPlan::idle(2), &mut buf, ShimDType::F32);
         assert_eq!(buf.len(), 2 * k.context * 4);
+    }
+
+    /// Feed `n` single-row tokens into `slot`, tagging each one's K/V with its
+    /// own byte so the surviving entries are identifiable afterwards.
+    fn feed_tokens(k: &mut PackedKv, slot: usize, n: u8) {
+        let slot_bytes = k.head_dim * k.elem_bytes;
+        for t in 1..=n {
+            let mut present = vec![0u8; k.context * slot_bytes];
+            let src = k.past_len * slot_bytes; // query row 0
+            present[src..src + slot_bytes].fill(t);
+            let at = k.valid(slot);
+            k.absorb_row(0, false, &present, 0, slot, at);
+            k.advance(slot, 1);
+        }
+    }
+
+    fn region_bytes(k: &PackedKv, slot: usize) -> Vec<u8> {
+        let slot_bytes = k.head_dim * k.elem_bytes;
+        let start = k.region_start(slot) * slot_bytes;
+        (0..k.region)
+            .map(|i| k.key_buf[0][start + i * slot_bytes])
+            .collect()
+    }
+
+    /// Eviction must never drop a slot's FIRST columns. Transformer heads park
+    /// a large share of their softmax mass on the earliest tokens; sliding them
+    /// out collapses generation into degenerate repetition instead of degrading
+    /// it gracefully. Feeds 12 tokens through a region-6 slot: the four sinks
+    /// must survive while only the tail slides.
+    #[test]
+    fn slide_preserves_the_attention_sink() {
+        let mut k = kv(2, 20, 2); // region = 10, sink = 4
+        assert_eq!((k.region, k.sink), (10, 4));
+        feed_tokens(&mut k, 0, 16);
+        assert_eq!(
+            region_bytes(&k, 0),
+            vec![1, 2, 3, 4, 11, 12, 13, 14, 15, 16],
+            "sinks 1-4 pinned; only the six evictable columns slide"
+        );
+    }
+
+    /// A neighbouring slot's region must stay untouched by the sink-aware slide.
+    #[test]
+    fn sink_slide_stays_inside_its_own_region() {
+        let mut k = kv(2, 20, 2);
+        feed_tokens(&mut k, 1, 16);
+        assert_eq!(region_bytes(&k, 0), vec![0; 10], "slot 0 never written");
+        assert_eq!(
+            region_bytes(&k, 1),
+            vec![1, 2, 3, 4, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    /// Pinning must never crowd out the sliding window: on a region too small
+    /// for the full sink it is capped at half, so the slot keeps turning over.
+    #[test]
+    fn sink_is_capped_at_half_the_region() {
+        let mut k = kv(4, 16, 2); // region = 4 -> sink capped to 2
+        assert_eq!((k.region, k.sink), (4, 2));
+        feed_tokens(&mut k, 0, 9);
+        assert_eq!(region_bytes(&k, 0), vec![1, 2, 8, 9]);
     }
 }
