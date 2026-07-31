@@ -1424,7 +1424,12 @@ impl Engine for OvDistSpecEngine {
                     return Ok(vec![(task_id, c)]);
                 }
             };
-            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) — flows into
+            // BOTH the draft and target prefill via start_task's shared feed_ids.
+            // No-op when not resuming.
+            cascadia_types::append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
@@ -1454,7 +1459,11 @@ impl Engine for OvDistSpecEngine {
             // If the first token already hits max_tokens or EOS, finalize now.
             // Decided before decoding: it is what makes this the terminal read,
             // which tells decode_delta whether it may hold anything back.
-            let hit_eos = self.eos_token_ids.contains(&(active.out[0] as u32));
+            // Option B: resume seeds a prefix ahead of the freshly sampled token,
+            // so the newly sampled token is `out.last()`, not `out[0]` — checking
+            // `out[0]` would test a RESUMED token for EOS and finalize instantly.
+            let first_new = *active.out.last().unwrap_or(&0);
+            let hit_eos = self.eos_token_ids.contains(&(first_new as u32));
             let finished = active.out.len() >= max_tokens || hit_eos;
             let new_text =
                 decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
@@ -1465,7 +1474,7 @@ impl Engine for OvDistSpecEngine {
                     task_id,
                     Chunk {
                         task_id: active.task.task_id.clone(),
-                        token_id: active.out[0],
+                        token_id: first_new,
                         text: new_text,
                         is_final: false,
                         logprobs: None,
@@ -1488,6 +1497,7 @@ impl Engine for OvDistSpecEngine {
                     delta,
                     finished,
                     n_tokens,
+                    token_ids,
                 }) => {
                     if finished {
                         self.finish_task(task_id, delta, n_tokens)
@@ -1505,7 +1515,7 @@ impl Engine for OvDistSpecEngine {
                                 n_tokens: Some(n_tokens),
                                 prompt_tokens: None,
                                 error: None,
-                                token_ids: Vec::new(),
+                                token_ids,
                                 finish_reason: None,
                             },
                         )]
@@ -1538,6 +1548,10 @@ struct RoundResult {
     /// Chunk::n_tokens so downstream tok/s metrics stay accurate when
     /// each chunk carries multiple tokens (1..=K+1).
     n_tokens: u32,
+    /// The token ids added to `out` this round, in order (accepted drafts
+    /// plus the correction). Surfaced via `Chunk::token_ids` so a dist-spec
+    /// multi-token chunk can serve as a resume source.
+    token_ids: Vec<i64>,
 }
 
 impl OvDistSpecEngine {
@@ -1574,12 +1588,29 @@ impl OvDistSpecEngine {
         let dv = d_shape[2];
         let d_last_logit = d_logits[d_logits.len() - dv..].to_vec();
 
+        // Option B: pre-seed `out` with the resumed tokens so `out.len()` bounds
+        // prefix+new against max_tokens (no separate subtraction needed), and seed
+        // `emitted` with the seed's DECODED BYTES so `decode_delta` hands the client
+        // only `full[emitted.len()..]` — the forced prefix is never re-emitted.
+        // Empty on a normal turn ⇒ identical to today.
+        let mut out = cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref());
+        let emitted: Vec<u8> = if out.is_empty() {
+            Vec::new()
+        } else {
+            let seed_u32: Vec<u32> = out.iter().map(|&t| t as u32).collect();
+            self.tokenizer
+                .decode(&seed_u32, true)
+                .unwrap_or_default()
+                .into_bytes()
+        };
+        out.push(first);
+
         Ok(ActiveSpec {
             task,
             #[cfg(feature = "kv_coord")]
             prompt_ids: prompt_ids.to_vec(),
-            out: vec![first],
-            emitted: Vec::new(),
+            out,
+            emitted,
             prev_correction: first,
             d_last_logit,
             stats: SpecDecodeStats::default(),
@@ -1654,6 +1685,9 @@ impl OvDistSpecEngine {
             active.out.push(t);
         }
         let n_tokens_added = (active.out.len() - out_len_before) as u32;
+        // Slice the ids this round actually appended to `out`, in order — the
+        // per-round accepted-ids source for `Chunk::token_ids`.
+        let token_ids_added: Vec<i64> = active.out[out_len_before..].to_vec();
 
         // Rewind any rejected drafts from the target's KV cache.
         self.target.rewind(drafts.len() - accepted);
@@ -1679,6 +1713,7 @@ impl OvDistSpecEngine {
             delta,
             finished: hit_eos || hit_max,
             n_tokens: n_tokens_added,
+            token_ids: token_ids_added,
         })
     }
 
@@ -1714,6 +1749,16 @@ impl OvDistSpecEngine {
             accept = active.stats.accept_rate(),
             "ov-dist-spec done"
         );
+        // Multi-token final round (do_one_round's finished=true path): surface
+        // every id this round appended, in order. Single/zero-token finals
+        // (first-chunk-hits-max/EOS, or the round-failed path) leave it empty —
+        // `token_id` alone already identifies the single accepted token.
+        let token_ids = if n_tokens > 1 {
+            let start = active.out.len().saturating_sub(n_tokens as usize);
+            active.out[start..].to_vec()
+        } else {
+            Vec::new()
+        };
         vec![(
             task_id.clone(),
             Chunk {
@@ -1725,7 +1770,7 @@ impl OvDistSpecEngine {
                 n_tokens: if n_tokens > 0 { Some(n_tokens) } else { None },
                 prompt_tokens: None,
                 error: None,
-                token_ids: Vec::new(),
+                token_ids,
                 finish_reason: None,
             },
         )]
