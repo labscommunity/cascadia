@@ -17,11 +17,13 @@
 //! `get_state_blob`/`set_state_blob` return `Error::Stub` and capture/restore degrade to no-ops
 //! (cold reprefill — today's behaviour). Warm==cold fidelity is certified on hardware.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use cascadia_engine::{KvCoordination, KvSnapshotHolder};
-use cascadia_kv_wire::{LayerMeta, Manifest, PartnerId, OPAQUE_KV_LAYOUT, SCHEMA_VERSION};
+use cascadia_kv_wire::{
+    KvSnapshotCodec, LayerMeta, Manifest, PartnerId, OPAQUE_KV_LAYOUT, SCHEMA_VERSION,
+};
 
 use crate::runtime::OvRuntimeEngine;
 
@@ -33,6 +35,13 @@ pub const KV_ENGINE_REV: u64 = 1;
 const KV_MAX_ENTRIES: usize = 8;
 /// Cap on stashed unconsumed offers (NEGOTIATE without a paired GET).
 const KV_MAX_OFFERS: usize = 32;
+/// Byte ceiling on `offers`, PER CACHE. Sized for a handful of concurrent NEGOTIATE→GET round trips
+/// at rig blob scale (~35 MB, from the slice-2 measurements); an OV engine holds two of these caches
+/// (`kv` and its `kv_share` holder mirror), so the node ceiling is twice this. NOT derived from
+/// `KV_MAX_ENTRIES` — an offer is cloned from an entry but outlives it (`take_warm` removes the entry
+/// it serves; the LRU drops the rest), so up to `KV_MAX_OFFERS` distinct offers can be held with no
+/// surviving source entry. Shrunk under `cfg(test)` so the eviction tests cost megabytes, not gigabytes.
+const KV_MAX_OFFER_BYTES: usize = if cfg!(test) { 4 << 20 } else { 256 << 20 };
 
 pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -424,6 +433,8 @@ pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 struct OvKvEntry {
     tokens: Vec<i32>,
     blob: Vec<u8>,
+    /// Pulled over the KV plane (`insert_both`), not captured from this rank's own turn.
+    plane_pulled: bool,
 }
 
 /// Per-engine KV blob cache + NEGOTIATE→GET offers. Lives in [`OvRuntimeEngine`] behind `kv_coord`.
@@ -434,6 +445,15 @@ pub(crate) struct OvKvCache {
     entries: Vec<OvKvEntry>,
     /// `epoch → (tokens, blob)` stashed at NEGOTIATE for the paired GET (short-lived, single-use).
     offers: HashMap<u64, (Vec<i32>, Vec<u8>)>,
+    /// `offers` epochs in insertion order, oldest first.
+    offer_order: VecDeque<u64>,
+    /// Live byte total of `offers`, against `KV_MAX_OFFER_BYTES`.
+    offer_bytes: usize,
+    /// Offers evicted before their paired GET, cumulative — the flood signal that survives suppression.
+    offers_evicted: u64,
+    /// A flood evicts once per NEGOTIATE, and one log line each is how a node's chain.log reached
+    /// 770 GB (see `warn_limit`); bound the eviction log the same way.
+    evict_log: crate::warn_limit::StepWarnLimiter,
     /// §8 multi-stage worker stash: `epoch → (tokens, blob)`. A worker rank has no tokens of its
     /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
@@ -453,11 +473,22 @@ pub(crate) struct OvKvCache {
 impl OvKvCache {
     /// Producer: stash a captured turn keyed by its full token sequence. Bounded LRU (oldest drop).
     pub(crate) fn capture(&mut self, tokens: Vec<i32>, blob: Vec<u8>) {
+        self.insert_entry(tokens, blob, false);
+    }
+
+    fn insert_entry(&mut self, tokens: Vec<i32>, blob: Vec<u8>, plane_pulled: bool) {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
         self.entries.retain(|e| e.tokens != tokens); // de-dup exact key (refresh to front)
-        self.entries.insert(0, OvKvEntry { tokens, blob });
+        self.entries.insert(
+            0,
+            OvKvEntry {
+                tokens,
+                blob,
+                plane_pulled,
+            },
+        );
         self.entries.truncate(KV_MAX_ENTRIES);
     }
 
@@ -484,7 +515,7 @@ impl OvKvCache {
             return;
         }
         self.capture_under_epoch(synth_epoch(&tokens), tokens.clone(), blob.clone());
-        self.capture(tokens, blob);
+        self.insert_entry(tokens, blob, true); // pulled over the plane, not captured locally
     }
 
     /// Worker RESTORE: take the blob stashed under `epoch` (from INSERT/CAPTURE) so the rank can
@@ -543,7 +574,7 @@ impl OvKvCache {
             in_offers = self.offers.contains_key(&epoch), in_captures = self.captures.contains_key(&epoch),
             n_offers = self.offers.len(), n_captures = self.captures.len(),
             cap_epochs = ?self.captures.keys().copied().collect::<Vec<_>>());
-        let (tokens, blob) = if let Some(off) = self.offers.remove(&epoch) {
+        let (tokens, blob) = if let Some(off) = self.take_offer(epoch) {
             off
         } else if let Some(cap) = self.captures.get(&epoch) {
             cap.clone()
@@ -580,13 +611,58 @@ impl OvKvCache {
         };
         let len = prefix.len() as u32;
         let epoch = synth_epoch(&prefix);
-        if self.offers.len() >= KV_MAX_OFFERS && !self.offers.contains_key(&epoch) {
-            if let Some(k) = self.offers.keys().next().copied() {
-                self.offers.remove(&k);
-            }
-        }
-        self.offers.insert(epoch, (prefix, blob));
+        self.stash_offer(epoch, prefix, blob);
         Some((epoch, len))
+    }
+
+    /// Stash an offer for its paired GET, evicting until it fits both bounds.
+    fn stash_offer(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
+        // A re-NEGOTIATE of the same prefix replaces its offer instead of double-counting its bytes.
+        let _ = self.take_offer(epoch);
+        // Loops on the order queue, not the map: if the two ever desync, evicting stops making
+        // progress and this spins forever holding the engine lock. Stops at empty so a blob over the
+        // whole budget is stashed alone, not evicted to death.
+        while !self.offer_order.is_empty()
+            && (self.offers.len() >= KV_MAX_OFFERS
+                || self.offer_bytes + blob.len() > KV_MAX_OFFER_BYTES)
+        {
+            self.evict_oldest_offer();
+        }
+        self.offer_bytes += blob.len();
+        self.offer_order.push_back(epoch);
+        self.offers.insert(epoch, (tokens, blob));
+        debug_assert_eq!(self.offer_order.len(), self.offers.len());
+    }
+
+    /// Oldest first: arbitrary `HashMap` order can drop the offer whose paired GET is in flight and
+    /// keep a stale one, turning a warm resume cold for no gain.
+    fn evict_oldest_offer(&mut self) {
+        let Some(epoch) = self.offer_order.pop_front() else {
+            return;
+        };
+        let Some((_, blob)) = self.offers.remove(&epoch) else {
+            return;
+        };
+        self.offer_bytes = self.offer_bytes.saturating_sub(blob.len());
+        self.offers_evicted += 1;
+        // No `on_success` counterpart: an eviction streak has no natural close, and one line per
+        // 30 s is the bound wanted. `suppressed` carries what that interval swallowed.
+        let suppressed = match self.evict_log.on_failure(std::time::Instant::now()) {
+            Some(crate::warn_limit::StepWarn::First) => 0,
+            Some(crate::warn_limit::StepWarn::StillFailing { suppressed }) => suppressed,
+            None => return,
+        };
+        tracing::info!(target: "cascadia::kv", event = "kv_offer_evicted_unserved",
+            epoch, blob = blob.len(), suppressed, evicted_total = self.offers_evicted,
+            n_offers = self.offers.len(), held = self.offer_bytes);
+    }
+
+    /// Remove an offer, keeping `offer_order` and `offer_bytes` in step.
+    fn take_offer(&mut self, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
+        let off = self.offers.remove(&epoch)?;
+        self.offer_order.retain(|&e| e != epoch);
+        self.offer_bytes = self.offer_bytes.saturating_sub(off.1.len());
+        Some(off)
     }
 
     /// Longest cached entry whose `tokens` is a prefix of `req`. The blob is whole-sequence
@@ -626,8 +702,9 @@ impl OvKvCache {
     /// Consumer: take a cached blob covering a **strict** prefix of `prompt`, for warm-resume at
     /// task start. Strict (`tokens.len() < prompt.len()`) guarantees ≥1 token left to prefill — the
     /// model needs a forward pass to produce the next token, and re-feeding tokens already in the
-    /// restored state would double-count. Returns `(blob, prefix_len)`; removed on take.
-    pub(crate) fn take_warm(&mut self, prompt: &[i32]) -> Option<(Vec<u8>, usize)> {
+    /// restored state would double-count. Returns `(blob, prefix_len, plane_pulled)`, removed on
+    /// take; `plane_pulled` scopes the chain verdict — see [`chain_verdict`].
+    pub(crate) fn take_warm(&mut self, prompt: &[i32]) -> Option<(Vec<u8>, usize, bool)> {
         let idx = self
             .entries
             .iter()
@@ -640,8 +717,23 @@ impl OvKvCache {
             .max_by_key(|(_, e)| e.tokens.len())
             .map(|(i, _)| i)?;
         let e = self.entries.remove(idx);
-        Some((e.blob, e.tokens.len()))
+        Some((e.blob, e.tokens.len(), e.plane_pulled))
     }
+}
+
+/// Chain-restore verdict for a warm head. `down` — every downstream rank confirmed — is binding,
+/// except on a turn the KV plane armed, where the ranks arm themselves out-of-band and `false` only
+/// means "no CAPTURE under the donor chain's epoch".
+///
+/// `plane_pulled` scopes that override. The mode flag alone made every turn advisory, so a
+/// same-chain turn whose tail had no CAPTURE under the donor epoch still warmed the head —
+/// head-warm/tail-cold, a silent corrupt serve.
+///
+/// Residual (accepted): the mark rides a CONTENT-keyed entry, not a request. A later prompt starting
+/// with an earlier plane-armed prefix consumes that entry and inherits the override. Closing it needs
+/// a request id carried across the node/engine boundary, which cannot be verified off-rig.
+pub(crate) fn chain_verdict(down: bool, plane_mode: bool, plane_pulled: bool) -> bool {
+    down || (plane_mode && plane_pulled)
 }
 
 /// Opaque blob → wire `Manifest` + single-payload `(blob, [])`. K carries the blob; V is empty.
@@ -802,6 +894,58 @@ pub struct KvHandoffSlot {
     pub payloads: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+/// Why [`handoff_decision`] refused a parked slice. Variants are 1:1 with the `kv_handoff_*` events
+/// the drain logs; the cert greps two of them, so keep the mapping.
+#[derive(Debug, PartialEq)]
+pub(crate) enum HandoffReject {
+    Validate,
+    Decode,
+    /// The slice's KV depth, which this rank is already past.
+    TooLate(i64),
+}
+
+/// The pure part of `OvRuntimeEngine::drain_kv_handoff` — structural validation, opaque decode, depth
+/// guard — split out because the engine needs a compiled IR, so this is the only part of the drain a
+/// unit test can reach. `Ok` carries the blob to `set_state`.
+///
+/// Validation MUST happen on this path: the driver-loop apply it replaced ran the codec before the
+/// consumer insert, which the hand-off skips entirely, so nothing else checks layout / engine_rev /
+/// fingerprint and a slice from a drifted build or another model would be `set_state`d silently. The
+/// holder's serve check is LENGTH-only (`tokens.len() == len`, never token equality), so it is not
+/// that bind either.
+pub(crate) fn handoff_decision(
+    slot: &KvHandoffSlot,
+    model_fp: u64,
+    position: i64,
+) -> Result<Vec<u8>, HandoffReject> {
+    let refs: Vec<(&[u8], &[u8])> = slot
+        .payloads
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    if KvSnapshotCodec::validate(
+        &slot.manifest,
+        &refs,
+        OPAQUE_KV_LAYOUT,
+        KV_ENGINE_REV,
+        model_fp,
+        &slot.manifest.token_ids,
+    )
+    .is_err()
+    {
+        return Err(HandoffReject::Validate);
+    }
+    let (_tokens, blob) =
+        wire_to_blob(&slot.manifest, &slot.payloads).ok_or(HandoffReject::Decode)?;
+    // Snapping back is what produced the two-item divergence: a slice shallower than where this rank
+    // already is cannot be resumed into, so drop it and let the turn stay cold.
+    let depth = kv_seq_from_blob(&blob).unwrap_or(0) as i64;
+    if position > depth {
+        return Err(HandoffReject::TooLate(depth));
+    }
+    Ok(blob)
+}
+
 /// One-slot mailbox handing a pulled warm-resume slice from the KV plane to the engine's recv loop.
 ///
 /// Its mutex is INDEPENDENT of the engine mutex, and the producer side never touches the engine at
@@ -810,21 +954,36 @@ pub struct KvHandoffSlot {
 /// on-rig). So the producer only parks bytes here; the engine drains the mailbox from inside its own
 /// recv loop, where it already owns its lock and can still apply ahead of the turn's forward.
 pub struct KvHandoffMailbox {
-    slot: Mutex<Option<KvHandoffSlot>>,
+    inner: Mutex<MailboxInner>,
+}
+
+#[derive(Default)]
+struct MailboxInner {
+    slot: Option<KvHandoffSlot>,
+    /// Last epoch the engine TOOK, so a `clear` that finds the slot empty can tell "already gone to
+    /// the engine" from "this rank never held it" — the two have opposite consequences for the head.
+    /// Set by `take` before the drain validates / decodes / depth-guards / `set_state`s, so it does
+    /// NOT mean applied: a taken-then-rejected slice records here too.
+    drained: Option<u64>,
+    too_late: u64,
 }
 
 impl KvHandoffMailbox {
     pub fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
+            inner: Mutex::new(MailboxInner::default()),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MailboxInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Overwrites any unconsumed slice: only the newest pull can still be ahead of the engine's
     /// position, and an older one would only be rejected by the apply-site depth guard anyway.
     pub fn put(&self, epoch: u64, manifest: Manifest, payloads: Vec<(Vec<u8>, Vec<u8>)>) {
         let n_payloads = payloads.len();
-        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(KvHandoffSlot {
+        self.lock().slot = Some(KvHandoffSlot {
             epoch,
             manifest,
             payloads,
@@ -833,7 +992,50 @@ impl KvHandoffMailbox {
     }
 
     pub fn take(&self) -> Option<KvHandoffSlot> {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let mut g = self.lock();
+        let slot = g.slot.take();
+        if let Some(s) = &slot {
+            g.drained = Some(s.epoch);
+        }
+        slot
+    }
+
+    /// Retract a parked slice (see [`cascadia_engine::KvWarmHandoff::clear`]). Epoch-matched so an
+    /// abort for a stale epoch cannot drop a newer pull that overwrote it.
+    ///
+    /// A `false` for an epoch this mailbox already drained is the residual the retraction cannot
+    /// close — the abort races the engine's recv-loop drain — so it is counted, not swallowed.
+    pub fn clear(&self, epoch: u64) -> bool {
+        let mut g = self.lock();
+        let retracted = g.slot.as_ref().is_some_and(|s| s.epoch == epoch);
+        if retracted {
+            g.slot = None;
+        }
+        let too_late = !retracted && g.drained == Some(epoch);
+        if too_late {
+            g.too_late += 1;
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_abort_too_late",
+                epoch, count = g.too_late);
+        } else {
+            tracing::info!(target: "cascadia::kv", event = "kv_handoff_cleared", epoch, retracted);
+        }
+        retracted
+    }
+
+    /// Epoch-blind retraction for the chain `ABORT`, whose frame is a bare opcode byte with no epoch
+    /// to match on. `true` if a slice was still parked.
+    ///
+    /// Deliberately leaves `drained` alone: that field is what makes a later `clear(epoch)` count as a
+    /// lost race, and a discarded slice never reached the engine at all.
+    pub fn discard_any(&self) -> bool {
+        self.lock().slot.take().is_some()
+    }
+
+    /// Aborts that arrived after the engine had already taken the slice. An UPPER BOUND on the
+    /// warm-rank-under-cold-head residual, not a count of it: `drained` is stamped at `take`, so a
+    /// slice the drain then rejected leaves that rank cold and is counted here anyway.
+    pub fn aborts_too_late(&self) -> u64 {
+        self.lock().too_late
     }
 }
 
@@ -846,6 +1048,10 @@ impl Default for KvHandoffMailbox {
 impl cascadia_engine::KvWarmHandoff for KvHandoffMailbox {
     fn put(&self, epoch: u64, manifest: Manifest, payloads: Vec<(Vec<u8>, Vec<u8>)>) {
         KvHandoffMailbox::put(self, epoch, manifest, payloads);
+    }
+
+    fn clear(&self, epoch: u64) -> bool {
+        KvHandoffMailbox::clear(self, epoch)
     }
 }
 
@@ -936,7 +1142,7 @@ mod tests {
     fn take_warm_removes_and_returns_len() {
         let mut c = OvKvCache::default();
         c.capture(vec![1, 2, 3], vec![0xC, 0xD]);
-        let (blob, len) = c.take_warm(&[1, 2, 3, 4, 5]).unwrap();
+        let (blob, len, _) = c.take_warm(&[1, 2, 3, 4, 5]).unwrap();
         assert_eq!((blob, len), (vec![0xC, 0xD], 3));
         assert!(c.take_warm(&[1, 2, 3, 4, 5]).is_none(), "consumed on take");
     }
@@ -1107,7 +1313,7 @@ mod tests {
         let mut c = OvKvCache::default();
         c.insert_both(vec![1, 2, 3], vec![0xAB]);
         // head path: take_warm by prompt prefix (strict)
-        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3)));
+        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
         // worker path: take_capture by epoch
         let epoch = synth_epoch(&[1, 2, 3]);
         assert_eq!(c.take_capture(epoch), Some((vec![1, 2, 3], vec![0xAB])));
@@ -1117,9 +1323,247 @@ mod tests {
     #[test]
     fn offers_take_precedence_and_are_single_use() {
         let mut c = OvKvCache::default();
-        c.offers.insert(0xF0, (vec![1, 2], vec![0x01]));
+        c.stash_offer(0xF0, vec![1, 2], vec![0x01]);
         assert_eq!(c.serve(0xF0, 2), Some((vec![1, 2], vec![0x01])));
         assert!(c.serve(0xF0, 2).is_none(), "offer consumed on serve");
+    }
+
+    /// One NEGOTIATE→GET cycle: capture a turn, negotiate a superset of it, get back `(epoch, len)`.
+    fn negotiate(c: &mut OvKvCache, tok: i32, blob: Vec<u8>) -> (u64, u32) {
+        c.capture(vec![tok], blob);
+        c.lookup(&[tok, 0])
+            .expect("the just-captured turn prefixes the request")
+    }
+
+    /// §8 criterion 6: an unpaired-NEGOTIATE flood cannot pin more than the stated budget.
+    #[test]
+    fn unpaired_negotiate_flood_stays_within_the_byte_budget() {
+        let mut c = OvKvCache::default();
+        let rig_blob = KV_MAX_OFFER_BYTES / 8;
+        for i in 0..20 {
+            negotiate(&mut c, i, vec![0u8; rig_blob]);
+            assert!(
+                c.offer_bytes <= KV_MAX_OFFER_BYTES,
+                "offer {i} pinned {} bytes",
+                c.offer_bytes
+            );
+        }
+        assert_eq!(c.offers.len(), 8, "exactly budget/blob offers survive");
+        assert_eq!(c.offer_order.len(), c.offers.len());
+    }
+
+    /// Arbitrary `HashMap` order can evict the offer whose paired GET is already in flight and keep
+    /// a stale one; the budget is only useful if the survivor is the one still expected. Driven
+    /// through the COUNT cap so every eviction is checked, not just one 50/50 draw.
+    #[test]
+    fn offer_eviction_is_oldest_first() {
+        let mut c = OvKvCache::default();
+        let n = KV_MAX_OFFERS as i32 + 8;
+        let e: Vec<u64> = (0..n)
+            .map(|i| negotiate(&mut c, i, vec![i as u8]).0)
+            .collect();
+        let (evicted, kept) = e.split_at(8);
+        assert!(
+            evicted.iter().all(|x| !c.offers.contains_key(x)),
+            "the 8 oldest offers go first"
+        );
+        assert!(kept.iter().all(|x| c.offers.contains_key(x)));
+    }
+
+    /// A re-NEGOTIATE of the same prefix replaces its offer: one map entry, one `offer_order` slot,
+    /// and its bytes counted once. Without that, a routine peer retry leaks a stale order slot and
+    /// `offer_bytes` drifts up until it pins the cache at one entry (release) or underflows (debug).
+    #[test]
+    fn re_negotiating_the_same_prefix_replaces_its_offer() {
+        let mut c = OvKvCache::default();
+        let (e1, _) = negotiate(&mut c, 1, vec![0u8; 64]);
+        let (e2, len) = negotiate(&mut c, 1, vec![0u8; 64]);
+        assert_eq!(e1, e2, "same prefix ⇒ same content epoch");
+        assert_eq!(c.offers.len(), 1);
+        assert_eq!(c.offer_order.len(), 1, "no stale order slot");
+        assert_eq!(c.offer_bytes, 64, "bytes counted once");
+        assert!(c.serve(e2, len).is_some());
+        assert_eq!(c.offer_bytes, 0);
+    }
+
+    /// A blob bigger than the whole budget is admitted alone rather than evicted to death — the
+    /// alternative leaves the node unable to serve its largest cached turn at all.
+    #[test]
+    fn an_offer_over_the_budget_is_still_servable() {
+        let mut c = OvKvCache::default();
+        let (epoch, len) = negotiate(&mut c, 7, vec![0u8; KV_MAX_OFFER_BYTES + 1]);
+        assert_eq!(c.offers.len(), 1);
+        assert_eq!(
+            c.serve(epoch, len).map(|(_, b)| b.len()),
+            Some(KV_MAX_OFFER_BYTES + 1)
+        );
+        assert_eq!(c.offer_bytes, 0);
+    }
+
+    #[test]
+    fn a_paired_get_still_serves_after_evictions() {
+        let mut c = OvKvCache::default();
+        let n = KV_MAX_OFFERS as i32 + 8;
+        let e: Vec<(u64, u32)> = (0..n)
+            .map(|i| negotiate(&mut c, i, vec![i as u8]))
+            .collect();
+        assert_eq!(c.offers.len(), KV_MAX_OFFERS);
+        let (epoch, len) = e[n as usize - 1];
+        assert_eq!(
+            c.serve(epoch, len),
+            Some((vec![n - 1], vec![(n - 1) as u8]))
+        );
+    }
+
+    /// Byte accounting must not drift: every offer leaves either through a GET or an eviction.
+    #[test]
+    fn offer_bytes_return_to_zero() {
+        let mut c = OvKvCache::default();
+        let e: Vec<(u64, u32)> = (0..(KV_MAX_OFFERS as i32 + 8))
+            .map(|i| negotiate(&mut c, i, vec![i as u8]))
+            .collect();
+        for (epoch, len) in e {
+            let _ = c.serve(epoch, len);
+        }
+        assert!(c.offers.is_empty() && c.offer_order.is_empty());
+        assert_eq!(c.offer_bytes, 0);
+    }
+
+    fn park(mb: &KvHandoffMailbox, epoch: u64) {
+        let (m, payloads) = blob_to_wire(&[1, 2, 3], &[0xAB], "acme", epoch, 0xABCD);
+        mb.put(epoch, m, payloads);
+    }
+
+    /// The abort that follows a partial commit has to actually retract, or the rank drains the slice
+    /// on its next turn and runs warm under a head that went cold.
+    #[test]
+    fn handoff_clear_retracts_a_parked_slice() {
+        let mb = KvHandoffMailbox::new();
+        park(&mb, 0xE7);
+        assert!(mb.clear(0xE7), "a parked slice must report as retracted");
+        assert!(
+            mb.take().is_none(),
+            "cleared slice must not reach the engine"
+        );
+        assert_eq!(mb.aborts_too_late(), 0);
+    }
+
+    #[test]
+    fn handoff_clear_of_an_unknown_epoch_is_safe() {
+        let mb = KvHandoffMailbox::new();
+        assert!(!mb.clear(0xE8), "nothing parked ⇒ nothing retracted");
+        park(&mb, 0xE9);
+        assert!(!mb.clear(0xE8), "a stale abort must not drop a newer pull");
+        assert_eq!(mb.take().map(|s| s.epoch), Some(0xE9));
+        assert_eq!(mb.aborts_too_late(), 0, "neither case is the drain race");
+    }
+
+    /// The residual `clear` cannot close: the abort loses the race with the engine's recv-loop drain.
+    /// Counted so the plan's acceptance criterion is measured rather than assumed rare.
+    #[test]
+    fn handoff_clear_after_a_drain_counts_the_residual() {
+        let mb = KvHandoffMailbox::new();
+        park(&mb, 0xEA);
+        assert!(mb.take().is_some());
+        assert!(!mb.clear(0xEA), "already drained ⇒ retraction impossible");
+        assert_eq!(mb.aborts_too_late(), 1);
+    }
+
+    /// The ABORT frame is a bare opcode byte, so the retraction it needs cannot be epoch-matched.
+    #[test]
+    fn handoff_discard_any_retracts_without_an_epoch() {
+        let mb = KvHandoffMailbox::new();
+        park(&mb, 0xEB);
+        assert!(mb.discard_any(), "a parked slice must report as discarded");
+        assert!(
+            mb.take().is_none(),
+            "discarded slice must not reach the engine"
+        );
+        assert!(!mb.discard_any(), "nothing parked ⇒ nothing discarded");
+    }
+
+    /// A discard is not a drain. If it marked the epoch drained, the `clear` the enterprise side still
+    /// sends for that epoch would be counted as too-late and inflate the residual with a slice the
+    /// engine never applied.
+    #[test]
+    fn handoff_discard_any_is_not_a_drain() {
+        let mb = KvHandoffMailbox::new();
+        park(&mb, 0xEC);
+        assert!(mb.discard_any());
+        assert!(!mb.clear(0xEC));
+        assert_eq!(mb.aborts_too_late(), 0);
+    }
+
+    const DECISION_FP: u64 = 0xF00D;
+
+    fn slot_of(blob: &[u8]) -> KvHandoffSlot {
+        let (manifest, payloads) = blob_to_wire(&[1, 2, 3], blob, "acme", DECISION_FP, 0xE0);
+        KvHandoffSlot {
+            epoch: 0xE0,
+            manifest,
+            payloads,
+        }
+    }
+
+    /// A parked slice whose blob reads back at KV depth `depth`: one rank-4 attention state, data
+    /// elided (`kv_seq_from_blob` reads shape only).
+    fn slot_at_depth(depth: u64) -> KvHandoffSlot {
+        let name = "past_key_values.0.key";
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name.as_bytes());
+        blob.extend_from_slice(&[1, 4]); // dtype, rank
+        for d in [1u64, 1, depth, 1] {
+            blob.extend_from_slice(&d.to_le_bytes());
+        }
+        blob.extend_from_slice(&0u64.to_le_bytes()); // nbytes
+        slot_of(&blob)
+    }
+
+    #[test]
+    fn handoff_decision_accepts_a_good_slice() {
+        let s = slot_at_depth(4);
+        let blob = handoff_decision(&s, DECISION_FP, 0).expect("valid slice ahead of position");
+        assert_eq!(kv_seq_from_blob(&blob), Some(4));
+    }
+
+    #[test]
+    fn handoff_decision_rejects_a_drifted_build_or_a_foreign_model() {
+        let mut drifted = slot_at_depth(4);
+        drifted.manifest.engine_rev += 1;
+        assert_eq!(
+            handoff_decision(&drifted, DECISION_FP, 0),
+            Err(HandoffReject::Validate)
+        );
+        assert_eq!(
+            handoff_decision(&slot_at_depth(4), DECISION_FP + 1, 0),
+            Err(HandoffReject::Validate)
+        );
+    }
+
+    /// Only the empty-blob arm of `wire_to_blob` is reachable: a payload count ≠ 1 is a `num_layers`
+    /// mismatch, which validate rejects first.
+    #[test]
+    fn handoff_decision_rejects_an_undecodable_payload() {
+        assert_eq!(
+            handoff_decision(&slot_of(&[]), DECISION_FP, 0),
+            Err(HandoffReject::Decode)
+        );
+    }
+
+    /// The guard is `>`, not `>=`: a slice exactly at this rank's position is still resumable, and
+    /// only a shallower one — which would snap the state backwards — is dropped.
+    #[test]
+    fn handoff_decision_guards_the_depth_boundary() {
+        let s = slot_at_depth(4);
+        assert!(
+            handoff_decision(&s, DECISION_FP, 4).is_ok(),
+            "position == depth must still resume"
+        );
+        assert_eq!(
+            handoff_decision(&s, DECISION_FP, 5),
+            Err(HandoffReject::TooLate(4))
+        );
     }
 
     #[test]
@@ -1135,5 +1579,45 @@ mod tests {
         c.capture(key.clone(), vec![0xFF]);
         assert_eq!(c.entries.len(), n);
         assert_eq!(c.entries[0].tokens, key, "re-capture moves to front");
+    }
+
+    #[test]
+    fn take_warm_reports_entry_provenance() {
+        let mut c = OvKvCache::default();
+        c.capture(vec![1, 2, 3], vec![0xC]);
+        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xC], 3, false)));
+        c.insert_both(vec![1, 2, 3], vec![0xAB]);
+        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
+    }
+
+    /// LRU pressure must fail safe: with the plane entry evicted, the local entry that still matches
+    /// carries its own mark, so the chain verdict stays binding.
+    #[test]
+    fn evicting_a_plane_entry_leaves_a_local_mark() {
+        let mut c = OvKvCache::default();
+        c.insert_both(vec![0, 1], vec![0xAB]);
+        c.capture(vec![0], vec![0x01]);
+        for i in 1..=(KV_MAX_ENTRIES as i32 - 1) {
+            c.capture(vec![9, i], vec![i as u8]); // key 9 never prefixes [0,1,2]; one over the bound
+        }
+        assert!(
+            c.entries.iter().all(|e| !e.plane_pulled),
+            "the plane entry fell off the tail"
+        );
+        assert_eq!(c.take_warm(&[0, 1, 2]), Some((vec![0x01], 1, false)));
+    }
+
+    #[test]
+    fn chain_verdict_scopes_the_plane_override_to_plane_entries() {
+        for (mode, entry) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(chain_verdict(true, mode, entry), "confirmed is always warm");
+        }
+        assert!(!chain_verdict(false, false, false));
+        assert!(!chain_verdict(false, false, true));
+        assert!(
+            !chain_verdict(false, true, false),
+            "P3: plane mode must not override a false verdict on a locally captured entry"
+        );
+        assert!(chain_verdict(false, true, true));
     }
 }

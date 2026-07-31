@@ -32,6 +32,17 @@ pub struct OvMoeKvSnapshot {
     pub layers: Vec<OvLayerKvSlice>,
 }
 
+impl OvMoeKvSnapshot {
+    /// Total cached bytes — the `f32` K/V buffers only. Underestimate: no `Vec`/map overhead.
+    /// Mirrors [`crate::kv_prefix_cache::KvSnapshot::approx_bytes`].
+    pub fn approx_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| (l.k.len() + l.v.len()) * std::mem::size_of::<f32>())
+            .sum()
+    }
+}
+
 /// Cache key: model fingerprint digest + a hash of the token-id prefix.
 /// The prefix is re-compared in full on lookup, so a prefix-hash collision
 /// cannot return a wrong entry.
