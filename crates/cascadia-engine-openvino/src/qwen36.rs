@@ -216,10 +216,19 @@ pub struct Qwen36Builder {
     eos: Option<u32>,
     last_logits_only: bool,
     /// Issue-34: KV-cache STORAGE precision. Distinct from the compute-precision hints noted at the
-    /// PluginConfig site (those are f16-only on the fused MoE gemm and fail to compile). A quantized
-    /// KV cache makes `set_state` LOSSY at the internal level even though get/set round-trips the
-    /// DECLARED bytes exactly — which is precisely the warm!=cold signature this engine shows. Every
-    /// other engine (runtime/gemma4/dist_spec) already plumbs this; qwen36 was the only one that did not.
+    /// PluginConfig site (those are f16-only on the fused MoE gemm and fail to compile).
+    ///
+    /// MEASURED INERT for this export, and it did NOT explain warm!=cold (that was the pre-restore
+    /// state clear; see `restore_clear_mode`). Setting f32 left cold output BYTE-IDENTICAL to the
+    /// default over a 48-token greedy turn and triggered NO recompile — neither is possible if a 35B
+    /// model's KV storage precision actually changed. This export's KV are graph-level ReadValue/Assign
+    /// variables (`cache_params.past.*`, see tools/qwen36_surgery/export_qwen36_moe.py), which the
+    /// plugin property does not reach. Kept as an inert opt-in rather than deleted: the OV CPU
+    /// StatefulSDPAFusion pass *can* absorb a stateful KV pattern into a plugin-managed cache, so this
+    /// is an empirical fact about this OV version and export, not a structural guarantee.
+    ///
+    /// Do NOT re-derive "inert" from unchanged tensor byte-width — get_state reports the DECLARED type
+    /// either way, so that observation is consistent with both readings and proves nothing.
     pub kv_cache_precision: Option<String>,
     pub dyn_quant_group: Option<String>,
     /// OV compiled-blob cache. Without it this 35B MoE recompiles from scratch on EVERY spawn (and any
@@ -375,9 +384,9 @@ impl Builder for Qwen36Builder {
         // (single-box / 2-stage, aligned GPU drivers), not a precision hint.
         // KV-cache STORAGE precision is a DIFFERENT property from the compute hints above: it does not
         // touch the MoE gemm kernel, so it compiles where INFERENCE_PRECISION_HINT/EXECUTION_MODE_HINT
-        // do not. With a quantized KV cache, set_state re-quantizes and loses the internal low bits, so
-        // a RESTORED state does not behave like a NATURALLY-folded one — while get/set still round-trips
-        // the declared bytes exactly. That is exactly this engine's warm!=cold signature.
+        // do not. Measured inert on this export and NOT the cause of warm!=cold — see the
+        // `kv_cache_precision` field doc. Left wired so the knob behaves as declared if a future export
+        // does route KV through a plugin-managed cache.
         let mut plugin = PluginConfig::new();
         if let Some(d) = &self.cache_dir {
             plugin = plugin.with("CACHE_DIR", d);
@@ -2245,9 +2254,19 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
                 // The head computes `warm` from RANK 0's slice alone and ships it to every rank as the
                 // FORWARD `pos`; this rank never computes its own restored depth, so a stage whose
                 // attention shape[2] differs folds the suffix at the wrong absolute offset (wrong
-                // RoPE/mask, mis-phased DeltaNet) with nothing to catch it. ov-runtime both computes
-                // and guards this. Log ours so head-vs-rank can be compared directly; a guard needs the
-                // head's value plumbed here, which the wire does not carry yet.
+                // RoPE/mask) with nothing to catch it. Within one healthy chain all ranks fold the same
+                // tokens, so depths agree by construction; the plane can break that, because its epoch
+                // is content-keyed (`synth_epoch(prefix)`) and two ranks may legitimately pull from
+                // DIFFERENT donor chains that captured at different lengths.
+                //
+                // A guard is cheap and does NOT need new wire fields: the head's value already arrives
+                // as the FORWARD header `pos` (see frame_header / the FORWARD parse), so stashing this
+                // depth and comparing on the next FORWARD would do it. Logged rather than guarded only
+                // because it is not on bar #1's path. Note a mis-phased conv/ssm state is invisible to
+                // any such check — those carry no depth at all.
+                //
+                // (ov-runtime's `kv_handoff_too_late` is NOT this guard: it compares its own advancing
+                // `position` against blob depth on a single-rank engine. qwen36 has no `self.position`.)
                 let depth = crate::kv_coordination::kv_seq_from_framed_blob(&blob).unwrap_or(0);
                 info!(epoch, rank_depth = depth, blob_len = blob.len(),
                     "qwen36: plane apply — THIS rank's restored depth (compare vs head warm_prefix)");
