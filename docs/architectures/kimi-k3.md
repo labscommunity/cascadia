@@ -381,7 +381,15 @@ scalar there.
 ### Where the remaining speed is
 
 Decode is 99% expert I/O, so every worthwhile change is an I/O change. Ranked by
-measured impact rather than by how interesting the code is:
+measured impact rather than by how interesting the code is.
+
+One caveat that cost most of a day: three entries below were configured, reported
+themselves enabled, and did nothing. The prefix cache sized its key index from an
+unrelated env var and evicted every entry on the line after recording it; autopin
+needs more tokens than any test run produces; explicit reads were judged from a
+comparison that moved two variables. None failed loudly. Before trusting a row
+here, check that the feature was observed DOING something — a `routed=` that
+dropped, a `syscr` that moved — not merely that it was switched on.
 
 | | Status | Expected |
 |---|---|---|
@@ -390,7 +398,7 @@ measured impact rather than by how interesting the code is:
 | explicit concurrent reads | done, **default** (`CASCADIA_K3_READ=0` opts out) | **measured +8.5%** steady-state decode, -1.6% prefill, 2 runs per side. Both phases must use the same strategy — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised, **needs a long run** | prior art finds static hot-set pinning helps cold start and loses in steady state. Two gotchas before measuring: the histogram is only persisted when autopin is enabled, so the FIRST enabled run always reports `pinned=0` and merely records; and the confidence ramp counts selections, of which K3 makes 92 layers x 16 = 1472 per token, so nothing pins below ~3.4 tokens and full confidence needs ~136. A 3-token run produces 4416 selections and stays under the floor — this cannot be evaluated at that scale |
-| prefix cache | built, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`), **needs >= 2 ranks**, unmeasured | should skip prefill on a repeated prefix, ~155 GB and ~15 min of it. Byte-bounded LRU over the post-prefill layer states. Driven only from the pipeline path, so 1 rank takes `step_single_stage` and never reaches it — the budget is accepted and ignored (now warned about). Reuse needs a STRICT prefix, so resending an identical prompt never hits; the case it serves is the next turn, which resends the reply too |
+| prefix cache | working, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`), **needs >= 2 ranks** | **measured 2.45x** on a next-turn request: prefill bytes 142.06 -> 51.66 GB and prefill 649.4 -> 228.3 s at `reused=7 prompt=10`, saving in proportion to the reuse fraction. Byte-bounded LRU over the post-prefill layer states. Driven only from the pipeline path, so 1 rank takes `step_single_stage` and never reaches it — the budget is accepted and ignored (now warned about). Reuse needs a STRICT prefix, so resending an identical prompt never hits; the case it serves is the next turn, which resends the reply too |
 | lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
