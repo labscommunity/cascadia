@@ -26,7 +26,125 @@ use crate::kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFinge
 pub const KV_ENGINE_REV: u64 = 1;
 
 /// Cap on stashed unconsumed offers (NEGOTIATE without a paired GET); oldest dropped on overflow.
-const KV_MAX_OFFERS: usize = 64;
+pub(crate) const KV_MAX_OFFERS: usize = 64;
+/// Byte ceiling on ONE `offers` map; an engine holds two (`kv_offers` + the `kv_share` mirror), and
+/// `lookup` has already cloned the snapshot before `stash` evicts — so node peak is ~2×(this + one
+/// snapshot), not 2×this. At K2.6 scale (~150 MiB/512-token snapshot) that is 1–2 live offers, where
+/// the same number buys the sibling OpenVINO engine ~7 at its ~35 MB blobs; a third concurrent
+/// NEGOTIATE evicts the oldest. NOT derived from the prefix-cache capacity: an offer is cloned from
+/// an entry but outlives it. Shrunk under `cfg(test)` so the eviction tests cost MB, not GB.
+pub(crate) const KV_MAX_OFFER_BYTES: usize = if cfg!(test) { 4 << 20 } else { 256 << 20 };
+/// Floor between eviction log lines.
+const EVICT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bounded NEGOTIATE→GET offer stash: `epoch → (prefix tokens, snapshot)`, held only until the paired
+/// GET. Generic over the snapshot type, so the K2.6 and OvMoe planes share it without a sizing trait.
+pub(crate) struct KvOfferStash<S> {
+    offers: std::collections::HashMap<u64, (Vec<i32>, S, usize)>,
+    /// Stashed epochs in insertion order, oldest first.
+    order: std::collections::VecDeque<u64>,
+    bytes: usize,
+    max_offers: usize,
+    max_bytes: usize,
+    /// Sizes each offer here rather than trusting a caller-supplied count: two of the four call sites
+    /// need a loaded engine to construct, so a wrong count there would disable the byte cap silently.
+    sizer: fn(&S) -> usize,
+    /// Offers dropped before their paired GET, cumulative. Monotone — the delta between two log lines
+    /// is what the 30 s floor swallowed.
+    evicted: u64,
+    /// A flood evicts once per NEGOTIATE, so a line per eviction would trade memory exhaustion for
+    /// log exhaustion on the same untrusted input.
+    last_log: Option<std::time::Instant>,
+}
+
+impl<S> KvOfferStash<S> {
+    pub(crate) fn new(max_offers: usize, max_bytes: usize, sizer: fn(&S) -> usize) -> Self {
+        Self {
+            offers: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            max_offers,
+            max_bytes,
+            sizer,
+            evicted: 0,
+            last_log: None,
+        }
+    }
+
+    /// Stash an offer for its paired GET, evicting until it fits both bounds.
+    pub(crate) fn stash(&mut self, epoch: u64, tokens: Vec<i32>, snapshot: S) {
+        let bytes = (self.sizer)(&snapshot);
+        // A re-NEGOTIATE of the same prefix replaces its offer instead of double-counting its bytes.
+        let _ = self.take(epoch);
+        // Loops on `order`, not the map: a desync must not spin here while the caller holds a lock.
+        // Stops at empty so an offer over the whole budget is stashed alone, not evicted to death.
+        while !self.order.is_empty()
+            && (self.offers.len() >= self.max_offers || self.bytes + bytes > self.max_bytes)
+        {
+            self.evict_oldest();
+        }
+        self.bytes += bytes;
+        self.order.push_back(epoch);
+        self.offers.insert(epoch, (tokens, snapshot, bytes));
+        debug_assert_eq!(self.order.len(), self.offers.len());
+    }
+
+    /// Oldest first: arbitrary `HashMap` order can drop the offer whose paired GET is in flight and
+    /// keep a stale one, turning a warm resume cold for no gain.
+    fn evict_oldest(&mut self) {
+        let Some(epoch) = self.order.pop_front() else {
+            return;
+        };
+        let Some((_, _, bytes)) = self.offers.remove(&epoch) else {
+            return;
+        };
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.evicted += 1;
+        let now = std::time::Instant::now();
+        if self
+            .last_log
+            .is_none_or(|t| now.duration_since(t) >= EVICT_LOG_EVERY)
+        {
+            self.last_log = Some(now);
+            tracing::info!(target: "cascadia::kv", event = "kv_offer_evicted_unserved",
+                epoch, bytes, evicted_total = self.evicted, n_offers = self.offers.len(),
+                held = self.bytes);
+        }
+    }
+
+    /// Remove an offer, keeping `order` and `bytes` in step.
+    pub(crate) fn take(&mut self, epoch: u64) -> Option<(Vec<i32>, S)> {
+        let (tokens, snapshot, bytes) = self.offers.remove(&epoch)?;
+        self.order.retain(|&e| e != epoch);
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some((tokens, snapshot))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.offers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn order_len(&self) -> usize {
+        self.order.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evicted(&self) -> u64 {
+        self.evicted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, epoch: u64) -> bool {
+        self.offers.contains_key(&epoch)
+    }
+}
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -194,13 +312,7 @@ impl KvCoordination for SparseMoEEngine {
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        if self.kv_offers.len() >= KV_MAX_OFFERS {
-            // Drop an arbitrary stale offer (bounded growth; offers are short-lived NEGOTIATE→GET).
-            if let Some(k) = self.kv_offers.keys().next().copied() {
-                self.kv_offers.remove(&k);
-            }
-        }
-        self.kv_offers.insert(epoch, (prefix, snap));
+        self.kv_offers.stash(epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -215,7 +327,7 @@ impl KvCoordination for SparseMoEEngine {
         //  - `kv_offers`: the head/single-stage NEGOTIATE→GET correlation (short-lived, single-use).
         //  - `kv_capture`: Task 1.3 multi-stage per-rank store (persistent; a worker has no NEGOTIATE,
         //    so its slice is stashed at CAPTURE time and may serve repeat/later GETs — clone, no remove).
-        let (prefix, snap) = if let Some(off) = self.kv_offers.remove(&expected_epoch) {
+        let (prefix, snap) = if let Some(off) = self.kv_offers.take(expected_epoch) {
             off
         } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -295,7 +407,7 @@ pub(crate) struct SparseHolderState {
     /// Mirror of the engine's `kv_prefix_cache`. `pub(crate)` so the engine's store sites mirror here.
     pub(crate) prefix: KvPrefixCache,
     /// Holder-internal NEGOTIATE→GET correlation (mirror of the engine's `kv_offers`).
-    offers: std::collections::HashMap<u64, (Vec<i32>, KvSnapshot)>,
+    offers: KvOfferStash<KvSnapshot>,
     /// Mirror of the engine's `kv_capture` (multi-stage per-rank captures). `pub(crate)` for mirroring.
     pub(crate) captures: std::collections::HashMap<u64, (Vec<i32>, KvSnapshot)>,
     /// Fingerprint snapshotted at holder creation (the prefix cache's lookup key).
@@ -306,7 +418,7 @@ impl SparseHolderState {
     pub(crate) fn new(capacity: usize, fp: ModelFingerprint) -> Self {
         Self {
             prefix: KvPrefixCache::new(capacity),
-            offers: std::collections::HashMap::new(),
+            offers: KvOfferStash::new(KV_MAX_OFFERS, KV_MAX_OFFER_BYTES, KvSnapshot::approx_bytes),
             captures: std::collections::HashMap::new(),
             fp,
         }
@@ -341,13 +453,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        if g.offers.len() >= KV_MAX_OFFERS {
-            // Drop an arbitrary stale offer (bounded growth; offers are short-lived NEGOTIATE→GET).
-            if let Some(k) = g.offers.keys().next().copied() {
-                g.offers.remove(&k);
-            }
-        }
-        g.offers.insert(epoch, (prefix, snap));
+        g.offers.stash(epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -359,7 +465,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         // Replicates `KvCoordination::export` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (prefix, snap) = if let Some(off) = g.offers.remove(&expected_epoch) {
+        let (prefix, snap) = if let Some(off) = g.offers.take(expected_epoch) {
             off
         } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -382,6 +488,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascadia_engine::KvSnapshotHolder;
     use cascadia_kv_wire::KvSnapshotCodec;
 
     // num_heads=1, len=3, qk_head_dim=2, v_head_dim=1 ⇒ K=6 u16, V=3 u16.
@@ -432,5 +539,154 @@ mod tests {
         assert_eq!(back.shells.len(), 1);
         assert_eq!(back.shells[0].lid, 1);
         assert_eq!(back.shells[0].past_k, vec![10, 11, 12, 13, 14, 15]);
+    }
+
+    /// A snapshot whose `approx_bytes()` is exactly `bytes` (k + v, u16 each ⇒ 4 bytes per step).
+    fn snap_of(bytes: usize) -> KvSnapshot {
+        let n = bytes / 4;
+        KvSnapshot {
+            past_seq_len: 1,
+            num_heads: 1,
+            qk_head_dim: 1,
+            v_head_dim: 1,
+            layer0: Some(LayerKvSlice {
+                lid: 0,
+                past_k: vec![0; n],
+                past_v: vec![0; n],
+            }),
+            shells: vec![],
+        }
+    }
+
+    /// One NEGOTIATE's worth of stashing: epoch `e`, an offer of `bytes`.
+    fn offer(s: &mut KvOfferStash<KvSnapshot>, e: u64, bytes: usize) {
+        s.stash(e, vec![e as i32], snap_of(bytes));
+    }
+
+    fn stash() -> KvOfferStash<KvSnapshot> {
+        KvOfferStash::new(KV_MAX_OFFERS, KV_MAX_OFFER_BYTES, KvSnapshot::approx_bytes)
+    }
+
+    /// An unpaired-NEGOTIATE flood from an admitted peer must not pin more than the stated budget:
+    /// the count cap alone let it pin `cap × blob`, on a node already under memory pressure.
+    #[test]
+    fn unpaired_negotiate_flood_stays_within_the_byte_budget() {
+        let mut s = stash();
+        let blob = KV_MAX_OFFER_BYTES / 8;
+        for e in 0..20 {
+            offer(&mut s, e, blob);
+            let held = s.bytes();
+            assert!(held <= KV_MAX_OFFER_BYTES, "offer {e} pinned {held}");
+        }
+        assert_eq!(s.len(), 8, "exactly budget/blob offers survive");
+        assert_eq!(s.order_len(), s.len());
+    }
+
+    /// Arbitrary `HashMap` order can evict the offer whose paired GET is already in flight and keep a
+    /// stale one. Driven through the COUNT cap so every eviction is checked — a two-candidate
+    /// byte-budget version passes the buggy code on a coin flip.
+    #[test]
+    fn offer_eviction_is_oldest_first() {
+        let mut s = stash();
+        let n = KV_MAX_OFFERS as u64 + 8;
+        for e in 0..n {
+            offer(&mut s, e, 4);
+        }
+        assert!((0..8).all(|e| !s.contains(e)), "8 oldest offers go first");
+        assert!((8..n).all(|e| s.contains(e)));
+        assert_eq!(s.evicted(), 8, "every unserved eviction is counted");
+    }
+
+    #[test]
+    fn a_paired_get_still_serves_after_evictions() {
+        let mut s = stash();
+        let n = KV_MAX_OFFERS as u64 + 8;
+        for e in 0..n {
+            offer(&mut s, e, 4);
+        }
+        let (tokens, snap) = s.take(n - 1).expect("newest offer still stashed");
+        assert_eq!(tokens, vec![(n - 1) as i32]);
+        assert_eq!(snap.approx_bytes(), 4);
+    }
+
+    /// An offer bigger than the whole budget is stashed alone rather than evicted to death — the
+    /// alternative leaves the node unable to serve its largest cached turn at all.
+    #[test]
+    fn an_offer_over_the_budget_is_still_servable() {
+        let mut s = stash();
+        offer(&mut s, 1, 8);
+        offer(&mut s, 2, KV_MAX_OFFER_BYTES + 4);
+        assert_eq!(s.len(), 1);
+        assert!(s.take(2).is_some(), "the over-budget offer is servable");
+        assert_eq!(s.bytes(), 0);
+    }
+
+    /// Byte accounting must not drift: every offer leaves through a GET or an eviction.
+    #[test]
+    fn offer_bytes_return_to_zero() {
+        let mut s = stash();
+        let n = KV_MAX_OFFERS as u64 + 8;
+        for e in 0..n {
+            offer(&mut s, e, 4);
+        }
+        for e in 0..n {
+            let _ = s.take(e);
+        }
+        assert_eq!((s.len(), s.order_len(), s.bytes()), (0, 0, 0));
+    }
+
+    /// A re-NEGOTIATE of the same prefix replaces its offer. Without that, a routine peer retry leaks
+    /// an order slot and over-counts bytes until the stash pins itself at one entry.
+    #[test]
+    fn re_negotiating_the_same_prefix_replaces_its_offer() {
+        let mut s = stash();
+        offer(&mut s, 0xF0, 64);
+        offer(&mut s, 0xF0, 64);
+        assert_eq!((s.len(), s.order_len(), s.bytes()), (1, 1, 64));
+        assert!(s.take(0xF0).is_some());
+        assert_eq!(s.bytes(), 0);
+    }
+
+    fn fp() -> ModelFingerprint {
+        ModelFingerprint {
+            arch: "k26".into(),
+            num_layers: 1,
+            num_experts: 1,
+            top_k: 1,
+            hidden_size: 8,
+            num_kv_heads: 1,
+            qk_head_dim: 1,
+            v_head_dim: 1,
+            vocab_size: 256,
+            layer_start: 0,
+            layer_end: 1,
+            is_first: true,
+            is_last: true,
+        }
+    }
+
+    /// The holder's NEGOTIATE path is bounded, and the newest offer still has its paired GET.
+    #[test]
+    fn holder_negotiate_flood_is_bounded_and_still_serves() {
+        let n = KV_MAX_OFFERS as i32 + 8;
+        let mut st = SparseHolderState::new(n as usize, fp());
+        for i in 0..n {
+            st.prefix.insert(vec![i64::from(i)], &fp(), snap_of(4));
+        }
+        let holder = SparseMoeKvHolder {
+            cache: std::sync::Arc::new(std::sync::Mutex::new(st)),
+            model_fp: fp().digest(),
+        };
+        let mut last = None;
+        for i in 0..n {
+            last = holder.lookup("peer", &[i, 0]);
+        }
+        {
+            let g = holder.cache.lock().unwrap();
+            assert_eq!(g.offers.len(), KV_MAX_OFFERS);
+            assert!(g.offers.bytes() <= KV_MAX_OFFER_BYTES);
+        }
+        let (epoch, len) = last.expect("negotiate hit");
+        assert!(holder.export("peer", epoch, len).is_some());
     }
 }

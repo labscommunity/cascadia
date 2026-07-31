@@ -918,7 +918,11 @@ impl Builder for SparseMoEBuilder {
             spec_decode_k,
             kv_prefix_cache,
             #[cfg(feature = "kv_coord")]
-            kv_offers: std::collections::HashMap::new(),
+            kv_offers: crate::kv_coordination::KvOfferStash::new(
+                crate::kv_coordination::KV_MAX_OFFERS,
+                crate::kv_coordination::KV_MAX_OFFER_BYTES,
+                crate::kv_prefix_cache::KvSnapshot::approx_bytes,
+            ),
             #[cfg(feature = "kv_coord")]
             kv_capture: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
@@ -1117,10 +1121,10 @@ pub struct SparseMoEEngine {
     pub(crate) kv_prefix_cache: KvPrefixCache,
     /// Issue-34 Option C: NEGOTIATE→GET correlation. A `lookup` stashes the offered `(prefix_tokens,
     /// snapshot)` keyed by its content-derived `snapshot_epoch`; the paired `export` retrieves it by
-    /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS`.
+    /// that epoch (the wire `Get` carries no token_ids). Bounded by `KV_MAX_OFFERS` and
+    /// `KV_MAX_OFFER_BYTES`.
     #[cfg(feature = "kv_coord")]
-    pub(crate) kv_offers:
-        std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+    pub(crate) kv_offers: crate::kv_coordination::KvOfferStash<crate::kv_prefix_cache::KvSnapshot>,
     /// Issue-34 Task 1.3 (multi-stage capture, §8): PERSISTENT per-rank capture store, keyed by the
     /// head-assigned epoch. Multi-stage `CAPTURE(E,tokens)` stashes each stage's `snapshot_kv()` here;
     /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
@@ -2746,8 +2750,7 @@ pub struct OvMoeEngine {
     /// Cross-chain (Issue-34 Option C) head/single-stage NEGOTIATE→GET offers:
     /// `epoch → (prefix tokens, snapshot)`, short-lived (created on NEGOTIATE, consumed on GET).
     #[cfg(feature = "kv_coord")]
-    kv_offers:
-        std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    kv_offers: crate::kv_coordination::KvOfferStash<crate::ov_kv_cache::OvMoeKvSnapshot>,
     /// Holder-side mirror of the prefix/offer/capture caches, served lock-free by
     /// [`crate::ov_kv_coordination::OvMoeKvHolder`] for cross-chain NEGOTIATE/GET.
     #[cfg(feature = "kv_coord")]
@@ -2795,7 +2798,11 @@ impl OvMoeEngine {
             #[cfg(feature = "kv_coord")]
             kv_capture: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
-            kv_offers: std::collections::HashMap::new(),
+            kv_offers: crate::kv_coordination::KvOfferStash::new(
+                crate::ov_kv_coordination::KV_MAX_OFFERS,
+                crate::ov_kv_coordination::KV_MAX_OFFER_BYTES,
+                crate::ov_kv_cache::OvMoeKvSnapshot::approx_bytes,
+            ),
             #[cfg(feature = "kv_coord")]
             kv_share,
             #[cfg(feature = "kv_coord")]
@@ -3638,12 +3645,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = crate::kv_coordination::synth_epoch(&prefix);
-        if self.kv_offers.len() >= crate::ov_kv_coordination::KV_MAX_OFFERS {
-            if let Some(k) = self.kv_offers.keys().next().copied() {
-                self.kv_offers.remove(&k);
-            }
-        }
-        self.kv_offers.insert(epoch, (prefix, snap));
+        self.kv_offers.stash(epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -3656,7 +3658,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         // Plane-level fp so a cross-chain consumer validating against the moved-to head's fp accepts
         // this (differently-sliced) rank's manifest.
         let model_fp = self.runner.fingerprint().plane_digest();
-        let (prefix, snap) = if let Some(off) = self.kv_offers.remove(&expected_epoch) {
+        let (prefix, snap) = if let Some(off) = self.kv_offers.take(expected_epoch) {
             off
         } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
             (tokens.clone(), snap.clone())

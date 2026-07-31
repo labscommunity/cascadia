@@ -526,10 +526,10 @@ pub struct Qwen36Engine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
-    /// Downstream ranks warm-resume over the KV plane, so the head skips the chain RESTORE and warms
-    /// rank 0 alone. Parity with ov-runtime (`runtime.rs` `plane_restore`); without it qwen36 demands
-    /// a downstream verdict nothing satisfies cross-chain and cold-resets the whole chain.
-    /// Read once from `CASCADIA_KV_PLANE_RESTORE` at build.
+    /// Plane-restore MODE, parity with ov-runtime (`runtime.rs` `plane_restore`): downstream ranks
+    /// warm-resume over the KV plane, so a `false` chain verdict is advisory — cross-chain nothing
+    /// satisfies it and the chain cold-resets with rank 0 already warm. Read once from
+    /// `CASCADIA_KV_PLANE_RESTORE` at build; scoped per-turn by `kv_coordination::chain_verdict`.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
     /// A `set_state_blob` has been applied to the stages and not yet cleared. `reset_state` alone
@@ -1172,14 +1172,8 @@ impl Qwen36Engine {
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&prompt_i32) {
-                        Some((blob, len)) => {
+                        Some((blob, len, plane_pulled)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                            // plane_restore ⇒ downstream ranks warm-resume over the KV plane, so the
-                            // head restores its own stages and skips the chain RESTORE (parity with
-                            // ov-runtime's `multi` guard). Without this the head demands a downstream
-                            // verdict that nothing satisfies cross-chain — the rank has no CAPTURE
-                            // stash for a foreign chain's epoch — and the all-or-nothing check
-                            // cold-resets a chain whose rank 0 warmed fine.
                             let local_ok = self.restore_local_stages(&blob);
                             // ALWAYS send the RESTORE, including in plane mode. It is the only thing on
                             // the warm path that advances the downstream ranks' `peer_epoch` (their
@@ -1191,10 +1185,12 @@ impl Qwen36Engine {
                                 let down = self
                                     .forward_restore_downstream(self.epoch, kv_epoch)
                                     .unwrap_or(false);
-                                // Only the verdict is advisory under plane_restore: there the ranks arm
-                                // themselves over the KV plane, so `false` just means "no CAPTURE under
-                                // the donor chain's epoch", which is expected cross-chain.
-                                down || self.plane_restore
+                                // Advisory only on a blob the plane pulled; local capture stays binding.
+                                crate::kv_coordination::chain_verdict(
+                                    down,
+                                    self.plane_restore,
+                                    plane_pulled,
+                                )
                             };
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
@@ -1780,7 +1776,7 @@ impl Qwen36Engine {
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
                     match self.kv.take_warm(&prompt_i32) {
-                        Some((blob, len)) if self.restore_local_stages(&blob) => {
+                        Some((blob, len, _)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
                             // the true attention depth, so resume at `.min(len)` (matching ov-runtime).

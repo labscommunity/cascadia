@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use cascadia_engine::KvSnapshotHolder;
 use cascadia_kv_wire::{LayerMeta, Manifest, PartnerId, OPAQUE_KV_LAYOUT, SCHEMA_VERSION};
 
-use crate::kv_coordination::synth_epoch;
+use crate::kv_coordination::{synth_epoch, KvOfferStash};
 use crate::kv_prefix_cache::ModelFingerprint;
 use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
 
@@ -20,6 +20,12 @@ use crate::ov_kv_cache::{OvLayerKvSlice, OvMoeKvPrefixCache, OvMoeKvSnapshot};
 pub(crate) const KV_ENGINE_REV: u64 = 1;
 /// Bound on live NEGOTIATE→GET offers (short-lived correlation entries).
 pub(crate) const KV_MAX_OFFERS: usize = 64;
+/// Byte ceiling on ONE `offers` map; an engine holds two (`kv_offers` + the `kv_share` mirror), and
+/// `lookup` has already cloned the snapshot before `stash` evicts — so node peak is ~2×(this + one
+/// snapshot), not 2×this. Same number as the K2.6 plane's
+/// [`crate::kv_coordination::KV_MAX_OFFER_BYTES`] because it bounds bytes, not blobs; f32 KV just
+/// means fewer offers fit. Shrunk under `cfg(test)` so the eviction tests cost MB, not GB.
+pub(crate) const KV_MAX_OFFER_BYTES: usize = if cfg!(test) { 4 << 20 } else { 256 << 20 };
 
 // ---- opaque f32 blob codec -------------------------------------------------
 // Self-describing little-endian layout:
@@ -155,7 +161,7 @@ pub(crate) type OvSharedHolderCache = Arc<Mutex<OvHolderState>>;
 /// offers + multi-stage captures), so [`OvMoeKvHolder`] serves NEGOTIATE/GET without the engine lock.
 pub(crate) struct OvHolderState {
     pub(crate) prefix: OvMoeKvPrefixCache,
-    offers: HashMap<u64, (Vec<i32>, OvMoeKvSnapshot)>,
+    offers: KvOfferStash<OvMoeKvSnapshot>,
     pub(crate) captures: HashMap<u64, (Vec<i32>, OvMoeKvSnapshot)>,
     fp: ModelFingerprint,
 }
@@ -163,7 +169,11 @@ impl OvHolderState {
     pub(crate) fn new(capacity: usize, fp: ModelFingerprint) -> Self {
         Self {
             prefix: OvMoeKvPrefixCache::new(capacity),
-            offers: HashMap::new(),
+            offers: KvOfferStash::new(
+                KV_MAX_OFFERS,
+                KV_MAX_OFFER_BYTES,
+                OvMoeKvSnapshot::approx_bytes,
+            ),
             captures: HashMap::new(),
             fp,
         }
@@ -196,12 +206,7 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        if g.offers.len() >= KV_MAX_OFFERS {
-            if let Some(k) = g.offers.keys().next().copied() {
-                g.offers.remove(&k);
-            }
-        }
-        g.offers.insert(epoch, (prefix, snap));
+        g.offers.stash(epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -212,7 +217,7 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (prefix, snap) = if let Some(off) = g.offers.remove(&expected_epoch) {
+        let (prefix, snap) = if let Some(off) = g.offers.take(expected_epoch) {
             off
         } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -328,5 +333,30 @@ mod tests {
         assert_eq!(snap.past_seq_len, 3);
         // Offer is single-use.
         assert!(holder.export("peer", epoch, len).is_none());
+    }
+
+    /// The OvMoe holder's NEGOTIATE path is bounded too, and the newest offer still has its GET.
+    #[test]
+    fn holder_negotiate_flood_is_bounded_and_still_serves() {
+        let n = KV_MAX_OFFERS as i32 + 8;
+        let mut st = OvHolderState::new(n as usize, fp());
+        for i in 0..n {
+            st.prefix.insert(vec![i64::from(i)], &fp(), snap(1, 1.0));
+        }
+        let holder = OvMoeKvHolder {
+            cache: Arc::new(Mutex::new(st)),
+            model_fp: fp().digest(),
+        };
+        let mut last = None;
+        for i in 0..n {
+            last = holder.lookup("peer", &[i, 0]);
+        }
+        {
+            let g = holder.cache.lock().unwrap();
+            assert_eq!(g.offers.len(), KV_MAX_OFFERS);
+            assert!(g.offers.bytes() <= KV_MAX_OFFER_BYTES);
+        }
+        let (epoch, len) = last.expect("negotiate hit");
+        assert!(holder.export("peer", epoch, len).is_some());
     }
 }

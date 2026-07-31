@@ -1497,9 +1497,9 @@ pub struct OvRuntimeEngine {
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
     kv_warm_pending: bool,
-    /// Issue-34 plane-restore: when set, downstream ranks warm-resume out-of-band over the KV plane,
-    /// so `step_first` skips the chain RESTORE/ABORT dance (the spliced transport bypasses it anyway).
-    /// Read once from `CASCADIA_KV_PLANE_RESTORE` at build. Rank0 still warm-resumes locally.
+    /// Issue-34 plane-restore MODE: downstream ranks warm-resume out-of-band over the KV plane, so a
+    /// `false` chain verdict is advisory. Read once from `CASCADIA_KV_PLANE_RESTORE` at build; the
+    /// per-turn scoping is in `kv_coordination::chain_verdict`.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
 }
@@ -2105,32 +2105,31 @@ impl OvRuntimeEngine {
             #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len)) = self.kv.take_warm(&prompt_i32) {
+                if let Some((blob, len, plane_pulled)) = self.kv.take_warm(&prompt_i32) {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
                             // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
-                            // plane_restore: downstream ranks warm-resume over the KV plane, so skip
-                            // the chain RESTORE (multi=false ⇒ chain_ok stays true, no downstream call).
-                            // `plane_restore` no longer suppresses the RESTORE itself — only its verdict.
+                            // `plane_restore` does not suppress the RESTORE itself — only its verdict.
                             // Dropping the frame skipped the SAME-CHAIN restore too (where no plane pull
                             // ever armed the downstream ranks), leaving head-warm/tail-cold with no
                             // verdict and no fallback; it also starved the downstream `peer_epoch`.
                             let multi = self.downstream.is_some() && !self.spec.is_last_stage;
-                            info!(plane_restore = self.plane_restore, "ov_step_first_warm_mode");
+                            // Effective mode for THIS turn, not the process — what a cert should read.
+                            let plane_turn = self.plane_restore && plane_pulled;
+                            info!(plane_restore = plane_turn, "ov_step_first_warm_mode");
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                                match self.send_restore_downstream(epoch) {
-                                    Ok(true) => true,
-                                    // Under plane_restore a false verdict is expected cross-chain (the
-                                    // rank has no CAPTURE for the donor epoch and arms itself over the
-                                    // plane), so do not abort the chain on it.
-                                    _ if self.plane_restore => true,
-                                    _ => {
-                                        let _ = self.send_abort_downstream();
-                                        false
-                                    }
+                                let down = matches!(self.send_restore_downstream(epoch), Ok(true));
+                                let ok = crate::kv_coordination::chain_verdict(
+                                    down,
+                                    self.plane_restore,
+                                    plane_pulled,
+                                );
+                                if !ok {
+                                    let _ = self.send_abort_downstream();
                                 }
+                                ok
                             };
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
@@ -2147,7 +2146,7 @@ impl OvRuntimeEngine {
                                     matched = len,
                                     blob_digest = crate::kv_coordination::byte_digest(&blob),
                                     blob_len = blob.len(),
-                                    plane = self.plane_restore,
+                                    plane = plane_turn,
                                     "ov-runtime warm-resumed from KV blob"
                                 );
                             } else {
@@ -3835,8 +3834,8 @@ impl OvRuntimeEngine {
     pub(crate) fn kv_cache_mut(&mut self) -> &mut crate::kv_coordination::OvKvCache {
         &mut self.kv
     }
-    /// Undo a plane arm: identical to the chain `OPCODE_ABORT` handler, which is the established
-    /// rollback for exactly this state. Idempotent — safe when nothing was armed.
+    /// Undo a plane arm: the local-state half of the chain `OPCODE_ABORT` rollback. The mailbox
+    /// retraction that handler also does is `clear(epoch)` on this path. Idempotent.
     #[cfg(feature = "kv_coord")]
     pub(crate) fn abort_warm_resume_local(&mut self) {
         let _ = self.runtime.reset_state();
@@ -3852,55 +3851,37 @@ impl OvRuntimeEngine {
     /// prefill skips its implicit `reset_state`.
     #[cfg(feature = "kv_coord")]
     pub(crate) fn drain_kv_handoff(&mut self) {
+        use crate::kv_coordination::HandoffReject;
         let Some(slot) = self.kv_handoff.take() else {
             return;
         };
-        // Structural validation MUST happen here. The driver-loop apply this replaced ran
-        // `KvSnapshotCodec::validate` before inserting; the handoff path skips the consumer-insert
-        // entirely, so without this nothing on the plane path would check layout_version, engine_rev or
-        // model_fingerprint — a slice from a drifted build, or another model, would be `set_state`d
-        // silently. Note the holder's own serve check is LENGTH-only (`tokens.len() == len`, never token
-        // equality), so it cannot be relied on as the content bind either. Validating in-engine is also
-        // strictly better than where it used to live: here the layout/rev come from THIS engine rather
-        // than from an adapter reading them through the mutex.
-        let refs: Vec<(&[u8], &[u8])> = slot
-            .payloads
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            .collect();
-        if cascadia_kv_wire::KvSnapshotCodec::validate(
-            &slot.manifest,
-            &refs,
-            cascadia_kv_wire::OPAQUE_KV_LAYOUT,
-            crate::kv_coordination::KV_ENGINE_REV,
-            self.kv_model_fingerprint(),
-            &slot.manifest.token_ids,
-        )
-        .is_err()
-        {
-            warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
-                epoch = slot.epoch, rev = crate::kv_coordination::KV_ENGINE_REV,
-                fp = self.kv_model_fingerprint());
-            return;
-        }
-        let Some((_tokens, blob)) =
-            crate::kv_coordination::wire_to_blob(&slot.manifest, &slot.payloads)
-        else {
-            warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
-            return;
+        let fp = self.kv_model_fingerprint();
+        let blob = match crate::kv_coordination::handoff_decision(&slot, fp, self.position) {
+            Ok(blob) => blob,
+            Err(HandoffReject::Validate) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                    epoch = slot.epoch, rev = crate::kv_coordination::KV_ENGINE_REV, fp);
+                return;
+            }
+            Err(HandoffReject::Decode) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+                return;
+            }
+            Err(HandoffReject::TooLate(depth)) => {
+                warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                    epoch = slot.epoch, position = self.position, depth);
+                return;
+            }
         };
-        // Snapping back is what produced the two-item divergence: a slice shallower than where this
-        // rank already is cannot be resumed into, so drop it and let the turn stay cold.
-        let depth = crate::kv_coordination::kv_seq_from_blob(&blob).unwrap_or(0) as i64;
-        if self.position > depth {
-            warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
-                epoch = slot.epoch, position = self.position, depth);
-            return;
-        }
         if self.apply_warm_resume_blob(&blob) {
             info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
                 epoch = slot.epoch, position = self.position,
                 blob_digest = crate::kv_coordination::byte_digest(&blob));
+        } else {
+            // set_state failed ⇒ this rank stays cold on a turn the commit path armed as warm, and
+            // nothing on this side can undo that. The arm exists to make the failure greppable.
+            warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
+                epoch = slot.epoch, position = self.position);
         }
     }
 
@@ -4344,6 +4325,12 @@ impl OvRuntimeEngine {
                 let _ = self.runtime.reset_state();
                 self.kv_warm_pending = false;
                 self.position = 0;
+                // Zeroing `position` disarms the drain's depth guard, so a still-parked slice would
+                // apply on a later turn — warm rank under a cold head. This frame carries no epoch,
+                // hence the epoch-blind discard.
+                if self.kv_handoff.discard_any() {
+                    info!(target: "cascadia::kv", event = "kv_handoff_discarded_on_abort");
+                }
                 if !self.spec.is_last_stage {
                     let _ = self.send_abort_downstream();
                 }

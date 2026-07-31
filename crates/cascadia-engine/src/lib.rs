@@ -289,6 +289,14 @@ pub trait KvWarmHandoff: Send + Sync {
         manifest: cascadia_kv_wire::Manifest,
         payloads: Vec<(Vec<u8>, Vec<u8>)>,
     );
+
+    /// Retract a parked slice when the head aborts a set this rank had already committed. `true` only
+    /// if the slice was still parked; `false` means it is gone — the engine already took it, so this
+    /// rank MAY be warm under a cold head — and the caller must report that, not treat the abort as
+    /// clean.
+    ///
+    /// Deliberately no default: an impl that cannot retract has to say so in its own body.
+    fn clear(&self, epoch: u64) -> bool;
 }
 
 pub trait Engine: Send {
