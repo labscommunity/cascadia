@@ -439,11 +439,25 @@ pub fn moe_forward_batch<E: ExpertSource>(
     // one pass per distinct expert; stage results at their gate slots
     let mut slots = vec![0.0f32; rows * d.top_k * d.latent];
     let mut eo = vec![0.0f32; d.latent];
+    // Same strategy as decode: `None` falls back to the mapping, so this is an
+    // I/O choice only. The batch has already unioned the rows, so `distinct` is
+    // the widest read this model ever issues.
+    let bufs = experts.read_batch(&distinct);
+    let mut next = 0usize;
     for (e, hits) in want.iter().enumerate() {
         if hits.is_empty() {
             continue;
         }
-        let bytes = experts.expert_bytes(e);
+        // `distinct` and `want` walk the experts in the same ascending order,
+        // so the buffer for this expert is the next one in the batch. Getting
+        // this wrong feeds one expert's weights to another's rows, which is
+        // silently wrong output rather than a crash.
+        debug_assert_eq!(distinct[next], e as u32, "batch buffer/expert mismatch");
+        let bytes = match bufs.get(next).and_then(|b| b.as_deref()) {
+            Some(b) => b,
+            None => experts.expert_bytes(e),
+        };
+        next += 1;
         for &(r, k) in hits {
             fp4_expert_forward(bytes, &lat[r * d.latent..(r + 1) * d.latent], d, &mut eo);
             let base = (r * d.top_k + k) * d.latent;
@@ -615,6 +629,39 @@ mod tests {
             }
         }
         FlatExperts { data, stride }
+    }
+
+    #[test]
+    fn batch_prefill_over_a_mapped_file_matches_the_in_memory_reference() {
+        // Prefill reads its experts through `read_batch`, which hands back one
+        // buffer per DISTINCT expert while the loop walks `want` and skips the
+        // experts nobody chose. If those two orders ever disagree, an expert's
+        // weights get applied to another expert's rows — wrong tokens, no
+        // panic, nothing in a log. The in-memory source cannot catch that: its
+        // `read_batch` is the default all-`None`, so it only ever exercises the
+        // fallback. This runs the real mapped path and compares against it.
+        let d = dims();
+        let w = weights(d);
+        let rows = 8usize;
+        let xs: Vec<f32> = (0..rows * d.hidden)
+            .map(|i| ((i as f32) * 0.19).cos())
+            .collect();
+
+        let flat = experts(d);
+        let mut want = vec![0.0f32; rows * d.hidden];
+        moe_forward_batch(&xs, &w, d, &flat, rows, &mut want);
+
+        let dir = std::env::temp_dir().join("k3_batch_prefill_read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layer.bin");
+        std::fs::write(&path, &flat.data).unwrap();
+        let mapped = MmapExperts::open(&path, flat.stride, d.n_experts).unwrap();
+
+        let mut got = vec![0.0f32; rows * d.hidden];
+        moe_forward_batch(&xs, &w, d, &mapped, rows, &mut got);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(got, want, "mapped prefill diverged from the in-memory run");
     }
 
     /// Counts how many times each expert's bytes are fetched.
