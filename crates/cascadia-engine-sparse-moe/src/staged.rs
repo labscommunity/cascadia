@@ -68,9 +68,11 @@ pub trait StagedRunner: Send + 'static {
     /// Last-rank only: logits from the final hidden.
     fn head_logits(&self, hidden: &[f32]) -> Vec<f32>;
 
-    /// Distributed KV-prefix cache hooks (pipeline prefix reuse). Default:
-    /// unsupported — only the glm5 runner implements them, so dsv4 / OV runners
-    /// are unaffected. `restore_prefix` restores this rank's cached KV slice for
+    /// KV-prefix cache hooks. Default: unsupported, so a runner that does not
+    /// implement them is unaffected. The glm5 and k3 runners do; both the
+    /// pipeline path and `generate_reason_from` drive them, so a runner that
+    /// implements these gets prefix reuse at any rank count.
+    /// `restore_prefix` restores this rank's cached KV slice for
     /// `key` and returns the restored length (== new pos), or `None` on a miss.
     /// `cache_prefix` snapshots the current KV slice under `key`.
     fn prefix_cache_enabled(&self) -> bool {

@@ -526,12 +526,15 @@ def copy_sidecars(model_dir: Path, out: Path):
 
     K3 ships a tiktoken BPE (`tiktoken.model` + a `TikTokenTokenizer` class),
     NOT a HF `tokenizer.json`, and no chat template. The engine's API rank loads
-    `tokenizer.json`, so a converted one is still required before this model can
-    serve text — see docs/architectures/kimi-k3.md. We deliberately do not
-    synthesise it here: the tiktoken `pat_str` uses Java/ICU character-class
-    intersection (`&&[^\p{Han}]`), which the HF tokenizers and Rust regex
-    engines do not accept, so a naive translation silently mis-splits text and
-    looks like a model bug rather than a tokenizer bug.
+    `tokenizer.json`, so this builds one and validates it token-for-token
+    against the reference tiktoken before writing it — a mismatch is fatal here,
+    because a subtly wrong tokenizer surfaces as a model quality problem rather
+    than as a tokenizer bug.
+
+    The `pat_str` carries across unchanged: it uses Java/ICU character-class
+    intersection (`&&[^\p{Han}]`), which the `tokenizers` build in use accepts
+    verbatim. `tests/k3_tokenizer_pattern.rs` pins that, since rewriting the
+    pattern by hand is what would silently mis-split text.
     """
     out.mkdir(parents=True, exist_ok=True)
     copied = []

@@ -9,9 +9,11 @@
 //!
 //! Works the same whether the expert bins sit in `<dir>/experts/` or are
 //! symlinked onto several filesystems by `--expert-roots` — the loader just
-//! opens the path. The banner resolves each bin so you can see which devices
-//! are actually backing the run, which is worth knowing: spreading the experts
-//! over several spindles is what gives read parallelism on rotational disks.
+//! opens the path. The banner resolves each bin so you can see which devices are
+//! actually backing the run. Note that spreading them buys CAPACITY, not read
+//! parallelism: a layer's 16 expert reads all live in one bin on one device and
+//! layers are visited serially, so the queue is one device deep however many
+//! roots there are.
 //!
 //! Set `CASCADIA_K3_PROFILE=1` for the per-token section split and residency,
 //! and `CASCADIA_K3_AUTOPIN=1` to mlock the hottest experts.

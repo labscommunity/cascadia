@@ -113,7 +113,7 @@ no code change is needed.
 
 | Other targets | Result |
 |---|---|
-| **Xeon bench host** (~172 GB RAM, ~1.6 TB free) | export fits with `--free-source-shards`; run ~4% resident → **~0.1 tok/s** |
+| **Xeon bench host** (~172 GB RAM, ~1.6 TB free) | export fits with `--free-source-shards`. Predicted ~0.1 tok/s at ~4% resident; MEASURED 363 s/token there, ~36x worse — see [Measured on that host](#measured-on-that-host) |
 | single host, ≥768 GB RAM + ~2 TB striped NVMe ≥10 GB/s | 45–60% residency → ~0.5–1 tok/s |
 
 For scale: GLM-5.2 is ~386 GB int4 and reaches 0.4–0.6 tok/s at N=4 with ~35%
@@ -220,9 +220,10 @@ time. Nothing on the CPU side is worth optimising until the I/O is fixed; the
 whole cost is fetching expert weights.
 
 The ~4x amplification is readahead over-fetching past each 17.6 MB slice inside a
-15.7 GB mapping — the expert set is scattered, not streamed. `MmapExperts::open`
-now issues `madvise(MADV_RANDOM)`; `CASCADIA_K3_READAHEAD=1` restores the old
-behaviour for comparison.
+15.7 GB mapping — the expert set is scattered, not streamed. Suppressing it with
+`MADV_RANDOM` was tried and removed: it cut the amplification and lost on both
+storage classes anyway, because it also kills readahead WITHIN each contiguous
+slice. See the fetch-strategy section.
 
 This is a correctness harness, not a throughput benchmark. Use
 `examples/k3_run.rs`, which reports which devices are backing the experts and
@@ -393,7 +394,7 @@ dropped, a `syscr` that moved — not merely that it was switched on.
 
 | | Status | Expected |
 |---|---|---|
-| `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
+| `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: tok 1 forward (excl. prefill) 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
 | AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
 | explicit concurrent reads | done, **default** (`CASCADIA_K3_READ=0` opts out) | **measured +8.5%** steady-state decode, -1.6% prefill, 2 runs per side. Both phases must use the same strategy — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
@@ -443,7 +444,7 @@ t=0.1    lanes=29.1%  pages=5.7%
 ```
 
 The bar was 20% of pages. Losslessly nothing is skippable at all, and even at a
-threshold that costs real precision only 5.5% of pages clear. The lane column is
+threshold that costs real precision only 5.7% of pages clear. The lane column is
 the idea's promise and the page column is what the storage stack would deliver:
 29.1% of lanes dead frees 5.7% of pages, because the dead ones are scattered and
 a page with one live lane on it is read in full. Reporting only the lane figure
@@ -596,20 +597,19 @@ would leave 32 heads' recurrent state never decaying — output that looks
 plausible and degrades as context grows. `kda.rs` has a test pinning that
 rationale so the truncation is not "simplified away" later.
 
-### 2. No `tokenizer.json` — blocks serving, not loading
+### 2. `tokenizer.json` — resolved
 
 K3 ships `tiktoken.model` plus a custom `TikTokenTokenizer`, and **no chat
-template**. Every engine in this crate loads `tokenizer.json` via the HF
-`tokenizers` crate, and there is no tiktoken support in the Rust tree, so the
-API rank refuses to start. Pre-tokenized input and benchmarking are unaffected.
+template**, while every engine here loads `tokenizer.json` via the HF
+`tokenizers` crate. The exporter now builds one and validates it token-for-token
+against the reference tiktoken, failing the export on a mismatch.
 
-The exporter now copies the tokenizer artifacts into the export but
-deliberately does **not** synthesise a `tokenizer.json`: the tiktoken `pat_str`
-relies on Java/ICU character-class intersection (`&&` against `\p{Han}`), which
-neither the HF tokenizers nor Rust regex engines accept. A naive translation
-mis-splits text and presents as a model quality problem rather than a tokenizer
-one. Converting it correctly, and validating token-for-token against the Python
-tokenizer, is a prerequisite for serving.
+The `pat_str` carries across unchanged rather than being translated: it uses
+Java/ICU character-class intersection (`&&` against `\p{Han}`), which the
+`tokenizers` build in use accepts verbatim. `tests/k3_tokenizer_pattern.rs` pins
+that, because rewriting it by hand is what would silently mis-split text and
+present as a model quality problem. The missing chat template still means
+`/v1/chat/completions` falls back to legacy formatting.
 
 ## Open risks
 
@@ -617,9 +617,9 @@ tokenizer, is a prerequisite for serving.
   expert set. Throughput follows residency, so more nodes and `CASCADIA_K3_AUTOPIN`
   are the levers; the arithmetic cannot predict whether 29 GB of 32 stays stable
   under load.
-- **Never run on real weights.** Everything is validated against a 6-layer
-  synthetic model. The numerics are golden-tested against upstream, but no real
-  tensor has passed through the shell.
+- **Thin real-weight coverage.** The full export runs and generates correct text,
+  but the automated suites still exercise a 6-layer synthetic model; every
+  real-weight result in this document is a hand-run measurement, mostly n=1.
 - **Export margin** — ~20 GB spare on a 1.6 TB disk, and only with
   `--free-source-shards`, which is destructive: a freed layer cannot be
   re-exported without re-downloading.

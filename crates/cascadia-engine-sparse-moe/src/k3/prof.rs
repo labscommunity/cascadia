@@ -14,9 +14,10 @@
 //! bytes arrive via mmap page faults, which are not billed to the process read
 //! counter, so a `read_bytes`-style delta reads ~0 and reports a bogus 100% hit.
 //!
-//! Usage: `CASCADIA_K3_PROFILE=1 cascadia worker …` → cumulative `K3_PROF …`
-//! lines on stderr, one per forwarded token. In a pipeline each rank profiles
-//! its OWN layer slice, so read the split per rank.
+//! Usage: `CASCADIA_K3_PROFILE=1 cascadia worker …` → one `K3_PROF …` line on
+//! stderr per forwarded token, each figure a DELTA since the previous line (only
+//! the trailing `total=` runs cumulatively). In a pipeline each rank profiles its
+//! OWN layer slice, so read the split per rank.
 //!
 //! COMPARING RUNS: only `WALL` is comparable across fetch strategies. The bucket
 //! shares are not, because the strategies bill their I/O to different places —
