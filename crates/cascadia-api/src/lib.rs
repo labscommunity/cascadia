@@ -1839,6 +1839,7 @@ async fn chat_completions(
         // client that could set it from request JSON could name another tenant's namespace and
         // resume off its prefix. The real value is assigned server-side from the admitted identity.
         tenant: String::new(),
+        resume_token_ids: None,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2055,6 +2056,7 @@ async fn completions(
         trust_remote_code: false,
         // H.1b: hardcoded server-side; see the note on the chat endpoint's task above.
         tenant: String::new(),
+        resume_token_ids: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
