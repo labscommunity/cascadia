@@ -106,8 +106,17 @@ pub fn pin_budget_experts(budget_bytes: u64, reserve_bytes: u64, expert_bytes: u
 /// What that costs in tokens: K3 records `moe_layers * top_k` selections per
 /// token, 92 x 16 = 1472. So nothing pins below ~3.4 tokens and full confidence
 /// needs ~136. Combined with the histogram only being written when autopin is
-/// enabled, the first enabled run always pins nothing and merely records. This
-/// is aimed at a long-lived process, and a short run cannot exercise it.
+/// enabled, the first enabled run always pins nothing and merely records.
+///
+/// Those tokens accumulate rather than having to arrive at once: `load` merges
+/// into the histogram instead of replacing it, so any sequence of runs with the
+/// flag set warms the same file and a long-lived process warms itself. What a
+/// short run cannot do is exercise this in ONE session.
+///
+/// The full-confidence figure is not conservative, either. K3 has 92 x 896 =
+/// 82,432 (layer, expert) slots and a token touches 1,472 of them, so 200k
+/// selections is ~2.4 observations per slot — about the least that can separate
+/// a hot expert from a cold one.
 pub fn autopin_count(total_selections: u64, budget_experts: usize) -> usize {
     if total_selections < AUTOPIN_MIN_SELECTIONS {
         return 0;
