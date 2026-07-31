@@ -1218,6 +1218,14 @@ impl Qwen36Engine {
                     prompt_ids.extend(e.get_ids());
                 }
             }
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            {
+                let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
+                cascadia_types::append_resume_ids(&mut prompt_ids_i64, task.resume_token_ids.as_deref());
+                prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
+            }
             // An empty prompt leaves next_token None through prefill and would
             // panic the decode branch (`expect`); reject at admission.
             if prompt_ids.is_empty() {
@@ -1228,6 +1236,22 @@ impl Qwen36Engine {
                 );
                 return vec![(task.task_id, e)];
             }
+            // Option B: pre-seed `gen_ids` + `emitted` with the resumed tokens so the
+            // budget check bounds prefix+new (not just new) and the first NEW tail
+            // token's delta decode starts after the prefix text. Empty on a normal turn.
+            let resume_gen_ids: Vec<u32> =
+                cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref())
+                    .into_iter()
+                    .map(|t| t as u32)
+                    .collect();
+            let resume_emitted = if resume_gen_ids.is_empty() {
+                0
+            } else {
+                tokenizer
+                    .decode(&resume_gen_ids, true)
+                    .unwrap_or_default()
+                    .len()
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1313,8 +1337,8 @@ impl Qwen36Engine {
                 step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
-                gen_ids: Vec::new(),
-                emitted: 0,
+                gen_ids: resume_gen_ids,
+                emitted: resume_emitted,
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
@@ -1894,6 +1918,14 @@ impl Qwen36Engine {
                     prompt_ids.extend(e.get_ids());
                 }
             }
+            // Option B forced-prefix resume: append the already-emitted assistant
+            // tokens after the rendered prompt (concat, not replace) so the cold
+            // prefill below carries them as context. No-op when not resuming.
+            {
+                let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
+                cascadia_types::append_resume_ids(&mut prompt_ids_i64, task.resume_token_ids.as_deref());
+                prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
+            }
             // An empty prompt leaves logits empty and would fabricate token 0
             // (garbage decode); reject at admission to match the pipeline path.
             if prompt_ids.is_empty() {
@@ -1904,6 +1936,22 @@ impl Qwen36Engine {
                 );
                 return vec![(task.task_id, e)];
             }
+            // Option B: pre-seed `gen_ids` + `emitted` with the resumed tokens so the
+            // budget check bounds prefix+new (not just new) and the first NEW tail
+            // token's delta decode starts after the prefix text. Empty on a normal turn.
+            let resume_gen_ids: Vec<u32> =
+                cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref())
+                    .into_iter()
+                    .map(|t| t as u32)
+                    .collect();
+            let resume_emitted = if resume_gen_ids.is_empty() {
+                0
+            } else {
+                tokenizer
+                    .decode(&resume_gen_ids, true)
+                    .unwrap_or_default()
+                    .len()
+            };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
             } else {
@@ -1951,8 +1999,8 @@ impl Qwen36Engine {
                 step: warm_prefix,
                 logits: Vec::new(),
                 next_token: None,
-                gen_ids: Vec::new(),
-                emitted: 0,
+                gen_ids: resume_gen_ids,
+                emitted: resume_emitted,
                 max_tokens,
                 started: Instant::now(),
                 wire_ms: Vec::new(),
