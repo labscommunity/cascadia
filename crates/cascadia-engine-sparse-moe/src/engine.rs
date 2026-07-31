@@ -20,7 +20,8 @@ use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::PluginConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
 use cascadia_types::{
-    Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+    append_resume_ids, Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
+    TaskId,
 };
 use futures::stream;
 use tokenizers::Tokenizer;
@@ -1389,7 +1390,7 @@ impl SparseMoEEngine {
             }
         };
         let started = std::time::Instant::now();
-        let prompt_ids: Vec<i64> = match tokenizer.encode(task.prompt.as_str(), true) {
+        let mut prompt_ids: Vec<i64> = match tokenizer.encode(task.prompt.as_str(), true) {
             Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
@@ -1400,8 +1401,18 @@ impl SparseMoEEngine {
                 return vec![(task.task_id, final_chunk)];
             }
         };
+        // Option B forced-prefix resume: append the already-emitted assistant
+        // tokens after the rendered prompt (concat, not replace) so prefill
+        // below carries them as context/KV history. No-op when not resuming.
+        append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = sampling_from_task(&task);
+        let mut sampling_cfg = sampling_from_task(&task);
+        // Option B: a resumed turn MUST decode greedily — sampling would let
+        // the continuation diverge from what the client already has. temperature
+        // <= 0.0 takes the deterministic argmax path in `sampling::sample`.
+        if task.resume_token_ids.is_some() {
+            sampling_cfg.temperature = 0.0;
+        }
         // Choose generate path: spec-decode if configured (and the
         // sampling config is greedy — the spec-decode helper falls
         // back to plain generate on temp>0 anyway, but this keeps the
@@ -1467,6 +1478,7 @@ impl SparseMoEEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.token_ids = generated;
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
@@ -1481,7 +1493,7 @@ impl SparseMoEEngine {
         #[cfg(feature = "kv_coord")]
         self.kv_set_turn_tenant(&task.tenant);
         let started = std::time::Instant::now();
-        let prompt_ids: Vec<i64> = {
+        let mut prompt_ids: Vec<i64> = {
             let Some(tok) = self.tokenizer.as_ref() else {
                 warn!(task = %task.task_id, "rank-0 engine has no tokenizer");
                 let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -1498,9 +1510,19 @@ impl SparseMoEEngine {
                 }
             }
         };
+        // Option B forced-prefix resume: append the already-emitted assistant
+        // tokens after the rendered prompt (concat, not replace) — the
+        // distributed prefill loop below is agnostic to id origin, so the
+        // appended ids prefill naturally. No-op when not resuming.
+        append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
 
         let max_new = task.max_tokens.max(1) as usize;
-        let sampling_cfg = sampling_from_task(&task);
+        let mut sampling_cfg = sampling_from_task(&task);
+        // Option B: force greedy decode on a resumed turn so the continuation
+        // is deterministic (see step_single_stage for rationale).
+        if task.resume_token_ids.is_some() {
+            sampling_cfg.temperature = 0.0;
+        }
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
             None => {
@@ -1714,6 +1736,7 @@ impl SparseMoEEngine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        chunk.token_ids = result_tokens;
         chunk.finish_reason = Some(finish_reason_for(n_tokens as usize, max_new));
         vec![(task.task_id.clone(), chunk)]
     }
