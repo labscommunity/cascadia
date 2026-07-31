@@ -37,12 +37,15 @@ pub fn mem_available() -> u64 {
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
                     if let Some(kb) = rest.split_whitespace().next() {
-                        return kb.parse::<u64>().unwrap_or(0) * 1024;
+                        if let Ok(kb) = kb.parse::<u64>() {
+                            return kb * 1024;
+                        }
                     }
                 }
             }
         }
-        0
+        // fall through to the conservative default: a failed parse must not
+        // read as "no memory available", which silently disables pinning
     }
     #[cfg(windows)]
     {
