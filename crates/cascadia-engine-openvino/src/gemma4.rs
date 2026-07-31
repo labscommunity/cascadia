@@ -869,7 +869,7 @@ impl Gemma4Engine {
             #[cfg(feature = "kv_coord")]
             {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, _)) = self.kv.take_warm(&prompt_i32) {
+                if let Some((blob, len, plane_pulled)) = self.kv.take_warm(&prompt_i32) {
                     // Restore must land on a CLEAN request: this model's `reset_state` leaves residue
                     // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
                     // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
@@ -917,6 +917,7 @@ impl Gemma4Engine {
                             info!(
                                 warm_prefix,
                                 matched = len,
+                                plane_pulled,
                                 "gemma4 warm-resumed from KV blob"
                             );
                         } else {

@@ -2605,7 +2605,7 @@ impl OvDistSpecEngine {
         // target (the target holds the last bonus token the draft hasn't fed yet); the resume below
         // catches the draft up so both align before `start_task` feeds one shared suffix.
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-        let Some((blob, len, _)) = self.kv.take_warm(&prompt_i32) else {
+        let Some((blob, len, plane_pulled)) = self.kv.take_warm(&prompt_i32) else {
             return 0;
         };
         let Some(parts) = crate::kv_coordination::unframe_blobs(&blob) else {
@@ -2665,6 +2665,7 @@ impl OvDistSpecEngine {
                     warm_prefix = t_pos,
                     d_pos,
                     matched = len,
+                    plane_pulled,
                     "ov-dist-spec pipeline warm-resumed"
                 );
                 t_pos
