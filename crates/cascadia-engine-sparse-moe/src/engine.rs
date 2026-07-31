@@ -971,6 +971,18 @@ fn utf8_safe_delta(full: &str, emitted: &mut usize) -> String {
     d
 }
 
+/// Option B resume budget: total (prefix + new) must equal `max_tokens`, the
+/// same invariant the streaming engines enforce by seeding their `generated`
+/// accumulator with the K resume ids. sparse-moe's generate helpers always
+/// start `generated` EMPTY (single-shot decode, no seedable accumulator), so
+/// this subtracts K from the caller's budget instead — the opposite lever,
+/// same total-length result. Saturating, no `.max(1)`: an exhausted budget
+/// (K >= max_tokens) must yield exactly zero new tokens.
+fn resume_max_new(max_tokens: u32, resume_token_ids: Option<&[i32]>) -> usize {
+    let already = resume_token_ids.map_or(0, |v| v.len());
+    (max_tokens as usize).saturating_sub(already)
+}
+
 fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
     let s = &task.sampling;
     crate::sampling::SamplingConfig {
@@ -1405,13 +1417,25 @@ impl SparseMoEEngine {
         // tokens after the rendered prompt (concat, not replace) so prefill
         // below carries them as context/KV history. No-op when not resuming.
         append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
-        let max_new = task.max_tokens.max(1) as usize;
+        let max_new = resume_max_new(task.max_tokens, task.resume_token_ids.as_deref());
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: a resumed turn MUST decode greedily — sampling would let
         // the continuation diverge from what the client already has. temperature
         // <= 0.0 takes the deterministic argmax path in `sampling::sample`.
         if task.resume_token_ids.is_some() {
             sampling_cfg.temperature = 0.0;
+        }
+        if max_new == 0 {
+            // Budget already exhausted by the resume prefix. Both generate
+            // helpers unconditionally sample one token off the last prefill
+            // step regardless of `max_tokens`, so we must not call them at
+            // all — the only way to guarantee zero new tokens here.
+            let elapsed = started.elapsed().as_secs_f64();
+            info!(task = %task.task_id, elapsed_s = elapsed, "task done (single-stage, resume budget exhausted)");
+            let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
+            chunk.n_tokens = Some(0);
+            chunk.finish_reason = Some(FinishReason::Length);
+            return vec![(task.task_id, chunk)];
         }
         // Choose generate path: spec-decode if configured (and the
         // sampling config is greedy — the spec-decode helper falls
@@ -1533,12 +1557,25 @@ impl SparseMoEEngine {
         // appended ids prefill naturally. No-op when not resuming.
         append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
 
-        let max_new = task.max_tokens.max(1) as usize;
+        let max_new = resume_max_new(task.max_tokens, task.resume_token_ids.as_deref());
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: force greedy decode on a resumed turn so the continuation
         // is deterministic (see step_single_stage for rationale).
         if task.resume_token_ids.is_some() {
             sampling_cfg.temperature = 0.0;
+        }
+        if max_new == 0 {
+            // Budget already exhausted by the resume prefix. Both
+            // drive_generation_first and drive_generation_first_spec
+            // unconditionally sample one token off the last prefill step
+            // regardless of max_new, so we must not drive generation at all
+            // — the only way to guarantee zero new tokens here.
+            let elapsed = started.elapsed().as_secs_f64();
+            info!(task = %task.task_id, elapsed_s = elapsed, "task done (rank-0 driver, resume budget exhausted)");
+            let mut chunk = Chunk::final_marker(task.task_id.clone(), "");
+            chunk.n_tokens = Some(0);
+            chunk.finish_reason = Some(FinishReason::Length);
+            return vec![(task.task_id, chunk)];
         }
         let downstream = match self.transport.downstream.clone() {
             Some(d) => d,
@@ -5279,6 +5316,31 @@ mod tests {
         // A final decode identical to the last (e.g. an EOS skipped by
         // skip_special_tokens) yields an empty delta.
         assert_eq!(utf8_safe_delta("The quick brown", &mut emitted), "");
+    }
+
+    #[test]
+    fn resume_max_new_is_unchanged_when_not_resuming() {
+        assert_eq!(resume_max_new(256, None), 256);
+    }
+
+    #[test]
+    fn resume_max_new_subtracts_prefix_len() {
+        assert_eq!(resume_max_new(256, Some(&[1, 2, 3])), 253);
+    }
+
+    /// Mirrors the mock engine's `resume_at_full_budget_emits_zero_new_tokens`
+    /// contract: a resume prefix that already meets/exceeds max_tokens must
+    /// leave zero budget for new tokens (not `.max(1)`'d back up to 1).
+    #[test]
+    fn resume_max_new_at_full_budget_is_zero() {
+        let prefix: Vec<i32> = (0..8).collect();
+        assert_eq!(resume_max_new(8, Some(&prefix)), 0);
+    }
+
+    #[test]
+    fn resume_max_new_saturates_when_prefix_exceeds_budget() {
+        let prefix: Vec<i32> = (0..10).collect();
+        assert_eq!(resume_max_new(8, Some(&prefix)), 0);
     }
 
     #[test]
