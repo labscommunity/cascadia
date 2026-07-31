@@ -208,7 +208,16 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
 
 /// Compact a `get_state_blob` blob along the seq dim (index 2): keep position `i` only where
 /// `valid[i] != 0` (positions past `valid.len()` are kept), packed in order, rewriting each rank≥3
-/// state's `shape[2]` + data to the kept count. Rank<3 states copy verbatim.
+/// state's `shape[2]` + data to the kept count. Rank<3 **and recurrent (conv/ssm)** states copy
+/// verbatim.
+///
+/// The conv/ssm exclusion is the same one `kv_seq_from_blob` makes, for the same reason: on a hybrid
+/// model index 2 is a fixed constant (conv window, ssm state width), not a fold position, so gathering
+/// it would silently reorder the recurrent state. Today every caller is dist-spec, which is pure
+/// attention — so this is safety by construction rather than by caller discipline. It matters because
+/// nothing downstream would catch the mistake: `set_state_blob` rebuilds the tensor from the blob's
+/// OWN rewritten shape and only checks `byte_size == nb`, which stays self-consistent after a bad
+/// gather, so a corrupted state restores "successfully".
 ///
 /// Spec-decode leaves the KV padded with proposed-then-rejected positions, masked out host-side via
 /// `valid_mask` — which the blob does NOT carry. Compacting at capture makes the blob self-describing
@@ -245,12 +254,21 @@ pub(crate) fn kv_compact_blob(blob: &[u8], valid: &[i64]) -> Option<Vec<u8>> {
         let data_start = p;
         let data_end = data_start.checked_add(nb)?;
         let data = blob.get(data_start..data_end)?;
-        // rank<3 (no seq dim) or fully-valid ⇒ copy state verbatim.
-        let seq = if rank >= 3 { shape[2] } else { 0 };
+        // rank<3 (no seq dim), recurrent (conv/ssm — index 2 is not a fold position), or fully-valid
+        // ⇒ copy state verbatim. Same name test as kv_seq_from_blob; keep the two in step.
+        let is_recurrent = {
+            let n = String::from_utf8_lossy(name);
+            n.contains("conv") || n.contains("ssm")
+        };
+        let seq = if rank >= 3 && !is_recurrent {
+            shape[2]
+        } else {
+            0
+        };
         let kept: Vec<usize> = (0..seq)
             .filter(|&i| i >= valid.len() || valid[i] != 0)
             .collect();
-        if rank < 3 || kept.len() == seq {
+        if rank < 3 || is_recurrent || kept.len() == seq {
             out.extend_from_slice(blob.get(state_start..data_end)?);
             p = data_end;
             continue;
@@ -1025,6 +1043,20 @@ mod tests {
         let mut r2 = 1u32.to_le_bytes().to_vec();
         r2.extend(state("scalar", &[1, 4], &[7, 7, 7, 7]));
         assert_eq!(kv_compact_blob(&r2, &[0, 0, 0, 0]), Some(r2));
+
+        // Recurrent states copy verbatim even at rank>=3 under a rejecting mask: for conv/ssm index 2
+        // is a fixed width (conv window / ssm state), not a fold position, so gathering it would
+        // silently reorder the recurrent state. The existing cases above all use generic names and so
+        // would not catch this. Names mirror the surgery export (`cache_params.past.<kind>.<idx>`).
+        for name in ["cache_params.past.conv.0", "cache_params.past.ssm.0"] {
+            let mut rec = 1u32.to_le_bytes().to_vec();
+            rec.extend(state(name, &[1, 1, 4, 2], &data));
+            assert_eq!(
+                kv_compact_blob(&rec, &[1, 0, 1, 1]),
+                Some(rec.clone()),
+                "{name} must be copied verbatim, not gathered"
+            );
+        }
     }
     #[test]
     fn capture_body_masked_roundtrips() {
