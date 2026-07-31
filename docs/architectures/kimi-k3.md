@@ -176,6 +176,12 @@ page-cache hit                 4.7%           4.8%
 routed                     154.98 GB      154.98 GB      identical work
 ```
 
+The `eff` row is overstated in both columns. Prefill recorded its routed bytes
+but no elapsed time, so the first dump divided prefill's bytes by decode's time.
+The wall-clock rows are unaffected — they are measured directly — and the two
+columns are wrong the same way, so the ratios stand. Fixed since; runs after that
+report a prefill rate that was actually achieved.
+
 Two changes account for it: `madvise(MADV_WILLNEED)` over a layer's routed
 experts right after routing, and an AVX2 fp4 kernel. They are not independent —
 AVX2 is compute-only, yet measured *fetch* throughput rose 745 -> 1836 MB/s,
@@ -285,9 +291,27 @@ mmap+random        112            75
 pread x16         3456           136
 ```
 
-Explicit concurrent `pread` is the default: a large win on NVMe, which is what
-the fleet and any production node use, and within noise of `madvise` on spinning
-disk. `CASCADIA_K3_READ=0` restores demand paging.
+That benchmark drops the cache before every run, so it only describes a *cold*
+fetch. Decode is not cold — by the second token most routed experts are already
+resident, and there the two strategies stop being equivalent: the mapping hands
+back a pointer, while an explicit read still copies the whole 17.6 MB slice.
+Per-token decode on the real model, at 62% reuse:
+
+```
+                  tok1     steady
+mmap             185.9s     152.6s
+pread x16        193.1s     193.0s
+```
+
+`pread` gives up the entire tok1 -> steady speedup, 26% on this host. Reuse is
+worth more than queue depth once the working set is warm, so demand paging is
+the default and `CASCADIA_K3_READ=1` opts in — appropriate for a cold-cache or
+high-miss deployment, where the table above applies.
+
+This was briefly the default on the strength of the cold benchmark alone, which
+is the second time on this model that a microbenchmark predicted the opposite of
+the workload (see `MADV_RANDOM` below). A fetch strategy is only settled once it
+has run against real decode.
 
 `MADV_RANDOM` was removed rather than kept behind a flag. It did what it claimed
 — read amplification fell ~4x to ~1x — but it loses on *both* storage classes,
@@ -336,7 +360,7 @@ measured impact rather than by how interesting the code is:
 |---|---|---|
 | `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
 | AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
-| explicit concurrent reads | done, **default** | measured 1.63x over `madvise` on NVMe, -3.5% on rotational |
+| explicit concurrent reads | done, **opt-in** (`CASCADIA_K3_READ=1`) | 1.63x over `madvise` on a cold NVMe benchmark, but -26% on real steady-state decode: it re-copies experts the page cache already holds |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
 | prefix cache | trait defaults, not implemented | a repeated prompt re-pays ~129 GB of prefill |

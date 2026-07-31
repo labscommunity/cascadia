@@ -242,10 +242,10 @@ impl ExpertSource for MmapExperts {
     }
 }
 
-/// Explicit concurrent reads for the routed experts, on by default.
+/// Explicit concurrent reads for the routed experts. Off unless asked for.
 ///
-/// Measured against `madvise` on both storage classes, useful MB/s over K3's
-/// actual access pattern (16 scattered 17.6 MB slices per layer):
+/// A cold-cache microbenchmark over K3's access pattern (16 scattered 17.6 MB
+/// slices per layer) makes this look like a clear win, useful MB/s:
 ///
 /// ```text
 ///                  NVMe    rotational
@@ -253,13 +253,24 @@ impl ExpertSource for MmapExperts {
 /// pread x16        3456           136
 /// ```
 ///
-/// 1.63x on NVMe, and 3.5% behind on rotational — a large win where the fleet
-/// lives and a rounding error where it does not, so it is the default rather
-/// than a flag. `CASCADIA_K3_READ=0` restores demand paging.
+/// The whole model is a cold read there, which is not how decode runs. In
+/// steady state most routed experts are already resident: the mapping then
+/// costs a pointer, while an explicit read still copies the full slice. On the
+/// real model, per-token decode at 62% reuse:
+///
+/// ```text
+///                  tok1     steady
+/// mmap            185.9s     152.6s
+/// pread x16       193.1s     193.0s
+/// ```
+///
+/// Reuse is worth more than queue depth once the working set is warm, so the
+/// mapping is the default. `CASCADIA_K3_READ=1` enables explicit reads for a
+/// cold-cache or high-miss deployment, where the benchmark above applies.
 fn explicit_reads_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() == Ok("1"))
 }
 
 /// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.
@@ -631,15 +642,37 @@ mod tests {
         FlatExperts { data, stride }
     }
 
+    /// Serves every requested expert from `read_batch`, so the batch path takes
+    /// the buffer branch rather than falling back to the mapping.
+    struct AlwaysBuffered {
+        inner: FlatExperts,
+    }
+
+    impl ExpertSource for AlwaysBuffered {
+        fn expert_bytes(&self, expert: usize) -> &[u8] {
+            self.inner.expert_bytes(expert)
+        }
+        fn stride(&self) -> usize {
+            self.inner.stride()
+        }
+        fn read_batch(&self, experts: &[u32]) -> Vec<Option<Vec<u8>>> {
+            experts
+                .iter()
+                .map(|&e| Some(self.inner.expert_bytes(e as usize).to_vec()))
+                .collect()
+        }
+    }
+
     #[test]
-    fn batch_prefill_over_a_mapped_file_matches_the_in_memory_reference() {
-        // Prefill reads its experts through `read_batch`, which hands back one
-        // buffer per DISTINCT expert while the loop walks `want` and skips the
-        // experts nobody chose. If those two orders ever disagree, an expert's
-        // weights get applied to another expert's rows — wrong tokens, no
-        // panic, nothing in a log. The in-memory source cannot catch that: its
-        // `read_batch` is the default all-`None`, so it only ever exercises the
-        // fallback. This runs the real mapped path and compares against it.
+    fn batch_prefill_reads_line_up_with_the_experts_that_asked_for_them() {
+        // `read_batch` returns one buffer per DISTINCT expert, while the loop
+        // walks every expert and skips the ones nobody chose. If those orders
+        // disagree, one expert's weights get applied to another's rows — wrong
+        // tokens, no panic, nothing in a log.
+        //
+        // This drives the buffer branch directly instead of relying on the
+        // env-gated default, so it keeps testing the real path whichever way
+        // that default is set.
         let d = dims();
         let w = weights(d);
         let rows = 8usize;
@@ -647,21 +680,14 @@ mod tests {
             .map(|i| ((i as f32) * 0.19).cos())
             .collect();
 
-        let flat = experts(d);
         let mut want = vec![0.0f32; rows * d.hidden];
-        moe_forward_batch(&xs, &w, d, &flat, rows, &mut want);
+        moe_forward_batch(&xs, &w, d, &experts(d), rows, &mut want);
 
-        let dir = std::env::temp_dir().join("k3_batch_prefill_read");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("layer.bin");
-        std::fs::write(&path, &flat.data).unwrap();
-        let mapped = MmapExperts::open(&path, flat.stride, d.n_experts).unwrap();
-
+        let buffered = AlwaysBuffered { inner: experts(d) };
         let mut got = vec![0.0f32; rows * d.hidden];
-        moe_forward_batch(&xs, &w, d, &mapped, rows, &mut got);
-        std::fs::remove_file(&path).ok();
+        moe_forward_batch(&xs, &w, d, &buffered, rows, &mut got);
 
-        assert_eq!(got, want, "mapped prefill diverged from the in-memory run");
+        assert_eq!(got, want, "buffered prefill diverged from the mapped run");
     }
 
     /// Counts how many times each expert's bytes are fetched.
