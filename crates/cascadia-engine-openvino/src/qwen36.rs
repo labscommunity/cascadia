@@ -79,19 +79,48 @@ fn selfchk_at() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok())
 }
 
-/// `CASCADIA_QWEN36_RESTORE_RESET=1` ⇒ clear state with `reset_state` (VariableState::reset over every
-/// `query_state()` entry) instead of `recreate_request` before `set_state_blob`.
+/// Pre-restore clear strategy. **Default: none** — `set_state_blob` writes straight over the live
+/// request. This is the bar-#1 fix.
 ///
-/// Measured motivation: on the 1-stage whole-model export, capture→`recreate_request`→restore is
-/// bit-identical, but on the sharded **stage-0** export the same round trip perturbs subsequent folds —
-/// which is precisely why single-box certifies 3/3 while 2-stage DIVERGEs. `reset_state` clears variable
-/// state without discarding the InferRequest, so it avoids whatever the rebuild changes.
+/// It is the CLEAR that breaks the restore, not the write. Measured with `SELFCHK`, where the bytes
+/// written are the ones just captured from this same request so the write is semantically a no-op and
+/// the clear is the only variable: `recreate_request` and `reset_state` both diverge from an untouched
+/// cold run — identically, same first-drift step and same flipped token — while skipping the clear is
+/// byte-identical. Declared state and first token match at the instant decode begins; state drifts one
+/// fold later, globally (attention 10/10, DeltaNet 24/30 tensors), and the token only flips 22 steps
+/// after that. So the perturbation is invisible to `get_state_blob` and is introduced by tearing the
+/// state down and re-establishing it.
 ///
-/// OFF by default: `recreate_request` is load-bearing. Restoring over LIVE folded state made the model
-/// regurgitate the user prompt, and `reset_state` alone was found not to clear that residue. So this arm
-/// must be validated on BOTH counts — warm==cold *and* no regurgitation — before it can become the default.
-fn restore_reset() -> bool {
-    std::env::var("CASCADIA_QWEN36_RESTORE_RESET").ok().as_deref() == Some("1")
+/// Removing the clear took qwen36 from chain 5/6 + plane 7/8 to **chain 6/6 + plane 8/8**, bar #1
+/// included, plus 3/3 single-chain.
+///
+/// The clear existed because restoring over live folded state once made the model regurgitate the
+/// prompt. That does not reproduce. `set_state_blob` overwrites every one of the 40 VariableStates
+/// (5 attention key + 5 value + 15 DeltaNet conv + 15 ssm), so no residue of the previous sequence
+/// survives for a clear to scrub — including on the cross-chain move, where the live state belongs to
+/// a DIFFERENT sequence and which certified 6/6 (chain) and 8/8 (plane).
+///
+/// `CASCADIA_QWEN36_RESTORE_CLEAR=recreate|reset` restores the old behaviour for A/B work.
+fn restore_clear_mode() -> &'static str {
+    match std::env::var("CASCADIA_QWEN36_RESTORE_CLEAR").ok().as_deref() {
+        Some("recreate") => "recreate_request",
+        Some("reset") => "reset_state",
+        _ => "none",
+    }
+}
+
+/// `CASCADIA_QWEN36_DECODE_FP=1` ⇒ fingerprint the local stage state after EVERY decode step.
+///
+/// Why this exists: with `SELFCHK`, the post-prefill state fingerprint and the first emitted token are
+/// BYTE-IDENTICAL to an untouched cold run, yet the text diverges ~15 tokens later. So the perturbation
+/// is invisible to `get_state_blob` at the point decode begins and only emerges while decoding.
+/// `qwen36_postprefill_state` fires once per turn, which cannot locate that. Comparing this per-step
+/// series between a plain cold run and a SELFCHK run gives the first step at which state (or the
+/// emitted token) diverges — the difference between a state drift and a decode-only flip.
+///
+/// Diagnostic only: it calls `get_state_blob` every step, which copies the whole local state.
+fn decode_fp() -> bool {
+    std::env::var("CASCADIA_QWEN36_DECODE_FP").ok().as_deref() == Some("1")
 }
 
 fn prefill_chunk() -> usize {
@@ -1309,6 +1338,35 @@ impl Qwen36Engine {
                     t.wire_ms.push(wire_ms);
                     t.gen_ids.push(next);
                     t.step += 1;
+                    let step_now = t.step;
+                    let gen_n = t.gen_ids.len();
+                    // Multi-stage path only: this is the topology bar #1 fails on. See decode_fp.
+                    #[cfg(feature = "kv_coord")]
+                    if decode_fp() {
+                        let mut fps: Vec<u64> = Vec::with_capacity(self.stages.len());
+                        for st in self.stages.iter_mut() {
+                            match st.get_state_blob() {
+                                Ok(b) => {
+                                    fps.push(crate::kv_coordination::fnv1a64(&b));
+                                    // Per-stage fps says THAT the state drifted at the first decode
+                                    // fold; it cannot say WHICH tensors. Attention-only would point at
+                                    // positional/layout handling, conv/ssm-only at the DeltaNet
+                                    // recurrent state. Capped at the first few steps: 40 tensors x 48
+                                    // steps is noise, and the drift is already known to start at fold 1.
+                                    // Self-gated on CASCADIA_KV_TENSOR_DUMP.
+                                    if gen_n <= 3 {
+                                        crate::kv_coordination::log_blob_tensors(
+                                            "qwen36_decode",
+                                            step_now as u64,
+                                            &b,
+                                        );
+                                    }
+                                }
+                                Err(_) => fps.push(0),
+                            }
+                        }
+                        info!(task = %task_id, pos = step_now, tok, ?fps, "qwen36_decode_fp");
+                    }
                     let full = self
                         .tokenizer
                         .as_ref()
@@ -2024,21 +2082,28 @@ impl Qwen36Engine {
             return false;
         }
         for (st, part) in self.stages.iter_mut().zip(parts.iter()) {
-            // Restore must land on a CLEAN request. `reset_state` leaves residue on this model
-            // (see reset_all), and the warm path skips it entirely, so `set_state_blob` here would
-            // otherwise apply over the prior turn's live folded state — the resumed continuation then
-            // loses context and regurgitates the user prompt (cross-chain DIVERGE). Rebuild first.
-            let clear = if restore_reset() {
-                st.reset_state()
-            } else {
-                st.recreate_request()
+            // Restore writes over the LIVE request — no pre-clear. See restore_clear_mode: clearing is
+            // what breaks bar #1, and `set_state_blob` overwrites every VariableState, so there is no
+            // residue for a clear to scrub. Logged so an A/B can tell a no-op arm from an env var that
+            // never reached the node.
+            let mode = restore_clear_mode();
+            info!(mode, "qwen36_restore_clear");
+            let clear = match mode {
+                "recreate_request" => st.recreate_request(),
+                "reset_state" => st.reset_state(),
+                _ => Ok(()),
             };
             if let Err(e) = clear {
-                warn!(error = %e, reset = restore_reset(),
+                warn!(error = %e, mode,
                     "qwen36: pre-restore state clear failed; cold reprefill");
                 self.state_restored = true;
                 return false;
             }
+            // The per-tensor discriminator was written for THIS bug and had no qwen36 caller, so a
+            // full tensor-dump rig run produced zero lines. Logs (name, rank, seq, nbytes, digest) per
+            // state so an A-capture vs B-restore diff can say WHICH tensor differs — attention-only
+            // points at layout mapping, conv/ssm-only at recurrent state handled as sequence-addressable.
+            crate::kv_coordination::log_blob_tensors("qwen36_restore", 0, part);
             if let Err(e) = st.set_state_blob(part) {
                 warn!(error = %e, "qwen36: set_state_blob failed; cold reprefill");
                 // A partial apply still dirtied earlier stages — make the next reset scrub properly.
@@ -2176,7 +2241,18 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         // restore it now. Mirrors the InFrame::Restore handler's local apply. Not on the total=1 path
         // (the head warms its own rank-0 slice via take_warm in step_first).
         match self.kv.take_capture(epoch) {
-            Some((_, blob)) => self.restore_local_stages(&blob),
+            Some((_, blob)) => {
+                // The head computes `warm` from RANK 0's slice alone and ships it to every rank as the
+                // FORWARD `pos`; this rank never computes its own restored depth, so a stage whose
+                // attention shape[2] differs folds the suffix at the wrong absolute offset (wrong
+                // RoPE/mask, mis-phased DeltaNet) with nothing to catch it. ov-runtime both computes
+                // and guards this. Log ours so head-vs-rank can be compared directly; a guard needs the
+                // head's value plumbed here, which the wire does not carry yet.
+                let depth = crate::kv_coordination::kv_seq_from_framed_blob(&blob).unwrap_or(0);
+                info!(epoch, rank_depth = depth, blob_len = blob.len(),
+                    "qwen36: plane apply — THIS rank's restored depth (compare vs head warm_prefix)");
+                self.restore_local_stages(&blob)
+            }
             None => false,
         }
     }
