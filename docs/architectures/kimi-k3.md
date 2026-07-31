@@ -10,11 +10,21 @@ exporter (`tools/export_kimi_k3.py`) and the CPU reference (`tools/kimi_k3_ref/`
 are golden-tested, and `{1,2,3,4,6}`-rank pipelines are bit-identical to a single
 process.
 
+Multi-rank is validated too: a 4-rank chain over the real transport returns
+`" Paris. The"`, identical to the single process, with no wire errors. That path
+had only ever run in-process before, so the widened AttnRes wire had never
+crossed a socket.
+
+**Any multi-rank K3 run must raise `CASCADIA_ACTIVATION_TIMEOUT_SECS`.** The
+transport's default reply deadline is 60 s, and a K3 decode step takes minutes —
+the wire reads a slow rank as a dead peer, drops the task after the first token
+and reports it as a clean short completion, which looks like an early stop rather
+than a failure. This will bite the fleet identically.
+
 What remains is throughput, not correctness. Decode is dominated by fetching
 expert weights; see [Measured on that host](#measured-on-that-host) for the real
 numbers and [Where the remaining speed is](#where-the-remaining-speed-is) for what
-is left. Multi-rank has only ever been exercised in-process — the layer split is
-bit-identical, but K3 over the network transport is untested.
+is left.
 
 K3 **does** run on the 4× 32 GB AI-PC fleet that dsv4 and glm5 target: the bf16
 shell is ~29 GB per node of 32, and the routed experts stream from NVMe as
