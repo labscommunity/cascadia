@@ -363,7 +363,7 @@ measured impact rather than by how interesting the code is:
 | explicit concurrent reads | done, **opt-in** (`CASCADIA_K3_READ=1`) | 1.63x over `madvise` on a cold NVMe benchmark, but -26% on real steady-state decode: it re-copies experts the page cache already holds |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
-| prefix cache | trait defaults, not implemented | a repeated prompt re-pays ~129 GB of prefill |
+| prefix cache | done, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`) | skips prefill on a repeated prefix, which is ~129 GB and minutes of it. Byte-bounded LRU over the post-prefill layer states. Not yet measured on the real model |
 | lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
@@ -376,6 +376,26 @@ that can skip byte ranges.
 
 Chunked-scan KDA prefill stays deferred: the recurrence is 1% of wall time, so
 there is nothing to win.
+
+### Measure before building either research item
+
+Both can cost more I/O than they save, and both can be settled offline in an
+afternoon without writing the feature.
+
+**Cross-layer gate prediction.** `residency.rs` already records per-layer
+selections. Dump the gate input and the resulting `sel.idx` per layer-token for a
+few hundred tokens, then offline score layer `L+1`'s gate on layer `L`'s hidden
+and measure recall of the true top-16 within the top-`M`, for `M` in
+`{16, 20, 24, 32}`. Prefetching `M` to catch `recall x 16` only pays if the saved
+misses beat the `M - 16` wasted fetches. **If recall at `M = 24` is under ~80%,
+drop it.** Correctness is never at risk — a wrong prediction wastes a fetch — so
+the only question is whether the arithmetic works.
+
+**Lane-lazy expert reads (CHESS).** Do not touch the reader first. Instrument:
+over a few hundred decode steps, record which lanes survive a candidate threshold
+and compute what fraction of `w3`'s *pages* end up fully dead. Skipping needs
+whole pages, not scattered rows. **If that is under ~20%, the line of work is not
+worth it.**
 
 ## Resolved math
 
