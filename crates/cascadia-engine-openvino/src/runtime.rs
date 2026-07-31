@@ -316,6 +316,22 @@ fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
+/// Refuse a prompt that cannot fit one packed slot's KV region.
+///
+/// A slot's region is a bounded window: once it fills, the oldest entries slide
+/// out. Serving an over-region prompt would answer from a silently truncated
+/// prompt — a request that looks successful and is wrong — so admission rejects
+/// it instead. Both remedies are the operator's, so name both.
+fn packed_admission_error(prompt_tokens: usize, region: usize) -> Option<String> {
+    (prompt_tokens > region).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens but this worker's per-slot KV region holds \
+             {region}; raise --static-context or lower --packed-slots (per-slot context is \
+             (static_context - 1 - packed_prefix) / packed_slots)"
+        )
+    })
+}
+
 /// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
 /// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
 /// the shared-prefix reuse length. The packed analogue of
@@ -1484,6 +1500,7 @@ impl OvRuntimeEngine {
     /// several tasks at once — which is exactly what the runner's per-task
     /// chunk buffers were built to demultiplex.
     fn step_first_packed(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        let mut out = Vec::new();
         // ---- admission ----
         while !self.pending.is_empty() {
             let Some(slot) = self.packed.as_ref().unwrap().free_slot() else {
@@ -1504,14 +1521,24 @@ impl OvRuntimeEngine {
                 ));
             }
             let region = self.packed.as_ref().unwrap().kv.region;
-            if prompt_ids.len() > region {
+            if let Some(msg) = packed_admission_error(prompt_ids.len(), region) {
+                // Fail this request, not the step. A step-level Err carries no
+                // task id, so the runner would close whichever stream happened
+                // to poll — a healthy request dying for someone else's prompt.
+                // An error chunk routes to its owner through the same per-task
+                // buffers every other packed chunk uses. The slot is untouched
+                // (only `admit` occupies one), so the next task can still use it.
                 warn!(
                     task = %task.task_id,
                     prompt_tokens = prompt_ids.len(),
                     region,
-                    "prompt exceeds this slot's KV region; earliest tokens will be evicted \
-                     — lower --packed-slots or raise --static-context"
+                    "refusing over-region prompt"
                 );
+                out.push((
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id.clone(), msg),
+                ));
+                continue;
             }
             info!(
                 task = %task.task_id,
@@ -1528,7 +1555,6 @@ impl OvRuntimeEngine {
         // three consecutive steps — so prefill must complete inside one step(),
         // exactly as the single-task static path already does.
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
-        let mut out = Vec::new();
         for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
             let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
                 break;
@@ -3739,6 +3765,25 @@ mod tests {
         let mut b = OvRuntimeBuilder::new("/non/existent", 0, 1, "CPU");
         let res = b.load(ShardSpec::single_stage("m", "CPU")).await;
         assert!(res.is_err());
+    }
+
+    /// A prompt longer than its slot's KV region cannot be served honestly: the
+    /// packed ring would evict its head and answer from a truncated prompt, so
+    /// admission must refuse it. The boundary is strict — a prompt that exactly
+    /// fills the region still fits.
+    #[test]
+    fn over_region_prompt_is_refused_at_admission() {
+        assert!(
+            packed_admission_error(255, 255).is_none(),
+            "a prompt that exactly fills the region is servable"
+        );
+        assert!(packed_admission_error(1, 255).is_none());
+        let msg = packed_admission_error(256, 255).expect("over-region must be refused");
+        assert!(msg.contains("256") && msg.contains("255"), "{msg}");
+        assert!(
+            msg.contains("--static-context") && msg.contains("--packed-slots"),
+            "the message must name both remedies: {msg}"
+        );
     }
 
     #[tokio::test]
