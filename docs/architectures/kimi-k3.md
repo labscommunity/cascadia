@@ -150,16 +150,30 @@ earlier revision of this section predicted `45 s/token` from a seek-plus-transfe
 model and credited it to spreading the roots over three spindles; both were
 wrong, and the run is recorded here in their place.
 
+The first run used the defaults as they shipped; the second is after the fixes
+below. Same host, same prompt, `routed` bytes byte-identical in both, so the
+comparison is like-for-like.
+
 ```
-load                1010.8 s      113.5 GB of shells, read() not mmap
-prompt 5 tok        "The capital of France is" -> " Paris. The E"
-decode              ~745 s/token steady state
-per token           25.8 GB of expert weights = 16 x 92 x 17.547 MB
-                    ~100 GB actually read from disk   <- ~4x amplification
-page-cache hit      4.4-4.7%      (the ~4% estimate above held)
-reuse               28% -> 37%    experts repeated from the previous token
-time split          experts 99%   kda 1%   mla/router/attnres ~0%
+                          as-shipped      corrected      note
+load                        1010.8 s       1088.7 s      unchanged control
+prefill + tok 1              768.5 s        182.6 s      4.22x
+decode, steady state         737.8 s        148.6 s      4.96x
+per token, end to end       1278.3 s        363.0 s      3.52x
+experts, share of wall           99%            46%
+eff                        204 MB/s      1836 MB/s
+page-cache hit                 4.7%           4.8%
+routed                     154.98 GB      154.98 GB      identical work
 ```
+
+Two changes account for it: `madvise(MADV_WILLNEED)` over a layer's routed
+experts right after routing, and an AVX2 fp4 kernel. They are not independent —
+AVX2 is compute-only, yet measured *fetch* throughput rose 745 -> 1836 MB/s,
+because a faster kernel returns to issue the next prefetch sooner and keeps the
+queue deeper. Modelling the expert bucket as serial `compute + I/O` does not even
+balance against these numbers; they compound.
+
+Prompt `"The capital of France is"` -> `" Paris. The"`, unchanged throughout.
 
 Two things that model got wrong:
 

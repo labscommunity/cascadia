@@ -170,11 +170,15 @@ impl K3Runner {
             expert_fp4::expert_bytes(m.routed_expert_hidden_size, m.moe_intermediate_size) as u64;
         // reserve for the bf16 shell this rank holds plus its KV/recurrent state
         let reserve = layers.len() as u64 * 1_200_000_000;
-        let budget = residency::autopin_budget(expert_bytes, reserve);
+        let raw_budget = residency::autopin_budget(expert_bytes, reserve);
+        let u = residency::snapshot();
+        // Earn the budget: a histogram with few observations picks near-arbitrary
+        // experts and spends the whole allowance on them, evicting page-cache
+        // entries that were doing more good. Ramp with confidence instead.
+        let budget = residency::autopin_count(u.total(), raw_budget);
         let mut pinned = 0usize;
         if budget > 0 {
             crate::dsv4::expert_mmap::reserve_lockable(budget * expert_bytes as usize);
-            let u = residency::snapshot();
             // spread the budget evenly over this rank's MoE layers
             let moe_layers = layers
                 .iter()
@@ -196,6 +200,8 @@ impl K3Runner {
             tracing::info!(
                 rank,
                 budget,
+                raw_budget,
+                observations = u.total(),
                 pinned,
                 "k3 autopin: mlock'd {pinned} of a {budget}-expert budget \
                  ({} recorded selections)",

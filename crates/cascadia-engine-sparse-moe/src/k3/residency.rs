@@ -19,6 +19,17 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// Physically-available RAM in bytes, or 0 when it cannot be determined.
+/// Page-cache reserve. Starving it drops buffered pread from ~800 to ~180 MB/s.
+pub const PAGE_CACHE_RESERVE: u64 = 2_500_000_000;
+/// Fraction of available RAM the pin budget may claim.
+pub const RAM_FRACTION: f64 = 0.88;
+/// Batch-union prefill touches a block of distinct experts; leave room for it.
+pub const WORKING_SET_BLOCK: u64 = 64;
+/// No pinning below this many recorded selections.
+pub const AUTOPIN_MIN_SELECTIONS: u64 = 5_000;
+/// Confidence reaches 1.0 at this many selections.
+pub const AUTOPIN_FULL_SELECTIONS: f64 = 200_000.0;
+
 pub fn mem_available() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -33,10 +44,38 @@ pub fn mem_available() -> u64 {
         }
         0
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     {
-        0
+        // The fleet runs Windows. Returning 0 here made autopin_budget return 0,
+        // so `if budget > 0` never fired and CASCADIA_K3_AUTOPIN silently pinned
+        // nothing on the machines that need it most — the same shape of bug as
+        // the cfg(unix)-only memory hints below.
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        // SAFETY: a zeroed MEMORYSTATUSEX with `length` set to its own size, as
+        // the API requires; the call only writes into it.
+        let mut ms: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        ms.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut ms) } != 0 {
+            return ms.avail_phys;
+        }
     }
+    // A query failure must not read as "no memory available" — that silently
+    // disables pinning. Be conservative instead.
+    8_000_000_000
 }
 
 /// How many experts fit in `budget_bytes`, leaving `reserve_bytes` for the
@@ -45,7 +84,27 @@ pub fn pin_budget_experts(budget_bytes: u64, reserve_bytes: u64, expert_bytes: u
     if expert_bytes == 0 {
         return 0;
     }
-    budget_bytes.saturating_sub(reserve_bytes) as usize / expert_bytes as usize
+    // Leave the page cache intact. Starving it is measured to drop buffered
+    // pread from ~800 to ~180 MB/s on this class of host — pinning that takes
+    // the cache's memory can therefore cost more than the pins are worth, which
+    // is precisely the failure this module's header warns about.
+    let slack = PAGE_CACHE_RESERVE + WORKING_SET_BLOCK * expert_bytes;
+    let usable = (budget_bytes as f64 * RAM_FRACTION) as u64;
+    usable.saturating_sub(reserve_bytes.saturating_add(slack)) as usize / expert_bytes as usize
+}
+
+/// Confidence ramp: pin nothing until [`AUTOPIN_MIN_SELECTIONS`], then rise
+/// linearly to half the budget by [`AUTOPIN_FULL_SELECTIONS`].
+///
+/// A histogram with a handful of observations picks near-arbitrary experts and
+/// spends the budget on them, evicting page-cache entries that were doing more
+/// good. Confidence is earned rather than assumed.
+pub fn autopin_count(total_selections: u64, budget_experts: usize) -> usize {
+    if total_selections < AUTOPIN_MIN_SELECTIONS {
+        return 0;
+    }
+    let conf = (total_selections as f64 / AUTOPIN_FULL_SELECTIONS).min(1.0);
+    (budget_experts as f64 * 0.5 * conf) as usize
 }
 
 /// The pin budget for this rank, from `CASCADIA_K3_PIN_BYTES` or available RAM.
@@ -110,13 +169,16 @@ impl UsageStats {
     /// `layer expert count` per line — plain text so it can be inspected and
     /// hand-edited on a node without tooling.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let mut s = String::new();
-        let mut keys: Vec<_> = self.counts.iter().collect();
-        keys.sort_by_key(|(k, _)| **k);
-        for ((l, e), c) in keys {
-            s.push_str(&format!("{l} {e} {c}\n"));
+        // Write-then-rename: this runs from `Drop`, the moment a kill is most
+        // likely, and `load` skips malformed lines silently — so a torn write
+        // would degrade the pin set with no error anywhere.
+        let mut out = String::new();
+        for ((l, e), c) in &self.counts {
+            out.push_str(&format!("{l} {e} {c}\n"));
         }
-        std::fs::write(path, s)
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, path)
     }
 
     pub fn load(&mut self, path: &Path) -> std::io::Result<()> {
@@ -333,10 +395,15 @@ mod tests {
 
     #[test]
     fn budget_divides_and_reserves() {
-        // 100 GB budget, 12 GB reserved, 17.5 MB experts
+        // 100 GB budget, 12 GB reserved, 17.5 MB experts:
+        //   usable = 100e9 * 0.88                       = 88.00 GB
+        //   slack  = 2.5 GB + 64 * 17.5 MB              =  3.62 GB
+        //   (88.00 - 12.00 - 3.62) GB / 17.547 MB       =  4124
+        // Below the naive (budget - reserve) / expert = 5015, deliberately:
+        // starving the page cache costs more than the extra pins gain.
         assert_eq!(
             pin_budget_experts(100_000_000_000, 12_000_000_000, 17_547_264),
-            5015
+            4124
         );
         // a reserve larger than the budget pins nothing rather than underflowing
         assert_eq!(pin_budget_experts(1_000, 2_000, 10), 0);
@@ -394,6 +461,69 @@ mod advise_tests {
         let mut v = vec![0u8; len];
         let addr = v.as_mut_ptr() as usize;
         assert!(advise_random(addr, len), "madvise(MADV_RANDOM) failed");
+    }
+
+    #[test]
+    fn mem_available_never_reports_zero() {
+        // Returning 0 on an unhandled platform silently disabled autopin: the
+        // budget became 0 and the `if budget > 0` guard never fired. A query
+        // failure must degrade to a conservative number, not to "no memory".
+        assert!(
+            super::mem_available() > 0,
+            "mem_available must never be 0 — that silently disables pinning"
+        );
+    }
+
+    #[test]
+    fn budget_leaves_the_page_cache_alone() {
+        let eb = 17_547_264u64;
+        // A budget that only just covers the reserve must not pin anything: the
+        // page-cache reserve and working-set block come out first.
+        assert_eq!(
+            super::pin_budget_experts(10_000_000_000, 9_000_000_000, eb),
+            0
+        );
+        // A large budget still holds back the reserve rather than spending all.
+        let big = super::pin_budget_experts(200_000_000_000, 10_000_000_000, eb);
+        let naive = (200_000_000_000u64 - 10_000_000_000) / eb;
+        assert!(
+            big > 0 && (big as u64) < naive,
+            "got {big}, naive would be {naive}"
+        );
+    }
+
+    #[test]
+    fn autopin_ramps_with_confidence() {
+        // Below the floor: nothing, however large the budget.
+        assert_eq!(super::autopin_count(0, 1000), 0);
+        assert_eq!(
+            super::autopin_count(super::AUTOPIN_MIN_SELECTIONS - 1, 1000),
+            0
+        );
+        // At the floor it engages, but only a sliver.
+        let low = super::autopin_count(super::AUTOPIN_MIN_SELECTIONS, 1000);
+        assert!(low > 0 && low < 50, "expected a small ramp, got {low}");
+        // Fully confident caps at half the budget, never the whole thing.
+        let full = super::autopin_count(1_000_000, 1000);
+        assert_eq!(full, 500);
+    }
+
+    #[test]
+    fn usage_save_is_atomic_and_round_trips() {
+        let dir = std::env::temp_dir().join("k3_usage_atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage");
+        let mut u = super::UsageStats::new();
+        u.record(3, 7);
+        u.record(3, 7);
+        u.record(1, 2);
+        u.save(&path).unwrap();
+        // the temp file must not survive a successful save
+        assert!(!path.with_extension("tmp").exists(), "left a .tmp behind");
+        let mut back = super::UsageStats::new();
+        back.load(&path).unwrap();
+        assert_eq!(back.total(), u.total());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
