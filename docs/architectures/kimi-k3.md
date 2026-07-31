@@ -307,22 +307,36 @@ pread x16         3456           136
 
 That benchmark drops the cache before every run, so it only describes a *cold*
 fetch. Decode is not cold — by the second token most routed experts are already
-resident, and there the two strategies stop being equivalent: the mapping hands
-back a pointer, while an explicit read still copies the whole 17.6 MB slice.
-Per-token decode on the real model, at 62% reuse:
+resident, and the strategies stop being equivalent there: the mapping hands back
+a pointer, an explicit read still copies the whole 17.6 MB slice.
+
+**This is not settled. Read the whole section before changing the default.**
+Three runs on the real model, one each, prompt and host identical:
 
 ```
-                  tok1     steady
-mmap             185.9s     152.6s
-pread x16        193.1s     193.0s
+                             prefill+tok1   steady   3 tokens
+A  mmap prefill, pread decode        --*    193.0s    1095.0s
+B  mmap everywhere                 905.1s   147.5s    1052.8s
+C  pread everywhere                914.2s   131.9s    1046.3s
 ```
+\* A predates the profiler fix, so its first dump excludes prefill and is not
+comparable.
 
-`pread` gives up the entire tok1 -> steady speedup, 26% on this host. Reuse is
-worth more than queue depth once the working set is warm, so demand paging is
-the default and `CASCADIA_K3_READ=1` opts in — appropriate for a cold-cache or
-high-miss deployment, where the table above applies.
+A vs B says explicit reads cost 26% of steady-state decode. B vs C says they
+*gain* 10.6%. Both cannot be true of the strategy itself, and the difference
+between A and C is only what prefill did — so decode's cost depends on the cache
+state prefill leaves behind, and A is the pathological mix rather than a verdict
+on `pread`.
 
-This was briefly the default on the strength of the cold benchmark alone, which
+End to end the three sit within 4.6%, and B vs C within 0.6%, so whatever this
+effect is, it is smaller than the steady-state column alone suggests.
+
+Demand paging stays the default until a repeat with the same binary on both sides
+says otherwise: the reverted state is the one with a plausible mechanism behind
+it, and reverting on a confounded comparison is cheaper to undo than shipping on
+one. `CASCADIA_K3_READ=1` opts in.
+
+The first default was set on the cold benchmark alone, which
 is the second time on this model that a microbenchmark predicted the opposite of
 the workload (see `MADV_RANDOM` below). A fetch strategy is only settled once it
 has run against real decode.
@@ -374,7 +388,7 @@ measured impact rather than by how interesting the code is:
 |---|---|---|
 | `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
 | AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
-| explicit concurrent reads | done, **opt-in** (`CASCADIA_K3_READ=1`) | 1.63x over `madvise` on a cold NVMe benchmark, but -26% on real steady-state decode: it re-copies experts the page cache already holds |
+| explicit concurrent reads | done, **opt-in** (`CASCADIA_K3_READ=1`), verdict unsettled | 1.63x on a cold NVMe benchmark; on the real model one pair says -26% steady-state and another says +10.6%. Needs a same-binary repeat — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
 | prefix cache | done, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`) | skips prefill on a repeated prefix, which is ~129 GB and minutes of it. Byte-bounded LRU over the post-prefill layer states. Not yet measured on the real model |
