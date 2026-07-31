@@ -19,4 +19,6 @@ pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;
-pub use task::{GenerationTask, SamplingParams, TaskId};
+pub use task::{
+    append_resume_ids, resume_generated_seed, GenerationTask, SamplingParams, TaskId,
+};
