@@ -3072,11 +3072,45 @@ impl<R: StagedRunner> PipelineEngine<R> {
                  the response answers only the first {max_seq} tokens"
             );
         }
-        let (generated, hit_context_cap) =
-            self.runner
-                .generate_reason(&prompt_ids, max_new, &sampling_cfg);
+        // Same prefix reuse the pipeline path gets. Without this a single-rank
+        // deployment accepts a cache budget and never uses it, which is
+        // indistinguishable from a cache that only ever misses.
+        let reuse = if self.runner.prefix_cache_enabled() {
+            self.prefix_reuse(&prompt_ids)
+        } else {
+            None
+        };
+        if let Some((_, k)) = reuse {
+            info!(
+                task = %task.task_id,
+                reused = k,
+                prompt = prompt_ids.len(),
+                suffix = prompt_ids.len() - k,
+                "kv-prefix cache HIT: prefilling suffix only"
+            );
+        }
+        let (generated, hit_context_cap) = self.runner.generate_reason_from(
+            &prompt_ids,
+            reuse.map(|(key, _)| key),
+            max_new,
+            &sampling_cfg,
+        );
         let n_tokens = generated.len() as u32;
         let text = tok.decode(&generated, true).unwrap_or_default();
+        if self.runner.prefix_cache_enabled() {
+            // Key on exactly the positions the state covers — prompt plus the
+            // generated tokens that were actually forwarded, which is not all of
+            // them: the last sampled token never goes back through the layers.
+            // Ask the runner rather than counting, since only it knows.
+            if let Some(covered) = self.runner.covered_positions() {
+                if covered >= prompt_ids.len() && covered <= prompt_ids.len() + generated.len() {
+                    let mut key_tokens = prompt_ids.clone();
+                    key_tokens.extend_from_slice(&generated[..covered - prompt_ids.len()]);
+                    let key = self.prefix_remember(&key_tokens);
+                    self.runner.cache_prefix(key);
+                }
+            }
+        }
         let elapsed = started.elapsed().as_secs_f64();
         info!(
             task = %task.task_id,

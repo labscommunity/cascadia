@@ -324,6 +324,10 @@ impl StagedRunner for K3Runner {
         self.states = states;
     }
 
+    fn covered_positions(&self) -> Option<usize> {
+        Some(self.pos)
+    }
+
     /// Rank 0: the embedding row becomes the prefix sum; the stack starts empty.
     fn embed_token(&self, token: u32) -> Vec<f32> {
         let e = self
