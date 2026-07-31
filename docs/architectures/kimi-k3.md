@@ -399,38 +399,55 @@ dropped, a `syscr` that moved — not merely that it was switched on.
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised, **needs a long run** | prior art finds static hot-set pinning helps cold start and loses in steady state. Two gotchas before measuring: the histogram is only persisted when autopin is enabled, so the FIRST enabled run always reports `pinned=0` and merely records; and the confidence ramp counts selections, of which K3 makes 92 layers x 16 = 1472 per token, so nothing pins below ~3.4 tokens and full confidence needs ~136. A 3-token run produces 4416 selections and stays under the floor — this cannot be evaluated at that scale |
 | prefix cache | working, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`), **needs >= 2 ranks** | **measured 2.45x** on a next-turn request: prefill bytes 142.06 -> 51.66 GB and prefill 649.4 -> 228.3 s at `reused=7 prompt=10`, saving in proportion to the reuse fraction. Byte-bounded LRU over the post-prefill layer states. Driven only from the pipeline path, so 1 rank takes `step_single_stage` and never reaches it — the budget is accepted and ignored (now warned about). Reuse needs a STRICT prefix, so resending an identical prompt never hits; the case it serves is the next turn, which resends the reply too |
-| lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
+| lane-lazy expert reads | **dropped, measured** | 28.8% of lanes are dead at the most aggressive threshold, but only 5.5% of `w3` PAGES, and 0.0% losslessly. The sparsity is real and too scattered to skip a page. `CASCADIA_K3_CHESS_PROBE=1` re-measures |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
 `ngram_draft.rs` and the `spec_decode.rs` primitives are already generic and pure,
 but K3 rejection has to rewind *both* the KDA recurrent state and the MLA cache,
 where K2.6 rewinds KV slots only. The per-channel FFN sparsity work in
-`cascadia-int4-gemm` (CHESS) is a compute win there and would be an I/O win here,
-which is the more valuable half — but it needs K3 calibration data and a reader
-that can skip byte ranges.
+`cascadia-int4-gemm` (CHESS) is a compute win there, and was expected to be an
+I/O win here — the more valuable half — until it was measured; see below.
 
 Chunked-scan KDA prefill stays deferred: the recurrence is 1% of wall time, so
 there is nothing to win.
 
-### Measure before building either research item
+### Two ideas the measurements killed
 
-Both can cost more I/O than they save, and both can be settled offline in an
-afternoon without writing the feature.
+Both were promising on paper, both had a threshold written down before any data,
+and both came in far under it. Each was settled by a probe rather than by
+building the feature — the probes are still in the tree, so either number can be
+re-checked on other hardware or another model.
 
-**Cross-layer gate prediction.** `residency.rs` already records per-layer
-selections. Dump the gate input and the resulting `sel.idx` per layer-token for a
-few hundred tokens, then offline score layer `L+1`'s gate on layer `L`'s hidden
-and measure recall of the true top-16 within the top-`M`, for `M` in
-`{16, 20, 24, 32}`. Prefetching `M` to catch `recall x 16` only pays if the saved
-misses beat the `M - 16` wasted fetches. **If recall at `M = 24` is under ~80%,
-drop it.** Correctness is never at risk — a wrong prediction wastes a fetch — so
-the only question is whether the arithmetic works.
+**Cross-layer gate prediction — dropped.** Score a layer's router against the
+previous layer's hidden and see how much of the real top-16 lands in the top-`M`
+(`CASCADIA_K3_GATE_PROBE=1`):
 
-**Lane-lazy expert reads (CHESS).** Do not touch the reader first. Instrument:
-over a few hundred decode steps, record which lanes survive a candidate threshold
-and compute what fraction of `w3`'s *pages* end up fully dead. Skipping needs
-whole pages, not scattered rows. **If that is under ~20%, the line of work is not
-worth it.**
+```
+top16=40.0%  top20=44.6%  top24=49.0%  top32=55.9%
+```
+
+The bar was 80% at `M = 24`. At the measured 49%, prefetching 24 experts catches
+`0.49 x 16` = 7.8 of them and the other 8.2 still miss — about 32 fetches where 16
+were needed. Every width loses, and `M = 32` loses hardest. The published results
+come from models selecting a much larger fraction than 16 of 896, which is
+exactly why the numbers had to be taken here rather than assumed.
+
+**Lane-lazy expert reads (CHESS) — dropped.** Count dead lanes and, separately,
+`w3` pages with no live lane on them (`CASCADIA_K3_CHESS_PROBE=1`):
+
+```
+t=0      lanes=0.0%   pages=0.0%
+t=0.001  lanes=0.4%   pages=0.0%
+t=0.01   lanes=3.4%   pages=0.0%
+t=0.1    lanes=28.8%  pages=5.5%
+```
+
+The bar was 20% of pages. Losslessly nothing is skippable at all, and even at a
+threshold that costs real precision only 5.5% of pages clear. The lane column is
+the idea's promise and the page column is what the storage stack would deliver:
+28.8% of lanes dead frees 5.5% of pages, because the dead ones are scattered and
+a page with one live lane on it is read in full. Reporting only the lane figure
+would have justified building something that saves nearly nothing.
 
 ## Resolved math
 
