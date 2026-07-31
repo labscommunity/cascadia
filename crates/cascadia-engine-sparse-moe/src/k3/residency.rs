@@ -102,6 +102,12 @@ pub fn pin_budget_experts(budget_bytes: u64, reserve_bytes: u64, expert_bytes: u
 /// A histogram with a handful of observations picks near-arbitrary experts and
 /// spends the budget on them, evicting page-cache entries that were doing more
 /// good. Confidence is earned rather than assumed.
+///
+/// What that costs in tokens: K3 records `moe_layers * top_k` selections per
+/// token, 92 x 16 = 1472. So nothing pins below ~3.4 tokens and full confidence
+/// needs ~136. Combined with the histogram only being written when autopin is
+/// enabled, the first enabled run always pins nothing and merely records. This
+/// is aimed at a long-lived process, and a short run cannot exercise it.
 pub fn autopin_count(total_selections: u64, budget_experts: usize) -> usize {
     if total_selections < AUTOPIN_MIN_SELECTIONS {
         return 0;
@@ -469,6 +475,28 @@ mod advise_tests {
         // Fully confident caps at half the budget, never the whole thing.
         let full = super::autopin_count(1_000_000, 1000);
         assert_eq!(full, 500);
+    }
+
+    #[test]
+    fn the_ramp_costs_more_tokens_than_a_short_run_produces() {
+        // K3 records moe_layers * top_k selections per token. If someone lowers
+        // the constants without meaning to, the docs' "needs a long run" caveat
+        // silently stops being true -- and if someone raises them, a test that
+        // was passing at 3 tokens starts failing for a non-obvious reason.
+        const PER_TOKEN: u64 = 92 * 16;
+        let floor_tokens = super::AUTOPIN_MIN_SELECTIONS.div_ceil(PER_TOKEN);
+        assert_eq!(floor_tokens, 4, "floor moved: {floor_tokens} tokens");
+
+        // A 3-token run stays under the floor and pins nothing at any budget.
+        assert_eq!(super::autopin_count(3 * PER_TOKEN, 100_000), 0);
+
+        // Full confidence is a long-run affair, not a smoke test.
+        let full_tokens = (super::AUTOPIN_FULL_SELECTIONS as u64).div_ceil(PER_TOKEN);
+        assert!(
+            full_tokens > 100,
+            "full confidence at {full_tokens} tokens, cheap enough that the \
+             long-run caveat in the docs no longer applies"
+        );
     }
 
     #[test]
