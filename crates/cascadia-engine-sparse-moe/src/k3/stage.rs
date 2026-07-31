@@ -361,6 +361,9 @@ impl StagedRunner for K3Runner {
         if let Some(line) = crate::k3::gate_probe::report() {
             eprintln!("{line}");
         }
+        if let Some(line) = crate::k3::chess_probe::report() {
+            eprintln!("{line}");
+        }
         w
     }
 

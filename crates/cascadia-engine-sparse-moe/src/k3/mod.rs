@@ -13,6 +13,7 @@
 
 pub mod attn;
 pub mod attn_res;
+pub mod chess_probe;
 pub mod expert_fp4;
 pub mod gate_probe;
 pub mod kda;

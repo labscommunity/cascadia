@@ -282,7 +282,12 @@ fn prefetch_enabled() -> bool {
 }
 
 /// SiTU FFN over fp4-packed weights: `w2(SiTU(w1(x), w3(x)))`.
-fn fp4_expert_forward(bytes: &[u8], x: &[f32], d: MoeDims, out: &mut [f32]) {
+///
+/// `probe` offers `g` to [`crate::k3::chess_probe`]. Decode only: the batch path
+/// runs one expert against many rows, so a per-row lane-sparsity number there
+/// would describe a skip that could not be taken without splitting the section
+/// read the batch exists to share.
+fn fp4_expert_forward(bytes: &[u8], x: &[f32], d: MoeDims, probe: bool, out: &mut [f32]) {
     let sec_gate = expert_fp4::section_bytes(d.inter, d.latent);
     let sec_down = expert_fp4::section_bytes(d.latent, d.inter);
     debug_assert_eq!(bytes.len(), 2 * sec_gate + sec_down);
@@ -290,6 +295,9 @@ fn fp4_expert_forward(bytes: &[u8], x: &[f32], d: MoeDims, out: &mut [f32]) {
     let mut g = vec![0.0f32; d.inter];
     let mut u = vec![0.0f32; d.inter];
     expert_fp4::gemv(&bytes[..sec_gate], d.inter, d.latent, x, &mut g);
+    if probe {
+        crate::k3::chess_probe::observe(&g, d.inter, d.latent);
+    }
     expert_fp4::gemv(&bytes[sec_gate..2 * sec_gate], d.inter, d.latent, x, &mut u);
 
     let mut h = vec![0.0f32; d.inter];
@@ -344,7 +352,7 @@ pub fn moe_forward<E: ExpertSource>(
             Some(b) => b,
             None => experts.expert_bytes(e as usize),
         };
-        fp4_expert_forward(bytes, &x_lat, d, &mut eo);
+        fp4_expert_forward(bytes, &x_lat, d, true, &mut eo);
         let wt = sel.weight[i];
         for (a, &v) in acc.iter_mut().zip(eo.iter()) {
             *a += wt * v;
@@ -472,7 +480,13 @@ pub fn moe_forward_batch<E: ExpertSource>(
         };
         next += 1;
         for &(r, k) in hits {
-            fp4_expert_forward(bytes, &lat[r * d.latent..(r + 1) * d.latent], d, &mut eo);
+            fp4_expert_forward(
+                bytes,
+                &lat[r * d.latent..(r + 1) * d.latent],
+                d,
+                false,
+                &mut eo,
+            );
             let base = (r * d.top_k + k) * d.latent;
             slots[base..base + d.latent].copy_from_slice(&eo);
         }
