@@ -167,20 +167,34 @@ comparison is like-for-like.
 ```
                           as-shipped      corrected      note
 load                        1010.8 s       1088.7 s      unchanged control
-prefill + tok 1              768.5 s        182.6 s      4.22x
+tok 1 forward                768.5 s        182.6 s      4.22x, EXCLUDES prefill
 decode, steady state         737.8 s        148.6 s      4.96x
 per token, end to end       1278.3 s        363.0 s      3.52x
 experts, share of wall           99%            46%
-eff                        204 MB/s      1836 MB/s
+eff                        204 MB/s      1836 MB/s      both overstated ~5x
 page-cache hit                 4.7%           4.8%
 routed                     154.98 GB      154.98 GB      identical work
 ```
 
-The `eff` row is overstated in both columns. Prefill recorded its routed bytes
-but no elapsed time, so the first dump divided prefill's bytes by decode's time.
-The wall-clock rows are unaffected — they are measured directly — and the two
-columns are wrong the same way, so the ratios stand. Fixed since; runs after that
-report a prefill rate that was actually achieved.
+Two rows above are not what their old labels claimed, because the profiler was
+blind to prefill: it recorded prefill's routed bytes but none of its time.
+
+The `tok 1` row was labelled "prefill + tok 1" and is the decode forward alone.
+And `eff` is routed bytes over the EXPERT-BUCKET time, a bucket prefill also
+never contributed to — so it divided prefill's bytes by decode's time and
+overstated fetch throughput about 5x.
+
+Both columns are wrong the same way and the wall-clock rows are measured
+directly, so every ratio above still stands. Re-measured after the fix, on the
+same host and prompt:
+
+```
+prefill                      757.6 s      72% of a 3-token run, previously unbilled
+tok 1 forward (in the above)     ~147 s
+decode, steady state         147.5 s      matches the 148.6 s column
+eff, prefill                306 MB/s      vs 1836 MB/s reported before
+accounted for                 99.98%      905.1 + 147.5 vs 1052.8 s end to end
+```
 
 Two changes account for it: `madvise(MADV_WILLNEED)` over a layer's routed
 experts right after routing, and an AVX2 fp4 kernel. They are not independent —

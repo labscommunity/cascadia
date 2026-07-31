@@ -158,6 +158,10 @@ pub fn dump(tag: &str) {
     let cur_bytes = ROUTED_BYTES.load(Ordering::Relaxed);
     let d_bytes = cur_bytes.saturating_sub(LAST_BYTES.swap(cur_bytes, Ordering::Relaxed));
     let gb = d_bytes as f64 / 1e9;
+    // Routed bytes over the EXPERT bucket, not over WALL: this is the rate while
+    // fetching, not the token's average. Both sides must cover the same phases —
+    // when prefill counted its bytes here but none of its time, this overstated
+    // fetch throughput about 5x.
     let eff_mbs = d_bytes as f64 / 1e6 / (d_ns[EXPERTS].max(1) as f64 / 1e9);
 
     let cur_probed = PAGES_PROBED.load(Ordering::Relaxed);
