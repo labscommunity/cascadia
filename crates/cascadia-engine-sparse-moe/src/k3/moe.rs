@@ -60,6 +60,16 @@ pub trait ExpertSource {
     /// Hint that these experts are about to be read, without blocking on them.
     /// Default is a no-op: in-memory sources have nothing to fetch.
     fn prefetch(&self, _experts: &[u32]) {}
+
+    /// Read these experts concurrently into owned buffers, in `experts` order.
+    ///
+    /// `None` for a slot means "use `expert_bytes` instead" — this is purely an
+    /// I/O strategy, so any failure falls back to the mapping rather than
+    /// propagating. Default is all-`None`: an in-memory source has nothing to
+    /// gain from reading what it already holds.
+    fn read_batch(&self, experts: &[u32]) -> Vec<Option<Vec<u8>>> {
+        vec![None; experts.len()]
+    }
 }
 
 /// A flat in-memory expert set — `n_experts * expert_bytes(latent, inter)`.
@@ -91,6 +101,11 @@ impl ExpertSource for FlatExperts {
 /// exceed Linux's default `vm.max_map_count` (65,530) outright.
 pub struct MmapExperts {
     mmap: memmap2::Mmap,
+    /// Kept open so routed experts can be read explicitly and concurrently.
+    /// `madvise` is only a hint the kernel may ignore or truncate; a blocking
+    /// `pread` per expert on a rayon thread is a guaranteed in-flight request,
+    /// which is the difference between asking for queue depth and having it.
+    file: std::fs::File,
     stride: usize,
     n: usize,
 }
@@ -126,7 +141,12 @@ impl MmapExperts {
         if std::env::var("CASCADIA_K3_RANDOM").as_deref() == Ok("1") {
             crate::k3::residency::advise_random(mmap.as_ptr() as usize, mmap.len());
         }
-        Ok(Self { mmap, stride, n })
+        Ok(Self {
+            mmap,
+            file: f,
+            stride,
+            n,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -141,6 +161,40 @@ impl MmapExperts {
     /// when every routed expert misses the page cache.
     pub fn bytes(&self) -> usize {
         self.n * self.stride
+    }
+
+    /// Read one expert's bytes explicitly, bypassing the fault path.
+    ///
+    /// Returns `None` on any I/O error so the caller can fall back to the mmap
+    /// slice — this is an optimisation, never a correctness dependency.
+    pub fn read_expert(&self, expert: usize) -> Option<Vec<u8>> {
+        if expert >= self.n {
+            return None;
+        }
+        let mut buf = vec![0u8; self.stride];
+        let off = (expert * self.stride) as u64;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut buf, off).ok()?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut done = 0usize;
+            while done < buf.len() {
+                match self.file.seek_read(&mut buf[done..], off + done as u64) {
+                    Ok(0) => return None,
+                    Ok(n) => done += n,
+                    Err(_) => return None,
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return None;
+        }
+        Some(buf)
     }
 
     /// Queue this expert's slice for read-ahead. Returns without waiting.
@@ -189,6 +243,31 @@ impl ExpertSource for MmapExperts {
             self.prefetch_expert(e as usize);
         }
     }
+
+    fn read_batch(&self, experts: &[u32]) -> Vec<Option<Vec<u8>>> {
+        if !explicit_reads_enabled() {
+            return vec![None; experts.len()];
+        }
+        use rayon::prelude::*;
+        experts
+            .par_iter()
+            .map(|&e| self.read_expert(e as usize))
+            .collect()
+    }
+}
+
+/// `CASCADIA_K3_READ=1` swaps the routed-expert fetch from demand paging to
+/// explicit concurrent reads.
+///
+/// Off by default: on the rotational host that produced the current numbers,
+/// `MADV_WILLNEED` already lifted throughput 204 -> 1836 MB/s by letting the
+/// drive reorder, and sixteen simultaneous readers may simply thrash the head
+/// instead. On a device with no seek penalty the guaranteed queue depth should
+/// win. That is a measurement, not a guess, so it ships behind a flag.
+fn explicit_reads_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() == Ok("1"))
 }
 
 /// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.
@@ -252,8 +331,15 @@ pub fn moe_forward<E: ExpertSource>(
 
     let mut acc = vec![0.0f32; d.latent];
     let mut eo = vec![0.0f32; d.latent];
+    // Optionally fetch every routed expert up front and concurrently; empty
+    // unless enabled, in which case a `None` slot falls back to the mapping.
+    let bufs = experts.read_batch(&sel.idx);
     for (i, &e) in sel.idx.iter().enumerate() {
-        fp4_expert_forward(experts.expert_bytes(e as usize), &x_lat, d, &mut eo);
+        let bytes = match bufs.get(i).and_then(|b| b.as_deref()) {
+            Some(b) => b,
+            None => experts.expert_bytes(e as usize),
+        };
+        fp4_expert_forward(bytes, &x_lat, d, &mut eo);
         let wt = sel.weight[i];
         for (a, &v) in acc.iter_mut().zip(eo.iter()) {
             *a += wt * v;
@@ -454,6 +540,38 @@ mod tests {
             shared_w3: bf(d.inter * d.n_shared * d.hidden, 0.19),
             shared_w2: bf(d.hidden * d.inter * d.n_shared, 0.23),
         }
+    }
+
+    #[test]
+    fn explicit_read_matches_the_mapping_byte_for_byte() {
+        // The whole point is that this is an I/O strategy, not a semantic
+        // change: whichever way the bytes arrive, they must be the same bytes.
+        let dir = std::env::temp_dir().join("k3_read_expert");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("layer.bin");
+        let stride = 4096usize;
+        let n = 5usize;
+        let data: Vec<u8> = (0..stride * n).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let ex = MmapExperts::open(&path, stride, n).unwrap();
+        for e in 0..n {
+            let got = ex.read_expert(e).expect("read");
+            assert_eq!(got, ex.expert_bytes(e), "expert {e} differs from the map");
+        }
+        // out of range is reported, not panicked, matching the other accessors
+        assert!(ex.read_expert(n).is_none());
+        assert!(ex.read_expert(usize::MAX).is_none());
+
+        // read_batch is order-preserving and falls back rather than failing
+        let batch = ex.read_batch(&[3, 0, 99]);
+        assert_eq!(batch.len(), 3);
+        if batch[0].is_some() {
+            assert_eq!(batch[0].as_deref().unwrap(), ex.expert_bytes(3));
+            assert_eq!(batch[1].as_deref().unwrap(), ex.expert_bytes(0));
+            assert!(batch[2].is_none(), "out-of-range slot must be None");
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
