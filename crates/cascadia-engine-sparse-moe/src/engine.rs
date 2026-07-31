@@ -818,6 +818,10 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                // Same value the per-rank SliceKvCache got, so the rank-0 index
+                // and the per-rank caches stay in lockstep. `None` falls through
+                // to the env var and then to whether the store is enabled.
+                self.config.prefix_cache_depth.map(|d| d as usize),
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -2910,9 +2914,33 @@ struct PipeActive {
     hit_context_cap: bool,
 }
 
+/// How many prefix keys the engine index may hold.
+///
+/// The index and the runner's store have to switch on together: the store
+/// decides whether snapshots are KEPT, the index decides whether their keys can
+/// be FOUND. This used to read one engine-specific variable and default to 0, so
+/// a runner enabled under any other name got an index of capacity zero — every
+/// prefix was evicted on the line after it was recorded, and the feature looked
+/// exactly like a cache that only ever missed.
+///
+/// Entries, not bytes: the store already bounds bytes. Keep this at or below
+/// what the store can hold, so a key cannot outlive its snapshot.
+fn prefix_index_cap(env_override: Option<&str>, store_enabled: bool) -> usize {
+    const DEFAULT_PREFIX_ENTRIES: usize = 4;
+    env_override
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(if store_enabled {
+            DEFAULT_PREFIX_ENTRIES
+        } else {
+            0
+        })
+}
+
 impl<R: StagedRunner> PipelineEngine<R> {
     /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
-    /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
+    /// `CASCADIA_GLM5_PREFIX_CACHE`, and failing that to whether the runner's
+    /// store is enabled — NOT to zero, which disabled the index for every
+    /// runner not named glm. This
     /// index must stay in lockstep with every rank's `SliceKvCache`, so the
     /// value threaded here is the same one handed to `StageOpts`.
     fn new(
@@ -2924,6 +2952,16 @@ impl<R: StagedRunner> PipelineEngine<R> {
         total: u32,
         prefix_cap: Option<usize>,
     ) -> Self {
+        // An explicit cap from the caller wins; `None` falls back to the env
+        // var, and failing that to whether the runner's store is on at all.
+        // Shadowing the parameter unconditionally here would silently discard
+        // the caller's value.
+        let prefix_cap = prefix_cap.unwrap_or_else(|| {
+            prefix_index_cap(
+                std::env::var("CASCADIA_GLM5_PREFIX_CACHE").ok().as_deref(),
+                runner.prefix_cache_enabled(),
+            )
+        });
         Self {
             runner,
             tokenizer,
@@ -2939,13 +2977,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
             last_rank_rng_seeded: false,
             prefix_index: Vec::new(),
             prefix_next_key: 0,
-            prefix_cap: prefix_cap
-                .or_else(|| {
-                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0),
+            prefix_cap,
             active: None,
         }
     }
@@ -4142,5 +4174,33 @@ mod tests {
             prefill_reply_budget(recv_timeout, Some(ceiling)),
             std::time::Duration::from_secs(600)
         );
+    }
+
+    #[test]
+    fn the_prefix_index_switches_on_with_the_runners_store() {
+        // The bug this pins: the cap defaulted to 0 whatever the runner said, so
+        // a store enabled under a different env name got an index that evicted
+        // every key the instant it was recorded. Indistinguishable from a cache
+        // that only misses, and it cost several full measurement runs to find.
+        assert_eq!(
+            super::prefix_index_cap(None, true),
+            4,
+            "store on, index must hold keys"
+        );
+        assert_eq!(
+            super::prefix_index_cap(None, false),
+            0,
+            "store off, index stays empty"
+        );
+
+        // An explicit override wins either way, including switching it off while
+        // the store is on.
+        assert_eq!(super::prefix_index_cap(Some("16"), false), 16);
+        assert_eq!(super::prefix_index_cap(Some("0"), true), 0);
+        assert_eq!(super::prefix_index_cap(Some(" 8 "), true), 8);
+
+        // Garbage falls back to the store-derived default rather than panicking
+        // or silently disabling the feature.
+        assert_eq!(super::prefix_index_cap(Some("not-a-number"), true), 4);
     }
 }
