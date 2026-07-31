@@ -242,35 +242,36 @@ impl ExpertSource for MmapExperts {
     }
 }
 
-/// Explicit concurrent reads for the routed experts. Off unless asked for.
+/// Explicit concurrent reads for the routed experts, on by default.
 ///
-/// A cold-cache microbenchmark over K3's access pattern (16 scattered 17.6 MB
-/// slices per layer) makes this look like a clear win, useful MB/s:
-///
-/// ```text
-///                  NVMe    rotational
-/// mmap+willneed    2117           141
-/// pread x16        3456           136
-/// ```
-///
-/// The whole model is a cold read there, which is not how decode runs. In
-/// steady state most routed experts are already resident: the mapping then
-/// costs a pointer, while an explicit read still copies the full slice. On the
-/// real model, per-token decode at 62% reuse:
+/// Two runs per side on the real model, same binary, cache dropped identically,
+/// the only difference being this flag:
 ///
 /// ```text
-///                  tok1     steady
-/// mmap            185.9s     152.6s
-/// pread x16       193.1s     193.0s
+///              prefill+tok1   steady decode   3 tokens
+/// mmap             901.5s         143.9s       1045.6s
+/// pread x16        915.7s         131.7s       1047.6s
 /// ```
 ///
-/// Reuse is worth more than queue depth once the working set is warm, so the
-/// mapping is the default. `CASCADIA_K3_READ=1` enables explicit reads for a
-/// cold-cache or high-miss deployment, where the benchmark above applies.
+/// Decode is 8.5% faster, prefill 1.6% slower, and a 3-token run is a wash.
+/// Prefill is paid once and decode is paid per token, so anything generating
+/// more than a handful of tokens comes out ahead. `CASCADIA_K3_READ=0` restores
+/// demand paging.
+///
+/// BOTH PHASES MUST USE THE SAME STRATEGY. An earlier build ran mmap prefill
+/// into pread decode and steady decode cost 193s — 47% worse than either
+/// consistent choice, with the same decode code. Prefill decides what the page
+/// cache holds when decode starts, and mixing the two leaves it in a state that
+/// suits neither. This flag deliberately covers both; a future per-phase split
+/// has to rule that combination out.
+///
+/// A cold-cache microbenchmark on the same access pattern says pread wins 1.63x
+/// on NVMe and loses 3.5% on rotational, but every read there is a miss, which
+/// is not how decode runs — it is a guide to cold fetch only.
 fn explicit_reads_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() != Ok("0"))
 }
 
 /// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.

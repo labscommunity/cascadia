@@ -310,31 +310,30 @@ fetch. Decode is not cold — by the second token most routed experts are alread
 resident, and the strategies stop being equivalent there: the mapping hands back
 a pointer, an explicit read still copies the whole 17.6 MB slice.
 
-**This is not settled. Read the whole section before changing the default.**
-Three runs on the real model, one each, prompt and host identical:
+Measured on the real model, two runs per side, same binary, cache dropped
+identically, this flag the only difference:
 
 ```
-                             prefill+tok1   steady   3 tokens
-A  mmap prefill, pread decode        --*    193.0s    1095.0s
-B  mmap everywhere                 905.1s   147.5s    1052.8s
-C  pread everywhere                914.2s   131.9s    1046.3s
+                  prefill+tok1        steady decode      3 tokens
+mmap        905.1s  897.8s  (901.5)  147.5s 140.3s (143.9)  1045.6s
+pread x16   914.2s  917.2s  (915.7)  131.9s 131.5s (131.7)  1047.6s
 ```
-\* A predates the profiler fix, so its first dump excludes prefill and is not
-comparable.
 
-A vs B says explicit reads cost 26% of steady-state decode. B vs C says they
-*gain* 10.6%. Both cannot be true of the strategy itself, and the difference
-between A and C is only what prefill did — so decode's cost depends on the cache
-state prefill leaves behind, and A is the pathological mix rather than a verdict
-on `pread`.
+Explicit reads are 8.5% faster at steady decode, 1.6% slower at prefill, and a
+wash over three tokens. Prefill is paid once and decode per token, so anything
+generating more than a handful comes out ahead — hence the default. The pread
+pair agrees to 0.3%, the mmap pair spreads 5%.
 
-End to end the three sit within 4.6%, and B vs C within 0.6%, so whatever this
-effect is, it is smaller than the steady-state column alone suggests.
+**Both phases must use the same strategy.** An earlier build ran mmap prefill
+into pread decode and steady decode cost 193.0s — 47% worse than either
+consistent choice, with identical decode code. Prefill decides what the page
+cache holds when decode starts; mixing leaves it suiting neither. One flag covers
+both phases today, and a per-phase split has to rule that combination out.
 
-Demand paging stays the default until a repeat with the same binary on both sides
-says otherwise: the reverted state is the one with a plausible mechanism behind
-it, and reverting on a confounded comparison is cheaper to undo than shipping on
-one. `CASCADIA_K3_READ=1` opts in.
+That mixed build is also where a reported "26% steady-state regression" came
+from: it was compared against an mmap run, so binary and flag both differed, and
+the result was read as a property of `pread`. It took a controlled repeat to
+show the opposite sign. Two variables, one conclusion, wrong.
 
 The first default was set on the cold benchmark alone, which
 is the second time on this model that a microbenchmark predicted the opposite of
@@ -388,7 +387,7 @@ measured impact rather than by how interesting the code is:
 |---|---|---|
 | `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
 | AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
-| explicit concurrent reads | done, **opt-in** (`CASCADIA_K3_READ=1`), verdict unsettled | 1.63x on a cold NVMe benchmark; on the real model one pair says -26% steady-state and another says +10.6%. Needs a same-binary repeat — see the fetch section |
+| explicit concurrent reads | done, **default** (`CASCADIA_K3_READ=0` opts out) | **measured +8.5%** steady-state decode, -1.6% prefill, 2 runs per side. Both phases must use the same strategy — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
 | prefix cache | done, opt-in (`CASCADIA_K3_PREFIX_CACHE=<bytes>`) | skips prefill on a repeated prefix, which is ~129 GB and minutes of it. Byte-bounded LRU over the post-prefill layer states. Not yet measured on the real model |
