@@ -386,6 +386,11 @@ impl StagedRunner for K3Runner {
         }
 
         let nb = blocks_at(self.lo, self.m.attn_res_block_size);
+        // Prefill costs real wall time and streams real bytes. Without this the
+        // byte counters still advance but the clock does not, so the next dump
+        // divides prefill's bytes by decode's time and reports a rate that was
+        // never achieved.
+        let t = std::time::Instant::now();
         forward_slice_batch(
             &mut self.layers,
             &mut self.states,
@@ -396,6 +401,7 @@ impl StagedRunner for K3Runner {
             mb,
             nb,
         );
+        prof::add(prof::WALL, t);
 
         let mut out = vec![0.0f32; rows * self.wire];
         for r in 0..rows {

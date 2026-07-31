@@ -385,6 +385,7 @@ pub fn moe_forward_batch<E: ExpertSource>(
     debug_assert_eq!(xs.len(), rows * d.hidden);
     debug_assert_eq!(outs.len(), rows * d.hidden);
 
+    let _t0 = std::time::Instant::now();
     // gate every row, and down-project every row into the latent
     let mut sel = Vec::with_capacity(rows);
     let mut lat = vec![0.0f32; rows * d.latent];
@@ -410,6 +411,7 @@ pub fn moe_forward_batch<E: ExpertSource>(
         );
     }
 
+    prof::add(prof::ROUTER, _t0);
     for s in &sel {
         prof::record_routing(d.layer, &s.idx, experts.stride());
         residency::record_selection(d.layer, &s.idx);
@@ -433,6 +435,7 @@ pub fn moe_forward_batch<E: ExpertSource>(
         .collect();
     experts.prefetch(&distinct);
 
+    let _t1 = std::time::Instant::now();
     // one pass per distinct expert; stage results at their gate slots
     let mut slots = vec![0.0f32; rows * d.top_k * d.latent];
     let mut eo = vec![0.0f32; d.latent];
@@ -447,6 +450,7 @@ pub fn moe_forward_batch<E: ExpertSource>(
             slots[base..base + d.latent].copy_from_slice(&eo);
         }
     }
+    prof::add(prof::EXPERTS, _t1);
 
     // reduce in gate order, then norm / up-proj / shared per row
     let mut acc = vec![0.0f32; d.latent];
