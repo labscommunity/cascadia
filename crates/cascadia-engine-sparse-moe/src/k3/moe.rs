@@ -127,20 +127,6 @@ impl MmapExperts {
         }
         // SAFETY: the file is opened read-only and the mapping is never written.
         let mmap = unsafe { memmap2::Mmap::map(&f)? };
-        // MADV_RANDOM is OFF by default because it MEASURED AS A NET LOSS.
-        //
-        // It does what it promises — expert read amplification fell from ~4x to
-        // ~1x — but it also kills the readahead *within* each 17.6 MB expert
-        // slice, which is contiguous and wants a large sequential transfer. On
-        // the 7200 RPM host, throughput collapsed 133 -> 23 MB/s: 4x fewer bytes
-        // fetched 5.8x more slowly. MADV_WILLNEED (below, on by default) gets the
-        // byte reduction AND keeps the large transfers, which is why it wins.
-        //
-        // Kept behind `CASCADIA_K3_RANDOM=1` because the trade may invert on a
-        // drive with no seek penalty.
-        if std::env::var("CASCADIA_K3_RANDOM").as_deref() == Ok("1") {
-            crate::k3::residency::advise_random(mmap.as_ptr() as usize, mmap.len());
-        }
         Ok(Self {
             mmap,
             file: f,
@@ -256,18 +242,24 @@ impl ExpertSource for MmapExperts {
     }
 }
 
-/// `CASCADIA_K3_READ=1` swaps the routed-expert fetch from demand paging to
-/// explicit concurrent reads.
+/// Explicit concurrent reads for the routed experts, on by default.
 ///
-/// Off by default: on the rotational host that produced the current numbers,
-/// `MADV_WILLNEED` already lifted throughput 204 -> 1836 MB/s by letting the
-/// drive reorder, and sixteen simultaneous readers may simply thrash the head
-/// instead. On a device with no seek penalty the guaranteed queue depth should
-/// win. That is a measurement, not a guess, so it ships behind a flag.
+/// Measured against `madvise` on both storage classes, useful MB/s over K3's
+/// actual access pattern (16 scattered 17.6 MB slices per layer):
+///
+/// ```text
+///                  NVMe    rotational
+/// mmap+willneed    2117           141
+/// pread x16        3456           136
+/// ```
+///
+/// 1.63x on NVMe, and 3.5% behind on rotational — a large win where the fleet
+/// lives and a rounding error where it does not, so it is the default rather
+/// than a flag. `CASCADIA_K3_READ=0` restores demand paging.
 fn explicit_reads_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() != Ok("0"))
 }
 
 /// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.

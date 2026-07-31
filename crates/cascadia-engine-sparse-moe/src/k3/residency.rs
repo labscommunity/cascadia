@@ -316,36 +316,6 @@ fn page_range(addr: usize, len: usize) -> (usize, usize) {
     (start, end - start)
 }
 
-/// Tell the kernel this mapping is read in random order, disabling readahead.
-///
-/// An expert is a ~17.6 MB contiguous slice, but the 16 experts a layer routes to
-/// are scattered through a ~15.7 GB mapping. Sequential-readahead heuristics see
-/// each slice as the start of a stream and fetch well past its end, so the disk
-/// delivers several times the bytes the model asked for. On the Xeon host a
-/// decode token needed 25.8 GB of expert weights and read ~100 GB — roughly 4x.
-///
-/// `MADV_RANDOM` is 1 on Linux and on the BSDs/macOS. Best-effort: failure just
-/// leaves the default heuristics in place.
-pub fn advise_random(addr: usize, len: usize) -> bool {
-    #[cfg(unix)]
-    {
-        use core::ffi::c_void;
-        const MADV_RANDOM: i32 = 1;
-        extern "C" {
-            fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
-        }
-        let (a, l) = page_range(addr, len);
-        // SAFETY: [a, a+l) covers the caller's live mapping, rounded out to whole
-        // pages. madvise only changes kernel readahead policy; it never writes.
-        unsafe { madvise(a as *mut c_void, l, MADV_RANDOM) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (addr, len);
-        false
-    }
-}
-
 /// Queue a read of `[addr, addr+len)` and return without waiting for it.
 ///
 /// The expert loop is serial — read one expert, compute it, read the next — so
@@ -452,16 +422,6 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod advise_tests {
-    use super::advise_random;
-
-    #[test]
-    fn advise_random_succeeds_on_a_real_mapping() {
-        // a private anonymous mapping is enough to exercise the syscall path
-        let len = 1 << 20;
-        let mut v = vec![0u8; len];
-        let addr = v.as_mut_ptr() as usize;
-        assert!(advise_random(addr, len), "madvise(MADV_RANDOM) failed");
-    }
 
     #[test]
     fn mem_available_never_reports_zero() {
@@ -549,13 +509,6 @@ mod advise_tests {
             super::advise_willneed(base + 3, len - 8),
             "unaligned WILLNEED must still be applied"
         );
-        assert!(super::advise_random(base + 1, len - 8));
-    }
-
-    #[test]
-    fn advise_random_reports_failure_on_a_bad_range() {
-        // length 0 at a bogus address must not panic; it just reports false/true
-        // without touching memory. The point is that it never aborts the run.
-        let _ = advise_random(0, 0);
+        assert!(super::advise_willneed(base + 1, len - 8));
     }
 }

@@ -272,6 +272,29 @@ shell validated against a Python CPU reference, not OpenVINO-traced graphs.
 
 The export and first-token bring-up are done — see the measured run above.
 
+### How the routed experts are fetched
+
+Three strategies over K3's real access pattern — 16 scattered 17.6 MB slices per
+layer — with the page cache dropped between runs. Useful MB/s counts only bytes
+the model asked for, so over-fetching is penalised:
+
+```
+                  NVMe    rotational
+mmap+willneed     2117           141
+mmap+random        112            75
+pread x16         3456           136
+```
+
+Explicit concurrent `pread` is the default: a large win on NVMe, which is what
+the fleet and any production node use, and within noise of `madvise` on spinning
+disk. `CASCADIA_K3_READ=0` restores demand paging.
+
+`MADV_RANDOM` was removed rather than kept behind a flag. It did what it claimed
+— read amplification fell ~4x to ~1x — but it loses on *both* storage classes,
+by 19x on NVMe and 1.9x on rotational, because it suppresses readahead *within*
+each contiguous slice. It was briefly the default, which cost 5.8x on the
+rotational host until it was measured. Kept in git history, not in the code.
+
 ### Devices: CPU, iGPU, NPU — measured, not assumed
 
 Benchmarked on a Core Ultra 7 258V AI-PC (Arc 140V iGPU, AI Boost NPU) with a 4-bit
@@ -313,7 +336,8 @@ measured impact rather than by how interesting the code is:
 |---|---|---|
 | `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: prefill+tok1 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
 | AVX2 fp4 expert kernel | done | **measured 1.79x** at real dims on x86 |
-| `madvise(MADV_RANDOM)` | **off by default** | cut amplification 4x -> 1x but killed intra-slice readahead: 133 -> 23 MB/s, a net loss on rotational disk. `CASCADIA_K3_RANDOM=1` to re-test on NVMe, where the seek penalty that sank it does not exist |
+| explicit concurrent reads | done, **default** | measured 1.63x over `madvise` on NVMe, -3.5% on rotational |
+| `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised | prior art finds static hot-set pinning helps cold start and loses in steady state; measure before investing |
 | prefix cache | trait defaults, not implemented | a repeated prompt re-pays ~129 GB of prefill |
 | lane-lazy expert reads | research | `w1` must be read to build the mask, but skipped lanes make `w3` rows and `w2` columns dead — up to ~1/3 of an expert |
