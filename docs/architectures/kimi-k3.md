@@ -170,7 +170,7 @@ load                        1010.8 s       1088.7 s      unchanged control
 tok 1 forward                768.5 s        182.6 s      4.22x, EXCLUDES prefill
 decode, steady state         737.8 s        148.6 s      4.96x
 per token, end to end       1278.3 s        363.0 s      3.52x
-experts, share of wall           99%            46%
+experts, share of wall           99%            46%      same strategy both sides
 eff                        204 MB/s      1836 MB/s      both overstated ~5x
 page-cache hit                 4.7%           4.8%
 routed                     154.98 GB      154.98 GB      identical work

@@ -17,6 +17,14 @@
 //! Usage: `CASCADIA_K3_PROFILE=1 cascadia worker …` → cumulative `K3_PROF …`
 //! lines on stderr, one per forwarded token. In a pipeline each rank profiles
 //! its OWN layer slice, so read the split per rank.
+//!
+//! COMPARING RUNS: only `WALL` is comparable across fetch strategies. The bucket
+//! shares are not, because the strategies bill their I/O to different places —
+//! an explicit read blocks inside the expert loop and lands in `experts`, while
+//! a demand-paged fault can be taken by any later code that touches the mapping,
+//! outside every bucket. The same run measured both ways put `experts` at 79%
+//! and 56% of an identical total. A bucket share that moved between two configs
+//! is evidence about attribution, not about work.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
