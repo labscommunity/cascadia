@@ -114,7 +114,9 @@ pub fn append_resume_ids(prompt_ids: &mut Vec<i64>, resume: Option<&[i32]>) {
 /// turn: makes `generated.len() >= max_tokens` bound total = prefix + new, and
 /// makes tail tokens decode WITH the prefix as context. Empty for a normal turn.
 pub fn resume_generated_seed(resume: Option<&[i32]>) -> Vec<i64> {
-    resume.map(|r| r.iter().map(|&t| t as i64).collect()).unwrap_or_default()
+    resume
+        .map(|r| r.iter().map(|&t| t as i64).collect())
+        .unwrap_or_default()
 }
 
 impl GenerationTask {

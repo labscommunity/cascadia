@@ -1223,7 +1223,10 @@ impl Qwen36Engine {
             // prefill below carries them as context. No-op when not resuming.
             {
                 let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
-                cascadia_types::append_resume_ids(&mut prompt_ids_i64, task.resume_token_ids.as_deref());
+                cascadia_types::append_resume_ids(
+                    &mut prompt_ids_i64,
+                    task.resume_token_ids.as_deref(),
+                );
                 prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
             }
             // An empty prompt leaves next_token None through prefill and would
@@ -1923,7 +1926,10 @@ impl Qwen36Engine {
             // prefill below carries them as context. No-op when not resuming.
             {
                 let mut prompt_ids_i64: Vec<i64> = prompt_ids.iter().map(|&u| u as i64).collect();
-                cascadia_types::append_resume_ids(&mut prompt_ids_i64, task.resume_token_ids.as_deref());
+                cascadia_types::append_resume_ids(
+                    &mut prompt_ids_i64,
+                    task.resume_token_ids.as_deref(),
+                );
                 prompt_ids = prompt_ids_i64.into_iter().map(|t| t as u32).collect();
             }
             // An empty prompt leaves logits empty and would fabricate token 0

@@ -1306,6 +1306,7 @@ struct ActiveSpec {
     /// not resuming). Unconditional (not `kv_coord`-gated) so both builds see
     /// the same `ActiveSpec` layout; used to keep the kv-capture key from
     /// double-counting the resume ids (they're already in `prompt_ids`).
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))]
     resume_seed_len: usize,
     /// Cumulative byte-length of the detokenized text emitted so far.
     /// Used to compute the streaming delta on each step.
