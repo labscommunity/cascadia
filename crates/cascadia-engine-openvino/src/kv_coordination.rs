@@ -729,6 +729,9 @@ impl OvKvCache {
 /// same-chain turn whose tail had no CAPTURE under the donor epoch still warmed the head —
 /// head-warm/tail-cold, a silent corrupt serve.
 ///
+/// Only for engines whose plane ranks still arm out-of-band (qwen36; ov-runtime arms in-band from its
+/// `OPCODE_RESTORE` handler, so it takes `down` unmasked). Delete this with issue-34 Task 2.3.
+///
 /// Residual (accepted): the mark rides a CONTENT-keyed entry, not a request. A later prompt starting
 /// with an earlier plane-armed prefix consumes that entry and inherits the override. Closing it needs
 /// a request id carried across the node/engine boundary, which cannot be verified off-rig.
@@ -966,6 +969,11 @@ struct MailboxInner {
     /// NOT mean applied: a taken-then-rejected slice records here too.
     drained: Option<u64>,
     too_late: u64,
+    /// Drains that found the mailbox empty, and whether a slice has ever landed here at all. Together
+    /// they separate the ordinary no-plane-slice drain from the engine running ahead of the commit —
+    /// the race that was otherwise diagnosable only by inference across two runs.
+    empty_drains: u64,
+    ever_parked: bool,
 }
 
 impl KvHandoffMailbox {
@@ -983,19 +991,29 @@ impl KvHandoffMailbox {
     /// position, and an older one would only be rejected by the apply-site depth guard anyway.
     pub fn put(&self, epoch: u64, manifest: Manifest, payloads: Vec<(Vec<u8>, Vec<u8>)>) {
         let n_payloads = payloads.len();
-        self.lock().slot = Some(KvHandoffSlot {
+        let mut g = self.lock();
+        g.ever_parked = true;
+        g.slot = Some(KvHandoffSlot {
             epoch,
             manifest,
             payloads,
         });
+        drop(g);
         tracing::info!(target: "cascadia::kv", event = "kv_handoff_put", epoch, n_payloads);
     }
 
     pub fn take(&self) -> Option<KvHandoffSlot> {
         let mut g = self.lock();
         let slot = g.slot.take();
-        if let Some(s) = &slot {
-            g.drained = Some(s.epoch);
+        match &slot {
+            Some(s) => g.drained = Some(s.epoch),
+            None => {
+                g.empty_drains += 1;
+                // DEBUG, not WARN: an empty drain is the normal case on any rank the plane never
+                // feeds, so this scales with turns. `ever_parked` is the bit worth grepping.
+                tracing::debug!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
+                    count = g.empty_drains, ever_parked = g.ever_parked);
+            }
         }
         slot
     }
@@ -1036,6 +1054,17 @@ impl KvHandoffMailbox {
     /// slice the drain then rejected leaves that rank cold and is counted here anyway.
     pub fn aborts_too_late(&self) -> u64 {
         self.lock().too_late
+    }
+
+    /// Drains that found nothing parked. Read with [`Self::ever_parked`].
+    pub fn empty_drains(&self) -> u64 {
+        self.lock().empty_drains
+    }
+
+    /// Whether any slice has ever been parked here. An empty drain with this `true` is the engine
+    /// running ahead of the plane's commit; with it `false` the rank simply has no plane traffic.
+    pub fn ever_parked(&self) -> bool {
+        self.lock().ever_parked
     }
 }
 
@@ -1492,6 +1521,33 @@ mod tests {
         assert!(mb.discard_any());
         assert!(!mb.clear(0xEC));
         assert_eq!(mb.aborts_too_late(), 0);
+    }
+
+    /// The drain's only fully silent exit, and the one that hid the commit/drain race for two runs.
+    /// `ever_parked` is the discriminator: an empty drain on a mailbox that has never held a slice is
+    /// the ordinary no-plane-turn case, while one on a mailbox that has is the engine running ahead of
+    /// the commit.
+    #[test]
+    fn an_empty_drain_is_counted_and_says_whether_a_slice_ever_landed() {
+        let mb = KvHandoffMailbox::new();
+        assert!(mb.take().is_none());
+        assert_eq!(mb.empty_drains(), 1);
+        assert!(!mb.ever_parked(), "nothing ever parked ⇒ not the race");
+
+        park(&mb, 0xED);
+        assert!(mb.take().is_some());
+        assert_eq!(
+            mb.empty_drains(),
+            1,
+            "a drain that found a slice is not empty"
+        );
+
+        assert!(mb.take().is_none());
+        assert_eq!(mb.empty_drains(), 2);
+        assert!(
+            mb.ever_parked(),
+            "a slice has landed here ⇒ the race signature"
+        );
     }
 
     const DECISION_FP: u64 = 0xF00D;

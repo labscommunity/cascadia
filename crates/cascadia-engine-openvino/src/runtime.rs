@@ -1488,18 +1488,18 @@ pub struct OvRuntimeEngine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
-    /// Issue-34 plane warm-resume: mailbox the plane's commit parks a pulled slice in. Drained inside
-    /// `recv_hidden_from_upstream` — its lock is independent of the engine lock, which is what lets the
-    /// commit path deposit while this engine is mid-`step()`.
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks a pulled slice in. Drained from the
+    /// `OPCODE_RESTORE` arm — its lock is independent of the engine lock, which is what lets the commit
+    /// path deposit while this engine is mid-`step()`.
     #[cfg(feature = "kv_coord")]
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     /// Issue-34 consume: set by a `RESTORE` control frame; suppresses the next prefill's implicit
     /// `reset_state` (this worker's KV is already warm). Cleared by that prefill or by `ABORT`.
     #[cfg(feature = "kv_coord")]
     kv_warm_pending: bool,
-    /// Issue-34 plane-restore MODE: downstream ranks warm-resume out-of-band over the KV plane, so a
-    /// `false` chain verdict is advisory. Read once from `CASCADIA_KV_PLANE_RESTORE` at build; the
-    /// per-turn scoping is in `kv_coordination::chain_verdict`.
+    /// Issue-34 plane-restore MODE, read once from `CASCADIA_KV_PLANE_RESTORE` at build. Since the
+    /// plane arm moved in-band (`drain_kv_handoff` under `OPCODE_RESTORE`) the chain verdict is binding
+    /// in both modes, so this only labels the mode in the warm-resume logs the cert greps.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
 }
@@ -1985,7 +1985,7 @@ impl OvRuntimeEngine {
         // and the bounded token deadline lives on the active wait downstream.
         //
         // A stateful KV worker may also receive a bare I8 control frame (CAPTURE)
-        // between turns. It carries no seq and no hidden follows it, so the lead
+        // between turns. It carries no seq and no hidden follows it, so the first frame
         // is recv'd on its own here rather than through `recv_hidden_frames`:
         // I8 => handle the control and loop to the next activation.
         let want_pos = self.static_kv.is_some();
@@ -1998,7 +1998,7 @@ impl OvRuntimeEngine {
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
-            let lead = self
+            let first = self
                 .block_on(async move {
                     let mut guard = upstream.lock().await;
                     Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
@@ -2006,18 +2006,11 @@ impl OvRuntimeEngine {
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
             info!(dtype = ?first.dtype, len = first.data.len(), want_pos, "ov_tail_upstream_frame_recv");
             #[cfg(feature = "kv_coord")]
-            if !want_pos && lead.dtype == WireDType::I8 {
-                self.handle_inbound_control(&lead)?;
+            if !want_pos && first.dtype == WireDType::I8 {
+                self.handle_inbound_control(&first)?;
                 continue;
             }
-            // Same instant the chain path's `OPCODE_RESTORE` arm applies its carried blob — the
-            // ordering that is already certified byte-identical — but for a slice that arrived over
-            // the plane instead of the chain. See `drain_kv_handoff`.
-            #[cfg(feature = "kv_coord")]
-            if !want_pos {
-                self.drain_kv_handoff();
-            }
-            // `lead` is an activation lead frame: the hidden it promises is a
+            // `first` is an activation lead frame: the hidden it promises is a
             // mid-group frame the peer owes promptly, so it is deadlined.
             let upstream = self
                 .upstream
@@ -2033,7 +2026,7 @@ impl OvRuntimeEngine {
             // Record the seq this stage must echo back on the token it sends
             // upstream; decode/validate outside the transport closure so a bad
             // frame yields a clear EngineError, not a desync.
-            let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+            let (inbound_seq, position) = decode_wire_lead(&first, want_pos)?;
             self.inbound_seq = Some(inbound_seq);
             let shape = [
                 tensor.shape[0] as usize,
@@ -2110,7 +2103,6 @@ impl OvRuntimeEngine {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).
                             // Any rank short ⇒ ABORT everyone + cold (never a partial/corrupt warm).
-                            // `plane_restore` does not suppress the RESTORE itself — only its verdict.
                             // Dropping the frame skipped the SAME-CHAIN restore too (where no plane pull
                             // ever armed the downstream ranks), leaving head-warm/tail-cold with no
                             // verdict and no fallback; it also starved the downstream `peer_epoch`.
@@ -2125,12 +2117,11 @@ impl OvRuntimeEngine {
                             );
                             let chain_ok = !multi || {
                                 let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
-                                let down = matches!(self.send_restore_downstream(epoch), Ok(true));
-                                let ok = crate::kv_coordination::chain_verdict(
-                                    down,
-                                    self.plane_restore,
-                                    plane_pulled,
-                                );
+                                // Binding in BOTH modes: a plane rank now arms in-band, inside its own
+                                // `OPCODE_RESTORE` handler, so a `false` here means it really is cold.
+                                // The old `chain_verdict` override existed for the out-of-band arm and
+                                // would now mask exactly that.
+                                let ok = matches!(self.send_restore_downstream(epoch), Ok(true));
                                 if !ok {
                                     let _ = self.send_abort_downstream();
                                 }
@@ -3848,18 +3839,23 @@ impl OvRuntimeEngine {
         self.kv_warm_pending = false;
         self.position = 0;
     }
-    /// Drain the plane hand-off mailbox and apply the parked slice, if any.
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any. `true` ⇒ this rank is now
+    /// armed warm, which is what makes the `RESTORE` verdict truthful in plane mode.
     ///
-    /// Applied from inside the recv loop, not from the node's relay loop: the relay only iterates once
-    /// `step()` has returned, by which point this rank has already cold-prefilled the whole turn and
-    /// zeroed `position`, so a `set_state` there snaps the state backwards mid-turn and the output
-    /// diverges. Here the arm lands before the forward, so `kv_consume_warm_pending()` sees it and the
-    /// prefill skips its implicit `reset_state`.
+    /// Called from the `OPCODE_RESTORE` arm, not from the node's relay loop: the relay only iterates
+    /// once `step()` has returned, by which point this rank has already cold-prefilled the whole turn
+    /// and zeroed `position`, so a `set_state` there snaps the state backwards mid-turn and the output
+    /// diverges. RESTORE lands before the turn's forward, so `kv_consume_warm_pending()` sees the arm
+    /// and the prefill skips its implicit `reset_state`.
+    ///
+    /// It is also the only call site on the SAME stream as the commit that parks the slice. Driving it
+    /// off the activation stream instead left the two unordered: at a short warm prefix the drain
+    /// routinely ran first and the slice sat parked forever — rank cold under a warm head.
     #[cfg(feature = "kv_coord")]
-    pub(crate) fn drain_kv_handoff(&mut self) {
+    pub(crate) fn drain_kv_handoff(&mut self) -> bool {
         use crate::kv_coordination::HandoffReject;
         let Some(slot) = self.kv_handoff.take() else {
-            return;
+            return false;
         };
         let fp = self.kv_model_fingerprint();
         let blob = match crate::kv_coordination::handoff_decision(&slot, fp, self.position) {
@@ -3867,27 +3863,29 @@ impl OvRuntimeEngine {
             Err(HandoffReject::Validate) => {
                 warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
                     epoch = slot.epoch, rev = crate::kv_coordination::KV_ENGINE_REV, fp);
-                return;
+                return false;
             }
             Err(HandoffReject::Decode) => {
                 warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
-                return;
+                return false;
             }
             Err(HandoffReject::TooLate(depth)) => {
                 warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
                     epoch = slot.epoch, position = self.position, depth);
-                return;
+                return false;
             }
         };
         if self.apply_warm_resume_blob(&blob) {
             info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
                 epoch = slot.epoch, position = self.position,
                 blob_digest = crate::kv_coordination::byte_digest(&blob));
+            true
         } else {
             // set_state failed ⇒ this rank stays cold on a turn the commit path armed as warm, and
             // nothing on this side can undo that. The arm exists to make the failure greppable.
             warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
                 epoch = slot.epoch, position = self.position);
+            false
         }
     }
 
@@ -4319,6 +4317,11 @@ impl OvRuntimeEngine {
                         None => false,
                     }
                 };
+                // Plane mode parks this rank's slice in the mailbox instead of carrying it on the
+                // RESTORE, so without this the arm above has nothing to restore from and reports a
+                // structurally false verdict. Draining here also puts the apply on the same stream as
+                // the commit that parked it.
+                let local_ok = local_ok || self.drain_kv_handoff();
                 let down_ok = if self.spec.is_last_stage {
                     true
                 } else {

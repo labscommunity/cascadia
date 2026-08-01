@@ -2256,7 +2256,7 @@ impl Runner {
         if let Some(c) = cache.as_mut() {
             if c.enabled() {
                 let fingerprint = fp.insert(self.fingerprint());
-                if let Some(snap) = c.lookup(prompt_ids, fingerprint) {
+                if let Some((snap, _)) = c.lookup(prompt_ids, fingerprint) {
                     // Restore into the runner's KV buffers. The
                     // restore validates shape against fingerprint;
                     // a failure here means cache + runner disagree on

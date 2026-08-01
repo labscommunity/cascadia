@@ -893,7 +893,7 @@ impl OvMoeRunner {
         if let Some(c) = cache.as_mut() {
             if c.enabled() {
                 let fingerprint = fp.insert(self.fingerprint());
-                if let Some(snap) = c.lookup(&prompt64, fingerprint) {
+                if let Some((snap, _)) = c.lookup(&prompt64, fingerprint) {
                     cache_skip = snap.past_seq_len;
                     self.restore_kv(&snap)?;
                     cache_hit = true;
