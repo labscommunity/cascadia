@@ -27,17 +27,28 @@ use cascadia_engine_sparse_moe::k3::stage::K3Runner;
 use cascadia_engine_sparse_moe::sampling::SamplingConfig;
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 
+/// The tiny export, or `None` with a visible skip.
+///
+/// A skipped test reports `ok`, so an absent fixture reads exactly like a
+/// passing suite. Every test in this file needs the fixture, so on a host
+/// without it this whole file is silently vacuous — including the positive
+/// control, which is the one that would catch an inert cache.
+/// `CASCADIA_REQUIRE_FIXTURES=1` makes that a failure instead.
 fn export_dir() -> Option<PathBuf> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi_k3_export");
     if p.exists() {
-        Some(p)
-    } else {
-        eprintln!(
-            "SKIP: {} absent (run tools/export_kimi_k3.py --tiny)",
-            p.display()
-        );
-        None
+        return Some(p);
     }
+    let msg = format!(
+        "{} absent (run tools/export_kimi_k3.py --tiny <that path>)",
+        p.display()
+    );
+    assert!(
+        std::env::var("CASCADIA_REQUIRE_FIXTURES").as_deref() != Ok("1"),
+        "CASCADIA_REQUIRE_FIXTURES=1 but {msg}"
+    );
+    eprintln!("SKIP: {msg}");
+    None
 }
 
 /// `PrefixStore` reads its budget when the runner is built, so the env has to be

@@ -10,7 +10,7 @@
 //!
 //!   cargo run --release --example nvme_readbench -- <dir-of-bins-on-nvme> [K=8] [tokens=16]
 //!
-//! (Linux; uses std::os::unix::fs::FileExt::read_at.)
+//! Runs on Linux and Windows; the positioned read is behind a small shim.
 
 // `read_at` is the point of the B) phase and is unix-only, so the bench only
 // exists there. The fleet is Windows, where `--all-targets` builds every
@@ -25,9 +25,6 @@ fn main() {
 
 #[cfg(unix)]
 use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::time::Instant;
@@ -37,7 +34,33 @@ use memmap2::Mmap;
 #[cfg(unix)]
 use rayon::prelude::*;
 
-#[cfg(unix)]
+/// Positioned read, on both targets.
+///
+/// `FileExt` exists under `std::os::unix` and `std::os::windows` with different
+/// method names and semantics, so this example used to be Unix-only — which meant
+/// `cargo test -p cascadia-engine-sparse-moe` could not complete on the Windows
+/// AI-PCs this benchmark is FOR.
+fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_at(buf, off)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        f.seek_read(buf, off)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (f, buf, off);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no positioned read on this target",
+        ))
+    }
+}
+
 fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read dir")
@@ -84,7 +107,12 @@ fn main() {
         bins.len(),
         total_gb
     );
-    println!("[readbench] NOTE: drop caches before each phase — `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`");
+    #[cfg(unix)]
+    println!(
+        "[readbench] NOTE: drop caches first — `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`"
+    );
+    #[cfg(windows)]
+    println!("[readbench] NOTE: Windows has no drop_caches; point this at a bin set larger than RAM or the numbers are page-cache hits");
 
     // Reproducible per-token expert picks (same for both phases).
     let mut st = 0x1234_5678_9abc_def0u64;
@@ -147,7 +175,7 @@ fn main() {
                     let mut buf = vec![0u8; len];
                     let mut off = 0usize;
                     while off < len {
-                        let n = f.read_at(&mut buf[off..], off as u64).unwrap();
+                        let n = read_at(&f, &mut buf[off..], off as u64).unwrap();
                         if n == 0 {
                             break;
                         }

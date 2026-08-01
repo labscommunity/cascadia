@@ -14,17 +14,34 @@ use std::path::{Path, PathBuf};
 use cascadia_engine_sparse_moe::k3::stage::K3Runner;
 use cascadia_engine_sparse_moe::staged::StagedRunner;
 
-fn export_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi_k3_export");
+/// A fixture directory, or `None` with a visible skip.
+///
+/// A skipped test reports `ok`, so an absent fixture is indistinguishable from a
+/// passing suite in the summary line — which is how a broken default survived
+/// several "green" runs on hosts that never had the fixture generated.
+/// `CASCADIA_REQUIRE_FIXTURES=1` turns the skip into a failure, so a gate can
+/// demand real coverage while a bare `cargo test` on a fresh clone still works.
+fn fixture_dir(name: &str, hint: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     if p.exists() {
-        Some(p)
-    } else {
-        eprintln!(
-            "SKIP: {} absent (run tools/export_kimi_k3.py --tiny)",
-            p.display()
-        );
-        None
+        return Some(p);
     }
+    let msg = format!("{} absent ({hint})", p.display());
+    assert!(
+        std::env::var("CASCADIA_REQUIRE_FIXTURES").as_deref() != Ok("1"),
+        "CASCADIA_REQUIRE_FIXTURES=1 but {msg}"
+    );
+    eprintln!("SKIP: {msg}");
+    None
+}
+
+fn export_dir() -> Option<PathBuf> {
+    fixture_dir(
+        "kimi_k3_export",
+        "run tools/export_kimi_k3.py --tiny <that path>",
+    )
 }
 
 /// Drive `total` ranks over one prompt, relaying the wire rank to rank.
@@ -171,15 +188,9 @@ fn generation_matches_across_single_and_split_sources() {
     // are symlinked across several filesystems. Covers the full generate path,
     // not just a single forward: state is carried across tokens.
     let Some(plain) = export_dir() else { return };
-    let split =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi_k3_export_split");
-    if !split.exists() {
-        eprintln!(
-            "SKIP: {} absent (run --tiny with --expert-roots)",
-            split.display()
-        );
+    let Some(split) = fixture_dir("kimi_k3_export_split", "run --tiny with --expert-roots") else {
         return;
-    }
+    };
     // guard: the split fixture must really be symlinked, or this proves nothing
     let l = split.join("experts/layer_01.bin");
     assert!(
@@ -219,12 +230,23 @@ fn prefix_restore_plus_suffix_matches_full_prefill() {
     // Asserted here rather than in its own test: the setting is an env var, and
     // cargo runs tests in the same process in parallel, so a sibling test that
     // sets it would race this one.
-    std::env::remove_var("CASCADIA_K3_PREFIX_CACHE");
+    //
+    // The cache is now budgeted from free RAM when the var is unset, so "no var"
+    // means ON, not off. `=0` is the way to turn it off, and that is what has to
+    // hold — otherwise there is no way to take the cache out of a run.
+    std::env::set_var("CASCADIA_K3_PREFIX_CACHE", "0");
     assert!(
         !K3Runner::load(&dir, 0, 1, 64)
             .expect("load")
             .prefix_cache_enabled(),
-        "cache must be off unless a byte budget is set"
+        "an explicit 0 must disable the cache"
+    );
+    std::env::remove_var("CASCADIA_K3_PREFIX_CACHE");
+    assert!(
+        K3Runner::load(&dir, 0, 1, 64)
+            .expect("load")
+            .prefix_cache_enabled(),
+        "with no budget set the cache derives one from free RAM"
     );
 
     std::env::set_var("CASCADIA_K3_PREFIX_CACHE", "268435456"); // 256 MiB
