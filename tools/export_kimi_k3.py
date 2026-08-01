@@ -636,9 +636,15 @@ def plan_expert_roots(out: Path, roots: list, cfg: dict, reserve: int = 0) -> di
     import shutil
     # a LAYER's bin holds every expert, not one — expert_bin_bytes is per expert
     per = build_manifest(cfg)["expert_bin_bytes"] * cfg["num_experts"]
-    headroom = 40 * 1024**3
     moe = [li for li in range(cfg["num_hidden_layers"])
            if li >= cfg["first_k_dense_replace"]]
+    # Safety margin, scaled to what is actually being written. A flat 40 GB is
+    # right for the real export but absurd for --tiny, whose whole expert set is
+    # under a megabyte: it made `--tiny --expert-roots` impossible on any machine
+    # with less than 40 GB free, which is why the split-source fixture could not
+    # be generated on smaller hosts. A quarter of the payload, clamped, keeps the
+    # real export at 40 GB and lets a tiny one through.
+    headroom = min(40 * 1024**3, max(64 * 1024**2, per * len(moe) // 4))
 
     # Budget per FILESYSTEM, not per directory: two roots on the same mount share
     # one pool of free space, and summing disk_usage() per root would promise
