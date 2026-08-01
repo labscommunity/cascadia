@@ -308,7 +308,7 @@ impl KvCoordination for SparseMoEEngine {
         }
         let fp = self.runner.fingerprint();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let snap = self.kv_prefix_cache.lookup(&prompt, &fp)?;
+        let (snap, _) = self.kv_prefix_cache.lookup(&prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
@@ -376,8 +376,8 @@ impl KvCoordination for SparseMoEEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prefix
-            .insert(prefix.clone(), &fp, snap.clone());
-        self.kv_prefix_cache.insert(prefix, &fp, snap);
+            .insert_pulled(prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache.insert_pulled(prefix, &fp, snap);
         Ok(())
     }
 
@@ -449,7 +449,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         // is read — a simultaneous field split isn't possible through the mutex guard's Deref.
         let fp = g.fp.clone();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let snap = g.prefix.lookup(&prompt, &fp)?;
+        let (snap, _) = g.prefix.lookup(&prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);

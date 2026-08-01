@@ -178,6 +178,9 @@ struct CacheKey {
 struct Entry {
     prefix: Vec<i64>,
     snapshot: KvSnapshot,
+    /// Pulled over the KV plane (`insert_pulled`) rather than captured from this rank's own turn.
+    /// Read back by [`KvPrefixCache::lookup`] so a cert bar can tell the two apart.
+    plane_pulled: bool,
 }
 
 /// LRU KV-prefix cache.
@@ -244,7 +247,7 @@ impl KvPrefixCache {
     }
 
     /// Look up the longest cached prefix that matches the start of
-    /// `prompt`. Returns `Some((matched_len, snapshot))` for the
+    /// `prompt`. Returns `Some((snapshot, plane_pulled))` for the
     /// best match, `None` if nothing matches.
     ///
     /// "Best" = longest prefix length. We scan every entry and pick
@@ -254,7 +257,11 @@ impl KvPrefixCache {
     /// Side effect: on a hit, the matched entry is moved to MRU
     /// position (front of the deque) so it survives the next eviction.
     /// `hits`/`misses` counters are bumped accordingly.
-    pub fn lookup(&mut self, prompt: &[i64], fingerprint: &ModelFingerprint) -> Option<KvSnapshot> {
+    pub fn lookup(
+        &mut self,
+        prompt: &[i64],
+        fingerprint: &ModelFingerprint,
+    ) -> Option<(KvSnapshot, bool)> {
         if !self.enabled() {
             return None;
         }
@@ -293,9 +300,9 @@ impl KvPrefixCache {
                     .entries
                     .remove(i)
                     .expect("index from enumerate must be valid");
-                let snapshot = entry.1.snapshot.clone();
+                let hit = (entry.1.snapshot.clone(), entry.1.plane_pulled);
                 self.entries.push_front(entry);
-                Some(snapshot)
+                Some(hit)
             }
         }
     }
@@ -306,11 +313,35 @@ impl KvPrefixCache {
     ///
     /// Returns the number of evicted entries (0 in the steady state
     /// once the cache is full and we replace rather than grow).
+    ///
+    /// Local capture — this rank's own turn. Cross-chain consumer-inserts
+    /// go through [`Self::insert_pulled`].
     pub fn insert(
         &mut self,
         prefix: Vec<i64>,
         fingerprint: &ModelFingerprint,
         snapshot: KvSnapshot,
+    ) -> usize {
+        self.store(prefix, fingerprint, snapshot, false)
+    }
+
+    /// As [`Self::insert`], but marks the entry as pulled over the KV plane so a later
+    /// warm resume off it is attributable to the cross-chain pull, not to a local capture.
+    pub fn insert_pulled(
+        &mut self,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: KvSnapshot,
+    ) -> usize {
+        self.store(prefix, fingerprint, snapshot, true)
+    }
+
+    fn store(
+        &mut self,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: KvSnapshot,
+        plane_pulled: bool,
     ) -> usize {
         if !self.enabled() {
             return 0;
@@ -337,7 +368,14 @@ impl KvPrefixCache {
             evicted += 1;
         }
         self.evictions += evicted as u64;
-        self.entries.push_front((key, Entry { prefix, snapshot }));
+        self.entries.push_front((
+            key,
+            Entry {
+                prefix,
+                snapshot,
+                plane_pulled,
+            },
+        ));
         self.inserts += 1;
         evicted
     }
@@ -464,7 +502,7 @@ mod tests {
         let mut c = KvPrefixCache::new(4);
         let snap = mk_snapshot(3, 7);
         c.insert(vec![10, 20, 30], &fp_a(), snap.clone());
-        let got = c
+        let (got, _) = c
             .lookup(&[10, 20, 30, 40, 50], &fp_a())
             .expect("hit expected");
         // Byte-identical restore: this is the load-bearing test the
@@ -493,7 +531,7 @@ mod tests {
         let mut c = KvPrefixCache::new(4);
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.insert(vec![1, 2, 3, 4, 5], &fp_a(), mk_snapshot(5, 2));
-        let got = c.lookup(&[1, 2, 3, 4, 5, 6], &fp_a()).expect("hit");
+        let (got, _) = c.lookup(&[1, 2, 3, 4, 5, 6], &fp_a()).expect("hit");
         assert_eq!(got.past_seq_len, 5);
     }
 
@@ -566,13 +604,39 @@ mod tests {
     }
 
     #[test]
+    fn lookup_reports_entry_provenance() {
+        let mut c = KvPrefixCache::new(4);
+        c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
+        let (_, pulled) = c.lookup(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        assert!(!pulled, "locally captured");
+        c.insert_pulled(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 2));
+        let (_, pulled) = c.lookup(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        assert!(pulled, "consumer-inserted over the plane");
+    }
+
+    /// LRU must fail safe: once the pulled entry is evicted, the local entry that still
+    /// matches carries its own mark, so a plane assertion can't green off a local capture.
+    #[test]
+    fn evicting_a_pulled_entry_leaves_a_local_mark() {
+        let mut c = KvPrefixCache::new(2);
+        c.insert_pulled(vec![1, 1, 1], &fp_a(), mk_snapshot(3, 1));
+        c.insert(vec![2, 2, 2], &fp_a(), mk_snapshot(3, 2));
+        c.insert(vec![3, 3, 3], &fp_a(), mk_snapshot(3, 3));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.evictions, 1);
+        assert!(c.lookup(&[1, 1, 1, 9], &fp_a()).is_none(), "pulled was LRU");
+        let (_, pulled) = c.lookup(&[2, 2, 2, 9], &fp_a()).expect("hit");
+        assert!(!pulled);
+    }
+
+    #[test]
     fn insert_same_key_replaces_in_place() {
         // Calling insert twice with the same key shouldn't grow the cache.
         let mut c = KvPrefixCache::new(4);
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 1));
         c.insert(vec![1, 2, 3], &fp_a(), mk_snapshot(3, 9));
         assert_eq!(c.len(), 1);
-        let got = c.lookup(&[1, 2, 3, 4], &fp_a()).expect("hit");
+        let (got, _) = c.lookup(&[1, 2, 3, 4], &fp_a()).expect("hit");
         // Second insert wins — value should be 9, not 1.
         assert_eq!(got.layer0.as_ref().unwrap().past_k[0], 9);
     }

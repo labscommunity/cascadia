@@ -1483,7 +1483,7 @@ impl SparseMoEEngine {
         let warm_prefix: usize = if !use_spec && self.kv_prefix_cache.enabled() {
             let fp = self.runner.fingerprint();
             match self.kv_prefix_cache.lookup(&prompt_ids, &fp) {
-                Some(snap) => {
+                Some((snap, plane_pulled)) => {
                     let matched = snap.past_seq_len;
                     let prefix32: Vec<i32> =
                         prompt_ids[..matched].iter().map(|&t| t as i32).collect();
@@ -1498,6 +1498,7 @@ impl SparseMoEEngine {
                             task = %task.task_id,
                             warm_prefix = matched,
                             prompt_len = prompt_ids.len(),
+                            plane_pulled,
                             "multi-stage warm-resumed"
                         );
                         matched
@@ -2993,7 +2994,7 @@ impl OvMoeEngine {
             let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
             let fp = self.runner.fingerprint();
             match self.kv_prefix_cache.lookup(&prompt64, &fp) {
-                Some(snap) => {
+                Some((snap, plane_pulled)) => {
                     let matched = snap.past_seq_len;
                     // The workers stashed their slices under E = synth_epoch(the captured token
                     // vector), and that captured vector is exactly this matched prefix (capture keys
@@ -3008,6 +3009,7 @@ impl OvMoeEngine {
                             task = %id,
                             warm_prefix = matched,
                             prompt_len = prompt_ids.len(),
+                            plane_pulled,
                             "multi-stage warm-resumed"
                         );
                         matched
@@ -3641,7 +3643,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         }
         let fp = self.runner.fingerprint();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let snap = self.kv_prefix_cache.lookup(&prompt, &fp)?;
+        let (snap, _) = self.kv_prefix_cache.lookup(&prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = crate::kv_coordination::synth_epoch(&prefix);
@@ -3711,8 +3713,8 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prefix
-            .insert(prefix.clone(), &fp, snap.clone());
-        self.kv_prefix_cache.insert(prefix, &fp, snap);
+            .insert_pulled(prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache.insert_pulled(prefix, &fp, snap);
         Ok(())
     }
 

@@ -202,7 +202,7 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         let hit = g.prefix.lookup(&prompt, &fp);
         tracing::debug!(target: "cascadia::kv", event = "ovmoe_holder_negotiate",
             query_len = prompt.len(), hit = hit.is_some(), "holder NEGOTIATE lookup");
-        let snap = hit?;
+        let (snap, _) = hit?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);

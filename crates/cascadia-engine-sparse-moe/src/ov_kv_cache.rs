@@ -55,6 +55,9 @@ struct CacheKey {
 struct Entry {
     prefix: Vec<i64>,
     snapshot: OvMoeKvSnapshot,
+    /// Pulled over the KV plane (`insert_pulled`) rather than captured from this rank's own turn.
+    /// Read back by [`OvMoeKvPrefixCache::lookup`] so a cert bar can tell the two apart.
+    plane_pulled: bool,
 }
 
 /// LRU KV-prefix cache for the OV-IR engine. `capacity == 0` disables it
@@ -102,9 +105,13 @@ impl OvMoeKvPrefixCache {
 
     /// Longest cached prefix that is a strict prefix of `prompt` (leaving
     /// at least one tail token for the generate loop) and shares `prompt`'s
-    /// model fingerprint. Returns the snapshot; its `past_seq_len` is the
-    /// matched length. On a hit the entry moves to MRU.
-    pub fn lookup(&mut self, prompt: &[i64], fingerprint: &ModelFingerprint) -> Option<OvMoeKvSnapshot> {
+    /// model fingerprint. Returns `(snapshot, plane_pulled)`; the snapshot's
+    /// `past_seq_len` is the matched length. On a hit the entry moves to MRU.
+    pub fn lookup(
+        &mut self,
+        prompt: &[i64],
+        fingerprint: &ModelFingerprint,
+    ) -> Option<(OvMoeKvSnapshot, bool)> {
         if !self.enabled() {
             return None;
         }
@@ -134,16 +141,45 @@ impl OvMoeKvPrefixCache {
             Some(i) => {
                 self.hits += 1;
                 let entry = self.entries.remove(i).expect("index from enumerate must be valid");
-                let snapshot = entry.1.snapshot.clone();
+                let hit = (entry.1.snapshot.clone(), entry.1.plane_pulled);
                 self.entries.push_front(entry);
-                Some(snapshot)
+                Some(hit)
             }
         }
     }
 
     /// Insert a snapshot keyed by `prefix` + fingerprint. Replaces an
     /// exact-key entry in place; evicts LRU entries until under capacity.
-    pub fn insert(&mut self, prefix: Vec<i64>, fingerprint: &ModelFingerprint, snapshot: OvMoeKvSnapshot) {
+    ///
+    /// Local capture — this rank's own turn. Cross-chain consumer-inserts go
+    /// through [`Self::insert_pulled`].
+    pub fn insert(
+        &mut self,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: OvMoeKvSnapshot,
+    ) {
+        self.store(prefix, fingerprint, snapshot, false);
+    }
+
+    /// As [`Self::insert`], but marks the entry as pulled over the KV plane so a later
+    /// warm resume off it is attributable to the cross-chain pull, not to a local capture.
+    pub fn insert_pulled(
+        &mut self,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: OvMoeKvSnapshot,
+    ) {
+        self.store(prefix, fingerprint, snapshot, true);
+    }
+
+    fn store(
+        &mut self,
+        prefix: Vec<i64>,
+        fingerprint: &ModelFingerprint,
+        snapshot: OvMoeKvSnapshot,
+        plane_pulled: bool,
+    ) {
         if !self.enabled() {
             return;
         }
@@ -164,7 +200,14 @@ impl OvMoeKvPrefixCache {
                 break;
             }
         }
-        self.entries.push_front((key, Entry { prefix, snapshot }));
+        self.entries.push_front((
+            key,
+            Entry {
+                prefix,
+                snapshot,
+                plane_pulled,
+            },
+        ));
     }
 }
 
@@ -213,9 +256,35 @@ mod tests {
         let prefix = vec![1i64, 2, 3];
         c.insert(prefix.clone(), &fp(), snap(3, 7.0));
         let prompt = vec![1i64, 2, 3, 4];
-        let got = c.lookup(&prompt, &fp()).expect("hit");
+        let (got, _) = c.lookup(&prompt, &fp()).expect("hit");
         assert_eq!(got.past_seq_len, 3);
         assert_eq!(got.layers[0].k[0], 7.0);
+    }
+
+    #[test]
+    fn lookup_reports_entry_provenance() {
+        let mut c = OvMoeKvPrefixCache::new(4);
+        c.insert(vec![1i64, 2, 3], &fp(), snap(3, 1.0));
+        let (_, pulled) = c.lookup(&[1i64, 2, 3, 4], &fp()).expect("hit");
+        assert!(!pulled, "locally captured");
+        c.insert_pulled(vec![1i64, 2, 3], &fp(), snap(3, 2.0));
+        let (_, pulled) = c.lookup(&[1i64, 2, 3, 4], &fp()).expect("hit");
+        assert!(pulled, "consumer-inserted over the plane");
+    }
+
+    /// LRU must fail safe: once the pulled entry is evicted, the local entry that still
+    /// matches carries its own mark, so a plane assertion can't green off a local capture.
+    #[test]
+    fn evicting_a_pulled_entry_leaves_a_local_mark() {
+        let mut c = OvMoeKvPrefixCache::new(2);
+        c.insert_pulled(vec![1i64, 1, 1], &fp(), snap(3, 1.0));
+        c.insert(vec![2i64, 2, 2], &fp(), snap(3, 2.0));
+        c.insert(vec![3i64, 3, 3], &fp(), snap(3, 3.0));
+        assert_eq!(c.len(), 2);
+        let evicted = c.lookup(&[1i64, 1, 1, 9], &fp());
+        assert!(evicted.is_none(), "pulled was LRU");
+        let (_, pulled) = c.lookup(&[2i64, 2, 2, 9], &fp()).expect("hit");
+        assert!(!pulled);
     }
 
     #[test]
@@ -231,7 +300,7 @@ mod tests {
         let mut c = OvMoeKvPrefixCache::new(4);
         c.insert(vec![1i64, 2, 3], &fp(), snap(3, 3.0));
         c.insert(vec![1i64, 2, 3, 4, 5], &fp(), snap(5, 5.0));
-        let got = c.lookup(&[1i64, 2, 3, 4, 5, 6], &fp()).expect("hit");
+        let (got, _) = c.lookup(&[1i64, 2, 3, 4, 5, 6], &fp()).expect("hit");
         assert_eq!(got.past_seq_len, 5);
     }
 
