@@ -34,10 +34,26 @@ pub fn decode_nibble(n: u8) -> f32 {
 }
 
 /// `2^(byte - 127)` — the E8M0 shared exponent.
+///
+/// Built from the exponent field rather than `powi`, which with a RUNTIME
+/// exponent is repeated squaring. This runs once per group of 32 columns, so
+/// ~344k times per section GEMV.
+///
+/// Bit-exact for all 256 inputs: `b` IS the biased exponent, so shifting it into
+/// place is the identity (b=127 -> 1.0, b=128 -> 2.0). Only b=0 is special, its
+/// value being subnormal, and it keeps the old result rather than flushing to 0.
+///
+/// MEASURE THIS WITH THE ACCUMULATOR SPLIT, NOT ALONE. On its own it is neutral
+/// (3.340 -> 3.367 ms) because the FMA dependency chain in the AVX2 loop left
+/// idle cycles that hid it. Remove that chain and this becomes the next
+/// bottleneck; the two together are 3.340 -> 0.572 ms, and either alone is
+/// nothing.
 #[inline]
 pub fn e8m0_to_f32(b: u8) -> f32 {
-    // exp2 via bit construction would overflow for b == 0; powi is fine here
-    2.0f32.powi(b as i32 - 127)
+    if b == 0 {
+        return 2.0f32.powi(-127);
+    }
+    f32::from_bits((b as u32) << 23)
 }
 
 /// Byte size of one packed `[out, in]` section (nibbles then scales).
@@ -174,7 +190,10 @@ mod avx2 {
 
         let lut = _mm_loadu_si128(LUT2.as_ptr() as *const __m128i);
         let lo_mask = _mm_set1_epi8(0x0F);
-        let mut acc = _mm256_setzero_ps();
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
         for (gi, &sb) in scales_row.iter().enumerate() {
             let base = gi * GROUP;
@@ -193,23 +212,36 @@ mod avx2 {
             let cols_16_31 = _mm_unpackhi_epi8(lo_v, hi_v);
 
             let xp = x.as_ptr().add(base);
-            let mut gacc = _mm256_setzero_ps();
-            // i8 -> i32 -> f32, 8 columns at a time.
-            let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_0_15));
-            gacc = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), gacc);
-            let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_0_15)));
-            gacc = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp.add(8)), gacc);
-            let w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_16_31));
-            gacc = _mm256_fmadd_ps(w2, _mm256_loadu_ps(xp.add(16)), gacc);
-            let w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_16_31)));
-            gacc = _mm256_fmadd_ps(w3, _mm256_loadu_ps(xp.add(24)), gacc);
-
             // The LUT is 2x the real magnitude; fold the 0.5 into the scale.
             // Both factors are powers of two, so the product is exact.
             let s_half = _mm256_set1_ps(e8m0_to_f32(sb) * 0.5);
-            acc = _mm256_fmadd_ps(gacc, s_half, acc);
+
+            // FOUR accumulators, not one. Chaining these into a single register
+            // makes each FMA wait on the previous one's ~4-cycle latency, so a
+            // group costs ~16 cycles of latency where the hardware could retire
+            // it in ~2 of throughput. Scaling x rather than w keeps the FMAs
+            // independent without an extra multiply on the weight side.
+            // i8 -> i32 -> f32, 8 columns at a time.
+            let w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_0_15));
+            let w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_0_15)));
+            let w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_16_31));
+            let w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_16_31)));
+
+            let x0 = _mm256_mul_ps(_mm256_loadu_ps(xp), s_half);
+            let x1 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(8)), s_half);
+            let x2 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(16)), s_half);
+            let x3 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(24)), s_half);
+
+            acc0 = _mm256_fmadd_ps(w0, x0, acc0);
+            acc1 = _mm256_fmadd_ps(w1, x1, acc1);
+            acc2 = _mm256_fmadd_ps(w2, x2, acc2);
+            acc3 = _mm256_fmadd_ps(w3, x3, acc3);
         }
-        hsum256(acc)
+        // Pairwise, so the two adds are independent too.
+        hsum256(_mm256_add_ps(
+            _mm256_add_ps(acc0, acc1),
+            _mm256_add_ps(acc2, acc3),
+        ))
     }
 }
 
