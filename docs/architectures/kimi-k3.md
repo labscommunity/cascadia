@@ -368,16 +368,23 @@ e2m1 keeps 90% of the `u4` bound at batch 32, so the codebook is not a blocker.
 Dequantizing to f16 at export buys nothing: 1218 GFLOP/s vs e2m1's 1306, for
 3.76x the bytes (17.5 -> 66 MB per expert).
 
-**K3's own kernel is the bottleneck here, not the devices.** Measured in
-isolation on the same machine (`simd_gemv_bench`, release):
+**The kernel was the bottleneck here, and was fixed.** Measured in isolation on
+the same machine (`simd_gemv_bench`, release), 3072x3584:
 
 ```
-gemv 3072x3584: scalar 34.610 ms, AVX2 3.340 ms, 10.36x = 6.6 GFLOP/s
+before  3.340 ms   6.6 GFLOP/s
+after   0.572 ms  38.5 GFLOP/s   (58x over scalar)
 ```
 
-OpenVINO's CPU kernel is **6.8x** that at batch 1 and **56x** at batch 32, on the
-same CPU. The batch gap is structural: `moe_forward_batch` runs one GEMV per row
-rather than a GEMM, so K3 gets no amortisation from batching.
+Two stalls of similar size, neither visible alone: the AVX2 loop chained four
+FMAs into one accumulator (~16 cycles of latency per group where the hardware
+retires in ~2), and `e8m0_to_f32` used `powi` with a runtime exponent once per
+group. Fixing only the powi gives 3.367 ms; only the accumulators, 3.599 ms.
+Both, 0.572 ms — the FMA chain left idle cycles that hid the powi.
+
+That leaves K3 within **1.16x** of OpenVINO's CPU kernel at batch 1. The
+remaining gap is structural and only at batch: `moe_forward_batch` runs one GEMV
+per row rather than a GEMM, so OV's batch-32 path is still **9.6x** ahead.
 
 **Decode belongs on the CPU** — occupancy, not bandwidth: at batch 1 the CPU
 moves 82 GB/s and the GPU 35, both far under the ~137 GB/s bus.
@@ -396,15 +403,17 @@ Per token K3 streams 25.8 GB and computes ~97.2 GFLOP:
 | | I/O | compute | bound by |
 |---|---|---|---|
 | bench host, rotational ~200 MB/s | ~129 s | 14.7 s | I/O, 9:1 |
-| AI-PC, NVMe 3566 MB/s | **7.2 s** | **14.7 s** | **compute, 1:2** |
+| AI-PC, NVMe 3566 MB/s | **7.2 s** | **2.5 s** | **I/O, 2.9:1** |
 
 The NVMe figure is measured at K3's access pattern — 16 scattered 17.5 MB slices,
 16-way concurrent, scratch larger than RAM since Windows has no `drop_caches`
 (`bench_fetch_win.py`). Stable at 2x and 3.8x RAM (3376 / 3566 MB/s), and it
 agrees with the Linux NVMe number taken with real cache drops.
 
-So "decode is 99% expert I/O" describes the rotational host, not K3. On NVMe it
-is compute bound ~2:1, and the largest lever is the CPU kernel.
+"Decode is 99% expert I/O" describes the rotational host. On NVMe the two are
+the same order, and which one binds moved with the kernel fix above: at the old
+6.6 GFLOP/s an AI-PC was compute bound 1:2, at 38.5 it is I/O bound 2.9:1. Worth
+re-checking after any kernel change, in both directions.
 
 ### Where the remaining speed is
 
@@ -423,13 +432,13 @@ dropped, a `syscr` that moved — not merely that it was switched on.
 | | Status | Expected |
 |---|---|---|
 | `madvise(MADV_WILLNEED)` after routing | done | **measured 2.46x**: tok 1 forward (excl. prefill) 768s -> 312s, `eff` 204 -> 745 MB/s, `routed` bytes identical |
-| AVX2 fp4 expert kernel | done | **10.36x over scalar**, 3.34 ms per 3072x3584 GEMV = 6.6 GFLOP/s. A previous "1.79x" here was an end-to-end token delta, not kernel throughput |
+| AVX2 fp4 expert kernel | done | **58x over scalar**, 0.572 ms per 3072x3584 GEMV = 38.5 GFLOP/s. A previous "1.79x" here was an end-to-end token delta, not kernel throughput |
 | explicit concurrent reads | done, **default** (`CASCADIA_K3_READ=0` opts out) | **measured +8.5%** steady-state decode, -1.6% prefill, 2 runs per side. Both phases must use the same strategy — see the fetch section |
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised, **warms over ~136 tokens** | prior art finds static hot-set pinning helps cold start and loses in steady state. Two gotchas before measuring: the histogram is only persisted when autopin is enabled, so the FIRST enabled run always reports `pinned=0` and merely records; and the confidence ramp counts selections, of which K3 makes 92 layers x 16 = 1472 per token, so nothing pins below ~3.4 tokens and full confidence needs ~136. A 3-token run produces 4416 selections and stays under the floor. The histogram MERGES on load, though, so the ~136 tokens accumulate across runs rather than needing one long session: any sequence of runs with the flag set warms it, and a long-lived worker warms itself |
 | prefix cache | working, **on by default** (5% of free RAM; `CASCADIA_K3_PREFIX_CACHE=<bytes>` overrides, `=0` disables), any rank count | **measured 2.45x at 2 ranks and 2.60x at 1**, the same -64% of prefill bytes either way, so the saving comes from the reuse fraction rather than the topology. The derived default was checked with no env set at all: 555 s against 548 s for a hand-set budget, and the same 103.32 GB prefill, so it behaves as the tuned value. At 2 ranks: prefill bytes 142.06 -> 51.66 GB and prefill 649.4 -> 228.3 s at `reused=7 prompt=10`, saving in proportion to the reuse fraction. Byte-bounded LRU over the post-prefill layer states. It was reachable only from the pipeline path at first, so a single rank accepted the budget and ignored it; `step_single_stage` now takes the same route. Reuse needs a STRICT prefix, so resending an identical prompt never hits — the case it serves is the next turn, which resends the reply too |
-| **close the CPU kernel gap** | not started, **largest lever on NVMe** | OV's CPU kernel is 6.8x K3's at batch 1, 56x at batch 32. Closing it takes per-token compute 14.7s -> ~2.2s, making an AI-PC node I/O bound again |
-| batched GEMM for prefill | not started | `moe_forward_batch` runs one GEMV per row, so many rows against one expert cost the same as one row each |
+| close the CPU kernel gap | **done, measured 5.8x** | was 6.8x behind OV's CPU kernel at batch 1, now 1.16x. Per-token compute 14.7s -> 2.5s, which puts an AI-PC node back to I/O bound |
+| batched GEMM for prefill | not started, **largest remaining compute lever** | `moe_forward_batch` runs one GEMV per row, so many rows against one expert cost the same as one row each. OV's batch-32 GEMM is 9.6x the fixed kernel |
 | lane-lazy expert reads | **dropped, measured** | 29.1% of lanes are dead at the most aggressive threshold, but only 5.7% of `w3` PAGES, and 0.0% losslessly. The sparsity is real and too scattered to skip a page. `CASCADIA_K3_CHESS_PROBE=1` re-measures |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
