@@ -550,6 +550,13 @@ impl OvMoeRunner {
     /// a cold prefill. Every owned layer must agree on `seq` (they advance
     /// in lockstep through `forward_layers`); a mismatch is an engine bug,
     /// not recoverable state.
+    /// This rank's current KV depth, or 0 if it owns no layers. Unlike [`Self::snapshot_kv`] this
+    /// never errors on a cross-layer disagreement — the plane's depth guard wants a cursor, not a
+    /// consistency verdict, and a disagreeing rank is caught by the snapshot path anyway.
+    pub fn kv_past_seq_len(&self) -> usize {
+        self.kv.first().map(|l| l.seq).unwrap_or(0)
+    }
+
     pub fn snapshot_kv(&self) -> Result<OvMoeKvSnapshot, OvMoeError> {
         let ps = match self.kv.first() {
             Some(l) => l.seq,

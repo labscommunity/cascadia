@@ -151,6 +151,108 @@ pub(crate) fn ov_wire_to_snapshot(
     ov_blob_decode(blob)
 }
 
+// ---- plane hand-off --------------------------------------------------------
+
+/// FNV-1a over the opaque blob, so a donor's serve digest and a consumer's applied digest are
+/// comparable across ranks. Over RAW BYTES, never over lengths or manifest fields.
+pub(crate) fn ov_payload_digest(payloads: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (k, v) in payloads {
+        for &b in k.iter().chain(v.iter()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Why [`ov_handoff_decision`] refused a parked slice. 1:1 with the `kv_handoff_*` events the drain
+/// logs; the cert greps two of them, so keep the mapping.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OvHandoffReject {
+    Validate,
+    Decode,
+    /// The slice's KV depth, which this rank is already past.
+    TooLate(usize),
+}
+
+/// The pure part of the OvMoe drain — validation, opaque decode, depth guard — split out because
+/// applying needs compiled shells, so this is the only part a unit test can reach.
+///
+/// Validation MUST happen here: the hand-off skips the consumer `insert` that would otherwise run
+/// the codec, so nothing else checks layout / engine_rev / fingerprint before `restore_kv`.
+pub(crate) fn ov_handoff_decision(
+    slot: &cascadia_engine::kv_handoff::KvHandoffSlot,
+    model_fp: u64,
+    position: usize,
+) -> Result<OvMoeKvSnapshot, OvHandoffReject> {
+    let refs: Vec<(&[u8], &[u8])> = slot
+        .payloads
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    if cascadia_kv_wire::KvSnapshotCodec::validate(
+        &slot.manifest,
+        &refs,
+        OPAQUE_KV_LAYOUT,
+        KV_ENGINE_REV,
+        model_fp,
+        &slot.manifest.token_ids,
+    )
+    .is_err()
+    {
+        return Err(OvHandoffReject::Validate);
+    }
+    let snap =
+        ov_wire_to_snapshot(&slot.manifest, &slot.payloads).ok_or(OvHandoffReject::Decode)?;
+    // A slice shallower than where this rank already sits cannot be resumed into — restoring it
+    // would snap the cursor backwards.
+    if position > snap.past_seq_len {
+        return Err(OvHandoffReject::TooLate(snap.past_seq_len));
+    }
+    Ok(snap)
+}
+
+/// Drain `mailbox` and hand the decided snapshot to `apply`. `true` ⇒ this rank is armed warm.
+/// Event names and fields are byte-identical to the other engines — the cert greps them.
+pub(crate) fn ov_drain_handoff(
+    mailbox: &cascadia_engine::kv_handoff::KvHandoffMailbox,
+    model_fp: u64,
+    position: usize,
+    apply: impl FnOnce(&OvMoeKvSnapshot) -> bool,
+) -> bool {
+    let Some(slot) = mailbox.take() else {
+        return false;
+    };
+    let digest = ov_payload_digest(&slot.payloads);
+    let snap = match ov_handoff_decision(&slot, model_fp, position) {
+        Ok(snap) => snap,
+        Err(OvHandoffReject::Validate) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                epoch = slot.epoch, rev = KV_ENGINE_REV, fp = model_fp);
+            return false;
+        }
+        Err(OvHandoffReject::Decode) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+            return false;
+        }
+        Err(OvHandoffReject::TooLate(depth)) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                epoch = slot.epoch, position, depth);
+            return false;
+        }
+    };
+    if apply(&snap) {
+        tracing::info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
+            epoch = slot.epoch, position, blob_digest = digest);
+        true
+    } else {
+        tracing::warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
+            epoch = slot.epoch, position);
+        false
+    }
+}
+
 // ---- holder ----------------------------------------------------------------
 
 /// Shared handle to the holder-side snapshot cache. The engine mirrors its captures here; the holder
@@ -358,5 +460,74 @@ mod tests {
         }
         let (epoch, len) = last.expect("negotiate hit");
         assert!(holder.export("peer", epoch, len).is_some());
+    }
+
+    fn ov_slot(model_fp: u64, past: usize) -> cascadia_engine::kv_handoff::KvHandoffSlot {
+        let prefix: Vec<i32> = (0..past as i32).collect();
+        let (manifest, payloads) =
+            ov_snapshot_to_wire(&prefix, &snap(past, 1.0), "peer", model_fp, 0xE0);
+        cascadia_engine::kv_handoff::KvHandoffSlot {
+            epoch: 0xE0,
+            manifest,
+            payloads,
+        }
+    }
+
+    #[test]
+    fn ov_handoff_decision_accepts_a_well_formed_slice() {
+        let decided =
+            ov_handoff_decision(&ov_slot(7, 3), 7, 0).expect("well-formed slice decides Ok");
+        assert_eq!(decided.past_seq_len, 3);
+        assert_eq!(decided.layers.len(), 2);
+    }
+
+    #[test]
+    fn ov_handoff_decision_rejects_a_foreign_model() {
+        // The hand-off skips the consumer insert that would otherwise run the codec, so this is the
+        // ONLY check between a foreign slice and `restore_kv`.
+        assert!(matches!(
+            ov_handoff_decision(&ov_slot(7, 3), 8, 0),
+            Err(OvHandoffReject::Validate)
+        ));
+    }
+
+    #[test]
+    fn ov_handoff_decision_rejects_a_slice_shallower_than_this_rank() {
+        assert!(matches!(
+            ov_handoff_decision(&ov_slot(7, 3), 7, 5),
+            Err(OvHandoffReject::TooLate(3))
+        ));
+        // Equal depth is not "too late" — the guard is `position > depth`.
+        assert!(ov_handoff_decision(&ov_slot(7, 3), 7, 3).is_ok());
+    }
+
+    #[test]
+    fn ov_drain_handoff_consumes_what_the_plane_parked() {
+        let mailbox = cascadia_engine::kv_handoff::KvHandoffMailbox::new();
+        assert!(
+            !ov_drain_handoff(&mailbox, 7, 0, |_| true),
+            "empty mailbox drains false"
+        );
+        let prefix: Vec<i32> = (0..3).collect();
+        let (m, pl) = ov_snapshot_to_wire(&prefix, &snap(3, 1.0), "peer", 7, 0xE0);
+        mailbox.put(0xE0, m, pl);
+        let mut applied = None;
+        assert!(ov_drain_handoff(&mailbox, 7, 0, |s| {
+            applied = Some(s.past_seq_len);
+            true
+        }));
+        assert_eq!(applied, Some(3));
+        assert!(!ov_drain_handoff(&mailbox, 7, 0, |_| true), "one slot only");
+    }
+
+    #[test]
+    fn ov_drain_handoff_reports_false_when_the_apply_fails() {
+        // A failed restore leaves the rank cold on a turn the commit armed warm; the drain must say
+        // so or the RESTORE verdict lies and the head warms over a cold rank.
+        let mailbox = cascadia_engine::kv_handoff::KvHandoffMailbox::new();
+        let prefix: Vec<i32> = (0..3).collect();
+        let (m, pl) = ov_snapshot_to_wire(&prefix, &snap(3, 1.0), "peer", 7, 0xE0);
+        mailbox.put(0xE0, m, pl);
+        assert!(!ov_drain_handoff(&mailbox, 7, 0, |_| false));
     }
 }

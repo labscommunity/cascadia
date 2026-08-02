@@ -1463,6 +1463,17 @@ impl Runner {
     /// `past_seq_len`; mismatches return an `Internal` error since they
     /// indicate a bug in the engine's prefill driver, not a recoverable
     /// state. (Compare `kv_past_seq_lens` on `main` post-spec-decode.)
+    /// This rank's current KV depth, or 0 if it holds no KV at all. Unlike [`Self::snapshot_kv`] this
+    /// never errors on a cross-layer disagreement — the plane's depth guard wants a cursor, not a
+    /// consistency verdict, and a disagreeing rank is caught by the snapshot path anyway.
+    pub fn kv_past_seq_len(&self) -> usize {
+        self.layer0
+            .as_ref()
+            .map(|l0| l0.past_seq_len)
+            .or_else(|| self.layers.first().map(|l| l.past_seq_len))
+            .unwrap_or(0)
+    }
+
     pub fn snapshot_kv(&self) -> Result<KvSnapshot, RunnerError> {
         let ps = if let Some(l0) = self.layer0.as_ref() {
             l0.past_seq_len

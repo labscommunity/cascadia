@@ -927,6 +927,10 @@ impl Builder for SparseMoEBuilder {
             kv_capture: std::collections::HashMap::new(),
             #[cfg(feature = "kv_coord")]
             kv_share,
+            #[cfg(feature = "kv_coord")]
+            kv_handoff_mailbox: std::sync::Arc::new(
+                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
+            ),
         }))
     }
 }
@@ -1138,6 +1142,11 @@ pub struct SparseMoEEngine {
     /// `kv_capture` so a busy engine answers cross-chain KV pulls without the engine lock.
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_share: crate::kv_coordination::SharedHolderCache,
+    /// Issue-34 plane warm-resume: where the node's commit path parks a pulled slice for this rank.
+    /// The commit cannot reach the engine — it usually runs while the engine mutex is held inside
+    /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
 }
 
 impl SparseMoEEngine {
@@ -1153,6 +1162,23 @@ impl SparseMoEEngine {
 
     fn is_last(&self) -> bool {
         self.transport.is_last()
+    }
+
+    /// Apply a plane-parked slice, if one is waiting. `true` ⇒ this rank is armed warm from the
+    /// plane, which is what makes its `RESTORE` verdict truthful in plane mode.
+    ///
+    /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see the
+    /// `FrameKind::Restore` arm for why that shape silently produces a hollow warm.
+    #[cfg(feature = "kv_coord")]
+    pub(crate) fn drain_kv_handoff(&mut self) -> bool {
+        // Plane fp, matching `KvCoordination::model_fingerprint` and this engine's holder.
+        let model_fp = self.runner.fingerprint().plane_digest();
+        let position = self.runner.kv_past_seq_len();
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
+        let runner = &mut self.runner;
+        crate::kv_coordination::drain_handoff(&mailbox, model_fp, position, |snap| {
+            runner.restore_kv(snap).is_ok()
+        })
     }
 
     /// Worker-side helper: if the runner's KV is AHEAD of the driver's
@@ -1274,9 +1300,17 @@ impl Engine for SparseMoEEngine {
         Some(std::sync::Arc::new(
             crate::kv_coordination::SparseMoeKvHolder {
                 cache: std::sync::Arc::clone(&self.kv_share),
-                model_fp: self.runner.fingerprint().digest(),
+                // Plane-level fp (model identity only): a cross-chain pull asserts the moved-to
+                // head's fp for EVERY rank's GET, so this holder must match despite its layer span.
+                model_fp: self.runner.fingerprint().plane_digest(),
             },
         ))
+    }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff_mailbox)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
     }
 
     fn close(&mut self) {
@@ -2517,23 +2551,24 @@ impl SparseMoEEngine {
                 let epoch = self
                     .block_on(recv_restore_body_server(upstream))
                     .map_err(|e| format!("recv_restore: {e}"))?;
-                // DELIBERATELY no plane hand-off mailbox here — this engine takes the
-                // `kv_handoff() -> None` trait default, so a plane rank refuses at trigger and the
-                // head cold-falls back. Reachable only once the capacity-0 sharded serve gap
-                // (kv_coordination.rs, `total>1`) is closed AND a runnable export exists.
+                // Drain the plane mailbox FIRST — never `local_ok || self.drain_kv_handoff()`. A
+                // cross-chain pull parks this rank's slice in the mailbox while the head may ALSO
+                // hold a same-chain capture under the same epoch, so a trailing `||` short-circuits
+                // the drain away: the rank warms from its own stale capture, the pulled slice is
+                // never applied, and the verdict still reads true — a silent hollow warm that
+                // nothing aborts. That exact bug shipped in three OV engines and cost a full cert
+                // cycle (fixed in 07d9bf2 / a8fc4b4).
                 //
-                // WHEN A MAILBOX IS ADDED: the drain MUST run BEFORE the capture branch below, never
-                // as `local_ok || drain()`. The head ships a carried blob inline even in plane mode,
-                // so a trailing `||` short-circuits the drain away: the rank warms from carried/local
-                // data, the plane slice is never applied, and the verdict still reads true — a silent
-                // hollow warm. That exact bug shipped in three OV engines and cost a full cert cycle
-                // (fixed in 07d9bf2 / a8fc4b4). Mirror those, and see the follow-up issue first.
-                //
-                // Same-chain: restore from this rank's own capture stash. `.get`+clone (not remove) —
-                // a repeat warm-resume over the same epoch may legitimately restore again.
-                let local_ok = match self.kv_capture.get(&epoch).cloned() {
-                    Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
-                    None => false,
+                // Fallback is same-chain: restore from this rank's own capture stash. `.get`+clone
+                // (not remove) — a repeat warm-resume over the same epoch may legitimately restore
+                // again.
+                let local_ok = if self.drain_kv_handoff() {
+                    true
+                } else {
+                    match self.kv_capture.get(&epoch).cloned() {
+                        Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                        None => false,
+                    }
                 };
                 // Chain downstream unless we're the last rank. A transport error folds into verdict 0
                 // (all-or-nothing) rather than aborting — the head still gets a definite NAK and cold-runs.
@@ -2774,6 +2809,11 @@ pub struct OvMoeEngine {
     /// One-shot: removed on send. Bounded by the prefix-cache capacity.
     #[cfg(feature = "kv_coord")]
     kv_downstream: std::collections::HashMap<u64, Vec<u8>>,
+    /// Issue-34 plane warm-resume: where the node's commit path parks a pulled slice for this rank.
+    /// The commit cannot reach the engine — it usually runs while the engine mutex is held inside
+    /// `step()` — so it only parks bytes here and the recv loop drains them at `RESTORE`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff_mailbox: std::sync::Arc<cascadia_engine::kv_handoff::KvHandoffMailbox>,
 }
 
 impl OvMoeEngine {
@@ -2820,6 +2860,10 @@ impl OvMoeEngine {
             kv_share,
             #[cfg(feature = "kv_coord")]
             kv_downstream: std::collections::HashMap::new(),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff_mailbox: std::sync::Arc::new(
+                cascadia_engine::kv_handoff::KvHandoffMailbox::new(),
+            ),
         }
     }
 
@@ -2831,6 +2875,25 @@ impl OvMoeEngine {
 
     fn is_last(&self) -> bool {
         self.transport.is_last()
+    }
+
+    /// Apply a plane-parked slice, if one is waiting. `true` ⇒ this rank is armed warm from the
+    /// plane, which is what makes its `RESTORE` verdict truthful in plane mode.
+    ///
+    /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see
+    /// `handle_restore` for why that shape silently produces a hollow warm.
+    #[cfg(feature = "kv_coord")]
+    fn drain_kv_handoff(&mut self) -> bool {
+        // PLANE-level fp, matching this engine's `KvCoordination::model_fingerprint` and its holder:
+        // a cross-chain pull asserts the moved-to head's single fp for every rank, so validating a
+        // parked slice against the per-stage `digest()` would reject every pull this rank receives.
+        let model_fp = self.runner.fingerprint().plane_digest();
+        let position = self.runner.kv_past_seq_len();
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
+        let runner = &mut self.runner;
+        crate::ov_kv_coordination::ov_drain_handoff(&mailbox, model_fp, position, |snap| {
+            runner.restore_kv(snap).is_ok()
+        })
     }
 
     /// Single-stage path: tokenize, run the whole model, decode.
@@ -3307,10 +3370,21 @@ impl OvMoeEngine {
         let epoch = self
             .block_on(recv_restore_body_server(upstream))
             .map_err(|e| format!("recv_restore: {e}"))?;
-        // `.get`+clone (not remove) — a repeat warm-resume over the same epoch may restore again.
-        let local_ok = match self.kv_capture.get(&epoch).cloned() {
-            Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
-            None => false,
+        // Drain the plane mailbox FIRST — never `local_ok || self.drain_kv_handoff()`. A cross-chain
+        // pull parks this rank's slice in the mailbox while a same-epoch local capture may also
+        // exist, so a trailing `||` short-circuits the drain away: the rank warms from its own stale
+        // capture, the pulled slice is never applied, and the verdict still reads true — a silent
+        // hollow warm that nothing aborts (07d9bf2 / a8fc4b4).
+        //
+        // Fallback is same-chain. `.get`+clone (not remove) — a repeat warm-resume over the same
+        // epoch may restore again.
+        let local_ok = if self.drain_kv_handoff() {
+            true
+        } else {
+            match self.kv_capture.get(&epoch).cloned() {
+                Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                None => false,
+            }
         };
         let down_ok = if self.is_last() {
             true
@@ -3624,6 +3698,12 @@ impl Engine for OvMoeEngine {
             model_fp: self.runner.fingerprint().plane_digest(),
         }))
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff_mailbox)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
 }
 
 /// Cross-chain (Issue-34 Option C) warm-pull for OvMoe: NEGOTIATE→GET→insert, mirroring
@@ -3765,9 +3845,15 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
     }
 
     fn apply_warm_resume(&mut self, epoch: u64) -> bool {
-        let local_ok = match self.kv_capture.get(&epoch).cloned() {
-            Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
-            None => false,
+        // Drain FIRST — the node parks EVERY rank's slice, rank 0 included, so a `||` here would let
+        // a stale local capture mask the pulled one. See `handle_restore`.
+        let local_ok = if self.drain_kv_handoff() {
+            true
+        } else {
+            match self.kv_capture.get(&epoch).cloned() {
+                Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                None => false,
+            }
         };
         if !local_ok {
             return false;
