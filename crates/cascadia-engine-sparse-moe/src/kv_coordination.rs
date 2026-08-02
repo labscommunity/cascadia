@@ -12,9 +12,12 @@
 //! **Known gap (DiD, deferred):** the `KvPrefixCache` is content-keyed, not partner-keyed — `partner`
 //! is stamped on the exported `Manifest` but does not namespace the lookup. The content-key + the
 //! no-tenant-tokens invariant are the load-bearing controls (§13); partner-keying is defense-in-depth.
-//! **Sharded gap (rig):** the cache is capacity-0 for `total>1`, so a holder serves nothing for a
-//! sharded model until `total>1` capture is re-enabled — lookup/insert degrade to None/no-op.
+//! **Sharded serve:** under `kv_coord` a `total>1` engine gets the configured cache size and the
+//! head seeds it after a chain-wide `CAPTURE` (engine.rs), so a sharded holder does serve. WITHOUT
+//! the feature the cache is capacity-0 and lookup/insert degrade to None/no-op — the "sharded gap"
+//! an earlier note recorded unconditionally, which is what made the plane path look unreachable.
 
+use cascadia_engine::kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
 use cascadia_engine::KvCoordination;
 use cascadia_kv_wire::{LayerMeta, Manifest, PartnerId, KV_LAYOUT_VERSION, SCHEMA_VERSION};
 
@@ -282,9 +285,126 @@ fn wire_to_snapshot(manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Opt
     })
 }
 
+/// FNV-1a over every payload byte in wire order, so a donor's serve digest and a consumer's
+/// applied digest are comparable across ranks.
+///
+/// Over RAW BYTES, never over lengths or manifest fields: an earlier probe on the OpenVINO side
+/// compared token COUNTS, found 98 == 98, and read that as confirmation when the two numbers were
+/// equal by construction. Hash what actually gets applied.
+pub(crate) fn payload_digest(payloads: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (k, v) in payloads {
+        for &b in k.iter().chain(v.iter()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Why [`handoff_decision`] refused a parked slice. Variants are 1:1 with the `kv_handoff_*` events
+/// the drain logs; the cert greps two of them, so keep the mapping.
+#[derive(Debug, PartialEq)]
+pub(crate) enum HandoffReject {
+    Validate,
+    Decode,
+    /// The slice's KV depth, which this rank is already past.
+    TooLate(usize),
+}
+
+/// The pure part of the sparse-MoE drain — structural validation, structured decode, depth guard —
+/// split out because applying needs a loaded runner, so this is the only part a unit test can reach.
+///
+/// Deliberately NOT the OpenVINO `handoff_decision`. That one validates against `OPAQUE_KV_LAYOUT`
+/// and decodes one opaque blob via `wire_to_blob`; this layout is `KV_LAYOUT_VERSION` with a payload
+/// pair per layer. Neither function can check the other's slice.
+///
+/// Validation MUST happen on this path: the hand-off skips the consumer `insert` that would otherwise
+/// run the codec, so nothing else checks layout / engine_rev / fingerprint before `restore_kv`, and a
+/// slice from a drifted build or another model would be restored silently.
+pub(crate) fn handoff_decision(
+    slot: &KvHandoffSlot,
+    model_fp: u64,
+    position: usize,
+) -> Result<KvSnapshot, HandoffReject> {
+    let refs: Vec<(&[u8], &[u8])> = slot
+        .payloads
+        .iter()
+        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        .collect();
+    if cascadia_kv_wire::KvSnapshotCodec::validate(
+        &slot.manifest,
+        &refs,
+        KV_LAYOUT_VERSION,
+        KV_ENGINE_REV,
+        model_fp,
+        &slot.manifest.token_ids,
+    )
+    .is_err()
+    {
+        return Err(HandoffReject::Validate);
+    }
+    let snap = wire_to_snapshot(&slot.manifest, &slot.payloads).ok_or(HandoffReject::Decode)?;
+    // A slice shallower than where this rank already sits cannot be resumed into — restoring it would
+    // snap the cursor backwards, which is what produced the OV two-item divergence.
+    if position > snap.past_seq_len {
+        return Err(HandoffReject::TooLate(snap.past_seq_len));
+    }
+    Ok(snap)
+}
+
+/// Drain `mailbox` and hand the decided snapshot to `apply`. `true` ⇒ this rank is now armed warm,
+/// which is what makes its `RESTORE` verdict truthful in plane mode.
+///
+/// Event names and fields are byte-identical to the OpenVINO drain on purpose — the cert greps them
+/// and cannot tell the engines apart.
+pub(crate) fn drain_handoff(
+    mailbox: &KvHandoffMailbox,
+    model_fp: u64,
+    position: usize,
+    apply: impl FnOnce(&KvSnapshot) -> bool,
+) -> bool {
+    let Some(slot) = mailbox.take() else {
+        return false;
+    };
+    let digest = payload_digest(&slot.payloads);
+    let snap = match handoff_decision(&slot, model_fp, position) {
+        Ok(snap) => snap,
+        Err(HandoffReject::Validate) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                epoch = slot.epoch, rev = KV_ENGINE_REV, fp = model_fp);
+            return false;
+        }
+        Err(HandoffReject::Decode) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+            return false;
+        }
+        Err(HandoffReject::TooLate(depth)) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                epoch = slot.epoch, position, depth);
+            return false;
+        }
+    };
+    if apply(&snap) {
+        tracing::info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
+            epoch = slot.epoch, position, blob_digest = digest);
+        true
+    } else {
+        // restore_kv failed ⇒ this rank stays cold on a turn the commit path armed as warm, and
+        // nothing on this side can undo that. The arm exists to make the failure greppable.
+        tracing::warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
+            epoch = slot.epoch, position);
+        false
+    }
+}
+
 impl KvCoordination for SparseMoEEngine {
     fn model_fingerprint(&self) -> u64 {
-        self.runner.fingerprint().digest()
+        // PLANE-level (model identity only), like the sibling OvMoe engine. A cross-chain move pulls
+        // every rank's KV under ONE fp — the moved-to head's — so a per-stage `digest()` here would
+        // reject every worker rank of a legitimate move, leaving the plane path warm only at rank 0.
+        // Local cache keys keep the full `digest()` (a rank-0 snapshot must never restore on rank 1).
+        self.runner.fingerprint().plane_digest()
     }
 
     fn layout_version(&self) -> u16 {
@@ -304,7 +424,7 @@ impl KvCoordination for SparseMoEEngine {
 
     fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         if !self.kv_prefix_cache.enabled() {
-            return None; // capacity-0 (e.g. total>1, sharded) — nothing to offer
+            return None; // capacity-0 (no kv_coord, or size 0) — nothing to offer
         }
         let fp = self.runner.fingerprint();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
@@ -322,7 +442,8 @@ impl KvCoordination for SparseMoEEngine {
         expected_epoch: u64,
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
-        let model_fp = self.runner.fingerprint().digest();
+        // Plane fp: must equal what the consumer asserts (see `model_fingerprint`).
+        let model_fp = self.runner.fingerprint().plane_digest();
         // Two sources, checked in order:
         //  - `kv_offers`: the head/single-stage NEGOTIATE→GET correlation (short-lived, single-use).
         //  - `kv_capture`: Task 1.3 multi-stage per-rank store (persistent; a worker has no NEGOTIATE,
@@ -337,13 +458,16 @@ impl KvCoordination for SparseMoEEngine {
         if snap.past_seq_len as u32 != expected_len {
             return None; // drifted from what was negotiated
         }
-        Some(snapshot_to_wire(
-            &prefix,
-            &snap,
-            partner,
-            model_fp,
-            expected_epoch,
-        ))
+        let (manifest, payloads) =
+            snapshot_to_wire(&prefix, &snap, partner, model_fp, expected_epoch);
+        // Serve-side identity of exactly what this holder hands out, so it can be compared against
+        // the consumer's `kv_handoff_applied_inline` digest. The length check above is LENGTH-only —
+        // it never compares tokens — so a capture under a colliding synthesized epoch with the same
+        // length but different tokens would serve silently; this is what makes that visible.
+        tracing::info!(target: "cascadia::kv", event = "kv_serve_digest",
+            epoch = expected_epoch, len = expected_len, blob_digest = payload_digest(&payloads),
+            n_tokens = prefix.len(), n_payloads = payloads.len());
+        Some((manifest, payloads))
     }
 
     fn insert(&mut self, manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ()> {
@@ -352,7 +476,7 @@ impl KvCoordination for SparseMoEEngine {
         // `kv_capture[epoch]`, but this only wrote the prefix cache (keyed by tokens), so a plane
         // consumer-insert staged a slice the commit could never find and EVERY plane warm-resume
         // silently voted cold. Done before the `enabled()` early-return: the plane path needs the
-        // staging even where the prefix cache is off (sharded/total>1). Bounded by the same cap as
+        // staging even where the prefix cache is off. Bounded by the same cap as
         // `capture_under_epoch` so staging cannot grow unbounded.
         {
             let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
@@ -367,7 +491,7 @@ impl KvCoordination for SparseMoEEngine {
                 .insert(epoch, (manifest.token_ids.clone(), snap.clone()));
         }
         if !self.kv_prefix_cache.enabled() {
-            return Ok(()); // sharded/total>1: cache disabled → no-op (warm path inert until rig)
+            return Ok(()); // cache disabled → prefix-cache mirror is a no-op; the plane staging above still ran
         }
         let fp = self.runner.fingerprint();
         let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
@@ -385,9 +509,19 @@ impl KvCoordination for SparseMoEEngine {
         // Plane-driven warm-resume: restore the head's own rank-0 slice staged under `epoch`, then
         // RESTORE the whole downstream chain (all-or-nothing). Mirrors the worker RESTORE handler's
         // local apply. A head-local miss ⇒ false (the caller cold-runs; never a partial restore).
-        let local_ok = match self.kv_capture.get(&epoch).cloned() {
-            Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
-            None => false,
+        //
+        // Drain FIRST, never `local_ok || self.drain_kv_handoff()`. The node parks EVERY rank's
+        // slice — rank 0 included — so on a cross-chain pull this head holds both a mailbox slice
+        // and, from an earlier turn, its own same-epoch capture. A trailing `||` short-circuits the
+        // drain away: the head warms from the stale local capture, the pulled slice is never
+        // applied, and the verdict still reads true — a hollow warm nothing aborts (07d9bf2/a8fc4b4).
+        let local_ok = if self.drain_kv_handoff() {
+            true
+        } else {
+            match self.kv_capture.get(&epoch).cloned() {
+                Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                None => false,
+            }
         };
         if !local_ok {
             return false;
@@ -443,7 +577,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         // Replicates `KvCoordination::lookup` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !g.prefix.enabled() {
-            return None; // capacity-0 (e.g. total>1, sharded) — nothing to offer
+            return None; // capacity-0 (no kv_coord, or size 0) — nothing to offer
         }
         // Clone the fingerprint so `g.prefix` can take the `&mut` borrow the lookup needs while `g.fp`
         // is read — a simultaneous field split isn't possible through the mutex guard's Deref.
@@ -688,5 +822,87 @@ mod tests {
         }
         let (epoch, len) = last.expect("negotiate hit");
         assert!(holder.export("peer", epoch, len).is_some());
+    }
+
+    fn slot_of(prefix: &[i32], snap: &KvSnapshot, model_fp: u64) -> KvHandoffSlot {
+        let (manifest, payloads) = snapshot_to_wire(prefix, snap, "peer", model_fp, 0xE0);
+        KvHandoffSlot {
+            epoch: 0xE0,
+            manifest,
+            payloads,
+        }
+    }
+
+    #[test]
+    fn handoff_decision_accepts_a_well_formed_slice() {
+        let prefix = vec![11, 22, 33];
+        let slot = slot_of(&prefix, &snap(), 7);
+        let decided = handoff_decision(&slot, 7, 0).expect("well-formed slice must decide Ok");
+        assert_eq!(decided.past_seq_len, 3);
+        assert_eq!(decided.shells.len(), 1);
+    }
+
+    #[test]
+    fn handoff_decision_rejects_a_foreign_model() {
+        // The hand-off path skips the consumer insert that would otherwise run the codec, so this
+        // check is the ONLY thing standing between a foreign slice and `restore_kv`.
+        let slot = slot_of(&[11, 22, 33], &snap(), 7);
+        assert_eq!(
+            handoff_decision(&slot, 8, 0).unwrap_err(),
+            HandoffReject::Validate,
+            "a slice from another model must not reach restore_kv"
+        );
+    }
+
+    #[test]
+    fn handoff_decision_rejects_a_slice_shallower_than_this_rank() {
+        // Restoring a 3-deep slice into a rank already at 5 would snap the cursor backwards.
+        let slot = slot_of(&[11, 22, 33], &snap(), 7);
+        assert_eq!(
+            handoff_decision(&slot, 7, 5).unwrap_err(),
+            HandoffReject::TooLate(3)
+        );
+        // Equal depth is not "too late" — the guard is `position > depth`.
+        assert!(handoff_decision(&slot, 7, 3).is_ok());
+    }
+
+    #[test]
+    fn drain_handoff_consumes_what_the_plane_parked() {
+        let mailbox = KvHandoffMailbox::new();
+        assert!(
+            !drain_handoff(&mailbox, 7, 0, |_| true),
+            "an empty mailbox drains false"
+        );
+        let (manifest, payloads) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
+        mailbox.put(0xE0, manifest, payloads);
+        assert!(mailbox.ever_parked());
+        let mut applied = None;
+        assert!(drain_handoff(&mailbox, 7, 0, |snap| {
+            applied = Some(snap.past_seq_len);
+            true
+        }));
+        assert_eq!(applied, Some(3), "the parked slice is what got applied");
+        // One slot: a second drain finds nothing.
+        assert!(!drain_handoff(&mailbox, 7, 0, |_| true));
+    }
+
+    #[test]
+    fn drain_handoff_reports_false_when_the_apply_fails() {
+        // A failed restore leaves the rank cold on a turn the commit armed as warm. The drain must
+        // say so, or the RESTORE verdict lies and the head warms over a cold rank.
+        let mailbox = KvHandoffMailbox::new();
+        let (manifest, payloads) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
+        mailbox.put(0xE0, manifest, payloads);
+        assert!(!drain_handoff(&mailbox, 7, 0, |_| false));
+    }
+
+    #[test]
+    fn serve_and_applied_digests_agree() {
+        // Bar: the consumer's applied digest must equal the donor's serve digest. Both sides digest
+        // the payload bytes, so a layout change on one side alone breaks this rather than silently
+        // warming from the wrong bytes.
+        let (_m, served) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
+        let slot = slot_of(&[11, 22, 33], &snap(), 7);
+        assert_eq!(payload_digest(&served), payload_digest(&slot.payloads));
     }
 }

@@ -18,6 +18,11 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::Stream;
 use thiserror::Error;
 
+#[cfg(feature = "kv_coord")]
+pub mod kv_handoff;
+#[cfg(feature = "kv_coord")]
+pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]

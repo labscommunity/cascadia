@@ -370,6 +370,7 @@ dependencies = [
  "cascadia-types",
  "futures",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
