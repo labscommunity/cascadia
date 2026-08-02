@@ -78,7 +78,9 @@ pub fn expert_bytes(dim: usize, inter: usize) -> usize {
 ///
 /// A 16-entry byte table is precisely the shape `vpshufb` consumes, which is
 /// why the nonlinear e2m1 grid can be decoded as cheaply as dsv4's linear one.
-#[cfg(target_arch = "x86_64")]
+///
+/// It is also what makes the VNNI path below possible: `vpdpbusd` multiplies
+/// bytes, and these are the e2m1 grid AS bytes, exactly.
 const LUT2: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// `CASCADIA_K3_SIMD=0` forces the scalar kernel, for A/B measurement.
@@ -87,6 +89,82 @@ fn simd_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("CASCADIA_K3_SIMD").as_deref() != Ok("0"))
+}
+
+/// `CASCADIA_K3_VNNI=1` enables the int8 VNNI kernel. OFF by default.
+///
+/// Off because it is the one path here that is not exact: it quantises the
+/// ACTIVATIONS to int8 per group of 32. The weights are unaffected — they are
+/// already the e2m1 grid and `LUT2` holds it exactly — but `x` is not, so
+/// results differ from every other kernel in this file by more than rounding.
+/// See `vnni_accuracy_vs_exact` for the measured size of that difference.
+#[cfg(target_arch = "x86_64")]
+fn vnni_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_VNNI").as_deref() == Ok("1"))
+}
+
+/// Quantise activations to int8, one scale per [`GROUP`] columns.
+///
+/// `q` is `in_dim` bytes, `qd` is `in_dim / GROUP` floats. Symmetric, no zero
+/// point: the reconstruction is `q[i] * qd[i / GROUP]`.
+///
+/// Clamped to ±127, not ±128. `vpdpbusd` takes one operand unsigned, and the
+/// sign is carried by negating the activation where the weight is negative —
+/// `-128` has no positive counterpart in i8, so it would wrap to itself and
+/// silently flip that term's sign.
+pub fn quantize_activations(x: &[f32], in_dim: usize, q: &mut [i8], qd: &mut [f32]) {
+    debug_assert_eq!(x.len(), in_dim);
+    debug_assert_eq!(q.len(), in_dim);
+    debug_assert_eq!(qd.len(), in_dim / GROUP);
+
+    for ((d, xg), qg) in qd
+        .iter_mut()
+        .zip(x.chunks_exact(GROUP))
+        .zip(q.chunks_exact_mut(GROUP))
+    {
+        let amax = xg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        *d = amax / 127.0;
+        // An all-zero group has no step; a reciprocal here would be infinite and
+        // every value in the group would come out NaN.
+        let inv = if *d > 0.0 { 1.0 / *d } else { 0.0 };
+        for (o, &v) in qg.iter_mut().zip(xg) {
+            *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// Scalar reference for the VNNI kernel: exact int8 arithmetic, no SIMD.
+///
+/// The per-group dot is computed in `i32` and is EXACT — `LUT2` values reach 12
+/// and `q` reaches 127, so a group's 32 terms cannot exceed 48,768. All the
+/// error in this path comes from [`quantize_activations`], none from here,
+/// which is what lets the accuracy test attribute it.
+pub fn dequant_row_dot_q8_scalar(
+    packed_row: &[u8],
+    scales_row: &[u8],
+    q: &[i8],
+    qd: &[f32],
+    in_dim: usize,
+) -> f32 {
+    debug_assert_eq!(packed_row.len(), in_dim / 2);
+    debug_assert_eq!(scales_row.len(), in_dim / GROUP);
+
+    let mut acc = 0.0f32;
+    for (gi, &sb) in scales_row.iter().enumerate() {
+        let base = gi * GROUP;
+        let mut sum = 0i32;
+        for j in 0..GROUP / 2 {
+            let b = packed_row[base / 2 + j];
+            let c = base + 2 * j;
+            sum += LUT2[(b & 0x0F) as usize] as i32 * q[c] as i32;
+            sum += LUT2[(b >> 4) as usize] as i32 * q[c + 1] as i32;
+        }
+        // LUT2 is 2x the real grid, so the 0.5 rides along with the two scales.
+        acc += sum as f32 * (e8m0_to_f32(sb) * 0.5 * qd[gi]);
+    }
+    acc
 }
 
 /// Fused dequant + dot for one output row:
@@ -244,6 +322,88 @@ mod avx2 {
         ))
     }
 
+    /// The int8 VNNI row dot, once per available instruction encoding.
+    ///
+    /// `vpdpbusd` exists twice on Intel: as AVX-VNNI (VEX, what Lunar Lake and
+    /// every other AI-PC part has) and as AVX512-VNNI + VL (EVEX, what the older
+    /// Xeons have). Same operation, different intrinsic, and no single target
+    /// feature covers both — hence one body, two instantiations, picked at
+    /// runtime. Verifying on an AVX512-VNNI box therefore does verify the
+    /// arithmetic that will run on an AI-PC.
+    ///
+    /// Per group of 32 columns this is: one `vpshufb` decode, two `vpsignb` for
+    /// the sign trick, one `vpdpbusd`, one convert and one FMA — against roughly
+    /// 25 operations in the f32 kernel, which spends most of them widening
+    /// `i8 -> i32 -> f32` purely so the FMA has something to eat.
+    ///
+    /// `vpdpbusd` is unsigned x signed. The weights carry the sign, so `|w|`
+    /// becomes the unsigned operand and the sign moves onto the activation:
+    /// `|w| * (q * sign(w)) == w * q`. Where `w == 0` both terms are zeroed,
+    /// which is also correct.
+    macro_rules! vnni_row_dot {
+        ($name:ident, $feat:literal, $dp:ident) => {
+            /// Caller must have checked this kernel's features.
+            #[target_feature(enable = $feat)]
+            pub unsafe fn $name(
+                packed_row: &[u8],
+                scales_row: &[u8],
+                q: &[i8],
+                qd: &[f32],
+                in_dim: usize,
+            ) -> f32 {
+                assert_eq!(packed_row.len(), in_dim / 2);
+                assert_eq!(scales_row.len(), in_dim / GROUP);
+                assert_eq!(q.len(), in_dim);
+                assert_eq!(qd.len(), in_dim / GROUP);
+
+                let lut = _mm_loadu_si128(LUT2.as_ptr() as *const __m128i);
+                let lo_mask = _mm_set1_epi8(0x0F);
+                // Four accumulators for the same reason as the f32 kernel: one
+                // chained FMA per group would be latency-bound, not throughput.
+                let mut acc = [_mm256_setzero_ps(); 4];
+
+                for (gi, &sb) in scales_row.iter().enumerate() {
+                    let base = gi * GROUP;
+                    let pk = _mm_loadu_si128(packed_row.as_ptr().add(base / 2) as *const __m128i);
+                    let lo_n = _mm_and_si128(pk, lo_mask);
+                    let hi_n = _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask);
+                    let lo_v = _mm_shuffle_epi8(lut, lo_n);
+                    let hi_v = _mm_shuffle_epi8(lut, hi_n);
+                    // Interleave back to ascending column order, then join the
+                    // two halves: 32 weights as bytes, ready to multiply.
+                    let w = _mm256_set_m128i(
+                        _mm_unpackhi_epi8(lo_v, hi_v),
+                        _mm_unpacklo_epi8(lo_v, hi_v),
+                    );
+                    let xq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
+
+                    let aw = _mm256_sign_epi8(w, w); // |w|
+                    let sx = _mm256_sign_epi8(xq, w); // q * sign(w)
+                    let dot = $dp(_mm256_setzero_si256(), aw, sx);
+
+                    let s = _mm256_set1_ps(e8m0_to_f32(sb) * 0.5 * *qd.get_unchecked(gi));
+                    let l = gi & 3;
+                    acc[l] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), s, acc[l]);
+                }
+                hsum256(_mm256_add_ps(
+                    _mm256_add_ps(acc[0], acc[1]),
+                    _mm256_add_ps(acc[2], acc[3]),
+                ))
+            }
+        };
+    }
+
+    vnni_row_dot!(
+        dequant_row_dot_avxvnni,
+        "avx2,fma,avxvnni",
+        _mm256_dpbusd_avx_epi32
+    );
+    vnni_row_dot!(
+        dequant_row_dot_avx512vnni,
+        "avx2,fma,avx512vnni,avx512vl",
+        _mm256_dpbusd_epi32
+    );
+
     /// Decode one packed weight row to `in_dim` f32, WITHOUT applying scales.
     ///
     /// This is the half of [`dequant_row_dot_avx2`] that does not depend on `x`:
@@ -339,6 +499,36 @@ mod avx2 {
     }
 }
 
+/// Which `vpdpbusd` encoding this CPU has, if any.
+///
+/// Checked once. AVX-VNNI is the AI-PC form and is preferred; AVX512-VNNI is
+/// what the older server parts expose and exists here so the kernel can be
+/// verified off-target.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq)]
+enum VnniKind {
+    None,
+    Avx,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn vnni_kind() -> VnniKind {
+    use std::sync::OnceLock;
+    static K: OnceLock<VnniKind> = OnceLock::new();
+    *K.get_or_init(|| {
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            VnniKind::None
+        } else if is_x86_feature_detected!("avxvnni") {
+            VnniKind::Avx
+        } else if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") {
+            VnniKind::Avx512
+        } else {
+            VnniKind::None
+        }
+    })
+}
+
 /// `y = W x` for a packed section. `data` is the section's bytes.
 pub fn gemv(data: &[u8], out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(data.len(), section_bytes(out_dim, in_dim));
@@ -347,6 +537,32 @@ pub fn gemv(data: &[u8], out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]
     let (nibs, scales) = data.split_at(nib_bytes);
     let row_nibs = in_dim / 2;
     let row_scales = in_dim / GROUP;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kind = vnni_kind();
+        if vnni_enabled() && simd_enabled() && kind != VnniKind::None && in_dim % GROUP == 0 {
+            // Quantise once for the whole section: `x` is shared by every output
+            // row, so this cost is amortised over `out_dim` dots (3072 of them).
+            let mut q = vec![0i8; in_dim];
+            let mut qd = vec![0.0f32; in_dim / GROUP];
+            quantize_activations(x, in_dim, &mut q, &mut qd);
+            for o in 0..out_dim {
+                let pk = &nibs[o * row_nibs..(o + 1) * row_nibs];
+                let sc = &scales[o * row_scales..(o + 1) * row_scales];
+                // SAFETY: `vnni_kind` feature-detected each branch's encoding,
+                // and the kernel re-checks every slice length with a hard assert.
+                y[o] = unsafe {
+                    match kind {
+                        VnniKind::Avx => avx2::dequant_row_dot_avxvnni(pk, sc, &q, &qd, in_dim),
+                        _ => avx2::dequant_row_dot_avx512vnni(pk, sc, &q, &qd, in_dim),
+                    }
+                };
+            }
+            return;
+        }
+    }
+
     for o in 0..out_dim {
         y[o] = dequant_row_dot(
             &nibs[o * row_nibs..(o + 1) * row_nibs],
@@ -711,6 +927,219 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Quantise/dequantise must round-trip to within half a step.
+    #[test]
+    fn activation_quantization_round_trips() {
+        let in_dim = 256usize;
+        let mut s = 0x1234_5678u64;
+        let x: Vec<f32> = (0..in_dim)
+            .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 20.0 - 10.0)
+            .collect();
+        let mut q = vec![0i8; in_dim];
+        let mut qd = vec![0.0f32; in_dim / GROUP];
+        quantize_activations(&x, in_dim, &mut q, &mut qd);
+
+        for ((gi, &d), (xg, qg)) in qd
+            .iter()
+            .enumerate()
+            .zip(x.chunks_exact(GROUP).zip(q.chunks_exact(GROUP)))
+        {
+            for (j, (&xv, &qv)) in xg.iter().zip(qg).enumerate() {
+                let back = qv as f32 * d;
+                assert!(
+                    (back - xv).abs() <= 0.5 * d + 1e-6,
+                    "col {}: {xv} -> {back} (step {d})",
+                    gi * GROUP + j
+                );
+            }
+        }
+    }
+
+    /// An all-zero group must not produce NaN.
+    ///
+    /// `amax` is 0 there, so the step is 0 and the naive reciprocal is infinite;
+    /// every quantised value would come out NaN and poison the whole dot.
+    #[test]
+    fn activation_quantization_survives_a_zero_group() {
+        let in_dim = 64usize;
+        let mut x = vec![0.0f32; in_dim];
+        for (i, v) in x[32..].iter_mut().enumerate() {
+            *v = (i as f32) * 0.25 - 4.0;
+        }
+        let mut q = vec![0i8; in_dim];
+        let mut qd = vec![0.0f32; in_dim / GROUP];
+        quantize_activations(&x, in_dim, &mut q, &mut qd);
+        assert_eq!(qd[0], 0.0, "zero group should have a zero step");
+        assert!(
+            q[..32].iter().all(|&v| v == 0),
+            "zero group must quantise to 0"
+        );
+        assert!(qd[1] > 0.0);
+    }
+
+    /// The VNNI kernel must agree with the exact int8 reference.
+    ///
+    /// Both do the same integer arithmetic, so any gap here is a SIMD bug — the
+    /// sign trick, the column interleave, or the group-to-accumulator mapping —
+    /// and NOT quantisation error, which both share. Off x86 this compares the
+    /// scalar reference with itself and proves nothing; that is what the
+    /// `vnni active` line in the bench is for.
+    #[test]
+    fn vnni_matches_int8_scalar_reference() {
+        for &in_dim in &[64usize, 3072, 3584] {
+            let (packed, scales, x) = random_row(in_dim, 0x7e57_0000 + in_dim as u64);
+            let mut q = vec![0i8; in_dim];
+            let mut qd = vec![0.0f32; in_dim / GROUP];
+            quantize_activations(&x, in_dim, &mut q, &mut qd);
+            let want = dequant_row_dot_q8_scalar(&packed, &scales, &q, &qd, in_dim);
+
+            #[cfg(target_arch = "x86_64")]
+            let got = match vnni_kind() {
+                VnniKind::None => want,
+                // SAFETY: detected immediately above.
+                VnniKind::Avx => unsafe {
+                    avx2::dequant_row_dot_avxvnni(&packed, &scales, &q, &qd, in_dim)
+                },
+                VnniKind::Avx512 => unsafe {
+                    avx2::dequant_row_dot_avx512vnni(&packed, &scales, &q, &qd, in_dim)
+                },
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let got = want;
+
+            let mag = accumulated_magnitude(&packed, &scales, &x, in_dim);
+            assert!(
+                (got - want).abs() <= 1e-6 * mag,
+                "in_dim {in_dim}: simd {got} vs scalar {want} (mag {mag})"
+            );
+        }
+    }
+
+    /// How much accuracy the int8 activation path actually costs.
+    ///
+    /// This is the number that decides whether `CASCADIA_K3_VNNI` is worth
+    /// turning on, so it prints the measured error rather than only asserting a
+    /// bound. The bound is deliberately loose — it exists to catch a broken
+    /// kernel, not to certify the accuracy; read the printed figure for that.
+    #[test]
+    fn vnni_accuracy_vs_exact() {
+        let mut worst = 0.0f64;
+        for &in_dim in &[3072usize, 3584] {
+            for seed in 0..8u64 {
+                let (packed, scales, x) =
+                    random_row(in_dim, 0xacc0_0000 + seed * 31 + in_dim as u64);
+                let exact = dequant_row_dot_scalar(&packed, &scales, &x, in_dim);
+                let mut q = vec![0i8; in_dim];
+                let mut qd = vec![0.0f32; in_dim / GROUP];
+                quantize_activations(&x, in_dim, &mut q, &mut qd);
+                let q8 = dequant_row_dot_q8_scalar(&packed, &scales, &q, &qd, in_dim);
+
+                let mag = accumulated_magnitude(&packed, &scales, &x, in_dim);
+                let rel = ((q8 - exact).abs() / mag.max(1e-12)) as f64;
+                worst = worst.max(rel);
+            }
+        }
+        println!(
+            "int8 activations: worst error {:.5}% of accumulated magnitude",
+            worst * 100.0
+        );
+        assert!(
+            worst < 0.02,
+            "int8 activation error {worst} is far past quantisation noise — kernel bug, not rounding"
+        );
+    }
+
+    /// f32 `gemv` vs the int8 VNNI `gemv`, at the real K3 expert dims.
+    ///
+    /// Needs a CPU with `vpdpbusd`; the printed `vnni` line says which encoding
+    /// was used, or `None`, in which case both columns are the same f32 kernel
+    /// and the ratio is meaningless. Run with
+    /// `cargo test -p cascadia-engine-sparse-moe vnni_bench -- --nocapture`.
+    #[test]
+    fn vnni_bench() {
+        use std::time::Instant;
+        #[cfg(target_arch = "x86_64")]
+        let kind = match vnni_kind() {
+            VnniKind::Avx => "AVX-VNNI",
+            VnniKind::Avx512 => "AVX512-VNNI",
+            VnniKind::None => "None",
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let kind = "None (not x86_64)";
+        println!("vnni: {kind}");
+
+        for &(out_dim, in_dim) in &[(3072usize, 3584usize), (3584usize, 3072usize)] {
+            let (data, x) = random_section(out_dim, in_dim, 0x5a5a + out_dim as u64);
+            let mut y = vec![0.0f32; out_dim];
+            let reps = 5;
+
+            // f32 path, reached directly so the env gate cannot confuse this.
+            let nib = out_dim * in_dim / 2;
+            let (nibs, scales) = data.split_at(nib);
+            let f32_run = || {
+                for o in 0..out_dim {
+                    std::hint::black_box(dequant_row_dot(
+                        &nibs[o * (in_dim / 2)..(o + 1) * (in_dim / 2)],
+                        &scales[o * (in_dim / GROUP)..(o + 1) * (in_dim / GROUP)],
+                        &x,
+                        in_dim,
+                    ));
+                }
+            };
+            f32_run();
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                f32_run();
+            }
+            let base = t0.elapsed().as_secs_f64() / reps as f64;
+
+            let mut q = vec![0i8; in_dim];
+            let mut qd = vec![0.0f32; in_dim / GROUP];
+            #[cfg(target_arch = "x86_64")]
+            let k = vnni_kind();
+            let vnni_run = || {
+                let mut q = q.clone();
+                let mut qd = qd.clone();
+                quantize_activations(&x, in_dim, &mut q, &mut qd);
+                for o in 0..out_dim {
+                    let pk = &nibs[o * (in_dim / 2)..(o + 1) * (in_dim / 2)];
+                    let sc = &scales[o * (in_dim / GROUP)..(o + 1) * (in_dim / GROUP)];
+                    #[cfg(target_arch = "x86_64")]
+                    let v = unsafe {
+                        match k {
+                            VnniKind::Avx => avx2::dequant_row_dot_avxvnni(pk, sc, &q, &qd, in_dim),
+                            VnniKind::Avx512 => {
+                                avx2::dequant_row_dot_avx512vnni(pk, sc, &q, &qd, in_dim)
+                            }
+                            VnniKind::None => dequant_row_dot(pk, sc, &x, in_dim),
+                        }
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let v = dequant_row_dot(pk, sc, &x, in_dim);
+                    std::hint::black_box(v);
+                }
+            };
+            vnni_run();
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                vnni_run();
+            }
+            let vnni = t1.elapsed().as_secs_f64() / reps as f64;
+
+            quantize_activations(&x, in_dim, &mut q, &mut qd);
+            let g = 2.0 * out_dim as f64 * in_dim as f64;
+            println!(
+                "{out_dim}x{in_dim}: f32 {:.3} ms ({:.1} GFLOP/s), vnni {:.3} ms ({:.1} GFLOP/s), {:.2}x",
+                base * 1e3,
+                g / base / 1e9,
+                vnni * 1e3,
+                g / vnni / 1e9,
+                base / vnni
+            );
+            let _ = &mut y;
         }
     }
 
