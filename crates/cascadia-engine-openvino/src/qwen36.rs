@@ -1284,10 +1284,14 @@ impl Qwen36Engine {
             let resume_emitted = if resume_gen_ids.is_empty() {
                 0
             } else {
-                tokenizer
-                    .decode(&resume_gen_ids, true)
-                    .unwrap_or_default()
-                    .len()
+                match tokenizer.decode(&resume_gen_ids, true) {
+                    Ok(s) => s.len(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "resume seed decode failed");
+                        let reason = format!("resume seed decode failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                }
             };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
@@ -1981,10 +1985,14 @@ impl Qwen36Engine {
             let resume_emitted = if resume_gen_ids.is_empty() {
                 0
             } else {
-                tokenizer
-                    .decode(&resume_gen_ids, true)
-                    .unwrap_or_default()
-                    .len()
+                match tokenizer.decode(&resume_gen_ids, true) {
+                    Ok(s) => s.len(),
+                    Err(e) => {
+                        warn!(task = %task.task_id, error = %e, "resume seed decode failed");
+                        let reason = format!("resume seed decode failed: {e}");
+                        return vec![(task.task_id.clone(), Chunk::error(task.task_id, reason))];
+                    }
+                }
             };
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
