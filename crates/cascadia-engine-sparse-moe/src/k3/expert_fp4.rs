@@ -733,7 +733,7 @@ mod tests {
         let (out_dim, in_dim) = (3072usize, 3584usize);
         let (data, _) = random_section(out_dim, in_dim, 0x2468);
         let reps = 3;
-        for &nrows in &[1usize, 2, 4, 8] {
+        for &nrows in &[1usize, 2, 3, 4, 8, 16, 32, 64] {
             let mut s = 0xbead_0000 + nrows as u64;
             let xs: Vec<f32> = (0..nrows * in_dim)
                 .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
