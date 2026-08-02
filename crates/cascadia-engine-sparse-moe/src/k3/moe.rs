@@ -308,6 +308,51 @@ fn fp4_expert_forward(bytes: &[u8], x: &[f32], d: MoeDims, probe: bool, out: &mu
     expert_fp4::gemv(&bytes[2 * sec_gate..], d.latent, d.inter, &h, out);
 }
 
+/// [`fp4_expert_forward`] for several rows at once, sharing one weight decode.
+///
+/// `xs`: `[nr * latent]`, `outs`: `[nr * latent]`, both row-major.
+///
+/// Prefill often routes several tokens of a batch to the same expert. Running
+/// them one at a time re-decodes the expert's ~17.5 MB for each, and the decode
+/// does not depend on the token — so this hands all of them to
+/// [`expert_fp4::gemm`] instead. The element-wise middle (SiTU, the bf16 round)
+/// stays per row; only the three matmuls are shared.
+fn fp4_expert_forward_batch(bytes: &[u8], xs: &[f32], nr: usize, d: MoeDims, outs: &mut [f32]) {
+    let sec_gate = expert_fp4::section_bytes(d.inter, d.latent);
+    let sec_down = expert_fp4::section_bytes(d.latent, d.inter);
+    debug_assert_eq!(bytes.len(), 2 * sec_gate + sec_down);
+    debug_assert_eq!(xs.len(), nr * d.latent);
+    debug_assert_eq!(outs.len(), nr * d.latent);
+
+    let mut g = vec![0.0f32; nr * d.inter];
+    let mut u = vec![0.0f32; nr * d.inter];
+    expert_fp4::gemm(&bytes[..sec_gate], d.inter, d.latent, xs, nr, &mut g);
+    expert_fp4::gemm(
+        &bytes[sec_gate..2 * sec_gate],
+        d.inter,
+        d.latent,
+        xs,
+        nr,
+        &mut u,
+    );
+
+    let mut h = vec![0.0f32; nr * d.inter];
+    for r in 0..nr {
+        let s = r * d.inter..(r + 1) * d.inter;
+        situ(
+            &g[s.clone()],
+            &u[s.clone()],
+            &mut h[s],
+            d.situ_beta,
+            d.situ_linear_beta,
+        );
+    }
+    for v in h.iter_mut() {
+        *v = to_bf16(*v);
+    }
+    expert_fp4::gemm(&bytes[2 * sec_gate..], d.latent, d.inter, &h, nr, outs);
+}
+
 /// One token through the LatentMoE block. `x`, `out`: `[hidden]`.
 pub fn moe_forward<E: ExpertSource>(
     x: &[f32],
@@ -460,6 +505,9 @@ pub fn moe_forward_batch<E: ExpertSource>(
     // one pass per distinct expert; stage results at their gate slots
     let mut slots = vec![0.0f32; rows * d.top_k * d.latent];
     let mut eo = vec![0.0f32; d.latent];
+    // Reused across experts so the batched path does not allocate per expert.
+    let mut xb: Vec<f32> = Vec::with_capacity(rows * d.latent);
+    let mut ob: Vec<f32> = Vec::with_capacity(rows * d.latent);
     // Same strategy as decode: `None` falls back to the mapping, so this is an
     // I/O choice only. The batch has already unioned the rows, so `distinct` is
     // the widest read this model ever issues.
@@ -479,7 +527,8 @@ pub fn moe_forward_batch<E: ExpertSource>(
             None => experts.expert_bytes(e),
         };
         next += 1;
-        for &(r, k) in hits {
+        if hits.len() == 1 {
+            let (r, k) = hits[0];
             fp4_expert_forward(
                 bytes,
                 &lat[r * d.latent..(r + 1) * d.latent],
@@ -489,6 +538,22 @@ pub fn moe_forward_batch<E: ExpertSource>(
             );
             let base = (r * d.top_k + k) * d.latent;
             slots[base..base + d.latent].copy_from_slice(&eo);
+            continue;
+        }
+        // Several rows chose this expert: gather them contiguous, run one
+        // batched pass so the weights are decoded once, then scatter back to
+        // each row's gate slot. The gather is `hits.len() * latent` floats
+        // against a section that is megabytes, so it pays for itself at nr = 2.
+        let nr = hits.len();
+        xb.clear();
+        for &(r, _) in hits {
+            xb.extend_from_slice(&lat[r * d.latent..(r + 1) * d.latent]);
+        }
+        ob.resize(nr * d.latent, 0.0);
+        fp4_expert_forward_batch(bytes, &xb, nr, d, &mut ob);
+        for (i, &(r, k)) in hits.iter().enumerate() {
+            let base = (r * d.top_k + k) * d.latent;
+            slots[base..base + d.latent].copy_from_slice(&ob[i * d.latent..(i + 1) * d.latent]);
         }
     }
     prof::add(prof::EXPERTS, _t1);

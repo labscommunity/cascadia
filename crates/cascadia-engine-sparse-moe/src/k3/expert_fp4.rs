@@ -243,6 +243,100 @@ mod avx2 {
             _mm256_add_ps(acc2, acc3),
         ))
     }
+
+    /// Decode one packed weight row to `in_dim` f32, WITHOUT applying scales.
+    ///
+    /// This is the half of [`dequant_row_dot_avx2`] that does not depend on `x`:
+    /// `vpshufb` through the table, the interleave, and the `i8 -> i32 -> f32`
+    /// widening. Several activation rows against the same expert can share it.
+    ///
+    /// The scales are deliberately NOT folded in here. Applying them to `x` per
+    /// row, exactly as the single-row kernel does, is what keeps the batched
+    /// result bit-identical to running the rows one at a time — see
+    /// [`dot_decoded_avx2`]. It costs 4 multiplies per group per row, which is
+    /// nothing next to the decode this hoists.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn decode_row_avx2(packed_row: &[u8], in_dim: usize, w: &mut [f32]) {
+        assert_eq!(packed_row.len(), in_dim / 2);
+        assert!(w.len() >= in_dim);
+
+        let lut = _mm_loadu_si128(LUT2.as_ptr() as *const __m128i);
+        let lo_mask = _mm_set1_epi8(0x0F);
+        let wp = w.as_mut_ptr();
+
+        let mut base = 0usize;
+        while base < in_dim {
+            let pk = _mm_loadu_si128(packed_row.as_ptr().add(base / 2) as *const __m128i);
+            let lo_n = _mm_and_si128(pk, lo_mask);
+            let hi_n = _mm_and_si128(_mm_srli_epi16::<4>(pk), lo_mask);
+            let lo_v = _mm_shuffle_epi8(lut, lo_n);
+            let hi_v = _mm_shuffle_epi8(lut, hi_n);
+            let cols_0_15 = _mm_unpacklo_epi8(lo_v, hi_v);
+            let cols_16_31 = _mm_unpackhi_epi8(lo_v, hi_v);
+
+            _mm256_storeu_ps(
+                wp.add(base),
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_0_15)),
+            );
+            _mm256_storeu_ps(
+                wp.add(base + 8),
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_0_15))),
+            );
+            _mm256_storeu_ps(
+                wp.add(base + 16),
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(cols_16_31)),
+            );
+            _mm256_storeu_ps(
+                wp.add(base + 24),
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(cols_16_31))),
+            );
+            base += GROUP;
+        }
+    }
+
+    /// Dot an already-decoded weight row against one activation row.
+    ///
+    /// Bit-identical to [`dequant_row_dot_avx2`] by construction: same four
+    /// accumulators, same lane-to-column assignment, same group order, same
+    /// `x * s_half` scaling, same pairwise reduction. The only difference is
+    /// that `w` arrives from a buffer instead of from `vpshufb`, and the decode
+    /// produces exactly the integers `vpshufb` would have.
+    ///
+    /// That exactness is the point. Prefill batches rows and decode does not,
+    /// and the prefix cache hands prefill's state to decode — so the two paths
+    /// have to agree to the last bit, not merely to a tolerance.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn dot_decoded_avx2(w: &[f32], scales_row: &[u8], x: &[f32], in_dim: usize) -> f32 {
+        assert!(w.len() >= in_dim);
+        assert_eq!(scales_row.len(), in_dim / GROUP);
+        assert_eq!(x.len(), in_dim);
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
+        for (gi, &sb) in scales_row.iter().enumerate() {
+            let base = gi * GROUP;
+            let wp = w.as_ptr().add(base);
+            let xp = x.as_ptr().add(base);
+            let s_half = _mm256_set1_ps(e8m0_to_f32(sb) * 0.5);
+
+            let x0 = _mm256_mul_ps(_mm256_loadu_ps(xp), s_half);
+            let x1 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(8)), s_half);
+            let x2 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(16)), s_half);
+            let x3 = _mm256_mul_ps(_mm256_loadu_ps(xp.add(24)), s_half);
+
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(wp), x0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(8)), x1, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(16)), x2, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(wp.add(24)), x3, acc3);
+        }
+        hsum256(_mm256_add_ps(
+            _mm256_add_ps(acc0, acc1),
+            _mm256_add_ps(acc2, acc3),
+        ))
+    }
 }
 
 /// `y = W x` for a packed section. `data` is the section's bytes.
@@ -260,6 +354,103 @@ pub fn gemv(data: &[u8], out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]
             x,
             in_dim,
         );
+    }
+}
+
+/// `CASCADIA_K3_GEMM=0` forces the per-row `gemv` path, for A/B measurement.
+fn gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CASCADIA_K3_GEMM").as_deref() != Ok("0"))
+}
+
+/// `Y = X Wᵀ` for a packed section: `nrows` activation rows share one decode.
+///
+/// `xs` is `[nrows * in_dim]` and `ys` is `[nrows * out_dim]`, both row-major.
+///
+/// Prefill routes several tokens to the same expert, and calling [`gemv`] once
+/// per token re-decodes the entire section every time. The decode does not
+/// depend on `x`, so this hoists it: one pass over the weights serves up to
+/// [`ROW_BLOCK`] rows.
+///
+/// Bit-identical to `nrows` separate [`gemv`] calls, not merely close: the
+/// per-row arithmetic is the same sequence in the same order, and the hoisted
+/// decode reproduces exactly the integers the fused kernel would have produced.
+/// Prefill batches and decode does not, so the two must not drift.
+pub fn gemm(data: &[u8], out_dim: usize, in_dim: usize, xs: &[f32], nrows: usize, ys: &mut [f32]) {
+    debug_assert_eq!(data.len(), section_bytes(out_dim, in_dim));
+    debug_assert_eq!(xs.len(), nrows * in_dim);
+    debug_assert_eq!(ys.len(), nrows * out_dim);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if gemm_enabled()
+            && nrows > 1
+            && simd_enabled()
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
+            // SAFETY: features detected immediately above; the callee re-checks
+            // every slice length it indexes with a hard assert.
+            unsafe { gemm_avx2(data, out_dim, in_dim, xs, nrows, ys) };
+            return;
+        }
+    }
+    let _ = gemm_enabled();
+    gemm_rowwise(data, out_dim, in_dim, xs, nrows, ys)
+}
+
+/// Reference `gemm`: one [`gemv`] per row. Also the fallback off x86_64.
+pub fn gemm_rowwise(
+    data: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    xs: &[f32],
+    nrows: usize,
+    ys: &mut [f32],
+) {
+    for r in 0..nrows {
+        gemv(
+            data,
+            out_dim,
+            in_dim,
+            &xs[r * in_dim..(r + 1) * in_dim],
+            &mut ys[r * out_dim..(r + 1) * out_dim],
+        );
+    }
+}
+
+/// Decode-once driver: one pass over the weights serves every row.
+///
+/// Output rows outer, activation rows inner. Each weight row is decoded a single
+/// time into `wbuf` and then dotted against all `nrows` activations, so the
+/// decode cost falls by a factor of `nrows` while the per-row arithmetic is
+/// untouched. `wbuf` is `in_dim` f32 — 14 KB at K3's widest — so it stays in L1
+/// across the inner loop, unlike the packed section it came from.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gemm_avx2(
+    data: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    xs: &[f32],
+    nrows: usize,
+    ys: &mut [f32],
+) {
+    let nib_bytes = out_dim * in_dim / 2;
+    let (nibs, scales) = data.split_at(nib_bytes);
+    let row_nibs = in_dim / 2;
+    let row_scales = in_dim / GROUP;
+    let mut wbuf = vec![0.0f32; in_dim];
+
+    for o in 0..out_dim {
+        let pk = &nibs[o * row_nibs..(o + 1) * row_nibs];
+        let sc = &scales[o * row_scales..(o + 1) * row_scales];
+        avx2::decode_row_avx2(pk, in_dim, &mut wbuf);
+        for r in 0..nrows {
+            ys[r * out_dim + o] =
+                avx2::dot_decoded_avx2(&wbuf, sc, &xs[r * in_dim..(r + 1) * in_dim], in_dim);
+        }
     }
 }
 
@@ -461,6 +652,116 @@ mod tests {
                 "row {o}: got {} want {} mag {mag}",
                 got[o],
                 want[o]
+            );
+        }
+    }
+
+    /// `gemm` must be BIT-IDENTICAL to the same rows run one at a time.
+    ///
+    /// Not a tolerance: the hoisted decode is exact and the per-row arithmetic
+    /// is unchanged, so any difference at all means the batched kernel is doing
+    /// something the single-row one is not. Prefill batches, decode does not,
+    /// and the prefix cache feeds one to the other — drift here is a real bug,
+    /// so the test is written to catch it rather than to absorb it.
+    ///
+    /// Row counts 1..=9 include the boundaries a batched kernel gets wrong.
+    #[test]
+    fn gemm_is_bit_identical_to_rowwise_gemv() {
+        let (out_dim, in_dim) = (13usize, 3072usize); // odd row count on purpose
+        let (data, _) = random_section(out_dim, in_dim, 0x3333_7777);
+        for nrows in 1..=9usize {
+            let mut s = 0xfeed_0000 + nrows as u64;
+            let xs: Vec<f32> = (0..nrows * in_dim)
+                .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
+                .collect();
+            let mut got = vec![0.0f32; nrows * out_dim];
+            let mut want = vec![0.0f32; nrows * out_dim];
+            gemm(&data, out_dim, in_dim, &xs, nrows, &mut got);
+            gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut want);
+            assert_eq!(got, want, "nrows {nrows}: batched gemm drifted from gemv");
+        }
+    }
+
+    /// Each row must get ITS OWN activations.
+    ///
+    /// The equality check above would still pass if the kernel broadcast row 0
+    /// to every output row and every row happened to hold the same activations.
+    /// Feeding one nonzero row among zeros pins the mapping: every other output
+    /// row must be exactly zero, and the live one must match `gemv`.
+    #[test]
+    fn gemm_does_not_cross_rows() {
+        let (out_dim, in_dim) = (7usize, 1024usize);
+        let (data, x1) = random_section(out_dim, in_dim, 0x9999_0001);
+        let nrows = 6usize;
+        for live in 0..nrows {
+            let mut xs = vec![0.0f32; nrows * in_dim];
+            xs[live * in_dim..(live + 1) * in_dim].copy_from_slice(&x1);
+            let mut got = vec![0.0f32; nrows * out_dim];
+            gemm(&data, out_dim, in_dim, &xs, nrows, &mut got);
+
+            let mut want = vec![0.0f32; out_dim];
+            gemv(&data, out_dim, in_dim, &x1, &mut want);
+            for r in 0..nrows {
+                for o in 0..out_dim {
+                    let g = got[r * out_dim + o];
+                    if r == live {
+                        assert_eq!(g, want[o], "live row {live} col {o}");
+                    } else {
+                        assert_eq!(g, 0.0, "row {r} should be zero, live row is {live}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prints per-row `gemv` vs batched `gemm` at the real K3 expert dims.
+    ///
+    /// This is the measurement the batched path exists for; it needs an x86 host
+    /// with AVX2, since everywhere else `gemm` is `gemm_rowwise` and both columns
+    /// are the same code. Run with
+    /// `cargo test -p cascadia-engine-sparse-moe gemm_bench -- --nocapture`.
+    #[test]
+    fn gemm_bench() {
+        use std::time::Instant;
+        #[cfg(target_arch = "x86_64")]
+        let simd =
+            simd_enabled() && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd = false;
+        println!("avx2 gemm active: {simd} (false => both columns are gemm_rowwise)");
+
+        let (out_dim, in_dim) = (3072usize, 3584usize);
+        let (data, _) = random_section(out_dim, in_dim, 0x2468);
+        let reps = 3;
+        for &nrows in &[1usize, 2, 4, 8] {
+            let mut s = 0xbead_0000 + nrows as u64;
+            let xs: Vec<f32> = (0..nrows * in_dim)
+                .map(|_| (lcg(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
+                .collect();
+            let mut ys = vec![0.0f32; nrows * out_dim];
+
+            gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+            let t0 = Instant::now();
+            for _ in 0..reps {
+                gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+            }
+            let rowwise = t0.elapsed().as_secs_f64() / reps as f64;
+
+            gemm(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                gemm(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+            }
+            let batched = t1.elapsed().as_secs_f64() / reps as f64;
+
+            let gflops = 2.0 * out_dim as f64 * in_dim as f64 * nrows as f64;
+            println!(
+                "nrows {nrows}: rowwise {:.3} ms ({:.1} GFLOP/s), batched {:.3} ms ({:.1} GFLOP/s), {:.2}x",
+                rowwise * 1e3,
+                gflops / rowwise / 1e9,
+                batched * 1e3,
+                gflops / batched / 1e9,
+                rowwise / batched
             );
         }
     }
