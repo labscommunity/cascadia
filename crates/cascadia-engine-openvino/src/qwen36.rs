@@ -102,7 +102,10 @@ fn selfchk_at() -> Option<usize> {
 ///
 /// `CASCADIA_QWEN36_RESTORE_CLEAR=recreate|reset` restores the old behaviour for A/B work.
 fn restore_clear_mode() -> &'static str {
-    match std::env::var("CASCADIA_QWEN36_RESTORE_CLEAR").ok().as_deref() {
+    match std::env::var("CASCADIA_QWEN36_RESTORE_CLEAR")
+        .ok()
+        .as_deref()
+    {
         Some("recreate") => "recreate_request",
         Some("reset") => "reset_state",
         _ => "none",
@@ -124,7 +127,11 @@ fn decode_fp() -> bool {
 }
 
 fn prefill_chunk() -> usize {
-    if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
+    if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         1
     } else {
         PREFILL_CHUNK
@@ -473,6 +480,8 @@ impl Builder for Qwen36Builder {
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
         }))
     }
 }
@@ -526,6 +535,11 @@ pub struct Qwen36Engine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks a pulled slice in. Drained from
+    /// the `InFrame::Restore` handler — its lock is independent of the engine lock, which is what lets
+    /// the commit path deposit while this engine is mid-`step()`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     /// Plane-restore MODE, parity with ov-runtime (`runtime.rs` `plane_restore`): downstream ranks
     /// warm-resume over the KV plane, so a `false` chain verdict is advisory — cross-chain nothing
     /// satisfies it and the chain cold-resets with rank 0 already warm. Read once from
@@ -1574,14 +1588,25 @@ impl Qwen36Engine {
                 self.peer_epoch = task_epoch;
                 // Carried blob wins: on a CROSS-chain move this rank has no capture under the source
                 // chain's epoch, so the local stash is empty and only the head's inline copy exists.
-                let local_ok = if !blob.is_empty() {
+                // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
+                // parks this rank's slice AND still carries a blob inline, so a `||` after the
+                // carried branch short-circuits the drain away and the rank warms from carried data
+                // while the plane slice goes unread. Chain mode parks nothing, so this is a false
+                // no-op there and the carried/capture path below is unchanged.
+                let local_ok = if self.drain_kv_handoff() {
+                    true
+                } else if !blob.is_empty() {
                     let ok = self.restore_local_stages(&blob);
                     // Cert marker: proves the CARRIED (cross-chain) branch ran, not the same-chain
                     // capture fallback — the two are indistinguishable in the verdict alone. Emitted
                     // ONLY on success, matching `ov_tail_restore_carried`, so the cert's gate counts
                     // successes for both engines rather than attempts for one of them.
                     if ok {
-                        info!(kv_epoch, blob_len = blob.len(), "qwen36_tail_restore_carried");
+                        info!(
+                            kv_epoch,
+                            blob_len = blob.len(),
+                            "qwen36_tail_restore_carried"
+                        );
                     } else {
                         warn!(
                             kv_epoch,
@@ -2059,10 +2084,33 @@ impl Engine for Qwen36Engine {
             model_fp: self.kv_fingerprint(),
         }))
     }
+
+    /// Not gated on `stages` like the two above: a stage-less rank is emb-only rank 0, which is the
+    /// head — it warms through `take_warm`, never through a RESTORE frame, so it is never parked into.
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
 }
 
 #[cfg(feature = "kv_coord")]
 impl Qwen36Engine {
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
+    /// [`crate::kv_coordination::drain_handoff`]; called from the `InFrame::Restore` handler for the
+    /// same two reasons ov-runtime calls it from `OPCODE_RESTORE`: it lands before the turn's forward,
+    /// and it is the only site on the same stream as the commit that parks the slice.
+    ///
+    /// Position 0 because this engine has no KV cursor to protect — see the note in
+    /// `apply_warm_resume`, where the same absence is why the plane depth is logged, not guarded.
+    fn drain_kv_handoff(&mut self) -> bool {
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff);
+        let fp = self.kv_fingerprint();
+        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, |blob| {
+            self.restore_local_stages(blob)
+        })
+    }
+
     /// Snapshot every local stage's OV KV state into one framed opaque blob (emb is stateless).
     /// `None` if any stage can't snapshot (e.g. stub build) — capture degrades to cold reprefill.
     fn blob_local_stages(&mut self) -> Option<Vec<u8>> {
@@ -2125,11 +2173,19 @@ impl Qwen36Engine {
                     let set_fnv = crate::kv_coordination::fnv1a64(part);
                     let rt_fnv = crate::kv_coordination::fnv1a64(&rt);
                     if set_fnv != rt_fnv {
-                        warn!(set_fnv, rt_fnv, set_len = part.len(), rt_len = rt.len(),
-                            "qwen36_state_roundtrip_mismatch (set_state lossy at declared level)");
+                        warn!(
+                            set_fnv,
+                            rt_fnv,
+                            set_len = part.len(),
+                            rt_len = rt.len(),
+                            "qwen36_state_roundtrip_mismatch (set_state lossy at declared level)"
+                        );
                     } else {
-                        info!(fnv = set_fnv, len = part.len(),
-                            "qwen36_state_roundtrip_exact (declared state faithful)");
+                        info!(
+                            fnv = set_fnv,
+                            len = part.len(),
+                            "qwen36_state_roundtrip_exact (declared state faithful)"
+                        );
                     }
                 }
                 Err(e) => warn!(error = %e, "qwen36: get_state_blob for round-trip diag failed"),
@@ -2325,6 +2381,8 @@ mod tests {
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
+            #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
         }
     }
 
@@ -2443,6 +2501,38 @@ mod tests {
             Some("pipeline decode failed: wire closed")
         );
         assert!(e.active.is_none(), "failed task must clear active state");
+    }
+
+    /// Without a mailbox this rank refuses the plane trigger, the head falls back to its local KV,
+    /// and the whole plane no-ops on qwen36 (rig: dist-spec PLANE 6/10, `plane_pulled=false`).
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn kv_handoff_is_advertised() {
+        let e = bare_engine(2, "{}");
+        assert!(cascadia_engine::Engine::kv_handoff(&e).is_some());
+    }
+
+    /// The handle the plane parks into must be the one the RESTORE drain reads, or the slice stays
+    /// parked forever and the rank is cold under a warm head. Only the take is observable off-rig —
+    /// the apply needs a compiled stage — so this asserts the retraction can no longer find it.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn kv_handoff_drain_consumes_what_the_plane_parked() {
+        let mut e = bare_engine(2, "{}");
+        let mb = cascadia_engine::Engine::kv_handoff(&e).unwrap();
+        let (manifest, payloads) = crate::kv_coordination::blob_to_wire(
+            &[1, 2, 3],
+            &[0xAB],
+            "acme",
+            e.kv_fingerprint(),
+            0xE7,
+        );
+        mb.put(0xE7, manifest, payloads);
+        assert!(
+            !e.drain_kv_handoff(),
+            "no stage loaded ⇒ the apply cannot arm"
+        );
+        assert!(!mb.clear(0xE7), "drain must have taken the parked slice");
     }
 
     #[test]

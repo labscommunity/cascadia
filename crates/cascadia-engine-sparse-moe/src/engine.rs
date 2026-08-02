@@ -2517,6 +2517,18 @@ impl SparseMoEEngine {
                 let epoch = self
                     .block_on(recv_restore_body_server(upstream))
                     .map_err(|e| format!("recv_restore: {e}"))?;
+                // DELIBERATELY no plane hand-off mailbox here — this engine takes the
+                // `kv_handoff() -> None` trait default, so a plane rank refuses at trigger and the
+                // head cold-falls back. Reachable only once the capacity-0 sharded serve gap
+                // (kv_coordination.rs, `total>1`) is closed AND a runnable export exists.
+                //
+                // WHEN A MAILBOX IS ADDED: the drain MUST run BEFORE the capture branch below, never
+                // as `local_ok || drain()`. The head ships a carried blob inline even in plane mode,
+                // so a trailing `||` short-circuits the drain away: the rank warms from carried/local
+                // data, the plane slice is never applied, and the verdict still reads true — a silent
+                // hollow warm. That exact bug shipped in three OV engines and cost a full cert cycle
+                // (fixed in 07d9bf2 / a8fc4b4). Mirror those, and see the follow-up issue first.
+                //
                 // Same-chain: restore from this rank's own capture stash. `.get`+clone (not remove) —
                 // a repeat warm-resume over the same epoch may legitimately restore again.
                 let local_ok = match self.kv_capture.get(&epoch).cloned() {

@@ -949,6 +949,56 @@ pub(crate) fn handoff_decision(
     Ok(blob)
 }
 
+/// Drain `mailbox` and hand the decided blob to `apply`. `true` ⇒ this rank is now armed warm, which
+/// is what makes its `RESTORE` verdict truthful in plane mode.
+///
+/// Shared by qwen36 and the dist-spec worker so the five `kv_handoff_*` event names the cert greps —
+/// and the conditions that emit them — cannot drift apart between engines. `OvRuntimeEngine` keeps its
+/// own copy: it logs the POST-apply `position` on success (`apply_warm_resume_blob` advances it), a
+/// field value this helper cannot reproduce from outside the apply.
+///
+/// `position` is the caller's own KV cursor, guarding against a slice shallower than where it already
+/// is; engines that hold no such cursor pass 0, which leaves the guard inert.
+#[cfg(feature = "kv_coord")]
+pub(crate) fn drain_handoff(
+    mailbox: &KvHandoffMailbox,
+    model_fp: u64,
+    position: i64,
+    apply: impl FnOnce(&[u8]) -> bool,
+) -> bool {
+    let Some(slot) = mailbox.take() else {
+        return false;
+    };
+    let blob = match handoff_decision(&slot, model_fp, position) {
+        Ok(blob) => blob,
+        Err(HandoffReject::Validate) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_validate_failed",
+                epoch = slot.epoch, rev = KV_ENGINE_REV, fp = model_fp);
+            return false;
+        }
+        Err(HandoffReject::Decode) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_decode_failed", epoch = slot.epoch);
+            return false;
+        }
+        Err(HandoffReject::TooLate(depth)) => {
+            tracing::warn!(target: "cascadia::kv", event = "kv_handoff_too_late",
+                epoch = slot.epoch, position, depth);
+            return false;
+        }
+    };
+    if apply(&blob) {
+        tracing::info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
+            epoch = slot.epoch, position, blob_digest = byte_digest(&blob));
+        true
+    } else {
+        // set_state failed ⇒ this rank stays cold on a turn the commit path armed as warm, and nothing
+        // on this side can undo that. The arm exists to make the failure greppable.
+        tracing::warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
+            epoch = slot.epoch, position);
+        false
+    }
+}
+
 /// One-slot mailbox handing a pulled warm-resume slice from the KV plane to the engine's recv loop.
 ///
 /// Its mutex is INDEPENDENT of the engine mutex, and the producer side never touches the engine at
@@ -1009,10 +1059,18 @@ impl KvHandoffMailbox {
             Some(s) => g.drained = Some(s.epoch),
             None => {
                 g.empty_drains += 1;
-                // DEBUG, not WARN: an empty drain is the normal case on any rank the plane never
-                // feeds, so this scales with turns. `ever_parked` is the bit worth grepping.
-                tracing::debug!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
-                    count = g.empty_drains, ever_parked = g.ever_parked);
+                // An empty drain on a rank the plane never fed is routine and scales with turns, so
+                // it stays DEBUG. An empty drain on a rank that WAS parked into is the
+                // slice-stranded-under-a-warm-head pathology and must be visible at the level the rig
+                // actually runs (`info`), or it can only be inferred across runs — which is exactly
+                // how the 2026-08-02 cert had to diagnose it.
+                if g.ever_parked {
+                    tracing::info!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
+                        count = g.empty_drains, ever_parked = true);
+                } else {
+                    tracing::debug!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
+                        count = g.empty_drains, ever_parked = false);
+                }
             }
         }
         slot

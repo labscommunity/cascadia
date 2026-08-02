@@ -1947,6 +1947,11 @@ pub struct OvDistSpecWorkerEngine {
     /// Lock-free holder mirror of `kv` so a busy worker still answers cross-chain per-rank GETs.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// Issue-34 plane warm-resume: mailbox the plane's commit parks this rank's pulled slice in.
+    /// Drained from the `FrameKind::Restore` handler; its lock is independent of the engine lock, so
+    /// the commit path can deposit while this worker is mid-`step()`.
+    #[cfg(feature = "kv_coord")]
+    kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     #[cfg(feature = "kv_coord")]
     kv_model_id: String,
 }
@@ -2026,6 +2031,12 @@ impl Engine for OvDistSpecWorkerEngine {
             model_fp: self.kv_fingerprint(),
         }))
     }
+
+    #[cfg(feature = "kv_coord")]
+    fn kv_handoff(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>> {
+        Some(std::sync::Arc::clone(&self.kv_handoff)
+            as std::sync::Arc<dyn cascadia_engine::KvWarmHandoff>)
+    }
 }
 
 impl OvDistSpecWorkerEngine {
@@ -2104,7 +2115,8 @@ impl OvDistSpecWorkerEngine {
                     let mut g = up.lock().await;
                     let eb = g.recv_raw(8).await?;
                     let lb = g.recv_raw(8).await?;
-                    let n = u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
+                    let n =
+                        u64::from_le_bytes(lb.as_slice().try_into().unwrap_or([0u8; 8])) as usize;
                     // recv_raw caps each read at MAX_RAW_BYTES; a whole-state KV blob is far larger, so
                     // drain it in capped chunks (matching the send-side write_all) or the stream desyncs.
                     let blob = if n == 0 {
@@ -2131,10 +2143,21 @@ impl OvDistSpecWorkerEngine {
                 // carried is empty (same-chain restore) fall back to this rank's own CAPTURE. Preferring
                 // a stale local CAPTURE would shadow the carried path whenever the content epoch already
                 // exists locally (e.g. the cert's B-chain warm-up serves the same prompt).
-                let local_ok = if !carried.is_empty() {
+                // Drain FIRST — same reason as ov-runtime's RESTORE arm: in plane mode the head
+                // parks this rank's slice AND still carries a blob inline, so a `||` after the
+                // carried branch short-circuits the drain away and the rank warms from carried data
+                // while the plane slice goes unread. Chain mode parks nothing, so this is a false
+                // no-op there and the carried/capture path below is unchanged.
+                let local_ok = if self.drain_kv_handoff() {
+                    true
+                } else if !carried.is_empty() {
                     let ok = self.runtime.set_state_blob(&carried).is_ok();
                     if ok {
-                        info!(epoch, blob_len = carried.len(), "distspec_tail_restore_carried");
+                        info!(
+                            epoch,
+                            blob_len = carried.len(),
+                            "distspec_tail_restore_carried"
+                        );
                     }
                     ok
                 } else if let Some((_, blob)) = self.kv.take_capture(epoch) {
@@ -2142,6 +2165,10 @@ impl OvDistSpecWorkerEngine {
                 } else {
                     false
                 };
+                // Plane mode parks this rank's slice in the mailbox instead of carrying it on the
+                // RESTORE, so without this both arms above come up empty and the verdict is
+                // structurally false — the head then aborts and falls back to its local KV.
+
                 let down_ok = if self.is_last {
                     true
                 } else {
@@ -2548,6 +2575,8 @@ impl Builder for OvDistSpecWorkerBuilder {
                 crate::kv_coordination::OvKvCache::default(),
             )),
             #[cfg(feature = "kv_coord")]
+            kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
+            #[cfg(feature = "kv_coord")]
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
         }))
     }
@@ -2626,7 +2655,10 @@ impl OvDistSpecEngine {
             .unwrap_or_default();
         let ok = self.draft.kv_restore(&parts[0])
             && self.target.stage0_restore(&parts[1])
-            && self.target.restore_downstream(epoch, carried).unwrap_or(false);
+            && self
+                .target
+                .restore_downstream(epoch, carried)
+                .unwrap_or(false);
         if ok {
             // Each model's cursor = its real KV depth, not the token count (off-by-one — see
             // kv_seq_from_blob). Steady state: draft is 0..=1 behind the target. Align to the target by
@@ -2670,7 +2702,10 @@ impl OvDistSpecEngine {
                 );
                 t_pos
             } else {
-                warn!(d_pos, t_pos, len, "ov-dist-spec: draft/target KV depth out of range; cold reprefill");
+                warn!(
+                    d_pos,
+                    t_pos, len, "ov-dist-spec: draft/target KV depth out of range; cold reprefill"
+                );
                 let _ = self.target.reset();
                 let _ = self.draft.reset();
                 0
@@ -2749,6 +2784,20 @@ impl OvDistSpecWorkerEngine {
     /// matches rank>0 GETs. See the driver's `kv_fingerprint` for the full rationale (fcd3e4e).
     fn kv_fingerprint(&self) -> u64 {
         crate::kv_coordination::fnv1a64(self.kv_model_id.as_bytes())
+    }
+    /// Drain the plane hand-off mailbox and apply the parked slice, if any. See
+    /// [`crate::kv_coordination::drain_handoff`]; called from `FrameKind::Restore` for the same two
+    /// reasons ov-runtime calls it from `OPCODE_RESTORE`: it lands before the turn's forward, and it
+    /// is the only site on the same stream as the commit that parks the slice.
+    ///
+    /// Position 0 because a worker holds no KV cursor of its own — the driver owns the spec-decode
+    /// positions — so the depth guard has nothing to compare against.
+    fn drain_kv_handoff(&mut self) -> bool {
+        let mailbox = std::sync::Arc::clone(&self.kv_handoff);
+        let fp = self.kv_fingerprint();
+        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, |blob| {
+            self.runtime.set_state_blob(blob).is_ok()
+        })
     }
     fn kv_ack_upstream(&mut self, ack_kind: u32, payload: &[u8]) -> Result<(), EngineError> {
         let up = self.upstream.clone();
