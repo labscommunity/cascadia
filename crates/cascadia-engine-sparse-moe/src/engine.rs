@@ -3293,6 +3293,12 @@ impl OvMoeEngine {
         };
         // One-shot: take the carried blob (if any) before the async send.
         let carried = self.kv_downstream.remove(&epoch);
+        // Whether a downstream slice is riding along is the difference between a warm tail and a
+        // cold one, and every site that could drop it was previously silent — a bare RESTORE and a
+        // never-stashed slice look identical from the logs.
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_send", epoch,
+            carried = carried.is_some(), bytes = carried.as_ref().map_or(0, |b| b.len()),
+            stashed_epochs = self.kv_downstream.len());
         let verdict = self.block_on(async {
             match &carried {
                 Some(blob) if blob.len() <= crate::dist::MAX_RESTORE_BLOB_BYTES as usize => {
@@ -3819,9 +3825,15 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         // Issue-34 cross-chain multi-stage: a DOWNSTREAM rank's pulled slice can't be applied on this
         // (head) rank locally; stash it under the content epoch so `forward_restore_downstream` ships it
         // inline via RESTORE_CARRY. Decode eagerly so a corrupt pull votes fail here (not mid-restore).
-        let snap = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads).ok_or(())?;
+        let Some(snap) = crate::ov_kv_coordination::ov_wire_to_snapshot(manifest, payloads) else {
+            tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                reason = "decode", rank = _rank, n_payloads = payloads.len());
+            return Err(());
+        };
         let blob = crate::ov_kv_coordination::ov_blob_encode(&snap);
         let epoch = crate::kv_coordination::synth_epoch(&manifest.token_ids);
+        tracing::info!(target: "cascadia::kv", event = "kv_carry_stash", epoch, rank = _rank,
+            bytes = blob.len(), n_tokens = manifest.token_ids.len());
         // Carried-slice RESTORE addresses each downstream rank BY EPOCH, and every rank's manifest in
         // one pull shares the same token_ids ⇒ the same epoch. With >1 downstream rank (a 3+-stage
         // chain) a second rank's blob would overwrite the first, and `restore_kv` checks only layer
@@ -3831,7 +3843,12 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         // same-blob re-stash (retry) is allowed. (3+-stage carried restore needs per-rank keying — a
         // follow-up; today it degrades to a safe cold.)
         if let Some(existing) = self.kv_downstream.get(&epoch) {
-            return if existing == &blob { Ok(()) } else { Err(()) };
+            let same = existing == &blob;
+            if !same {
+                tracing::warn!(target: "cascadia::kv", event = "kv_carry_stash_rejected",
+                    reason = "epoch_collision", epoch, rank = _rank);
+            }
+            return if same { Ok(()) } else { Err(()) };
         }
         let cap = self.kv_prefix_cache.capacity().max(1);
         while self.kv_downstream.len() >= cap && !self.kv_downstream.contains_key(&epoch) {
