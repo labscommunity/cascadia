@@ -4270,7 +4270,16 @@ impl OvRuntimeEngine {
                 // (bytes past the 8-byte epoch). Use it directly; else restore from a local CAPTURE
                 // stash (the same-chain path, where the rank captured its own slice).
                 let carried = t.data.get(9..).filter(|b| !b.is_empty());
-                let local_ok = if let Some(blob) = carried {
+                // Drain FIRST. In plane mode the head parks this rank's slice in the mailbox AND
+                // still carries a blob inline, so a `||` placed after the carried/capture branch
+                // short-circuits the drain away: the rank warms from the carried blob while the
+                // plane slice is never read, `kv_handoff_applied_inline` never fires, and the
+                // verdict is true so nothing aborts — a hollow warm. The parked slice is the
+                // authoritative cross-chain data, so it wins; chain mode parks nothing, so this is
+                // a false no-op there and the carried/capture path is unchanged.
+                let local_ok = if self.drain_kv_handoff() {
+                    true
+                } else if let Some(blob) = carried {
                     let pos_before = self.position;
                     match self.runtime.set_state_blob(blob) {
                         Ok(()) => {
@@ -4317,11 +4326,6 @@ impl OvRuntimeEngine {
                         None => false,
                     }
                 };
-                // Plane mode parks this rank's slice in the mailbox instead of carrying it on the
-                // RESTORE, so without this the arm above has nothing to restore from and reports a
-                // structurally false verdict. Draining here also puts the apply on the same stream as
-                // the commit that parked it.
-                let local_ok = local_ok || self.drain_kv_handoff();
                 let down_ok = if self.spec.is_last_stage {
                     true
                 } else {
