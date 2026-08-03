@@ -1631,7 +1631,8 @@ impl SparseMoEEngine {
                 Ok(()) => {
                     if let Ok(snap) = self.runner.snapshot_kv() {
                         let fp = self.runner.fingerprint();
-                        let prompt64: Vec<i64> = full_tokens.iter().map(|&t| i64::from(t)).collect();
+                        let prompt64: Vec<i64> =
+                            full_tokens.iter().map(|&t| i64::from(t)).collect();
                         // Mirror into the holder cache so a busy engine still serves this prefix.
                         self.kv_share
                             .lock()
@@ -2793,8 +2794,7 @@ pub struct OvMoeEngine {
     /// stashed on a CAPTURE frame and restored on a matching RESTORE. Bounded
     /// by the prefix-cache capacity.
     #[cfg(feature = "kv_coord")]
-    kv_capture:
-        std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    kv_capture: std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
     /// Cross-chain (Issue-34 Option C) head/single-stage NEGOTIATE→GET offers:
     /// `epoch → (prefix tokens, snapshot)`, short-lived (created on NEGOTIATE, consumed on GET).
     #[cfg(feature = "kv_coord")]
@@ -3247,7 +3247,10 @@ impl OvMoeEngine {
         let snap = match self.runner.snapshot_kv() {
             Ok(s) => s,
             Err(e) => {
-                warn!(rank = self.rank, epoch, "kv capture: snapshot_kv failed: {e}");
+                warn!(
+                    rank = self.rank,
+                    epoch, "kv capture: snapshot_kv failed: {e}"
+                );
                 return;
             }
         };
@@ -3354,7 +3357,9 @@ impl OvMoeEngine {
                         .await
                         .map(|_| ())
                         .map_err(|e| format!("recv_capture_ack: {e}")),
-                    Ok(Some(other)) => Err(format!("expected CaptureAck downstream, got {other:?}")),
+                    Ok(Some(other)) => {
+                        Err(format!("expected CaptureAck downstream, got {other:?}"))
+                    }
                     Ok(None) => Err("downstream closed during capture-ack".into()),
                     Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
                 }
@@ -3404,7 +3409,9 @@ impl OvMoeEngine {
                         .await
                         .map(|(_, v)| v == 1)
                         .map_err(|e| format!("recv_restore_ack: {e}")),
-                    Ok(Some(other)) => Err(format!("expected RestoreAck downstream, got {other:?}")),
+                    Ok(Some(other)) => {
+                        Err(format!("expected RestoreAck downstream, got {other:?}"))
+                    }
                     Ok(None) => Err("downstream closed during restore-ack".into()),
                     Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
                 }
@@ -3452,7 +3459,9 @@ impl OvMoeEngine {
                         .await
                         .map(|(_, v)| v == 1)
                         .map_err(|e| format!("recv_restore_ack: {e}")),
-                    Ok(Some(other)) => Err(format!("expected RestoreAck downstream, got {other:?}")),
+                    Ok(Some(other)) => {
+                        Err(format!("expected RestoreAck downstream, got {other:?}"))
+                    }
                     Ok(None) => Err("downstream closed during restore-ack".into()),
                     Err(e) => Err(format!("recv_kind (restore-ack): {e}")),
                 }
@@ -3697,12 +3706,14 @@ impl Engine for OvMoeEngine {
 
     #[cfg(feature = "kv_coord")]
     fn kv_holder(&self) -> Option<std::sync::Arc<dyn cascadia_engine::KvSnapshotHolder>> {
-        Some(std::sync::Arc::new(crate::ov_kv_coordination::OvMoeKvHolder {
-            cache: std::sync::Arc::clone(&self.kv_share),
-            // Plane-level fp (model-identity only): a cross-chain pull asserts the moved-to head's fp
-            // for EVERY rank's GET, so this tail holder must match despite its per-stage layer span.
-            model_fp: self.runner.fingerprint().plane_digest(),
-        }))
+        Some(std::sync::Arc::new(
+            crate::ov_kv_coordination::OvMoeKvHolder {
+                cache: std::sync::Arc::clone(&self.kv_share),
+                // Plane-level fp (model-identity only): a cross-chain pull asserts the moved-to head's fp
+                // for EVERY rank's GET, so this tail holder must match despite its per-stage layer span.
+                model_fp: self.runner.fingerprint().plane_digest(),
+            },
+        ))
     }
 
     #[cfg(feature = "kv_coord")]

@@ -441,7 +441,10 @@ fn minimax_m2_snapshot_restore_matches_continuous() {
 
     eprintln!("cold: {cold:?}");
     eprintln!("warm: {warm:?}");
-    assert_eq!(warm, cold, "snapshot/restore warm run must match continuous cold run");
+    assert_eq!(
+        warm, cold,
+        "snapshot/restore warm run must match continuous cold run"
+    );
 }
 
 /// Two-stage (rank0 + rank1, in-process, no wire) snapshot/restore round-trip
@@ -456,12 +459,30 @@ fn minimax_m2_two_stage_snapshot_restore_matches_continuous() {
         return;
     };
     let dev = std::env::var("CASCADIA_DEVICE").unwrap_or_else(|_| "CPU".to_string());
-    let mut r0 =
-        OvMoeRunner::load_staged(model_dir.clone(), &dev, PluginConfig::new(), None, 0, 2, 0, 0, false)
-            .expect("load rank0");
-    let mut r1 =
-        OvMoeRunner::load_staged(model_dir, &dev, PluginConfig::new(), None, 1, 2, 0, 0, false)
-            .expect("load rank1");
+    let mut r0 = OvMoeRunner::load_staged(
+        model_dir.clone(),
+        &dev,
+        PluginConfig::new(),
+        None,
+        0,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank0");
+    let mut r1 = OvMoeRunner::load_staged(
+        model_dir,
+        &dev,
+        PluginConfig::new(),
+        None,
+        1,
+        2,
+        0,
+        0,
+        false,
+    )
+    .expect("load rank1");
 
     // One pipeline step: rank0 (embed+its layers) -> rank1 (its layers+head) -> argmax.
     fn pstep(r0: &mut OvMoeRunner, r1: &mut OvMoeRunner, tok: u32, pos: usize) -> u32 {

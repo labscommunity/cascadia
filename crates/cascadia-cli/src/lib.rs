@@ -1371,7 +1371,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
             // re-quantizes on set_state, so a restored state is not bit-equal to a naturally folded one
             // internally even though get_state_blob round-trips the declared bytes exactly — which is
             // what qwen36's own `qwen36_state_roundtrip_exact` diag keeps reporting while bar #1 fails.
-            let mut b = Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total);
+            let mut b =
+                Qwen36Builder::new(&args.model, &args.device).with_rank(args.rank, args.total);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
                 b = b.with_cache_dir(&dir);
             }

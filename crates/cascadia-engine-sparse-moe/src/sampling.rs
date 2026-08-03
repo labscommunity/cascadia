@@ -339,7 +339,10 @@ mod tests {
         for _ in 0..16 {
             assert_eq!(sample(&l, &[], &cfg, &mut s), 7);
         }
-        assert_eq!(s, before, "temperature-0 sampling must not touch the RNG state");
+        assert_eq!(
+            s, before,
+            "temperature-0 sampling must not touch the RNG state"
+        );
     }
 
     #[test]
@@ -352,6 +355,9 @@ mod tests {
         let mut s = 0xDEAD_BEEF_u64;
         let before = s;
         let _ = sample(&l, &[], &cfg, &mut s);
-        assert_ne!(s, before, "temperature>0 sampling must advance the RNG state");
+        assert_ne!(
+            s, before,
+            "temperature>0 sampling must advance the RNG state"
+        );
     }
 }

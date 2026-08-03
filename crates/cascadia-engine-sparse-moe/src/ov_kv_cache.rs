@@ -140,7 +140,10 @@ impl OvMoeKvPrefixCache {
             }
             Some(i) => {
                 self.hits += 1;
-                let entry = self.entries.remove(i).expect("index from enumerate must be valid");
+                let entry = self
+                    .entries
+                    .remove(i)
+                    .expect("index from enumerate must be valid");
                 let hit = (entry.1.snapshot.clone(), entry.1.plane_pulled);
                 self.entries.push_front(entry);
                 Some(hit)

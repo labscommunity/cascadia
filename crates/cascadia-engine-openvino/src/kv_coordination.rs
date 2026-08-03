@@ -118,7 +118,9 @@ pub(crate) fn log_blob_tensors(tag: &str, epoch: u64, blob: &[u8]) {
         let Some(name_len) = u32_at(blob, p).map(|v| v as usize) else {
             return;
         };
-        let Some(name_at) = p.checked_add(4) else { return };
+        let Some(name_at) = p.checked_add(4) else {
+            return;
+        };
         let name = blob
             .get(name_at..name_at.saturating_add(name_len))
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -996,7 +998,6 @@ pub(crate) fn drain_handoff(
         false
     }
 }
-
 
 /// Lock-free [`KvSnapshotHolder`] over a [`SharedKvCache`]. Serves NEGOTIATE/GET by locking ONLY the
 /// snapshot cache — which inference touches only briefly at capture, not across the forward pass — so

@@ -403,6 +403,37 @@ pub trait Builder: Send {
 mod tests {
     use super::*;
 
+    /// The two "frame-start" errors are NOT the same error, and conflating them is easy: both
+    /// start with the same words and both mention a timeout. Only one is fatal.
+    ///
+    ///   frame-start WAIT TIMED OUT after <deadline> ... (retryable)  -> NON-fatal, retry on the
+    ///       same socket. Zero bytes were consumed, so the frame stays aligned. A slow upstream
+    ///       stage must NOT tear the chain down.
+    ///   frame-start IDLE CEILING hit after <ceiling> ... dropped     -> FATAL. The connection was
+    ///       actually dropped (black-holed peer); the loopback is gone.
+    ///
+    /// A rig report attributed a `worker_relay_connection_fatal` exit to the retryable one; the
+    /// archived logs showed every such exit carried "idle ceiling" or "socket closed" instead.
+    /// Pin both directions so a rewording cannot silently flip either.
+    #[test]
+    fn frame_start_retryable_is_not_confused_with_the_fatal_idle_ceiling() {
+        let retryable = "frame-start wait timed out after 59.9999999s with no bytes (retryable)";
+        let fatal =
+            "frame-start idle ceiling hit after 900s; connection dropped (black-holed peer?)";
+
+        assert!(
+            !EngineError::Backend(retryable.into()).is_connection_fatal(),
+            "the retryable frame-start wait must not exit the worker relay loop"
+        );
+        assert!(
+            EngineError::Backend(fatal.into()).is_connection_fatal(),
+            "the idle-ceiling drop is a real dead connection and must stay fatal"
+        );
+        // The discriminator is the substring, not the shared "frame-start"/"timed out" prefix.
+        assert!(retryable.contains("frame-start") && fatal.contains("frame-start"));
+        assert!(!retryable.contains("idle ceiling"));
+    }
+
     #[test]
     fn connection_fatal_classification() {
         // Structural variant.
@@ -442,6 +473,25 @@ mod tests {
         assert!(!EngineError::Io(IoError::from(ErrorKind::NotFound)).is_connection_fatal());
         // Recoverable / unrelated failures are NOT fatal.
         assert!(!EngineError::Backend("bad kind 7".into()).is_connection_fatal());
+        // #40: the bounded frame-start token wait timing out is NON-fatal — it
+        // flattens to this Backend string, which contains "timed out" but NOT
+        // "recv_exact timed out", so it must classify recoverable (the caller
+        // retries on the same live socket). Pin it so a reworded message can't
+        // silently flip it to fatal + drop the once-dialed engine loopback.
+        // The literal duration used to be hardcoded here as "120s", which never matched what
+        // production emits: the message is formatted from the ACTUAL deadline
+        // (`TransportError::FrameStartTimeout(Duration)` → `{0:?}`), and the deadline is
+        // `base.min(TOKEN_RECV_DEADLINE_CEILING)` — so a 60s operator timeout logs ~60s while
+        // the 120s ceiling only caps it. A reader comparing the log against this fixture would
+        // conclude two deadlines disagreed. Assert across a range instead: the classification
+        // must not depend on the number at all.
+        for secs in [1u64, 60, 120, 900] {
+            let msg = format!("frame-start wait timed out after {secs}s with no bytes (retryable)");
+            assert!(
+                !EngineError::Backend(msg.clone()).is_connection_fatal(),
+                "retryable frame-start timeout must NOT be connection-fatal: {msg}"
+            );
+        }
         assert!(
             !EngineError::Backend("worker received LOGITS_RESPONSE".into()).is_connection_fatal()
         );

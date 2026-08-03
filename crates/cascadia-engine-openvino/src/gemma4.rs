@@ -418,7 +418,11 @@ struct ActiveTask {
 /// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
 /// not bit-identical). Mirrors `qwen36::prefill_chunk`.
 fn prefill_chunk() -> usize {
-    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL").ok().as_deref() == Some("1") {
+    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         1
     } else {
         usize::MAX
@@ -888,11 +892,16 @@ impl Gemma4Engine {
                                     warn!(set_fnv = a, rt_fnv = b, set_len = blob.len(), rt_len = rt.len(),
                                         "gemma4_state_roundtrip_mismatch (set_state lossy at declared level)");
                                 } else {
-                                    info!(fnv = a, len = blob.len(),
-                                        "gemma4_state_roundtrip_exact (declared state faithful)");
+                                    info!(
+                                        fnv = a,
+                                        len = blob.len(),
+                                        "gemma4_state_roundtrip_exact (declared state faithful)"
+                                    );
                                 }
                             }
-                            Err(e) => warn!(error = %e, "gemma4: get_state_blob round-trip diag failed"),
+                            Err(e) => {
+                                warn!(error = %e, "gemma4: get_state_blob round-trip diag failed")
+                            }
                         }
                     }
                     if set_ok {
@@ -1557,7 +1566,11 @@ impl Gemma4Engine {
     }
 
     fn has_own_kv(&self) -> bool {
-        self.spec.layer_start < self.spec.total_layers.saturating_sub(self.num_kv_shared_layers)
+        self.spec.layer_start
+            < self
+                .spec
+                .total_layers
+                .saturating_sub(self.num_kv_shared_layers)
     }
 }
 
@@ -1631,7 +1644,10 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
     fn kv_bearing_ranks(&self, total_ranks: usize) -> usize {
         // A stage bears own KV iff its layer range starts before the own-KV layers [0, own).
         // Layers split ceil(total/num_stages) per stage (matches export_gemma4.py).
-        let own = self.spec.total_layers.saturating_sub(self.num_kv_shared_layers);
+        let own = self
+            .spec
+            .total_layers
+            .saturating_sub(self.num_kv_shared_layers);
         if own == 0 || self.num_stages == 0 {
             return total_ranks;
         }
