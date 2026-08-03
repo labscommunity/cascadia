@@ -32,7 +32,8 @@ pub(crate) struct PackedSlot {
     /// Prompt tokens already consumed; `== prompt_ids.len()` once prefilled.
     pub(crate) prompt_fed: usize,
     pub(crate) generated: Vec<i32>,
-    pub(crate) last_text: String,
+    /// Bytes already handed to the client (see `ActiveTask::emitted`).
+    pub(crate) emitted: Vec<u8>,
     pub(crate) last_token: i32,
     pub(crate) started: Instant,
     pub(crate) t_prefill: Duration,
@@ -166,7 +167,7 @@ impl PackedState {
             prompt_ids,
             prompt_fed: shared,
             generated: Vec::new(),
-            last_text: String::new(),
+            emitted: Vec::new(),
             last_token: 0,
             started: Instant::now(),
             t_prefill: Duration::ZERO,

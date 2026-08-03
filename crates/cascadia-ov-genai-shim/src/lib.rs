@@ -746,8 +746,11 @@ fn emittable_len(full: &[u8], running: bool) -> usize {
 /// bytes already handed out cannot be recalled, and emitting the corrected
 /// suffix would duplicate text; re-anchoring at least stops the error
 /// compounding and is reportable.
-#[allow(dead_code)]
-fn advance_emitted(emitted: &mut Vec<u8>, full: &[u8], running: bool) -> (String, bool) {
+///
+/// Public because the ov-runtime static paths need the identical algorithm:
+/// they drive their own tokenizer and have the same non-prefix-stable decode.
+/// One implementation, so the two cannot drift.
+pub fn advance_emitted(emitted: &mut Vec<u8>, full: &[u8], running: bool) -> (String, bool) {
     if !full.starts_with(emitted) {
         emitted.clear();
         emitted.extend_from_slice(full);

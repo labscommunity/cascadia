@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
+    advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, MAX_RANK,
@@ -826,7 +826,10 @@ struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
     generated: Vec<i32>,
-    last_text: String,
+    /// Bytes already handed to the client. Not the decoded text: the delta is
+    /// computed by `advance_emitted`, which holds back an unresolved
+    /// replacement-char run and re-anchors if the decode diverges.
+    emitted: Vec<u8>,
     prefilled: bool,
     last_token: i32,
     /// Wall-clock when the task became active. Used to compute the
@@ -1466,7 +1469,7 @@ impl OvRuntimeEngine {
                 task,
                 prompt_ids,
                 generated: Vec::new(),
-                last_text: String::new(),
+                emitted: Vec::new(),
                 prefilled: false,
                 last_token: 0,
                 started: std::time::Instant::now(),
@@ -1811,23 +1814,23 @@ impl OvRuntimeEngine {
         };
         t.last_token = token;
         t.generated.push(token);
-        let all_ids: Vec<u32> = t.generated.iter().map(|&x| x as u32).collect();
-        let full_text = tok
-            .decode(&all_ids, true)
-            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        // strip_prefix, not byte slicing: BPE can split a UTF-8 glyph across
-        // two tokens, so `last_text` is not always a clean byte prefix.
-        let delta = full_text
-            .strip_prefix(t.last_text.as_str())
-            .unwrap_or(&full_text)
-            .to_string();
-        t.last_text = full_text;
-
+        // Stop conditions first: they decide `running`, which tells
+        // `advance_emitted` whether it may hold back an unresolved
+        // replacement-char run or must flush it.
         let max_tokens = t.task.max_tokens.max(1) as usize;
         let is_eos = eos.contains(&(token as u32));
         let hit_cap = t.generated.len() >= max_tokens;
         let is_final = hit_cap || is_eos;
         let task_id = t.task.task_id.clone();
+
+        let all_ids: Vec<u32> = t.generated.iter().map(|&x| x as u32).collect();
+        let full_text = tok
+            .decode(&all_ids, true)
+            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
+        let (delta, resynced) = advance_emitted(&mut t.emitted, full_text.as_bytes(), !is_final);
+        if resynced {
+            warn!(task = %task_id, slot, "detokenizer decode diverged; re-anchored");
+        }
 
         if !is_final {
             // Explicit count for the same reason: a token whose text lands in
@@ -2110,6 +2113,14 @@ impl OvRuntimeEngine {
         active.last_token = next_token;
         active.generated.push(next_token);
 
+        // Stop conditions first: they decide `running`, which tells
+        // `advance_emitted` whether it may hold back an unresolved
+        // replacement-char run or must flush it.
+        let max_tokens = active.task.max_tokens.max(1) as usize;
+        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
+        let is_final = active.generated.len() >= max_tokens || is_eos;
+        let task_id = active.task.task_id.clone();
+
         let tok = self
             .tokenizer
             .as_ref()
@@ -2118,22 +2129,11 @@ impl OvRuntimeEngine {
         let full_text = tok
             .decode(&all_ids, true)
             .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        // Use strip_prefix instead of byte-slice indexing — `last_text`
-        // is not always a clean byte-prefix of `full_text` (BPE can
-        // emit a partial UTF-8 sequence on token N and complete the
-        // glyph on token N+1, in which case the prefix bytes change).
-        // Slicing past a UTF-8 boundary panics.
-        let delta = full_text
-            .strip_prefix(active.last_text.as_str())
-            .unwrap_or(&full_text)
-            .to_string();
-        active.last_text = full_text;
-
-        let max_tokens = active.task.max_tokens.max(1) as usize;
-        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
-        let is_final = active.generated.len() >= max_tokens || is_eos;
-
-        let task_id = active.task.task_id.clone();
+        let (delta, resynced) =
+            advance_emitted(&mut active.emitted, full_text.as_bytes(), !is_final);
+        if resynced {
+            warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
+        }
         let chunk = if is_final {
             Chunk {
                 task_id: task_id.clone(),
@@ -3795,6 +3795,46 @@ mod tests {
         let mut b = OvRuntimeBuilder::new("/non/existent", 0, 1, "CPU");
         let res = b.load(ShardSpec::single_stage("m", "CPU")).await;
         assert!(res.is_err());
+    }
+
+    /// Byte-level detokenizers emit one U+FFFD per byte they cannot yet decode,
+    /// so a multi-byte glyph arriving across reads appears as a run that later
+    /// RESOLVES — the decode is not prefix-stable, and can even get shorter.
+    /// The old delta (`full.strip_prefix(last).unwrap_or(full)`) re-emitted the
+    /// WHOLE text at that point, so the client saw the prefix twice.
+    #[test]
+    fn delta_does_not_duplicate_when_a_replacement_char_resolves() {
+        // Successive full decodes as tokens arrive: "caf", an undecodable byte,
+        // then the completed glyph, then more text.
+        let decodes = ["caf", "caf\u{FFFD}", "café", "café au lait"];
+
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut client = String::new();
+        for (i, full) in decodes.iter().enumerate() {
+            let running = i + 1 < decodes.len();
+            let (delta, _) = advance_emitted(&mut emitted, full.as_bytes(), running);
+            client.push_str(&delta);
+        }
+        assert_eq!(
+            client, "café au lait",
+            "the client stream must reconstruct the final decode exactly"
+        );
+        assert!(
+            !client.contains('\u{FFFD}'),
+            "an unresolved replacement char must never be handed out: {client:?}"
+        );
+
+        // The regression this replaces, computed the old way for contrast.
+        let mut old = String::new();
+        let mut last = String::new();
+        for full in decodes {
+            old.push_str(full.strip_prefix(last.as_str()).unwrap_or(full));
+            last = full.to_string();
+        }
+        assert!(
+            old.matches("caf").count() > 1,
+            "old logic duplicated the prefix, which is the bug: {old:?}"
+        );
     }
 
     /// A packed variant narrower than its own slot count can never decode every
