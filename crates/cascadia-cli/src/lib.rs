@@ -1539,8 +1539,9 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         if args.total != 1 {
             return Err(anyhow!(
                 "--packed-slots is single-stage only (--total 1); multi-stage packed can lose a \
-                 token frame between ranks and wedge the pipeline. Run the packed worker as a \
-                 single stage, or drop --packed-slots to use the multi-stage baseline path"
+                 token frame between ranks and wedge the pipeline (issue #122). Run the packed \
+                 worker as a single stage, or drop --packed-slots to use the multi-stage baseline \
+                 path"
             ));
         }
     }

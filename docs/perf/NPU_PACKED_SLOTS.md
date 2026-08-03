@@ -171,8 +171,8 @@ saving a full NPU compile and a second resident weight copy.
 > no error on either side. It surfaces after sustained load — roughly two runs in
 > three, and adding the instrumentation masked it once — so it reads as a race in
 > `cascadia-transport` rather than in the packing. Single-stage packed is
-> unaffected and verified across 5 models. Reproduction and evidence:
-> `experiments/.ignore/packed-multistage-transport-handoff.md`.
+> unaffected and verified across 5 models. Evidence, what is ruled out and a
+> reproduction: **issue #122**.
 
 Packing works across a pipeline. Stage 0 ships an I64 `[1, 3, S]` **plan frame**
 (per row: slot id with `-1` for idle, absolute position, and shared-prefix reuse

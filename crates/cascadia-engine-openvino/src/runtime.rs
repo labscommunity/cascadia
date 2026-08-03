@@ -1635,7 +1635,7 @@ impl OvRuntimeEngine {
                     return Err(EngineError::Backend(
                         "packed token recv timed out: the downstream stage did not answer a \
                              plan+hidden pair. Multi-stage packed is known to drop a token frame \
-                             under load (see docs/perf/NPU_PACKED_SLOTS.md); run the packed worker \
+                             under load (issue #122); run the packed worker \
                              single-stage (--total 1)"
                             .into(),
                     ))
