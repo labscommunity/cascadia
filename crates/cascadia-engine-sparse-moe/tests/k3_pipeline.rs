@@ -47,7 +47,7 @@ fn export_dir() -> Option<PathBuf> {
 /// Drive `total` ranks over one prompt, relaying the wire rank to rank.
 fn run_chain(dir: &Path, total: u32, toks: &[u32]) -> Vec<Vec<f32>> {
     let mut ranks: Vec<K3Runner> = (0..total)
-        .map(|r| K3Runner::load(dir, r, total, 64).expect("load rank"))
+        .map(|r| K3Runner::load(dir, r, total, 64, None).expect("load rank"))
         .collect();
     for r in ranks.iter_mut() {
         r.reset();
@@ -88,7 +88,7 @@ fn multi_rank_matches_single_process() {
 #[test]
 fn wire_width_carries_the_block_stack() {
     let Some(dir) = export_dir() else { return };
-    let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let r = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     // tiny: hidden 64, 6 layers, block size 2 -> 3 slots -> (1 + 3) * 64
     assert_eq!(r.hidden_size(), 4 * 64);
     assert_eq!(r.arch_name(), "k3");
@@ -116,7 +116,7 @@ fn batched_prefill_is_bit_exact_vs_per_token() {
     let toks: Vec<u32> = vec![3, 17, 5, 28, 11, 2, 19];
 
     // per-token: the default StagedRunner path
-    let mut a = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let mut a = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     a.reset();
     let w = a.hidden_size();
     let mut per_token = vec![0.0f32; toks.len() * w];
@@ -127,7 +127,7 @@ fn batched_prefill_is_bit_exact_vs_per_token() {
     }
 
     // batched: one call over all rows, batch-union MoE inside
-    let mut b = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let mut b = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     b.reset();
     assert!(
         b.supports_batched_prefill(),
@@ -178,7 +178,7 @@ fn routing_is_recorded_and_autopin_stays_off_by_default() {
         0,
         "autopin engaged without CASCADIA_K3_AUTOPIN"
     );
-    let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let r = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     assert_eq!(r.pinned_experts(), 0, "experts pinned with autopin off");
 }
 
@@ -202,7 +202,7 @@ fn generation_matches_across_single_and_split_sources() {
     );
 
     let gen = |dir: &std::path::Path| {
-        let mut r = K3Runner::load(dir, 0, 1, 64).expect("load");
+        let mut r = K3Runner::load(dir, 0, 1, 64, None).expect("load");
         r.reset();
         r.generate_argmax(&[3, 17, 5, 28], 6)
     };
@@ -236,14 +236,14 @@ fn prefix_restore_plus_suffix_matches_full_prefill() {
     // hold — otherwise there is no way to take the cache out of a run.
     std::env::set_var("CASCADIA_K3_PREFIX_CACHE", "0");
     assert!(
-        !K3Runner::load(&dir, 0, 1, 64)
+        !K3Runner::load(&dir, 0, 1, 64, None)
             .expect("load")
             .prefix_cache_enabled(),
         "an explicit 0 must disable the cache"
     );
     std::env::remove_var("CASCADIA_K3_PREFIX_CACHE");
     assert!(
-        K3Runner::load(&dir, 0, 1, 64)
+        K3Runner::load(&dir, 0, 1, 64, None)
             .expect("load")
             .prefix_cache_enabled(),
         "with no budget set the cache derives one from free RAM"
@@ -251,12 +251,12 @@ fn prefix_restore_plus_suffix_matches_full_prefill() {
 
     std::env::set_var("CASCADIA_K3_PREFIX_CACHE", "268435456"); // 256 MiB
     let hs = {
-        let r = K3Runner::load(&dir, 0, 1, 64).expect("load");
+        let r = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
         r.hidden_size()
     };
 
     // reference: one uninterrupted prefill over the whole prompt
-    let mut a = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let mut a = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     a.reset();
     let mut batch = vec![0.0f32; prompt.len() * hs];
     for (r, &t) in prompt.iter().enumerate() {
@@ -266,7 +266,7 @@ fn prefix_restore_plus_suffix_matches_full_prefill() {
     let want = a.head_logits(&full[(prompt.len() - 1) * hs..prompt.len() * hs]);
 
     // cached: prefill the head, snapshot, reset, restore, prefill only the suffix
-    let mut b = K3Runner::load(&dir, 0, 1, 64).expect("load");
+    let mut b = K3Runner::load(&dir, 0, 1, 64, None).expect("load");
     assert!(b.prefix_cache_enabled(), "budget should enable the cache");
     b.reset();
     let mut head = vec![0.0f32; split * hs];

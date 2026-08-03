@@ -128,6 +128,38 @@ impl K3Manifest {
         }
     }
 
+    /// Routed experts actually dispatched per token, after `--top-k-override`.
+    ///
+    /// K3 streams `top_k * moe_layers * expert_bytes` per token — 16 x 92 x
+    /// 17.5 MB = 25.8 GB — and that is the term decode is bound by, so bytes
+    /// fall exactly in proportion to this number. The same flag on K2.6 measured
+    /// 8 -> 6 as strictly better on BOTH axes: +51% throughput and higher eval
+    /// quality than the manifest default, which the cited work attributes to
+    /// sigmoid routers spreading weight fairly evenly across the top-k. K3 uses
+    /// the same sigmoid + `noaux_tc` router at twice the k.
+    ///
+    /// Only ever lowers. Raising it past what the checkpoint was trained to
+    /// route is not a knob worth exposing, and `moe_gate` asserts against
+    /// exceeding `n_experts` anyway.
+    ///
+    /// Nothing here picks a value — K2.6's number does not transfer on faith,
+    /// and the quality curve has to be measured on K3's own weights. K2.6 also
+    /// found a floor rather than a smooth curve: K=3 of 8 was a real quality
+    /// regression while K=4 was not, so the useful range ends somewhere and the
+    /// sweep has to find where.
+    ///
+    /// `k = 1` is a special case rather than merely the most aggressive setting:
+    /// `moe_gate` skips renormalisation at width 1 (`norm_topk && top_k > 1`),
+    /// so the surviving weight keeps its raw sigmoid score instead of becoming
+    /// 1.0 and the whole block output is scaled by the router's confidence. See
+    /// `gate_weights_renormalise_above_k1_and_not_at_k1`.
+    pub fn effective_top_k(config_top_k: usize, override_k: Option<u32>) -> usize {
+        match override_k {
+            Some(k) => (k as usize).clamp(1, config_top_k),
+            None => config_top_k,
+        }
+    }
+
     pub fn moe_dims(&self, layer: u32) -> MoeDims {
         MoeDims {
             layer,
@@ -323,4 +355,53 @@ pub fn load_layers(
         states.push(state);
     }
     Ok((layers, states))
+}
+
+#[cfg(test)]
+mod top_k_tests {
+    use super::K3Manifest;
+
+    #[test]
+    fn override_only_ever_lowers_top_k() {
+        // K3 ships top_k=16.
+        assert_eq!(K3Manifest::effective_top_k(16, None), 16, "no override");
+        assert_eq!(
+            K3Manifest::effective_top_k(16, Some(6)),
+            6,
+            "the K2.6 value"
+        );
+        assert_eq!(
+            K3Manifest::effective_top_k(16, Some(16)),
+            16,
+            "equal is a no-op"
+        );
+
+        // Raising is clamped away rather than honoured: routing more experts
+        // than the checkpoint was trained for is not a knob, and `moe_gate`
+        // asserts top_k <= n_experts.
+        assert_eq!(
+            K3Manifest::effective_top_k(16, Some(64)),
+            16,
+            "cannot raise"
+        );
+
+        // Zero would route nothing and produce a zero expert contribution.
+        assert_eq!(K3Manifest::effective_top_k(16, Some(0)), 1, "floor is 1");
+    }
+
+    #[test]
+    fn routed_bytes_scale_exactly_with_the_override() {
+        // The whole point: decode is bound by bytes streamed per token, and that
+        // is linear in top_k. If this ratio ever stops holding, the flag has
+        // stopped being an I/O lever and is only a compute one.
+        const LAYERS: usize = 92;
+        const EXPERT_BYTES: usize = 17_547_264;
+        let per_token = |k: usize| k * LAYERS * EXPERT_BYTES;
+
+        let full = per_token(K3Manifest::effective_top_k(16, None));
+        assert_eq!(full, 25_829_572_608, "25.8 GB/token at the shipped top_k");
+
+        let half = per_token(K3Manifest::effective_top_k(16, Some(8)));
+        assert_eq!(half * 2, full, "k=8 must be exactly half the bytes");
+    }
 }

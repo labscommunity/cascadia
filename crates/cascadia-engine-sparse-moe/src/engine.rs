@@ -549,9 +549,14 @@ impl Builder for SparseMoEBuilder {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(crate::k3::stage::K3_DEFAULT_MAX_SEQ);
-            let runner =
-                crate::k3::stage::K3Runner::load(&self.config.model_dir, rank, total, max_seq)
-                    .map_err(|e| EngineError::Backend(format!("kimi_k3 load: {e}")))?;
+            let runner = crate::k3::stage::K3Runner::load(
+                &self.config.model_dir,
+                rank,
+                total,
+                max_seq,
+                self.config.top_k_override,
+            )
+            .map_err(|e| EngineError::Backend(format!("kimi_k3 load: {e}")))?;
             if rank == 0 {
                 let tok_path = self.config.model_dir.join("tokenizer.json");
                 if tok_path.exists() {

@@ -161,8 +161,27 @@ impl Drop for K3Runner {
 
 impl K3Runner {
     /// Load rank `rank` of `total` from an export directory.
-    pub fn load(dir: &Path, rank: u32, total: u32, max_seq: usize) -> Result<Self, K3LoadError> {
-        let m = K3Manifest::load(dir)?;
+    pub fn load(
+        dir: &Path,
+        rank: u32,
+        total: u32,
+        max_seq: usize,
+        top_k_override: Option<u32>,
+    ) -> Result<Self, K3LoadError> {
+        let mut m = K3Manifest::load(dir)?;
+        // Applied before the layers are built: `moe_dims` is evaluated once per
+        // layer at load, so overriding here is what makes every consumer —
+        // routing, the batch-union slot layout, the residency histogram — agree
+        // on one k. Setting it later would leave them disagreeing.
+        let eff = K3Manifest::effective_top_k(m.top_k, top_k_override);
+        if eff != m.top_k {
+            tracing::info!(
+                config_top_k = m.top_k,
+                effective_top_k = eff,
+                "k3: top-k override; routed bytes per token scale with this"
+            );
+            m.top_k = eff;
+        }
         let (lo, hi) = even_layer_split(m.num_hidden_layers, rank, total);
         let first = rank == 0;
         let last = rank == total.max(1) - 1;

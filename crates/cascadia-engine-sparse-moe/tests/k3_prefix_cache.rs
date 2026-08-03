@@ -62,7 +62,7 @@ fn load_with_cache(dir: &Path, budget: &str) -> K3Runner {
     // SAFETY: the lock makes this the only thread touching the variable, and it
     // is consumed by `load` before the guard drops.
     unsafe { std::env::set_var("CASCADIA_K3_PREFIX_CACHE", budget) };
-    K3Runner::load(dir, 0, 1, 64).expect("load tiny k3")
+    K3Runner::load(dir, 0, 1, 64, None).expect("load tiny k3")
 }
 
 #[test]

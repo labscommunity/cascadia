@@ -107,8 +107,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_gen
     );
 
+    // `CASCADIA_K3_TOP_K=<k>` lowers the routed experts per token. Routed bytes
+    // scale with it exactly, so this is the knob the throughput/quality curve is
+    // swept over — which is the only way to choose a value.
+    let top_k_override = std::env::var("CASCADIA_K3_TOP_K")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&k| k > 0);
+    if let Some(k) = top_k_override {
+        println!("[k3_run] top_k override = {k}");
+    }
+
     let t_load = Instant::now();
-    let mut runner = K3Runner::load(&dir, 0, 1, max_seq)?;
+    let mut runner = K3Runner::load(&dir, 0, 1, max_seq, top_k_override)?;
     println!(
         "[k3_run] loaded in {:.1}s (arch={}, pinned={} experts)",
         t_load.elapsed().as_secs_f64(),

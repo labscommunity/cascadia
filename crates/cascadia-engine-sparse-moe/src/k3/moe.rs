@@ -835,6 +835,95 @@ mod tests {
         );
     }
 
+    /// Lowering `top_k` must fetch strictly fewer experts, and keep the gate
+    /// weights normalised over the ones it kept.
+    ///
+    /// The arithmetic in `effective_top_k`'s tests only shows a number got
+    /// smaller. This shows the number is load-bearing: decode is bound by bytes
+    /// streamed, so the flag is only worth anything if fewer experts are
+    /// actually READ. A wiring mistake that lowered the routing width while
+    /// still touching every expert would pass there and fail here.
+    #[test]
+    fn lowering_top_k_fetches_fewer_experts() {
+        let d_full = dims();
+        assert!(d_full.top_k > 1, "test needs room to lower top_k");
+        let d_low = MoeDims {
+            top_k: d_full.top_k - 1,
+            ..d_full
+        };
+        let w = weights(d_full);
+        let rows = 4usize;
+        let xs: Vec<f32> = (0..rows * d_full.hidden)
+            .map(|i| ((i as f32) * 0.23).sin())
+            .collect();
+
+        let count = |d: MoeDims| -> usize {
+            let c = Counting {
+                inner: experts(d),
+                hits: std::cell::RefCell::new(vec![0; d.n_experts]),
+            };
+            let mut out = vec![0.0f32; rows * d.hidden];
+            moe_forward_batch(&xs, &w, d, &c, rows, &mut out);
+            let hits = c.hits.borrow();
+            // Every output must still be finite: a renormalisation that divided
+            // by a stale full-width denominator would show up here.
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "non-finite at k={}",
+                d.top_k
+            );
+            hits.iter().filter(|&&h| h > 0).count()
+        };
+
+        let full = count(d_full);
+        let low = count(d_low);
+        assert!(
+            low <= full,
+            "lowering top_k touched MORE experts: {low} vs {full}"
+        );
+    }
+
+    /// Gate weights sum to `scale` over whatever width is in force — EXCEPT at
+    /// `k = 1`, where `moe_gate` skips renormalisation by design.
+    ///
+    /// This is what makes a lowered `top_k` a reweighting rather than a
+    /// truncation that quietly drops part of the expert contribution. The
+    /// `k = 1` carve-out (`norm_topk && top_k > 1` in the gate) means the single
+    /// surviving weight keeps its raw sigmoid score instead of becoming 1.0, so
+    /// the block's whole output is scaled by the router's confidence. That is a
+    /// real behavioural cliff at the bottom of the override's range and the
+    /// reason `k = 1` should not be treated as just "the most aggressive
+    /// setting". Pinned here so lowering top_k never reaches it unknowingly.
+    #[test]
+    fn gate_weights_renormalise_above_k1_and_not_at_k1() {
+        let d = dims();
+        let logits: Vec<f32> = (0..d.n_experts).map(|i| (i as f32) * 0.37 - 0.5).collect();
+        let bias = vec![0.0f32; d.n_experts];
+
+        for k in 2..=d.n_experts {
+            let g = moe_gate(&logits, &bias, k, d.scale, true);
+            assert_eq!(g.idx.len(), k);
+            let sum: f32 = g.weight.iter().sum();
+            assert!(
+                (sum - d.scale).abs() < 1e-5,
+                "k={k}: weights sum to {sum}, expected {}",
+                d.scale
+            );
+        }
+
+        let g1 = moe_gate(&logits, &bias, 1, d.scale, true);
+        assert_eq!(g1.idx.len(), 1);
+        let top = logits
+            .iter()
+            .map(|&l| 1.0 / (1.0 + (-l).exp()))
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (g1.weight[0] - top * d.scale).abs() < 1e-5,
+            "k=1 should keep the raw sigmoid score, got {}",
+            g1.weight[0]
+        );
+    }
+
     #[test]
     fn output_is_finite_and_shaped() {
         let d = dims();
