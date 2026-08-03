@@ -30,7 +30,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
+    advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
 use cascadia_transport::{
     recv_tensor, send_tensor, ActivationClient, ActivationServer, DType as WireDType,
@@ -1139,7 +1139,8 @@ struct ActiveSpec {
     out: Vec<i64>,
     /// Cumulative byte-length of the detokenized text emitted so far.
     /// Used to compute the streaming delta on each step.
-    last_text_len: usize,
+    /// Bytes already handed to the client (see `decode_delta`).
+    emitted: Vec<u8>,
     /// Token id that became the "always-accepted" prefix for the next
     /// verify call (i.e. the correction from the previous round, or
     /// the first sampled token on the very first round).
@@ -1274,10 +1275,13 @@ impl Engine for OvDistSpecEngine {
         // First step after init: emit a chunk for the first sampled token.
         let chunks = if !active.initialized {
             active.initialized = true;
-            let new_text = decode_delta(&self.tokenizer, &active.out, &mut active.last_text_len);
             // If the first token already hits max_tokens or EOS, finalize now.
+            // Decided before decoding: it is what makes this the terminal read,
+            // which tells decode_delta whether it may hold anything back.
             let hit_eos = self.eos_token_ids.contains(&(active.out[0] as u32));
             let finished = active.out.len() >= max_tokens || hit_eos;
+            let new_text =
+                decode_delta(&self.tokenizer, &active.out, &mut active.emitted, !finished);
             if finished {
                 self.finish_task(task_id.clone(), new_text, 1)
             } else {
@@ -1372,7 +1376,7 @@ impl OvDistSpecEngine {
         Ok(ActiveSpec {
             task,
             out: vec![first],
-            last_text_len: 0,
+            emitted: Vec::new(),
             prev_correction: first,
             d_last_logit,
             stats: SpecDecodeStats::default(),
@@ -1462,7 +1466,12 @@ impl OvDistSpecEngine {
             active.prev_correction = correction;
         }
 
-        let delta = decode_delta(&self.tokenizer, &active.out, &mut active.last_text_len);
+        let delta = decode_delta(
+            &self.tokenizer,
+            &active.out,
+            &mut active.emitted,
+            !(hit_eos || hit_max),
+        );
         Ok(RoundResult {
             delta,
             finished: hit_eos || hit_max,
@@ -1505,20 +1514,27 @@ impl OvDistSpecEngine {
     }
 }
 
-/// Detokenize `tokens` and return only the text that's been added since
-/// the last call. `last_text_len` is updated in place to the new total
-/// byte length so the next call sees only the next delta.
-fn decode_delta(tokenizer: &Tokenizer, tokens: &[i64], last_text_len: &mut usize) -> String {
+/// Detokenize `tokens` and return only the text added since the last call.
+/// `emitted` holds the bytes already handed out; `running` is false on the
+/// terminal read, which flushes anything held back.
+///
+/// Delegates to the shim's `advance_emitted` rather than remembering a byte
+/// LENGTH and slicing at it. That offset is not safe: a detokenizer can rewrite
+/// earlier bytes, so a 3-byte U+FFFD run resolving into a wider glyph leaves
+/// the offset inside that glyph, and slicing a `str` off a char boundary
+/// panics. Guarding only on "the decode got shorter" missed that case.
+fn decode_delta(
+    tokenizer: &Tokenizer,
+    tokens: &[i64],
+    emitted: &mut Vec<u8>,
+    running: bool,
+) -> String {
     let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
     let full = tokenizer.decode(&ids, true).unwrap_or_default();
-    if full.len() <= *last_text_len {
-        // Detokenizer changed its mind about prefix bytes (rare but
-        // possible with BPE tokens). Just emit nothing this round; the
-        // next round will catch up.
-        return String::new();
+    let (delta, diverged) = advance_emitted(emitted, full.as_bytes(), running);
+    if diverged {
+        warn!("spec-decode detokenizer decode diverged; re-anchored");
     }
-    let delta = full[*last_text_len..].to_string();
-    *last_text_len = full.len();
     delta
 }
 
@@ -2260,6 +2276,32 @@ fn lookup_eos(model_dir: &std::path::Path) -> Vec<u32> {
 mod tests {
     use super::*;
     use cascadia_transport::{ActivationClient, ActivationServer};
+
+    /// `decode_delta` used to remember a byte LENGTH and slice `full[len..]`.
+    /// Its only guard was `full.len() <= last_text_len`, which catches a decode
+    /// that got shorter but not one that grew while the boundary moved: a
+    /// 3-byte U+FFFD run resolving into a 4-byte glyph leaves the offset inside
+    /// that glyph, and slicing a `str` off a char boundary PANICS — taking the
+    /// worker down, not just corrupting one response.
+    #[test]
+    fn delta_survives_a_replacement_run_resolving_into_a_wider_glyph() {
+        let decodes = ["abc", "abc\u{FFFD}", "abc\u{1F600}", "abc\u{1F600}!"];
+        // The offset the old code would have sliced at, inside the emoji.
+        let stale = "abc\u{FFFD}".len();
+        assert!(
+            !"abc\u{1F600}".is_char_boundary(stale),
+            "this sequence is only interesting because the offset lands mid-glyph"
+        );
+
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut client = String::new();
+        for (i, full) in decodes.iter().enumerate() {
+            let (delta, _) = advance_emitted(&mut emitted, full.as_bytes(), i + 1 < decodes.len());
+            client.push_str(&delta);
+        }
+        assert_eq!(client, "abc\u{1F600}!");
+        assert!(!client.contains('\u{FFFD}'));
+    }
 
     #[test]
     fn frame_kind_roundtrip() {
