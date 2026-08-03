@@ -1527,11 +1527,22 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         if args.packed_slots < 2 {
             return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
         }
-        // Multi-stage is supported: stage 0 ships an I64 [1,3,S] plan frame
-        // (slot, absolute position and prefix-reuse length per row) ahead of the
-        // [1,S,hidden] block, and the tail replies with one token per row. EVERY
-        // stage must be started with the same --packed-slots, since the slot
-        // count is baked into each stage's IR shape.
+        // Multi-stage packed is withheld pending a wire fault. The mechanism
+        // works — stage 0 ships an I64 [1,3,S] plan frame (slot, absolute
+        // position and prefix-reuse length per row) ahead of the [1,S,hidden]
+        // block, and the tail replies one token per row — but a token frame
+        // intermittently goes missing between the ranks, and rank 0 then blocks
+        // forever on a reply that never comes. Instrumented on NPU: rank 1
+        // logged the reply and advanced, rank 0 never saw it, no error on
+        // either side. Reproduces after sustained load, roughly two runs in
+        // three. Single-stage is unaffected and verified.
+        if args.total != 1 {
+            return Err(anyhow!(
+                "--packed-slots is single-stage only (--total 1); multi-stage packed can lose a \
+                 token frame between ranks and wedge the pipeline. Run the packed worker as a \
+                 single stage, or drop --packed-slots to use the multi-stage baseline path"
+            ));
+        }
     }
     // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
     // different mechanism to --packed-slots above: OV's paged attention on the
@@ -2399,11 +2410,15 @@ mod python_tests {
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains(">= 2"), "{err}");
 
-        // multi-stage packed is allowed (plan + token frames carry per-row state)
+        // Multi-stage packed wedges: a token frame goes missing on the wire and
+        // rank 0 blocks on a reply that never arrives. Refuse it rather than
+        // hand an operator a pipeline that hangs after a while under load.
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
         a.total = 2;
-        assert!(validate_worker_runtime_flags(&a).is_ok());
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--total 1"), "{err}");
+        assert!(err.contains("single-stage"), "{err}");
 
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
