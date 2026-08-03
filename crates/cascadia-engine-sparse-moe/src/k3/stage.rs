@@ -283,6 +283,37 @@ impl K3Runner {
         self.pinned
     }
 
+    /// Routed experts per token, as every MoE layer on this rank currently sees it.
+    pub fn top_k(&self) -> usize {
+        self.layers
+            .iter()
+            .find_map(|l| match &l.ffn {
+                LayerFfn::Moe(_, md, _) => Some(md.top_k),
+                LayerFfn::Dense { .. } => None,
+            })
+            .unwrap_or(self.m.top_k)
+    }
+
+    /// Change the routed width after load, clamped the same way as the flag.
+    ///
+    /// Exists for sweeping k without paying the load again. K3 takes ~1000 s to
+    /// load and a sweep wants several points, so reloading per point would be
+    /// most of the measurement. Returns the value actually applied.
+    ///
+    /// Updates EVERY MoE layer: a partial update would leave the rank routing
+    /// different widths per layer, which is not a configuration anyone wants to
+    /// interpret. Serving would also want this to retune without a restart, but
+    /// nothing calls it on that path today.
+    pub fn set_top_k(&mut self, k: usize) -> usize {
+        let eff = K3Manifest::effective_top_k(self.m.top_k, Some(k as u32));
+        for l in self.layers.iter_mut() {
+            if let LayerFfn::Moe(_, md, _) = &mut l.ffn {
+                md.top_k = eff;
+            }
+        }
+        eff
+    }
+
     /// Fold this rank's expert-map residency into the profiler. Sampled, not
     /// exhaustive — probing every page of a 15.7 GB layer per token would cost
     /// more than the decode.
