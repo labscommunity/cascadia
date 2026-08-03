@@ -1618,10 +1618,29 @@ impl OvRuntimeEngine {
                 .send(&hidden_frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
-            let (reply, _) = guard
-                .recv()
-                .await
-                .map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?;
+            // Bound the reply wait. Having just sent both frames this stage is
+            // OWED a token frame, so a downstream that never answers must not
+            // pin the thread forever — the same reasoning as `reply_bounded` on
+            // the qwen36 path, and the same configured activation timeout. This
+            // is what turns a dropped token frame from a silent permanent wedge
+            // into a reportable error; it does not prevent the drop.
+            let (reply, _) = match tokio::time::timeout(
+                cascadia_transport::recv_timeout(),
+                guard.recv(),
+            )
+            .await
+            {
+                Ok(r) => r.map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?,
+                Err(_) => {
+                    return Err(EngineError::Backend(
+                        "packed token recv timed out: the downstream stage did not answer a \
+                             plan+hidden pair. Multi-stage packed is known to drop a token frame \
+                             under load (see docs/perf/NPU_PACKED_SLOTS.md); run the packed worker \
+                             single-stage (--total 1)"
+                            .into(),
+                    ))
+                }
+            };
             decode_wire_tokens(&reply)
         })
     }
