@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use cascadia_engine_sparse_moe::dist::{
     decode_sampling, encode_sampling, recv_forward_batch_body_server, recv_forward_body_server,
-    recv_kind_client, recv_kind_server, recv_restore_carry_body_server, recv_token_batch_body_client,
-    recv_token_body_client, send_forward, send_forward_batch, send_reset, send_restore_carry,
-    send_token_batch_upstream, send_token_upstream, FrameKind, MAX_BATCH_COUNT, SAMPLING_WIRE_BYTES,
+    recv_kind_client, recv_kind_server, recv_restore_carry_body_server,
+    recv_token_batch_body_client, recv_token_body_client, send_forward, send_forward_batch,
+    send_reset, send_restore_carry, send_token_batch_upstream, send_token_upstream, FrameKind,
+    MAX_BATCH_COUNT, SAMPLING_WIRE_BYTES,
 };
 use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
@@ -464,12 +465,17 @@ async fn restore_carry_round_trips_blob_larger_than_max_raw() {
     let epoch = 0xABCD_1234_5678_9F00u64;
     let blob_send = blob.clone();
     let send_task = tokio::spawn(async move {
-        send_restore_carry(&client, epoch, &blob_send).await.unwrap();
+        send_restore_carry(&client, epoch, &blob_send)
+            .await
+            .unwrap();
     });
     let kind = recv_kind_server(&server).await.unwrap();
     assert_eq!(kind, Some(FrameKind::RestoreCarry));
     let (got_epoch, got_blob) = recv_restore_carry_body_server(&server).await.unwrap();
     assert_eq!(got_epoch, epoch);
-    assert_eq!(got_blob, blob, "chunked recv must reassemble the blob byte-identically");
+    assert_eq!(
+        got_blob, blob,
+        "chunked recv must reassemble the blob byte-identically"
+    );
     send_task.await.unwrap();
 }

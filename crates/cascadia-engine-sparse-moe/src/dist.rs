@@ -53,7 +53,8 @@
 use std::sync::Arc;
 
 use cascadia_transport::{
-    ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult, MAX_RAW_BYTES,
+    ActivationClient, ActivationServer, DType, Tensor, TransportError, TransportResult,
+    MAX_RAW_BYTES,
 };
 use tokio::sync::Mutex;
 
@@ -144,7 +145,7 @@ pub enum FrameKind {
     // RestoreAck(E, verdict) flows upstream like CaptureAck, carrying the all-or-nothing verdict
     // (1 ⇒ that rank AND its whole downstream restored). An older peer lacking these rejects them in
     // `from_code` (loud, not silent corruption).
-    Restore = 0x53_4D_45_40,    // "SME\x40" — head→down: restore each stage's KV captured under epoch E
+    Restore = 0x53_4D_45_40, // "SME\x40" — head→down: restore each stage's KV captured under epoch E
     RestoreAck = 0x53_4D_45_41, // "SME\x41" — up: verdict byte (1 = restored, 0 = missed ⇒ head cold)
     // Issue-34 cross-chain: like Restore but CARRIES the pulled slice blob inline (epoch + len + blob).
     // The moved-to head sends this to a moved-to tail that has NO local capture for a FOREIGN chain's

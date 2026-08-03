@@ -4297,8 +4297,7 @@ impl OvRuntimeEngine {
                                 mode = "chain",
                                 "ov_tail_restore_carried"
                             );
-                            crate::kv_coordination::log_blob_tensors(
-                                "restore_chain", epoch, blob);
+                            crate::kv_coordination::log_blob_tensors("restore_chain", epoch, blob);
                             true
                         }
                         Err(e) => {
@@ -4354,9 +4353,7 @@ impl OvRuntimeEngine {
             ))),
         }
     }
-
 }
-
 
 // -------- Builder --------
 
