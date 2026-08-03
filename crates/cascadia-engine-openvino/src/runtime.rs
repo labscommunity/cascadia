@@ -316,6 +316,24 @@ fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
+/// Refuse a packed variant whose query window is narrower than its slot count.
+///
+/// A decode step lays down one row per ready slot, but the plan is only
+/// `packed_seq` rows wide — so with `packed_seq < slots` the slots past the
+/// window never get a row, and sampling then asks for a logits row the output
+/// does not contain. `packed_seq > slots` is fine and useful: the extra rows
+/// widen a prefill chunk. Only the narrow case is broken.
+fn packed_geometry_error(slots: u32, packed_seq: u32) -> Option<String> {
+    (packed_seq < slots).then(|| {
+        format!(
+            "packed variant has packed_seq={packed_seq} but packed_slots={slots}: the query \
+             window cannot be narrower than the slot count, or slots beyond it can never \
+             decode. Rebuild with `python tools/packed_variant.py <stage_dir> --slots {slots}` \
+             (packed_seq defaults to the slot count)"
+        )
+    })
+}
+
 /// Refuse a prompt that cannot fit one packed slot's KV region.
 ///
 /// A slot's region is a bounded window: once it fills, the oldest entries slide
@@ -3199,6 +3217,9 @@ impl Builder for OvRuntimeBuilder {
                          (packed_slots={slots}); the slot count is baked into the IR shape"
                     )));
                 }
+                if let Some(msg) = packed_geometry_error(slots, pseq) {
+                    return Err(EngineError::InvalidConfig(msg));
+                }
                 let past_len = ctx - 1;
                 if pctx != past_len + pseq {
                     return Err(EngineError::InvalidConfig(format!(
@@ -3774,6 +3795,27 @@ mod tests {
         let mut b = OvRuntimeBuilder::new("/non/existent", 0, 1, "CPU");
         let res = b.load(ShardSpec::single_stage("m", "CPU")).await;
         assert!(res.is_err());
+    }
+
+    /// A packed variant narrower than its own slot count can never decode every
+    /// slot: `PackedPlan::decode` only lays down `packed_seq` rows, so slots
+    /// beyond that get no row, and the step then samples a logits row the
+    /// output does not have. That surfaces as an untyped step error which the
+    /// runner charges to whichever stream happened to poll. Refuse the geometry
+    /// at load instead.
+    #[test]
+    fn packed_variant_narrower_than_its_slot_count_is_refused() {
+        assert!(
+            packed_geometry_error(8, 8).is_none(),
+            "seq == slots is the norm"
+        );
+        assert!(
+            packed_geometry_error(8, 16).is_none(),
+            "a wider query window than slots is legitimate (fatter prefill chunks)"
+        );
+        let msg = packed_geometry_error(8, 4).expect("seq < slots must be refused");
+        assert!(msg.contains('8') && msg.contains('4'), "{msg}");
+        assert!(msg.contains("packed_seq"), "{msg}");
     }
 
     /// A prompt longer than its slot's KV region cannot be served honestly: the
