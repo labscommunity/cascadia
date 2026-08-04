@@ -240,6 +240,24 @@ int32_t cascadia_pipeline_create_with_draft(
         auto draft_kv = ov::genai::draft_model(
             std::filesystem::path(draft_model_path), draft_dev);
         props.emplace(draft_kv.first, draft_kv.second);
+        // The draft path routes LLMPipeline onto the speculative
+        // continuous-batching impl, whose default SchedulerConfig
+        // (cache_size = 0 = dynamic allocation) resolves to zero physical
+        // KV blocks on shared-memory iGPUs — every generate then fails
+        // "Check 'num_physical_blocks > 0'" at block_manager.hpp. Pin an
+        // explicit cache budget instead. CASCADIA_SPEC_CACHE_GB is consumed
+        // here, never forwarded to the plugin.
+        std::size_t spec_cache_gb = 2;
+        auto it = props.find("CASCADIA_SPEC_CACHE_GB");
+        if (it != props.end()) {
+            spec_cache_gb = static_cast<std::size_t>(
+                std::strtoull(it->second.as<std::string>().c_str(), nullptr, 10));
+            if (spec_cache_gb == 0) spec_cache_gb = 2;
+            props.erase(it);
+        }
+        ov::genai::SchedulerConfig scfg;
+        scfg.cache_size = spec_cache_gb;
+        props[ov::genai::scheduler_config.name()] = scfg;
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
         *out_handle = new cascadia_pipeline_t{std::move(pipe)};
