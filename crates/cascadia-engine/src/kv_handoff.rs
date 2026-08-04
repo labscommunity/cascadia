@@ -85,9 +85,17 @@ impl KvHandoffMailbox {
                 // slice-stranded-under-a-warm-head pathology and must be visible at the level the rig
                 // actually runs (`info`), or it can only be inferred across runs — which is exactly
                 // how the 2026-08-02 cert had to diagnose it.
-                if g.ever_parked {
+                // `ever_parked == false` is NOT purely routine: it also covers the drain that runs
+                // BEFORE the plane's first put, which strands the slice for the rest of the turn and
+                // leaves the rank cold under a warm head. At DEBUG that case is invisible at the
+                // level the rig runs, so a lost race can only be inferred from an ABSENT
+                // `kv_handoff_applied_inline` — which is exactly how the 2026-08-04 cert had to find
+                // it. Make the first few loud either way; the steady-state repeats stay DEBUG so the
+                // turn-scaling counter cannot flood a long run.
+                const LOUD_EMPTY_DRAINS: u64 = 3;
+                if g.ever_parked || g.empty_drains <= LOUD_EMPTY_DRAINS {
                     tracing::info!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
-                        count = g.empty_drains, ever_parked = true);
+                        count = g.empty_drains, ever_parked = g.ever_parked);
                 } else {
                     tracing::debug!(target: "cascadia::kv", event = "kv_handoff_drain_empty",
                         count = g.empty_drains, ever_parked = false);
