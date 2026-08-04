@@ -340,8 +340,22 @@ mod avx2 {
     /// becomes the unsigned operand and the sign moves onto the activation:
     /// `|w| * (q * sign(w)) == w * q`. Where `w == 0` both terms are zeroed,
     /// which is also correct.
+    ///
+    /// `vpdpbssd` (AVX-VNNI-INT8) is signed x signed and needs none of that, so
+    /// the `signed` arm drops both `vpsignb`. Lunar Lake reports `avxvnniint8`,
+    /// so that arm is the one AI-PCs actually take.
     macro_rules! vnni_row_dot {
-        ($name:ident, $feat:literal, $dp:ident) => {
+        ($name:ident, $feat:literal, $dp:ident, unsigned) => {
+            vnni_row_dot!(@body $name, $feat, $dp, |w, xq| (
+                _mm256_sign_epi8(w, w),   // |w|
+                _mm256_sign_epi8(xq, w),  // q * sign(w)
+            ));
+        };
+        ($name:ident, $feat:literal, $dp:ident, signed) => {
+            // Signed x signed: the operands go in as they are.
+            vnni_row_dot!(@body $name, $feat, $dp, |w, xq| (w, xq));
+        };
+        (@body $name:ident, $feat:literal, $dp:ident, $ops:expr) => {
             /// Caller must have checked this kernel's features.
             #[target_feature(enable = $feat)]
             pub unsafe fn $name(
@@ -377,9 +391,9 @@ mod avx2 {
                     );
                     let xq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
 
-                    let aw = _mm256_sign_epi8(w, w); // |w|
-                    let sx = _mm256_sign_epi8(xq, w); // q * sign(w)
-                    let dot = $dp(_mm256_setzero_si256(), aw, sx);
+                    let prep = $ops;
+                    let (a, b) = prep(w, xq);
+                    let dot = $dp(_mm256_setzero_si256(), a, b);
 
                     let s = _mm256_set1_ps(e8m0_to_f32(sb) * 0.5 * *qd.get_unchecked(gi));
                     let l = gi & 3;
@@ -396,12 +410,20 @@ mod avx2 {
     vnni_row_dot!(
         dequant_row_dot_avxvnni,
         "avx2,fma,avxvnni",
-        _mm256_dpbusd_avx_epi32
+        _mm256_dpbusd_avx_epi32,
+        unsigned
     );
     vnni_row_dot!(
         dequant_row_dot_avx512vnni,
         "avx2,fma,avx512vnni,avx512vl",
-        _mm256_dpbusd_epi32
+        _mm256_dpbusd_epi32,
+        unsigned
+    );
+    vnni_row_dot!(
+        dequant_row_dot_avxvnniint8,
+        "avx2,fma,avxvnniint8",
+        _mm256_dpbssd_epi32,
+        signed
     );
 
     /// Decode one packed weight row to `in_dim` f32, WITHOUT applying scales.
@@ -508,7 +530,12 @@ mod avx2 {
 #[derive(Clone, Copy, PartialEq)]
 enum VnniKind {
     None,
+    /// `vpdpbssd`, signed x signed — no sign trick. Lunar Lake has this.
+    AvxInt8,
+    /// `vpdpbusd`, VEX encoding.
     Avx,
+    /// `vpdpbusd`, EVEX. Older server parts; lets the kernel be verified
+    /// off-target, since no AI-PC has it.
     Avx512,
 }
 
@@ -519,6 +546,10 @@ fn vnni_kind() -> VnniKind {
     *K.get_or_init(|| {
         if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
             VnniKind::None
+        } else if is_x86_feature_detected!("avxvnniint8") {
+            // Preferred where present: signed x signed removes two vpsignb per
+            // group of 32 columns.
+            VnniKind::AvxInt8
         } else if is_x86_feature_detected!("avxvnni") {
             VnniKind::Avx
         } else if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512vl") {
@@ -554,6 +585,9 @@ pub fn gemv(data: &[u8], out_dim: usize, in_dim: usize, x: &[f32], y: &mut [f32]
                 // and the kernel re-checks every slice length with a hard assert.
                 y[o] = unsafe {
                     match kind {
+                        VnniKind::AvxInt8 => {
+                            avx2::dequant_row_dot_avxvnniint8(pk, sc, &q, &qd, in_dim)
+                        }
                         VnniKind::Avx => avx2::dequant_row_dot_avxvnni(pk, sc, &q, &qd, in_dim),
                         _ => avx2::dequant_row_dot_avx512vnni(pk, sc, &q, &qd, in_dim),
                     }
@@ -1000,6 +1034,9 @@ mod tests {
             let got = match vnni_kind() {
                 VnniKind::None => want,
                 // SAFETY: detected immediately above.
+                VnniKind::AvxInt8 => unsafe {
+                    avx2::dequant_row_dot_avxvnniint8(&packed, &scales, &q, &qd, in_dim)
+                },
                 VnniKind::Avx => unsafe {
                     avx2::dequant_row_dot_avxvnni(&packed, &scales, &q, &qd, in_dim)
                 },
@@ -1063,7 +1100,8 @@ mod tests {
         use std::time::Instant;
         #[cfg(target_arch = "x86_64")]
         let kind = match vnni_kind() {
-            VnniKind::Avx => "AVX-VNNI",
+            VnniKind::AvxInt8 => "AVX-VNNI-INT8 (vpdpbssd)",
+            VnniKind::Avx => "AVX-VNNI (vpdpbusd)",
             VnniKind::Avx512 => "AVX512-VNNI",
             VnniKind::None => "None",
         };
@@ -1105,6 +1143,9 @@ mod tests {
                     #[cfg(target_arch = "x86_64")]
                     let v = unsafe {
                         match k {
+                            VnniKind::AvxInt8 => {
+                                avx2::dequant_row_dot_avxvnniint8(pk, sc, &q, &qd, in_dim)
+                            }
                             VnniKind::Avx => avx2::dequant_row_dot_avxvnni(pk, sc, &q, &qd, in_dim),
                             VnniKind::Avx512 => {
                                 avx2::dequant_row_dot_avx512vnni(pk, sc, &q, &qd, in_dim)
