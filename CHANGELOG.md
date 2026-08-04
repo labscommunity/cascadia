@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.1.6](https://github.com/labscommunity/cascadia/compare/v0.1.5...v0.1.6) (2026-08-04)
+
+
+### Features
+
+* **npu:** continuous batching on the NPU via packed multi-slot decode ([7cd3190](https://github.com/labscommunity/cascadia/commit/7cd3190dab7c0afd814b077d121d6b45d26d3c05))
+* **npu:** multi-stage packed wire + per-slot cancel ([63e44ee](https://github.com/labscommunity/cascadia/commit/63e44eed1da13868ad23a20e7fdcc09d3f57cebb))
+* **npu:** packed multi-slot substrate for continuous batching (seq-as-batch) ([f36c408](https://github.com/labscommunity/cascadia/commit/f36c40884d462d06429e29027d674abe3b5dec69))
+* **npu:** prefix caching via a shared read-only KV region ([14c9903](https://github.com/labscommunity/cascadia/commit/14c9903fb14704c2e5c1943abd1954f9276e4b3a))
+* **npu:** wire packed multi-slot execution into OvRuntimeEngine ([9ab6746](https://github.com/labscommunity/cascadia/commit/9ab6746dd0b34fa3ab09ec7430c230d95c6c6908))
+
+
+### Bug Fixes
+
+* **dist-spec:** remove a byte-offset slice that could panic the worker ([6ba63b6](https://github.com/labscommunity/cascadia/commit/6ba63b66a93e9b9ff1dbe9ca5baa8112d31c0570))
+* **npu:** answer 413, not 503, when a prompt cannot fit a packed slot ([165fcdd](https://github.com/labscommunity/cascadia/commit/165fcdd131b2c051fe84947931975a07936f32cd))
+* **npu:** bound the packed multi-stage reply wait ([6560dda](https://github.com/labscommunity/cascadia/commit/6560dda6f79f10026ba485c07caadd89af5057e9))
+* **npu:** complete packed prefill inside one step + report prompt_tokens ([481174b](https://github.com/labscommunity/cascadia/commit/481174b4be8f835e15354c7741985ee632f631ae))
+* **npu:** keep attention sinks when a packed slot's KV region slides ([62efd11](https://github.com/labscommunity/cascadia/commit/62efd111ffc4484d2acf98b9569fbba537349947))
+* **npu:** packed usage double-count + f16 wire dtype; document parity findings ([866544a](https://github.com/labscommunity/cascadia/commit/866544a158f243f5b536c8e01fd808693ced221f))
+* **npu:** packed wire must use the block_in_place-aware dispatch ([126b232](https://github.com/labscommunity/cascadia/commit/126b23255f640269d0be1f1bb0398a973a42d666))
+* **npu:** refuse a packed prompt that cannot fit its slot's KV region ([fee9c33](https://github.com/labscommunity/cascadia/commit/fee9c337bd6a3e8f6373fdc9c1d30bf7c85e5815))
+* **npu:** refuse a packed variant narrower than its own slot count ([c5e64c7](https://github.com/labscommunity/cascadia/commit/c5e64c76eed7a977bd082139034fd8e13b301870))
+* **npu:** withhold multi-stage packed — it can lose a token frame and wedge ([db18d0d](https://github.com/labscommunity/cascadia/commit/db18d0d37ecd516482f61d99677f4a607ed217e2))
+* **runtime:** keep attention sinks when the single-task KV ring slides ([feff6b1](https://github.com/labscommunity/cascadia/commit/feff6b1c9a8249f19de3a09b0265a071deb80b76))
+* **runtime:** stop the ov-runtime delta duplicating on a resolved glyph ([428a875](https://github.com/labscommunity/cascadia/commit/428a875311da23cb288ab223bf16f2c2f8b0497e))
+
+
+### Performance
+
+* **npu:** skip the prefill-variant compile in packed mode + NPU e2e results ([205f894](https://github.com/labscommunity/cascadia/commit/205f894fa715d98811b471622f873d94394498db))
+
+
+### Documentation
+
+* **npu:** fix stale plan-frame shape in perf doc — [1,3,S], not [1,2,S] ([0435285](https://github.com/labscommunity/cascadia/commit/04352854418ca4653d55d33f844a825bca00bbdb))
+* **npu:** point the multi-stage gate at its tracking issue ([637cb96](https://github.com/labscommunity/cascadia/commit/637cb9678a4729214d995458afbc374d8e51e490))
+* **npu:** reconcile packed-slots with [#116](https://github.com/labscommunity/cascadia/issues/116) continuous batching ([1ef825f](https://github.com/labscommunity/cascadia/commit/1ef825f440c04af9c57829951c0fe60a1c2997f6))
+* **npu:** record the packed-slots end-to-end run ([1bd4009](https://github.com/labscommunity/cascadia/commit/1bd400949fbe5754bc6e4abcaa05a3b2697b495f))
+
+
+### Testing
+
+* **npu:** add solo-only capture mode ([8f0efe4](https://github.com/labscommunity/cascadia/commit/8f0efe477d91ecb5ca937c4ca297aa9ed8462a1b))
+* **npu:** end-to-end accuracy parity harness for packed multi-slot decode ([3a034a9](https://github.com/labscommunity/cascadia/commit/3a034a9f6b7eb2aed5db9a287f5120e3e79fa5bc))
+* **npu:** scored long-form accuracy benchmark ([6eff7c3](https://github.com/labscommunity/cascadia/commit/6eff7c31b4ea779df56f476ec782239e190748f0))
+* **npu:** scored task-accuracy benchmark for packed decode ([10a76f0](https://github.com/labscommunity/cascadia/commit/10a76f012b3992969053012f1ac9d6d5103ceca5))
+
 ## [0.1.5](https://github.com/labscommunity/cascadia/compare/v0.1.4...v0.1.5) (2026-07-30)
 
 
