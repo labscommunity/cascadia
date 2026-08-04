@@ -184,6 +184,60 @@ impl UsageStats {
         v.into_iter().map(|(e, _)| e).collect()
     }
 
+    /// Share of routed selections the hottest `budget` experts of each layer
+    /// account for — i.e. the hit rate pinning that many would actually buy.
+    ///
+    /// This is the number the whole autopin idea rests on, and nothing computed
+    /// it before: the histogram was recorded and consumed only by
+    /// [`Self::hottest_for`], so a run produced data no one could read.
+    ///
+    /// Compare against `budget / n_experts`, the uniform baseline. If routing is
+    /// uniform, pinning buys exactly its budget fraction and nothing more —
+    /// K3 streams 25.8 GB/token, so at the ~3% of a layer that fits in RAM at
+    /// 4 nodes that would be a ~3% saving, which is noise. Pinning is only worth
+    /// shipping if the hot set is concentrated enough to beat that badly.
+    ///
+    /// Layers are weighted by their own selection counts rather than averaged,
+    /// so a layer that routed more tokens counts for more.
+    pub fn coverage(&self, budget: usize) -> f64 {
+        let total = self.total();
+        if total == 0 || budget == 0 {
+            return 0.0;
+        }
+        let mut per_layer: HashMap<u32, Vec<u64>> = HashMap::new();
+        for ((l, _), &c) in &self.counts {
+            per_layer.entry(*l).or_default().push(c);
+        }
+        let mut covered = 0u64;
+        for v in per_layer.values_mut() {
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            covered += v.iter().take(budget).sum::<u64>();
+        }
+        covered as f64 / total as f64
+    }
+
+    /// Distinct experts this histogram ever saw, per layer (max over layers).
+    ///
+    /// A budget only means something against the width actually exercised: if a
+    /// short run touched 40 of 896 experts, "top 28" covers most of what was
+    /// seen and says nothing about the real distribution.
+    pub fn widest_layer(&self) -> usize {
+        let mut per_layer: HashMap<u32, usize> = HashMap::new();
+        for (l, _) in self.counts.keys() {
+            *per_layer.entry(*l).or_insert(0) += 1;
+        }
+        per_layer.values().copied().max().unwrap_or(0)
+    }
+
+    /// Layers this histogram covers.
+    pub fn layers(&self) -> usize {
+        self.counts
+            .keys()
+            .map(|(l, _)| *l)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     /// `layer expert count` per line — plain text so it can be inspected and
     /// hand-edited on a node without tooling.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -484,6 +538,86 @@ mod advise_tests {
         // Fully confident caps at half the budget, never the whole thing.
         let full = super::autopin_count(1_000_000, 1000);
         assert_eq!(full, 500);
+    }
+
+    /// Coverage must separate the two cases the decision turns on.
+    ///
+    /// Uniform routing => pinning buys exactly its budget fraction and autopin
+    /// is not worth shipping. Concentrated routing => it buys far more. A metric
+    /// that cannot tell these apart would let either conclusion be claimed.
+    #[test]
+    fn coverage_separates_uniform_from_concentrated() {
+        const N: usize = 896;
+        const LAYERS: u32 = 4;
+        const BUDGET: usize = 28; // ~3% of a layer, what fits in RAM at 4 nodes
+
+        // Uniform: every expert selected the same number of times.
+        let mut uni = super::UsageStats::new();
+        for l in 0..LAYERS {
+            for e in 0..N as u32 {
+                for _ in 0..3 {
+                    uni.record(l, e);
+                }
+            }
+        }
+        let c = uni.coverage(BUDGET);
+        let baseline = BUDGET as f64 / N as f64;
+        assert!(
+            (c - baseline).abs() < 1e-9,
+            "uniform coverage {c} should equal the budget fraction {baseline}"
+        );
+
+        // Concentrated: the top BUDGET experts get HOT selections each, the tail
+        // COLD each. The expectation is DERIVED from that rather than written as
+        // a round number — the first version asserted "~0.60" from mental
+        // arithmetic and the real value is 0.617.
+        const HOT: u64 = 600;
+        const COLD: u64 = 12;
+        let mut hot = super::UsageStats::new();
+        for l in 0..LAYERS {
+            for e in 0..BUDGET as u32 {
+                for _ in 0..HOT {
+                    hot.record(l, e);
+                }
+            }
+            for e in BUDGET as u32..N as u32 {
+                for _ in 0..COLD {
+                    hot.record(l, e);
+                }
+            }
+        }
+        let hot_sel = BUDGET as f64 * HOT as f64;
+        let expected = hot_sel / (hot_sel + (N - BUDGET) as f64 * COLD as f64);
+        let c = hot.coverage(BUDGET);
+        assert!(
+            (c - expected).abs() < 1e-9,
+            "concentrated coverage {c} should be {expected}"
+        );
+        assert!(
+            c > baseline * 15.0,
+            "metric failed to distinguish the cases"
+        );
+    }
+
+    /// A budget wider than the experts actually seen must not read as skew.
+    ///
+    /// A short run touches few experts, so "top 28 of 40 seen" covers most of
+    /// the histogram and looks concentrated when it is only sparse. `coverage`
+    /// reports the truth for what it was given; `widest_layer` is what tells the
+    /// caller whether that truth means anything.
+    #[test]
+    fn a_sparse_histogram_is_reported_as_sparse() {
+        let mut u = super::UsageStats::new();
+        for l in 0..2u32 {
+            for e in 0..40u32 {
+                u.record(l, e);
+            }
+        }
+        assert_eq!(u.widest_layer(), 40, "only 40 experts were ever selected");
+        assert_eq!(u.layers(), 2);
+        // Budget exceeding what was seen covers everything — trivially, not
+        // because routing is skewed.
+        assert!((u.coverage(100) - 1.0).abs() < 1e-9);
     }
 
     #[test]
