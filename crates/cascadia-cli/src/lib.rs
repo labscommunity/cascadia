@@ -1869,6 +1869,18 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // the thinking-OFF path (engine sets apply_chat_template=false then);
         // thinking-ON stays on ov-genai's native template, untouched.
         cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
+        // The admission cap must be able to exceed the CB scheduler's
+        // max_num_seqs, or the API refuses streams the batcher could serve
+        // (measured: CB scaling was still near-linear when the default cap
+        // of 16 cut the sweep short). Env override, not a flag, so the
+        // locked arena launch line stays untouched.
+        if let Some(n) = std::env::var("CASCADIA_MAX_CONCURRENT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            cfg.max_concurrent_requests = n;
+        }
         let max_concurrent = cfg.max_concurrent_requests as u64;
         // Shared live counters: the API bumps them on the chat hot path,
         // the dashboard's /api/stats reads them — same Arc, so the cluster
