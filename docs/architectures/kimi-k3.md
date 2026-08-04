@@ -293,6 +293,30 @@ shell validated against a Python CPU reference, not OpenVINO-traced graphs.
 
 The export and first-token bring-up are done — see the measured run above.
 
+### The test suite was reporting green on tests it never ran
+
+Eleven K3 integration tests skip themselves when their fixture is absent, and the
+fixtures are gitignored. They exist on the machine they were generated on and
+nowhere else — so on every remote host, "50 suites passed" meant those eleven
+returned early without executing a line. Every green Linux run cited in this
+document before that was found was, for those paths, vacuous.
+
+`CASCADIA_REQUIRE_FIXTURES=1` now turns a missing fixture into a failure instead
+of a skip, and the fixtures a plain checkout cannot produce are generated rather
+than assumed. CI and any verification run should set it; without it a skip is
+indistinguishable from a pass in the summary line.
+
+This is the same failure as the three features in the table below that reported
+themselves enabled and did nothing. A skip that prints like a pass and a flag
+that sets without engaging are the same bug in different clothing: the signal
+says yes and nothing happened. Prefer checks that fail loudly over checks that
+decline quietly.
+
+A related one in the exporter: its memory headroom was computed as a fraction of
+the per-shard size with no ceiling, so a large shard could reserve tens of GB and
+the export would thrash or die on a smaller box. It is now clamped to a fixed
+upper bound.
+
 ### How the routed experts are fetched
 
 Three strategies over K3's real access pattern — 16 scattered 17.6 MB slices per
@@ -352,21 +376,74 @@ rotational host until it was measured. Kept in git history, not in the code.
 Benchmarked on a Core Ultra 7 258V AI-PC (Arc 140V iGPU, AI Boost NPU) at K3's
 real expert dims via OpenVINO.
 
-The first pass measured OpenVINO's `u4`, a LINEAR grid — K3's mxfp4 is the
-NONLINEAR e2m1 grid, so those numbers described a kernel K3 cannot use.
-Re-measured with e2m1 decoded through a 16-entry Gather, GFLOP/s:
+This section was measured twice and wrong both times before it was right. The
+first pass measured OpenVINO's `u4`, a LINEAR grid — K3's mxfp4 is the NONLINEAR
+e2m1 grid, so those numbers described a kernel K3 cannot use. The second pass
+fixed the grid but held the weights as an OpenVINO `Constant`, and every number
+it produced was constant folding:
 
 ```
-w1/w3 [3072,3584], e2m1
+batch 32, HELD AS CONSTANT — these numbers are void
+        u4 1374    e2m1 1306    f16 1218  GFLOP/s
+```
+
+`f16` does no decode at all, so it cannot be the slowest of the three. All three
+landing within 12% is what folding looks like: OV decoded each variant once at
+compile time and then ran the same pre-decoded f16 matmul. "e2m1 keeps 90% of
+the `u4` bound" measured the compiler, not a kernel.
+
+**A constant is also the wrong shape for K3.** There are 896 x 92 experts and
+nothing stays resident; a real backend compiles ONE graph and streams weights
+through it as an input. Re-measured that way, so nothing can fold:
+
+```
+w1/w3 [3072,3584], weights as a runtime INPUT
  batch    CPU     GPU     NPU
-     1   44.6    51.8    16.9
-     8  209.3   303.0    43.8
-    32  368.0  1305.6   712.3
+     1     4.3     5.4    n/a
+    32    99.5   127.6    n/a     (f16 ceiling: GPU 280.4)
 ```
 
-e2m1 keeps 90% of the `u4` bound at batch 32, so the codebook is not a blocker.
-Dequantizing to f16 at export buys nothing: 1218 GFLOP/s vs e2m1's 1306, for
-3.76x the bytes (17.5 -> 66 MB per expert).
+Three findings follow, and they close the device question rather than open it.
+
+**Native MXFP4 exists in OpenVINO 2026.2 and K3 cannot reach it.** `f4e2m1` and
+`f8e8m0` are real element types — exactly K3's format — and a
+`Convert -> Multiply -> MatMul` over them compiles on CPU and GPU. But the fused
+dequant+matmul op (`FullyConnectedCompressed`) pattern-matches only on
+`v0::Constant` weights *and* scales, so a streamed weight can never select it, on
+any device or version. And `f4e2m1` as a *Parameter* is rejected outright by the
+GPU plugin. Native MXFP4 there is a resident-weight compression feature; K3 has
+no resident weights.
+
+**The iGPU has no MXFP4 kernel at all.** Intel gates MXFP4 dequant marking on
+`arch >= xe3p`; Arc 140V is `xe2`. There are no e2m1 entries anywhere in the GPU
+kernel selector or its OpenCL kernels. Corroborating: Intel ships gpt-oss-20b —
+natively an MXFP4 model — as INT4-MIXED rather than running it native.
+
+**The NPU is out on documented grounds, not measured ones.** Static shapes only,
+and the supported inference types are F32/F16/U8. There is no 4-bit float weight
+type to compile against, and a data-dependent gather into a data-dependent weight
+tensor is not expressible under a compiler that fixes all shapes at compile time.
+
+So for the ROUTED EXPERTS the CPU is not one option among three — it is the only
+one.
+
+**That verdict covers the experts and nothing else, which is narrower than the
+question it was asked to answer.** Every row of it — the rejected `f4e2m1`
+parameter, the constant-only fusion, the xe3p gate, the NPU's missing 4-bit type
+and its static-shape rule — is a property of the streamed fp4 path. The
+always-resident bf16 shell is the opposite workload on every axis that decided
+those rows: bf16 not fp4, static shapes not a data-dependent gather, plain
+supported matmuls not a compression path, and — the one that matters most — it is
+loaded ONCE rather than costing 25.8 GB of transfer per token. The shell is also
+roughly half the wall clock (`experts, share of wall: 46%` above).
+
+None of it has been measured on a device. `cascadia profile-stages` / `place` /
+`run-placement` already exist for exactly this question (see
+`docs/perf/THREE_TIER_PLACEMENT.md`) and have never been pointed at K3. Two
+things temper it in advance: at 4 nodes the shell is 29 GB per node against an
+iGPU budget of ~16.5 GB, so only part of it could move; and #41 measured the
+near-full-iGPU regime collapsing under memory pressure. KDA's recurrence stays on
+the CPU in any case — only the projections feeding it are placeable.
 
 **The kernel was the bottleneck here, and was fixed.** Measured in isolation on
 the same machine (`simd_gemv_bench`, release), 3072x3584:
@@ -382,44 +459,122 @@ retires in ~2), and `e8m0_to_f32` used `powi` with a runtime exponent once per
 group. Fixing only the powi gives 3.367 ms; only the accumulators, 3.599 ms.
 Both, 0.572 ms — the FMA chain left idle cycles that hid the powi.
 
-That leaves K3 within **1.16x** of OpenVINO's CPU kernel at batch 1. The
-remaining gap is structural and only at batch: `moe_forward_batch` runs one GEMV
-per row rather than a GEMM, so OV's batch-32 path is still **9.6x** ahead.
+That verification was run against the real exported weights, not synthetic
+sections, so the scale reassociation and the `from_bits` conversion are confirmed
+on the actual e8m0 distribution rather than on a generator's.
 
-**Decode belongs on the CPU** — occupancy, not bandwidth: at batch 1 the CPU
-moves 82 GB/s and the GPU 35, both far under the ~137 GB/s bus.
+Against the unfolded numbers above, the fixed kernel at 38.5 GFLOP/s is **9x
+faster than OpenVINO's own streamed CPU path** at batch 1 and **7x faster than
+the iGPU's**. The earlier claim that prefill was "a real iGPU opportunity, 3.35x"
+came from the folded table and is withdrawn — and neither figure charges the
+25.8 GB/token that would have to reach the device.
 
-**Prefill is a real iGPU opportunity**, 3.35x over OV-CPU at batch 32. Unbuilt,
-and narrowed by the prefix cache, which removes prefill on a repeated prefix.
+**A caveat on the CPU comparison.** 4.3 GFLOP/s is OpenVINO's *unfused* path,
+which is what a streamed weight is guaranteed to get. It is a floor, not OV's
+ceiling. The comparison is still the right one for K3, because K3 cannot use
+constants — but it is not a statement that our kernel beats OpenVINO in general.
 
-**The NPU is out** — erratic (43.8 GFLOP/s at batch 8, worse than at batch 1),
-plus the static-shape work a dynamic MoE needs. The earlier "15x slower than CPU"
-came from the `u4` graph and does not hold for e2m1.
+**The roofline says the kernel is not done.** At 38.5 GFLOP/s a 3072x3584 GEMV
+moves 5.85 MB in 572 us = 10.2 GB/s effective, against ~99.5 GB/s measured on
+this class of part. The working set also fits inside Lunar Lake's 8 MB
+memory-side cache, so a hot kernel is not even reaching DRAM. Roughly 10x of
+instruction-side headroom remains — though see the balance table below for why
+that headroom is not where the wall-clock is.
 
 ### Which side of the balance K3 sits on
 
-Per token K3 streams 25.8 GB and computes ~97.2 GFLOP:
+Per token K3 streams 25.8 GB. The compute column below counts only the ROUTED
+EXPERTS — `2 x 16 x 92 x 33M` = 97.2 GFLOP — and that is the table's defect:
 
-| | I/O | compute | bound by |
+| | I/O | expert compute | ratio as published |
 |---|---|---|---|
 | bench host, rotational ~200 MB/s | ~129 s | 14.7 s | I/O, 9:1 |
-| AI-PC, NVMe 3566 MB/s | **7.2 s** | **2.5 s** | **I/O, 2.9:1** |
+| AI-PC, NVMe 3566 MB/s | **7.2 s** | **2.5 s** | I/O, 2.9:1 |
+
+**The bf16 shell is missing from it, and the shell is the LARGER half.** ~112 GB
+of bf16 is 56B parameters, all of them dense-used every token: 112 GFLOP against
+the experts' 97.2. Being resident it costs no NVMe, but it still has to cross
+DRAM — 112 GB per token, which at the ~99.5 GB/s this class of part measures is a
+**1.13 s/token floor** before any inefficiency in the kernel reading it.
+
+Fold in just that floor and the balance moves:
+
+```
+as published   7.20 / 2.50 = 2.9:1
++ shell floor  7.20 / 3.63 = 2.0:1     and 2.0:1 is the OPTIMISTIC end —
+                                        it assumes the bf16 GEMV achieves full
+                                        memory bandwidth, which the fp4 kernel
+                                        did not until it was fixed
+```
+
+So the "compute is worth at most 1.34x end-to-end" conclusion that was drawn from
+the 2.9:1 figure does not hold; at 2.0:1 it is 1.5x or better. Two rounds of
+expert-kernel work were deprioritised on the strength of a ratio that had left
+out more than half the arithmetic.
+
+**That 1.13 s is a floor the kernel already reaches — measured, not assumed.**
+`dot_bf16w_avx2` accumulates into two registers, and the fp4 kernel's 5.84x came
+from exactly that shape of defect, so the analogy was worth testing. It does not
+hold. `bf16_accumulator_sweep` (`dsv4/math.rs`) measures 2, 4 and 8 accumulators
+against the shipped kernel at real shell shapes:
+
+```
+                       shipped   2acc    4acc    8acc     parallel (48 thr)
+kda qkvo [12288,7168]  6.6       6.6     6.6     6.9  GB/s   59.3 GB/s
+shared   [ 6144,7168]  7.4       7.4     7.4     7.5         76.1
+up_proj  [ 7168,3584]  8.0       7.7     7.9     8.3        104.0
+```
+
+Every variant ties — the loop is not FMA-latency-bound, so the accumulator count
+is not the lever it was on fp4. And the shipped path (`linear_bf16_w`, rayon over
+rows) reaches 59-104 GB/s, which on a 6-channel DDR4-2933 host is at the memory
+roof. **The bf16 shell is bandwidth-bound and there is no kernel win in it.**
+
+The single-thread columns are the trap this nearly fell into: 6-8 GB/s next to a
+~100 GB/s roof reads like enormous headroom, and means nothing, because the
+production caller is parallel. Measure the entry point that actually runs.
 
 The NVMe figure is measured at K3's access pattern — 16 scattered 17.5 MB slices,
 16-way concurrent, scratch larger than RAM since Windows has no `drop_caches`
 (`bench_fetch_win.py`). Stable at 2x and 3.8x RAM (3376 / 3566 MB/s), and it
 agrees with the Linux NVMe number taken with real cache drops.
 
-"Decode is 99% expert I/O" describes the rotational host. On NVMe the two are
-the same order, and which one binds moved with the kernel fix above: at the old
-6.6 GFLOP/s an AI-PC was compute bound 1:2, at 38.5 it is I/O bound 2.9:1. Worth
-re-checking after any kernel change, in both directions.
+**A longer run on an AI-PC gets less: 2858 MB/s**, not 3566. `nvme_readbench`
+over 2800 synthetic bins (49 GB, RAM is 32) reading 44.92 GB in one pass:
+
+```
+explicit pread x16   2858 MB/s    98.2 ms/token
+mmap + touch         1386 MB/s   202.5 ms/token    2.06x apart
+```
+
+Order-independent — running the phases in either order moves each by ~2%,
+because a 45 GB working set is far enough past RAM that the page cache cannot
+skew it. A SHORT run is a different story: reading 3.37 GB of a freshly written
+49 GB set reported 6303 MB/s, more than double, because the bins were still
+cached. Any fetch number from a run that does not exceed RAM is measuring the
+page cache.
+
+Take 2858 MB/s as the sustained figure — it is the one that matches decode,
+which streams continuously rather than in bursts — and it makes I/O **9.0
+s/token**, not 7.2. The disk was 82% full, which is also the realistic state.
+
+"Decode is 99% expert I/O" describes the rotational host. On NVMe the two are the
+same order, and which one binds moved with the kernel fix above. Re-measure the
+split on an AI-PC billing shell, experts and I/O SEPARATELY before trusting any
+ratio in this section — the profiler bucket that produced the table never
+attributed shell time.
 
 ### Where the remaining speed is
 
 What dominates depends on the storage (see above): ~9:1 I/O bound on rotational,
-~1:2 compute bound on NVMe. The table is ordered by measured impact on the
-rotational host, where these were taken.
+and on NVMe no better than ~2:1 once the shell is counted.
+
+**The one lever with headroom well past any of this is `top_k`.** Routed bytes
+are exactly `top_k * moe_layers * expert_bytes`, so they fall in direct
+proportion: k=8 halves the 7.2 s. Everything else here competes for the ~1.5x on
+the compute side; this competes for the other half. `--top-k-override` is wired
+(`K3Manifest::effective_top_k`); what is missing is the quality curve, which has
+to be measured on K3's own weights — K2.6 found a cliff, not a slope.
 
 One caveat that cost most of a day: three entries below were configured, reported
 themselves enabled, and did nothing. The prefix cache sized its key index from an
@@ -437,8 +592,9 @@ dropped, a `syscr` that moved — not merely that it was switched on.
 | `madvise(MADV_RANDOM)` | **removed** | lost on both storage classes — see below |
 | autopin (`CASCADIA_K3_AUTOPIN=1`) | built, never exercised, **warms over ~136 tokens** | prior art finds static hot-set pinning helps cold start and loses in steady state. Two gotchas before measuring: the histogram is only persisted when autopin is enabled, so the FIRST enabled run always reports `pinned=0` and merely records; and the confidence ramp counts selections, of which K3 makes 92 layers x 16 = 1472 per token, so nothing pins below ~3.4 tokens and full confidence needs ~136. A 3-token run produces 4416 selections and stays under the floor. The histogram MERGES on load, though, so the ~136 tokens accumulate across runs rather than needing one long session: any sequence of runs with the flag set warms it, and a long-lived worker warms itself |
 | prefix cache | working, **on by default** (5% of free RAM; `CASCADIA_K3_PREFIX_CACHE=<bytes>` overrides, `=0` disables), any rank count | **measured 2.45x at 2 ranks and 2.60x at 1**, the same -64% of prefill bytes either way, so the saving comes from the reuse fraction rather than the topology. The derived default was checked with no env set at all: 555 s against 548 s for a hand-set budget, and the same 103.32 GB prefill, so it behaves as the tuned value. At 2 ranks: prefill bytes 142.06 -> 51.66 GB and prefill 649.4 -> 228.3 s at `reused=7 prompt=10`, saving in proportion to the reuse fraction. Byte-bounded LRU over the post-prefill layer states. It was reachable only from the pipeline path at first, so a single rank accepted the budget and ignored it; `step_single_stage` now takes the same route. Reuse needs a STRICT prefix, so resending an identical prompt never hits — the case it serves is the next turn, which resends the reply too |
-| close the CPU kernel gap | **done, measured 5.8x** | was 6.8x behind OV's CPU kernel at batch 1, now 1.16x. Per-token compute 14.7s -> 2.5s, which puts an AI-PC node back to I/O bound |
-| batched GEMM for prefill | not started, **largest remaining compute lever** | `moe_forward_batch` runs one GEMV per row, so many rows against one expert cost the same as one row each. OV's batch-32 GEMM is 9.6x the fixed kernel |
+| close the CPU kernel gap | **done, measured 5.8x** | 0.572 ms per 3072x3584 GEMV, 38.5 GFLOP/s. Per-token compute 14.7s -> 2.5s, which puts an AI-PC node back to I/O bound |
+| batched GEMM for prefill | **done, measured 1.0-1.4x**, far under forecast | prefill routes several rows to one expert and each was re-decoding the whole 17.5 MB section; `gemm` now decodes a weight row once and dots it against every row. Peaks at 1.42x around 8 rows, ~1.0x at 2. The forecast was 2.6x, taken from OV's batch-32 number, and it was the wrong comparison: OV does a real blocked GEMM that reuses activations in registers and cuts FLOPs per row, while this only hoists the decode. Bit-identical to the per-row path by construction, not merely close — prefill batches, decode does not, and the prefix cache hands one to the other. `CASCADIA_K3_GEMM=0` opts out |
+| int8 VNNI expert kernel | built, **off by default** (`CASCADIA_K3_VNNI=1`), **measured 1.57-1.60x on an AI-PC** | `vpdpbusd` multiplies bytes and the doubled e2m1 grid `{0,1,2,3,4,6,8,12}` already fits in `i8`, so the fp4 decode feeds it directly: one `vpdpbusd` and a convert per 32 columns against ~25 ops widening to f32. Off by default because it is the only inexact path here — activations quantise to int8 per group of 32. That costs **0.027% of accumulated magnitude** on uniform random activations, which is the BEST case and not evidence about a real model: the quantiser takes an amax per group, so one large value costs the other 31 their resolution, and LLM activations carry exactly that. `vnni_accuracy_under_activation_outliers` plants one outlier per group and sweeps it — worst-element error scales linearly with the ratio, and the dot error peaks near **0.46%** at 100x before falling again (a large enough outlier dominates the sum and is itself represented exactly). Still small, but 17x the figure usually quoted. The question that decides the default is not single-dot error but whether token predictions change over 92 layers x 16 experts, which `k3_topk_probe` already measures and which needs real weights. Three encodings are built and chosen at runtime. Lunar Lake reports `avxvnniint8`, so it takes `vpdpbssd` — signed x signed, which needs neither of the two `vpsignb` the unsigned form does: 1.48x -> **1.57-1.60x** against a 38.8 GFLOP/s f32 baseline. `vpdpbusd` (VEX) and the AVX512-VNNI form remain for parts without it; the latter is what lets the kernel be verified off-target, since no AI-PC has AVX-512. A Xeon 6252 measured 1.31-1.34x, and the prediction that an AI-PC would be LOWER (faster f32 baseline, same memory system) was wrong in the useful direction. Not yet wired into the batched `gemm`, so prefill and decode cannot both benefit |
 | lane-lazy expert reads | **dropped, measured** | 29.1% of lanes are dead at the most aggressive threshold, but only 5.7% of `w3` PAGES, and 0.0% losslessly. The sparsity is real and too scattered to skip a page. `CASCADIA_K3_CHESS_PROBE=1` re-measures |
 | n-gram speculative decode | research | bounded by expert-set overlap; measured reuse is ~33%, so expect ~1.2-1.4x, not 2x |
 
@@ -659,6 +815,15 @@ present as a model quality problem. The missing chat template still means
 - **Thin real-weight coverage.** The full export runs and generates correct text,
   but the automated suites still exercise a 6-layer synthetic model; every
   real-weight result in this document is a hand-run measurement, mostly n=1.
+  Until `CASCADIA_REQUIRE_FIXTURES=1` existed the coverage was thinner still than
+  that sentence implied — see above.
+- **The device verdict rests on OpenVINO's current behaviour, not on silicon.**
+  The iGPU is ruled out by an architecture gate (`xe3p`) and by a graph pattern
+  that requires constant weights. Both are software, and Intel is actively moving
+  in this area — a newer runtime added an offload-to-disk MoE path with an LRU
+  device cache, gated to `u4`/`i4` and reachable on this hardware. If the iGPU is
+  ever revisited, requantising mxfp4 -> u4 offline is the entry point, and the
+  cost is an accuracy delta that has not been measured.
 - **Export margin** — ~20 GB spare on a 1.6 TB disk, and only with
   `--free-source-shards`, which is destructive: a freed layer cannot be
   re-exported without re-downloading.
