@@ -1786,6 +1786,9 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
+        // Permanent for this request: retrying sends the identical prompt into
+        // the identical window. 413 is what every SDK treats as non-retryable.
+        EngineError::PromptTooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
         EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
@@ -1821,6 +1824,19 @@ mod tests {
     // engine sets `n_tokens` on a single text-bearing final chunk, that count
     // is authoritative (not the "1 per chunk" fallback), so `usage` reflects
     // the real generated-token count rather than 0/1.
+    /// A prompt that cannot fit the engine's per-request window is a permanent,
+    /// deterministic rejection of THIS request — not backpressure. It must not
+    /// map to 503: the official SDKs retry 5xx with backoff, so a request that
+    /// can never succeed would be sent three times before surfacing, and the
+    /// operator could not tell it apart from genuine "engine at capacity".
+    #[test]
+    fn prompt_too_long_maps_to_413_not_503() {
+        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
+            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+        ));
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[test]
     fn chunk_token_count_honors_engine_count() {
         // ov-genai's shape: whole response on one final chunk, n_tokens set.

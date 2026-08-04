@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
-    DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
+    advance_emitted, DType as ShimDType, Error as OvError, PluginConfig, Runtime as OvRuntime,
 };
 use cascadia_transport::{
     ActivationClient, ActivationServer, DType as WireDType, Tensor as WireTensor, MAX_RANK,
@@ -88,6 +88,14 @@ struct StageConfig {
     static_seq: Option<u32>,
     #[serde(default)]
     static_context: Option<u32>,
+    /// Packed multi-slot IR variant (openvino_packed_model.xml): how many
+    /// independent requests share one inference via the sequence dimension.
+    #[serde(default)]
+    packed_slots: Option<u32>,
+    #[serde(default)]
+    packed_seq: Option<u32>,
+    #[serde(default)]
+    packed_context: Option<u32>,
     /// Chunked-prefill IR variant (openvino_prefill_model.xml) query-window
     /// width, exported via `--static-prefill-seq`. Absent/None on decode-only
     /// static exports and on all stateful exports.
@@ -175,7 +183,7 @@ fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     use half::f16;
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -209,7 +217,7 @@ fn argmax_last_row(logits: &[f32], vocab: usize) -> i32 {
     best_i as i32
 }
 
-fn map_ov_err(err: OvError) -> EngineError {
+pub(crate) fn map_ov_err(err: OvError) -> EngineError {
     match err {
         OvError::Stub => {
             EngineError::Backend("openvino shim built without --features openvino".into())
@@ -308,6 +316,152 @@ fn encode_wire_position(position: i64) -> WireTensor {
     WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
+/// Refuse a packed variant whose query window is narrower than its slot count.
+///
+/// A decode step lays down one row per ready slot, but the plan is only
+/// `packed_seq` rows wide — so with `packed_seq < slots` the slots past the
+/// window never get a row, and sampling then asks for a logits row the output
+/// does not contain. `packed_seq > slots` is fine and useful: the extra rows
+/// widen a prefill chunk. Only the narrow case is broken.
+fn packed_geometry_error(slots: u32, packed_seq: u32) -> Option<String> {
+    (packed_seq < slots).then(|| {
+        format!(
+            "packed variant has packed_seq={packed_seq} but packed_slots={slots}: the query \
+             window cannot be narrower than the slot count, or slots beyond it can never \
+             decode. Rebuild with `python tools/packed_variant.py <stage_dir> --slots {slots}` \
+             (packed_seq defaults to the slot count)"
+        )
+    })
+}
+
+/// Refuse a prompt that cannot fit one packed slot's KV region.
+///
+/// A slot's region is a bounded window: once it fills, the oldest entries slide
+/// out. Serving an over-region prompt would answer from a silently truncated
+/// prompt — a request that looks successful and is wrong — so admission rejects
+/// it instead. Both remedies are the operator's, so name both.
+fn packed_prompt_too_long(prompt_tokens: usize, region: usize) -> Option<String> {
+    (prompt_tokens > region).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens but this worker's per-slot KV region holds \
+             {region}; raise --static-context or lower --packed-slots (per-slot context is \
+             (static_context - 1 - packed_prefix) / packed_slots)"
+        )
+    })
+}
+
+/// Encode a packed step's per-row assignment as one framed I64 `[1, 3, S]`
+/// tensor: row 0 slot ids (`-1` = idle row), row 1 absolute positions, row 2
+/// the shared-prefix reuse length. The packed analogue of
+/// `encode_wire_position` — downstream stages need per-ROW routing, not one
+/// scalar, to rebuild the mask and scatter each row into the right slot's ring.
+///
+/// The reuse length must travel: only the driver stage holds the prompt ids to
+/// match against the prefix cache, but EVERY stage has to open the same shared
+/// columns or its attention would disagree with stage 0's.
+fn encode_wire_plan(rows: &[Option<(usize, i64, usize)>]) -> WireTensor {
+    let s = rows.len();
+    let mut data = Vec::with_capacity(s * 3 * 8);
+    for r in rows {
+        let slot: i64 = r.map(|(sl, _, _)| sl as i64).unwrap_or(-1);
+        data.extend_from_slice(&slot.to_le_bytes());
+    }
+    for r in rows {
+        let pos: i64 = r.map(|(_, p, _)| p).unwrap_or(0);
+        data.extend_from_slice(&pos.to_le_bytes());
+    }
+    for r in rows {
+        let sh: i64 = r.map(|(_, _, sh)| sh as i64).unwrap_or(0);
+        data.extend_from_slice(&sh.to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, 3, s as u32], data)
+}
+
+/// Decode + validate a packed plan frame. Rejects a wrong dtype/rank, a
+/// length/shape disagreement, out-of-range slot ids, and negative positions —
+/// each of which would otherwise index or wrap somewhere downstream.
+fn decode_wire_plan(
+    t: &WireTensor,
+    slots: usize,
+) -> EngineResult<Vec<Option<(usize, i64, usize)>>> {
+    let s = t.shape[2] as usize;
+    if t.dtype != WireDType::I64 || t.shape[0] != 1 || t.shape[1] != 3 || s == 0 {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 [1,3,S] packed plan frame, got dtype={:?} shape={:?} — likely a \
+             packed/non-packed pipeline mismatch or a desynced activation stream",
+            t.dtype, t.shape
+        )));
+    }
+    if t.data.len() != s * 3 * 8 {
+        return Err(EngineError::Backend(format!(
+            "packed plan frame payload {} bytes does not match shape {:?}",
+            t.data.len(),
+            t.shape
+        )));
+    }
+    let rd = |i: usize| -> i64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&t.data[i * 8..i * 8 + 8]);
+        i64::from_le_bytes(b)
+    };
+    let mut out = Vec::with_capacity(s);
+    for r in 0..s {
+        let slot = rd(r);
+        let pos = rd(s + r);
+        let shared = rd(2 * s + r);
+        if slot < 0 {
+            out.push(None);
+            continue;
+        }
+        if shared < 0 || shared > pos {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has shared_use={shared} inconsistent with position {pos}"
+            )));
+        }
+        if slot as usize >= slots {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} names slot {slot} but this stage has {slots} slots"
+            )));
+        }
+        if pos < 0 {
+            return Err(EngineError::Backend(format!(
+                "packed plan row {r} has negative position {pos}"
+            )));
+        }
+        out.push(Some((slot as usize, pos, shared as usize)));
+    }
+    Ok(out)
+}
+
+/// Encode the head stage's per-row sampled tokens as I64 `[1, 1, S]`. The
+/// non-packed path returns one token; packed returns one per active row, in
+/// row order, with 0 for idle rows (never read).
+fn encode_wire_tokens(tokens: &[i32]) -> WireTensor {
+    let mut data = Vec::with_capacity(tokens.len() * 8);
+    for &t in tokens {
+        data.extend_from_slice(&(t as i64).to_le_bytes());
+    }
+    WireTensor::new(WireDType::I64, [1, 1, tokens.len() as u32], data)
+}
+
+fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
+    if t.dtype != WireDType::I64 || t.data.len() % 8 != 0 || t.data.is_empty() {
+        return Err(EngineError::Backend(format!(
+            "expected an I64 packed token frame, got dtype={:?} len={}",
+            t.dtype,
+            t.data.len()
+        )));
+    }
+    Ok(t.data
+        .chunks_exact(8)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(c);
+            i64::from_le_bytes(b) as i32
+        })
+        .collect())
+}
+
 /// Decode + strictly validate a wire position frame. Must be I64 with exactly
 /// 8 payload bytes and non-negative; anything else (a desynced stream, a
 /// stateful peer that sent a hidden tensor where a position was expected, or
@@ -356,6 +510,10 @@ struct StaticKvLayer {
 /// absolute `position` the first stage carries with each activation.
 struct StaticKv {
     past_len: usize,
+    /// Leading ring columns the slide never evicts (see
+    /// [`crate::packed::KV_SINK`]). Capped at half the window so pinning can
+    /// never crowd out the sliding portion.
+    sink: usize,
     context: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -444,6 +602,7 @@ impl StaticKv {
         let full = valid_now >= self.past_len;
         let kv_heads = self.kv_heads;
         let past_len = self.past_len;
+        let sink = self.sink;
         let buf: &mut [u8] = if is_value {
             &mut self.val_buf[li]
         } else {
@@ -454,7 +613,10 @@ impl StaticKv {
             let new = &present[src..src + slot];
             let base = h * buf_row;
             if full {
-                buf.copy_within(base + slot..base + buf_row, base); // drop oldest
+                // Drop the oldest EVICTABLE entry: the leading `sink` columns
+                // are pinned, so the shift starts past them. Without that the
+                // slide drops token 0 and attention collapses (see KV_SINK).
+                buf.copy_within(base + (sink + 1) * slot..base + buf_row, base + sink * slot);
                 let dst = base + (past_len - 1) * slot;
                 buf[dst..dst + slot].copy_from_slice(new);
             } else {
@@ -664,7 +826,10 @@ struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
     generated: Vec<i32>,
-    last_text: String,
+    /// Bytes already handed to the client. Not the decoded text: the delta is
+    /// computed by `advance_emitted`, which holds back an unresolved
+    /// replacement-char run and re-anchors if the decode diverges.
+    emitted: Vec<u8>,
     prefilled: bool,
     last_token: i32,
     /// Wall-clock when the task became active. Used to compute the
@@ -702,6 +867,10 @@ pub struct OvRuntimeEngine {
     canonical_inputs: std::collections::HashMap<String, String>,
     pending: Vec<GenerationTask>,
     active: Option<ActiveTask>,
+    /// `--packed-slots`: multi-slot packed decode state (own compiled variant,
+    /// per-slot KV regions, slot table). Mutually exclusive with `static_kv`
+    /// single-task decode; when set, `step_first` dispatches to the packed path.
+    packed: Option<crate::packed_exec::PackedState>,
     /// Set for stateless static-shape (NPU) shards; drives the host-side
     /// bounded-KV decode path instead of OV internal state.
     static_kv: Option<StaticKv>,
@@ -1274,6 +1443,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        if self.packed.is_some() {
+            return self.step_first_packed();
+        }
         if self.active.is_none() && !self.pending.is_empty() {
             let task = self.pending.remove(0);
             let tok = self
@@ -1297,7 +1469,7 @@ impl OvRuntimeEngine {
                 task,
                 prompt_ids,
                 generated: Vec::new(),
-                last_text: String::new(),
+                emitted: Vec::new(),
                 prefilled: false,
                 last_token: 0,
                 started: std::time::Instant::now(),
@@ -1344,6 +1516,377 @@ impl OvRuntimeEngine {
             });
         }
         res
+    }
+
+    /// Upper bound on inferences one packed `step()` may run before returning.
+    /// Sized for the worst case: a full-region prompt consumed `packed_seq`
+    /// tokens at a time, plus slack. Purely a runaway guard.
+    const PACKED_MAX_INFERS_PER_STEP: usize = 4096;
+
+    /// Packed multi-slot step: admit what fits, run ONE inference (a prefill
+    /// chunk for one slot, or a decode row for every ready slot), then sample
+    /// and emit per slot. Unlike the single-task path this returns chunks for
+    /// several tasks at once — which is exactly what the runner's per-task
+    /// chunk buffers were built to demultiplex.
+    fn step_first_packed(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        let mut out = Vec::new();
+        // ---- admission ----
+        while !self.pending.is_empty() {
+            let Some(slot) = self.packed.as_ref().unwrap().free_slot() else {
+                break;
+            };
+            let task = self.pending.remove(0);
+            let tok = self
+                .tokenizer
+                .clone()
+                .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
+            let enc = tok
+                .encode(task.prompt.clone(), false)
+                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
+            let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
+            if prompt_ids.is_empty() {
+                return Err(EngineError::Backend(
+                    "empty prompt: no tokens to prefill".into(),
+                ));
+            }
+            info!(
+                task = %task.task_id,
+                slot,
+                prompt_tokens = prompt_ids.len(),
+                "task admitted to packed slot"
+            );
+            self.packed.as_mut().unwrap().admit(slot, task, prompt_ids);
+        }
+
+        // Keep inferring until this call produces at least one chunk. A prompt
+        // wider than `packed_seq` takes several prefill inferences that emit
+        // nothing, and the runner closes a stream that makes no progress for
+        // three consecutive steps — so prefill must complete inside one step(),
+        // exactly as the single-task static path already does.
+        let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
+        for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
+            let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
+                break;
+            };
+            if single_stage {
+                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            } else {
+                // Pipeline: this stage produced hidden rows. Ship the plan (so
+                // every downstream stage can rebuild the same mask and route
+                // rows to the same slots) plus the hidden block, then take back
+                // one sampled token per row from the tail.
+                let hidden = bytes_to_f32(odt, &obytes)?;
+                let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
+                let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                self.emit_packed_tokens(&tokens, kind, &mut out)?;
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Send `[1, S, hidden]` + the packed plan downstream and wait for the tail
+    /// stage's per-row tokens.
+    fn exchange_packed_downstream(
+        &mut self,
+        hidden: &[f32],
+        shape: &[usize],
+        plan_rows: &[Option<(usize, i64, usize)>],
+    ) -> EngineResult<Vec<i32>> {
+        let down = self.downstream.clone().ok_or_else(|| {
+            EngineError::Backend("packed pipeline stage has no downstream".into())
+        })?;
+        let s3 = to_shape3(shape);
+        let plan_frame = encode_wire_plan(plan_rows);
+        // f16 on the wire, matching the non-packed path: the receiving stage
+        // converts to f16 before feeding the IR regardless, so f32 doubled the
+        // bytes per stage hop and bought nothing.
+        let hidden_frame = WireTensor::new(
+            WireDType::F16,
+            [s3[0] as u32, s3[1] as u32, s3[2] as u32],
+            f32_to_f16_bytes(hidden),
+        );
+        self.block_on(async {
+            let mut guard = down.lock().await;
+            guard
+                .send(&plan_frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed plan send: {e}")))?;
+            guard
+                .send(&hidden_frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
+            // Bound the reply wait. Having just sent both frames this stage is
+            // OWED a token frame, so a downstream that never answers must not
+            // pin the thread forever — the same reasoning as `reply_bounded` on
+            // the qwen36 path, and the same configured activation timeout. This
+            // is what turns a dropped token frame from a silent permanent wedge
+            // into a reportable error; it does not prevent the drop.
+            let (reply, _) = match tokio::time::timeout(
+                cascadia_transport::recv_timeout(),
+                guard.recv(),
+            )
+            .await
+            {
+                Ok(r) => r.map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?,
+                Err(_) => {
+                    return Err(EngineError::Backend(
+                        "packed token recv timed out: the downstream stage did not answer a \
+                             plan+hidden pair. Multi-stage packed is known to drop a token frame \
+                             under load (issue #122); run the packed worker \
+                             single-stage (--total 1)"
+                            .into(),
+                    ))
+                }
+            };
+            decode_wire_tokens(&reply)
+        })
+    }
+
+    /// Emit chunks from a pipeline tail's per-row tokens.
+    fn emit_packed_tokens(
+        &mut self,
+        tokens: &[i32],
+        kind: crate::packed_exec::PackedStepKind,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<()> {
+        let sampled: Vec<(usize, usize)> = match kind {
+            crate::packed_exec::PackedStepKind::Prefill {
+                slot,
+                last_row,
+                finished_prompt,
+            } => {
+                if finished_prompt {
+                    vec![(last_row, slot)]
+                } else {
+                    Vec::new()
+                }
+            }
+            crate::packed_exec::PackedStepKind::Decode { rows } => rows,
+        };
+        for (row, slot) in sampled {
+            let token = tokens.get(row).copied().ok_or_else(|| {
+                EngineError::Backend(format!(
+                    "packed tail returned {} tokens, need row {row}",
+                    tokens.len()
+                ))
+            })?;
+            if let Some(chunk) = self.emit_packed_token(slot, token)? {
+                out.push(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// Relay/head stage: consume one packed (plan, hidden) pair. The head
+    /// samples every active row and replies with the token vector; a middle
+    /// stage forwards both frames on and passes the reply back up.
+    fn step_relay_packed(&mut self) -> EngineResult<()> {
+        let up = self
+            .upstream
+            .clone()
+            .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
+        let slots = self.packed.as_ref().unwrap().kv.slots;
+        let (plan_rows, hidden, hshape) = self.block_on(async {
+            let mut guard = up.lock().await;
+            let (pf, _) = guard
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed plan recv: {e}")))?;
+            let plan_rows = decode_wire_plan(&pf, slots)?;
+            let (hf, _) = guard
+                .recv()
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
+            let hidden: Vec<f32> = match hf.dtype {
+                WireDType::F16 => f16_bytes_to_f32(&hf.data),
+                _ => hf
+                    .data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            };
+            Ok::<_, EngineError>((plan_rows, hidden, hf.shape))
+        })?;
+
+        let hidden_size = hshape[2] as usize;
+        let plan = crate::packed::PackedPlan {
+            rows: plan_rows
+                .iter()
+                .map(|r| r.map(|(slot, _, _)| crate::packed::PackedRow { slot, order: 0 }))
+                .collect(),
+        };
+        // Same-slot rows in one frame are a prefill chunk: restore their causal
+        // order so this stage masks them exactly as the sender did.
+        let mut plan = plan;
+        let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for row in plan.rows.iter_mut().flatten() {
+            let n = seen.entry(row.slot).or_insert(0);
+            row.order = *n;
+            *n += 1;
+        }
+        let positions: Vec<i64> = plan_rows
+            .iter()
+            .map(|r| r.map(|(_, p, _)| p).unwrap_or(0))
+            .collect();
+        let reuse: Vec<usize> = plan_rows
+            .iter()
+            .map(|r| r.map(|(_, _, sh)| sh).unwrap_or(0))
+            .collect();
+        let (odt, oshape, obytes) = self.packed.as_mut().unwrap().run_plan(
+            &plan,
+            crate::packed_exec::PackedPrimary::Hidden(&hidden, hidden_size),
+            &positions,
+            &reuse,
+        )?;
+
+        if self.spec.is_last_stage {
+            let logits = bytes_to_f32(odt, &obytes)?;
+            let mut tokens = Vec::with_capacity(plan.rows.len());
+            for (r, row) in plan.rows.iter().enumerate() {
+                tokens.push(if row.is_some() {
+                    argmax_logits_row(&logits, &oshape, r)?
+                } else {
+                    0
+                });
+            }
+            let frame = encode_wire_tokens(&tokens);
+            self.block_on(async {
+                let mut guard = up.lock().await;
+                guard
+                    .send(&frame)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+            })?;
+        } else {
+            let hidden_out = bytes_to_f32(odt, &obytes)?;
+            let tokens = self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)?;
+            let frame = encode_wire_tokens(&tokens);
+            self.block_on(async {
+                let mut guard = up.lock().await;
+                guard
+                    .send(&frame)
+                    .await
+                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Sample the rows one packed inference produced and append their chunks.
+    fn emit_packed_rows(
+        &mut self,
+        odt: ShimDType,
+        oshape: &[usize],
+        obytes: &[u8],
+        kind: crate::packed_exec::PackedStepKind,
+        out: &mut Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<()> {
+        let sampled: Vec<(usize, usize)> = match kind {
+            crate::packed_exec::PackedStepKind::Prefill {
+                slot,
+                last_row,
+                finished_prompt,
+            } => {
+                // Only the chunk that consumed the final prompt token yields a
+                // real token; earlier chunks just fill the slot's KV.
+                if finished_prompt {
+                    vec![(last_row, slot)]
+                } else {
+                    Vec::new()
+                }
+            }
+            crate::packed_exec::PackedStepKind::Decode { rows } => rows,
+        };
+        if sampled.is_empty() {
+            return Ok(());
+        }
+        let logits = bytes_to_f32(odt, obytes)?;
+        for (row, slot) in sampled {
+            let token = argmax_logits_row(&logits, oshape, row)?;
+            if let Some(chunk) = self.emit_packed_token(slot, token)? {
+                out.push(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// Append `token` to `slot`'s sequence, decode its text delta, and build the
+    /// chunk. Returns None if the slot vanished (cancelled mid-step). Retires
+    /// the slot — freeing its KV region for the next admission — on the final
+    /// chunk, which is what makes this continuous rather than batch-synchronous.
+    fn emit_packed_token(
+        &mut self,
+        slot: usize,
+        token: i32,
+    ) -> EngineResult<Option<(TaskId, Chunk)>> {
+        let tok = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
+        let eos = self.eos_token_ids.clone();
+        let packed = self.packed.as_mut().unwrap();
+        let Some(t) = packed.slots[slot].as_mut() else {
+            return Ok(None);
+        };
+        t.last_token = token;
+        t.generated.push(token);
+        // Stop conditions first: they decide `running`, which tells
+        // `advance_emitted` whether it may hold back an unresolved
+        // replacement-char run or must flush it.
+        let max_tokens = t.task.max_tokens.max(1) as usize;
+        let is_eos = eos.contains(&(token as u32));
+        let hit_cap = t.generated.len() >= max_tokens;
+        let is_final = hit_cap || is_eos;
+        let task_id = t.task.task_id.clone();
+
+        let all_ids: Vec<u32> = t.generated.iter().map(|&x| x as u32).collect();
+        let full_text = tok
+            .decode(&all_ids, true)
+            .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
+        let (delta, resynced) = advance_emitted(&mut t.emitted, full_text.as_bytes(), !is_final);
+        if resynced {
+            warn!(task = %task_id, slot, "detokenizer decode diverged; re-anchored");
+        }
+
+        if !is_final {
+            // Explicit count for the same reason: a token whose text lands in
+            // the next chunk (BPE splitting a glyph) would otherwise count 0.
+            return Ok(Some((
+                task_id.clone(),
+                Chunk::token(task_id, token as i64, delta).with_n_tokens(1),
+            )));
+        }
+        let n_tokens = t.generated.len() as u32;
+        let prompt_tokens = t.prompt_ids.len() as u32;
+        let elapsed = t.started.elapsed();
+        // n_tokens is THIS chunk's increment, not the running total. The API
+        // sums per-chunk counts (falling back to 1 per non-empty chunk), so a
+        // cumulative value here double-counts every interim token — measured as
+        // completion_tokens = 2N-1. This chunk carries exactly one token, and
+        // it is set explicitly so an empty final delta (EOS decoding to "")
+        // still counts.
+        let chunk = Chunk::final_marker(task_id.clone(), delta)
+            .with_n_tokens(1)
+            .with_prompt_tokens(prompt_tokens)
+            .with_finish_reason(if is_eos {
+                cascadia_types::FinishReason::Stop
+            } else {
+                cascadia_types::FinishReason::Length
+            });
+        packed.retire(slot);
+        info!(
+            task = %task_id,
+            slot,
+            tokens = n_tokens,
+            elapsed_s = elapsed.as_secs_f64(),
+            tok_s = n_tokens as f64 / elapsed.as_secs_f64().max(1e-9),
+            in_flight = packed.occupied(),
+            "packed task done"
+        );
+        Ok(Some((task_id, chunk)))
     }
 
     fn step_first_body(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -1589,6 +2132,14 @@ impl OvRuntimeEngine {
         active.last_token = next_token;
         active.generated.push(next_token);
 
+        // Stop conditions first: they decide `running`, which tells
+        // `advance_emitted` whether it may hold back an unresolved
+        // replacement-char run or must flush it.
+        let max_tokens = active.task.max_tokens.max(1) as usize;
+        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
+        let is_final = active.generated.len() >= max_tokens || is_eos;
+        let task_id = active.task.task_id.clone();
+
         let tok = self
             .tokenizer
             .as_ref()
@@ -1597,22 +2148,11 @@ impl OvRuntimeEngine {
         let full_text = tok
             .decode(&all_ids, true)
             .map_err(|e| EngineError::Backend(format!("tokenizer decode: {e}")))?;
-        // Use strip_prefix instead of byte-slice indexing — `last_text`
-        // is not always a clean byte-prefix of `full_text` (BPE can
-        // emit a partial UTF-8 sequence on token N and complete the
-        // glyph on token N+1, in which case the prefix bytes change).
-        // Slicing past a UTF-8 boundary panics.
-        let delta = full_text
-            .strip_prefix(active.last_text.as_str())
-            .unwrap_or(&full_text)
-            .to_string();
-        active.last_text = full_text;
-
-        let max_tokens = active.task.max_tokens.max(1) as usize;
-        let is_eos = self.eos_token_ids.contains(&(next_token as u32));
-        let is_final = active.generated.len() >= max_tokens || is_eos;
-
-        let task_id = active.task.task_id.clone();
+        let (delta, resynced) =
+            advance_emitted(&mut active.emitted, full_text.as_bytes(), !is_final);
+        if resynced {
+            warn!(task = %task_id, "detokenizer decode diverged; re-anchored");
+        }
         let chunk = if is_final {
             Chunk {
                 task_id: task_id.clone(),
@@ -1976,6 +2516,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_last(&mut self) -> EngineResult<()> {
+        if self.packed.is_some() {
+            return self.step_relay_packed();
+        }
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
         // A seq=1 static frame means this task's prefill chunks are done —
         // with --park-prefill, release the prefill model's weights now.
@@ -2002,6 +2545,9 @@ impl OvRuntimeEngine {
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
+        if self.packed.is_some() {
+            return self.step_relay_packed();
+        }
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
         // Multi-token hidden = prefill work downstream: a stateful
         // whole-prompt frame, or (static path) a prefill CHUNK — either way
@@ -2139,6 +2685,26 @@ impl Engine for OvRuntimeEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
+        // Packed slots divide the KV window, so a prompt can be too long for a
+        // slot while the model itself could hold it. Reject here rather than at
+        // admission: submit() is synchronous with the HTTP request, so the
+        // caller gets a 413 before any stream is opened — a streaming client
+        // rejected mid-stream would already have had its 200 committed and
+        // would receive a non-standard error frame instead.
+        if let Some(packed) = self.packed.as_ref() {
+            if let Some(tok) = self.tokenizer.as_ref() {
+                let n = tok
+                    .encode(task.prompt.clone(), false)
+                    .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?
+                    .get_ids()
+                    .len();
+                if let Some(msg) = packed_prompt_too_long(n, packed.kv.region) {
+                    warn!(task = %task.task_id, prompt_tokens = n,
+                          region = packed.kv.region, "refusing over-region prompt");
+                    return Err(EngineError::PromptTooLong(msg));
+                }
+            }
+        }
         self.pending.push(task);
         Ok(())
     }
@@ -2180,6 +2746,22 @@ impl Engine for OvRuntimeEngine {
 
     fn cancel(&mut self, task_id: &TaskId) {
         self.pending.retain(|t| t.task_id != *task_id);
+        // Packed path: drop just this request's slot. Its KV region is cleared
+        // and returned to the free pool immediately, so a disconnecting client
+        // frees capacity for the next admission without disturbing the other
+        // in-flight slots sharing the inference.
+        if let Some(packed) = self.packed.as_mut() {
+            if let Some(slot) = packed
+                .slots
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|t| t.task.task_id == *task_id))
+            {
+                packed.retire(slot);
+                info!(task = %task_id, slot, in_flight = packed.occupied(),
+                      "packed cancel: slot released");
+            }
+            return;
+        }
         // Abandoning the active task mirrors the step-failure recovery:
         // clear it and reset generation state so the next pending task
         // activates immediately instead of waiting for this one to
@@ -2388,6 +2970,14 @@ pub struct OvRuntimeBuilder {
     /// Ignore the export's chunked-prefill variant and prefill one token per
     /// step (the pre-variant behavior); conflicts with `prefill_device`.
     pub disable_chunked_prefill: bool,
+    /// `--packed-slots N`: serve N concurrent requests per inference through
+    /// the packed multi-slot variant (continuous batching on a device that
+    /// rejects batch > 1). 0 = off.
+    pub packed_slots: u32,
+    /// `--packed-prefix N`: reserve N KV slots as a read-only SHARED prefix
+    /// that every packed slot may attend to — prefix caching without paging.
+    /// Taken out of the same window, so it costs per-slot context. 0 = off.
+    pub packed_prefix: u32,
     /// `--park-prefill`: drop the prefill CompiledModel after each task's
     /// prefill (freeing its resident weight copy — the structural cost of
     /// the two-model split) and re-create it on the next prefill from the
@@ -2424,6 +3014,8 @@ pub struct OvRuntimeBuilder {
     /// (seq, context) of the chunked-prefill IR variant, when the stage
     /// exports one (stage_config.static_prefill_*) and it isn't disabled.
     static_prefill_params: Option<(u32, u32)>,
+    /// Resolved packed geometry: (slots, packed_seq, packed_context).
+    packed_params: Option<(u32, u32, u32)>,
 }
 
 impl OvRuntimeBuilder {
@@ -2612,6 +3204,75 @@ impl Builder for OvRuntimeBuilder {
             }
             _ => None,
         };
+        // Packed multi-slot variant (`--packed-slots`). Like the prefill
+        // variant it must share the decode variant's past-KV shape, so its
+        // context is past_len + packed_seq.
+        self.packed_params = match (self.static_params, self.packed_slots) {
+            (_, 0) => None,
+            (None, _) => {
+                return Err(EngineError::InvalidConfig(
+                    "--packed-slots requires a stateless static (--target npu) export; the \
+                     stateful path keeps KV inside OV state, which cannot be partitioned \
+                     per request"
+                        .into(),
+                ));
+            }
+            (Some((ctx, _, _)), want) => {
+                let slots = stage_cfg.packed_slots.unwrap_or(0);
+                let pseq = stage_cfg.packed_seq.unwrap_or(slots);
+                let pctx = stage_cfg.packed_context.unwrap_or(0);
+                let packed_xml = stage_dir.join("openvino_packed_model.xml");
+                if slots == 0 || !packed_xml.exists() {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "--packed-slots {want} needs a packed variant beside the decode IR; {} \
+                         is missing. Build it with `python tools/packed_variant.py <stage_dir> \
+                         --slots {want}` or re-export with --packed-slots {want}",
+                        packed_xml.display()
+                    )));
+                }
+                if want != slots {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "--packed-slots {want} disagrees with the exported variant \
+                         (packed_slots={slots}); the slot count is baked into the IR shape"
+                    )));
+                }
+                if let Some(msg) = packed_geometry_error(slots, pseq) {
+                    return Err(EngineError::InvalidConfig(msg));
+                }
+                let past_len = ctx - 1;
+                if pctx != past_len + pseq {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "packed_context={pctx} inconsistent: need past_len + packed_seq = {} so \
+                         the packed and decode variants share one past-KV shape",
+                        past_len + pseq
+                    )));
+                }
+                if past_len / slots == 0 {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "packed_slots={slots} exceeds the KV window ({past_len})"
+                    )));
+                }
+                events.push(LoadProgress::message(format!(
+                    "packed multi-slot variant: slots={slots} seq={pseq} context={pctx} \
+                     per-request context={}",
+                    past_len / slots
+                )));
+                Some((slots, pseq, pctx))
+            }
+        };
+
+        // The packed variant does its own chunked prefill (a plan whose rows all
+        // belong to one slot IS a causal chunk), so the separate prefill model
+        // would never be used — skip compiling it and keep its weights off the
+        // device. On NPU that is a whole compile (~100 s) and a second resident
+        // weight copy saved.
+        if self.packed_params.is_some() && self.static_prefill_params.take().is_some() {
+            events.push(LoadProgress::message(String::from(
+                "packed slots: skipping the chunked-prefill variant (packed inference covers \
+                 prefill natively)",
+            )));
+        }
+
         // --gemv-offload (spike): the offloaded matmuls run on the CPU
         // plugin's evaluate() fallback, and the rewrite targets the stateless
         // static IR's sym-INT4 pattern — gate both up front.
@@ -2887,6 +3548,12 @@ impl Builder for OvRuntimeBuilder {
     }
 
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
+        // Resolved before any field of `self` is moved out below.
+        let packed_plugin = self.plugin();
+        let packed_xml = self
+            .pipeline_dir
+            .join(format!("stage_{}", self.rank))
+            .join("openvino_packed_model.xml");
         let runtime = self.runtime.ok_or(EngineError::NotLoaded)?;
         let spec = self.spec.ok_or(EngineError::NotLoaded)?;
         let rotary = self.rotary.ok_or(EngineError::NotLoaded)?;
@@ -2941,6 +3608,7 @@ impl Builder for OvRuntimeBuilder {
             }
             Some(StaticKv {
                 past_len,
+                sink: crate::packed::KV_SINK.min(past_len / 2),
                 context: ctx as usize,
                 kv_heads: kvh,
                 head_dim: hd,
@@ -3037,7 +3705,82 @@ impl Builder for OvRuntimeBuilder {
             }
         };
 
+        // Packed multi-slot state: its own compiled variant + per-slot KV.
+        let packed = match self.packed_params {
+            None => None,
+            Some((slots, pseq, _pctx)) => {
+                let (ctx, kvh, hd) = self.static_params.expect("checked in load");
+                let past_len = (ctx - 1) as usize;
+                let prt = OvRuntime::compile(
+                    packed_xml.to_string_lossy().as_ref(),
+                    &self.device,
+                    &packed_plugin,
+                )
+                .map_err(map_ov_err)?;
+                let players = resolve_static_layers(&prt, "packed variant")?
+                    .into_iter()
+                    .map(|l| crate::packed_exec::PackedLayer {
+                        key_in: l.key_in,
+                        val_in: l.val_in,
+                        key_out: l.key_out,
+                        val_out: l.val_out,
+                    })
+                    .collect::<Vec<_>>();
+                let pcanon = resolve_canonical_inputs(&prt)?;
+                let ids_in = pcanon.get("input_ids").cloned().unwrap_or_default();
+                let hidden_in = pcanon.get("hidden_states").cloned().unwrap_or_default();
+                if ids_in.is_empty() && hidden_in.is_empty() {
+                    return Err(EngineError::Backend(
+                        "packed variant has neither input_ids nor hidden_states".into(),
+                    ));
+                }
+                let pos_in = pcanon.get("position_ids").cloned().ok_or_else(|| {
+                    EngineError::Backend("packed variant missing position_ids".into())
+                })?;
+                // The packed variant replaces the 2D attention_mask with a 4D
+                // per-row mask parameter; find it by name and take its dtype
+                // from the IR so f16/f32 exports both work.
+                let mut mask_in = None;
+                let mut mask_dtype = ShimDType::F16;
+                for idx in 0..prt.input_count() {
+                    let aliases = prt.input_aliases(idx).map_err(map_ov_err)?;
+                    if aliases.iter().any(|a| a.contains("attn_mask_4d")) {
+                        mask_in = Some(prt.input_name(idx).map_err(map_ov_err)?);
+                        mask_dtype = prt.input_dtype(idx).map_err(map_ov_err)?;
+                    }
+                }
+                let mask_in = mask_in.ok_or_else(|| {
+                    EngineError::Backend(
+                        "packed variant missing the attn_mask_4d input — rebuild it with \
+                         tools/packed_variant.py"
+                            .into(),
+                    )
+                })?;
+                let kv = crate::packed::PackedKv::new(
+                    slots as usize,
+                    past_len,
+                    pseq as usize,
+                    players.len(),
+                    kvh as usize,
+                    hd as usize,
+                    ShimDType::F16,
+                    self.packed_prefix as usize,
+                );
+                info!(
+                    slots,
+                    packed_seq = pseq,
+                    region = kv.region,
+                    shared_prefix = kv.prefix_capacity,
+                    "packed multi-slot decode active"
+                );
+                Some(crate::packed_exec::PackedState::new(
+                    prt, kv, players, ids_in, hidden_in, mask_in, pos_in, mask_dtype,
+                ))
+            }
+        };
+
         Ok(Box::new(OvRuntimeEngine {
+            packed,
             spec,
             runtime,
             rotary,
@@ -3073,6 +3816,86 @@ mod tests {
         assert!(res.is_err());
     }
 
+    /// Byte-level detokenizers emit one U+FFFD per byte they cannot yet decode,
+    /// so a multi-byte glyph arriving across reads appears as a run that later
+    /// RESOLVES — the decode is not prefix-stable, and can even get shorter.
+    /// The old delta (`full.strip_prefix(last).unwrap_or(full)`) re-emitted the
+    /// WHOLE text at that point, so the client saw the prefix twice.
+    #[test]
+    fn delta_does_not_duplicate_when_a_replacement_char_resolves() {
+        // Successive full decodes as tokens arrive: "caf", an undecodable byte,
+        // then the completed glyph, then more text.
+        let decodes = ["caf", "caf\u{FFFD}", "café", "café au lait"];
+
+        let mut emitted: Vec<u8> = Vec::new();
+        let mut client = String::new();
+        for (i, full) in decodes.iter().enumerate() {
+            let running = i + 1 < decodes.len();
+            let (delta, _) = advance_emitted(&mut emitted, full.as_bytes(), running);
+            client.push_str(&delta);
+        }
+        assert_eq!(
+            client, "café au lait",
+            "the client stream must reconstruct the final decode exactly"
+        );
+        assert!(
+            !client.contains('\u{FFFD}'),
+            "an unresolved replacement char must never be handed out: {client:?}"
+        );
+
+        // The regression this replaces, computed the old way for contrast.
+        let mut old = String::new();
+        let mut last = String::new();
+        for full in decodes {
+            old.push_str(full.strip_prefix(last.as_str()).unwrap_or(full));
+            last = full.to_string();
+        }
+        assert!(
+            old.matches("caf").count() > 1,
+            "old logic duplicated the prefix, which is the bug: {old:?}"
+        );
+    }
+
+    /// A packed variant narrower than its own slot count can never decode every
+    /// slot: `PackedPlan::decode` only lays down `packed_seq` rows, so slots
+    /// beyond that get no row, and the step then samples a logits row the
+    /// output does not have. That surfaces as an untyped step error which the
+    /// runner charges to whichever stream happened to poll. Refuse the geometry
+    /// at load instead.
+    #[test]
+    fn packed_variant_narrower_than_its_slot_count_is_refused() {
+        assert!(
+            packed_geometry_error(8, 8).is_none(),
+            "seq == slots is the norm"
+        );
+        assert!(
+            packed_geometry_error(8, 16).is_none(),
+            "a wider query window than slots is legitimate (fatter prefill chunks)"
+        );
+        let msg = packed_geometry_error(8, 4).expect("seq < slots must be refused");
+        assert!(msg.contains('8') && msg.contains('4'), "{msg}");
+        assert!(msg.contains("packed_seq"), "{msg}");
+    }
+
+    /// A prompt longer than its slot's KV region cannot be served honestly: the
+    /// packed ring would evict its head and answer from a truncated prompt, so
+    /// admission must refuse it. The boundary is strict — a prompt that exactly
+    /// fills the region still fits.
+    #[test]
+    fn over_region_prompt_is_refused_at_admission() {
+        assert!(
+            packed_prompt_too_long(255, 255).is_none(),
+            "a prompt that exactly fills the region is servable"
+        );
+        assert!(packed_prompt_too_long(1, 255).is_none());
+        let msg = packed_prompt_too_long(256, 255).expect("over-region must be refused");
+        assert!(msg.contains("256") && msg.contains("255"), "{msg}");
+        assert!(
+            msg.contains("--static-context") && msg.contains("--packed-slots"),
+            "the message must name both remedies: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn build_before_load_errors() {
         let b = Box::new(OvRuntimeBuilder::new("/x", 0, 1, "CPU"));
@@ -3092,6 +3915,7 @@ mod tests {
         let layer_bytes = kv_heads * past_len * head_dim * elem;
         StaticKv {
             past_len,
+            sink: crate::packed::KV_SINK.min(past_len / 2),
             context: past_len + 1,
             kv_heads,
             head_dim,
@@ -3158,6 +3982,82 @@ mod tests {
     /// after the window fills and slides. This is what makes the chunked
     /// (possibly other-device) prefill hand exactly the same KV state to the
     /// seq=1 decode loop as the legacy path.
+    #[test]
+    fn packed_plan_frame_round_trips() {
+        let rows = vec![
+            Some((0usize, 7i64, 0usize)),
+            None,
+            Some((3, 12, 12)),
+            Some((1, 129, 40)),
+        ];
+        let frame = encode_wire_plan(&rows);
+        assert_eq!(frame.shape, [1, 3, 4]);
+        let back = decode_wire_plan(&frame, 4).expect("round trip");
+        assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn packed_plan_frame_rejects_bad_frames() {
+        // wrong rank/shape (a scalar position frame from a non-packed peer)
+        let pos = encode_wire_position(5);
+        assert!(decode_wire_plan(&pos, 4).is_err());
+        // slot id beyond this stage's slot count
+        let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
+        let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
+        assert!(err.contains("slot 9"), "{err}");
+        // negative position would wrap in the ring math
+        let mut bad = encode_wire_plan(&[Some((0usize, 1i64, 0usize))]);
+        bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
+        assert!(decode_wire_plan(&bad, 4).is_err());
+    }
+
+    #[test]
+    fn packed_token_frame_round_trips() {
+        let toks = vec![5i32, 0, 128009, 42];
+        let back = decode_wire_tokens(&encode_wire_tokens(&toks)).expect("round trip");
+        assert_eq!(back, toks);
+        // a hidden (F32) frame where tokens were expected is a hard error
+        let wrong = WireTensor::new(WireDType::F32, [1, 1, 2], vec![0u8; 8]);
+        assert!(decode_wire_tokens(&wrong).is_err());
+    }
+
+    /// Which token sits in each ring slot, recovered by matching the
+    /// deterministic per-token byte pattern back.
+    fn ring_tokens(ring: &StaticKv, n: usize) -> Vec<Option<usize>> {
+        let slot = ring.head_dim * ring.elem_bytes;
+        (0..ring.past_len)
+            .map(|i| {
+                (0..n).find(|&t| {
+                    (0..slot).all(|b| ring.key_buf[0][i * slot + b] == tok_byte(t, 0, b, false))
+                })
+            })
+            .collect()
+    }
+
+    /// The single-task ring drops its OLDEST entry once full, which evicts
+    /// token 0 — the attention sink. Same defect the packed ring had, at the
+    /// full window instead of a per-slot region, so it needs a conversation
+    /// past `past_len` rather than past `region` to show. Measured on CPU: a
+    /// run crossing 1023 total tokens degenerated into "ttettettett...".
+    #[test]
+    fn single_task_slide_preserves_the_attention_sink() {
+        let mut ring = test_ring(10, 1, 1, 1); // sink = min(4, 10/2) = 4
+        assert_eq!(ring.sink, 4);
+        for t in 0..16 {
+            ring.begin_token(t);
+            let k = present_seq1(&ring, t, false);
+            ring.absorb_layer(0, false, &k);
+        }
+        assert_eq!(
+            ring_tokens(&ring, 16),
+            vec![0, 1, 2, 3, 10, 11, 12, 13, 14, 15]
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>(),
+            "tokens 0-3 are the sinks and must survive; only the tail slides"
+        );
+    }
+
     #[test]
     fn chunked_absorb_matches_sequential() {
         // past_len=4 forces sliding early; prompt=11 with C=3 exercises a

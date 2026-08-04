@@ -174,7 +174,12 @@ issue #41):
   prefill is token-at-a-time.
 - **FP16 KV** on the ring and the wire; `--default-dtype` must be `fp16` for
   `--target npu`.
-- **batch = 1** (single sequence).
+- **batch = 1** — the NPU compiler rejects a batch dimension outright
+  (`ConvertBatchedLayerTo1N` fails to legalize). Serving several requests at
+  once instead uses the SEQUENCE dimension: see
+  [packed multi-slot decode](perf/NPU_PACKED_SLOTS.md) (`--packed-slots N`),
+  measured at 6.0x aggregate throughput at 16 slots with bit-exact per-request
+  isolation.
 - Per-token host overhead is the mask rewrite + ring copies — small relative to
   the NPU forward pass.
 

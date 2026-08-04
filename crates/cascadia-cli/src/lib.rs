@@ -417,6 +417,21 @@ pub struct WorkerArgs {
     #[arg(long, default_value_t = 0)]
     pub prompt_lookup: u32,
 
+    /// Packed multi-slot continuous batching (NPU, ov-runtime static exports):
+    /// serve N concurrent requests in ONE inference by packing them into the
+    /// sequence dimension with a per-row mask. Requires a packed variant beside
+    /// the decode IR (`tools/packed_variant.py --slots N`). 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub packed_slots: u32,
+
+    /// Reserve N KV slots as a read-only SHARED prefix that every packed slot
+    /// may attend to — prefix caching without paged attention. The first
+    /// admitted request populates it; later requests sharing that prompt prefix
+    /// skip re-prefilling those tokens. Taken from the same window, so it costs
+    /// per-slot context. Requires --packed-slots. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    pub packed_prefix: u32,
+
     /// Continuous batching (#20, ov-genai only): serve concurrent requests
     /// through one ContinuousBatchingPipeline (paged attention; CPU/GPU
     /// plugins) instead of one generation at a time. Incompatible with
@@ -653,6 +668,8 @@ impl WorkerArgs {
             draft_device: None,
             spec_k: 5,
             prompt_lookup: 0,
+            packed_slots: 0,
+            packed_prefix: 0,
             cb: false,
             cb_cache_size: 0,
             cb_max_num_seqs: 0,
@@ -1236,6 +1253,8 @@ fn build_builder(args: &WorkerArgs) -> Result<Box<dyn Builder>> {
                 b = b.with_prefill_device(dev);
             }
             b = b.with_chunked_prefill_disabled(args.no_chunked_prefill);
+            b.packed_slots = args.packed_slots;
+            b.packed_prefix = args.packed_prefix;
             b = b.with_prefill_parking(args.park_prefill);
             b = b.with_gemv_offload(args.gemv_offload);
             if let Some(dir) = resolve_ov_cache_dir(args.ov_cache_dir.as_deref()) {
@@ -1491,7 +1510,44 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
             "--prefill-device / --park-prefill conflict with --no-chunked-prefill"
         ));
     }
-    // Continuous batching (#20) lives in the ov-genai CBP path only.
+    if args.packed_prefix > 0 && args.packed_slots == 0 {
+        return Err(anyhow!(
+            "--packed-prefix requires --packed-slots (the shared prefix lives in the packed \
+             KV window)"
+        ));
+    }
+    // Packed multi-slot decode lives in the ov-runtime static (NPU-target) path.
+    if args.packed_slots > 0 {
+        if args.engine != EngineKind::OvRuntime {
+            return Err(anyhow!(
+                "--packed-slots requires --engine ov-runtime (packed multi-slot decode is a \
+                 static-KV path feature)"
+            ));
+        }
+        if args.packed_slots < 2 {
+            return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
+        }
+        // Multi-stage packed is withheld pending a wire fault. The mechanism
+        // works — stage 0 ships an I64 [1,3,S] plan frame (slot, absolute
+        // position and prefix-reuse length per row) ahead of the [1,S,hidden]
+        // block, and the tail replies one token per row — but a token frame
+        // intermittently goes missing between the ranks, and rank 0 then blocks
+        // forever on a reply that never comes. Instrumented on NPU: rank 1
+        // logged the reply and advanced, rank 0 never saw it, no error on
+        // either side. Reproduces after sustained load, roughly two runs in
+        // three. Single-stage is unaffected and verified.
+        if args.total != 1 {
+            return Err(anyhow!(
+                "--packed-slots is single-stage only (--total 1); multi-stage packed can lose a \
+                 token frame between ranks and wedge the pipeline (issue #122). Run the packed \
+                 worker as a single stage, or drop --packed-slots to use the multi-stage baseline \
+                 path"
+            ));
+        }
+    }
+    // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
+    // different mechanism to --packed-slots above: OV's paged attention on the
+    // CPU/GPU plugins, versus our sequence-packing on the NPU static path.
     if (args.cb
         || args.cb_cache_size > 0
         || args.cb_max_num_seqs > 0
@@ -1516,11 +1572,13 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
     }
     // Paged attention is a CPU/GPU-plugin capability; on NPU ov-genai serves
     // the static NPUW pipeline. Without this gate the operator waits out a
-    // full model compile only to get a raw OpenVINO exception.
+    // full model compile only to get a raw OpenVINO exception. (NPU operators
+    // wanting concurrency use --engine ov-runtime --packed-slots instead.)
     if args.cb && device_is_npu(&args.device) {
         return Err(anyhow!(
             "--cb requires a CPU or GPU device; NPU serves ov-genai's static NPUW \
-             pipeline and cannot continuous-batch — drop --cb for NPU workers"
+             pipeline and cannot continuous-batch — use --engine ov-runtime with \
+             --packed-slots for NPU concurrency"
         ));
     }
     Ok(())
@@ -2337,6 +2395,65 @@ mod python_tests {
         a.no_chunked_prefill = true;
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains("conflict"), "{err}");
+    }
+
+    /// Packed multi-slot decode is an ov-runtime static-path feature; using it
+    /// on another engine, at N<2, or multi-stage is rejected loudly.
+    #[test]
+    fn worker_flags_gate_packed_slots() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 1;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains(">= 2"), "{err}");
+
+        // Multi-stage packed wedges: a token frame goes missing on the wire and
+        // rank 0 blocks on a reply that never arrives. Refuse it rather than
+        // hand an operator a pipeline that hangs after a while under load.
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 8;
+        a.total = 2;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--total 1"), "{err}");
+        assert!(err.contains("single-stage"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 8;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+
+        // the shared prefix lives inside the packed window, so it needs slots
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_prefix = 128;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("--packed-slots"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// The two continuous-batching mechanisms target different engines, so
+    /// asking for both at once is always rejected — whichever engine is named,
+    /// the other flag's gate fires. Pins that the ov-genai (#116) and
+    /// ov-runtime packed paths stay mutually exclusive.
+    #[test]
+    fn worker_flags_reject_cb_and_packed_slots_together() {
+        let mut a = worker("m", EngineKind::OvGenai);
+        a.cb = true;
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-runtime"), "{err}");
+
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.cb = true;
+        a.packed_slots = 8;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(err.contains("ov-genai"), "{err}");
     }
 
     /// A valid phase split (ov-runtime + prefill device, chunked enabled) passes.
