@@ -561,25 +561,33 @@ mod bf16_acc_experiment {
                 );
             }
 
-            let reps = 3;
+            let reps = 7;
             let run = |f: &dyn Fn(&[u16], &[f32]) -> f32| {
                 for o in 0..out_dim {
                     std::hint::black_box(f(&w[o * in_dim..(o + 1) * in_dim], &x));
                 }
             };
-            let time = |f: &dyn Fn(&[u16], &[f32]) -> f32| {
-                run(f);
+            // Round-robin the four variants and keep each one's BEST time.
+            // Timing them in sequence lets the clock ramp across the group, so
+            // whichever runs last looks fastest — on a laptop part that bias
+            // exceeded the effect. Min-of-N also rejects one-sided interference,
+            // which a mean would absorb.
+            let (mut shipped, mut n2, mut n4, mut n8) = (f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+            run(&|a, b| unsafe { super::dot_bf16w_avx2(a, b) });
+            for _ in 0..reps {
                 let t = Instant::now();
-                for _ in 0..reps {
-                    run(f);
-                }
-                t.elapsed().as_secs_f64() / reps as f64
-            };
-
-            let shipped = time(&|a, b| unsafe { super::dot_bf16w_avx2(a, b) });
-            let n2 = time(&|a, b| unsafe { dot_nacc::<2>(a, b) });
-            let n4 = time(&|a, b| unsafe { dot_nacc::<4>(a, b) });
-            let n8 = time(&|a, b| unsafe { dot_nacc::<8>(a, b) });
+                run(&|a, b| unsafe { super::dot_bf16w_avx2(a, b) });
+                shipped = shipped.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<2>(a, b) });
+                n2 = n2.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<4>(a, b) });
+                n4 = n4.min(t.elapsed().as_secs_f64());
+                let t = Instant::now();
+                run(&|a, b| unsafe { dot_nacc::<8>(a, b) });
+                n8 = n8.min(t.elapsed().as_secs_f64());
+            }
 
             // GEMV is one pass over the weights, so GB/s is the number that says
             // whether this is anywhere near the memory roof.

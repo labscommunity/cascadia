@@ -1090,11 +1090,6 @@ mod tests {
                 }
             };
             f32_run();
-            let t0 = Instant::now();
-            for _ in 0..reps {
-                f32_run();
-            }
-            let base = t0.elapsed().as_secs_f64() / reps as f64;
 
             let mut q = vec![0i8; in_dim];
             let mut qd = vec![0.0f32; in_dim / GROUP];
@@ -1123,11 +1118,19 @@ mod tests {
                 }
             };
             vnni_run();
-            let t1 = Instant::now();
+            // Alternate and keep the best of each: timing one variant fully then
+            // the other lets the clock ramp between them, and on a laptop part
+            // that bias is larger than the effect being measured.
+            let (mut base, mut vnni) = (f64::MAX, f64::MAX);
             for _ in 0..reps {
+                let t = Instant::now();
+                f32_run();
+                base = base.min(t.elapsed().as_secs_f64());
+
+                let t = Instant::now();
                 vnni_run();
+                vnni = vnni.min(t.elapsed().as_secs_f64());
             }
-            let vnni = t1.elapsed().as_secs_f64() / reps as f64;
 
             quantize_activations(&x, in_dim, &mut q, &mut qd);
             let g = 2.0 * out_dim as f64 * in_dim as f64;
@@ -1161,7 +1164,7 @@ mod tests {
 
         let (out_dim, in_dim) = (3072usize, 3584usize);
         let (data, _) = random_section(out_dim, in_dim, 0x2468);
-        let reps = 3;
+        let reps = 9;
         for &nrows in &[1usize, 2, 3, 4, 8, 16, 32, 64] {
             let mut s = 0xbead_0000 + nrows as u64;
             let xs: Vec<f32> = (0..nrows * in_dim)
@@ -1169,19 +1172,27 @@ mod tests {
                 .collect();
             let mut ys = vec![0.0f32; nrows * out_dim];
 
+            // ALTERNATE the two variants and keep the best time for each.
+            //
+            // Timing A fully, then B, is wrong on a laptop-class part: the clock
+            // ramps between them and whichever ran second wins. The `nrows = 1`
+            // row is the control that exposed it — there both columns are the
+            // SAME code (the batched path needs nrows > 1), and back-to-back
+            // timing still reported the second one 5-14% faster, drifting run to
+            // run. Alternating cancels the ramp; min-of-N rejects interference,
+            // which one-sided noise otherwise adds to the mean.
             gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut ys);
-            let t0 = Instant::now();
-            for _ in 0..reps {
-                gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut ys);
-            }
-            let rowwise = t0.elapsed().as_secs_f64() / reps as f64;
-
             gemm(&data, out_dim, in_dim, &xs, nrows, &mut ys);
-            let t1 = Instant::now();
+            let (mut rowwise, mut batched) = (f64::MAX, f64::MAX);
             for _ in 0..reps {
+                let t = Instant::now();
+                gemm_rowwise(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+                rowwise = rowwise.min(t.elapsed().as_secs_f64());
+
+                let t = Instant::now();
                 gemm(&data, out_dim, in_dim, &xs, nrows, &mut ys);
+                batched = batched.min(t.elapsed().as_secs_f64());
             }
-            let batched = t1.elapsed().as_secs_f64() / reps as f64;
 
             let gflops = 2.0 * out_dim as f64 * in_dim as f64 * nrows as f64;
             println!(
