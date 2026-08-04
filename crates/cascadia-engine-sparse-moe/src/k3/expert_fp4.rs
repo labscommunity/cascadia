@@ -1187,6 +1187,66 @@ mod tests {
         }
     }
 
+    /// What OUTLIERS do to the int8 activation path.
+    ///
+    /// `vnni_accuracy_vs_exact` uses uniform random activations and reports
+    /// 0.027%. That number is not evidence about a real model. The quantiser
+    /// takes an amax over each group of 32 and divides into 127 levels, so a
+    /// single large value in a group costs every other value in it resolution —
+    /// and LLM activations are known to carry exactly that kind of outlier.
+    ///
+    /// This sweeps one planted outlier per group from 1x to 1000x the rest and
+    /// reports the resulting error, so the shape of the risk is on record before
+    /// anyone argues about flipping `CASCADIA_K3_VNNI` on by default. It asserts
+    /// only the mechanism (error grows with outlier ratio, stays finite); the
+    /// verdict needs real activations, which needs the real model.
+    #[test]
+    fn vnni_accuracy_under_activation_outliers() {
+        let in_dim = 3584usize;
+        let (packed, scales, base_x) = random_row(in_dim, 0x0417_1ee7);
+
+        println!("outlier x   worst-group err    dot err (% of |accumulated|)");
+        let mut prev = 0.0f64;
+        for &ratio in &[1.0f32, 10.0, 50.0, 100.0, 1000.0] {
+            let mut x = base_x.clone();
+            // One planted outlier per group of 32, at the same position each
+            // time so the only variable is its magnitude.
+            for g in x.chunks_mut(GROUP) {
+                let m = g.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-6);
+                g[7] = m * ratio;
+            }
+
+            let exact = dequant_row_dot_scalar(&packed, &scales, &x, in_dim);
+            let mut q = vec![0i8; in_dim];
+            let mut qd = vec![0.0f32; in_dim / GROUP];
+            quantize_activations(&x, in_dim, &mut q, &mut qd);
+            let q8 = dequant_row_dot_q8_scalar(&packed, &scales, &q, &qd, in_dim);
+
+            // Worst single-element reconstruction error, relative to the group's
+            // step — this is what an outlier actually damages.
+            let mut worst = 0.0f32;
+            for (gi, (xg, qg)) in x.chunks_exact(GROUP).zip(q.chunks_exact(GROUP)).enumerate() {
+                for (&xv, &qv) in xg.iter().zip(qg) {
+                    worst = worst.max((qv as f32 * qd[gi] - xv).abs());
+                }
+            }
+            let mag = accumulated_magnitude(&packed, &scales, &x, in_dim);
+            let rel = ((q8 - exact).abs() / mag.max(1e-12)) as f64 * 100.0;
+            println!("{ratio:>9.0}   {worst:>14.5}    {rel:>8.4}%");
+
+            assert!(
+                rel.is_finite(),
+                "outlier {ratio}x produced a non-finite error"
+            );
+            prev = prev.max(rel);
+        }
+        assert!(
+            prev < 5.0,
+            "int8 activation error reached {prev}% even before real data — \
+             the group-32 amax quantiser is not viable as written"
+        );
+    }
+
     /// Prints per-row `gemv` vs batched `gemm` at the real K3 expert dims.
     ///
     /// This is the measurement the batched path exists for; it needs an x86 host
