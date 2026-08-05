@@ -3403,6 +3403,135 @@ mod tests {
         );
     }
 
+    /// Engine that emits a token every step and NEVER finishes. Only
+    /// `Runner::close()` can end a generation from it, which is what makes
+    /// the teardown test deterministic: the no-progress wedge guard trips
+    /// after 3 consecutive EMPTY steps, so an engine that stalls instead
+    /// would race that guard rather than the shutdown.
+    struct NeverEndingEngine {
+        task: Option<cascadia_types::TaskId>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl cascadia_engine::Engine for NeverEndingEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            self.task = Some(task.task_id);
+            Ok(())
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match &self.task {
+                Some(id) => vec![(id.clone(), Chunk::token(id, 0, "tok "))],
+                None => Vec::new(),
+            })
+        }
+    }
+
+    struct NeverEndingBuilder(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for NeverEndingBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: cascadia_types::ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(NeverEndingEngine {
+                task: None,
+                steps: self.0.clone(),
+            }))
+        }
+    }
+
+    /// Server teardown mid-generation must reach the CLIENT as a failure.
+    ///
+    /// The non-streaming handler seeds `finish_reason = "stop"` and drains
+    /// with `while let Some(chunk)`, so a bare end-of-stream builds a 200
+    /// carrying the partial text — telling the caller the model finished
+    /// normally while the server was going away. Anything persisting
+    /// completions then records truncated output as complete.
+    ///
+    /// The runner unit tests assert the metric on both poll/drop orderings;
+    /// this one covers what those cannot — the HTTP surface, on the
+    /// NON-streaming path (the local SSE probe covered streaming only).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn teardown_mid_generation_fails_the_request_and_books_teardown() {
+        const MODEL: &str = "api-teardown-model";
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = Arc::new(Runner::new(Box::new(NeverEndingBuilder(steps.clone()))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(runner.clone(), MODEL);
+
+        let req = tokio::spawn(post_chat(
+            app,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        ));
+
+        // Wait until the generation is genuinely under way before shutting
+        // down — otherwise the close could land before admission and the
+        // request would fail as NotLoaded, which is a different path.
+        while steps.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        runner.close();
+
+        let (status, body) = req.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "teardown must not return 200: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shutting down"),
+            "expected a shutdown error, got {body}"
+        );
+
+        let (_, buf) = cascadia_metrics::encode_text();
+        let text = String::from_utf8(buf).unwrap();
+        let needle = format!(
+            "cascadia_generation_duration_seconds_count{{finish_reason=\"teardown\",model=\"{MODEL}\"}} 1"
+        );
+        assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        // A restart is neither a client cancellation nor an engine fault.
+        for reason in ["cancelled", "error"] {
+            assert_eq!(
+                cascadia_metrics::GENERATION_DURATION_SECONDS
+                    .with_label_values(&[MODEL, reason])
+                    .get_sample_count(),
+                0,
+                "teardown must not be booked as {reason}"
+            );
+        }
+    }
+
     // Rejections that never reach the engine are counted by reason.
     #[tokio::test]
     async fn metrics_count_pre_engine_rejections() {

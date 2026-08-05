@@ -1426,6 +1426,48 @@ mod tests {
         assert!(chunk.error.as_deref().unwrap().contains("manifest"));
     }
 
+    /// Minimal real tokenizer: whitespace pre-tokenizer over a one-word
+    /// vocab. Enough to reach the post-tokenize admission checks without a
+    /// model — `""` encodes to zero ids, which is the case under test.
+    fn tiny_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("build tiny tokenizer")
+    }
+
+    /// A prompt that tokenizes to nothing is REJECTED at admission — the
+    /// decode branch would otherwise fabricate token 0 and emit garbage.
+    /// The rejection must reach the caller as an error, not as an empty
+    /// `final_marker`, which the API renders as a 200 with no content and
+    /// the runner books as a successful zero-token generation (so
+    /// `cascadia_tasks_failed_total` could never see it).
+    ///
+    /// `enable_thinking` is set so the empty-think-block injection is
+    /// skipped — otherwise those ids would make the prompt non-empty and
+    /// the branch under test unreachable.
+    #[test]
+    fn empty_prompt_is_rejected_loud_not_as_empty_success() {
+        let mut e = bare_engine(1, "{}");
+        e.rank = 0;
+        e.tokenizer = Some(tiny_tokenizer());
+        let mut task = GenerationTask::new("t-empty", "");
+        task.enable_thinking = true;
+        e.pending.push(task);
+
+        let out = e.step_local();
+        assert_eq!(out.len(), 1);
+        let (_, chunk) = &out[0];
+        assert!(chunk.is_final, "rejection must terminate the task");
+        assert!(
+            chunk.error.is_some(),
+            "empty prompt must be rejected LOUD; got a silent empty success: {chunk:?}"
+        );
+        assert!(chunk.error.as_deref().unwrap().contains("empty prompt"));
+    }
+
     #[test]
     fn finalize_error_emits_error_chunk_and_clears_active() {
         // A mid-generation backend/wire failure must terminate the task as
