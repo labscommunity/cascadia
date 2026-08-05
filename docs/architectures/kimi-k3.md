@@ -111,6 +111,35 @@ More nodes help steeply, because the shell shrinks as the cache grows: N=6 and
 N=8 reach ~3.9% and ~7.6% residency. The split is parameterised by `total`, so
 no code change is needed.
 
+**And they help far more than those residency figures suggest, because routing
+is not uniform.** Measured over 104,880 real selections (`k3_skew` on a
+`.k3_usage` from four prefills at the full top-16, 1.27 observations per slot so
+it is not a sparsity artefact):
+
+```
+experts/layer   coverage   uniform   ratio
+       1 (N=4)      4.3%      0.1%    38.8x
+      35 (N=6)     44.6%      3.9%    11.4x
+      68 (N=8)     61.9%      7.6%     8.2x
+```
+
+`coverage` is the share of routed reads the hottest experts of each layer
+account for — the hit rate pinning them buys, and so the fraction the I/O term
+falls by. Cache converts to hit rate at 8-39x the uniform rate, so the residency
+column above UNDERSTATES what a node costs and buys: N=6 is not 3.9% of reads
+served from RAM, it is ~45%.
+
+At N=4 the distribution is just as skewed (38.8x) but the budget is ~1 expert
+per LAYER — 0.5 GB is 28 experts spread over 23 layers — so only 4.3% is
+capturable. The hot set exists; there is nowhere to put it. That is a budget
+problem, not a routing one, and it is why `CASCADIA_K3_AUTOPIN` is worth little
+at four nodes and a great deal at six.
+
+Adding nodes is close to free on the wire here, which is worth stating because
+the opposite is true for tensor-parallel serving: K3 is PIPELINE-parallel, so a
+hop carries one activation — `(1 + max_blocks) * 7168` f32, ~258 KB — not a
+per-layer all-reduce. Three hops at N=4 is under 2 ms against a 9 s token.
+
 | Other targets | Result |
 |---|---|
 | **Xeon bench host** (~172 GB RAM, ~1.6 TB free) | export fits with `--free-source-shards`. Predicted ~0.1 tok/s at ~4% resident; MEASURED 363 s/token there, ~36x worse — see [Measured on that host](#measured-on-that-host) |
@@ -571,10 +600,37 @@ and on NVMe no better than ~2:1 once the shell is counted.
 
 **The one lever with headroom well past any of this is `top_k`.** Routed bytes
 are exactly `top_k * moe_layers * expert_bytes`, so they fall in direct
-proportion: k=8 halves the 7.2 s. Everything else here competes for the ~1.5x on
-the compute side; this competes for the other half. `--top-k-override` is wired
-(`K3Manifest::effective_top_k`); what is missing is the quality curve, which has
-to be measured on K3's own weights — K2.6 found a cliff, not a slope.
+proportion. Everything else here competes for the ~1.5x on the compute side;
+this competes for the other half.
+
+`--top-k-override` is wired (`K3Manifest::effective_top_k`). The quality screen
+has now run on real weights — `k3_topk_probe`, four prompts chosen to span easy
+recall through contested continuation, comparing next-token logits at k=4
+against the same prompt at k=16:
+
+```
+prompt          k=16 predicts   k=4 argmax   top5   KL(nats)
+factual_easy    " Rome"         same         4/5    0.073
+open_ended      " write"        same         5/5    0.096
+narrative       " the"          same         5/5    0.062
+reasoning       " fade"         same         4/5    0.365
+```
+
+Nothing was ruled out: the top token survives at a QUARTER of the bytes on every
+prompt, including ones where the reference was a weak hedge (" the") rather than
+an overdetermined answer.
+
+**Read the last row before acting on the rest.** `reasoning` is the only prompt
+needing a contextual chain carried across 92 layers (roses -> flowers -> fade),
+and its distribution moved 4-6x further than any other. The top token held, but
+by much less margin. A single-step screen is least trustworthy exactly there,
+because that is the error that compounds over a generation — and K2.6 found a
+real cliff (K=4 fine, K=3 a regression) that a screen like this would have
+walked straight past.
+
+So: promising, not settled. `top_k` stays at the manifest value until a
+generation eval on the survivors, because unlike autopin this is the one change
+that alters output.
 
 One caveat that cost most of a day: three entries below were configured, reported
 themselves enabled, and did nothing. The prefix cache sized its key index from an
