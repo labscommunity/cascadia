@@ -823,7 +823,11 @@ impl Qwen36Engine {
             // panic the decode branch (`expect`); reject at admission.
             if prompt_ids.is_empty() {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                let e = Chunk::error(
+                    task.task_id.clone(),
+                    "empty prompt after tokenize".to_string(),
+                );
+                return vec![(task.task_id, e)];
             }
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens
@@ -1149,7 +1153,11 @@ impl Qwen36Engine {
             // (garbage decode); reject at admission to match the pipeline path.
             if prompt_ids.is_empty() {
                 warn!(task = %task.task_id, "qwen36: empty prompt after tokenize; rejecting");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                let e = Chunk::error(
+                    task.task_id.clone(),
+                    "empty prompt after tokenize".to_string(),
+                );
+                return vec![(task.task_id, e)];
             }
             let max_tokens = if task.max_tokens > 0 {
                 task.max_tokens

@@ -1246,7 +1246,8 @@ impl Engine for OvDistSpecEngine {
                 Err(e) => {
                     warn!(error = %e, "tokenize failed");
                     let task_id = task.task_id.clone();
-                    return Ok(vec![(task_id, Chunk::final_marker(task.task_id, ""))]);
+                    let c = Chunk::error(task.task_id, format!("tokenize failed: {e}"));
+                    return Ok(vec![(task_id, c)]);
                 }
             };
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
@@ -1262,7 +1263,8 @@ impl Engine for OvDistSpecEngine {
                 Ok(active) => self.active = Some(active),
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec start failed");
-                    return Ok(vec![(task_id.clone(), Chunk::final_marker(task_id, ""))]);
+                    let c = Chunk::error(task_id.clone(), format!("start failed: {e}"));
+                    return Ok(vec![(task_id, c)]);
                 }
             }
         }

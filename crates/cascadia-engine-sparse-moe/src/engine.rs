@@ -1035,7 +1035,8 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => {
                 warn!(task = %task.task_id, "single-stage engine has no tokenizer");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                let final_chunk =
+                    Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
                 return vec![(task.task_id, final_chunk)];
             }
         };
@@ -1044,7 +1045,10 @@ impl SparseMoEEngine {
             Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                let final_chunk = Chunk::error(
+                    task.task_id.clone(),
+                    format!("tokenizer encode failed: {e}"),
+                );
                 return vec![(task.task_id, final_chunk)];
             }
         };
@@ -1073,7 +1077,8 @@ impl SparseMoEEngine {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "runner spec-decode failed: {e}");
-                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    let final_chunk =
+                        Chunk::error(task.task_id.clone(), format!("spec-decode failed: {e}"));
                     return vec![(task.task_id, final_chunk)];
                 }
             }
@@ -1090,7 +1095,8 @@ impl SparseMoEEngine {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "runner failed: {e}");
-                    let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                    let final_chunk =
+                        Chunk::error(task.task_id.clone(), format!("runner failed: {e}"));
                     return vec![(task.task_id, final_chunk)];
                 }
             }
@@ -1128,13 +1134,17 @@ impl SparseMoEEngine {
         let prompt_ids: Vec<i64> = {
             let Some(tok) = self.tokenizer.as_ref() else {
                 warn!(task = %task.task_id, "rank-0 engine has no tokenizer");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
+                return vec![(task.task_id, e)];
             };
             match tok.encode(task.prompt.as_str(), true) {
                 Ok(enc) => enc.get_ids().iter().map(|&u| u as i64).collect(),
                 Err(e) => {
                     warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("tokenizer encode failed: {e}")),
+                    )];
                 }
             }
         };
@@ -1145,7 +1155,13 @@ impl SparseMoEEngine {
             Some(d) => d,
             None => {
                 warn!("rank 0 has no downstream peer in multi-stage mode");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(
+                        task.task_id,
+                        "rank 0 has no downstream peer in multi-stage mode".to_string(),
+                    ),
+                )];
             }
         };
 
@@ -1153,7 +1169,10 @@ impl SparseMoEEngine {
         self.runner.reset_kv();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
             warn!(task = %task.task_id, "send_reset: {e}");
-            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            return vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id, format!("send_reset: {e}")),
+            )];
         }
 
         // Drive the full generation. result_tokens collects new tokens
@@ -1180,7 +1199,13 @@ impl SparseMoEEngine {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 spec-decode driver failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(
+                            task.task_id,
+                            format!("rank-0 spec-decode driver failed: {e}"),
+                        ),
+                    )];
                 }
             }
         } else {
@@ -1188,7 +1213,10 @@ impl SparseMoEEngine {
                 Ok(g) => g,
                 Err(e) => {
                     warn!(task = %task.task_id, "rank-0 driver failed: {e}");
-                    return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                    return vec![(
+                        task.task_id.clone(),
+                        Chunk::error(task.task_id, format!("rank-0 driver failed: {e}")),
+                    )];
                 }
             }
         };
@@ -1197,7 +1225,10 @@ impl SparseMoEEngine {
         let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
         let Some(tokenizer) = self.tokenizer.as_ref() else {
             warn!("tokenizer disappeared mid-task");
-            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            return vec![(
+                task.task_id.clone(),
+                Chunk::error(task.task_id, "tokenizer disappeared mid-task".to_string()),
+            )];
         };
         let mut text = tokenizer
             .decode(&ids_u32, true)
@@ -2158,14 +2189,18 @@ impl OvMoeEngine {
         };
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "MiniMax-M2 engine has no tokenizer");
-            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
+            return vec![(task.task_id, e)];
         };
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, format!("tokenizer encode failed: {e}")),
+                )];
             }
         };
         let max_new = task.max_tokens.max(1) as usize;
@@ -2174,7 +2209,10 @@ impl OvMoeEngine {
             Ok(g) => g,
             Err(e) => {
                 warn!(task = %task.task_id, "MiniMax-M2 generate failed: {e}");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, format!("MiniMax-M2 generate failed: {e}")),
+                )];
             }
         };
         let n_tokens = generated.len() as u32;
@@ -2250,7 +2288,8 @@ impl OvMoeEngine {
         };
         if self.tokenizer.is_none() {
             warn!(task = %id, "MiniMax-M2 rank 0 has no tokenizer");
-            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            let e = Chunk::error(id.clone(), "engine has no tokenizer".to_string());
+            return vec![(id, e)];
         }
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match self
@@ -2262,7 +2301,10 @@ impl OvMoeEngine {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %id, "tokenizer encode failed: {e}");
-                return vec![(id.clone(), Chunk::final_marker(id, ""))];
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("tokenizer encode failed: {e}")),
+                )];
             }
         };
         if prompt_ids.is_empty() {
@@ -2587,14 +2629,18 @@ impl Dsv4Engine {
         };
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "dsv4 engine has no tokenizer");
-            return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+            let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
+            return vec![(task.task_id, e)];
         };
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match tok.encode(task.prompt.as_str(), true) {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %task.task_id, "tokenizer encode failed: {e}");
-                return vec![(task.task_id.clone(), Chunk::final_marker(task.task_id, ""))];
+                return vec![(
+                    task.task_id.clone(),
+                    Chunk::error(task.task_id, format!("tokenizer encode failed: {e}")),
+                )];
             }
         };
         if prompt_ids.is_empty() {
@@ -2700,7 +2746,10 @@ impl Dsv4Engine {
         };
         if self.tokenizer.is_none() {
             warn!(task = %id, "dsv4 rank 0 has no tokenizer");
-            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            return vec![(
+                id.clone(),
+                Chunk::error(id, "dsv4 rank 0 has no tokenizer".to_string()),
+            )];
         }
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match self
@@ -2712,7 +2761,10 @@ impl Dsv4Engine {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %id, "tokenizer encode failed: {e}");
-                return vec![(id.clone(), Chunk::final_marker(id, ""))];
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("tokenizer encode failed: {e}")),
+                )];
             }
         };
         if prompt_ids.is_empty() {
