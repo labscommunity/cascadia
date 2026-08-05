@@ -972,6 +972,13 @@ mod tests {
         let recv_before = cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
             .with_label_values(&["tensor"])
             .get();
+        // Same before/after treatment for the histograms. These two are
+        // process-global and UNLABELLED, so a bare `>= 1` would be satisfied
+        // by any other roundtrip test in this binary — it would hold even
+        // with both `observe` calls deleted.
+        let send_samples_before = cascadia_metrics::TRANSPORT_SEND_SECONDS.get_sample_count();
+        let recv_samples_before =
+            cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS.get_sample_count();
         let mut server = ActivationServer::new("127.0.0.1", 0);
         server.start().await.unwrap();
         let port = server.port();
@@ -1001,8 +1008,17 @@ mod tests {
             recv_after >= recv_before + frame,
             "{recv_before}→{recv_after}"
         );
-        assert!(cascadia_metrics::TRANSPORT_SEND_SECONDS.get_sample_count() >= 1);
-        assert!(cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS.get_sample_count() >= 1);
+        let send_samples_after = cascadia_metrics::TRANSPORT_SEND_SECONDS.get_sample_count();
+        let recv_samples_after =
+            cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS.get_sample_count();
+        assert!(
+            send_samples_after > send_samples_before,
+            "send histogram took no sample ({send_samples_before}→{send_samples_after})"
+        );
+        assert!(
+            recv_samples_after > recv_samples_before,
+            "recv histogram took no sample ({recv_samples_before}→{recv_samples_after})"
+        );
     }
 
     #[tokio::test]

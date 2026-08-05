@@ -1611,12 +1611,21 @@ mod tests {
         );
         // Load + warmup gauges were set at start() (values may be ~0 for the
         // mock; presence of the label pair is the contract).
-        assert!(
-            cascadia_metrics::ENGINE_LOAD_DURATION_SECONDS
-                .with_label_values(&[MODEL, "CPU"])
-                .get()
-                >= 0.0
-        );
+        //
+        // Assert that through the EXPOSITION, not `with_label_values().get()`:
+        // that call CREATES the child on first access, so it would fabricate
+        // the very label pair it claims to check and then compare a fresh
+        // gauge's 0.0 against >= 0.0 — an assertion that cannot fail even if
+        // start() never touched either gauge.
+        let (_, buf) = cascadia_metrics::encode_text();
+        let text = String::from_utf8(buf).expect("exposition is utf-8");
+        for family in [
+            "cascadia_engine_model_load_duration_seconds",
+            "cascadia_engine_warmup_duration_seconds",
+        ] {
+            let needle = format!("{family}{{device=\"CPU\",model=\"{MODEL}\"}}");
+            assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        }
     }
 
     #[tokio::test]
