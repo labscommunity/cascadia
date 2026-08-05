@@ -81,14 +81,31 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register cascadia_inflight_tasks")
 });
 
-/// Requests rejected before generation started, by reason. Reasons:
-/// `capacity` (permit gate full OR the engine's own pending queue full —
-/// both 503), `empty_prompt` (400), `prompt_too_large` (over the API's
-/// `max_prompt_bytes` body limit, 413), `prompt_over_window` (tokenizes
-/// past what the engine can window for one request — e.g. a packed slot's
-/// KV region, also 413), `multi_prompt` (unsupported batch form, 400).
-/// The two 413s are split because they are different knobs: the first is
-/// the API's byte limit, the second is an engine sizing decision.
+/// Requests rejected before generation started, by reason. Each reason
+/// names the knob that fixes it, not the status code:
+///
+/// - `capacity` — permit gate full OR the engine's own pending queue full
+///   (both 503). Add workers.
+/// - `empty_prompt` (400), `multi_prompt` (unsupported batch form, 400) —
+///   malformed request.
+/// - `prompt_too_large` (413) — over the API's `max_prompt_bytes` body
+///   limit. Raise that limit.
+/// - `prompt_over_window` (413) — tokenizes past what the engine can window
+///   for one request, e.g. a packed slot's KV region. Resize the slots or
+///   widen the context. Split from `prompt_too_large` deliberately: same
+///   status, different knob, different owner.
+/// - `engine_unavailable` (503) — the engine is not loaded, or a pipeline
+///   peer is unreachable. Bring the stage or its peer up.
+/// - `engine_error` (500) — the engine itself failed the submit (backend,
+///   I/O, or an attributed task failure). Read that node's logs.
+/// - `invalid_request` (400/404) — bad config, rejected peer/shard, or an
+///   unknown model id.
+///
+/// The engine-raised reasons matter for a specific reason: no `ChunkStream`
+/// exists for a request that fails at submit, so the runner's
+/// `tasks_failed_total` never sees it. Without them a node failing every
+/// request looks exactly like a healthy idle one.
+///
 /// Rejections issued by router layers before a handler runs (body over the
 /// DefaultBodyLimit, malformed JSON) are NOT counted here — they are
 /// visible in `cascadia_http_requests_total` by status code.

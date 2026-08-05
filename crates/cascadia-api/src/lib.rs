@@ -1850,11 +1850,27 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     // edge case, and the fix is a sizing change (fewer slots, wider context).
     // Its own reason rather than `prompt_too_large` — that is the API's byte
     // limit on the request body, a different knob with a different owner.
-    match &err {
-        EngineError::QueueFull { .. } => count_rejected("capacity"),
-        EngineError::PromptTooLong(_) => count_rejected("prompt_over_window"),
-        _ => {}
-    }
+    // Exhaustive on purpose — no `_` arm. Every variant reaching here is a
+    // request rejected before generation started, which is exactly what this
+    // metric promises to count, and a catch-all is how PromptTooLong stayed
+    // invisible until someone went looking. A new EngineError variant should
+    // fail to compile until it is classified, not silently vanish.
+    //
+    // Reasons name the knob, not the status: `engine_unavailable` means bring
+    // the stage or its peer up, `engine_error` means read that node's logs,
+    // `invalid_request` means the caller sent something this worker can't
+    // serve. Without these a node failing 100% of requests looked identical
+    // to a healthy idle one on every metric here.
+    count_rejected(match &err {
+        EngineError::QueueFull { .. } => "capacity",
+        EngineError::PromptTooLong(_) => "prompt_over_window",
+        EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
+        EngineError::Backend(_) | EngineError::Io(_) | EngineError::Task { .. } => "engine_error",
+        EngineError::InvalidConfig(_)
+        | EngineError::PeerRejected(_)
+        | EngineError::ShardRejected(_)
+        | EngineError::ModelNotFound(_) => "invalid_request",
+    });
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
@@ -1915,6 +1931,42 @@ mod tests {
     /// "resize the slots" separately from `capacity` (add workers) and from
     /// `prompt_too_large` (raise the API's byte limit). Folding it into
     /// either would point at the wrong knob.
+    /// A request that fails at `submit()` never builds a `ChunkStream`, so
+    /// the runner's `tasks_failed_total` cannot see it. If these aren't
+    /// counted as rejections either, a worker failing 100% of requests is
+    /// indistinguishable from a healthy idle one on every metric we export.
+    ///
+    /// Strictly-greater deltas throughout: `reason` has no isolating label
+    /// and the registry is process-global, so other tests in this binary
+    /// drive the same arms concurrently.
+    #[test]
+    fn every_engine_error_books_a_rejection_reason() {
+        use cascadia_engine::EngineError;
+        // (error, expected reason) — one per arm of the classifier.
+        let cases: Vec<(EngineError, &str)> = vec![
+            (EngineError::QueueFull { queued: 8, cap: 8 }, "capacity"),
+            (EngineError::PromptTooLong("x".into()), "prompt_over_window"),
+            (EngineError::NotLoaded, "engine_unavailable"),
+            (EngineError::NotConnected, "engine_unavailable"),
+            (EngineError::Backend("boom".into()), "engine_error"),
+            (EngineError::InvalidConfig("bad".into()), "invalid_request"),
+            (EngineError::ModelNotFound("nope".into()), "invalid_request"),
+        ];
+        for (err, reason) in cases {
+            let before = cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&[reason])
+                .get();
+            let status = engine_error_response(err).status();
+            let after = cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&[reason])
+                .get();
+            assert!(
+                after > before,
+                "{status} was returned but booked no {reason} rejection"
+            );
+        }
+    }
+
     /// Strictly-greater, not an exact delta: the registry is process-global
     /// and `prompt_too_long_maps_to_413_not_503` drives the same arm on
     /// another test thread, so an `== before + 1` assertion races it. That
