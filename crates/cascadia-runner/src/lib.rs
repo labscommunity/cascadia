@@ -1479,6 +1479,95 @@ mod tests {
         }
     }
 
+    /// #16: each stream's metrics must be attributed to ITS OWN generation
+    /// while several streams share one engine.
+    ///
+    /// Every other metrics test drives a single stream, where "recorded at
+    /// buffer time" and "recorded at delivery" are the same instant on the
+    /// same object — so none of them can tell the two apart. This one can,
+    /// and it is the case continuous batching actually runs.
+    ///
+    /// If `record_chunk_metrics` were called from the distribution loop
+    /// (where the polling stream sees OTHER tasks' chunks) instead of from
+    /// the step-1 drain, all four assertions below break at once: the
+    /// poller would stamp foreign chunks against its own `submitted_at`, a
+    /// foreign `is_final` would set the poller's `metrics_finalized` and
+    /// silently swallow its own terminal sample, and tokens would be
+    /// counted twice — once by the driver, once by the owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_streams_attribute_metrics_to_their_own_generation() {
+        const MODEL: &str = "runner-metrics-concurrent-model";
+        const N: usize = 8;
+        const STREAMS: u64 = 2;
+        let ids: Vec<TaskId> = vec!["ca".to_string(), "cb".to_string()];
+        let runner = Arc::new(Runner::new(Box::new(MultiTaskBuilder {
+            tasks: ids.clone(),
+            total: N,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let r = runner.clone();
+            handles.push(tokio::spawn(async move {
+                let mut stream = r
+                    .generate(GenerationTask::new(id, "x").with_max_tokens(64))
+                    .unwrap();
+                while stream.next().await.is_some() {}
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Every chunk MultiTaskEngine emits carries text, so all N per task
+        // are token-bearing: N tokens, 1 TTFT and N-1 inter-token gaps each.
+        assert_eq!(
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            STREAMS * N as u64,
+            "tokens must be counted once, by the owning stream"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            STREAMS,
+            "one TTFT sample per generation, not per poller"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            STREAMS * (N as u64 - 1)
+        );
+        // The terminal sample is the one a foreign is_final would swallow.
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "stop"])
+                .get_sample_count(),
+            STREAMS,
+            "every generation must book its own terminal outcome"
+        );
+        for (counter, name) in [
+            (&cascadia_metrics::TASKS_CANCELLED_TOTAL, "cancelled"),
+            (&cascadia_metrics::TASKS_FAILED_TOTAL, "failed"),
+        ] {
+            assert_eq!(
+                counter.with_label_values(&[MODEL]).get(),
+                0,
+                "clean concurrent completion must not book {name}"
+            );
+        }
+    }
+
     /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
     /// (clearing each — a correctly-behaving engine), then serves the polled
     /// task a final chunk. Models concurrent serving where several other
