@@ -83,11 +83,15 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
 
 /// Requests rejected before generation started, by reason. Reasons:
 /// `capacity` (permit gate full OR the engine's own pending queue full —
-/// both 503), `empty_prompt` (400), `prompt_too_large` (413),
-/// `multi_prompt` (unsupported batch form, 400). Rejections issued by
-/// router layers before a handler runs (body over the DefaultBodyLimit,
-/// malformed JSON) are NOT counted here — they are visible in
-/// `cascadia_http_requests_total` by status code.
+/// both 503), `empty_prompt` (400), `prompt_too_large` (over the API's
+/// `max_prompt_bytes` body limit, 413), `prompt_over_window` (tokenizes
+/// past what the engine can window for one request — e.g. a packed slot's
+/// KV region, also 413), `multi_prompt` (unsupported batch form, 400).
+/// The two 413s are split because they are different knobs: the first is
+/// the API's byte limit, the second is an engine sizing decision.
+/// Rejections issued by router layers before a handler runs (body over the
+/// DefaultBodyLimit, malformed JSON) are NOT counted here — they are
+/// visible in `cascadia_http_requests_total` by status code.
 pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_api_rejected_total",

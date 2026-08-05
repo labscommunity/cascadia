@@ -1843,8 +1843,17 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     // permit-gate 503 (engines cap pending tasks BELOW the default permit
     // count, so this path is reachable at default config) — count it under
     // the same rejection reason or capacity pressure hides from the metric.
-    if matches!(&err, EngineError::QueueFull { .. }) {
-        count_rejected("capacity");
+    //
+    // A prompt the engine cannot window is a rejection too, and the one an
+    // operator most needs to see: at 8 packed slots on a 1024-context export
+    // the per-slot region is 127 tokens, so it is the common path, not an
+    // edge case, and the fix is a sizing change (fewer slots, wider context).
+    // Its own reason rather than `prompt_too_large` — that is the API's byte
+    // limit on the request body, a different knob with a different owner.
+    match &err {
+        EngineError::QueueFull { .. } => count_rejected("capacity"),
+        EngineError::PromptTooLong(_) => count_rejected("prompt_over_window"),
+        _ => {}
     }
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -1898,6 +1907,35 @@ mod tests {
             "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
         ));
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The window rejection is a rejection, and it must be countable on its
+    /// own: at 8 packed slots on a 1024-context export the per-slot region is
+    /// 127 tokens, so an operator watching a worker shed traffic needs to see
+    /// "resize the slots" separately from `capacity` (add workers) and from
+    /// `prompt_too_large` (raise the API's byte limit). Folding it into
+    /// either would point at the wrong knob.
+    /// Strictly-greater, not an exact delta: the registry is process-global
+    /// and `prompt_too_long_maps_to_413_not_503` drives the same arm on
+    /// another test thread, so an `== before + 1` assertion races it. That
+    /// this is NOT also booked as `capacity` needs no assertion — the two
+    /// live in exclusive arms of one `match`.
+    #[test]
+    fn prompt_over_window_counts_its_own_rejection_reason() {
+        let before = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
+            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+        ));
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let after = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        assert!(
+            after > before,
+            "a windowed-out prompt must count as a rejection ({before} -> {after})"
+        );
     }
 
     #[test]
