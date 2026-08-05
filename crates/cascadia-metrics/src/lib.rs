@@ -95,7 +95,7 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_api_rejected_total",
-        "Requests rejected before reaching the engine, by reason.",
+        "Requests rejected before generation started, by reason.",
         &["reason"]
     )
     .expect("register cascadia_api_rejected_total")
@@ -110,7 +110,7 @@ pub static API_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static GENERATION_TTFT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_ttft_seconds",
-        "Time-to-first-token: task submission to first engine chunk.",
+        "Task submission to first token-bearing chunk delivered to the consumer.",
         &["model"],
         TTFT_BUCKETS.to_vec()
     )
@@ -124,7 +124,7 @@ pub static GENERATION_TTFT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
 pub static GENERATION_INTER_TOKEN_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_inter_token_seconds",
-        "Latency between consecutive chunks of one generation.",
+        "Gap between consecutive token-bearing chunks, at delivery.",
         &["model"],
         INTER_TOKEN_BUCKETS.to_vec()
     )
@@ -132,11 +132,13 @@ pub static GENERATION_INTER_TOKEN_SECONDS: LazyLock<HistogramVec> = LazyLock::ne
 });
 
 /// Whole-generation duration, labeled with how it ended: `stop`, `length`,
-/// `cancelled` (client gone / explicit cancel), or `error`.
+/// `cancelled` (client gone / explicit cancel), or `error`. The `cancelled`
+/// samples are taken at abandonment, where there is no final chunk to
+/// deliver — hence "terminal outcome" rather than "final chunk".
 pub static GENERATION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_duration_seconds",
-        "Task submission to final chunk, by finish reason.",
+        "Task submission to terminal outcome, by finish reason.",
         &["model", "finish_reason"],
         DURATION_BUCKETS.to_vec()
     )
@@ -156,7 +158,10 @@ pub static TOKENS_GENERATED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 /// Prompt tokens consumed, as reported by engines that can tell (on the
-/// final chunk). Engines that can't report contribute 0.
+/// final chunk). An engine that never reports contributes NOTHING rather
+/// than 0 — the child is never created, so the family can be absent from
+/// the scrape entirely. Absence here means "nobody reported", not "zero
+/// prompt tokens".
 pub static TOKENS_PROMPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tokens_prompt_total",
@@ -168,9 +173,14 @@ pub static TOKENS_PROMPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 /// Generations abandoned before completion: explicit `/v1/cancel`
 /// (including an engine acknowledging with a Cancelled final marker), or
-/// the client dropped the response stream mid-generation. Server teardown
-/// (engine slot emptied under in-flight generations) is deliberately NOT
-/// counted here — a restart is not a client cancellation.
+/// the client dropped the response stream mid-generation.
+///
+/// Server teardown (engine slot emptied under in-flight generations) is
+/// deliberately not counted — a restart is not a client cancellation — but
+/// that suppression is CONDITIONAL, not a guarantee: it fires only when a
+/// stream is polled after `Runner::close()` empties the slot. A stream
+/// dropped before that poll still books a cancel here, so a restart can
+/// leave a small nondeterministic bump. Tracked as a follow-up.
 pub static TASKS_CANCELLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tasks_cancelled_total",
@@ -239,7 +249,9 @@ pub static TRANSPORT_RECV_BYTES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|
     .expect("register cascadia_transport_recv_bytes_total")
 });
 
-/// Full tensor-frame send duration (serialize + kernel send + flush).
+/// Full tensor-frame send duration (serialize + kernel send + flush). When
+/// `CASCADIA_SEND_BURST_BYTES` is set the timed window also contains the
+/// deliberate inter-burst sleeps, which are pacing, not link latency.
 pub static TRANSPORT_SEND_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "cascadia_transport_send_seconds",
@@ -262,8 +274,18 @@ pub static TRANSPORT_RECV_PAYLOAD_SECONDS: LazyLock<Histogram> = LazyLock::new(|
     .expect("register cascadia_transport_recv_payload_seconds")
 });
 
-/// Force registration of the label-less metrics so a scrape before any
-/// traffic still shows them (vec families appear once a child exists).
+/// Force registration of EVERY family at startup. Two reasons, and the
+/// label-less ones are only the visible half:
+///
+/// 1. Exposition: a scrape before any traffic still shows the label-less
+///    families (vec families stay absent until a child exists — prometheus
+///    drops childless families from `gather`, so forcing them is inert for
+///    output).
+/// 2. Collision detection: registration is the only thing that can fail
+///    here, and forcing it at boot turns a duplicate metric name into an
+///    immediate startup panic instead of one raised on a rare path — some
+///    of which run inside `Drop`, where a panic during unwind aborts.
+///
 /// Call once at server startup; idempotent.
 pub fn init() {
     LazyLock::force(&INFLIGHT_TASKS);
