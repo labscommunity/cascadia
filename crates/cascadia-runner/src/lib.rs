@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -130,6 +131,12 @@ pub struct Runner {
     /// Model id captured from the [`ShardSpec`] at `start()`, used as the
     /// `model` label on generation metrics (#16). `None` until started.
     model: Mutex<Option<Arc<str>>>,
+    /// Set by `close()` BEFORE the engine slot is emptied, so an in-flight
+    /// generation can tell "the server is shutting down" from "my client
+    /// hung up". Without it the outcome depends on an unsynchronised race
+    /// between a stream's next poll and its `Drop`, and every restart books
+    /// a nondeterministic number of client cancellations.
+    closing: Arc<AtomicBool>,
 }
 
 impl Runner {
@@ -139,6 +146,7 @@ impl Runner {
             engine: Arc::new(Mutex::new(None)),
             buffers: Arc::new(Mutex::new(Buffers::default())),
             model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -250,6 +258,7 @@ impl Runner {
             submitted_at: Instant::now(),
             last_chunk_at: None,
             metrics_finalized: false,
+            closing: self.closing.clone(),
         })
     }
 
@@ -313,6 +322,11 @@ impl Runner {
     }
 
     pub fn close(&self) {
+        // BEFORE the slot empties, so no in-flight stream can observe a gone
+        // engine without also seeing that this is a shutdown. Ordering is the
+        // whole point: set it after, and a stream that polls in between books
+        // a client cancellation for a server restart.
+        self.closing.store(true, Ordering::SeqCst);
         if let Some(engine) = self.engine.lock().as_mut() {
             engine.close();
         }
@@ -344,10 +358,14 @@ pub struct ChunkStream {
     submitted_at: Instant,
     /// When the previous chunk was delivered (inter-token latency).
     last_chunk_at: Option<Instant>,
-    /// A terminal outcome (completed / failed / cancelled) has been
-    /// recorded; guards exactly-once accounting between the final-chunk
-    /// paths, the cancel path, and `Drop`.
+    /// A terminal outcome (completed / failed / cancelled / teardown) has
+    /// been recorded; guards exactly-once accounting between the
+    /// final-chunk paths, the cancel path, and `Drop`.
     metrics_finalized: bool,
+    /// Shared with the [`Runner`]: set before `close()` empties the engine
+    /// slot, so an abandoned generation is attributed to the shutdown
+    /// rather than to the client regardless of poll/drop ordering.
+    closing: Arc<AtomicBool>,
 }
 
 impl ChunkStream {
@@ -430,10 +448,46 @@ impl ChunkStream {
         Poll::Ready(Some(chunk))
     }
 
+    /// The engine slot emptied under us: the server is shutting down.
+    ///
+    /// Ends the stream with an ERROR chunk, not a bare `None`. A bare
+    /// end-of-stream is indistinguishable from a completed generation, so
+    /// the API built a 200 carrying the partial text with
+    /// `finish_reason: "stop"` — telling the client the model finished
+    /// normally when the server was actually going away. The error chunk
+    /// routes through the existing 503 / SSE-error paths instead.
+    ///
+    /// Deliberately NOT `fail_stream`: that books `tasks_failed_total`, and
+    /// a planned restart must not land on the primary failure SLO.
+    fn fail_teardown(&mut self) -> Poll<Option<Chunk>> {
+        self.done = true;
+        self.buffers.lock().chunks.remove(&self.task_id);
+        warn!(
+            task = %self.task_id,
+            "engine slot emptied mid-generation (server teardown); failing the \
+             request rather than returning a truncated success"
+        );
+        self.record_teardown_metrics();
+        Poll::Ready(Some(Chunk::error(
+            self.task_id.clone(),
+            "server is shutting down".to_string(),
+        )))
+    }
+
     /// Record an abandoned generation: explicit cancel, or the consumer
     /// dropped the stream before the final chunk.
+    ///
+    /// A shutdown wins over both. `close()` sets `closing` before it empties
+    /// the engine slot, so this is decided by a flag rather than by whether
+    /// the stream happened to be polled once more before being dropped —
+    /// which is what previously made every restart book an unpredictable
+    /// number of "client cancelled".
     fn record_cancelled_metrics(&mut self) {
         if self.metrics_finalized {
+            return;
+        }
+        if self.closing.load(Ordering::SeqCst) {
+            self.record_teardown_metrics();
             return;
         }
         cascadia_metrics::TASKS_CANCELLED_TOTAL
@@ -441,6 +495,25 @@ impl ChunkStream {
             .inc();
         cascadia_metrics::GENERATION_DURATION_SECONDS
             .with_label_values(&[&self.model, "cancelled"])
+            .observe(self.submitted_at.elapsed().as_secs_f64());
+        self.metrics_finalized = true;
+    }
+
+    /// Record a generation cut short by server teardown.
+    ///
+    /// Its own `finish_reason` rather than silence: recording nothing left
+    /// `completed + failed + cancelled < started` after every restart with
+    /// no metric to explain the difference, so "how many answers did that
+    /// restart cut off?" was unanswerable. And its own reason rather than
+    /// `cancelled` or `error`: a graceful restart is neither a client
+    /// hanging up nor an engine fault, and folding it into either puts
+    /// planned maintenance on a panel someone pages on.
+    fn record_teardown_metrics(&mut self) {
+        if self.metrics_finalized {
+            return;
+        }
+        cascadia_metrics::GENERATION_DURATION_SECONDS
+            .with_label_values(&[&self.model, "teardown"])
             .observe(self.submitted_at.elapsed().as_secs_f64());
         self.metrics_finalized = true;
     }
@@ -495,29 +568,30 @@ impl Stream for ChunkStream {
             //    own text. Step and distribute have to be one critical section.
             let step_result = {
                 let mut guard = this.engine.lock();
-                let Some(engine) = guard.as_mut() else {
-                    this.done = true;
-                    // Server teardown (Runner::close emptied the slot), not a
-                    // client cancel: finalize with NO terminal sample so Drop
-                    // doesn't book every in-flight generation of a shutdown
-                    // as a client cancellation.
-                    this.metrics_finalized = true;
-                    return Poll::Ready(None);
-                };
-                match engine.step() {
-                    Ok(produced) => {
-                        let empty = produced.is_empty();
-                        let mut bufs = this.buffers.lock();
-                        for (tid, chunk) in produced {
-                            if bufs.cancelled.contains(&tid) {
-                                continue;
+                match guard.as_mut() {
+                    // Slot empty: `Runner::close` took the engine, i.e. server
+                    // teardown. Handled below rather than here because
+                    // `fail_teardown` needs `&mut *this` and this guard still
+                    // borrows `this.engine`.
+                    None => None,
+                    Some(engine) => Some(match engine.step() {
+                        Ok(produced) => {
+                            let empty = produced.is_empty();
+                            let mut bufs = this.buffers.lock();
+                            for (tid, chunk) in produced {
+                                if bufs.cancelled.contains(&tid) {
+                                    continue;
+                                }
+                                bufs.chunks.entry(tid).or_default().push_back(chunk);
                             }
-                            bufs.chunks.entry(tid).or_default().push_back(chunk);
+                            Ok(empty)
                         }
-                        Ok(empty)
-                    }
-                    Err(e) => Err(e),
+                        Err(e) => Err(e),
+                    }),
                 }
+            };
+            let Some(step_result) = step_result else {
+                return this.fail_teardown();
             };
             let produced_empty = match step_result {
                 Ok(empty) => empty,
@@ -824,6 +898,7 @@ mod tests {
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
             model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         });
 
         // Drive the relay loop on a worker thread, let it run for a window
@@ -875,6 +950,7 @@ mod tests {
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
             model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         });
 
         // No external stop: the loop must terminate on its own. A timed join
@@ -923,6 +999,7 @@ mod tests {
                 engine: Arc::new(Mutex::new(Some(engine))),
                 buffers: Arc::new(Mutex::new(Buffers::default())),
                 model: Mutex::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
             });
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
@@ -1766,13 +1843,81 @@ mod tests {
         let mut stream = runner.generate(task).unwrap();
         let _ = stream.next().await;
         runner.close(); // engine slot empties mid-generation
-        while stream.next().await.is_some() {}
+
+        // The stream must END LOUD. A bare None is indistinguishable from a
+        // completed generation, and the API turns it into a 200 carrying the
+        // partial text with finish_reason "stop" — telling the client the
+        // model finished normally while the server was going away.
+        let last = stream
+            .next()
+            .await
+            .expect("teardown must surface a terminal chunk, not a silent end-of-stream");
+        assert!(
+            last.error.is_some(),
+            "teardown chunk must carry an error so the API fails the request: {last:?}"
+        );
+        assert!(stream.next().await.is_none());
         drop(stream);
+
         assert_eq!(
             cascadia_metrics::TASKS_CANCELLED_TOTAL
                 .with_label_values(&[MODEL])
                 .get(),
-            0
+            0,
+            "a restart is not a client cancellation"
+        );
+        // Nor is it an engine fault: booking it failed would put planned
+        // maintenance on the primary failure SLO.
+        assert_eq!(
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0,
+            "a restart is not an engine failure"
+        );
+        // But it IS an outcome. Recording nothing left completed+failed+
+        // cancelled < started after every restart, with no metric to explain
+        // the gap.
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "teardown"])
+                .get_sample_count(),
+            1
+        );
+    }
+
+    /// The same shutdown, with the opposite interleaving: the stream is
+    /// DROPPED before it is ever polled again.
+    ///
+    /// Both orderings are reachable on the real shutdown path — per-connection
+    /// tasks are spawned, so they keep running while `close()` is dispatched —
+    /// and nothing sequences them. Before `Runner::closing`, which one won
+    /// decided whether the generation was booked as a client cancellation or
+    /// as nothing at all, so every restart produced a nondeterministic cancel
+    /// spike whose size no one could correct for.
+    #[tokio::test]
+    async fn teardown_books_the_same_outcome_when_the_stream_is_dropped_first() {
+        const MODEL: &str = "runner-metrics-teardown-drop-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-td2", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await;
+        runner.close();
+        drop(stream); // never polled again — Drop decides the outcome
+
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0,
+            "drop-first teardown must not book a client cancellation either"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "teardown"])
+                .get_sample_count(),
+            1,
+            "both orderings must book the SAME outcome"
         );
     }
 

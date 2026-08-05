@@ -58,10 +58,10 @@ The `model` label is the shard's `model_id`.
 |---|---|---|---|
 | `cascadia_generation_ttft_seconds` | histogram | `model` | Task submission → first token-bearing chunk **delivered to the consumer**. |
 | `cascadia_generation_inter_token_seconds` | histogram | `model` | Gap between consecutive token-bearing chunks of one generation, at delivery. |
-| `cascadia_generation_duration_seconds` | histogram | `model`, `finish_reason` | Submission → final chunk. `finish_reason`: `stop`, `length`, `cancelled`, `error`. |
+| `cascadia_generation_duration_seconds` | histogram | `model`, `finish_reason` | Submission → terminal outcome. `finish_reason`: `stop`, `length`, `cancelled` (client gone / explicit cancel), `error` (engine fault), `teardown` (server shut down mid-generation). Every admitted generation books exactly one sample, so `sum(rate(..._count))` reconciles with admissions — including across restarts. |
 | `cascadia_tokens_generated_total` | counter | `model` | Model tokens **delivered to clients** (uses the engine's `n_tokens` when set — spec-decode and ov-genai report multi-token chunks correctly). Tokens ground out after a client disconnected, before the cancel lands, are not counted. |
 | `cascadia_tokens_prompt_total` | counter | `model` | Prompt tokens, for engines that report them on the final chunk. |
-| `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or client disconnect mid-stream. Server teardown with generations in flight is deliberately not counted — but that suppression is conditional (it needs the stream to be polled after the engine slot empties), so a restart can still leave a small nondeterministic bump. |
+| `cascadia_tasks_cancelled_total` | counter | `model` | Generations abandoned before completion: explicit `/v1/cancel` (including an engine acknowledging with a `Cancelled` final marker) or client disconnect mid-stream. Server teardown is never counted here — a restart is not a client cancellation, and the suppression is deterministic (`close()` flags the shutdown before emptying the engine slot, so poll-first and drop-first orderings agree). Those generations land on `finish_reason="teardown"` instead. |
 | `cascadia_tasks_failed_total` | counter | `model` | Generations that terminated with an engine error. |
 
 Modes that deliver the whole response on a single final chunk — `ov-genai`

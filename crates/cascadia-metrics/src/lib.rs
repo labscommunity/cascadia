@@ -149,9 +149,14 @@ pub static GENERATION_INTER_TOKEN_SECONDS: LazyLock<HistogramVec> = LazyLock::ne
 });
 
 /// Whole-generation duration, labeled with how it ended: `stop`, `length`,
-/// `cancelled` (client gone / explicit cancel), or `error`. The `cancelled`
-/// samples are taken at abandonment, where there is no final chunk to
-/// deliver — hence "terminal outcome" rather than "final chunk".
+/// `cancelled` (client gone / explicit cancel), `error` (engine fault), or
+/// `teardown` (server shut down mid-generation). The `cancelled` and
+/// `teardown` samples are taken at abandonment, where there is no final
+/// chunk to deliver — hence "terminal outcome" rather than "final chunk".
+///
+/// Every admitted generation books exactly one sample here, so
+/// `sum(rate(..._count))` reconciles with admissions; `teardown` exists so
+/// that stays true across restarts instead of silently going short.
 pub static GENERATION_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "cascadia_generation_duration_seconds",
@@ -193,11 +198,12 @@ pub static TOKENS_PROMPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 /// the client dropped the response stream mid-generation.
 ///
 /// Server teardown (engine slot emptied under in-flight generations) is
-/// deliberately not counted — a restart is not a client cancellation — but
-/// that suppression is CONDITIONAL, not a guarantee: it fires only when a
-/// stream is polled after `Runner::close()` empties the slot. A stream
-/// dropped before that poll still books a cancel here, so a restart can
-/// leave a small nondeterministic bump. Tracked as a follow-up.
+/// never counted here — a restart is not a client cancellation. That
+/// suppression is deterministic, not best-effort: `Runner::close()` sets a
+/// shared `closing` flag BEFORE it empties the engine slot, so both
+/// orderings (stream polled again, stream dropped first) take the same
+/// branch. Those generations land on
+/// `cascadia_generation_duration_seconds{finish_reason="teardown"}`.
 pub static TASKS_CANCELLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tasks_cancelled_total",
