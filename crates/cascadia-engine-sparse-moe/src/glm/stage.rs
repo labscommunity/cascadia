@@ -379,7 +379,23 @@ impl GlmRunner {
             }
         }
 
-        if mode == ExpertsMode::Mmap {
+        // `CASCADIA_GLM5_NOPIN=1` disables ALL residency pinning: the hard
+        // minimum-working-set raise below AND both pin passes.
+        //
+        // Distinct from `CASCADIA_GLM5_NOPIN_ACTIVE`, which gates only the
+        // always-active pins — `reserve_lockable` and the hot-expert loop run
+        // regardless of it. That makes NOPIN_ACTIVE unusable as a pin A/B: a run
+        // with it set still raises the working-set minimum and still pins
+        // hundreds of hot experts, so a failure proves nothing about pinning.
+        //
+        // Exists for the OV-on-GPU compile investigation: every expert fails to
+        // compile on the iGPU inside the worker but compiles standalone, and the
+        // leading hypothesis is that a hard-enforced working-set minimum (up to
+        // 80% of available RAM) plus hundreds of VirtualLock'd bins starves the
+        // GPU driver's residency request during weight upload. This knob is what
+        // makes that testable; it is not itself the fix.
+        let nopin = std::env::var_os("CASCADIA_GLM5_NOPIN").is_some();
+        if mode == ExpertsMode::Mmap && !nopin {
             // Windows caps VirtualLock'd pages at the process minimum working set,
             // which defaults to a few MB — so raise it to cover everything we pin
             // (always-active + hot experts) before pinning, or every pin fails and
