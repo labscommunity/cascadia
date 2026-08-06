@@ -246,6 +246,7 @@ fn glm5_bf16_head_pipeline_bounded_vs_f32() {
         StageOpts {
             bf16_head: true,
             bf16_kv: false,
+            ..Default::default()
         },
     )
     .expect("load bf16-head")];
