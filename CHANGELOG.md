@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.1.7](https://github.com/labscommunity/cascadia/compare/v0.1.6...v0.1.7) (2026-08-06)
+
+
+### Features
+
+* **metrics:** Prometheus /metrics endpoint — request, generation, engine, and transport metrics ([#16](https://github.com/labscommunity/cascadia/issues/16)) ([adcd3cd](https://github.com/labscommunity/cascadia/commit/adcd3cdcb2acee3e27e15819306acd1104410440))
+* **metrics:** Prometheus /metrics endpoint — request, generation, engine, transport metrics ([#16](https://github.com/labscommunity/cascadia/issues/16)) ([fa0a326](https://github.com/labscommunity/cascadia/commit/fa0a3268c236118b4bb248d888dd4d694f80f295))
+
+
+### Bug Fixes
+
+* **engines:** stop reporting engine failures as empty successful completions ([a895407](https://github.com/labscommunity/cascadia/commit/a8954073ddc4f3155ddb99586b0475e13f00538f))
+* **metrics:** count an over-window prompt rejection ([9ec49e7](https://github.com/labscommunity/cascadia/commit/9ec49e757494b2f16a37573a6ff5d9f588cecc4c))
+* **metrics:** count every pre-generation engine rejection, not two of them ([9b67680](https://github.com/labscommunity/cascadia/commit/9b6768007d50bd148355a230fa73980d5e98f4ad))
+* **metrics:** review round — cancel accounting, teardown, QueueFull capacity, timing artifacts ([d9b1f8f](https://github.com/labscommunity/cascadia/commit/d9b1f8fd1ca94f8afb38e1cc10290dda1c9756e9))
+* **ov-genai:** a failed generate() must emit an error chunk, not an empty success ([14b6d49](https://github.com/labscommunity/cascadia/commit/14b6d49875adcced70bf96cedf4a48fd5ed8e998))
+* **runner:** fail loud on shutdown, and book teardown deterministically ([bcf5a11](https://github.com/labscommunity/cascadia/commit/bcf5a118d4cd04875c9d74c5d8ecb367c60a47bd))
+
+
+### Documentation
+
+* **metrics:** fix the scrape example and the HELP strings that contradict their docs ([48b98a3](https://github.com/labscommunity/cascadia/commit/48b98a36b5e8c09bfbb64e6bee231b8b935cdcb8))
+
+
+### Testing
+
+* cover the teardown HTTP surface and the qwen36 empty-prompt rejection ([a503ad6](https://github.com/labscommunity/cascadia/commit/a503ad6be68d4de47b65b00aa32eac6eeb7ed343))
+* **metrics:** make three assertions that could not fail actually fail ([8c10cbf](https://github.com/labscommunity/cascadia/commit/8c10cbf1e7281162feaa164fcf2ad77c378dd083))
+* **runner:** pin metric attribution across concurrent streams ([b75d4a3](https://github.com/labscommunity/cascadia/commit/b75d4a32019141574ecebf23ab30e96bd33553bf))
+
 ## [0.1.6](https://github.com/labscommunity/cascadia/compare/v0.1.5...v0.1.6) (2026-08-04)
 
 
