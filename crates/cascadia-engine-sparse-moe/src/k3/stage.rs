@@ -152,17 +152,26 @@ impl PrefixStore {
     }
 }
 
+/// Whether `Drop` should persist the usage histogram. Split out of `Drop` so
+/// the override path has a test — a cold run under `k3_autopin` has
+/// `pinned == 0` and no env var, and used to skip the write-back entirely.
+///
+/// Only write back when pinning is in use, so a plain run never touches the
+/// model dir. A `k3_autopin` override wins over the env var, same as
+/// `autopin_budget()` — otherwise a cold first run under the override
+/// (`pinned == 0`, no env var) never writes the histogram and autopin never
+/// bootstraps.
+fn should_save_usage(pinned: usize, autopin_override: Option<bool>, env_set: bool) -> bool {
+    pinned > 0 || autopin_override == Some(true) || env_set
+}
+
 impl Drop for K3Runner {
     fn drop(&mut self) {
-        // only write back when pinning is in use, so a plain run never touches
-        // the model dir. A `k3_autopin` override wins over the env var, same
-        // as autopin_budget() — otherwise a cold first run under the override
-        // (pinned == 0, no env var) never writes the histogram and autopin
-        // never bootstraps.
-        if self.pinned > 0
-            || crate::k3::knobs::get().autopin == Some(true)
-            || std::env::var_os("CASCADIA_K3_AUTOPIN").is_some()
-        {
+        if should_save_usage(
+            self.pinned,
+            crate::k3::knobs::get().autopin,
+            std::env::var_os("CASCADIA_K3_AUTOPIN").is_some(),
+        ) {
             self.save_usage();
         }
     }
@@ -586,5 +595,34 @@ mod tests {
             PREFIX_CACHE_FRACTION > 0.0 && PREFIX_CACHE_FRACTION <= 0.10,
             "fraction {PREFIX_CACHE_FRACTION} is outside the measured-safe range"
         );
+    }
+
+    #[test]
+    fn a_cold_run_with_the_autopin_override_still_saves_usage() {
+        // The regression case: pinned == 0 (a fresh deployment's histogram
+        // hasn't earned a budget yet) and no env var, but the config override
+        // is on. Before the fix this returned false and the histogram was
+        // never written, so autopin could never bootstrap.
+        assert!(should_save_usage(0, Some(true), false));
+    }
+
+    #[test]
+    fn a_plain_run_never_touches_the_model_dir() {
+        assert!(!should_save_usage(0, None, false));
+    }
+
+    #[test]
+    fn an_explicit_autopin_opt_out_is_honoured() {
+        assert!(!should_save_usage(0, Some(false), false));
+    }
+
+    #[test]
+    fn the_env_fallback_still_works_when_unconfigured() {
+        assert!(should_save_usage(0, None, true));
+    }
+
+    #[test]
+    fn pinning_in_use_always_saves() {
+        assert!(should_save_usage(3, None, false));
     }
 }
