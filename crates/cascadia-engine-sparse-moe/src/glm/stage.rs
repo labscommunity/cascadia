@@ -169,13 +169,22 @@ impl WideTable {
 /// exact f32 — what the correctness tests and the single-process reference
 /// compare against. Production selects precision via [`StageOpts::from_env`], so
 /// the env is read in ONE place (not scattered through the loader).
-#[derive(Clone, Copy, Default)]
+// No `Copy`: `experts_mode` is an owned `String`. Callers that previously relied
+// on implicit copies clone explicitly — this struct is built once per load.
+#[derive(Clone, Default)]
 pub struct StageOpts {
     /// embed + lm_head as bf16 (frees ~3 GB/edge-rank → more resident experts;
     /// ~1.2× decode, output within bf16 tolerance of f32).
     pub bf16_head: bool,
     /// MLA latent / k_pe KV cache as bf16 (frees KV RAM ∝ `max_seq`).
     pub bf16_kv: bool,
+    /// Expert storage mode (`"eager"` | `"mmap"`). `None` → `CASCADIA_GLM5_EXPERTS`,
+    /// else the size heuristic below.
+    pub experts_mode: Option<String>,
+    /// Async lookahead expert prefetch. `None` → `CASCADIA_GLM5_LOOKAHEAD`.
+    pub lookahead: Option<bool>,
+    /// Per-rank KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE`.
+    pub prefix_cache_depth: Option<u32>,
 }
 
 impl StageOpts {
@@ -183,10 +192,44 @@ impl StageOpts {
     /// `CASCADIA_GLM5_F32_HEAD`), bf16 KV **off** (opt in with
     /// `CASCADIA_GLM5_BF16_KV`). Call this only from the serving entry point;
     /// tests/examples pass an explicit `StageOpts` (default = exact f32).
+    ///
+    /// The three `Option` fields stay `None` here: their env fallback happens at
+    /// their read sites in [`GlmRunner::load_staged`], where the existing parse
+    /// logic already lives.
     pub fn from_env() -> Self {
         Self {
             bf16_head: std::env::var_os("CASCADIA_GLM5_F32_HEAD").is_none(),
             bf16_kv: std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
+            experts_mode: None,
+            lookahead: None,
+            prefix_cache_depth: None,
+        }
+    }
+
+    /// Resolve from explicit config, falling back to env for any field left
+    /// `None`.
+    ///
+    /// `f32_head` is modelled as the OPT-OUT to match `CASCADIA_GLM5_F32_HEAD`:
+    /// bf16 head is the production default, so a `bf16_head` config field
+    /// defaulting to `false` would silently cost ~1.2× decode on every
+    /// deployment that didn't set it.
+    ///
+    /// Exists because in-process hosts cannot set the environment for a single
+    /// engine (`set_var` is `unsafe` under edition 2024, and process-global).
+    pub fn resolve(
+        f32_head: Option<bool>,
+        bf16_kv: Option<bool>,
+        experts_mode: Option<String>,
+        lookahead: Option<bool>,
+        prefix_cache_depth: Option<u32>,
+    ) -> Self {
+        let env = Self::from_env();
+        Self {
+            bf16_head: f32_head.map(|f| !f).unwrap_or(env.bf16_head),
+            bf16_kv: bf16_kv.unwrap_or(env.bf16_kv),
+            experts_mode,
+            lookahead,
+            prefix_cache_depth,
         }
     }
 }
@@ -282,9 +325,15 @@ impl GlmRunner {
         let last = rank == total - 1;
         // Real-model expert sets can't be held dequantized; tiny/dev ones are
         // faster eager. CASCADIA_GLM5_EXPERTS=eager|mmap overrides.
-        let mode = match std::env::var("CASCADIA_GLM5_EXPERTS").as_deref() {
-            Ok("eager") => ExpertsMode::Eager,
-            Ok("mmap") => ExpertsMode::Mmap,
+        // Config first, then env, then the size heuristic — same precedence for
+        // every knob below.
+        let experts_mode = opts
+            .experts_mode
+            .clone()
+            .or_else(|| std::env::var("CASCADIA_GLM5_EXPERTS").ok());
+        let mode = match experts_mode.as_deref() {
+            Some("eager") => ExpertsMode::Eager,
+            Some("mmap") => ExpertsMode::Mmap,
             _ if m.num_experts > 32 => ExpertsMode::Mmap,
             _ => ExpertsMode::Eager,
         };
@@ -408,18 +457,20 @@ impl GlmRunner {
         // Async lookahead: build the per-layer expert-bin table (local index -> routed
         // bin paths) and spawn the background lookahead worker. Only on the mmap path
         // (streamed experts); eager/bf16 have nothing to warm.
-        let lookahead =
-            if mode == ExpertsMode::Mmap && std::env::var_os("CASCADIA_GLM5_LOOKAHEAD").is_some() {
-                let table: super::lookahead::LookaheadTable = s
-                    .layers
-                    .iter()
-                    .map(|l| l.moe().map(|ml| ml.expert_bins()))
-                    .collect();
-                eprintln!("[glm5] rank {rank}: lookahead prefetch thread started");
-                Some(super::lookahead::Lookahead::new(table))
-            } else {
-                None
-            };
+        let lookahead_on = opts
+            .lookahead
+            .unwrap_or_else(|| std::env::var_os("CASCADIA_GLM5_LOOKAHEAD").is_some());
+        let lookahead = if mode == ExpertsMode::Mmap && lookahead_on {
+            let table: super::lookahead::LookaheadTable = s
+                .layers
+                .iter()
+                .map(|l| l.moe().map(|ml| ml.expert_bins()))
+                .collect();
+            eprintln!("[glm5] rank {rank}: lookahead prefetch thread started");
+            Some(super::lookahead::Lookahead::new(table))
+        } else {
+            None
+        };
 
         Ok(Self {
             embed: embed_tab,
@@ -438,9 +489,13 @@ impl GlmRunner {
             prefetch: std::env::var("CASCADIA_GLM5_PREFETCH").is_ok(),
             lookahead,
             prefix_cache: SliceKvCache::new(
-                std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok())
+                opts.prefix_cache_depth
+                    .map(|d| d as usize)
+                    .or_else(|| {
+                        std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
+                            .ok()
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                    })
                     .unwrap_or(0),
             ),
         })

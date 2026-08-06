@@ -46,6 +46,29 @@ pub struct SparseMoEBuilderConfig {
     pub model_dir: PathBuf,
     pub device: String,
     pub cache_dir: Option<String>,
+    // ---- glm5 tunables, config-threaded ----------------------------------
+    // Each of these is otherwise read from the process environment deep inside
+    // the engine. A host that loads the engine in-process cannot set those
+    // (`set_var` is `unsafe` under edition 2024, and process-global), so they
+    // travel as config instead. `None` means "use the env value", preserving
+    // every existing env-driven deployment byte-for-byte.
+    //
+    // Deliberately absent: `profile`. `CASCADIA_GLM5_PROFILE` is read from a
+    // `OnceLock` process global in the decode loop, which no config can reach;
+    // it stays env-only rather than becoming a field that silently does nothing.
+    /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    pub max_seq: Option<usize>,
+    /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
+    pub prefix_cache_depth: Option<u32>,
+    /// bf16 MLA latent / k_pe KV cache. `None` → `CASCADIA_GLM5_BF16_KV` (off).
+    pub bf16_kv: Option<bool>,
+    /// Force exact-f32 embed + lm_head. `None` → `CASCADIA_GLM5_F32_HEAD`.
+    /// Modelled as the opt-OUT: bf16 head is the default-ON production path.
+    pub f32_head: Option<bool>,
+    /// Async lookahead expert prefetch. `None` → `CASCADIA_GLM5_LOOKAHEAD` (off).
+    pub lookahead: Option<bool>,
+    /// Expert storage mode (`"eager"` | `"mmap"`). `None` → `CASCADIA_GLM5_EXPERTS`.
+    pub experts_mode: Option<String>,
     /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
     /// Applied via the shared `PluginConfig` to every OV-compiled IR on this
     /// rank: embedding, transformer shells, head, and — for `ov_ir`-format
@@ -140,6 +163,14 @@ impl SparseMoEBuilderConfig {
             model_dir: model_dir.into(),
             device: device.into(),
             cache_dir: None,
+            // All `None` = "defer to env", so constructing a config changes
+            // nothing for existing env-driven deployments.
+            max_seq: None,
+            prefix_cache_depth: None,
+            bf16_kv: None,
+            f32_head: None,
+            lookahead: None,
+            experts_mode: None,
             ov_properties: Vec::new(),
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
@@ -443,10 +474,17 @@ impl Builder for SparseMoEBuilder {
         if is_glm {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = std::env::var("CASCADIA_GLM5_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .filter(|&n| n > 0)
+            let max_seq = self
+                .config
+                .max_seq
+                .or_else(|| {
+                    std::env::var("CASCADIA_GLM5_MAX_SEQ")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        // `=0` keeps meaning "fall through to the default",
+                        // not "zero context".
+                        .filter(|&n| n > 0)
+                })
                 .unwrap_or(crate::glm::stage::GLM5_DEFAULT_MAX_SEQ);
             let runner = crate::glm::stage::GlmRunner::load_staged(
                 &self.config.model_dir,
@@ -455,7 +493,13 @@ impl Builder for SparseMoEBuilder {
                 total,
                 shard.layer_start,
                 shard.layer_end,
-                crate::glm::stage::StageOpts::from_env(),
+                crate::glm::stage::StageOpts::resolve(
+                    self.config.f32_head,
+                    self.config.bf16_kv,
+                    self.config.experts_mode.clone(),
+                    self.config.lookahead,
+                    self.config.prefix_cache_depth,
+                ),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
             if rank == 0 {
@@ -667,6 +711,9 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                // dsv4 has no config-threaded prefix cache; `None` keeps its
+                // existing env-only behaviour byte-for-byte.
+                None,
             )));
         }
         if let Some(runner) = self.glm_runner {
@@ -687,6 +734,9 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                // Same value the per-rank SliceKvCache got, so the rank-0 index
+                // and the per-rank caches stay in lockstep.
+                self.config.prefix_cache_depth.map(|d| d as usize),
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -2692,6 +2742,10 @@ struct PipeActive {
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
+    /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
+    /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
+    /// index must stay in lockstep with every rank's `SliceKvCache`, so the
+    /// value threaded here is the same one handed to `StageOpts`.
     fn new(
         runner: R,
         tokenizer: Option<Tokenizer>,
@@ -2699,6 +2753,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
+        prefix_cap: Option<usize>,
     ) -> Self {
         Self {
             runner,
@@ -2715,9 +2770,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
             last_rank_rng_seeded: false,
             prefix_index: Vec::new(),
             prefix_next_key: 0,
-            prefix_cap: std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
+            prefix_cap: prefix_cap
+                .or_else(|| {
+                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                })
                 .unwrap_or(0),
             active: None,
         }
