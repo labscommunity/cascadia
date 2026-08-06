@@ -1,0 +1,12 @@
+[package]
+name = "cascadia-metrics"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prometheus metric registry + inventory shared by the API server, runner, and transport."
+
+[dependencies]
+prometheus = { workspace = true }

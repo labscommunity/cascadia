@@ -52,27 +52,26 @@ pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 /// this whole HTTP-server crate.
 pub use cascadia_types::ApiStats;
 
-/// Tokens a chunk contributes to the cumulative counter. The engine's
-/// `n_tokens` is authoritative when set (spec-decode reports 1..=K+1;
-/// ov-genai sets it on its single final chunk so `usage` reflects the
-/// real generated count — issue #55); otherwise the per-chunk convention
-/// is "one token per non-empty chunk" (see `Chunk::n_tokens` docs). An
-/// empty chunk — the no-text final marker mock/runtime engines emit —
-/// contributes 0 so it isn't counted as a phantom token.
+/// Tokens a chunk contributes to the cumulative counter. The convention
+/// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
+/// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
+/// the dashboard counters, and the runner's Prometheus metrics can never
+/// drift apart; this alias keeps the historical call sites and tests.
 fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
-    chunk
-        .n_tokens
-        .unwrap_or(if chunk.text.is_empty() { 0 } else { 1 })
+    chunk.token_count()
 }
 
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
 /// on drop, so the gauge is correct even on early return, client disconnect,
-/// or a mid-stream engine error.
+/// or a mid-stream engine error. Mirrors into the Prometheus
+/// `cascadia_inflight_tasks` gauge (#16) so both the dashboard and
+/// `/metrics` see the same lifecycle.
 struct InFlightGuard(Arc<ApiStats>);
 
 impl InFlightGuard {
     fn new(stats: Arc<ApiStats>) -> Self {
         stats.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        cascadia_metrics::INFLIGHT_TASKS.inc();
         InFlightGuard(stats)
     }
 }
@@ -80,7 +79,16 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.requests_in_flight.fetch_sub(1, Ordering::Relaxed);
+        cascadia_metrics::INFLIGHT_TASKS.dec();
     }
+}
+
+/// Count a pre-engine rejection in `cascadia_api_rejected_total`. Reasons
+/// are a closed set — see the metric's docs in `cascadia-metrics`.
+fn count_rejected(reason: &str) {
+    cascadia_metrics::API_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
 }
 
 #[derive(Clone)]
@@ -249,9 +257,13 @@ pub fn make_router_with_stats(
         defer_template_on_thinking: cfg.defer_template_on_thinking,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
+    // Register the label-less metric families up-front so a scrape before
+    // any traffic still lists them (#16). Idempotent.
+    cascadia_metrics::init();
     let mw_state = state.clone();
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -268,6 +280,43 @@ pub fn make_router_with_stats(
         // a multi-GB request. Apply at router level so it applies to
         // every route, not just chat_completions.
         .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
+        // Outermost: request count + latency per matched route (#16), so it
+        // observes rejections from the inner layers too.
+        .layer(axum::middleware::from_fn(track_http_metrics))
+}
+
+/// Request middleware: per-route request counter + latency histogram. Uses
+/// the MATCHED route template (bounded cardinality), never the raw URI; a
+/// request that matched no route is bucketed as `other`. For streaming
+/// (SSE) responses the duration is time-to-response-head — full generation
+/// time is `cascadia_generation_duration_seconds` (see `cascadia-metrics`).
+async fn track_http_metrics(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let endpoint = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "other".to_owned());
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    cascadia_metrics::HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&[&endpoint])
+        .observe(start.elapsed().as_secs_f64());
+    cascadia_metrics::HTTP_REQUESTS_TOTAL
+        .with_label_values(&[&endpoint, resp.status().as_str()])
+        .inc();
+    resp
+}
+
+/// `GET /metrics` — Prometheus text exposition format (#16). Serves the
+/// process-global registry: request, generation, engine, and transport
+/// metrics. Only stages started with `--api` expose it (same as every
+/// other HTTP route); relay-only stages have no HTTP listener.
+async fn metrics() -> impl IntoResponse {
+    let (content_type, body) = cascadia_metrics::encode_text();
+    ([(header::CONTENT_TYPE, content_type)], body)
 }
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
@@ -1049,6 +1098,7 @@ async fn chat_completions(
     // prompt to the engine, which would generate nothing and return a 200
     // with empty content — indistinguishable from a real failure.
     if prompt.trim().is_empty() {
+        count_rejected("empty_prompt");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1058,6 +1108,7 @@ async fn chat_completions(
             .into_response();
     }
     if prompt.len() > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
@@ -1089,6 +1140,7 @@ async fn chat_completions(
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            count_rejected("capacity");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -1246,6 +1298,7 @@ async fn completions(
     let prompt = match &req.prompt {
         PromptSpec::Single(s) => s.clone(),
         PromptSpec::Multiple(_) => {
+            count_rejected("multi_prompt");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -1257,6 +1310,7 @@ async fn completions(
     };
     let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
     if prompt.trim().is_empty() {
+        count_rejected("empty_prompt");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "no prompt content: `prompt` is empty" })),
@@ -1264,6 +1318,7 @@ async fn completions(
             .into_response();
     }
     if prompt.len() > state.max_prompt_bytes {
+        count_rejected("prompt_too_large");
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
@@ -1291,6 +1346,7 @@ async fn completions(
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
+            count_rejected("capacity");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
@@ -1783,6 +1839,38 @@ impl Stream for StreamWithPermit {
 
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
     use cascadia_engine::EngineError;
+    // An engine-queue-full 503 is the same "at capacity" experience as the
+    // permit-gate 503 (engines cap pending tasks BELOW the default permit
+    // count, so this path is reachable at default config) — count it under
+    // the same rejection reason or capacity pressure hides from the metric.
+    //
+    // A prompt the engine cannot window is a rejection too, and the one an
+    // operator most needs to see: at 8 packed slots on a 1024-context export
+    // the per-slot region is 127 tokens, so it is the common path, not an
+    // edge case, and the fix is a sizing change (fewer slots, wider context).
+    // Its own reason rather than `prompt_too_large` — that is the API's byte
+    // limit on the request body, a different knob with a different owner.
+    // Exhaustive on purpose — no `_` arm. Every variant reaching here is a
+    // request rejected before generation started, which is exactly what this
+    // metric promises to count, and a catch-all is how PromptTooLong stayed
+    // invisible until someone went looking. A new EngineError variant should
+    // fail to compile until it is classified, not silently vanish.
+    //
+    // Reasons name the knob, not the status: `engine_unavailable` means bring
+    // the stage or its peer up, `engine_error` means read that node's logs,
+    // `invalid_request` means the caller sent something this worker can't
+    // serve. Without these a node failing 100% of requests looked identical
+    // to a healthy idle one on every metric here.
+    count_rejected(match &err {
+        EngineError::QueueFull { .. } => "capacity",
+        EngineError::PromptTooLong(_) => "prompt_over_window",
+        EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
+        EngineError::Backend(_) | EngineError::Io(_) | EngineError::Task { .. } => "engine_error",
+        EngineError::InvalidConfig(_)
+        | EngineError::PeerRejected(_)
+        | EngineError::ShardRejected(_)
+        | EngineError::ModelNotFound(_) => "invalid_request",
+    });
     let status = match &err {
         EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
         EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
@@ -1835,6 +1923,71 @@ mod tests {
             "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
         ));
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The window rejection is a rejection, and it must be countable on its
+    /// own: at 8 packed slots on a 1024-context export the per-slot region is
+    /// 127 tokens, so an operator watching a worker shed traffic needs to see
+    /// "resize the slots" separately from `capacity` (add workers) and from
+    /// `prompt_too_large` (raise the API's byte limit). Folding it into
+    /// either would point at the wrong knob.
+    /// A request that fails at `submit()` never builds a `ChunkStream`, so
+    /// the runner's `tasks_failed_total` cannot see it. If these aren't
+    /// counted as rejections either, a worker failing 100% of requests is
+    /// indistinguishable from a healthy idle one on every metric we export.
+    ///
+    /// Strictly-greater deltas throughout: `reason` has no isolating label
+    /// and the registry is process-global, so other tests in this binary
+    /// drive the same arms concurrently.
+    #[test]
+    fn every_engine_error_books_a_rejection_reason() {
+        use cascadia_engine::EngineError;
+        // (error, expected reason) — one per arm of the classifier.
+        let cases: Vec<(EngineError, &str)> = vec![
+            (EngineError::QueueFull { queued: 8, cap: 8 }, "capacity"),
+            (EngineError::PromptTooLong("x".into()), "prompt_over_window"),
+            (EngineError::NotLoaded, "engine_unavailable"),
+            (EngineError::NotConnected, "engine_unavailable"),
+            (EngineError::Backend("boom".into()), "engine_error"),
+            (EngineError::InvalidConfig("bad".into()), "invalid_request"),
+            (EngineError::ModelNotFound("nope".into()), "invalid_request"),
+        ];
+        for (err, reason) in cases {
+            let before = cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&[reason])
+                .get();
+            let status = engine_error_response(err).status();
+            let after = cascadia_metrics::API_REJECTED_TOTAL
+                .with_label_values(&[reason])
+                .get();
+            assert!(
+                after > before,
+                "{status} was returned but booked no {reason} rejection"
+            );
+        }
+    }
+
+    /// Strictly-greater, not an exact delta: the registry is process-global
+    /// and `prompt_too_long_maps_to_413_not_503` drives the same arm on
+    /// another test thread, so an `== before + 1` assertion races it. That
+    /// this is NOT also booked as `capacity` needs no assertion — the two
+    /// live in exclusive arms of one `match`.
+    #[test]
+    fn prompt_over_window_counts_its_own_rejection_reason() {
+        let before = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
+            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+        ));
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let after = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["prompt_over_window"])
+            .get();
+        assert!(
+            after > before,
+            "a windowed-out prompt must count as a rejection ({before} -> {after})"
+        );
     }
 
     #[test]
@@ -3064,5 +3217,335 @@ mod tests {
             "expected SSE error event: {body}"
         );
         assert!(!body.contains("tool_calls"), "{body}");
+    }
+
+    // Helper: GET /metrics, return the exposition text.
+    async fn scrape_metrics(app: Router) -> (StatusCode, String, String) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (
+            status,
+            content_type,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    // #16 smoke test: real requests populate the request-, generation-, and
+    // engine-level metrics, and /metrics serves them in text exposition
+    // format. Uses a DEDICATED model id — the registry is process-global and
+    // other tests in this binary run concurrently, so assertions must be
+    // isolated by label, and on counters only assert presence (not exact
+    // values shared with other tests' traffic).
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_request_and_generation_metrics() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("metrics-probe-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "metrics-probe-model");
+
+        // Before traffic: the endpoint serves and the label-less families
+        // are already registered.
+        let (status, content_type, text) = scrape_metrics(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/plain; version=0.0.4");
+        assert!(text.contains("cascadia_inflight_tasks"), "{text}");
+
+        // One real (mock-engine) chat completion.
+        let (status, _) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "metrics-probe-model",
+                "messages": [{"role": "user", "content": "alpha bravo charlie delta"}],
+                "max_tokens": 2,
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, _, text) = scrape_metrics(app).await;
+        // Request-level: counted against the MATCHED route + status. (The
+        // prometheus text encoder emits label pairs sorted by name.)
+        assert!(
+            text.contains(
+                "cascadia_http_requests_total{endpoint=\"/v1/chat/completions\",status=\"200\"}"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("cascadia_http_request_duration_seconds_count"),
+            "{text}"
+        );
+        // Generation-level: tokens + TTFT + duration under the model label.
+        assert!(
+            text.contains("cascadia_tokens_generated_total{model=\"metrics-probe-model\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cascadia_generation_ttft_seconds_count{model=\"metrics-probe-model\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cascadia_generation_duration_seconds_count{finish_reason=\"length\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+        // Engine-level: load + warmup gauges recorded by Runner::start.
+        assert!(
+            text.contains(
+                "cascadia_engine_model_load_duration_seconds{device=\"CPU\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cascadia_engine_warmup_duration_seconds{device=\"CPU\",model=\"metrics-probe-model\"}"
+            ),
+            "{text}"
+        );
+    }
+
+    /// Engine whose queue is always full: submit() fails QueueFull, the
+    /// same "at capacity" 503 the permit gate produces.
+    struct QueueFullEngine;
+
+    impl cascadia_engine::Engine for QueueFullEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            _task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Err(cascadia_engine::EngineError::QueueFull { queued: 8, cap: 8 })
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct QueueFullBuilder;
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for QueueFullBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(QueueFullEngine))
+        }
+    }
+
+    // An engine-queue-full 503 must count toward the same capacity-rejection
+    // reason as the permit-gate 503 — engines cap pending tasks below the
+    // default permit count, so this path is reachable at default config.
+    #[tokio::test]
+    async fn engine_queue_full_counts_capacity_rejection() {
+        let capacity_before = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["capacity"])
+            .get();
+        let runner = Runner::new(Box::new(QueueFullBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("queuefull-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(Arc::new(runner), "queuefull-model");
+        let (status, _) = post_chat(
+            app,
+            serde_json::json!({
+                "model": "queuefull-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
+            .with_label_values(&["capacity"])
+            .get();
+        assert!(
+            capacity_after > capacity_before,
+            "QueueFull 503 must count as a capacity rejection ({capacity_before} -> {capacity_after})"
+        );
+    }
+
+    /// Engine that emits a token every step and NEVER finishes. Only
+    /// `Runner::close()` can end a generation from it, which is what makes
+    /// the teardown test deterministic: the no-progress wedge guard trips
+    /// after 3 consecutive EMPTY steps, so an engine that stalls instead
+    /// would race that guard rather than the shutdown.
+    struct NeverEndingEngine {
+        task: Option<cascadia_types::TaskId>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl cascadia_engine::Engine for NeverEndingEngine {
+        fn warmup(&mut self) {}
+        fn submit(
+            &mut self,
+            task: cascadia_types::GenerationTask,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            self.task = Some(task.task_id);
+            Ok(())
+        }
+        fn step(
+            &mut self,
+        ) -> Result<Vec<(cascadia_types::TaskId, Chunk)>, cascadia_engine::EngineError> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(match &self.task {
+                Some(id) => vec![(id.clone(), Chunk::token(id, 0, "tok "))],
+                None => Vec::new(),
+            })
+        }
+    }
+
+    struct NeverEndingBuilder(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for NeverEndingBuilder {
+        async fn connect(
+            &mut self,
+            _peers: PeerLayout,
+        ) -> Result<(), cascadia_engine::EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: cascadia_types::ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, cascadia_engine::EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> Result<Box<dyn cascadia_engine::Engine>, cascadia_engine::EngineError> {
+            Ok(Box::new(NeverEndingEngine {
+                task: None,
+                steps: self.0.clone(),
+            }))
+        }
+    }
+
+    /// Server teardown mid-generation must reach the CLIENT as a failure.
+    ///
+    /// The non-streaming handler seeds `finish_reason = "stop"` and drains
+    /// with `while let Some(chunk)`, so a bare end-of-stream builds a 200
+    /// carrying the partial text — telling the caller the model finished
+    /// normally while the server was going away. Anything persisting
+    /// completions then records truncated output as complete.
+    ///
+    /// The runner unit tests assert the metric on both poll/drop orderings;
+    /// this one covers what those cannot — the HTTP surface, on the
+    /// NON-streaming path (the local SSE probe covered streaming only).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn teardown_mid_generation_fails_the_request_and_books_teardown() {
+        const MODEL: &str = "api-teardown-model";
+        let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = Arc::new(Runner::new(Box::new(NeverEndingBuilder(steps.clone()))));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router(runner.clone(), MODEL);
+
+        let req = tokio::spawn(post_chat(
+            app,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+            }),
+        ));
+
+        // Wait until the generation is genuinely under way before shutting
+        // down — otherwise the close could land before admission and the
+        // request would fail as NotLoaded, which is a different path.
+        while steps.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        runner.close();
+
+        let (status, body) = req.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "teardown must not return 200: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shutting down"),
+            "expected a shutdown error, got {body}"
+        );
+
+        let (_, buf) = cascadia_metrics::encode_text();
+        let text = String::from_utf8(buf).unwrap();
+        let needle = format!(
+            "cascadia_generation_duration_seconds_count{{finish_reason=\"teardown\",model=\"{MODEL}\"}} 1"
+        );
+        assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        // A restart is neither a client cancellation nor an engine fault.
+        for reason in ["cancelled", "error"] {
+            assert_eq!(
+                cascadia_metrics::GENERATION_DURATION_SECONDS
+                    .with_label_values(&[MODEL, reason])
+                    .get_sample_count(),
+                0,
+                "teardown must not be booked as {reason}"
+            );
+        }
+    }
+
+    // Rejections that never reach the engine are counted by reason.
+    #[tokio::test]
+    async fn metrics_count_pre_engine_rejections() {
+        let app = make_app().await;
+        let (status, _) = post_chat(
+            app.clone(),
+            serde_json::json!({ "model": "mock-model", "messages": [] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, _, text) = scrape_metrics(app).await;
+        assert!(
+            text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
+            "{text}"
+        );
     }
 }

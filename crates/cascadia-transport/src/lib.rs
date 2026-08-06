@@ -198,8 +198,14 @@ pub async fn send_tensor(sock: &mut TcpStream, tensor: &Tensor) -> TransportResu
     }
     sock.flush().await?;
 
+    let elapsed = start.elapsed();
+    cascadia_metrics::TRANSPORT_SEND_SECONDS.observe(elapsed.as_secs_f64());
+    cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+        .with_label_values(&["tensor"])
+        .inc_by((HEADER_SIZE + tensor.data.len()) as u64);
+
     Ok(TransferStats {
-        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+        elapsed_ms: elapsed.as_secs_f64() * 1000.0,
         bytes: HEADER_SIZE + tensor.data.len(),
     })
 }
@@ -344,7 +350,16 @@ async fn recv_tensor_inner(
     }
 
     let mut data = vec![0u8; payload_len as usize];
+    // Time only the payload phase: the header wait above legitimately
+    // includes idle time between requests (frame-start exemption), which
+    // would swamp a latency histogram with idle gaps.
+    let payload_started = Instant::now();
     recv_exact(sock, &mut data).await?;
+    cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS
+        .observe(payload_started.elapsed().as_secs_f64());
+    cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
+        .with_label_values(&["tensor"])
+        .inc_by((HEADER_SIZE + payload_len as usize) as u64);
 
     let tensor = Tensor::new(dtype, [d0, d1, d2], data);
     let stats = TransferStats {
@@ -694,6 +709,9 @@ impl ActivationServer {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
         sock.write_all(bytes).await?;
         sock.flush().await?;
+        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+            .with_label_values(&["raw"])
+            .inc_by(bytes.len() as u64);
         Ok(())
     }
 
@@ -709,6 +727,9 @@ impl ActivationServer {
         let res = recv_exact_frame_start(sock, &mut buf).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
+        cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
+            .with_label_values(&["raw"])
+            .inc_by(n as u64);
         Ok(buf)
     }
 
@@ -861,6 +882,9 @@ impl ActivationClient {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
         sock.write_all(bytes).await?;
         sock.flush().await?;
+        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+            .with_label_values(&["raw"])
+            .inc_by(bytes.len() as u64);
         Ok(())
     }
 
@@ -873,6 +897,9 @@ impl ActivationClient {
         let res = recv_exact_frame_start(sock, &mut buf).await;
         self.drop_connection_if_recv_fatal(res.as_ref().err());
         res?;
+        cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
+            .with_label_values(&["raw"])
+            .inc_by(n as u64);
         Ok(buf)
     }
 
@@ -932,6 +959,66 @@ mod tests {
         assert_eq!(got.dtype, DType::F32);
         assert_eq!(got.shape, [1, 1, 2]);
         assert_eq!(got.data, payload);
+    }
+
+    /// #16: a tensor roundtrip advances the transport byte counters by at
+    /// least one frame in each direction. `>=` deltas — the registry is
+    /// process-global and other tests in this binary send frames too.
+    #[tokio::test]
+    async fn roundtrip_advances_metric_byte_counters() {
+        let sent_before = cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+            .with_label_values(&["tensor"])
+            .get();
+        let recv_before = cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
+            .with_label_values(&["tensor"])
+            .get();
+        // Same before/after treatment for the histograms. These two are
+        // process-global and UNLABELLED, so a bare `>= 1` would be satisfied
+        // by any other roundtrip test in this binary — it would hold even
+        // with both `observe` calls deleted.
+        let send_samples_before = cascadia_metrics::TRANSPORT_SEND_SECONDS.get_sample_count();
+        let recv_samples_before =
+            cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS.get_sample_count();
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server.recv().await.unwrap()
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let payload = vec![0u8, 0, 128, 63, 0, 0, 0, 64];
+        let tensor = Tensor::from_2d(DType::F32, 1, 2, payload);
+        client.send(&tensor).await.unwrap();
+        h.await.unwrap();
+
+        let frame = (HEADER_SIZE + 8) as u64;
+        let sent_after = cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+            .with_label_values(&["tensor"])
+            .get();
+        let recv_after = cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
+            .with_label_values(&["tensor"])
+            .get();
+        assert!(
+            sent_after >= sent_before + frame,
+            "{sent_before}→{sent_after}"
+        );
+        assert!(
+            recv_after >= recv_before + frame,
+            "{recv_before}→{recv_after}"
+        );
+        let send_samples_after = cascadia_metrics::TRANSPORT_SEND_SECONDS.get_sample_count();
+        let recv_samples_after =
+            cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS.get_sample_count();
+        assert!(
+            send_samples_after > send_samples_before,
+            "send histogram took no sample ({send_samples_before}→{send_samples_after})"
+        );
+        assert!(
+            recv_samples_after > recv_samples_before,
+            "recv histogram took no sample ({recv_samples_before}→{recv_samples_after})"
+        );
     }
 
     #[tokio::test]

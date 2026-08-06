@@ -13,11 +13,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use cascadia_engine::{Builder, Engine, EngineError};
-use cascadia_types::{Chunk, GenerationTask, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{Chunk, FinishReason, GenerationTask, PeerLayout, ShardSpec, TaskId};
 use futures::Stream;
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -126,6 +128,15 @@ pub struct Runner {
     /// cleanly with [`EngineError::NotLoaded`].
     engine: Arc<Mutex<Option<Box<dyn Engine>>>>,
     buffers: Arc<Mutex<Buffers>>,
+    /// Model id captured from the [`ShardSpec`] at `start()`, used as the
+    /// `model` label on generation metrics (#16). `None` until started.
+    model: Mutex<Option<Arc<str>>>,
+    /// Set by `close()` BEFORE the engine slot is emptied, so an in-flight
+    /// generation can tell "the server is shutting down" from "my client
+    /// hung up". Without it the outcome depends on an unsynchronised race
+    /// between a stream's next poll and its `Drop`, and every restart books
+    /// a nondeterministic number of client cancellations.
+    closing: Arc<AtomicBool>,
 }
 
 impl Runner {
@@ -134,7 +145,17 @@ impl Runner {
             builder: Mutex::new(Some(builder)),
             engine: Arc::new(Mutex::new(None)),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// `model` label for generation metrics; "unknown" before `start()`.
+    fn model_label(&self) -> Arc<str> {
+        self.model
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Arc::from("unknown"))
     }
 
     /// Connect transports, load weights, build engine, warm up. Pass
@@ -159,6 +180,9 @@ impl Runner {
         builder.connect(peers).await?;
 
         info!("runner load");
+        let model = shard.model_id.clone();
+        let device = shard.device.clone();
+        let load_started = Instant::now();
         let mut load_stream = builder.load(shard).await?;
         // drain the load progress stream
         use futures::StreamExt;
@@ -168,10 +192,18 @@ impl Runner {
 
         info!("runner build engine");
         let mut engine = builder.build()?;
+        cascadia_metrics::ENGINE_LOAD_DURATION_SECONDS
+            .with_label_values(&[&model, &device])
+            .set(load_started.elapsed().as_secs_f64());
         info!("runner warmup");
+        let warmup_started = Instant::now();
         engine.warmup();
+        cascadia_metrics::ENGINE_WARMUP_DURATION_SECONDS
+            .with_label_values(&[&model, &device])
+            .set(warmup_started.elapsed().as_secs_f64());
         info!("runner ready");
 
+        *self.model.lock() = Some(Arc::from(model));
         *self.engine.lock() = Some(engine);
         Ok(())
     }
@@ -222,6 +254,11 @@ impl Runner {
             last_errored_task: None,
             consecutive_foreign_err: 0,
             done: false,
+            model: self.model_label(),
+            submitted_at: Instant::now(),
+            last_chunk_at: None,
+            metrics_finalized: false,
+            closing: self.closing.clone(),
         })
     }
 
@@ -285,6 +322,11 @@ impl Runner {
     }
 
     pub fn close(&self) {
+        // BEFORE the slot empties, so no in-flight stream can observe a gone
+        // engine without also seeing that this is a shutdown. Ordering is the
+        // whole point: set it after, and a stream that polls in between books
+        // a client cancellation for a server restart.
+        self.closing.store(true, Ordering::SeqCst);
         if let Some(engine) = self.engine.lock().as_mut() {
             engine.close();
         }
@@ -310,6 +352,171 @@ pub struct ChunkStream {
     last_errored_task: Option<TaskId>,
     consecutive_foreign_err: usize,
     done: bool,
+    /// `model` label for the generation metrics below (#16).
+    model: Arc<str>,
+    /// When the task was submitted — the zero point for TTFT and duration.
+    submitted_at: Instant,
+    /// When the previous chunk was delivered (inter-token latency).
+    last_chunk_at: Option<Instant>,
+    /// A terminal outcome (completed / failed / cancelled / teardown) has
+    /// been recorded; guards exactly-once accounting between the
+    /// final-chunk paths, the cancel path, and `Drop`.
+    metrics_finalized: bool,
+    /// Shared with the [`Runner`]: set before `close()` empties the engine
+    /// slot, so an abandoned generation is attributed to the shutdown
+    /// rather than to the client regardless of poll/drop ordering.
+    closing: Arc<AtomicBool>,
+}
+
+impl ChunkStream {
+    /// Record per-chunk generation metrics for a chunk delivered to OUR
+    /// consumer (never for chunks routed to other tasks' buffers).
+    fn record_chunk_metrics(&mut self, chunk: &Chunk) {
+        if self.metrics_finalized {
+            return;
+        }
+        let now = Instant::now();
+        if chunk.error.is_some() {
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[&self.model])
+                .inc();
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[&self.model, "error"])
+                .observe((now - self.submitted_at).as_secs_f64());
+            self.metrics_finalized = true;
+            return;
+        }
+        // Same convention as the API's usage accounting (Chunk::token_count):
+        // `n_tokens` is authoritative when set; otherwise one token per
+        // non-empty chunk, so the empty final markers contribute 0.
+        let n = chunk.token_count();
+        // Only token-bearing chunks are timing samples: the separate empty
+        // final marker most engines emit would otherwise add one artificial
+        // inter-token gap per generation (and a zero-token generation would
+        // record a bogus TTFT).
+        if n > 0 {
+            match self.last_chunk_at {
+                None => cascadia_metrics::GENERATION_TTFT_SECONDS
+                    .with_label_values(&[&self.model])
+                    .observe((now - self.submitted_at).as_secs_f64()),
+                Some(prev) => cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                    .with_label_values(&[&self.model])
+                    .observe((now - prev).as_secs_f64()),
+            }
+            self.last_chunk_at = Some(now);
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[&self.model])
+                .inc_by(n as u64);
+        }
+        if chunk.is_final {
+            if let Some(p) = chunk.prompt_tokens {
+                cascadia_metrics::TOKENS_PROMPT_TOTAL
+                    .with_label_values(&[&self.model])
+                    .inc_by(p as u64);
+            }
+            // `Cancelled` is surfaced here (metrics-only per FinishReason's
+            // contract); the API maps it to "stop" on the wire. An engine
+            // that acknowledges a cancel with a Cancelled final marker must
+            // land in the SAME counter as the tombstone/Drop cancel paths,
+            // or the cancelled duration histogram and cancelled counter
+            // would diverge.
+            let reason = match chunk.finish_reason {
+                Some(FinishReason::Length) => "length",
+                Some(FinishReason::Cancelled) => {
+                    cascadia_metrics::TASKS_CANCELLED_TOTAL
+                        .with_label_values(&[&self.model])
+                        .inc();
+                    "cancelled"
+                }
+                Some(FinishReason::Stop) | None => "stop",
+            };
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[&self.model, reason])
+                .observe((now - self.submitted_at).as_secs_f64());
+            self.metrics_finalized = true;
+        }
+    }
+
+    /// Terminal failure of OUR stream: close the buffers entry, build the
+    /// final error chunk, and record it — one place, so every error-return
+    /// site in `poll_next` gets terminal accounting by construction.
+    fn fail_stream(&mut self, reason: String) -> Poll<Option<Chunk>> {
+        self.done = true;
+        self.buffers.lock().chunks.remove(&self.task_id);
+        let chunk = Chunk::error(self.task_id.clone(), reason);
+        self.record_chunk_metrics(&chunk);
+        Poll::Ready(Some(chunk))
+    }
+
+    /// The engine slot emptied under us: the server is shutting down.
+    ///
+    /// Ends the stream with an ERROR chunk, not a bare `None`. A bare
+    /// end-of-stream is indistinguishable from a completed generation, so
+    /// the API built a 200 carrying the partial text with
+    /// `finish_reason: "stop"` — telling the client the model finished
+    /// normally when the server was actually going away. The error chunk
+    /// routes through the existing 503 / SSE-error paths instead.
+    ///
+    /// Deliberately NOT `fail_stream`: that books `tasks_failed_total`, and
+    /// a planned restart must not land on the primary failure SLO.
+    fn fail_teardown(&mut self) -> Poll<Option<Chunk>> {
+        self.done = true;
+        self.buffers.lock().chunks.remove(&self.task_id);
+        warn!(
+            task = %self.task_id,
+            "engine slot emptied mid-generation (server teardown); failing the \
+             request rather than returning a truncated success"
+        );
+        self.record_teardown_metrics();
+        Poll::Ready(Some(Chunk::error(
+            self.task_id.clone(),
+            "server is shutting down".to_string(),
+        )))
+    }
+
+    /// Record an abandoned generation: explicit cancel, or the consumer
+    /// dropped the stream before the final chunk.
+    ///
+    /// A shutdown wins over both. `close()` sets `closing` before it empties
+    /// the engine slot, so this is decided by a flag rather than by whether
+    /// the stream happened to be polled once more before being dropped —
+    /// which is what previously made every restart book an unpredictable
+    /// number of "client cancelled".
+    fn record_cancelled_metrics(&mut self) {
+        if self.metrics_finalized {
+            return;
+        }
+        if self.closing.load(Ordering::SeqCst) {
+            self.record_teardown_metrics();
+            return;
+        }
+        cascadia_metrics::TASKS_CANCELLED_TOTAL
+            .with_label_values(&[&self.model])
+            .inc();
+        cascadia_metrics::GENERATION_DURATION_SECONDS
+            .with_label_values(&[&self.model, "cancelled"])
+            .observe(self.submitted_at.elapsed().as_secs_f64());
+        self.metrics_finalized = true;
+    }
+
+    /// Record a generation cut short by server teardown.
+    ///
+    /// Its own `finish_reason` rather than silence: recording nothing left
+    /// `completed + failed + cancelled < started` after every restart with
+    /// no metric to explain the difference, so "how many answers did that
+    /// restart cut off?" was unanswerable. And its own reason rather than
+    /// `cancelled` or `error`: a graceful restart is neither a client
+    /// hanging up nor an engine fault, and folding it into either puts
+    /// planned maintenance on a panel someone pages on.
+    fn record_teardown_metrics(&mut self) {
+        if self.metrics_finalized {
+            return;
+        }
+        cascadia_metrics::GENERATION_DURATION_SECONDS
+            .with_label_values(&[&self.model, "teardown"])
+            .observe(self.submitted_at.elapsed().as_secs_f64());
+        self.metrics_finalized = true;
+    }
 }
 
 impl Stream for ChunkStream {
@@ -329,6 +536,8 @@ impl Stream for ChunkStream {
                     this.done = true;
                     bufs.chunks.remove(&this.task_id);
                     bufs.cancelled.remove(&this.task_id);
+                    drop(bufs);
+                    this.record_cancelled_metrics();
                     return Poll::Ready(None);
                 }
                 if let Some(buf) = bufs.chunks.get_mut(&this.task_id) {
@@ -338,6 +547,8 @@ impl Stream for ChunkStream {
                             this.done = true;
                             bufs.chunks.remove(&this.task_id);
                         }
+                        drop(bufs);
+                        this.record_chunk_metrics(&chunk);
                         return Poll::Ready(Some(chunk));
                     }
                 }
@@ -357,24 +568,30 @@ impl Stream for ChunkStream {
             //    own text. Step and distribute have to be one critical section.
             let step_result = {
                 let mut guard = this.engine.lock();
-                let Some(engine) = guard.as_mut() else {
-                    this.done = true;
-                    return Poll::Ready(None);
-                };
-                match engine.step() {
-                    Ok(produced) => {
-                        let empty = produced.is_empty();
-                        let mut bufs = this.buffers.lock();
-                        for (tid, chunk) in produced {
-                            if bufs.cancelled.contains(&tid) {
-                                continue;
+                match guard.as_mut() {
+                    // Slot empty: `Runner::close` took the engine, i.e. server
+                    // teardown. Handled below rather than here because
+                    // `fail_teardown` needs `&mut *this` and this guard still
+                    // borrows `this.engine`.
+                    None => None,
+                    Some(engine) => Some(match engine.step() {
+                        Ok(produced) => {
+                            let empty = produced.is_empty();
+                            let mut bufs = this.buffers.lock();
+                            for (tid, chunk) in produced {
+                                if bufs.cancelled.contains(&tid) {
+                                    continue;
+                                }
+                                bufs.chunks.entry(tid).or_default().push_back(chunk);
                             }
-                            bufs.chunks.entry(tid).or_default().push_back(chunk);
+                            Ok(empty)
                         }
-                        Ok(empty)
-                    }
-                    Err(e) => Err(e),
+                        Err(e) => Err(e),
+                    }),
                 }
+            };
+            let Some(step_result) = step_result else {
+                return this.fail_teardown();
             };
             let produced_empty = match step_result {
                 Ok(empty) => empty,
@@ -430,20 +647,15 @@ impl Stream for ChunkStream {
                         if this.consecutive_foreign_err >= MAX_CONSECUTIVE_EMPTY_STEPS {
                             // Abnormal close of a healthy stream — fail it
                             // loud (see the own-task arm below).
-                            this.done = true;
-                            this.buffers.lock().chunks.remove(&this.task_id);
                             warn!(
                                 task = %this.task_id,
                                 "engine re-failed the same foreign task for {} consecutive steps; closing stream",
                                 MAX_CONSECUTIVE_EMPTY_STEPS
                             );
-                            return Poll::Ready(Some(Chunk::error(
-                                this.task_id.clone(),
-                                format!(
-                                    "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
-                                    MAX_CONSECUTIVE_EMPTY_STEPS
-                                ),
-                            )));
+                            return this.fail_stream(format!(
+                                "engine wedged re-failing task {failed} for {} consecutive steps: {e}",
+                                MAX_CONSECUTIVE_EMPTY_STEPS
+                            ));
                         }
                         continue;
                     }
@@ -453,17 +665,12 @@ impl Stream for ChunkStream {
                         // finish_reason "stop" at the API layer. The error
                         // chunk routes through the existing 503 / SSE-error
                         // paths instead.
-                        this.done = true;
-                        this.buffers.lock().chunks.remove(&this.task_id);
                         warn!(
                             task = %this.task_id,
                             error = %e,
                             "engine step failed; closing stream"
                         );
-                        return Poll::Ready(Some(Chunk::error(
-                            this.task_id.clone(),
-                            e.to_string(),
-                        )));
+                        return this.fail_stream(e.to_string());
                     }
                 },
             };
@@ -474,20 +681,15 @@ impl Stream for ChunkStream {
                     // An engine that wedges by stalling (Ok-empty forever)
                     // is a failure the client must see — fail loud like the
                     // step-error arms above.
-                    this.done = true;
-                    this.buffers.lock().chunks.remove(&this.task_id);
                     warn!(
                         task = %this.task_id,
                         "engine made no progress for {} consecutive steps; closing stream",
                         MAX_CONSECUTIVE_EMPTY_STEPS
                     );
-                    return Poll::Ready(Some(Chunk::error(
-                        this.task_id.clone(),
-                        format!(
-                            "engine made no progress for {} consecutive steps",
-                            MAX_CONSECUTIVE_EMPTY_STEPS
-                        ),
-                    )));
+                    return this.fail_stream(format!(
+                        "engine made no progress for {} consecutive steps",
+                        MAX_CONSECUTIVE_EMPTY_STEPS
+                    ));
                 }
                 continue;
             }
@@ -498,7 +700,8 @@ impl Stream for ChunkStream {
 
             // 3) Everything this round produced — including our own chunks —
             //    is already in its owner's buffer, so loop and let step 1 hand
-            //    ours back in FIFO order.
+            //    ours back in FIFO order. Terminal/TTFT accounting rides that
+            //    same drain, so metrics stay delivery-timed.
             //
             //    Returning our chunk straight from the step instead would jump
             //    it ahead of anything another stream buffered for us while we
@@ -514,6 +717,10 @@ impl Stream for ChunkStream {
 
 impl Drop for ChunkStream {
     fn drop(&mut self) {
+        // A stream dropped before any terminal outcome was recorded is an
+        // abandoned generation (client disconnect, or a cancel the poll
+        // loop never observed) — count it exactly once.
+        self.record_cancelled_metrics();
         // Tell the engine to abandon this task. Without this an SSE
         // client that disconnects mid-generation leaves the engine
         // grinding through max_tokens worth of chunks that no one
@@ -690,6 +897,8 @@ mod tests {
             builder: Mutex::new(None),
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         });
 
         // Drive the relay loop on a worker thread, let it run for a window
@@ -740,6 +949,8 @@ mod tests {
             builder: Mutex::new(None),
             engine: Arc::new(Mutex::new(Some(engine))),
             buffers: Arc::new(Mutex::new(Buffers::default())),
+            model: Mutex::new(None),
+            closing: Arc::new(AtomicBool::new(false)),
         });
 
         // No external stop: the loop must terminate on its own. A timed join
@@ -787,6 +998,8 @@ mod tests {
                 builder: Mutex::new(None),
                 engine: Arc::new(Mutex::new(Some(engine))),
                 buffers: Arc::new(Mutex::new(Buffers::default())),
+                model: Mutex::new(None),
+                closing: Arc::new(AtomicBool::new(false)),
             });
             let driver = runner.clone();
             let handle = std::thread::spawn(move || driver.run_relay_loop());
@@ -1343,6 +1556,95 @@ mod tests {
         }
     }
 
+    /// #16: each stream's metrics must be attributed to ITS OWN generation
+    /// while several streams share one engine.
+    ///
+    /// Every other metrics test drives a single stream, where "recorded at
+    /// buffer time" and "recorded at delivery" are the same instant on the
+    /// same object — so none of them can tell the two apart. This one can,
+    /// and it is the case continuous batching actually runs.
+    ///
+    /// If `record_chunk_metrics` were called from the distribution loop
+    /// (where the polling stream sees OTHER tasks' chunks) instead of from
+    /// the step-1 drain, all four assertions below break at once: the
+    /// poller would stamp foreign chunks against its own `submitted_at`, a
+    /// foreign `is_final` would set the poller's `metrics_finalized` and
+    /// silently swallow its own terminal sample, and tokens would be
+    /// counted twice — once by the driver, once by the owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_streams_attribute_metrics_to_their_own_generation() {
+        const MODEL: &str = "runner-metrics-concurrent-model";
+        const N: usize = 8;
+        const STREAMS: u64 = 2;
+        let ids: Vec<TaskId> = vec!["ca".to_string(), "cb".to_string()];
+        let runner = Arc::new(Runner::new(Box::new(MultiTaskBuilder {
+            tasks: ids.clone(),
+            total: N,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+
+        let mut handles = Vec::new();
+        for id in ids {
+            let r = runner.clone();
+            handles.push(tokio::spawn(async move {
+                let mut stream = r
+                    .generate(GenerationTask::new(id, "x").with_max_tokens(64))
+                    .unwrap();
+                while stream.next().await.is_some() {}
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Every chunk MultiTaskEngine emits carries text, so all N per task
+        // are token-bearing: N tokens, 1 TTFT and N-1 inter-token gaps each.
+        assert_eq!(
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            STREAMS * N as u64,
+            "tokens must be counted once, by the owning stream"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            STREAMS,
+            "one TTFT sample per generation, not per poller"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            STREAMS * (N as u64 - 1)
+        );
+        // The terminal sample is the one a foreign is_final would swallow.
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "stop"])
+                .get_sample_count(),
+            STREAMS,
+            "every generation must book its own terminal outcome"
+        );
+        for (counter, name) in [
+            (&cascadia_metrics::TASKS_CANCELLED_TOTAL, "cancelled"),
+            (&cascadia_metrics::TASKS_FAILED_TOTAL, "failed"),
+        ] {
+            assert_eq!(
+                counter.with_label_values(&[MODEL]).get(),
+                0,
+                "clean concurrent completion must not book {name}"
+            );
+        }
+    }
+
     /// Engine that fails a sequence of DISTINCT foreign tasks, one per step
     /// (clearing each — a correctly-behaving engine), then serves the polled
     /// task a final chunk. Models concurrent serving where several other
@@ -1420,5 +1722,311 @@ mod tests {
             "healthy stream was false-closed by distinct foreign-task errors: {chunk:?}"
         );
         assert!(stream.next().await.is_none(), "stream should be complete");
+    }
+
+    /// #16: metric tests use a DEDICATED model id per test — the registry is
+    /// process-global and tests in this binary run concurrently, so exact
+    /// assertions are only safe on labels no other test touches.
+    async fn make_runner_for_model(model: &str) -> Runner {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(model, "CPU"),
+            )
+            .await
+            .unwrap();
+        runner
+    }
+
+    #[tokio::test]
+    async fn completed_generation_records_metrics() {
+        const MODEL: &str = "runner-metrics-complete-model";
+        let runner = make_runner_for_model(MODEL).await;
+        // 4-word prompt, max_tokens 2 → two 1-token chunks, then an empty
+        // final marker with finish_reason "length".
+        let task = GenerationTask::new("t-m1", "alpha bravo charlie delta").with_max_tokens(2);
+        let mut stream = runner.generate(task).unwrap();
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            cascadia_metrics::TOKENS_GENERATED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            2
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_TTFT_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            1
+        );
+        // Two token chunks → exactly ONE inter-token gap. The separate
+        // empty final marker must not add an artificial sample.
+        assert_eq!(
+            cascadia_metrics::GENERATION_INTER_TOKEN_SECONDS
+                .with_label_values(&[MODEL])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "length"])
+                .get_sample_count(),
+            1
+        );
+        // Load + warmup gauges were set at start() (values may be ~0 for the
+        // mock; presence of the label pair is the contract).
+        //
+        // Assert that through the EXPOSITION, not `with_label_values().get()`:
+        // that call CREATES the child on first access, so it would fabricate
+        // the very label pair it claims to check and then compare a fresh
+        // gauge's 0.0 against >= 0.0 — an assertion that cannot fail even if
+        // start() never touched either gauge.
+        let (_, buf) = cascadia_metrics::encode_text();
+        let text = String::from_utf8(buf).expect("exposition is utf-8");
+        for family in [
+            "cascadia_engine_model_load_duration_seconds",
+            "cascadia_engine_warmup_duration_seconds",
+        ] {
+            let needle = format!("{family}{{device=\"CPU\",model=\"{MODEL}\"}}");
+            assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_counts_cancelled_exactly_once() {
+        const MODEL: &str = "runner-metrics-cancel-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-m2", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await; // one chunk, then the client goes away
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "cancelled"])
+                .get_sample_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_stream_does_not_count_cancelled() {
+        const MODEL: &str = "runner-metrics-clean-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-m3", "alpha bravo").with_max_tokens(8);
+        let mut stream = runner.generate(task).unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0
+        );
+    }
+
+    /// Server teardown (Runner::close with a generation in flight) must NOT
+    /// be booked as a client cancellation — the metric's contract is
+    /// "explicit cancel or client disconnect".
+    #[tokio::test]
+    async fn teardown_mid_generation_is_not_counted_cancelled() {
+        const MODEL: &str = "runner-metrics-teardown-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-td", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await;
+        runner.close(); // engine slot empties mid-generation
+
+        // The stream must END LOUD. A bare None is indistinguishable from a
+        // completed generation, and the API turns it into a 200 carrying the
+        // partial text with finish_reason "stop" — telling the client the
+        // model finished normally while the server was going away.
+        let last = stream
+            .next()
+            .await
+            .expect("teardown must surface a terminal chunk, not a silent end-of-stream");
+        assert!(
+            last.error.is_some(),
+            "teardown chunk must carry an error so the API fails the request: {last:?}"
+        );
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0,
+            "a restart is not a client cancellation"
+        );
+        // Nor is it an engine fault: booking it failed would put planned
+        // maintenance on the primary failure SLO.
+        assert_eq!(
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0,
+            "a restart is not an engine failure"
+        );
+        // But it IS an outcome. Recording nothing left completed+failed+
+        // cancelled < started after every restart, with no metric to explain
+        // the gap.
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "teardown"])
+                .get_sample_count(),
+            1
+        );
+    }
+
+    /// The same shutdown, with the opposite interleaving: the stream is
+    /// DROPPED before it is ever polled again.
+    ///
+    /// Both orderings are reachable on the real shutdown path — per-connection
+    /// tasks are spawned, so they keep running while `close()` is dispatched —
+    /// and nothing sequences them. Before `Runner::closing`, which one won
+    /// decided whether the generation was booked as a client cancellation or
+    /// as nothing at all, so every restart produced a nondeterministic cancel
+    /// spike whose size no one could correct for.
+    #[tokio::test]
+    async fn teardown_books_the_same_outcome_when_the_stream_is_dropped_first() {
+        const MODEL: &str = "runner-metrics-teardown-drop-model";
+        let runner = make_runner_for_model(MODEL).await;
+        let task = GenerationTask::new("t-td2", "alpha bravo charlie delta").with_max_tokens(64);
+        let mut stream = runner.generate(task).unwrap();
+        let _ = stream.next().await;
+        runner.close();
+        drop(stream); // never polled again — Drop decides the outcome
+
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0,
+            "drop-first teardown must not book a client cancellation either"
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "teardown"])
+                .get_sample_count(),
+            1,
+            "both orderings must book the SAME outcome"
+        );
+    }
+
+    /// Engine that acknowledges every task with a final marker tagged
+    /// FinishReason::Cancelled — the contract-blessed way for an engine to
+    /// surface a cancel it honored.
+    struct CancelAckEngine(Vec<TaskId>);
+
+    impl Engine for CancelAckEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.0.push(task.task_id);
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            Ok(self
+                .0
+                .pop()
+                .map(|tid| {
+                    let c = Chunk::final_marker(tid.clone(), "")
+                        .with_finish_reason(cascadia_types::FinishReason::Cancelled);
+                    (tid, c)
+                })
+                .into_iter()
+                .collect())
+        }
+    }
+
+    struct CancelAckBuilder;
+
+    #[async_trait::async_trait]
+    impl Builder for CancelAckBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(CancelAckEngine(Vec::new())))
+        }
+    }
+
+    /// An engine-acknowledged cancel (Cancelled final marker) must land in
+    /// TASKS_CANCELLED_TOTAL exactly once — same counter as the tombstone /
+    /// Drop cancel paths — so the cancelled counter and the cancelled
+    /// duration histogram never diverge.
+    #[tokio::test]
+    async fn cancel_ack_final_chunk_counts_cancelled_exactly_once() {
+        const MODEL: &str = "runner-metrics-cancelack-model";
+        let runner = Runner::new(Box::new(CancelAckBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t-ca", "x").with_max_tokens(4))
+            .unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream); // Drop must not double-count (metrics_finalized set)
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        assert_eq!(
+            cascadia_metrics::GENERATION_DURATION_SECONDS
+                .with_label_values(&[MODEL, "cancelled"])
+                .get_sample_count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_generation_counts_failed_metric() {
+        const MODEL: &str = "runner-metrics-fail-model";
+        let runner = Runner::new(Box::new(FailingBuilder));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage(MODEL, "CPU"),
+            )
+            .await
+            .unwrap();
+        let mut stream = runner
+            .generate(GenerationTask::new("t-m4", "hello").with_max_tokens(4))
+            .unwrap();
+        while stream.next().await.is_some() {}
+        drop(stream);
+        assert_eq!(
+            cascadia_metrics::TASKS_FAILED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            1
+        );
+        // The failure is terminal accounting — the drop must not ALSO count
+        // it as cancelled.
+        assert_eq!(
+            cascadia_metrics::TASKS_CANCELLED_TOTAL
+                .with_label_values(&[MODEL])
+                .get(),
+            0
+        );
     }
 }

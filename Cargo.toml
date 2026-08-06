@@ -10,6 +10,7 @@ members = [
     "crates/cascadia-engine-openvino",
     "crates/cascadia-engine-sparse-moe",
     "crates/cascadia-int4-gemm",
+    "crates/cascadia-metrics",
     "crates/cascadia-runner",
     "crates/cascadia-discovery",
     "crates/cascadia-download",
@@ -38,6 +39,7 @@ cascadia-ov-genai-shim = { path = "crates/cascadia-ov-genai-shim" }
 cascadia-engine-openvino = { path = "crates/cascadia-engine-openvino" }
 cascadia-engine-sparse-moe = { path = "crates/cascadia-engine-sparse-moe" }
 cascadia-int4-gemm = { path = "crates/cascadia-int4-gemm" }
+cascadia-metrics = { path = "crates/cascadia-metrics" }
 cascadia-runner = { path = "crates/cascadia-runner" }
 cascadia-discovery = { path = "crates/cascadia-discovery" }
 cascadia-download = { path = "crates/cascadia-download" }
@@ -58,6 +60,11 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
+
+# Observability. default-features = false drops the protobuf exposition
+# format (we only serve the text format), keeping the dependency tree —
+# and the cargo-deny surface — small.
+prometheus = { version = "0.13", default-features = false }
 
 # HTTP
 axum = "0.7"

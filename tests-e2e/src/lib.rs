@@ -255,6 +255,45 @@ mod tests {
             .as_str()
             .expect("content string");
         assert!(!content.is_empty(), "completion content was empty");
+
+        // /metrics (#16): the real binary serves Prometheus text exposition
+        // and the chat request above populated the request + generation
+        // metrics.
+        let r = client
+            .get(proc.url("/metrics"))
+            .send()
+            .await
+            .expect("get metrics");
+        assert!(r.status().is_success(), "metrics status: {}", r.status());
+        let content_type = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "metrics content-type: {content_type}"
+        );
+        let text = r.text().await.unwrap();
+        assert!(
+            text.contains(
+                "cascadia_http_requests_total{endpoint=\"/v1/chat/completions\",status=\"200\"}"
+            ),
+            "metrics missing chat request counter:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_tokens_generated_total"),
+            "metrics missing token counter:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_generation_ttft_seconds_bucket"),
+            "metrics missing TTFT histogram:\n{text}"
+        );
+        assert!(
+            text.contains("cascadia_inflight_tasks 0"),
+            "in-flight gauge should be back to 0 after the request:\n{text}"
+        );
     }
 
     #[tokio::test]

@@ -429,7 +429,14 @@ impl Engine for OvGenaiEngine {
             Ok(r) => r,
             Err(err) => {
                 warn!(task = %task.task_id, error = %err, "generate failed");
-                let final_chunk = Chunk::final_marker(task.task_id.clone(), "");
+                // Chunk::error, not an empty final_marker: the latter reads as
+                // a SUCCESSFUL empty completion, so the client got a 200 with
+                // no content and cascadia_tasks_failed_total never moved —
+                // the failure was booked as finish_reason="stop" with zero
+                // tokens. Same class as the poisoned-head bug guarded in
+                // qwen36.rs. This is the default engine, so it was the common
+                // failure that the failure metric could not see.
+                let final_chunk = Chunk::error(task.task_id.clone(), err.to_string());
                 return Ok(vec![(task.task_id, final_chunk)]);
             }
         };

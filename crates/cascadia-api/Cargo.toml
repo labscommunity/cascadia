@@ -11,6 +11,7 @@ description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with 
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
+cascadia-metrics = { workspace = true }
 cascadia-runner = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -38,3 +39,4 @@ minijinja-contrib = { version = "2", default-features = false, features = ["pyco
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
+async-trait = { workspace = true }
