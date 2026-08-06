@@ -269,6 +269,9 @@ impl ExpertSource for MmapExperts {
 /// on NVMe and loses 3.5% on rotational, but every read there is a miss, which
 /// is not how decode runs — it is a guide to cold fetch only.
 fn explicit_reads_enabled() -> bool {
+    if let Some(v) = crate::k3::knobs::get().read {
+        return v;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("CASCADIA_K3_READ").as_deref() != Ok("0"))
@@ -276,6 +279,9 @@ fn explicit_reads_enabled() -> bool {
 
 /// `CASCADIA_K3_PREFETCH=0` turns the read-ahead hint off, for A/B measurement.
 fn prefetch_enabled() -> bool {
+    if let Some(v) = crate::k3::knobs::get().prefetch {
+        return v;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("CASCADIA_K3_PREFETCH").as_deref() != Ok("0"))

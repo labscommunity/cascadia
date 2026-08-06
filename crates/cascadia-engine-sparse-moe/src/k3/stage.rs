@@ -108,6 +108,9 @@ impl PrefixStore {
     ///
     /// `CASCADIA_K3_PREFIX_CACHE=0` still turns it off outright.
     fn budget_from_env_or_ram() -> usize {
+        if let Some(b) = crate::k3::knobs::get().prefix_cache_bytes {
+            return b as usize;
+        }
         if let Ok(v) = std::env::var("CASCADIA_K3_PREFIX_CACHE") {
             return v.trim().parse::<usize>().unwrap_or(0);
         }

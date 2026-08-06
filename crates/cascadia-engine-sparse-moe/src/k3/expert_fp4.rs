@@ -84,8 +84,12 @@ pub fn expert_bytes(dim: usize, inter: usize) -> usize {
 const LUT2: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// `CASCADIA_K3_SIMD=0` forces the scalar kernel, for A/B measurement.
+/// A `k3_simd` builder-config value wins over the env var.
 #[cfg(target_arch = "x86_64")]
 fn simd_enabled() -> bool {
+    if let Some(v) = crate::k3::knobs::get().simd {
+        return v;
+    }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("CASCADIA_K3_SIMD").as_deref() != Ok("0"))

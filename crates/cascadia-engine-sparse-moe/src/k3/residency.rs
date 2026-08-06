@@ -130,16 +130,23 @@ pub fn autopin_count(total_selections: u64, budget_experts: usize) -> usize {
 /// Returns 0 unless `CASCADIA_K3_AUTOPIN` is set — pinning the wrong set is
 /// worse than pinning nothing, so it never engages by default.
 pub fn autopin_budget(expert_bytes: u64, reserve_bytes: u64) -> usize {
-    if std::env::var("CASCADIA_K3_AUTOPIN")
-        .map(|v| v == "0" || v.is_empty())
-        .unwrap_or(true)
-    {
+    let k = crate::k3::knobs::get();
+    let on = match k.autopin {
+        Some(v) => v,
+        None => !std::env::var("CASCADIA_K3_AUTOPIN")
+            .map(|v| v == "0" || v.is_empty())
+            .unwrap_or(true),
+    };
+    if !on {
         return 0;
     }
-    let budget = std::env::var("CASCADIA_K3_PIN_BYTES")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or_else(mem_available);
+    let budget = match k.pin_bytes {
+        Some(b) => b,
+        None => std::env::var("CASCADIA_K3_PIN_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or_else(mem_available),
+    };
     pin_budget_experts(budget, reserve_bytes, expert_bytes)
 }
 

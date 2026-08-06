@@ -17,6 +17,7 @@ pub mod chess_probe;
 pub mod expert_fp4;
 pub mod gate_probe;
 pub mod kda;
+pub mod knobs;
 pub mod loader;
 pub mod model;
 pub mod moe;

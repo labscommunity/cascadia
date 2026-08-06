@@ -160,6 +160,24 @@ pub struct SparseMoEBuilderConfig {
     /// Only meaningful while the AXPY-form path is active — the
     /// non-AXPY (bf16 boundary) path doesn't surface `silu(gate)`.
     pub ffn_sparsity_capture_dir: Option<PathBuf>,
+    /// K3 context budget. `None` defers to `CASCADIA_K3_MAX_SEQ`, then to
+    /// `K3_DEFAULT_MAX_SEQ`. K3's `max_position_embeddings` is 1M; sizing the
+    /// caches from that would preallocate TB-scale state.
+    pub k3_max_seq: Option<usize>,
+    /// Exact KV-prefix-cache budget in bytes. `Some(0)` disables it; `None`
+    /// defers to `CASCADIA_K3_PREFIX_CACHE`, then to a slice of free RAM.
+    pub k3_prefix_cache_bytes: Option<u64>,
+    /// Explicit concurrent `pread` per routed expert. `None` ⇒ env, then on.
+    pub k3_read: Option<bool>,
+    /// `MADV_WILLNEED` after routing. `None` ⇒ env, then on.
+    pub k3_prefetch: Option<bool>,
+    /// AVX2 mxfp4 kernel. `None` ⇒ env, then on.
+    pub k3_simd: Option<bool>,
+    /// `mlock` the hottest experts from the learned histogram. `None` ⇒ env,
+    /// then off.
+    pub k3_autopin: Option<bool>,
+    /// Autopin budget override in bytes. Only meaningful with autopin on.
+    pub k3_pin_bytes: Option<u64>,
 }
 
 impl SparseMoEBuilderConfig {
@@ -195,6 +213,13 @@ impl SparseMoEBuilderConfig {
             ffn_axpy_prebuild: false,
             ffn_sparsity_thresholds_file: None,
             ffn_sparsity_capture_dir: None,
+            k3_max_seq: None,
+            k3_prefix_cache_bytes: None,
+            k3_read: None,
+            k3_prefetch: None,
+            k3_simd: None,
+            k3_autopin: None,
+            k3_pin_bytes: None,
         }
     }
 
@@ -542,11 +567,25 @@ impl Builder for SparseMoEBuilder {
             .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("kimi_k3"))
             .unwrap_or(false);
         if is_k3 {
+            crate::k3::knobs::seed(crate::k3::knobs::Overrides {
+                max_seq: self.config.k3_max_seq,
+                prefix_cache_bytes: self.config.k3_prefix_cache_bytes,
+                read: self.config.k3_read,
+                prefetch: self.config.k3_prefetch,
+                simd: self.config.k3_simd,
+                autopin: self.config.k3_autopin,
+                pin_bytes: self.config.k3_pin_bytes,
+            });
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
-            let max_seq = std::env::var("CASCADIA_K3_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
+            let max_seq = self
+                .config
+                .k3_max_seq
+                .or_else(|| {
+                    std::env::var("CASCADIA_K3_MAX_SEQ")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                })
                 .filter(|&n| n > 0)
                 .unwrap_or(crate::k3::stage::K3_DEFAULT_MAX_SEQ);
             let runner = crate::k3::stage::K3Runner::load(
