@@ -71,6 +71,7 @@ mod sys {
 
     extern "C" {
         pub fn cascadia_last_error_message() -> *const c_char;
+        pub fn cascadia_last_error_code() -> i32;
 
         // Test-only: see cpp/shim.cpp. Reports how collect_properties() stored
         // `key` — 1 = int64 (written to *out_i64), 0 = string, -1 = absent.
@@ -383,6 +384,21 @@ fn last_native_error() -> String {
         } else {
             CStr::from_ptr(p).to_string_lossy().into_owned()
         }
+    }
+}
+
+/// Was the last shim error on this thread a resource-exhaustion class error
+/// (EAGAIN / ENOMEM inside a plugin — code 2 from the C++ classifier)? Read it
+/// right after a failed call, before any other shim call on the same thread.
+/// Always `false` in the stub build.
+pub fn last_error_resource_exhausted() -> bool {
+    #[cfg(feature = "openvino")]
+    {
+        unsafe { sys::cascadia_last_error_code() == 2 }
+    }
+    #[cfg(not(feature = "openvino"))]
+    {
+        false
     }
 }
 
