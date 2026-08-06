@@ -35,6 +35,11 @@ typedef struct cascadia_runtime_t cascadia_runtime_t;
 /// not thread-safe — read it on the same thread that triggered the error.
 const char* cascadia_last_error_message();
 
+// Class of the last error on this thread: 0 = none, 1 = generic,
+// 2 = resource exhaustion (EAGAIN/ENOMEM inside a plugin). Read it right
+// after a failed call, before any other shim call on the same thread.
+int32_t cascadia_last_error_code();
+
 /// Test-only: run collect_properties() over `properties_kv` and report how
 /// `key` was stored — 1 = int64_t (written to *out_i64), 0 = string, -1 =
 /// absent. Exists so the Rust test can verify the NPU LLM keys are coerced to

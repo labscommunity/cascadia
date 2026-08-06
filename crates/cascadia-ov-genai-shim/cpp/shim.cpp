@@ -14,6 +14,7 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <openvino/openvino.hpp>
@@ -29,12 +30,38 @@
 namespace {
 
 thread_local std::string g_last_error;
+// Machine-readable class of the last error, alongside the message: 0 = none,
+// 1 = generic, 2 = resource exhaustion (EAGAIN / ENOMEM — e.g. the GPU plugin
+// failing thread creation or allocation under memory pressure, which surfaces
+// as "resource unavailable try again"). Classified HERE, once, so Rust callers
+// don't sniff message strings. thread_local like the message, so reading it
+// right after a failed call on the same thread is race-free.
+thread_local int32_t g_last_error_code = 0;
 
 void set_last_error(const char* msg) {
     g_last_error = msg ? msg : "(null)";
+    g_last_error_code = 1;
 }
 
-void set_last_error(const std::exception& e) { g_last_error = e.what(); }
+void set_last_error(const std::exception& e) {
+    g_last_error = e.what();
+    g_last_error_code = 1;
+    // Typed first: EAGAIN/ENOMEM system_errors (thread creation / allocation
+    // failure inside a plugin). Message sniff second: OV usually flattens the
+    // cause into an ov::Exception string by the time it reaches us.
+    if (const auto* se = dynamic_cast<const std::system_error*>(&e)) {
+        const auto c = se->code();
+        if (c == std::errc::resource_unavailable_try_again ||
+            c == std::errc::not_enough_memory) {
+            g_last_error_code = 2;
+            return;
+        }
+    }
+    if (g_last_error.find("resource unavailable") != std::string::npos ||
+        g_last_error.find("not enough memory") != std::string::npos) {
+        g_last_error_code = 2;
+    }
+}
 
 // Hard cap on plugin property pairs. OpenVINO plugin configs never
 // exceed a few dozen keys in practice; this caps allocation at ~4 KB
@@ -178,6 +205,10 @@ struct cascadia_runtime_t {
 };
 
 extern "C" {
+
+int32_t cascadia_last_error_code() {
+    return g_last_error_code;
+}
 
 const char* cascadia_last_error_message() {
     return g_last_error.c_str();

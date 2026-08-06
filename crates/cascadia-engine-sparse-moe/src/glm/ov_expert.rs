@@ -44,9 +44,52 @@ const SHARED: u32 = u32::MAX;
 
 /// Process-level GPU exhaustion (`resource unavailable try again`), as opposed
 /// to one bad IR. Only this latches [`OvExperts::poison`]: `CL_INVALID_EVENT`
-/// can be a one-off under momentary pressure and stays per-key.
+/// can be a one-off under momentary pressure and stays per-key. String fallback
+/// for the typed `last_error_resource_exhausted` check (stub builds, old shims).
 fn is_fatal_resource_error(msg: &str) -> bool {
     msg.contains("resource unavailable")
+}
+
+/// Estimated iGPU device bytes one cached expert holds: weights + request
+/// buffers ≈ IR bin size × 1.6 (measured ~30 MiB held per ~19 MiB int4 bin),
+/// floored at 8 MiB for tiny/missing bins.
+fn expert_cost_bytes(xml: &Path) -> u64 {
+    let bin = xml.with_extension("bin");
+    let len = std::fs::metadata(bin).map(|m| m.len()).unwrap_or(0);
+    (len.saturating_mul(8) / 5).max(8 * 1024 * 1024)
+}
+
+/// Count-capped LRU plus a running estimate of held device bytes, evicted to
+/// `budget` on insert. Counts alone don't bound memory: entry size follows the
+/// model's expert dims, and 1024 × ~30 MiB is what exhausted the iGPU pool.
+struct OvCache {
+    lru: LruCache<(u32, u32), (Runtime, u64)>,
+    bytes: u64,
+    budget: u64,
+}
+
+impl OvCache {
+    /// Insert and evict LRU entries until back under budget. The newest entry
+    /// always stays, even alone over budget — the alternative is compiling it
+    /// every call.
+    fn insert(&mut self, key: (u32, u32), rt: Runtime, cost: u64) {
+        if let Some((_, evicted)) = self.lru.push(key, (rt, cost)) {
+            self.bytes = self.bytes.saturating_sub(evicted.1);
+        }
+        self.bytes = self.bytes.saturating_add(cost);
+        while self.bytes > self.budget && self.lru.len() > 1 {
+            if let Some((_, (_, c))) = self.lru.pop_lru() {
+                self.bytes = self.bytes.saturating_sub(c);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+        self.bytes = 0;
+    }
 }
 
 pub struct OvExperts {
@@ -54,12 +97,12 @@ pub struct OvExperts {
     device: String,
     plugin: PluginConfig,
     dim: usize,
-    /// Compiled OV models, LRU-bounded ((global layer, expert) -> Runtime).
-    /// `Mutex` (not `RefCell`) so a single `OvExperts` can be shared across all
-    /// MoE layers behind an `Arc` and stay `Send + Sync` (the runner is moved
-    /// across threads); expert calls within a rank are sequential, so the lock
-    /// is uncontended.
-    cache: Mutex<LruCache<(u32, u32), Runtime>>,
+    /// Compiled OV models, bounded by count AND estimated device bytes —
+    /// whichever hits first. `Mutex` (not `RefCell`) so a single `OvExperts`
+    /// can be shared across all MoE layers behind an `Arc` and stay
+    /// `Send + Sync` (the runner is moved across threads); expert calls within
+    /// a rank are sequential, so the lock is uncontended.
+    cache: Mutex<OvCache>,
     /// `(layer, expert)` keys whose IR is missing or won't compile. A partial /
     /// corrupt `experts_ov/` (e.g. an export killed mid-run) must NOT take down a
     /// serving rank: the first touch of such an expert falls back to the Rust
@@ -101,12 +144,22 @@ impl OvExperts {
         if let Ok(cd) = std::env::var("CASCADIA_GLM5_OV_CACHE_DIR") {
             plugin = plugin.with("CACHE_DIR", cd);
         }
+        // Byte budget is the primary bound; count is the backstop.
+        let budget = std::env::var("CASCADIA_GLM5_OV_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024);
         Some(Self {
             dir,
             device,
             plugin,
             dim,
-            cache: Mutex::new(LruCache::new(cap)),
+            cache: Mutex::new(OvCache {
+                lru: LruCache::new(cap),
+                bytes: 0,
+                budget,
+            }),
             failed: Mutex::new(HashSet::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
         })
@@ -147,7 +200,7 @@ impl OvExperts {
         }
         let t0 = std::time::Instant::now();
         let mut cache = self.cache.lock().expect("OV expert cache lock");
-        let miss = !cache.contains(&key);
+        let miss = !cache.lru.contains(&key);
         if miss {
             let path = self.xml(lid, eid);
             let Some(p) = path.to_str() else {
@@ -156,12 +209,16 @@ impl OvExperts {
             };
             match Runtime::compile(p, &self.device, &self.plugin) {
                 Ok(rt) => {
-                    cache.put(key, rt);
+                    let cost = expert_cost_bytes(&path);
+                    cache.insert(key, rt, cost);
                 }
                 Err(e) => {
+                    // Typed check first (thread-local, set by the compile that
+                    // just failed); string sniff covers stub builds.
+                    let fatal = cascadia_ov_genai_shim::last_error_resource_exhausted();
                     drop(cache);
                     let msg = format!("compile on {}: {e}", self.device);
-                    if is_fatal_resource_error(&msg) {
+                    if fatal || is_fatal_resource_error(&msg) {
                         self.poison(&msg);
                     } else {
                         self.mark_failed(key, &msg);
@@ -170,7 +227,7 @@ impl OvExperts {
                 }
             }
         }
-        let rt = cache.get_mut(&key).unwrap();
+        let rt = &mut cache.lru.get_mut(&key).unwrap().0;
         // A device-side error (set_input/infer/output) is not necessarily
         // permanent, so fall back for this call without latching the key.
         if rt
@@ -378,6 +435,30 @@ mod tests {
             "compile on GPU: [GPU] clWaitForEvents, error code: -58 CL_INVALID_EVENT"
         ));
         assert!(!is_fatal_resource_error("compile on GPU: cannot open file"));
+    }
+
+    /// Cost = bin × 1.6 with an 8 MiB floor (missing bin included, so a broken
+    /// IR never counts as free).
+    #[test]
+    fn expert_cost_scales_with_bin_and_floors() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("openvino_model.xml");
+        std::fs::write(&xml, "<net/>").unwrap();
+        assert_eq!(
+            expert_cost_bytes(&xml),
+            8 * 1024 * 1024,
+            "missing bin -> floor"
+        );
+        std::fs::write(
+            dir.path().join("openvino_model.bin"),
+            vec![0u8; 20 * 1024 * 1024],
+        )
+        .unwrap();
+        assert_eq!(
+            expert_cost_bytes(&xml),
+            32 * 1024 * 1024,
+            "20 MiB bin -> 32 MiB"
+        );
     }
 
     /// The OV expert backend is strictly opt-in: with `CASCADIA_GLM5_OV_EXPERTS`
