@@ -32,7 +32,11 @@ use crate::dsv4::st::StFile;
 const G: usize = 32;
 
 /// The subset of `manifest.json` the glm5 shell needs.
-#[derive(Debug, Deserialize)]
+///
+/// `Default` is derived so tests and downstream tooling can build a manifest
+/// with only the fields they care about (`..Default::default()`); it is never
+/// used on the load path, which always deserialises a real `manifest.json`.
+#[derive(Debug, Default, Deserialize)]
 pub struct GlmManifest {
     pub arch: String,
     pub num_layers: usize,

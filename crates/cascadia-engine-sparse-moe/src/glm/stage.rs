@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use super::attn::AttnKv;
 use super::kv_cache::SliceKvCache;
-use super::loader::{load_stage, read_manifest};
+use super::loader::{load_stage, read_manifest, GlmManifest};
 use super::model::GlmLayer;
 use super::moe::AnyExpert;
 use super::residency::{self, UsageStats};
@@ -29,6 +29,56 @@ pub const GLM5_DEFAULT_MAX_SEQ: usize = 4096;
 /// How many of a layer's hottest routed experts to prefetch ahead (plus its
 /// always-active shared expert). ~4x top_k covers the common routes.
 const PREFETCH_EXPERTS: usize = 32;
+
+/// The layer range `[lo, hi)` that rank `rank` of `total` owns.
+///
+/// Single source of truth for the split: [`GlmRunner::load_staged`] derives its
+/// slice from this, and out-of-process consumers (cascadia-enterprise) call it to
+/// fill the `ShardDescriptor` layer range the scheduler's contiguity rule reads.
+/// A descriptor that disagrees with what the engine actually loaded breaks chain
+/// formation silently, so there must be exactly one implementation.
+///
+/// Ends are EXCLUSIVE. The guarantees below are asserted here rather than left to
+/// callers, because none of them surface as an inference error:
+///
+/// - rank 0 starts at layer 0 and the last rank ends at `num_layers`
+/// - ranges are contiguous and non-overlapping
+/// - no rank owns zero layers
+pub fn layer_split(m: &GlmManifest, rank: u32, total: u32) -> Result<(usize, usize), String> {
+    let n = m.num_layers;
+    let total = total.max(1);
+    if rank >= total {
+        return Err(format!("rank {rank} out of range for total {total}"));
+    }
+    let (lo, hi) = if !m.indexer_types.is_empty() {
+        index_aligned_split(n, &m.indexer_types, rank, total)
+    } else {
+        even_layer_split(n, rank, total)
+    };
+    if lo >= hi {
+        return Err(format!(
+            "rank {rank} of {total} owns zero layers [{lo}, {hi}) — total exceeds the \
+             model's {n} layers; reduce --total"
+        ));
+    }
+    // `index_aligned_split` anchors rank 0 at `fulls[0]`, which is 0 only because
+    // glm5's layer 0 happens to be "full". An export whose layer 0 is "shared"
+    // would orphan `[0, fulls[0])` with nothing to catch it — the scheduler's
+    // rule 3 checks adjacency between stages, never that the chain spans the
+    // whole model.
+    if rank == 0 && lo != 0 {
+        return Err(format!(
+            "split orphans layer 0: rank 0 starts at {lo}; the first indexer layer \
+             must be \"full\""
+        ));
+    }
+    if rank + 1 == total && hi != n {
+        return Err(format!(
+            "split orphans tail layers [{hi}, {n}): last rank must end at num_layers"
+        ));
+    }
+    Ok((lo, hi))
+}
 
 /// Split `n` layers across `total` ranks so each rank's first layer is a `"full"`
 /// IndexShare layer (owns an indexer / computes its own top-k). Boundaries are
@@ -189,16 +239,18 @@ impl GlmRunner {
         let rank = rank.min(total - 1);
         let (lo, hi) = if layer_end > 0 {
             (layer_start as usize, layer_end as usize)
-        } else if !m.indexer_types.is_empty() {
-            // IndexShare: snap rank boundaries to "full" layers so every rank
-            // starts on a layer that computes its own top-k — then a "shared"
-            // layer never needs the carry from a full layer on another rank.
-            index_aligned_split(n, &m.indexer_types, rank, total)
         } else {
-            even_layer_split(n, rank, total)
+            // Derived split — including the IndexShare boundary snapping — lives
+            // in `layer_split` so out-of-process consumers publish the same range
+            // this rank actually loads.
+            layer_split(&m, rank, total).map_err(LoadError::Manifest)?
         };
         // A rank must own at least one layer; `total > num_layers` would leave a
         // dead rank on the wire, paying every round-trip's latency for nothing.
+        //
+        // Redundant for the derived arm (`layer_split` checks it too) but NOT for
+        // the explicit `layer_start`/`layer_end` arm above, which never reaches
+        // `layer_split` — an inverted ShardSpec range would otherwise sail past.
         if lo >= hi {
             return Err(LoadError::Manifest(format!(
                 "rank {rank} of {total} owns zero layers [{lo}, {hi}) — total exceeds the \
