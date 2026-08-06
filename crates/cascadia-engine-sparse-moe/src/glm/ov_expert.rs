@@ -42,6 +42,13 @@ use crate::dsv4::math::to_bf16;
 /// Sentinel expert id for the always-on shared expert.
 const SHARED: u32 = u32::MAX;
 
+/// Process-level GPU exhaustion (`resource unavailable try again`), as opposed
+/// to one bad IR. Only this latches [`OvExperts::poison`]: `CL_INVALID_EVENT`
+/// can be a one-off under momentary pressure and stays per-key.
+fn is_fatal_resource_error(msg: &str) -> bool {
+    msg.contains("resource unavailable")
+}
+
 pub struct OvExperts {
     dir: PathBuf, // <model>/experts_ov
     device: String,
@@ -59,6 +66,10 @@ pub struct OvExperts {
     /// kernel and records the key here so subsequent tokens skip the (failing)
     /// recompile + re-warn. Warned once per key.
     failed: Mutex<HashSet<(u32, u32)>>,
+    /// Latched on GPU resource exhaustion; `run()` then returns `None` for
+    /// everything. Compiling against an exhausted driver kills the rank
+    /// (observed live), so the backend stops rather than degrades per-key.
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl OvExperts {
@@ -77,7 +88,13 @@ impl OvExperts {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .and_then(NonZeroUsize::new)
-            .unwrap_or_else(|| NonZeroUsize::new(1024).unwrap());
+            // 64 ≈ 2 GiB: each cached entry holds ~30 MiB of iGPU driver
+            // allocations (measured: 800 held experts = 24 GiB). The old 1024
+            // default (~30 GiB) crowded the shared-RAM pool until fresh builds
+            // failed (CL_INVALID_EVENT) and eventually killed the rank. Hit
+            // rate loses nothing: the 3084-key space never fit any cap, and
+            // the always-active set (12/rank) still fits.
+            .unwrap_or_else(|| NonZeroUsize::new(64).unwrap());
         let mut plugin = PluginConfig::new();
         // Persist compiled blobs across runs so first-touch compile isn't
         // re-paid every process start (GPU kernel JIT is expensive).
@@ -91,7 +108,16 @@ impl OvExperts {
             dim,
             cache: Mutex::new(LruCache::new(cap)),
             failed: Mutex::new(HashSet::new()),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// True when experts run on a device that shares the iGPU/NPU allocation
+    /// pool with host RAM. Residency pinning and accelerator offload compete
+    /// for the same physical memory on these — see the pin exclusion in
+    /// `stage.rs`.
+    pub fn on_accelerator(&self) -> bool {
+        !self.device.eq_ignore_ascii_case("CPU")
     }
 
     fn xml(&self, lid: u32, eid: u32) -> PathBuf {
@@ -113,6 +139,9 @@ impl OvExperts {
     /// glm Rust path `out += wj * expert(x)`), so prefill and decode agree.
     fn run(&self, lid: u32, eid: u32, x: &[f32]) -> Option<Vec<f32>> {
         let key = (lid, eid);
+        if self.poisoned.load(std::sync::atomic::Ordering::Relaxed) {
+            return None; // driver reported exhaustion — OV offload is off for good
+        }
         if self.failed.lock().unwrap().contains(&key) {
             return None; // known-bad IR — skip straight to the Rust fallback
         }
@@ -131,7 +160,12 @@ impl OvExperts {
                 }
                 Err(e) => {
                     drop(cache);
-                    self.mark_failed(key, &format!("compile on {}: {e}", self.device));
+                    let msg = format!("compile on {}: {e}", self.device);
+                    if is_fatal_resource_error(&msg) {
+                        self.poison(&msg);
+                    } else {
+                        self.mark_failed(key, &msg);
+                    }
                     return None;
                 }
             }
@@ -159,6 +193,22 @@ impl OvExperts {
 
     /// Latch a permanently-bad expert key (missing / uncompilable IR) and warn
     /// once, so subsequent tokens skip the failing recompile and fall back
+    /// Disable OV offload for good and free the cached compiled models. Per-key
+    /// `failed` is wrong here: it would keep hammering the other 3000+ keys
+    /// against a driver that just said it is out of resources — one bad expert
+    /// is an IR problem, refused resources are a process problem.
+    fn poison(&self, why: &str) {
+        use std::sync::atomic::Ordering;
+        if !self.poisoned.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                device = %self.device,
+                "OV expert offload disabled: GPU resource exhaustion ({why}); \
+                 all experts now on the Rust int4 kernel"
+            );
+            self.cache.lock().expect("OV expert cache lock").clear();
+        }
+    }
+
     /// silently to the Rust kernel.
     fn mark_failed(&self, key: (u32, u32), why: &str) {
         if self.failed.lock().unwrap().insert(key) {
@@ -314,6 +364,21 @@ pub mod stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the terminal exhaustion signature latches the process-wide poison;
+    /// CL_INVALID_EVENT and ordinary bad-IR errors stay per-key so one crowded
+    /// moment or one corrupt export doesn't disable the whole backend.
+    #[test]
+    fn fatal_classifier_matches_only_terminal_exhaustion() {
+        assert!(is_fatal_resource_error(
+            "compile on GPU: openvino-genai error: Exception from plugin.cpp:54: \
+             resource unavailable try again: resource unavailable try again"
+        ));
+        assert!(!is_fatal_resource_error(
+            "compile on GPU: [GPU] clWaitForEvents, error code: -58 CL_INVALID_EVENT"
+        ));
+        assert!(!is_fatal_resource_error("compile on GPU: cannot open file"));
+    }
 
     /// The OV expert backend is strictly opt-in: with `CASCADIA_GLM5_OV_EXPERTS`
     /// unset, `from_env` returns `None` regardless of the dir, so the engine keeps

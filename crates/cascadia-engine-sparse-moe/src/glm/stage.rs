@@ -394,7 +394,18 @@ impl GlmRunner {
         // 80% of available RAM) plus hundreds of VirtualLock'd bins starves the
         // GPU driver's residency request during weight upload. This knob is what
         // makes that testable; it is not itself the fix.
-        let nopin = std::env::var_os("CASCADIA_GLM5_NOPIN").is_some();
+        let nopin_env = std::env::var_os("CASCADIA_GLM5_NOPIN").is_some();
+        // Pinning and accelerator offload are mutually exclusive on shared-RAM
+        // devices: pins + held compiled experts crowd the pool GPU builds
+        // allocate from (measured: combined = 100/100 CL_INVALID_EVENT, either
+        // half alone = 0 failures).
+        let ov_accel = ov.as_ref().is_some_and(|o| o.on_accelerator());
+        if ov_accel && !nopin_env {
+            tracing::info!(
+                "skipping expert pinning: OV offload on an accelerator shares its RAM pool"
+            );
+        }
+        let nopin = nopin_env || ov_accel;
         if mode == ExpertsMode::Mmap && !nopin {
             // Windows caps VirtualLock'd pages at the process minimum working set,
             // which defaults to a few MB — so raise it to cover everything we pin
