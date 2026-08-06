@@ -591,6 +591,10 @@ impl Drop for GlmRunner {
         if has_history {
             let _ = self.save_usage();
         }
+        // Final OV-stats emission, ignoring the rate limit — otherwise up to one
+        // interval's worth of the run's tail never reaches the log. No-op unless
+        // CASCADIA_GLM5_OV_STATS is set.
+        super::ov_expert::stats::dump_now();
     }
 }
 

@@ -232,8 +232,55 @@ pub mod stats {
         *access().lock().unwrap().entry(key).or_insert(0) += 1;
     }
 
+    /// Minimum gap between emissions, in seconds. `dump()` is called once per
+    /// decode token, and its body clones + sorts the whole access map (up to
+    /// `layers * experts_per_layer` entries — 3084 on a 12-layer glm5 rank)
+    /// while holding the same lock `record()` takes on EVERY expert dispatch.
+    /// Unthrottled that is O(n log n) plus a stderr write per token, contending
+    /// with the hot path: an instrumented 9-node run produced 0 tokens on all
+    /// three timed passes with mid-stream transport resets. Counters stay exact
+    /// either way — only the reporting cadence is bounded.
+    /// Override with `CASCADIA_GLM5_OV_STATS_EVERY_SECS`.
+    fn dump_interval_secs() -> u64 {
+        std::env::var("CASCADIA_GLM5_OV_STATS_EVERY_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(10)
+    }
+
+    /// Monotonic seconds of the last emission; 0 = never emitted.
+    static LAST_DUMP_S: AtomicU64 = AtomicU64::new(0);
+
+    /// Process start, so we have a monotonic clock without pulling in Instant
+    /// statics. `OnceLock<Instant>` keeps this allocation-free after first use.
+    fn since_start_secs() -> u64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_secs()
+    }
+
     /// Emit the cumulative split to stderr (no-op when disabled / no calls).
+    ///
+    /// Rate-limited — see [`dump_interval_secs`]. Call [`dump_now`] for the
+    /// final, unconditional emission at shutdown.
     pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let now = since_start_secs();
+        let last = LAST_DUMP_S.load(Ordering::Relaxed);
+        // `last == 0 && now == 0` is the first token of the run: skip, so the
+        // first emission carries real data rather than a single call.
+        if now.saturating_sub(last) < dump_interval_secs() {
+            return;
+        }
+        // Race here just means two threads both emit once; harmless, and far
+        // cheaper than holding a lock across the check.
+        LAST_DUMP_S.store(now, Ordering::Relaxed);
+        dump_now();
+    }
+
+    /// Emit unconditionally, ignoring the rate limit.
+    pub fn dump_now() {
         if !enabled() {
             return;
         }
