@@ -155,8 +155,14 @@ impl PrefixStore {
 impl Drop for K3Runner {
     fn drop(&mut self) {
         // only write back when pinning is in use, so a plain run never touches
-        // the model dir
-        if self.pinned > 0 || std::env::var_os("CASCADIA_K3_AUTOPIN").is_some() {
+        // the model dir. A `k3_autopin` override wins over the env var, same
+        // as autopin_budget() — otherwise a cold first run under the override
+        // (pinned == 0, no env var) never writes the histogram and autopin
+        // never bootstraps.
+        if self.pinned > 0
+            || crate::k3::knobs::get().autopin == Some(true)
+            || std::env::var_os("CASCADIA_K3_AUTOPIN").is_some()
+        {
             self.save_usage();
         }
     }
