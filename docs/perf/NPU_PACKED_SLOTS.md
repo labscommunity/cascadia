@@ -160,19 +160,22 @@ Note also that packed mode skips compiling the chunked-prefill variant
 entirely — a packed plan whose rows all belong to one slot IS a causal chunk —
 saving a full NPU compile and a second resident weight copy.
 
-### Multi-stage — WITHHELD (`--total 1` enforced)
+### Multi-stage
 
-> **Not currently available.** The CLI rejects `--packed-slots` with `--total > 1`.
-> The packing mechanism below is correct and the pipeline serves requests, but a
-> token frame intermittently goes missing between ranks and rank 0 then blocks
-> forever on a reply that never arrives. Instrumented on NPU with a shared
-> sequence counter: rank 1 logged `replying with tokens seq=1119` and advanced to
-> the next frame, rank 0 logged `awaiting tokens seq=1119` and never saw it, with
-> no error on either side. It surfaces after sustained load — roughly two runs in
-> three, and adding the instrumentation masked it once — so it reads as a race in
-> `cascadia-transport` rather than in the packing. Single-stage packed is
-> unaffected and verified across 5 models. Evidence, what is ruled out and a
-> reproduction: **issue #122**.
+> **Available.** Historical note: multi-stage packed was withheld for a while
+> because the pipeline intermittently wedged under sustained concurrent load —
+> rank 1 wrote the token-frame reply and advanced, rank 0 never saw it, no
+> error on either side (issue #122). The frame was never lost on the wire: the
+> reply sat unread in rank 0's kernel receive buffer (observed directly:
+> `Recv-Q` = exactly one token frame, every tokio worker parked in a futex,
+> no thread in `ep_poll`). Rank 0's process had starved its own tokio I/O +
+> timer driver — the runner's sync engine mutex was hard-locked from enough
+> worker-thread tasks (stream polls, submits, drops) that no worker remained
+> to poll the driver, so the readable event could never be dispatched and no
+> recv deadline could fire either. Fixed in `cascadia-runner` (non-blocking
+> poll/submit/cancel/drop) with the packed wire hardened alongside
+> (deadlined + poisoning reply recvs, an on-wire NACK from a failed relay
+> step, whole-batch abort with per-task attribution).
 
 Packing works across a pipeline. Stage 0 ships an I64 `[1, 3, S]` **plan frame**
 (per row: slot id with `-1` for idle, absolute position, and shared-prefix reuse
