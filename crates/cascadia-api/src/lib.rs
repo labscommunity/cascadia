@@ -1101,10 +1101,30 @@ impl ChatPromptRenderer {
 
     /// Render `messages` with optional `tools`, falling back to
     /// [`render_prompt_legacy`] when no template is set or rendering fails.
+    /// `enable_thinking = true` — use [`render_with_opts`](Self::render_with_opts)
+    /// to control the template's thinking branch.
     pub fn render_with_tools(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
+        self.render_with_opts(messages, tools, true)
+    }
+
+    /// Render with an explicit `enable_thinking` for hybrid-reasoning
+    /// templates (GLM/Qwen3 convention): the value lands in the template's
+    /// `enable_thinking` variable, same as the server's `render_prompt` path.
+    pub fn render_with_opts(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        enable_thinking: bool,
+    ) -> String {
         if let Some(env) = &self.env {
-            match render_with_chat_env(env, messages, &self.bos_token, &self.eos_token, true, tools)
-            {
+            match render_with_chat_env(
+                env,
+                messages,
+                &self.bos_token,
+                &self.eos_token,
+                enable_thinking,
+                tools,
+            ) {
                 Ok(s) => return s,
                 Err(e) => {
                     warn!(error = %e, "chat_template render failed; falling back to legacy formatter")
@@ -2721,6 +2741,35 @@ mod tests {
         assert!(out.contains("<start_of_turn>user"), "out={out}");
         assert!(out.contains("hi"), "out={out}");
         assert!(out.contains("<start_of_turn>model"), "out={out}");
+    }
+
+    #[test]
+    fn renderer_opts_control_the_thinking_branch() {
+        // GLM/Qwen3 hybrid-reasoning templates branch on `enable_thinking`.
+        // `render_with_tools` must keep its historical thinking-on default;
+        // `render_with_opts(.., false)` must take the off branch.
+        const T: &str = "{% for m in messages %}{{ m.content }}{% endfor %}\
+            {% if enable_thinking %}<think>{% else %}<think></think>{% endif %}";
+        let cfg = ChatTemplateConfig {
+            template: Some(T.into()),
+            bos_token: None,
+            eos_token: None,
+        };
+        let renderer = ChatPromptRenderer::new(&cfg);
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let on = renderer.render_with_tools(&msgs, None);
+        assert!(on.ends_with("<think>"), "thinking-on render: {on}");
+        let off = renderer.render_with_opts(&msgs, None, false);
+        assert!(
+            off.ends_with("<think></think>"),
+            "thinking-off render: {off}"
+        );
     }
 
     #[test]
