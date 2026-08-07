@@ -22,3 +22,4 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
+cascadia-transport = { workspace = true }

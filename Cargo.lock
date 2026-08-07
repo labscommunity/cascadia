@@ -446,6 +446,7 @@ dependencies = [
  "cascadia-engine",
  "cascadia-engine-mock",
  "cascadia-metrics",
+ "cascadia-transport",
  "cascadia-types",
  "futures",
  "parking_lot",

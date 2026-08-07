@@ -1183,7 +1183,7 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate(task.clone()) {
+    let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -1381,7 +1381,7 @@ async fn completions(
 
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate(task) {
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -1476,7 +1476,7 @@ async fn stream_text_completion(
     include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
-    let chunk_stream = match state.runner.generate(task) {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
@@ -1599,7 +1599,7 @@ async fn stream_completion(
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
 
-    let chunk_stream = match state.runner.generate(task) {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");

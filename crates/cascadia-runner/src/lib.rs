@@ -117,6 +117,17 @@ pub fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F
 struct Buffers {
     chunks: HashMap<TaskId, VecDeque<Chunk>>,
     cancelled: std::collections::HashSet<TaskId>,
+    /// Streams parked because another caller held the engine (#122). Every
+    /// engine-lock release drains + wakes these, so a parked stream re-polls
+    /// as soon as the engine may be free. Registration happens ONLY after a
+    /// failed `try_lock`, and the registrant re-checks the lock afterwards,
+    /// so a release can't slip between the check and the registration.
+    step_wakers: Vec<std::task::Waker>,
+    /// Cancels that could not take the engine lock without blocking a
+    /// worker thread (#122). Applied by the next engine-lock holder before
+    /// it steps — the same effective timing a blocking cancel had, since a
+    /// running step can't be interrupted anyway.
+    deferred_cancels: Vec<TaskId>,
 }
 
 pub struct Runner {
@@ -217,9 +228,28 @@ impl Runner {
     }
 
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
-        let mut guard = self.engine.lock();
-        let engine = guard.as_mut().ok_or(EngineError::NotLoaded)?;
-        engine.submit(task)
+        // NOTE: blocks the calling thread for up to one engine step if a
+        // step is in flight. Async callers must use [`Runner::generate`]'s
+        // async submit path (or their own `spawn_blocking`) — a worker
+        // thread blocked here counts toward the driver starvation that
+        // wedges the pipeline (#122).
+        let res = {
+            let mut guard = self.engine.lock();
+            let engine = guard.as_mut().ok_or(EngineError::NotLoaded)?;
+            engine.submit(task)
+        };
+        self.wake_parked_streams();
+        res
+    }
+
+    /// Drain + wake every stream that parked on engine-lock contention.
+    /// Called after every engine-lock release (#122): a parked stream is
+    /// only ever woken from here, so skipping a release site would strand it.
+    fn wake_parked_streams(&self) {
+        let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
+        for w in wakers {
+            w.wake();
+        }
     }
 
     /// Cooperatively cancel a task.
@@ -235,8 +265,22 @@ impl Runner {
             bufs.cancelled.insert(task_id.clone());
             bufs.chunks.remove(task_id);
         }
-        if let Some(engine) = self.engine.lock().as_mut() {
-            engine.cancel(task_id);
+        // Never block a (possibly async) caller on the engine mutex — a
+        // worker thread parked here counts toward the driver starvation
+        // that wedges the pipeline (#122). If a step is in flight, defer:
+        // the next engine-lock holder applies it before stepping, which is
+        // when a blocking cancel would have run anyway.
+        match self.engine.try_lock() {
+            Some(mut guard) => {
+                if let Some(engine) = guard.as_mut() {
+                    engine.cancel(task_id);
+                }
+                drop(guard);
+                self.wake_parked_streams();
+            }
+            None => {
+                self.buffers.lock().deferred_cancels.push(task_id.clone());
+            }
         }
     }
 
@@ -246,8 +290,29 @@ impl Runner {
     /// stuck).
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
         self.submit(task.clone())?;
-        Ok(ChunkStream {
-            task_id: task.task_id,
+        Ok(self.stream_for(task.task_id))
+    }
+
+    /// Async [`Runner::generate`]: submits off the runtime via
+    /// `spawn_blocking`. Async servers must use this — `submit` blocks on
+    /// the engine mutex for up to a full engine step, and enough worker
+    /// threads parked there starve the tokio I/O + timer drivers, which is
+    /// the #122 pipeline wedge.
+    pub async fn generate_async(
+        self: &Arc<Self>,
+        task: GenerationTask,
+    ) -> Result<ChunkStream, EngineError> {
+        let this = self.clone();
+        let submitted = task.clone();
+        tokio::task::spawn_blocking(move || this.submit(submitted))
+            .await
+            .map_err(|e| EngineError::Backend(format!("submit task join: {e}")))??;
+        Ok(self.stream_for(task.task_id))
+    }
+
+    fn stream_for(&self, task_id: TaskId) -> ChunkStream {
+        ChunkStream {
+            task_id,
             engine: self.engine.clone(),
             buffers: self.buffers.clone(),
             consecutive_empty: 0,
@@ -259,7 +324,7 @@ impl Runner {
             last_chunk_at: None,
             metrics_finalized: false,
             closing: self.closing.clone(),
-        })
+        }
     }
 
     /// Step the engine forever; exits when the engine slot empties (clean
@@ -331,6 +396,9 @@ impl Runner {
             engine.close();
         }
         *self.engine.lock() = None;
+        // Streams parked on engine-lock contention must re-poll to observe
+        // the emptied slot, or a teardown would strand them Pending forever.
+        self.wake_parked_streams();
         if let Some(builder) = self.builder.lock().as_mut() {
             builder.close();
         }
@@ -522,7 +590,7 @@ impl ChunkStream {
 impl Stream for ChunkStream {
     type Item = Chunk;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Chunk>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Chunk>> {
         let this = self.get_mut();
         loop {
             if this.done {
@@ -566,29 +634,67 @@ impl Stream for ChunkStream {
             //    which another stream completes a LATER step and buffers its
             //    round before this one lands — reordering a single request's
             //    own text. Step and distribute have to be one critical section.
+            //    The engine mutex is a sync lock and `step()` spans real
+            //    network round trips, so NEVER block this worker thread on
+            //    it: enough streams parked in a hard `lock()` here (plus one
+            //    stepping) can pin every tokio worker, and with no worker
+            //    left to poll the I/O + timer drivers the step-holder's
+            //    `recv()` never wakes — no bytes delivered, no timeout fired,
+            //    the whole pipeline permanently wedged (#122). Contended =
+            //    someone else is stepping; park with a registered waker and
+            //    let their release wake us.
             let step_result = {
-                let mut guard = this.engine.lock();
-                match guard.as_mut() {
+                let mut guard = match this.engine.try_lock() {
+                    Some(g) => g,
+                    None => {
+                        this.buffers.lock().step_wakers.push(cx.waker().clone());
+                        // Re-check after registering: the holder may have
+                        // released (and drained wakers) between the failed
+                        // try_lock and the registration. A stale registration
+                        // from the success arm only costs a spurious wake.
+                        match this.engine.try_lock() {
+                            Some(g) => g,
+                            None => return Poll::Pending,
+                        }
+                    }
+                };
+                let result = match guard.as_mut() {
                     // Slot empty: `Runner::close` took the engine, i.e. server
                     // teardown. Handled below rather than here because
                     // `fail_teardown` needs `&mut *this` and this guard still
                     // borrows `this.engine`.
                     None => None,
-                    Some(engine) => Some(match engine.step() {
-                        Ok(produced) => {
-                            let empty = produced.is_empty();
-                            let mut bufs = this.buffers.lock();
-                            for (tid, chunk) in produced {
-                                if bufs.cancelled.contains(&tid) {
-                                    continue;
-                                }
-                                bufs.chunks.entry(tid).or_default().push_back(chunk);
-                            }
-                            Ok(empty)
+                    Some(engine) => {
+                        // Apply cancels that arrived while the engine was
+                        // busy (Runner::cancel / stream Drop never block on
+                        // the engine mutex — see deferred_cancels).
+                        let deferred = std::mem::take(&mut this.buffers.lock().deferred_cancels);
+                        for tid in &deferred {
+                            engine.cancel(tid);
                         }
-                        Err(e) => Err(e),
-                    }),
+                        Some(match engine.step() {
+                            Ok(produced) => {
+                                let empty = produced.is_empty();
+                                let mut bufs = this.buffers.lock();
+                                for (tid, chunk) in produced {
+                                    if bufs.cancelled.contains(&tid) {
+                                        continue;
+                                    }
+                                    bufs.chunks.entry(tid).or_default().push_back(chunk);
+                                }
+                                Ok(empty)
+                            }
+                            Err(e) => Err(e),
+                        })
+                    }
+                };
+                drop(guard);
+                // Engine released: wake every stream parked on contention.
+                let wakers = std::mem::take(&mut this.buffers.lock().step_wakers);
+                for w in wakers {
+                    w.wake();
                 }
+                result
             };
             let Some(step_result) = step_result else {
                 return this.fail_teardown();
@@ -726,8 +832,29 @@ impl Drop for ChunkStream {
         // grinding through max_tokens worth of chunks that no one
         // will ever drain — the chunk buffer for this task accretes
         // until close() and the engine slot stays busy.
-        if let Some(engine) = self.engine.lock().as_mut() {
-            engine.cancel(&self.task_id);
+        //
+        // Never block on the engine mutex here: Drop runs on whatever
+        // (often tokio worker) thread drops the stream, and a hard lock()
+        // during another stream's step counts toward the worker starvation
+        // that wedges the pipeline (#122). Busy engine = defer; the next
+        // engine-lock holder applies it before stepping.
+        match self.engine.try_lock() {
+            Some(mut guard) => {
+                if let Some(engine) = guard.as_mut() {
+                    engine.cancel(&self.task_id);
+                }
+                drop(guard);
+                let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
+                for w in wakers {
+                    w.wake();
+                }
+            }
+            None => {
+                self.buffers
+                    .lock()
+                    .deferred_cancels
+                    .push(self.task_id.clone());
+            }
         }
         let mut bufs = self.buffers.lock();
         bufs.chunks.remove(&self.task_id);
