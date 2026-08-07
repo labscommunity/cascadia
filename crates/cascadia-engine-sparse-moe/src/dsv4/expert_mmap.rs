@@ -46,6 +46,11 @@ mod winmem {
     extern "system" {
         /// `BOOL VirtualLock(LPVOID lpAddress, SIZE_T dwSize)` — nonzero on success.
         pub fn VirtualLock(address: *const c_void, size: usize) -> i32;
+        /// `BOOL K32EmptyWorkingSet(HANDLE)` — moves every removable page of the
+        /// process working set to the standby list. `VirtualLock`'d pages and the
+        /// hard working-set minimum are respected; standby pages soft-fault back
+        /// (no disk I/O) on next touch.
+        pub fn K32EmptyWorkingSet(process: isize) -> i32;
         /// `HANDLE GetCurrentProcess(void)` — the current-process pseudo handle.
         pub fn GetCurrentProcess() -> isize;
         /// `BOOL PrefetchVirtualMemory(HANDLE, ULONG_PTR NumberOfEntries,
@@ -100,11 +105,56 @@ pub fn reserve_lockable(bytes: usize) {
                 "[glm5] SetProcessWorkingSetSizeEx({min}) failed: {} — hot-expert pins may not stick",
                 std::io::Error::last_os_error()
             );
+        } else {
+            RESERVED_WS_MIN.store(min, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[cfg(not(windows))]
     {
         let _ = bytes;
+    }
+}
+
+/// The hard working-set minimum applied by [`reserve_lockable`] (bytes; 0 if
+/// none). [`trim_working_set`] re-applies it after an `EmptyWorkingSet`, which
+/// resets the quota to defaults on some Windows builds.
+#[cfg(windows)]
+static RESERVED_WS_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Trim every removable page of this process's working set to the standby
+/// list, then re-apply the pinned floor. `VirtualLock`'d pages stay resident;
+/// trimmed pages stay in RAM (standby counts toward `MemAvailable`) and
+/// soft-fault back without disk I/O on next touch.
+///
+/// Why: the mmap expert path grows the working set far past the pinned floor,
+/// and Windows trims lazily — under-pressure nodes sit at a few hundred MB of
+/// `MemAvailable` while holding gigabytes of clean, re-readable pages. The
+/// scheduler's memory rule (correctly) refuses to route to such a node. Moving
+/// the excess to standby makes the metric — and the node — schedulable again.
+/// No-op (returns `false`) off Windows.
+pub fn trim_working_set() -> bool {
+    #[cfg(windows)]
+    {
+        // SAFETY: pseudo-handle; both calls only affect this process.
+        let ok = unsafe { winmem::K32EmptyWorkingSet(winmem::GetCurrentProcess()) };
+        let min = RESERVED_WS_MIN.load(std::sync::atomic::Ordering::Relaxed);
+        if min > 0 {
+            let max = min.saturating_add(min / 4);
+            // SAFETY: as above.
+            unsafe {
+                winmem::SetProcessWorkingSetSizeEx(
+                    winmem::GetCurrentProcess(),
+                    min,
+                    max,
+                    winmem::QUOTA_LIMITS_HARDWS_MIN_ENABLE,
+                );
+            }
+        }
+        ok != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
