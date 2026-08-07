@@ -481,6 +481,25 @@ impl GlmRunner {
             }
         }
 
+        // Working-set governor: on the mmap path the working set grows far past
+        // the pinned floor and Windows trims it lazily, so a 32 GB node settles
+        // at a few hundred MB of MemAvailable while holding gigabytes of clean,
+        // instantly-reclaimable pages — and the scheduler (correctly) marks it
+        // unservable. When available RAM sinks below the threshold, trim the
+        // excess to standby (pins and the hard floor survive; standby pages
+        // soft-fault back without disk I/O). Threshold default 2560 MB — above
+        // the scheduler's 1 GiB serve floor with margin; CASCADIA_GLM5_TRIM_MB
+        // overrides, 0 disables. Healthy nodes never cross it.
+        if mode == ExpertsMode::Mmap {
+            let threshold_mb = std::env::var("CASCADIA_GLM5_TRIM_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2560);
+            if threshold_mb > 0 {
+                Self::start_ws_governor(threshold_mb);
+            }
+        }
+
         // Async lookahead: build the per-layer expert-bin table (local index -> routed
         // bin paths) and spawn the background lookahead worker. Only on the mmap path
         // (streamed experts); eager/bf16 have nothing to warm.
@@ -526,6 +545,50 @@ impl GlmRunner {
                     .unwrap_or(0),
             ),
         })
+    }
+
+    /// Spawn the process-wide working-set governor (once; engine rebuilds
+    /// reuse it). Every `CASCADIA_GLM5_TRIM_SECS` (default 20) it samples
+    /// `MemAvailable`; below `threshold_mb` it calls
+    /// [`trim_working_set`](crate::dsv4::expert_mmap::trim_working_set) and
+    /// logs the recovery. Windows-only in effect — the trim is a no-op
+    /// elsewhere, so no thread is spawned.
+    fn start_ws_governor(threshold_mb: u64) {
+        #[cfg(windows)]
+        {
+            static STARTED: std::sync::Once = std::sync::Once::new();
+            STARTED.call_once(move || {
+                let period = std::env::var("CASCADIA_GLM5_TRIM_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&s| s > 0)
+                    .unwrap_or(20);
+                std::thread::Builder::new()
+                    .name("glm5-ws-governor".into())
+                    .spawn(move || loop {
+                        std::thread::sleep(std::time::Duration::from_secs(period));
+                        let before_mb = super::residency::mem_available() / (1024 * 1024);
+                        if before_mb >= threshold_mb {
+                            continue;
+                        }
+                        let ok = crate::dsv4::expert_mmap::trim_working_set();
+                        let after_mb = super::residency::mem_available() / (1024 * 1024);
+                        tracing::info!(
+                            target: "cascadia::glm5",
+                            event = "ws_trimmed",
+                            ok,
+                            before_mb,
+                            after_mb,
+                            threshold_mb,
+                        );
+                    })
+                    .ok();
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = threshold_mb;
+        }
     }
 
     /// RAM budget (in whole experts) this rank may `mlock`, after reserving its
