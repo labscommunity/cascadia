@@ -433,6 +433,19 @@ fn decode_wire_plan(
     Ok(out)
 }
 
+/// True when a packed plan carries a prefill chunk: some slot owns more than
+/// one row (decode frames have at most one row per slot). Picks the token
+/// reply's deadline budget — a prefill reply waits on multi-token compute
+/// across every remaining stage. A single-row prefill chunk is
+/// indistinguishable from a decode row here and gets the strict decode
+/// deadline, which a one-row tail inference fits comfortably.
+fn plan_has_prefill_rows(rows: &[Option<(usize, i64, usize)>]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .flatten()
+        .any(|(slot, _, _)| !seen.insert(*slot))
+}
+
 /// Encode the head stage's per-row sampled tokens as I64 `[1, 1, S]`. The
 /// non-packed path returns one token; packed returns one per active row, in
 /// row order, with 0 for idle rows (never read).
@@ -1540,14 +1553,19 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            let enc = tok
-                .encode(task.prompt.clone(), false)
-                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
+            // Admission failures are attributed to the failed task so the
+            // runner routes them to its stream — a bare Err here would kill
+            // whichever concurrent stream happened to be polling.
+            let enc = tok.encode(task.prompt.clone(), false).map_err(|e| {
+                EngineError::Backend(format!("tokenizer encode: {e}"))
+                    .for_task(task.task_id.clone())
+            })?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             if prompt_ids.is_empty() {
-                return Err(EngineError::Backend(
-                    "empty prompt: no tokens to prefill".into(),
-                ));
+                return Err(
+                    EngineError::Backend("empty prompt: no tokens to prefill".into())
+                        .for_task(task.task_id),
+                );
             }
             info!(
                 task = %task.task_id,
@@ -1565,23 +1583,61 @@ impl OvRuntimeEngine {
         // exactly as the single-task static path already does.
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
         for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
-            let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
+            // Any failure past admission loses the whole in-flight packed
+            // batch (a shared inference, or a shared downstream exchange) —
+            // route it through `abort_packed_batch` so every affected stream
+            // gets its own attributed error and every slot is retired. A
+            // bare `?` would kill whichever stream happened to be polling
+            // and leave the other slots wedged-active forever.
+            let stepped = match self.packed.as_mut().unwrap().step() {
+                Ok(s) => s,
+                Err(e) => return self.abort_packed_batch(e, out),
+            };
+            let Some((odt, oshape, obytes, kind)) = stepped else {
                 break;
             };
-            if single_stage {
-                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            let emitted = if single_stage {
+                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)
             } else {
                 // Pipeline: this stage produced hidden rows. Ship the plan (so
                 // every downstream stage can rebuild the same mask and route
                 // rows to the same slots) plus the hidden block, then take back
                 // one sampled token per row from the tail.
-                let hidden = bytes_to_f32(odt, &obytes)?;
-                let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
-                let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
-                self.emit_packed_tokens(&tokens, kind, &mut out)?;
+                bytes_to_f32(odt, &obytes).and_then(|hidden| {
+                    let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
+                    let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                    self.emit_packed_tokens(&tokens, kind, &mut out)
+                })
+            };
+            if let Err(e) = emitted {
+                return self.abort_packed_batch(e, out);
             }
             if !out.is_empty() {
                 break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A packed step failed in a way that loses the in-flight batch: retire
+    /// every active slot (freeing its KV region) and hand each task its own
+    /// final error chunk. The single-task recovery in `step_first_body`
+    /// cannot express a multi-task failure. Slot state downstream is stale
+    /// but harmless — the next admission resets its slot in-band (a row
+    /// whose position equals its reuse length starts that slot fresh).
+    fn abort_packed_batch(
+        &mut self,
+        e: EngineError,
+        mut out: Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        warn!(error = %e, "packed step failed; aborting the in-flight packed batch");
+        let packed = self.packed.as_mut().unwrap();
+        for slot in 0..packed.slots.len() {
+            if let Some(ps) = packed.retire(slot) {
+                out.push((
+                    ps.task.task_id.clone(),
+                    Chunk::error(ps.task.task_id, format!("packed batch aborted: {e}")),
+                ));
             }
         }
         Ok(out)
@@ -1608,6 +1664,9 @@ impl OvRuntimeEngine {
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
             f32_to_f16_bytes(hidden),
         );
+        // A prefill reply waits on multi-token compute across every remaining
+        // stage — widen its deadline like the non-packed path does.
+        let prefill = plan_has_prefill_rows(plan_rows);
         self.block_on(async {
             let mut guard = down.lock().await;
             guard
@@ -1618,29 +1677,35 @@ impl OvRuntimeEngine {
                 .send(&hidden_frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
-            // Bound the reply wait. Having just sent both frames this stage is
-            // OWED a token frame, so a downstream that never answers must not
-            // pin the thread forever — the same reasoning as `reply_bounded` on
-            // the qwen36 path, and the same configured activation timeout. This
-            // is what turns a dropped token frame from a silent permanent wedge
-            // into a reportable error; it does not prevent the drop.
-            let (reply, _) = match tokio::time::timeout(
-                cascadia_transport::recv_timeout(),
-                guard.recv(),
-            )
-            .await
-            {
-                Ok(r) => r.map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?,
-                Err(_) => {
-                    return Err(EngineError::Backend(
-                        "packed token recv timed out: the downstream stage did not answer a \
-                             plan+hidden pair. Multi-stage packed is known to drop a token frame \
-                             under load (issue #122); run the packed worker \
-                             single-stage (--total 1)"
-                            .into(),
-                    ))
-                }
-            };
+            // Having just sent both frames this stage is OWED a token frame.
+            // `recv_reply*`, NOT plain `recv` under an external
+            // `tokio::time::timeout` (#122): the deadline lives inside the
+            // transport, so a miss surfaces as an error instead of a dropped
+            // future (which silently discarded any partially-read bytes and
+            // left the stream misaligned), and a failed reply POISONS the
+            // connection — the socket is dropped so a late token frame can
+            // never be read into the next exchange as fresh data. The
+            // poisoned-socket errors ("recv_exact timed out" / "not
+            // connected") are connection-fatal, so a middle rank's relay
+            // loop exits for a supervisor rebuild rather than grinding on a
+            // desynced stream.
+            let (reply, _) = if prefill {
+                guard.recv_reply_prefill().await
+            } else {
+                guard.recv_reply().await
+            }
+            .map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?;
+            // An EMPTY token frame is the downstream's NACK (see
+            // `step_relay_packed`): its step failed AFTER it consumed our
+            // pair, so the batch is lost but the link is still
+            // frame-aligned. Abort the batch; do not poison the connection.
+            if reply.elements() == Some(0) {
+                return Err(EngineError::Backend(
+                    "downstream stage failed its packed step and NACKed this batch \
+                     (empty token frame); the pipeline link stays aligned"
+                        .into(),
+                ));
+            }
             decode_wire_tokens(&reply)
         })
     }
@@ -1689,17 +1754,27 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let (plan_rows, hidden, hshape) = self.block_on(async {
+        let (plan_res, hidden, hshape) = self.block_on(async {
             let mut guard = up.lock().await;
+            // The plan frame is this stage's idle wait for the next unit of
+            // work — idle-tolerant `recv`. Once it arrives the upstream owes
+            // the hidden frame promptly, so the SECOND frame of the pair is
+            // a deadlined `recv_reply` (same rule as the non-packed
+            // `recv_hidden_from_upstream`): a half-sent pair must fail fast
+            // and poison the socket, not park this stage for the whole
+            // frame-idle ceiling. The plan is decoded only AFTER the hidden
+            // frame is consumed — bailing between the two frames would
+            // leave the hidden frame in the socket and permanently desync
+            // every later frame (#122).
             let (pf, _) = guard
                 .recv()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed plan recv: {e}")))?;
-            let plan_rows = decode_wire_plan(&pf, slots)?;
             let (hf, _) = guard
-                .recv()
+                .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
+            let plan_res = decode_wire_plan(&pf, slots);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
                 _ => hf
@@ -1708,9 +1783,41 @@ impl OvRuntimeEngine {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             };
-            Ok::<_, EngineError>((plan_rows, hidden, hf.shape))
+            Ok::<_, EngineError>((plan_res, hidden, hf.shape))
         })?;
 
+        // The pair is consumed. From here on, any failure MUST still answer
+        // the upstream — otherwise it blocks awaiting a token frame that
+        // never comes while this loop swallows the error and moves on: the
+        // silent-deadlock half of issue #122. The NACK is an EMPTY token
+        // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
+        // has one token per row), and it tells the upstream "batch lost,
+        // link healthy".
+        let step = self.relay_packed_body(plan_res, hidden, hshape);
+        let frame = match &step {
+            Ok(tokens) => encode_wire_tokens(tokens),
+            Err(_) => encode_wire_tokens(&[]),
+        };
+        self.block_on(async {
+            let mut guard = up.lock().await;
+            guard
+                .send(&frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+        })?;
+        step.map(|_| ())
+    }
+
+    /// Everything `step_relay_packed` does between consuming the (plan,
+    /// hidden) pair and answering the upstream. Split out so the caller can
+    /// turn any failure into an on-wire NACK instead of a swallowed error.
+    fn relay_packed_body(
+        &mut self,
+        plan_res: EngineResult<Vec<Option<(usize, i64, usize)>>>,
+        hidden: Vec<f32>,
+        hshape: [u32; MAX_RANK],
+    ) -> EngineResult<Vec<i32>> {
+        let plan_rows = plan_res?;
         let hidden_size = hshape[2] as usize;
         let plan = crate::packed::PackedPlan {
             rows: plan_rows
@@ -1752,27 +1859,14 @@ impl OvRuntimeEngine {
                     0
                 });
             }
-            let frame = encode_wire_tokens(&tokens);
-            self.block_on(async {
-                let mut guard = up.lock().await;
-                guard
-                    .send(&frame)
-                    .await
-                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
-            })?;
+            Ok(tokens)
         } else {
             let hidden_out = bytes_to_f32(odt, &obytes)?;
-            let tokens = self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)?;
-            let frame = encode_wire_tokens(&tokens);
-            self.block_on(async {
-                let mut guard = up.lock().await;
-                guard
-                    .send(&frame)
-                    .await
-                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
-            })?;
+            // A downstream failure (including its NACK) propagates as Err —
+            // the caller NACKs our own upstream in turn, so the abort
+            // reaches rank 0 no matter how deep the pipeline is.
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)
         }
-        Ok(())
     }
 
     /// Sample the rows one packed inference produced and append their chunks.
@@ -4019,6 +4113,47 @@ mod tests {
         // a hidden (F32) frame where tokens were expected is a hard error
         let wrong = WireTensor::new(WireDType::F32, [1, 1, 2], vec![0u8; 8]);
         assert!(decode_wire_tokens(&wrong).is_err());
+    }
+
+    /// The relay's NACK is an EMPTY token frame — it must be wire-valid
+    /// (shape/payload consistent so the transport delivers it), detectable
+    /// via `elements() == 0` BEFORE `decode_wire_tokens` (which rejects
+    /// empties as malformed), and impossible to confuse with a real reply
+    /// (a real reply always carries one token per row, S >= 1).
+    #[test]
+    fn packed_nack_frame_is_empty_and_detectable() {
+        let nack = encode_wire_tokens(&[]);
+        assert_eq!(nack.shape, [1, 1, 0]);
+        assert!(nack.data.is_empty());
+        assert_eq!(nack.elements(), Some(0));
+        assert!(decode_wire_tokens(&nack).is_err()); // NACK check must come first
+        let real = encode_wire_tokens(&[7]);
+        assert_ne!(real.elements(), Some(0));
+    }
+
+    /// Prefill chunks (several rows for one slot) get the widened reply
+    /// budget; decode frames (at most one row per slot) keep the strict
+    /// deadline. Idle rows never count.
+    #[test]
+    fn plan_prefill_detection_by_duplicate_slot() {
+        // decode: three distinct slots + an idle row
+        assert!(!plan_has_prefill_rows(&[
+            Some((0, 5, 0)),
+            Some((1, 9, 0)),
+            None,
+            Some((3, 2, 0)),
+        ]));
+        // prefill chunk: slot 2 owns several rows
+        assert!(plan_has_prefill_rows(&[
+            Some((2, 0, 0)),
+            Some((2, 1, 0)),
+            Some((2, 2, 0)),
+            None,
+        ]));
+        // single-row prefill is indistinguishable from decode — strict
+        // deadline by design
+        assert!(!plan_has_prefill_rows(&[Some((0, 0, 0))]));
+        assert!(!plan_has_prefill_rows(&[]));
     }
 
     /// Which token sits in each ring slot, recovered by matching the
