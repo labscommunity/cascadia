@@ -185,6 +185,11 @@ pub struct StageOpts {
     pub lookahead: Option<bool>,
     /// Per-rank KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE`.
     pub prefix_cache_depth: Option<u32>,
+    /// OV expert cache count backstop. `None` → `CASCADIA_GLM5_OV_CACHE`.
+    pub ov_cache_entries: Option<u32>,
+    /// OV expert cache byte budget (MiB), the primary bound. `None` →
+    /// `CASCADIA_GLM5_OV_CACHE_MB`.
+    pub ov_cache_mb: Option<u64>,
 }
 
 impl StageOpts {
@@ -203,6 +208,8 @@ impl StageOpts {
             experts_mode: None,
             lookahead: None,
             prefix_cache_depth: None,
+            ov_cache_entries: None,
+            ov_cache_mb: None,
         }
     }
 
@@ -216,12 +223,15 @@ impl StageOpts {
     ///
     /// Exists because in-process hosts cannot set the environment for a single
     /// engine (`set_var` is `unsafe` under edition 2024, and process-global).
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         f32_head: Option<bool>,
         bf16_kv: Option<bool>,
         experts_mode: Option<String>,
         lookahead: Option<bool>,
         prefix_cache_depth: Option<u32>,
+        ov_cache_entries: Option<u32>,
+        ov_cache_mb: Option<u64>,
     ) -> Self {
         let env = Self::from_env();
         Self {
@@ -230,6 +240,8 @@ impl StageOpts {
             experts_mode,
             lookahead,
             prefix_cache_depth,
+            ov_cache_entries,
+            ov_cache_mb,
         }
     }
 }
@@ -368,7 +380,13 @@ impl GlmRunner {
         // compiled IRs. Worth enabling only once a rank's experts are RAM-resident
         // (shard wide enough) — on a disk-streaming rank it just moves the same
         // NVMe wait onto the accelerator.
-        let ov = super::ov_expert::OvExperts::from_env(dir, m.hidden_size).map(Arc::new);
+        let ov = super::ov_expert::OvExperts::from_env_with(
+            dir,
+            m.hidden_size,
+            opts.ov_cache_entries,
+            opts.ov_cache_mb,
+        )
+        .map(Arc::new);
 
         for (i, layer) in s.layers.iter_mut().enumerate() {
             if let Some(ml) = layer.moe_mut() {

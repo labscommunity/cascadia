@@ -119,6 +119,18 @@ impl OvExperts {
     /// Construct from env, or `None` to keep the Rust expert path:
     /// requires `CASCADIA_GLM5_OV_EXPERTS` set and `<model>/experts_ov` present.
     pub fn from_env(model_dir: &Path, dim: usize) -> Option<Self> {
+        Self::from_env_with(model_dir, dim, None, None)
+    }
+
+    /// [`from_env`] with config-first cache overrides (entries backstop /
+    /// MiB budget); `None` falls back to the env knobs. In-process hosts
+    /// can't set env per engine (edition-2024 `set_var` is unsafe).
+    pub fn from_env_with(
+        model_dir: &Path,
+        dim: usize,
+        cache_entries: Option<u32>,
+        cache_mb: Option<u64>,
+    ) -> Option<Self> {
         if std::env::var("CASCADIA_GLM5_OV_EXPERTS").is_err() {
             return None;
         }
@@ -127,9 +139,13 @@ impl OvExperts {
             return None;
         }
         let device = std::env::var("CASCADIA_GLM5_OV_DEVICE").unwrap_or_else(|_| "GPU".into());
-        let cap = std::env::var("CASCADIA_GLM5_OV_CACHE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let cap = cache_entries
+            .map(|n| n as usize)
+            .or_else(|| {
+                std::env::var("CASCADIA_GLM5_OV_CACHE")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
             .and_then(NonZeroUsize::new)
             // 64 ≈ 2 GiB: each cached entry holds ~30 MiB of iGPU driver
             // allocations (measured: 800 held experts = 24 GiB). The old 1024
@@ -141,15 +157,30 @@ impl OvExperts {
         let mut plugin = PluginConfig::new();
         // Persist compiled blobs across runs so first-touch compile isn't
         // re-paid every process start (GPU kernel JIT is expensive).
-        if let Ok(cd) = std::env::var("CASCADIA_GLM5_OV_CACHE_DIR") {
-            plugin = plugin.with("CACHE_DIR", cd);
+        let cache_dir = std::env::var("CASCADIA_GLM5_OV_CACHE_DIR").ok();
+        if let Some(cd) = &cache_dir {
+            plugin = plugin.with("CACHE_DIR", cd.clone());
         }
         // Byte budget is the primary bound; count is the backstop.
-        let budget = std::env::var("CASCADIA_GLM5_OV_CACHE_MB")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
+        let budget = cache_mb
+            .or_else(|| {
+                std::env::var("CASCADIA_GLM5_OV_CACHE_MB")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
             .unwrap_or(2048)
             .saturating_mul(1024 * 1024);
+        // The effective config, verifiable from logs rather than guessed —
+        // multiple fleet sessions burned time inferring these from behaviour.
+        tracing::info!(
+            target: "cascadia::glm5",
+            event = "ov_experts_config",
+            device = %device,
+            cache_entries = cap.get(),
+            cache_budget_mb = budget / (1024 * 1024),
+            cache_dir = cache_dir.as_deref().unwrap_or("<unset>"),
+            dir = %dir.display(),
+        );
         Some(Self {
             dir,
             device,
