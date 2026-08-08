@@ -117,4 +117,28 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.hpp");
     println!("cargo:rerun-if-env-changed=INTEL_OPENVINO_DIR");
+    // Track the SDK's CONTENTS, not just the env value: fleets swap the SDK
+    // behind a stable INTEL_OPENVINO_DIR (side-by-side install + junction),
+    // which `rerun-if-env-changed` cannot see — the "upgrade" then relinks
+    // nothing and reports success in <1s, leaving a binary built against the
+    // previous SDK (observed on the 2026.2 -> 2026.3 fleet upgrade). The
+    // version headers change contents on every SDK bump. Existence-gated:
+    // `rerun-if-changed` on a MISSING path marks the script always-dirty,
+    // which would silently defeat caching instead.
+    let version_markers = [
+        format!("{ov_root}/runtime/include/openvino/genai/version.hpp"),
+        format!("{ov_root}/runtime/include/openvino/core/version.hpp"),
+    ];
+    let mut tracked = false;
+    for m in &version_markers {
+        if std::path::Path::new(m).is_file() {
+            println!("cargo:rerun-if-changed={m}");
+            tracked = true;
+        }
+    }
+    if !tracked {
+        // Unknown layout: fall back to walking the genai include dir (a per-
+        // build directory stat, still cheap) rather than tracking nothing.
+        println!("cargo:rerun-if-changed={genai_include}");
+    }
 }
