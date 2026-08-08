@@ -10,18 +10,22 @@ y[1,1,hidden]` graph — the SAME activation the Rust glm5 SwiGLU applies
 baked in).
 
 Weight dtype (`--dtype`, default **int4**):
-  * `int4` — **NNCF `INT4_SYM` weight-compression** (`group_size=32`, `ratio=1.0`)
-    on the fp16-constant graph, so the IR stores int4-compressed weights
-    (~0.56 B/weight, matching the int4 bins). This is the same proven path the
-    dsv4 fleet tool (`dsv4/dsv4_expert_ov.py`) uses and validated on-device; it
-    avoids hand-packing a `u4` constant. It is the ONLY dtype that fits a
-    RAM-tight shard, which is the whole reason the offload exists.
+  * `int4` — the bins' OWN nibbles and bf16 group scales, packed verbatim into a
+    `u4` constant + the standard OV decompression subgraph
+    (`u4 -> Convert(f32) -> Subtract(8) -> Multiply(bf16 scale -> f32)`).
+    The IR sits on the EXACT quantization grid the Rust mmap kernel reads —
+    no NNCF, no float round-trip, ~0.56 B/weight. (The previous version
+    dequantized to fp32, built fp16 constants, and let NNCF re-quantize on a
+    fresh grid: int4 -> fp32 -> fp16 -> new-int4, cos ~0.9968 per expert vs
+    the source grid. See OV-INT4-REQUANT-ISSUE.)
   * `fp16` — the uncompressed fp16-constant graph (2 B/weight, ~3.6x larger).
-    Escape hatch for a box with spare RAM or debugging.
+    Escape hatch for a box with spare RAM or debugging. NOT grid-exact (fp16
+    rounds the dequantized values).
 
-`--validate` compiles the fp16 and int4 IRs for one expert and compares both to a
-numpy reference of the true glm SwiGLU (max/mean abs error + cosine), so the
-quantization error is visible before a fleet run.
+`--validate` compiles the fp16 and int4 IRs for one expert and compares both to
+a numpy reference of the true glm SwiGLU on the bins' grid. int4 must match to
+f32 accumulation-order noise (~1e-6); it prints full-precision error stats and
+a scale ratio so gain errors can't hide in rounded output.
 
 The IRs are entirely **opt-in**: the runtime loads them only when
 `CASCADIA_GLM5_OV_EXPERTS=1` and `<model>/experts_ov` exists. Absent -> the Rust
@@ -34,7 +38,7 @@ int4_bin byte layout (byte-identical to `dsv4/expert_mmap.rs` `MmapExpert` and
 nibble = even col, high = odd col, value = nibble-8) then bf16-LE per-32-column
 group scales. GROUP=32.
 
-Requires `openvino` and `nncf` (the fleet export environment has both).
+Requires `openvino` only (NNCF is no longer used).
 
 Usage:
   python tools/glm5_expert_ov.py --src /media/.../glm5/export
@@ -107,48 +111,108 @@ def _build(wg, wu, wd, hidden):
     return m
 
 
-def _to_int4(m):
-    """NNCF symmetric int4 weight-compression (group_size=32), matching the
-    int4_bin grouping. Same call the dsv4 fleet tool uses."""
-    import logging
+def _raw_const(t, dims, raw):
+    """Constant of low-precision Type `t` built from raw LE bytes, verbatim.
+    The python Constant ctor has no bytes overload; go through a Tensor whose
+    u8 byte view we fill. `shared_memory=False` copies, so the Tensor and the
+    source buffer may die."""
+    ten = ov.Tensor(t, ov.Shape(dims))
+    view = ten.data if isinstance(ten.data, np.ndarray) else np.frombuffer(ten.data, np.uint8)
+    view = view.reshape(-1).view(np.uint8)
+    src = np.frombuffer(raw, np.uint8)
+    assert view.size == src.size, f"{t} tensor {dims}: {view.size}B buffer vs {src.size}B raw"
+    view[:] = src
+    return ov.op.Constant(ten, shared_memory=False)
 
-    import nncf
-    nncf.set_log_level(logging.CRITICAL)
-    return nncf.compress_weights(m, mode=nncf.CompressWeightsMode.INT4_SYM, group_size=GROUP, ratio=1.0)
+
+def _int4_section(buf, off, out, inn):
+    """One int4_bin section -> (f32 weight node on the bins' EXACT grid, next off).
+
+    The packed nibble bytes are a valid OV `u4` buffer AS-IS: the bin stores the
+    even column in the low nibble, which is also OV's u4 element order (verified
+    by probe — nibble-swapping breaks it). The bf16 scales likewise go in
+    verbatim as a `bf16` constant. Dequant runs in f32 (`(q-8) * f32(scale)`),
+    the same arithmetic as `expert_mmap.rs::dequant_row_dot`'s grid, so the IR
+    and the Rust kernel see bit-identical weights."""
+    nb = out * inn // 2
+    ng = inn // GROUP
+    nibbles = _raw_const(Type.u4, [out, ng, GROUP], buf[off:off + nb])
+    scales = _raw_const(Type.bf16, [out, ng, 1], buf[off + nb:off + nb + out * ng * 2])
+    w = ops.convert(nibbles, Type.f32)
+    w = ops.subtract(w, ops.constant(np.float32(8.0)))
+    w = ops.multiply(w, ops.convert(scales, Type.f32))
+    w = ops.reshape(w, ops.constant(np.array([out, inn], np.int64)), False)
+    return w, off + nb + out * ng * 2
+
+
+def _build_int4(binp, hidden, inter):
+    """SwiGLU graph whose weights are the bins' own nibbles + scales (u4
+    constants, zero re-quantization). Same topology as `_build`."""
+    buf = open(binp, "rb").read()
+    wg, o = _int4_section(buf, 0, inter, hidden)
+    wu, o = _int4_section(buf, o, inter, hidden)
+    wd, _ = _int4_section(buf, o, hidden, inter)
+
+    x = ops.parameter(PartialShape([1, 1, hidden]), Type.f32, name="x")
+    x.get_output_tensor(0).set_names({"x"})
+    g = ops.matmul(x, wg, False, True)
+    u = ops.matmul(x, wu, False, True)
+    h = ops.multiply(ops.multiply(g, ops.sigmoid(g)), u)
+    y = ops.matmul(h, wd, False, True)
+    m = Model([y], [x], "glm5_expert")
+    m.outputs[0].tensor.set_names({"y"})
+    return m
 
 
 def _save_expert(binp, hidden, inter, dtype, edst):
-    wg, wu, wd = _load(binp, hidden, inter)
-    m = _build(wg, wu, wd, hidden)
     if dtype == "int4":
-        m = _to_int4(m)
+        m = _build_int4(binp, hidden, inter)
+    else:
+        wg, wu, wd = _load(binp, hidden, inter)
+        m = _build(wg, wu, wd, hidden)
     os.makedirs(edst, exist_ok=True)
     ov.save_model(m, os.path.join(edst, "openvino_model.xml"), compress_to_fp16=False)
 
 
 def _validate(binp, hidden, inter):
     """Compile fp16 + int4 IRs for one expert and compare both to the numpy
-    reference of the true glm SwiGLU."""
+    reference of the true glm SwiGLU on the bins' own grid. int4 must match to
+    f32 accumulation-order noise; anything worse means the exporter left the
+    grid. Full-float stats + a scale ratio so a uniform gain error (invisible
+    to cosine) and sub-1e-5 deviations (invisible at 5 decimals) surface."""
     wg, wu, wd = _load(binp, hidden, inter)
-    m = _build(wg, wu, wd, hidden)
     rng = np.random.default_rng(0)
     x = (rng.standard_normal((1, 1, hidden)).astype(np.float32)) * 0.1
     ref = _ref_forward(wg, wu, wd, x.reshape(1, hidden)).reshape(-1)
     core = ov.Core()
 
     def run(model):
-        r = core.compile_model(model, "CPU", {"SNIPPETS_MODE": "DISABLE"}).create_infer_request()
+        # Pin f32 so the numbers measure the WEIGHT GRID, not the plugin's
+        # inference-precision default (f16 on some hosts -> ~1e-3 noise).
+        cfg = {"SNIPPETS_MODE": "DISABLE", "INFERENCE_PRECISION_HINT": "f32"}
+        r = core.compile_model(model, "CPU", cfg).create_infer_request()
         return np.array(r.infer({"x": x})[0]).reshape(-1)
 
     def stats(name, got):
         d = np.abs(got - ref)
         rel = d / (np.abs(ref) + 1e-6)
         cos = np.dot(got, ref) / (np.linalg.norm(got) * np.linalg.norm(ref) + 1e-9)
-        print(f"  {name}: max_abs={d.max():.5f} mean_abs={d.mean():.5f} max_rel={rel.max():.3f} cos={cos:.5f}")
+        gain = float(np.dot(got, ref) / (np.dot(ref, ref) + 1e-12))
+        print(
+            f"  {name}: exact={np.array_equal(got, ref)} max_abs={d.max():.3e} "
+            f"mean_abs={d.mean():.3e} max_rel={rel.max():.3e} cos={cos!r} gain={gain!r}"
+        )
+        return float(d.max())
 
     print(f"validate {binp}  ref |mean|={np.abs(ref).mean():.4f} max={np.abs(ref).max():.4f}")
-    stats("fp16", run(m))
-    stats("int4", run(_to_int4(_build(wg, wu, wd, hidden))))
+    stats("fp16", run(_build(wg, wu, wd, hidden)))
+    int4_err = stats("int4", run(_build_int4(binp, hidden, inter)))
+    # Grid gate: f32 accumulation reorder tops out orders of magnitude below
+    # any quantization step. 1e-4 abs on ~0.1-magnitude outputs is a loose
+    # ceiling for "same grid" and far below the old exporter's ~1e-3.
+    if int4_err > 1e-4:
+        raise SystemExit(f"int4 IR left the source grid: max_abs={int4_err:.3e} (expected ~1e-6)")
+    print("  int4 IR is on the source quantization grid (residual = f32 accumulation order)")
 
 
 def main():
