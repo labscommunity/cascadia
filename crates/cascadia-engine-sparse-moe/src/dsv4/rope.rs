@@ -100,24 +100,36 @@ pub fn apply_rope_row(row: &mut [f32], freqs: &Freqs, pos: usize, rd: usize, inv
 mod freqs_dump {
     use super::precompute_freqs;
 
-    /// Dumps `Freqs.data` at GLM-5.2's real rope dims (`qk_rope_head_dim=64`,
-    /// `rope_theta=8e6`, `original_seq_len=0` so no YaRN — matches the
-    /// `precompute_freqs` call in `glm/loader.rs`) as raw little-endian f32
-    /// bytes, so an OpenVINO exporter's cos/sin table can be diffed
-    /// bit-for-bit against this crate's table — the one place an OV attention
-    /// export must be numerically EXACT, not just ULP-close (a silently
-    /// wrong-basis rope table breaks decode while short-prompt parity stays
-    /// green).
+    /// Dumps `Freqs.data` as raw little-endian f32 bytes plus a `.meta.json`
+    /// sidecar (`{"rot_dims","seqlen","theta"}`), so an OpenVINO exporter's
+    /// cos/sin table can be diffed bit-for-bit against this crate's table —
+    /// the one place an OV attention export must be numerically EXACT, not
+    /// just ULP-close (a silently wrong-basis rope table breaks decode while
+    /// short-prompt parity stays green) — and the exporter can verify the
+    /// dump's dims actually match what it needed instead of trusting a stale
+    /// file.
     ///
+    /// Dims default to GLM-5.2's Task-1 real rope dims (`qk_rope_head_dim=64`,
+    /// `rope_theta=8e6`, `original_seq_len=0` so no YaRN — matches the
+    /// `precompute_freqs` call in `glm/loader.rs`), overridable via
+    /// `GLM5_ROPE_DUMP_ROT_DIMS` / `GLM5_ROPE_DUMP_SEQLEN` / `GLM5_ROPE_DUMP_THETA`
+    /// so Task 2's exporter can request the real `(qk_rope, W, rope_theta)` a
+    /// manifest calls for, or a small synthetic shape for `--validate-graph`.
     /// Writes to `GLM5_ROPE_FREQS_DUMP` if set, else `$TMPDIR/glm5_rope_freqs_dump.bin`.
     /// Run: `cargo test -p cascadia-engine-sparse-moe --lib dump_real_dims_freqs -- --nocapture`.
     #[test]
     fn dump_real_dims_freqs() {
-        const DIM: usize = 64;
-        const SEQLEN: usize = 16;
-        const THETA: f32 = 8_000_000.0;
-        let freqs = precompute_freqs(DIM, SEQLEN, 0, THETA, 1.0, 32.0, 1.0);
-        assert_eq!(freqs.data.len(), SEQLEN * (DIM / 2) * 2);
+        fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        }
+        let dim: usize = env_or("GLM5_ROPE_DUMP_ROT_DIMS", 64);
+        let seqlen: usize = env_or("GLM5_ROPE_DUMP_SEQLEN", 16);
+        let theta: f32 = env_or("GLM5_ROPE_DUMP_THETA", 8_000_000.0);
+        let freqs = precompute_freqs(dim, seqlen, 0, theta, 1.0, 32.0, 1.0);
+        assert_eq!(freqs.data.len(), seqlen * (dim / 2) * 2);
 
         let path = std::env::var("GLM5_ROPE_FREQS_DUMP").unwrap_or_else(|_| {
             std::env::temp_dir()
@@ -130,8 +142,10 @@ mod freqs_dump {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(&path, &bytes).expect("write rope freqs dump");
+        let meta = format!("{{\"rot_dims\":{dim},\"seqlen\":{seqlen},\"theta\":{theta:e}}}\n");
+        std::fs::write(format!("{path}.meta.json"), &meta).expect("write rope freqs dump meta");
         println!(
-            "wrote {} f32 values ({} bytes) to {path}",
+            "wrote {} f32 values ({} bytes) to {path} (meta: {meta:?})",
             freqs.data.len(),
             bytes.len()
         );

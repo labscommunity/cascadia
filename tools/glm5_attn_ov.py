@@ -31,8 +31,13 @@ Usage:
 import argparse
 import ctypes
 import ctypes.util
+import hashlib
+import json
+import math
 import os
+import statistics
 import tempfile
+import time
 
 import numpy as np
 import openvino as ov
@@ -204,8 +209,8 @@ def ref_rope_interleaved(x: np.ndarray, pos: int, theta: float, rot_dims: int) -
 # --------------------------------------------------------------------------
 # 20 hand-picked bf16 tie cases — SAME list as
 # `crates/cascadia-engine-sparse-moe/src/dsv4/math.rs::bf16_ties::CASES`.
-# Used to cross-check OV's own f32->bf16->f32 Convert round-trip against
-# `bf16_round` on exactly the cases verified against `half::bf16::from_f32`.
+# Used to cross-check the `_bf16_roundtrip` subgraph against `bf16_round` on
+# exactly the cases verified against `half::bf16::from_f32`.
 # --------------------------------------------------------------------------
 BF16_TIE_CASES = [
     (0x3F808000, 0x3F80), (0x3F818000, 0x3F82), (0x3F808001, 0x3F81),
@@ -235,10 +240,65 @@ def _raw_const(t: Type, dims: list, raw: bytes):
     return ov.op.Constant(ten, shared_memory=False)
 
 
+# Strictly decreasing powers of two, sum=127. Every `2**step` (and its
+# reciprocal) used below is a NORMAL float32 (>= 2**-64, far above the
+# subnormal threshold 2**-126) -- deliberately narrower than the full f32
+# exponent range so no intermediate ever touches a subnormal, where FTZ/DAZ
+# SIMD execution can silently flush a value to zero and corrupt the search
+# (this bit us during development at the full [-127,127] range). Bounds the
+# supported magnitude to roughly [2**-64, 2**63], comfortably beyond any
+# realistic bf16-native activation.
+_BF16_BISECT_STEPS = (64, 32, 16, 8, 4, 2, 1)
+
+
 def _bf16_roundtrip(node):
-    """Explicit `Convert f32->bf16->f32`, reproducing the trailing bf16 round
-    the Rust contract applies after every linear / RMSNorm / rope."""
-    return ops.convert(ops.convert(node, Type.bf16), Type.f32)
+    """Round `node` (f32) to the bf16 grid (round-to-nearest-even) and back to
+    f32, matching `half::bf16::from_f32(v).to_f32()` / `dsv4/math.rs::to_bf16`
+    -- the trailing rounding the Rust contract applies after every linear /
+    RMSNorm / rope.
+
+    NOT implemented as `Convert(f32->bf16)->Convert(bf16->f32)`: that pair is
+    silently defeated under `INFERENCE_PRECISION_HINT=f32` (the exact config
+    this whole exporter is required to compile under) -- the CPU plugin
+    treats it as a "compressed-weight precision hint" and removes it as a
+    redundant identity (verified: the compiled exec graph literally drops
+    both Converts, `out == x` bit-for-bit; the plugin can ALSO be caught
+    doing plain truncation instead of round-to-nearest when the pair isn't
+    fully eliminated). Task 1's `--validate-ops` ULP gate never caught this
+    because it re-rounds BOTH sides (ref and graph output) before comparing,
+    which mostly still lands in the same bf16 bucket -- Task 2's stricter
+    Step 3 requirement (`lc`/`rc` must land EXACTLY on the bf16 grid, since
+    Rust caches literal bf16 bits) is what exposed it.
+
+    Implemented instead as genuine arithmetic reproducing `bf16_round`'s
+    round-to-nearest-even bit trick WITHOUT bit access (OpenVINO's available
+    opsets have no bitcast/reinterpret op): find `e` with `2**e <= |x| <
+    2**(e+1)` via exact power-of-two bisection (comparisons and multiplies by
+    powers of two are exact in IEEE754, so this introduces no ULP-level noise
+    of its own), then `round(x / 2**(e-7), half_to_even) * 2**(e-7)` --
+    `ops.round`'s `half_to_even` mode was verified directly against known
+    tie cases (0.5->0, 1.5->2, 2.5->2, -0.5->-0, -1.5->-2). `x==0` and
+    `is_nan(x)` are special-cased (the bisection has no valid exponent for
+    either; NaN is canonicalized to `0x7FC0` widened, matching every
+    `BF16_TIE_CASES` NaN expectation, though not `half`'s payload-preserving
+    behavior -- unreachable in practice, matching `bf16_round`'s own doc
+    note that activations are never NaN)."""
+    ax = ops.abs(node)
+    e = ops.constant(np.float32(-64.0))
+    p = ops.constant(np.float32(2.0 ** -64))
+    for step in _BF16_BISECT_STEPS:
+        cand_e = ops.add(e, ops.constant(np.float32(step)))
+        cand_p = ops.multiply(p, ops.constant(np.float32(2.0 ** step)))
+        take = ops.greater_equal(ax, cand_p)
+        e = ops.select(take, cand_e, e)
+        p = ops.select(take, cand_p, p)
+    ulp = ops.multiply(p, ops.constant(np.float32(2.0 ** -7)))
+    rounded = ops.round(ops.divide(node, ulp), "half_to_even")
+    result = ops.multiply(rounded, ulp)
+    is_zero = ops.equal(node, ops.constant(np.float32(0.0)))
+    result = ops.select(is_zero, node, result)  # preserve signed zero exactly
+    canonical_nan = ops.constant(np.uint32(0x7FC00000).view(np.float32).copy())
+    return ops.select(ops.is_nan(node), canonical_nan, result)
 
 
 def build_op_graph(op_name: str, dims: dict) -> Model:
@@ -313,9 +373,17 @@ def build_op_graph(op_name: str, dims: dict) -> Model:
 
 
 def _bf16_roundtrip_graph(n: int) -> Model:
-    """Standalone `x[n] -> Convert(bf16) -> Convert(f32)` graph, used only to
-    cross-check OV's own bf16 Convert rounding against `bf16_round` on the
-    tie cases (a narrower question than the per-op ULP gate)."""
+    """Standalone `x[n] -> _bf16_roundtrip -> y` graph, used only to
+    cross-check the bf16 rounding subgraph against `bf16_round` on the tie
+    cases (a narrower question than the per-op ULP gate). Originally built
+    around a bare `Convert(f32->bf16)->Convert(bf16->f32)` pair; Task 2 found
+    that pair gets silently eliminated as an identity by the CPU plugin under
+    `INFERENCE_PRECISION_HINT=f32` (see `_bf16_roundtrip`'s docstring), which
+    made this specific check vacuous (it re-derives the "expected" value from
+    `bf16_round(x)` in Python, so it couldn't tell a real round-trip from a
+    no-op). `_bf16_roundtrip` was replaced with an exact-arithmetic
+    implementation that does NOT suffer that elision, so this graph -- and
+    the check below -- are meaningful again without any change needed here."""
     x = ops.parameter(PartialShape([n]), Type.f32, name="x")
     x.get_output_tensor(0).set_names({"x"})
     y = _bf16_roundtrip(x)
@@ -350,15 +418,18 @@ _effective_config_total = 0
 _effective_config_bad: list = []
 
 
-def compile_checked(core, model: Model, name: str):
+def compile_checked(core, model: Model, name: str, device: str = None):
     """`core.compile_model` + effective-config readback. `INFERENCE_PRECISION_HINT`
     and `DYNAMIC_QUANTIZATION_GROUP_SIZE` are compile HINTS, not guarantees —
     the plugin can silently land elsewhere. Every compile in this harness
     (~17 of them) feeds the numerics every later task builds on, so each one
     reads both properties back and records a failure if either isn't exactly
-    the required value, instead of trusting the requested config dict."""
+    the required value, instead of trusting the requested config dict.
+    `device` defaults to the module's `DEVICE` (CPU, for numerics validation);
+    `--bench` (Step 6b) is the one caller that overrides it to target a real
+    accelerator."""
     global _effective_config_total
-    compiled = core.compile_model(model, DEVICE, COMPILE_CFG)
+    compiled = core.compile_model(model, device or DEVICE, COMPILE_CFG)
     _effective_config_total += 1
     for prop, required in (
         ("INFERENCE_PRECISION_HINT", REQUIRED_PRECISION_HINT),
@@ -530,7 +601,7 @@ def validate_rope(core) -> bool:
 
 
 def validate_bf16_roundtrip(core) -> bool:
-    """OV's own `Convert f32->bf16->f32` vs `bf16_round`, on the SAME 20 tie
+    """The `_bf16_roundtrip` subgraph vs `bf16_round`, on the SAME 20 tie
     cases verified against `half::bf16::from_f32` in Rust. Not an op under
     the ULP gate (it IS the rounding primitive) — reported separately."""
     print("\n== bf16 Convert round-trip (OV vs numpy, tie cases) ==")
@@ -589,6 +660,797 @@ def validate_rope_table_exact(rope_dump_path: str) -> bool:
     return False
 
 
+# ============================================================================
+# Task 2: full per-layer attention graph + export pipeline + stamp.
+#
+# Weight source: `<model>/shells/layer_NN.safetensors`, tensor names written by
+# `tools/export_glm5.py`'s `attn_shell()` (--tiny) / `export_real`'s per-layer
+# `shell` dict — `input_layernorm.weight`, `self_attn.{wq_a,q_a_layernorm,
+# wq_b,wkv_a,kv_a_layernorm,wkv_b,o_proj}.weight` — read the SAME way
+# `glm/loader.rs::load_layer` reads them (`g`/`gb` there), via a small
+# safetensors reader mirroring `dsv4/st.rs::StFile` (see `SafeTensorsFile`
+# below) rather than a torch dependency.
+# ============================================================================
+
+MAX_BATCH_COUNT = 256  # dist.rs MAX_BATCH_COUNT (spec Sec2/Sec14 windowing
+# constant — NOT a manifest dim). If this wire constant ever changes, the
+# window math here (P_max = W - MAX_BATCH_COUNT) must be revisited (spec
+# Sec14's own cross-reference note).
+
+NO_INDEXER_W = 2048  # spec Sec4: dense-exact domain cap when the manifest has
+# no DSA indexer (index_n_heads == 0) — never unbounded, never 0.
+
+EXPORTER_VERSION = "1"
+
+# Additive-mask "invalid" sentinel. Finite (not literal -inf): avoids any
+# inf-vs-inf edge case inside the fused SDPA kernel while sitting far enough
+# below realistic score magnitudes that its softmax weight rounds to exactly
+# 0. `_MASK_VALID_THRESHOLD` is what in-graph/host code uses to classify a
+# mask entry as "valid" vs "masked" when deriving past_len from the mask.
+MASK_NEG = np.float32(-1e30)
+_MASK_VALID_THRESHOLD = np.float32(-1e29)
+
+
+# ----------------------------------------------------------------------------
+# Minimal safetensors reader — mirrors `dsv4/st.rs::StFile` (whole-file read,
+# header parse, dtype-aware decode) rather than depending on torch/ml_dtypes
+# just to get at raw bf16 bits (numpy has no native bf16 dtype). Shell files
+# are documented there as "a few hundred MB at most", so a full read is fine.
+# ----------------------------------------------------------------------------
+class SafeTensorsFile:
+    def __init__(self, path: str):
+        with open(path, "rb") as f:
+            hlen = int.from_bytes(f.read(8), "little")
+            self.header = json.loads(f.read(hlen))
+            self.data_start = 8 + hlen
+            f.seek(0)
+            self.data = f.read()
+
+    def _bytes(self, name: str):
+        if name not in self.header:
+            raise KeyError(f"tensor {name!r} not found in safetensors file")
+        info = self.header[name]
+        s, e = info["data_offsets"]
+        return info, self.data[self.data_start + s:self.data_start + e]
+
+    def bf16_bits(self, name: str) -> np.ndarray:
+        """Raw bf16 bit pattern (u16), shape as declared. The tensor must be
+        BF16-dtype in the file — true of every attention projection weight
+        `export_glm5.py` writes (this module's docstring above)."""
+        info, b = self._bytes(name)
+        if info["dtype"] != "BF16":
+            raise ValueError(f"{name}: expected BF16, got {info['dtype']!r}")
+        return np.frombuffer(b, dtype="<u2").reshape(info["shape"]).copy()
+
+    def f32(self, name: str) -> np.ndarray:
+        """f32-widened tensor (accepts F32 or BF16), matching `StFile::f32`."""
+        info, b = self._bytes(name)
+        shape = info["shape"]
+        if info["dtype"] == "F32":
+            return np.frombuffer(b, dtype="<f4").reshape(shape).astype(np.float32).copy()
+        if info["dtype"] == "BF16":
+            bits = np.frombuffer(b, dtype="<u2").reshape(shape)
+            return ((bits.astype(np.uint32) << np.uint32(16)).view(np.float32)).copy()
+        raise ValueError(f"{name}: unsupported dtype {info['dtype']!r}")
+
+
+def read_manifest(model_dir: str) -> dict:
+    path = os.path.join(model_dir, "manifest.json")
+    with open(path) as f:
+        m = json.load(f)
+    if m.get("arch") != "glm5":
+        raise SystemExit(f"{path}: arch={m.get('arch')!r}, expected 'glm5'")
+    return m
+
+
+def derive_w(manifest: dict) -> int:
+    """`W` per spec Sec4 — mirrors `glm/loader.rs::load_layer`'s indexer
+    clamp, EXCEPT it fails loudly instead of the loader's `usize::MAX` when an
+    indexer is present with `index_topk == 0`: the loader's clamp is a
+    decode-time convenience (unbounded causal attention has no static shape
+    problem there) that a compiled graph's fixed `P_max` cannot inherit."""
+    index_n_heads = int(manifest.get("index_n_heads", 0))
+    index_topk = int(manifest.get("index_topk", 0))
+    if index_n_heads > 0:
+        if index_topk == 0:
+            raise SystemExit(
+                f"manifest has an indexer (index_n_heads={index_n_heads}) but "
+                "index_topk == 0 — the loader clamps this to unbounded "
+                "(usize::MAX) at decode time, which has no static graph "
+                "shape; export cannot proceed. Re-export with a real "
+                "index_topk, or without an indexer."
+            )
+        return index_topk
+    return NO_INDEXER_W
+
+
+# ----------------------------------------------------------------------------
+# Rope table sourcing (Step 0): a bit-for-bit Rust dump, never recomputed in
+# Python. Extends Task 1's `dsv4/rope.rs::freqs_dump::dump_real_dims_freqs`
+# (now parameterized via env vars, defaults unchanged) rather than inventing a
+# second mechanism.
+# ----------------------------------------------------------------------------
+def _rope_regen_cmd(rot_dims: int, seqlen: int, theta: float, dump_path: str) -> str:
+    return (
+        f"GLM5_ROPE_DUMP_ROT_DIMS={rot_dims} GLM5_ROPE_DUMP_SEQLEN={seqlen} "
+        f"GLM5_ROPE_DUMP_THETA={theta!r} GLM5_ROPE_FREQS_DUMP={dump_path} "
+        "cargo test -p cascadia-engine-sparse-moe --lib dump_real_dims_freqs -- --nocapture"
+    )
+
+
+def load_rope_table(dump_path: str, rot_dims: int, seqlen: int, theta: float, *, hard_fail: bool):
+    """Loads the `[seqlen, rot_dims//2]` (cos, sin) table from a Rust `Freqs`
+    dump, verifying its `.meta.json` sidecar's dims against what THIS
+    export/test actually needs — never recomputing the table in Python (a
+    wrong-basis table is a decode-breaking bug short-prompt parity would not
+    catch).
+
+    `hard_fail=True` (export mode): missing/mismatched dump raises
+    `SystemExit`. `hard_fail=False` (`--validate-graph`): a MISSING dump
+    returns `None` (caller treats it as a loud, non-fatal SKIPPED — the SAME
+    discipline `--validate-ops` established for Step 3b); a PRESENT-but-
+    mismatched dump still raises regardless of `hard_fail`.
+    """
+    half = rot_dims // 2
+    regen = _rope_regen_cmd(rot_dims, seqlen, theta, dump_path)
+    if not os.path.exists(dump_path):
+        if hard_fail:
+            raise SystemExit(f"rope table dump missing at {dump_path}\n  regenerate with: {regen}")
+        print(f"  SKIPPED: no rope table dump at {dump_path}")
+        print(f"  regenerate with: {regen}")
+        return None
+
+    meta_path = dump_path + ".meta.json"
+    if not os.path.exists(meta_path):
+        raise SystemExit(f"rope table dump at {dump_path} has no .meta.json sidecar "
+                          f"(stale/hand-made dump?)\n  regenerate with: {regen}")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    if (int(meta["rot_dims"]) != rot_dims or int(meta["seqlen"]) != seqlen
+            or not math.isclose(float(meta["theta"]), float(theta), rel_tol=1e-6)):
+        raise SystemExit(
+            f"rope table dump at {dump_path} was built for rot_dims={meta['rot_dims']} "
+            f"seqlen={meta['seqlen']} theta={meta['theta']}, but this export/test needs "
+            f"rot_dims={rot_dims} seqlen={seqlen} theta={theta}.\n  regenerate with: {regen}"
+        )
+    raw = np.fromfile(dump_path, dtype="<f4")
+    if raw.size != seqlen * half * 2:
+        raise SystemExit(f"rope table dump at {dump_path}: {raw.size} f32 values, "
+                          f"expected {seqlen * half * 2} (seqlen={seqlen} half={half})")
+    raw = raw.reshape(seqlen, half, 2)
+    return raw[:, :, 0].copy(), raw[:, :, 1].copy()
+
+
+def _scale_for_qk(qk_head: int) -> np.float32:
+    """`(qk_head as f32).powf(-0.5)` — `attn.rs`'s `scale` field, computed via
+    the SAME system-libm ctypes call `_rope_cos_sin` uses above, for
+    bit-exactness with Rust's `f32::powf` (numpy's vectorized `power` can land
+    1 ULP off, per Task 1's finding)."""
+    base = np.float32(qk_head)
+    if _libm is not None:
+        return np.float32(_libm.powf(ctypes.c_float(float(base)), ctypes.c_float(-0.5)))
+    return np.power(base, np.float32(-0.5), dtype=np.float32)
+
+
+def load_layer_weights(model_dir: str, li: int, manifest: dict) -> dict:
+    """One layer's attention weights from `<model_dir>/shells/layer_NN.safetensors`
+    — see this section's header comment for the exact source tensor names."""
+    hidden = manifest["hidden_size"]
+    h = manifest["num_attention_heads"]
+    nope = manifest["qk_nope_head_dim"]
+    rope_d = manifest["qk_rope_head_dim"]
+    vh = manifest["v_head_dim"]
+    kvl = manifest["kv_lora_rank"]
+    ql = manifest["q_lora_rank"]
+    qk = nope + rope_d
+
+    st = SafeTensorsFile(os.path.join(model_dir, "shells", f"layer_{li:02d}.safetensors"))
+    w = {
+        "in_ln": st.f32("input_layernorm.weight"),
+        "wq_a_bits": st.bf16_bits("self_attn.wq_a.weight"),
+        "q_a_ln": st.f32("self_attn.q_a_layernorm.weight"),
+        "wq_b_bits": st.bf16_bits("self_attn.wq_b.weight"),
+        "wkv_a_bits": st.bf16_bits("self_attn.wkv_a.weight"),
+        "kv_a_ln": st.f32("self_attn.kv_a_layernorm.weight"),
+        "wkv_b_bits": st.bf16_bits("self_attn.wkv_b.weight"),
+        "wo_bits": st.bf16_bits("self_attn.o_proj.weight"),
+    }
+    # Mirror AttentionLayer::new's shape asserts — catch manifest/shell drift
+    # loudly instead of a confusing shape error deep in graph construction.
+    checks = [
+        ("in_ln", (hidden,)), ("wq_a_bits", (ql, hidden)), ("q_a_ln", (ql,)),
+        ("wq_b_bits", (h * qk, ql)), ("wkv_a_bits", (kvl + rope_d, hidden)),
+        ("kv_a_ln", (kvl,)), ("wkv_b_bits", (h * (nope + vh), kvl)),
+        ("wo_bits", (hidden, h * vh)),
+    ]
+    for name, shape in checks:
+        got = tuple(int(d) for d in w[name].shape)
+        if got != shape:
+            raise SystemExit(f"layer {li}: {name} shape {got} != expected {shape} "
+                              "(manifest/shell drift?)")
+    return w
+
+
+def layer_dims(manifest: dict, w: int, rows: int) -> dict:
+    return {
+        "hidden": manifest["hidden_size"],
+        "h": manifest["num_attention_heads"],
+        "qk_nope": manifest["qk_nope_head_dim"],
+        "qk_rope": manifest["qk_rope_head_dim"],
+        "v_head": manifest["v_head_dim"],
+        "kv_lora": manifest["kv_lora_rank"],
+        "q_lora": manifest["q_lora_rank"],
+        "rms_norm_eps": manifest["rms_norm_eps"],
+        "rope_theta": manifest["rope_theta"],
+        "rows": rows,
+        "p_max": w - rows,
+    }
+
+
+# --------------------------------------------------------------------------
+# ref_attention — non-absorbed MLA prefill reference (spec Sec3 dataflow)
+# --------------------------------------------------------------------------
+
+def ref_attention(weights: dict, x_rows: np.ndarray, past_lc: np.ndarray,
+                   past_rc: np.ndarray, dims: dict):
+    """Full numpy MLA-attention reference, built from Task 1's per-op refs
+    (`ref_rmsnorm`/`ref_linear_bf16`/`ref_rope_interleaved`) called per row so
+    it is literally THEIR math under test, not a batched re-derivation.
+    `past_lc`/`past_rc` are the TRUE (unpadded) past — `[P, kv_lora]` /
+    `[P, qk_rope]` for whatever `P` the caller has; padding to a fixed graph
+    shape is a `--validate-graph`-only concern layered on top of this
+    function (this is also why Task 7 can reuse it directly with no window
+    concept at all).
+
+    Returns `(attn_out[R,hidden], lc[R,kv_lora], rc[R,qk_rope])`,
+    `R = x_rows.shape[0]`. `scores`/softmax/context stay f32 throughout (no
+    bf16 rounding) — spec Sec3.1's "NOT inside the SDPA core", matching
+    `attn.rs::forward_token`'s f32 absorb core (`smax`/`denom`/`clat` are all
+    `f32` there) exactly, including the per-row sequential accumulation.
+    """
+    R = x_rows.shape[0]
+    P = past_lc.shape[0]
+    hidden, h = dims["hidden"], dims["h"]
+    nope, rope_d, vh = dims["qk_nope"], dims["qk_rope"], dims["v_head"]
+    kvl = dims["kv_lora"]
+    qk = nope + rope_d
+    theta = dims["rope_theta"]
+    scale = _scale_for_qk(qk)
+
+    lc_out = np.zeros((R, kvl), np.float32)
+    rc_out = np.zeros((R, rope_d), np.float32)
+    q_all = np.zeros((R, h, qk), np.float32)
+    for r in range(R):
+        pos = P + r
+        nrm = ref_rmsnorm(x_rows[r], weights["in_ln"], dims["rms_norm_eps"])
+        qr = ref_linear_bf16(nrm, weights["wq_a_bits"])
+        qr = ref_rmsnorm(qr, weights["q_a_ln"], MLA_LATENT_EPS)
+        q_flat = ref_linear_bf16(qr, weights["wq_b_bits"]).reshape(h, qk)
+        for hi in range(h):
+            q_all[r, hi] = ref_rope_interleaved(q_flat[hi], pos, theta, rope_d)
+
+        comp = ref_linear_bf16(nrm, weights["wkv_a_bits"])
+        latent, kpe = comp[:kvl], comp[kvl:]
+        lc_out[r] = ref_rmsnorm(latent, weights["kv_a_ln"], MLA_LATENT_EPS)
+        rc_out[r] = ref_rope_interleaved(kpe, pos, theta, rope_d)
+
+    full_lc = np.concatenate([past_lc.astype(np.float32), lc_out], axis=0)  # [T,kvl]
+    full_rc = np.concatenate([past_rc.astype(np.float32), rc_out], axis=0)  # [T,rope_d]
+    T = P + R
+
+    ctx = np.zeros((R, h, vh), np.float32)
+    wkv_b_bits = weights["wkv_b_bits"]
+    for hi in range(h):
+        rbase = hi * (nope + vh)
+        w_uk = ((wkv_b_bits[rbase:rbase + nope].astype(np.uint32) << np.uint32(16))
+                .view(np.float32))
+        w_uv = ((wkv_b_bits[rbase + nope:rbase + nope + vh].astype(np.uint32) << np.uint32(16))
+                .view(np.float32))
+        K_nope = (full_lc @ w_uk.T).astype(np.float32)          # [T,nope]  f32 core, no bf16 round
+        V_h = (full_lc @ w_uv.T).astype(np.float32)              # [T,vh]
+        K_h = np.concatenate([K_nope, full_rc], axis=-1)         # [T,qk]
+        Qh = q_all[:, hi, :]                                     # [R,qk]
+        scores = ((Qh @ K_h.T) * scale).astype(np.float32)       # [R,T]
+        for r in range(R):
+            cut = P + r + 1  # causal: row r (absolute pos P+r) sees columns [0, P+r]
+            if cut < T:
+                scores[r, cut:] = -np.inf
+        smax = scores.max(axis=-1, keepdims=True).astype(np.float32)
+        expv = np.exp((scores - smax).astype(np.float32)).astype(np.float32)
+        denom = expv.sum(axis=-1, keepdims=True).astype(np.float32)
+        p = (expv / denom).astype(np.float32)
+        ctx[:, hi, :] = (p @ V_h).astype(np.float32)
+
+    ctx_flat = ctx.reshape(R, h * vh)
+    attn_out = np.zeros((R, hidden), np.float32)
+    for r in range(R):
+        attn_out[r] = ref_linear_bf16(ctx_flat[r], weights["wo_bits"])
+    return attn_out, lc_out, rc_out
+
+
+# --------------------------------------------------------------------------
+# build_layer_graph — the OV attention IR (spec Sec3)
+# --------------------------------------------------------------------------
+
+def _i64(*vals) -> "ov.Node":
+    return ops.constant(np.array(vals, dtype=np.int64))
+
+
+def _i64_scalar(v: int) -> "ov.Node":
+    return ops.constant(np.array(v, dtype=np.int64))
+
+
+def build_layer_graph(weights: dict, dims: dict) -> Model:
+    """One MLA-attention OV graph for one transformer layer — the
+    NON-ABSORBED prefill form (spec Sec3): K/V are expanded per head from the
+    `kv_lora` latent via `wkv_b`'s per-head row slices, rather than
+    `attn.rs::forward_token`'s absorbed DECODE form (which folds the
+    up-projection into the query/output and never materializes K/V) —
+    mathematically equivalent by associativity of matmul (`q_nope·(W_UK·Lc) ==
+    (q_nope·W_UK)·Lc`), but `scaled_dot_product_attention` needs literal K/V.
+
+    ALL dims are read from `dims` (no literals): `rows`, `p_max`, `hidden`,
+    `h`, `qk_nope`, `qk_rope`, `v_head`, `kv_lora`, `q_lora`, `rms_norm_eps`,
+    `rope_theta`. `weights` carries the per-layer bf16-bit projection tensors
+    (`load_layer_weights`'s output, or a synthetic dict for `--validate-graph`)
+    PLUS the Rust-dump-sourced `rope_cos`/`rope_sin` tables
+    (`[p_max+rows, qk_rope//2]` each, Step 0).
+
+    Inputs: `x[rows,hidden]`, `past_lc[p_max,kv_lora]`, `past_rc[p_max,qk_rope]`,
+    `mask[rows,p_max+rows]` (additive f32) — EXACTLY spec Sec3's four tensors;
+    no fifth "past_len" input. The window's true past length is derived
+    IN-GRAPH from the mask itself (spec Sec3.2: "the true past length enters
+    through the mask input... not through the graph shape") via a
+    ReduceSum-over-valid-columns on row 0's past segment (row 0 is always a
+    real row — windows are trailing-zero-padded, spec Sec3), then used to
+    `Gather` the matching `[rows, half]` slice of the rope table. This
+    derivation is load-bearing, not cosmetic: row i's true rope position is
+    `past_len + i`, and RoPE's relative-position identity
+    (`dot(rope(q,pi),rope(k,pj))` is a function of `pj-pi` alone) gives no
+    freedom to substitute a different, compile-time-fixed `pi` for q/rc's
+    rotation — `past_rc`'s cached rows are already rotated at their TRUE
+    absolute positions (committed by a past window) and can't be cheaply
+    re-rotated in-graph, so matching them requires knowing the actual
+    `past_len`.
+
+    Outputs: `attn_out[rows,hidden]`, `lc[rows,kv_lora]`, `rc[rows,qk_rope]`.
+
+    Op set used: `ops.scaled_dot_product_attention` (fused), NOT explicit
+    MatMul+softmax — verified during development against a numpy reference
+    (max abs diff ~1e-7, expected float reduction-order noise) with an
+    explicit additive mask + explicit scale, per spec Sec13's fallback
+    guidance. The one wrinkle: SDPA requires rank >= 3 (`Query input rank
+    length must be at least 3 or more`), so each head's Q/K/V/mask gets a
+    leading size-1 dim added before the call and squeezed after — no
+    multi-head batching, one SDPA op per head (see the per-head Python loop
+    note in the module's report re: node count).
+    """
+    rows, p_max = dims["rows"], dims["p_max"]
+    hidden, h = dims["hidden"], dims["h"]
+    nope, rope_d, vh = dims["qk_nope"], dims["qk_rope"], dims["v_head"]
+    kvl, qlora = dims["kv_lora"], dims["q_lora"]
+    qk = nope + rope_d
+    W = p_max + rows
+    eps_in_ln = np.float32(dims["rms_norm_eps"])
+    eps_latent = np.float32(MLA_LATENT_EPS)
+    scale = _scale_for_qk(qk)
+
+    x = ops.parameter(PartialShape([rows, hidden]), Type.f32, name="x")
+    x.get_output_tensor(0).set_names({"x"})
+    past_lc = ops.parameter(PartialShape([p_max, kvl]), Type.f32, name="past_lc")
+    past_lc.get_output_tensor(0).set_names({"past_lc"})
+    past_rc = ops.parameter(PartialShape([p_max, rope_d]), Type.f32, name="past_rc")
+    past_rc.get_output_tensor(0).set_names({"past_rc"})
+    mask = ops.parameter(PartialShape([rows, W]), Type.f32, name="mask")
+    mask.get_output_tensor(0).set_names({"mask"})
+
+    def const_bf16(bits, shape):
+        return _raw_const(Type.bf16, list(shape), np.ascontiguousarray(bits).tobytes())
+
+    def linear_bf16(inp, w_bits, out_dim, in_dim):
+        w_const = const_bf16(w_bits, [out_dim, in_dim])
+        y = ops.matmul(inp, ops.convert(w_const, Type.f32), False, True)
+        return _bf16_roundtrip(y)
+
+    def rmsnorm_bf16(inp, w_f32, eps_val):
+        w_const = ops.constant(np.asarray(w_f32, np.float32))
+        ms = ops.reduce_mean(ops.multiply(inp, inp), _i64(1), True)
+        denom = ops.sqrt(ops.add(ms, ops.constant(np.float32(eps_val))))
+        r = ops.divide(ops.constant(np.float32(1.0)), denom)
+        y = ops.multiply(ops.multiply(inp, r), w_const)
+        return _bf16_roundtrip(y)
+
+    # past_len, derived from the mask (see docstring), and the rope-table
+    # gather shared by q-rope and rc-rope for this window's new rows.
+    row0_past = ops.slice(mask, _i64(0, 0), _i64(1, p_max), _i64(1, 1), _i64(0, 1))
+    valid = ops.greater(row0_past, ops.constant(_MASK_VALID_THRESHOLD))
+    past_len = ops.reduce_sum(ops.convert(valid, Type.i64), _i64(0, 1), False)
+    idx = ops.range(past_len, ops.add(past_len, _i64_scalar(rows)), _i64_scalar(1), output_type="i64")
+    cos_table = ops.constant(np.asarray(weights["rope_cos"], np.float32))
+    sin_table = ops.constant(np.asarray(weights["rope_sin"], np.float32))
+    c_rows = ops.gather(cos_table, idx, _i64_scalar(0))  # [rows, half]
+    s_rows = ops.gather(sin_table, idx, _i64_scalar(0))
+
+    def apply_rope(vec, dim_total):
+        """Rotate the LAST `rope_d` dims of `vec[rows, dim_total]` as
+        adjacent (even, odd) complex pairs — same slice/concat/reshape
+        pattern as Task 1's `build_op_graph('rope', ...)`, generalized to a
+        batch of rows sharing one gathered `[rows, half]` cos/sin table."""
+        start = dim_total - rope_d
+        a = ops.slice(vec, _i64(0, start), _i64(rows, dim_total), _i64(1, 2), _i64(0, 1))
+        b = ops.slice(vec, _i64(0, start + 1), _i64(rows, dim_total), _i64(1, 2), _i64(0, 1))
+        re = ops.subtract(ops.multiply(a, c_rows), ops.multiply(b, s_rows))
+        im = ops.add(ops.multiply(a, s_rows), ops.multiply(b, c_rows))
+        re_u = ops.unsqueeze(re, _i64(2))
+        im_u = ops.unsqueeze(im, _i64(2))
+        inter = ops.concat([re_u, im_u], axis=2)
+        rotated = ops.reshape(inter, _i64(rows, rope_d), False)
+        if start == 0:
+            return rotated
+        head = ops.slice(vec, _i64(0, 0), _i64(rows, start), _i64(1, 1), _i64(0, 1))
+        return ops.concat([head, rotated], axis=1)
+
+    nrm = rmsnorm_bf16(x, weights["in_ln"], eps_in_ln)                             # [rows,hidden]
+
+    qr = linear_bf16(nrm, weights["wq_a_bits"], qlora, hidden)                     # [rows,qlora]
+    qr = rmsnorm_bf16(qr, weights["q_a_ln"], eps_latent)                           # [rows,qlora]
+    q_flat = linear_bf16(qr, weights["wq_b_bits"], h * qk, qlora)                  # [rows,h*qk]
+
+    comp = linear_bf16(nrm, weights["wkv_a_bits"], kvl + rope_d, hidden)           # [rows,kvl+rope_d]
+    latent = ops.slice(comp, _i64(0, 0), _i64(rows, kvl), _i64(1, 1), _i64(0, 1))
+    kpe = ops.slice(comp, _i64(0, kvl), _i64(rows, kvl + rope_d), _i64(1, 1), _i64(0, 1))
+    lc = rmsnorm_bf16(latent, weights["kv_a_ln"], eps_latent)                       # OUTPUT lc [rows,kvl]
+    rc = _bf16_roundtrip(apply_rope(kpe, rope_d))                                   # OUTPUT rc [rows,rope_d]
+
+    q_heads = []
+    for hi in range(h):
+        qh = ops.slice(q_flat, _i64(0, hi * qk), _i64(rows, (hi + 1) * qk), _i64(1, 1), _i64(0, 1))
+        qh = _bf16_roundtrip(apply_rope(qh, qk))
+        q_heads.append(qh)
+
+    full_lc = ops.concat([past_lc, lc], axis=0)   # [W,kvl]
+    full_rc = ops.concat([past_rc, rc], axis=0)   # [W,rope_d]
+
+    # ONE shared bf16 constant + ONE f32 convert for wkv_b — per-head slices
+    # below are views into it, so the per-head loop does NOT duplicate weight
+    # bytes into separate Constant nodes (the same "no duplicated weights"
+    # discipline spec Sec3.2 mandates at the bucket level, applied here too).
+    wkv_b_const = const_bf16(weights["wkv_b_bits"], [h * (nope + vh), kvl])
+    wkv_b_f32 = ops.convert(wkv_b_const, Type.f32)
+
+    scale_const = ops.constant(np.float32(scale))
+    m3 = ops.unsqueeze(mask, _i64(0))  # [1,rows,W], shared across heads
+
+    ctx_heads = []
+    for hi in range(h):
+        rbase = hi * (nope + vh)
+        w_uk = ops.slice(wkv_b_f32, _i64(rbase, 0), _i64(rbase + nope, kvl), _i64(1, 1), _i64(0, 1))
+        w_uv = ops.slice(wkv_b_f32, _i64(rbase + nope, 0), _i64(rbase + nope + vh, kvl), _i64(1, 1), _i64(0, 1))
+        K_nope = ops.matmul(full_lc, w_uk, False, True)   # [W,nope]
+        V_h = ops.matmul(full_lc, w_uv, False, True)       # [W,vh]
+        K_h = ops.concat([K_nope, full_rc], axis=1)         # [W,qk]
+
+        q3 = ops.unsqueeze(q_heads[hi], _i64(0))
+        k3 = ops.unsqueeze(K_h, _i64(0))
+        v3 = ops.unsqueeze(V_h, _i64(0))
+        ctx3 = ops.scaled_dot_product_attention(q3, k3, v3, m3, scale_const, False)
+        ctx_heads.append(ops.squeeze(ctx3, _i64(0)))
+
+    ctx = ops.concat(ctx_heads, axis=1)                        # [rows,h*vh]
+    attn_out = linear_bf16(ctx, weights["wo_bits"], hidden, h * vh)
+
+    m = Model([attn_out, lc, rc], [x, past_lc, past_rc, mask], "glm5_attn_layer")
+    m.outputs[0].tensor.set_names({"attn_out"})
+    m.outputs[1].tensor.set_names({"lc"})
+    m.outputs[2].tensor.set_names({"rc"})
+    return m
+
+
+def build_window_mask(rows: int, p_max: int, past_len: int) -> np.ndarray:
+    """Host-side additive mask builder matching spec Sec3.1's convention: real
+    past occupies columns `[0,past_len)`, padding `[past_len,p_max)`; window
+    columns `[p_max,p_max+rows)` are causal (row i sees window columns
+    `p_max..p_max+i]`). Applied uniformly to ALL `rows` (real and padding) —
+    a padding row still sees its own diagonal (never fully masked, per spec
+    Sec3.1's NaN-avoidance note), since its output is discarded by the caller
+    regardless."""
+    W = p_max + rows
+    m = np.full((rows, W), MASK_NEG, dtype=np.float32)
+    m[:, :past_len] = 0.0
+    for i in range(rows):
+        m[i, p_max:p_max + i + 1] = 0.0
+    return m
+
+
+def expected_bf16_layer_bytes(dims: dict) -> dict:
+    """Expected `.bin` size for one layer: bf16 attention weight bytes
+    (2 B/elem) plus the small f32 rope table + norm weights — Step 5's
+    no-fp16/f32-blowup sanity check."""
+    hidden, h = dims["hidden"], dims["h"]
+    nope, rope_d, vh = dims["qk_nope"], dims["qk_rope"], dims["v_head"]
+    kvl, ql = dims["kv_lora"], dims["q_lora"]
+    rows, p_max = dims["rows"], dims["p_max"]
+    qk = nope + rope_d
+    W = p_max + rows
+    half = rope_d // 2
+    bf16_elems = (ql * hidden + h * qk * ql + (kvl + rope_d) * hidden
+                  + h * (nope + vh) * kvl + hidden * h * vh)
+    f32_elems = hidden + ql + kvl + 2 * W * half
+    return {"bf16_bytes": bf16_elems * 2, "f32_bytes": f32_elems * 4,
+            "total": bf16_elems * 2 + f32_elems * 4}
+
+
+# --------------------------------------------------------------------------
+# --validate-graph (Step 3) — synthetic dims small enough to compile/run fast;
+# `qk_rope=REAL_QK_ROPE`/`theta=REAL_ROPE_THETA`/`p_max+rows=16` deliberately
+# match Task 1's DEFAULT rope-table dump, so the common case needs no extra
+# `cargo test` invocation beyond what `--validate-ops` already asked for.
+# --------------------------------------------------------------------------
+
+VG_HIDDEN, VG_H, VG_QK_NOPE, VG_V_HEAD, VG_KV_LORA, VG_Q_LORA = 48, 3, 12, 10, 8, 16
+VG_QK_ROPE = REAL_QK_ROPE   # 64 -- matches Task 1's default rope dump (seqlen=16)
+VG_P_MAX, VG_ROWS_MAX = 8, 8  # p_max+rows_max = 16, matches that same dump exactly
+
+
+def _vg_synthetic_weights(seed: int) -> dict:
+    rng = np.random.default_rng(seed)
+    h, nope, rope_d, vh = VG_H, VG_QK_NOPE, VG_QK_ROPE, VG_V_HEAD
+    kvl, ql, hidden = VG_KV_LORA, VG_Q_LORA, VG_HIDDEN
+    qk = nope + rope_d
+
+    def bf16bits(shape, scale=0.02):
+        f = rng.standard_normal(shape).astype(np.float32) * scale
+        return (f.view(np.uint32) >> np.uint32(16)).astype(np.uint16)
+
+    def normw(n):
+        return (1.0 + 0.05 * rng.standard_normal(n)).astype(np.float32)
+
+    return {
+        "in_ln": normw(hidden),
+        "wq_a_bits": bf16bits((ql, hidden)),
+        "q_a_ln": normw(ql),
+        "wq_b_bits": bf16bits((h * qk, ql)),
+        "wkv_a_bits": bf16bits((kvl + rope_d, hidden)),
+        "kv_a_ln": normw(kvl),
+        "wkv_b_bits": bf16bits((h * (nope + vh), kvl)),
+        "wo_bits": bf16bits((hidden, h * vh)),
+    }
+
+
+def validate_graph(core, rope_dump_path: str):
+    """Returns True (pass), False (fail), or None (rope dump SKIPPED — same
+    non-fatal-but-loud discipline as `--validate-ops`'s Step 3b)."""
+    print("\n== validate-graph (Step 3) ==")
+    dims = {
+        "hidden": VG_HIDDEN, "h": VG_H, "qk_nope": VG_QK_NOPE, "qk_rope": VG_QK_ROPE,
+        "v_head": VG_V_HEAD, "kv_lora": VG_KV_LORA, "q_lora": VG_Q_LORA,
+        "rms_norm_eps": RMS_NORM_EPS, "rope_theta": REAL_ROPE_THETA,
+        "rows": VG_ROWS_MAX, "p_max": VG_P_MAX,
+    }
+    p_max, rows = dims["p_max"], dims["rows"]
+    W = p_max + rows
+    table = load_rope_table(rope_dump_path, VG_QK_ROPE, W, REAL_ROPE_THETA, hard_fail=False)
+    if table is None:
+        return None
+    weights = dict(_vg_synthetic_weights(seed=42), rope_cos=table[0], rope_sin=table[1])
+
+    model = build_layer_graph(weights, dims)
+    node_count = len(model.get_ordered_ops())
+    flag = "  ** > 50k nodes -- flag per brief **" if node_count > 50_000 else ""
+    print(f"  graph node count: {node_count}{flag}")
+    compiled = compile_checked(core, model, "validate-graph")
+    _kernel_names_seen.update(_kernel_names(compiled))
+    req = compiled.create_infer_request()
+
+    rng = np.random.default_rng(7)
+    x_full = (rng.standard_normal((rows, dims["hidden"])).astype(np.float32) * 0.3)
+    past_lc_full = bf16_round(rng.standard_normal((p_max, dims["kv_lora"])).astype(np.float32) * 0.3)
+    past_rc_full = bf16_round(rng.standard_normal((p_max, dims["qk_rope"])).astype(np.float32) * 0.3)
+
+    past_lens = sorted({0, 1, p_max // 2, p_max})
+    row_counts = sorted({1, 5, rows})
+    print(f"  past_len cases: {past_lens}  rows cases: {row_counts}")
+
+    ok = True
+    save_case = None  # (inputs, before-outputs) for the Step 5 round-trip check
+    for past_len in past_lens:
+        past_lc_in = np.zeros_like(past_lc_full)
+        past_rc_in = np.zeros_like(past_rc_full)
+        past_lc_in[:past_len] = past_lc_full[:past_len]
+        past_rc_in[:past_len] = past_rc_full[:past_len]
+        true_past_lc = past_lc_full[:past_len]
+        true_past_rc = past_rc_full[:past_len]
+        mask_in = build_window_mask(rows, p_max, past_len)
+
+        for real_rows in row_counts:
+            x_in = np.zeros_like(x_full)
+            x_in[:real_rows] = x_full[:real_rows]
+
+            ref_out, ref_lc, ref_rc = ref_attention(
+                weights, x_full[:real_rows], true_past_lc, true_past_rc, dims)
+
+            inputs = {"x": x_in, "past_lc": past_lc_in, "past_rc": past_rc_in, "mask": mask_in}
+            got = req.infer(inputs)
+            got_attn = np.array(got[0])[:real_rows]
+            got_lc = np.array(got[1])[:real_rows]
+            got_rc = np.array(got[2])[:real_rows]
+
+            max_ulp_a, flip_a, worst_a, rb_a, gb_a = ulp_stats(ref_out, got_attn)
+            max_ulp_lc, _, _, _, _ = ulp_stats(ref_lc, got_lc)
+            max_ulp_rc, _, _, _, _ = ulp_stats(ref_rc, got_rc)
+            on_grid_lc = bool(np.array_equal(got_lc, bf16_round(got_lc)))
+            on_grid_rc = bool(np.array_equal(got_rc, bf16_round(got_rc)))
+
+            passed = (max_ulp_a <= 1 and flip_a <= 0.01
+                      and max_ulp_lc <= 1 and on_grid_lc
+                      and max_ulp_rc <= 1 and on_grid_rc)
+            ok &= passed
+            status = "PASS" if passed else "FAIL"
+            note = "  <- P=0 case" if past_len == 0 else ""
+            print(f"  [{status}] past_len={past_len:2d} rows={real_rows:2d} "
+                  f"attn(ulp={max_ulp_a},flip={flip_a:.4f}) "
+                  f"lc(ulp={max_ulp_lc},grid={on_grid_lc}) rc(ulp={max_ulp_rc},grid={on_grid_rc}){note}")
+            if not passed:
+                print(f"    worst attn idx={worst_a} ref=0x{rb_a.flat[worst_a]:04x} ov=0x{gb_a.flat[worst_a]:04x}")
+            if past_len == p_max // 2 and real_rows == min(5, rows) and save_case is None:
+                # Unsliced (full [rows,...]) outputs -- Step 5 re-infers the
+                # SAME `inputs` on the reloaded model and compares the FULL
+                # tensors, not just the real-row prefix.
+                save_case = (inputs, np.array(got[0]).copy(), np.array(got[1]).copy(), np.array(got[2]).copy())
+
+    # Step 5: save -> core.read_model -> re-run one case, assert the round
+    # trip preserves the baked constants (bf16 weights + rope table) exactly.
+    print("  -- Step 5: save/reload round-trip --")
+    tmp_dir = tempfile.mkdtemp(prefix="glm5_attn_vg_")
+    xml_path = os.path.join(tmp_dir, "layer.xml")
+    bin_path = os.path.join(tmp_dir, "layer.bin")
+    ov.save_model(model, xml_path, compress_to_fp16=False)
+    reloaded = core.read_model(xml_path)
+    compiled2 = compile_checked(core, reloaded, "validate-graph (reloaded)")
+    req2 = compiled2.create_infer_request()
+    inputs, before_attn, before_lc, before_rc = save_case
+    after = req2.infer(inputs)
+    roundtrip_ok = (np.array_equal(np.array(after[0]), before_attn)
+                     and np.array_equal(np.array(after[1]), before_lc)
+                     and np.array_equal(np.array(after[2]), before_rc))
+    sizes = expected_bf16_layer_bytes(dims)
+    bin_size = os.path.getsize(bin_path)
+    size_ok = bin_size < 1.5 * sizes["total"]
+    print(f"    round-trip exact match (attn_out/lc/rc): {roundtrip_ok}")
+    print(f"    .bin={bin_size}B  expected~{sizes['total']}B "
+          f"(bf16={sizes['bf16_bytes']}B f32={sizes['f32_bytes']}B)  size_ok={size_ok}")
+    ok &= roundtrip_ok and size_ok
+    return ok
+
+
+# --------------------------------------------------------------------------
+# Export mode (Step 4) + stamp
+# --------------------------------------------------------------------------
+
+def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=None):
+    manifest = read_manifest(model_dir)
+    w = derive_w(manifest)
+    rows = MAX_BATCH_COUNT
+    if w <= rows:
+        raise SystemExit(f"derived W={w} <= rows={rows} (MAX_BATCH_COUNT) — every "
+                          "window would have zero past capacity; refusing to export")
+    p_max = w - rows
+
+    hidden = manifest["hidden_size"]
+    kv_lora = manifest["kv_lora_rank"]
+    qk_rope = manifest["qk_rope_head_dim"]
+    rope_theta = manifest["rope_theta"]
+    cos, sin = load_rope_table(rope_dump_path, qk_rope, w, rope_theta, hard_fail=True)
+
+    layers = list(range(manifest["num_layers"]))
+    if layers_filter is not None:
+        layers = [li for li in layers if li in layers_filter]
+    if not layers:
+        raise SystemExit("no layers selected (--layers filter matched nothing)")
+
+    attn_dir = os.path.join(out_dir, "attn_ov")
+    os.makedirs(attn_dir, exist_ok=True)
+    core = ov.Core()
+
+    manifest_path = os.path.join(model_dir, "manifest.json")
+    with open(manifest_path, "rb") as f:
+        manifest_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    dims = layer_dims(manifest, w, rows)
+    per_layer_digest = {}
+    total_bytes = 0
+    for li in layers:
+        shell_path = os.path.join(model_dir, "shells", f"layer_{li:02d}.safetensors")
+        with open(shell_path, "rb") as f:
+            per_layer_digest[f"{li:02d}"] = hashlib.sha256(f.read()).hexdigest()
+
+        w_layer = load_layer_weights(model_dir, li, manifest)
+        w_layer["rope_cos"], w_layer["rope_sin"] = cos, sin
+        model = build_layer_graph(w_layer, dims)
+        # Compile once before committing to disk -- catches a broken export
+        # before it becomes a stale-looking .xml/.bin pair.
+        compile_checked(core, model, f"export layer_{li:02d}")
+
+        xml_path = os.path.join(attn_dir, f"layer_{li:02d}.xml")
+        bin_path = os.path.join(attn_dir, f"layer_{li:02d}.bin")
+        ov.save_model(model, xml_path, compress_to_fp16=False)
+        bin_size = os.path.getsize(bin_path)
+        total_bytes += bin_size + os.path.getsize(xml_path)
+        print(f"  layer_{li:02d}: {bin_size} bytes .bin")
+
+    stamp = {
+        "manifest_sha256": manifest_sha256,
+        "per_layer_digest": per_layer_digest,
+        "exporter_version": EXPORTER_VERSION,
+        "w": w,
+        "p_max": p_max,
+        "rows": rows,
+        "hidden": hidden,
+        "kv_lora": kv_lora,
+        "qk_rope": qk_rope,
+    }
+    stamp_path = os.path.join(attn_dir, "export_stamp.json")
+    with open(stamp_path, "w") as f:
+        json.dump(stamp, f, indent=2)
+    print(f"  wrote {stamp_path}")
+    print(f"  total attn_ov bytes: {total_bytes} across {len(layers)} layer(s)")
+    return stamp
+
+
+# --------------------------------------------------------------------------
+# Step 6b — f32 throughput tripwire. Needs a fleet node + a real manifest;
+# this only BUILDS the harness (single command for an operator to run) and
+# never fabricates a number. See the report for the exact invocation.
+# --------------------------------------------------------------------------
+
+def bench_layer(model_dir: str, layer: int, rope_dump_path: str, device: str, iters: int):
+    manifest = read_manifest(model_dir)
+    w = derive_w(manifest)
+    rows = MAX_BATCH_COUNT
+    p_max = w - rows
+    dims = layer_dims(manifest, w, rows)
+    cos, sin = load_rope_table(rope_dump_path, manifest["qk_rope_head_dim"], w,
+                                manifest["rope_theta"], hard_fail=True)
+    weights = load_layer_weights(model_dir, layer, manifest)
+    weights["rope_cos"], weights["rope_sin"] = cos, sin
+
+    model = build_layer_graph(weights, dims)
+    print(f"openvino {ov.__version__}  device={device}  cfg={COMPILE_CFG}")
+    print(f"shapes: hidden={dims['hidden']} h={dims['h']} kv_lora={dims['kv_lora']} "
+          f"qk_rope={dims['qk_rope']} v_head={dims['v_head']} W={w} p_max={p_max} rows={rows}")
+    print(f"graph node count: {len(model.get_ordered_ops())}")
+
+    core = ov.Core()
+    compiled = compile_checked(core, model, f"bench layer_{layer:02d}", device=device)
+    req = compiled.create_infer_request()
+
+    rng = np.random.default_rng(0)
+    feed = {
+        "x": rng.standard_normal((rows, dims["hidden"])).astype(np.float32),
+        "past_lc": bf16_round(rng.standard_normal((p_max, dims["kv_lora"])).astype(np.float32)),
+        "past_rc": bf16_round(rng.standard_normal((p_max, dims["qk_rope"])).astype(np.float32)),
+        "mask": build_window_mask(rows, p_max, p_max),  # steady-state: past fully populated
+    }
+    for _ in range(5):
+        req.infer(feed)
+    ts = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        req.infer(feed)
+        ts.append((time.perf_counter() - t0) * 1e3)
+    med, p95 = statistics.median(ts), sorted(ts)[int(len(ts) * 0.95) - 1]
+    print(f"OV layer_{layer:02d} (rows={rows}, past=p_max steady-state): "
+          f"median={med:.3f}ms p95={p95:.3f}ms over {iters} iters")
+    print(f"\nRust baseline (five-projection sum, comparable dims): "
+          f"cargo run --release -p cascadia-engine-sparse-moe --example glm5_attn_bench "
+          f"-- {model_dir} {iters}")
+    print("speedup = (Rust batch=256 five-projection median ms) / "
+          f"(this script's median ms = {med:.3f})")
+    print("Step 6b gate: speedup >= ~20x to proceed with Tasks 3-9 as scoped "
+          "(spec Sec13); gates survive down to ~5x.")
+    return med, p95
+
+
 _kernel_names_seen: set = set()
 
 
@@ -596,9 +1458,26 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--validate-ops", action="store_true",
                      help="run the self-contained per-op numerics harness (no model dir needed)")
+    ap.add_argument("--validate-graph", action="store_true",
+                     help="run the self-contained full-attention-graph harness (Step 3, no model dir needed)")
+    ap.add_argument("--export", metavar="MODEL_DIR",
+                     help="export attn_ov/{layer_NN.xml,.bin,export_stamp.json} for a real model dir "
+                          "(manifest.json + shells/layer_NN.safetensors)")
+    ap.add_argument("--out", metavar="OUT_DIR",
+                     help="--export only: output dir (default: MODEL_DIR itself)")
+    ap.add_argument("--layers", default=None,
+                     help="--export only: comma-separated global layer indices to export (dev filter; "
+                          "default: all layers, including first_k_dense_replace dense-MLP layers)")
+    ap.add_argument("--bench", metavar="MODEL_DIR",
+                     help="Step 6b throughput tripwire: time one layer's graph under the f32 contract "
+                          "against the Rust five-projection baseline (needs a fleet node + a real "
+                          "manifest.json/shells -- BLOCKED-ON-OPERATOR here, see the report)")
+    ap.add_argument("--bench-layer", type=int, default=0, help="--bench: which global layer index to time")
+    ap.add_argument("--bench-device", default="GPU", help="--bench: OV device (default GPU)")
+    ap.add_argument("--bench-iters", type=int, default=50, help="--bench: timed iterations")
     ap.add_argument("--rope-table-dump", default=os.path.join(tempfile.gettempdir(), "glm5_rope_freqs_dump.bin"),
-                     help="path to the Rust Freqs dump for Step 3b's exact gate "
-                          "(default matches dsv4/rope.rs::freqs_dump's default output path)")
+                     help="path to the Rust Freqs dump for Step 3b's exact gate / --validate-graph / "
+                          "--export / --bench (default matches dsv4/rope.rs::freqs_dump's default output path)")
     ap.add_argument("--inject-bad-config", action="store_true", help=argparse.SUPPRESS)
     # ^ debug-only: deliberately requests DYNAMIC_QUANTIZATION_GROUP_SIZE=32
     # (a value the CPU plugin WILL honor) so the effective-config readback
@@ -606,7 +1485,18 @@ def main():
     # passing vacuously. Not for normal use.
     args = ap.parse_args()
 
-    if not args.validate_ops:
+    if args.export:
+        out_dir = args.out or args.export
+        layers_filter = {int(x) for x in args.layers.split(",")} if args.layers else None
+        stamp = export_all(args.export, out_dir, args.rope_table_dump, layers_filter)
+        print(f"\nexport_stamp: {json.dumps(stamp, indent=2)}")
+        return
+
+    if args.bench:
+        bench_layer(args.bench, args.bench_layer, args.rope_table_dump, args.bench_device, args.bench_iters)
+        return
+
+    if not (args.validate_ops or args.validate_graph):
         ap.print_help()
         return
 
@@ -619,25 +1509,40 @@ def main():
     core = ov.Core()
 
     ok = True
-    ok &= validate_linear(core)
-    ok &= validate_rmsnorm(core)
-    ok &= validate_rope(core)
-    ok &= validate_bf16_roundtrip(core)
-    rope_table_dump_present = os.path.exists(args.rope_table_dump)
-    rope_table_exact = validate_rope_table_exact(args.rope_table_dump)
-    # A present-but-mismatched table IS a hard failure. A MISSING dump is
-    # kept non-fatal (a fresh checkout legitimately hasn't run the Rust test
-    # yet) but is tracked separately below so the final summary can't read as
-    # "ALL PASS" while the one safety-critical exact-match gate never ran.
     critical_skips = []
-    if rope_table_dump_present:
-        ok &= rope_table_exact
-    else:
-        critical_skips.append(
-            "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
-            f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
-            "this harness was skipped, not passed"
-        )
+
+    if args.validate_ops:
+        ok &= validate_linear(core)
+        ok &= validate_rmsnorm(core)
+        ok &= validate_rope(core)
+        ok &= validate_bf16_roundtrip(core)
+        rope_table_dump_present = os.path.exists(args.rope_table_dump)
+        rope_table_exact = validate_rope_table_exact(args.rope_table_dump)
+        # A present-but-mismatched table IS a hard failure. A MISSING dump is
+        # kept non-fatal (a fresh checkout legitimately hasn't run the Rust
+        # test yet) but is tracked separately so the final summary can't read
+        # as "ALL PASS" while the one safety-critical exact-match gate never
+        # ran.
+        if rope_table_dump_present:
+            ok &= rope_table_exact
+        else:
+            critical_skips.append(
+                "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
+                f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
+                "this harness was skipped, not passed"
+            )
+
+    if args.validate_graph:
+        vg_result = validate_graph(core, args.rope_table_dump)
+        # Same discipline as Step 3b above: a missing dump is a loud,
+        # non-fatal SKIPPED, not a silent pass.
+        if vg_result is None:
+            critical_skips.append(
+                "--validate-graph did NOT run (no Rust rope-table dump found at "
+                f"{args.rope_table_dump}) — regenerate per the message printed above"
+            )
+        else:
+            ok &= vg_result
 
     print("\n== exec-graph kernels seen ==")
     for k in sorted(_kernel_names_seen):
