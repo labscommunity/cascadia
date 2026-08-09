@@ -439,3 +439,44 @@ pub fn linear_f32(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [
         *yy = dot(row, x);
     });
 }
+
+#[cfg(test)]
+mod bf16_ties {
+    // Ground truth for `tools/glm5_attn_ov.py`'s numpy bf16 round-to-nearest-even
+    // bit trick — the exporter's rounding must agree with `half::bf16::from_f32`
+    // on these ties (and the mantissa-carry / NaN edge cases) or it silently
+    // diverges from the Rust activation contract. (input bits, expected bf16 bits).
+    const CASES: [(u32, u16); 20] = [
+        (0x3F808000, 0x3F80), // tie, even retained LSB -> no round
+        (0x3F818000, 0x3F82), // tie, odd retained LSB -> round up
+        (0x3F808001, 0x3F81), // just above tie -> round up
+        (0x3F817FFF, 0x3F81), // just below tie -> truncate
+        (0xBF808000, 0xBF80), // negative tie, even
+        (0xBF818000, 0xBF82), // negative tie, odd
+        (0x40FF8000, 0x4100), // tie causing mantissa carry into exponent
+        (0x3F800000, 0x3F80), // exact bf16 value
+        (0x00000000, 0x0000), // +0
+        (0x80000000, 0x8000), // -0
+        (0x7F800000, 0x7F80), // +inf
+        (0xFF800000, 0xFF80), // -inf
+        (0x7FC00000, 0x7FC0), // canonical qNaN
+        (0x7F800001, 0x7FC0), // signaling NaN -> forced qNaN bit
+        (0x00000001, 0x0000), // smallest positive subnormal f32
+        (0x3F7FFFFF, 0x3F80), // just below 1.0 -> rounds up through exponent
+        (0x42F60000, 0x42F6), // exact, no rounding needed
+        (0x42F68000, 0x42F6), // tie, even
+        (0x42F78000, 0x42F8), // tie, odd
+        (0xC2F68000, 0xC2F6), // negative tie, even
+    ];
+
+    #[test]
+    fn matches_half_crate() {
+        for &(bits, want) in &CASES {
+            let got = half::bf16::from_f32(f32::from_bits(bits)).to_bits();
+            assert_eq!(
+                got, want,
+                "bf16(0x{bits:08x}): got 0x{got:04x} want 0x{want:04x}"
+            );
+        }
+    }
+}

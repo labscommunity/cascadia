@@ -95,3 +95,46 @@ pub fn apply_rope_row(row: &mut [f32], freqs: &Freqs, pos: usize, rd: usize, inv
         row[start + 2 * k + 1] = to_bf16(a * s + b * c);
     }
 }
+
+#[cfg(test)]
+mod freqs_dump {
+    use super::precompute_freqs;
+
+    /// Dumps `Freqs.data` at GLM-5.2's real rope dims (`qk_rope_head_dim=64`,
+    /// `rope_theta=8e6`, `original_seq_len=0` so no YaRN — matches the
+    /// `precompute_freqs` call in `glm/loader.rs`) as raw little-endian f32
+    /// bytes, so an OpenVINO exporter's cos/sin table can be diffed
+    /// bit-for-bit against this crate's table — the one place an OV attention
+    /// export must be numerically EXACT, not just ULP-close (a silently
+    /// wrong-basis rope table breaks decode while short-prompt parity stays
+    /// green).
+    ///
+    /// Writes to `GLM5_ROPE_FREQS_DUMP` if set, else `$TMPDIR/glm5_rope_freqs_dump.bin`.
+    /// Run: `cargo test -p cascadia-engine-sparse-moe --lib dump_real_dims_freqs -- --nocapture`.
+    #[test]
+    fn dump_real_dims_freqs() {
+        const DIM: usize = 64;
+        const SEQLEN: usize = 16;
+        const THETA: f32 = 8_000_000.0;
+        let freqs = precompute_freqs(DIM, SEQLEN, 0, THETA, 1.0, 32.0, 1.0);
+        assert_eq!(freqs.data.len(), SEQLEN * (DIM / 2) * 2);
+
+        let path = std::env::var("GLM5_ROPE_FREQS_DUMP").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("glm5_rope_freqs_dump.bin")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let mut bytes = Vec::with_capacity(freqs.data.len() * 4);
+        for v in &freqs.data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).expect("write rope freqs dump");
+        println!(
+            "wrote {} f32 values ({} bytes) to {path}",
+            freqs.data.len(),
+            bytes.len()
+        );
+        println!("first 8: {:?}", &freqs.data[..8.min(freqs.data.len())]);
+    }
+}
