@@ -33,7 +33,7 @@ use half::bf16;
 
 use super::indexer::Indexer;
 use super::rope::apply_rope_row;
-use crate::dsv4::math::{dot, dot_bf16w, linear_bf16_w, rmsnorm};
+use crate::dsv4::math::{dot, dot_bf16w, linear_bf16_w, rmsnorm, round_bf16};
 use crate::dsv4::rope::Freqs;
 
 /// Widen a bf16-bit weight to f32 (bf16 is the top 16 bits of an f32).
@@ -350,6 +350,22 @@ impl AttentionLayer {
         }
     }
 
+    /// The cached-latent (`lc`) / roped-k_pe (`rc`) mapping for one token: the
+    /// exact computation an external prefill path (the OV iGPU graph) must
+    /// reproduce bit-for-bit for [`Self::commit_prefill_rows`] to be a valid
+    /// substitute for this cache write. `forward_token` is the only other
+    /// caller — kept here so there is one place this math lives, not two.
+    fn compute_lc_rc(&self, x: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>) {
+        let (kvl, rope) = (self.kv_lora, self.qk_rope);
+        let mut comp = vec![0.0f32; kvl + rope];
+        linear_bf16_w(x, &self.w.wkv_a, kvl + rope, self.hidden, &mut comp);
+        let mut lat = comp[..kvl].to_vec();
+        rmsnorm(&mut lat, &self.w.kv_a_ln, MLA_LATENT_EPS);
+        let mut kpe = comp[kvl..].to_vec();
+        apply_rope_row(&mut kpe, &self.freqs, pos, rope, false);
+        (lat, kpe)
+    }
+
     /// Attend one token `x` (`[hidden]`) at absolute position `self.len`,
     /// appending its latent/k_pe to the cache. Returns `out` (`[hidden]`).
     /// Positions must be fed in order starting from 0.
@@ -390,13 +406,8 @@ impl AttentionLayer {
         }
 
         // comp = wkv_a · x -> [latent | k_pe]; append normed latent + roped k_pe.
-        let mut comp = vec![0.0f32; kvl + rope];
-        linear_bf16_w(x, &self.w.wkv_a, kvl + rope, self.hidden, &mut comp);
-        let mut lat = comp[..kvl].to_vec();
-        rmsnorm(&mut lat, &self.w.kv_a_ln, MLA_LATENT_EPS);
+        let (lat, kpe) = self.compute_lc_rc(x, pos);
         self.lc.write_row(pos, kvl, &lat);
-        let mut kpe = comp[kvl..].to_vec();
-        apply_rope_row(&mut kpe, &self.freqs, pos, rope, false);
         self.rc.write_row(pos, rope, &kpe);
         self.len += 1;
         let n = self.len; // cached tokens, includes self (causal)
@@ -483,6 +494,88 @@ impl AttentionLayer {
         linear_bf16_w(&ctx, &self.w.wo, self.hidden, h * vh, &mut out);
         out
     }
+
+    /// Commit `rows` externally-computed cache rows — `lc_rows` `[rows,
+    /// kv_lora]`, `rc_rows` `[rows, qk_rope]`, row-major, starting at absolute
+    /// position `self.len` — into the live KV cache via the same
+    /// `bf16_kv`-aware write path [`Self::forward_token`] uses, then advances
+    /// `len` by `rows`. This is the landing site for an OV-computed prefill
+    /// window's latent/k_pe rows; it does not itself compute them (see
+    /// [`Self::compute_lc_rc`] for the mapping those rows must match).
+    ///
+    /// `rmsnorm`/rope always leave `forward_token`'s own rows on the bf16
+    /// grid (see the module numeric contract), so every row is defensively
+    /// re-rounded onto that grid before being written — a no-op for
+    /// already-on-grid input, a correctness fix if a GPU plugin's Convert was
+    /// silently elided the way one already was in this project (Task 2). A
+    /// debug assertion catches off-grid input loudly in testing without
+    /// costing anything in release, where the rounding is the only guard.
+    ///
+    /// Errors (never panics) on mismatched slice lengths or if `rows` would
+    /// overflow the cache's capacity: the caller is a fallible OV path that
+    /// must be able to fall back to the Rust loop instead of taking down a
+    /// serving rank.
+    pub fn commit_prefill_rows(
+        &mut self,
+        lc_rows: &[f32],
+        rc_rows: &[f32],
+        rows: usize,
+    ) -> Result<(), String> {
+        let (kvl, rope) = (self.kv_lora, self.qk_rope);
+        if lc_rows.len() != rows * kvl {
+            return Err(format!(
+                "commit_prefill_rows: lc_rows len {} != rows {rows} * kv_lora {kvl}",
+                lc_rows.len()
+            ));
+        }
+        if rc_rows.len() != rows * rope {
+            return Err(format!(
+                "commit_prefill_rows: rc_rows len {} != rows {rows} * qk_rope {rope}",
+                rc_rows.len()
+            ));
+        }
+        let max_seq = self.lc.len() / kvl;
+        if self.len + rows > max_seq {
+            return Err(format!(
+                "commit_prefill_rows: len {} + rows {rows} exceeds max_seq {max_seq}",
+                self.len
+            ));
+        }
+        let mut lat = vec![0.0f32; kvl];
+        let mut kpe = vec![0.0f32; rope];
+        for r in 0..rows {
+            let pos = self.len + r;
+            lat.copy_from_slice(&lc_rows[r * kvl..(r + 1) * kvl]);
+            round_bf16(&mut lat);
+            debug_assert_eq!(
+                lat.as_slice(),
+                &lc_rows[r * kvl..(r + 1) * kvl],
+                "commit_prefill_rows: lc row {r} off the bf16 grid (OV contract violated)"
+            );
+            kpe.copy_from_slice(&rc_rows[r * rope..(r + 1) * rope]);
+            round_bf16(&mut kpe);
+            debug_assert_eq!(
+                kpe.as_slice(),
+                &rc_rows[r * rope..(r + 1) * rope],
+                "commit_prefill_rows: rc row {r} off the bf16 grid (OV contract violated)"
+            );
+            self.lc.write_row(pos, kvl, &lat);
+            self.rc.write_row(pos, rope, &kpe);
+        }
+        self.len += rows;
+        Ok(())
+    }
+
+    /// Feed one row's post-`in_ln` normed activations (the same input
+    /// `forward_token` takes as `x`, NOT the raw residual) to the DSA
+    /// indexer's key cache — the bulk-commit counterpart of the
+    /// `ix.append_key(x)` call inside `forward_token`. No-op on a layer with
+    /// no indexer (plain layers and `"shared"` layers never hold one).
+    pub fn indexer_append_normed(&mut self, normed_row: &[f32]) {
+        if let Some(ix) = self.indexer.as_mut() {
+            ix.append_key(normed_row);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,5 +617,196 @@ mod kv_tests {
         for (x, y) in f.to_f32_prefix(dim).iter().zip(&b.to_f32_prefix(dim)) {
             assert!((x - y).abs() <= x.abs() / 128.0 + 1e-3, "prefix {x} vs {y}");
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    use crate::dsv4::rope::precompute_freqs;
+    use crate::glm::indexer::IndexerWeights;
+
+    /// A tiny xorshift-style LCG stands in for real weights/activations —
+    /// these tests check `commit_prefill_rows`/`indexer_append_normed`
+    /// against `forward_token` itself, not against an external reference, so
+    /// the exact values don't matter as long as both sides of a comparison
+    /// see the same ones.
+    fn lcg(seed: u32) -> impl FnMut() -> f32 {
+        let mut s = seed;
+        move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / u16::MAX as f32 - 0.5
+        }
+    }
+
+    fn bf16_bits(v: f32) -> u16 {
+        bf16::from_f32(v).to_bits()
+    }
+
+    /// Deterministic tiny `AttentionLayer` — same seed every call, so two
+    /// independently-built instances have byte-identical weights and can
+    /// stand in for "the same layer" without needing `Clone`.
+    fn tiny_layer(bf16_kv: bool, max_seq: usize) -> AttentionLayer {
+        let (hidden, h, nope, rope, vh, kvl, ql) =
+            (12usize, 2usize, 4usize, 4usize, 4usize, 6usize, 8usize);
+        let mut rnd = lcg(7);
+        let w = AttnWeights {
+            wq_a: (0..ql * hidden).map(|_| bf16_bits(rnd())).collect(),
+            q_a_ln: (0..ql).map(|_| 1.0 + rnd() * 0.1).collect(),
+            wq_b: (0..h * (nope + rope) * ql)
+                .map(|_| bf16_bits(rnd()))
+                .collect(),
+            wkv_a: (0..(kvl + rope) * hidden)
+                .map(|_| bf16_bits(rnd()))
+                .collect(),
+            kv_a_ln: (0..kvl).map(|_| 1.0 + rnd() * 0.1).collect(),
+            wkv_b: (0..h * (nope + vh) * kvl)
+                .map(|_| bf16_bits(rnd()))
+                .collect(),
+            wo: (0..hidden * h * vh).map(|_| bf16_bits(rnd())).collect(),
+        };
+        let freqs = precompute_freqs(rope, max_seq, 0, 1.0e4, 1.0, 32.0, 1.0);
+        let mut layer = AttentionLayer::new(hidden, h, nope, rope, vh, kvl, ql, max_seq, w, freqs);
+        layer.set_kv_precision(bf16_kv);
+        layer
+    }
+
+    fn rows(n: usize, hidden: usize, seed: u32) -> Vec<Vec<f32>> {
+        let mut rnd = lcg(seed);
+        (0..n)
+            .map(|_| (0..hidden).map(|_| rnd()).collect())
+            .collect()
+    }
+
+    fn kv_bytes_eq(a: &KvStore, b: &KvStore) -> bool {
+        match (a, b) {
+            (KvStore::F32(x), KvStore::F32(y)) => x == y,
+            (KvStore::Bf16(x), KvStore::Bf16(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    /// The equivalence this whole task exists to guarantee: writing rows via
+    /// `commit_prefill_rows` must land byte-identical to what `forward_token`
+    /// would have written itself, in BOTH KV precisions, and the committed
+    /// state must go on to behave identically under further decode — not
+    /// merely look similar right after the commit.
+    #[test]
+    fn commit_prefill_rows_matches_forward_token() {
+        for bf16_kv in [false, true] {
+            let (hidden, n, max_seq) = (12usize, 6usize, 16usize);
+            let mut a = tiny_layer(bf16_kv, max_seq);
+            let mut b = tiny_layer(bf16_kv, max_seq);
+            let x_rows = rows(n, hidden, 123);
+
+            let mut carry = None;
+            for r in &x_rows {
+                a.forward_token(r, &mut carry);
+            }
+
+            let mut lc_rows = Vec::new();
+            let mut rc_rows = Vec::new();
+            for (i, r) in x_rows.iter().enumerate() {
+                let (lat, kpe) = b.compute_lc_rc(r, i);
+                lc_rows.extend(lat);
+                rc_rows.extend(kpe);
+            }
+            b.commit_prefill_rows(&lc_rows, &rc_rows, n)
+                .expect("commit_prefill_rows");
+
+            assert_eq!(a.len, b.len, "len diverged (bf16_kv={bf16_kv})");
+            assert!(
+                kv_bytes_eq(&a.lc, &b.lc),
+                "lc cache diverged (bf16_kv={bf16_kv})"
+            );
+            assert!(
+                kv_bytes_eq(&a.rc, &b.rc),
+                "rc cache diverged (bf16_kv={bf16_kv})"
+            );
+
+            // Not just "looks the same" — the committed cache must be usable
+            // going forward exactly like a forward_token-built one.
+            let extra = &rows(1, hidden, 999)[0];
+            let out_a = a.forward_token(extra, &mut None);
+            let out_b = b.forward_token(extra, &mut None);
+            assert_eq!(
+                out_a, out_b,
+                "post-commit forward_token diverged (bf16_kv={bf16_kv})"
+            );
+        }
+    }
+
+    /// Proves the on-grid debug guard actually fires rather than being
+    /// present-but-vacuous: an off-grid `lc` row (a value bf16 rounding
+    /// changes) must trip the debug assertion, the same way a GPU plugin
+    /// silently defeating the graph's own rounding would.
+    #[test]
+    #[should_panic(expected = "off the bf16 grid")]
+    fn commit_prefill_rows_debug_asserts_off_grid_input() {
+        let (kvl, rope, max_seq) = (6usize, 4usize, 4usize);
+        let mut layer = tiny_layer(false, max_seq);
+        // 0.1f32 is not exactly representable in bf16 (7 mantissa bits), so
+        // rounding it changes the value — the off-grid case this guards.
+        let lc_row = vec![0.1f32; kvl];
+        let rc_row = vec![0.0f32; rope];
+        let _ = layer.commit_prefill_rows(&lc_row, &rc_row, 1);
+    }
+
+    #[test]
+    fn commit_prefill_rows_rejects_bad_lengths_and_overflow() {
+        let (hidden, kvl, rope, max_seq) = (12usize, 6usize, 4usize, 4usize);
+        let mut layer = tiny_layer(false, max_seq);
+
+        assert!(
+            layer
+                .commit_prefill_rows(&vec![0.0; kvl * 3], &vec![0.0; rope * 2], 3)
+                .is_err(),
+            "rc_rows length mismatch must error"
+        );
+        assert!(
+            layer
+                .commit_prefill_rows(&vec![0.0; kvl * 2], &vec![0.0; rope * 3], 3)
+                .is_err(),
+            "lc_rows length mismatch must error"
+        );
+
+        // Fill to capacity, then one more row must overflow rather than panic.
+        let x_rows = rows(max_seq, hidden, 5);
+        let mut carry = None;
+        for r in &x_rows {
+            layer.forward_token(r, &mut carry);
+        }
+        assert!(
+            layer
+                .commit_prefill_rows(&vec![0.0; kvl], &vec![0.0; rope], 1)
+                .is_err(),
+            "committing past max_seq must error, not panic"
+        );
+    }
+
+    #[test]
+    fn indexer_append_normed_noop_without_indexer_forwards_with_one() {
+        let mut layer = tiny_layer(false, 8);
+        let hidden = layer.hidden;
+
+        // No indexer attached: must be a true no-op, not a panic.
+        layer.indexer_append_normed(&vec![0.0f32; hidden]);
+
+        let (q_lora, nh, hd, rope_dim) = (layer.q_lora, 2usize, 4usize, layer.qk_rope);
+        let mut rnd = lcg(42);
+        let iw = IndexerWeights {
+            ix_wq: (0..nh * hd * q_lora).map(|_| bf16_bits(rnd())).collect(),
+            ix_wk: (0..hd * hidden).map(|_| bf16_bits(rnd())).collect(),
+            ix_wp: (0..nh * hidden).map(|_| bf16_bits(rnd())).collect(),
+            k_norm_w: vec![1.0; hd],
+            k_norm_b: vec![0.0; hd],
+        };
+        let freqs = precompute_freqs(rope_dim, 8, 0, 1.0e4, 1.0, 32.0, 1.0);
+        let ix = Indexer::new(hidden, q_lora, nh, hd, rope_dim, 8, 1e-6, iw, freqs);
+        layer.attach_indexer(ix, 4);
+
+        let row: Vec<f32> = (0..hidden).map(|_| rnd()).collect();
+        layer.indexer_append_normed(&row);
+        assert_eq!(layer.indexer.as_ref().unwrap().len(), 1);
     }
 }
