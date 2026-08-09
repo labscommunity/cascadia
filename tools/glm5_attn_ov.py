@@ -1564,12 +1564,20 @@ def validate_graph(core, rope_dump_path: str):
 # Export mode (Step 4) + stamp
 # --------------------------------------------------------------------------
 
-def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=None):
+def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=None,
+                rows_cap: int = MAX_BATCH_COUNT):
+    """`rows_cap` overrides the graph's baked row capacity (default
+    MAX_BATCH_COUNT, the production wire's window size). A small `W` model
+    (e.g. the `--tiny` DSA fixture, `index_topk=8`) cannot fit MAX_BATCH_COUNT
+    at all -- every window would need zero past capacity -- so the tiny-model
+    parity harness (T3 Task 7) passes a small `rows_cap` here to get a graph
+    whose shape actually fits the tiny budget. Production exports never pass
+    this (the default reproduces the exact prior behavior)."""
     manifest = read_manifest(model_dir)
     w = derive_w(manifest)
-    rows = MAX_BATCH_COUNT
+    rows = rows_cap
     if w <= rows:
-        raise SystemExit(f"derived W={w} <= rows={rows} (MAX_BATCH_COUNT) — every "
+        raise SystemExit(f"derived W={w} <= rows={rows} (rows_cap) — every "
                           "window would have zero past capacity; refusing to export")
     p_max = w - rows
 
@@ -1711,6 +1719,11 @@ def main():
     ap.add_argument("--layers", default=None,
                      help="--export only: comma-separated global layer indices to export (dev filter; "
                           "default: all layers, including first_k_dense_replace dense-MLP layers)")
+    ap.add_argument("--rows-cap", type=int, default=MAX_BATCH_COUNT,
+                     help="--export only: override the graph's baked row capacity (default "
+                          "MAX_BATCH_COUNT=256, the production wire's window size). Needed for a "
+                          "small-W model (e.g. --tiny's index_topk=8) where MAX_BATCH_COUNT can't "
+                          "fit at all -- T3 Task 7's tiny-model parity harness uses this.")
     ap.add_argument("--bench", metavar="MODEL_DIR",
                      help="Step 6b throughput tripwire: time one layer's graph under the f32 contract "
                           "against the Rust five-projection baseline (needs a fleet node + a real "
@@ -1752,7 +1765,8 @@ def main():
         if args.export:
             out_dir = args.out or args.export
             layers_filter = {int(x) for x in args.layers.split(",")} if args.layers else None
-            stamp = export_all(args.export, out_dir, args.rope_table_dump, layers_filter)
+            stamp = export_all(args.export, out_dir, args.rope_table_dump, layers_filter,
+                                rows_cap=args.rows_cap)
             print(f"\nexport_stamp: {json.dumps(stamp, indent=2)}")
             return
 
