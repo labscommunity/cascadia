@@ -64,6 +64,12 @@ except OSError:
 COMPILE_CFG = {"INFERENCE_PRECISION_HINT": "f32", "DYNAMIC_QUANTIZATION_GROUP_SIZE": "0"}
 DEVICE = "CPU"  # no GPU on this dev machine; the graphs are device-agnostic
 
+# The binding contract: every compile must land on these EFFECTIVE values, not
+# just request them — a hint is not a guarantee. `compile_checked` reads both
+# back from every compiled model and fails the run if either drifted.
+REQUIRED_PRECISION_HINT = Type.f32
+REQUIRED_DYN_QUANT_GROUP_SIZE = 0
+
 # GLM-5.2 real export dims — order-of-magnitude placeholders until a real
 # manifest supplies exact values (this harness is model-dir-free by design).
 REAL_HIDDEN = 4096
@@ -340,6 +346,33 @@ def ulp_stats(ref: np.ndarray, got: np.ndarray):
     return int(diff.max()), float(np.mean(diff == 1)), worst, rb, gb
 
 
+_effective_config_total = 0
+_effective_config_bad: list = []
+
+
+def compile_checked(core, model: Model, name: str):
+    """`core.compile_model` + effective-config readback. `INFERENCE_PRECISION_HINT`
+    and `DYNAMIC_QUANTIZATION_GROUP_SIZE` are compile HINTS, not guarantees —
+    the plugin can silently land elsewhere. Every compile in this harness
+    (~17 of them) feeds the numerics every later task builds on, so each one
+    reads both properties back and records a failure if either isn't exactly
+    the required value, instead of trusting the requested config dict."""
+    global _effective_config_total
+    compiled = core.compile_model(model, DEVICE, COMPILE_CFG)
+    _effective_config_total += 1
+    for prop, required in (
+        ("INFERENCE_PRECISION_HINT", REQUIRED_PRECISION_HINT),
+        ("DYNAMIC_QUANTIZATION_GROUP_SIZE", REQUIRED_DYN_QUANT_GROUP_SIZE),
+    ):
+        effective = compiled.get_property(prop)
+        if effective != required:
+            _effective_config_bad.append(
+                f"[{name}] {prop}: requested={COMPILE_CFG[prop]!r} "
+                f"effective={effective!r} (required {required!r})"
+            )
+    return compiled
+
+
 def _kernel_names(compiled) -> set:
     """Best-effort exec-graph op kind set (mirrors
     `glm5_attn_ov_probe.py::compiled_precisions`), used only to assert no
@@ -414,7 +447,7 @@ def validate_linear(core) -> bool:
 
         ref = ref_linear_bf16(x, w_bits)
         model = build_op_graph("linear", {"out_dim": out_dim, "in_dim": in_dim, "w_bits": w_bits})
-        compiled = core.compile_model(model, DEVICE, COMPILE_CFG)
+        compiled = compile_checked(core, model, f"linear seed={case['seed']}")
         got = np.array(compiled.create_infer_request().infer({"x": x.reshape(1, in_dim)})[0]).reshape(-1)
 
         max_ulp, flip, worst, rb, gb = ulp_stats(ref, got)
@@ -440,7 +473,7 @@ def validate_rmsnorm(core) -> bool:
         x = rng.standard_normal((dim,)).astype(np.float32) * case["x_scale"]
 
         model = build_op_graph("rmsnorm", {"dim": dim, "w": w})
-        compiled = core.compile_model(model, DEVICE, COMPILE_CFG)
+        compiled = compile_checked(core, model, f"rmsnorm seed={case['seed']}")
         req = compiled.create_infer_request()
         _kernel_names_seen.update(_kernel_names(compiled))
 
@@ -480,7 +513,7 @@ def validate_rope(core) -> bool:
 
         ref = ref_rope_interleaved(x, pos, theta, rd)
         model = build_op_graph("rope", {"rot_dims": rd, "theta": theta, "pos": pos})
-        compiled = core.compile_model(model, DEVICE, COMPILE_CFG)
+        compiled = compile_checked(core, model, f"rope seed={case['seed']}")
         got = np.array(compiled.create_infer_request().infer({"x": x.reshape(1, rd)})[0]).reshape(-1)
         _kernel_names_seen.update(_kernel_names(compiled))
 
@@ -503,7 +536,8 @@ def validate_bf16_roundtrip(core) -> bool:
     print("\n== bf16 Convert round-trip (OV vs numpy, tie cases) ==")
     xin = np.array([np.uint32(b) for b, _ in BF16_TIE_CASES], dtype=np.uint32).view(np.float32)
     model = _bf16_roundtrip_graph(len(BF16_TIE_CASES))
-    core_out = np.array(core.compile_model(model, DEVICE, COMPILE_CFG).create_infer_request().infer({"x": xin})[0]).reshape(-1)
+    compiled = compile_checked(core, model, "bf16_roundtrip")
+    core_out = np.array(compiled.create_infer_request().infer({"x": xin})[0]).reshape(-1)
     ov_bits = bf16_bits(core_out)
     np_bits = bf16_bits(bf16_round(xin))
     mismatches = [
@@ -565,11 +599,21 @@ def main():
     ap.add_argument("--rope-table-dump", default=os.path.join(tempfile.gettempdir(), "glm5_rope_freqs_dump.bin"),
                      help="path to the Rust Freqs dump for Step 3b's exact gate "
                           "(default matches dsv4/rope.rs::freqs_dump's default output path)")
+    ap.add_argument("--inject-bad-config", action="store_true", help=argparse.SUPPRESS)
+    # ^ debug-only: deliberately requests DYNAMIC_QUANTIZATION_GROUP_SIZE=32
+    # (a value the CPU plugin WILL honor) so the effective-config readback
+    # gate has a real mismatch to catch, proving it fails loudly instead of
+    # passing vacuously. Not for normal use.
     args = ap.parse_args()
 
     if not args.validate_ops:
         ap.print_help()
         return
+
+    if args.inject_bad_config:
+        COMPILE_CFG["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
+        print("*** --inject-bad-config: requesting DYNAMIC_QUANTIZATION_GROUP_SIZE=32 "
+              "(contract requires 0) to prove the readback gate fires ***")
 
     print(f"openvino {ov.__version__}  device={DEVICE}  cfg={COMPILE_CFG}")
     core = ov.Core()
@@ -579,12 +623,21 @@ def main():
     ok &= validate_rmsnorm(core)
     ok &= validate_rope(core)
     ok &= validate_bf16_roundtrip(core)
+    rope_table_dump_present = os.path.exists(args.rope_table_dump)
     rope_table_exact = validate_rope_table_exact(args.rope_table_dump)
-    # Step 3b is a documented gap, not a hard --validate-ops failure, when the
-    # dump is simply absent (fresh checkout without having run the cargo test
-    # yet); a present-but-mismatched table IS a hard failure.
-    if os.path.exists(args.rope_table_dump):
+    # A present-but-mismatched table IS a hard failure. A MISSING dump is
+    # kept non-fatal (a fresh checkout legitimately hasn't run the Rust test
+    # yet) but is tracked separately below so the final summary can't read as
+    # "ALL PASS" while the one safety-critical exact-match gate never ran.
+    critical_skips = []
+    if rope_table_dump_present:
         ok &= rope_table_exact
+    else:
+        critical_skips.append(
+            "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
+            f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
+            "this harness was skipped, not passed"
+        )
 
     print("\n== exec-graph kernels seen ==")
     for k in sorted(_kernel_names_seen):
@@ -596,8 +649,29 @@ def main():
     else:
         print("  OK: no int8 / dyn-quant kernels")
 
-    print(f"\n{'ALL PASS' if ok else 'FAILURES ABOVE'}")
-    raise SystemExit(0 if ok else 1)
+    print("\n== effective-config readback ==")
+    if _effective_config_bad:
+        for msg in _effective_config_bad:
+            print(f"  FAIL: {msg}")
+        print(f"  {len(_effective_config_bad)} mismatch(es) across {_effective_config_total} compiles")
+        ok = False
+    else:
+        print(f"  OK: INFERENCE_PRECISION_HINT={REQUIRED_PRECISION_HINT} and "
+              f"DYNAMIC_QUANTIZATION_GROUP_SIZE={REQUIRED_DYN_QUANT_GROUP_SIZE} "
+              f"confirmed effective on all {_effective_config_total} compiles")
+
+    if not ok:
+        print("\nFAILURES ABOVE")
+        raise SystemExit(1)
+    if critical_skips:
+        print("\n" + "!" * 78)
+        print("!! PASSED, BUT CRITICAL CHECK(S) SKIPPED — THIS IS NOT A FULL VALIDATION RUN !!")
+        for s in critical_skips:
+            print(f"!!   {s}")
+        print("!" * 78)
+        raise SystemExit(0)
+    print("\nALL PASS")
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
