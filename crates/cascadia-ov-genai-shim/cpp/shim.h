@@ -31,13 +31,25 @@ typedef struct cascadia_genconfig_t cascadia_genconfig_t;
 typedef struct cascadia_tokenizer_t cascadia_tokenizer_t;
 typedef struct cascadia_runtime_t cascadia_runtime_t;
 
-/// ABI marker for this compiled shim's C surface. Bump on every symbol
-/// addition/change that a Rust binding depends on. Rust asserts this against
-/// its own expected constant at startup (glm5 ov_attn's `from_opts`) so a
-/// shim built from a version that predates a required symbol fails LOUDLY
-/// (event=ov_attn_unavailable) instead of silently skipping a safety check —
-/// this fleet has a documented history of stale-DLL / stale-object rebuilds
-/// going unnoticed. Bumped to 2 for cascadia_runtime_get_property +
+/// ABI marker for this compiled shim's C SOURCE (cpp/shim.cpp + friends).
+/// Bump on every symbol addition/change that a Rust binding depends on. Rust
+/// asserts this against its own expected constant at startup (glm5 ov_attn's
+/// `from_opts`) so a shim compiled from source that predates a required
+/// symbol fails LOUDLY (event=ov_attn_unavailable) instead of silently
+/// skipping a safety check.
+///
+/// Scope, stated honestly: `build.rs` compiles this file fresh alongside
+/// every `--features openvino` Rust build (no separately-shipped shim
+/// binary today), so in the CURRENT build model this check cannot actually
+/// disagree — an old Rust binary simply lacks the new code entirely. It is
+/// defense-in-depth against a future build-model change (e.g. a prebuilt-
+/// object cache, or this shim shipped as its own dylib). It says NOTHING
+/// about, and does not protect against, a stale OpenVINO RUNTIME install
+/// (`libopenvino`/`libopenvino_genai` behind `INTEL_OPENVINO_DIR`) — that is
+/// this fleet's actual stale-artifact hazard and a completely different
+/// mechanism (dynamic linking against the SDK's own shared libraries, not
+/// this header's version marker). Do not read this symbol as covering that.
+/// Bumped to 2 for cascadia_runtime_get_property +
 /// cascadia_runtime_compile_bf16_canary (glm5-attn-igpu-t3 Task 5).
 #define CASCADIA_SHIM_ABI_VERSION 2
 int32_t cascadia_shim_abi_version();

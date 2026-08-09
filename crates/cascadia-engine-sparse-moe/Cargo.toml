@@ -36,3 +36,4 @@ sha2 = "0.10"
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-subscriber = { workspace = true }

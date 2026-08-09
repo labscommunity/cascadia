@@ -17,6 +17,7 @@
 #include "bf16_canary.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -69,17 +70,24 @@ std::shared_ptr<ov::Model> build_canary_model(size_t n) {
     x->set_friendly_name("x");
     x->get_output_tensor(0).set_names({"x"});
 
+    // std::ldexp(1.0f, k) == 2**k EXACTLY by definition (IEEE754 scales the
+    // exponent field directly, no rounding) for any k in range -- unlike
+    // std::exp2(float(k)), which routes through a transcendental
+    // approximation and is not guaranteed exact even for integral inputs.
+    // This bisection's correctness depends on every power-of-two constant
+    // being bit-exact (see the module doc), so ldexp is not a style
+    // preference here.
     auto ax = std::make_shared<Abs>(x);
     std::shared_ptr<ov::Node> e = scalar_f32(-64.0f);
-    std::shared_ptr<ov::Node> p = scalar_f32(std::exp2(-64.0f));
+    std::shared_ptr<ov::Node> p = scalar_f32(std::ldexp(1.0f, -64));
     for (int step : kBisectSteps) {
         auto cand_e = std::make_shared<Add>(e, scalar_f32(static_cast<float>(step)));
-        auto cand_p = std::make_shared<Multiply>(p, scalar_f32(std::exp2(static_cast<float>(step))));
+        auto cand_p = std::make_shared<Multiply>(p, scalar_f32(std::ldexp(1.0f, step)));
         auto take = std::make_shared<GreaterEqual>(ax, cand_p);
         e = std::make_shared<Select>(take, cand_e, e);
         p = std::make_shared<Select>(take, cand_p, p);
     }
-    auto ulp = std::make_shared<Multiply>(p, scalar_f32(std::exp2(-7.0f)));
+    auto ulp = std::make_shared<Multiply>(p, scalar_f32(std::ldexp(1.0f, -7)));
     auto rounded = std::make_shared<ov::op::v5::Round>(
         std::make_shared<Divide>(x, ulp), ov::op::v5::Round::RoundMode::HALF_TO_EVEN);
     std::shared_ptr<ov::Node> result = std::make_shared<Multiply>(rounded, ulp);

@@ -129,6 +129,12 @@ struct ExportStamp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StampCheck {
     Ok,
+    /// `p_max + rows != w` — the stamp's own internal invariant (the
+    /// exporter guarantees this by construction: `p_max = w - rows`) doesn't
+    /// hold. A corrupt/hand-edited/truncated stamp, checked BEFORE comparing
+    /// against the live manifest at all, since there's no point asking "is
+    /// this stale" about an artifact that was never internally consistent.
+    CorruptDims,
     /// `manifest_sha256` disagrees: the model was re-exported (weights
     /// changed) without re-running the attention exporter.
     ManifestMismatch,
@@ -145,6 +151,9 @@ fn check_stamp(
     derived_w: usize,
     owned_layers: &[usize],
 ) -> StampCheck {
+    if stamp.p_max + stamp.rows != stamp.w {
+        return StampCheck::CorruptDims;
+    }
     if stamp.manifest_sha256 != manifest_sha256 {
         return StampCheck::ManifestMismatch;
     }
@@ -318,10 +327,18 @@ fn bf16_ulp_at(x: f32) -> f32 {
     2f32.powi(frexp_e - 8)
 }
 
+/// One canary case plus the OTHER three rounding hypotheses it could have
+/// matched instead — ported from Python's `canary_cases()`, which computes
+/// these so a device mismatch is diagnosable without re-deriving the battery
+/// by hand (`run_bf16_canary` reports which hypothesis, if any, the observed
+/// bits actually matched).
 struct CanaryCase {
     label: String,
     x: f32,
     rne: f32,
+    trunc: f32,
+    half_away: f32,
+    identity: f32,
 }
 
 fn canary_cases() -> Vec<CanaryCase> {
@@ -329,13 +346,29 @@ fn canary_cases() -> Vec<CanaryCase> {
     for &base in CANARY_BASES.iter() {
         let g_lo = to_bf16(base);
         let ulp = bf16_ulp_at(g_lo);
+        let g_hi = to_bf16(g_lo + ulp);
         for (frac, tag) in [(0.25f32, "f=.25"), (0.5, "f=.5(tie)"), (0.75, "f=.75")] {
             let x = g_lo + frac * ulp;
             let rne = to_bf16(x);
+            // Matches Python's canary_cases(): frac<0.5 -> trunc=half_away=g_lo;
+            // frac>0.5 -> trunc=g_lo, half_away=g_hi; frac==0.5 (exact tie) ->
+            // trunc always keeps g_lo (round-toward-zero drops the
+            // tie-breaking bit), half_away breaks toward the LARGER-magnitude
+            // of g_lo/g_hi (g_hi for base>0, g_lo for base<0 -- g_lo is the
+            // more-negative / larger-magnitude one there).
+            let half_away_breaks_up = frac > 0.5 || base > 0.0;
+            let (trunc, half_away) = if frac < 0.5 {
+                (g_lo, g_lo)
+            } else {
+                (g_lo, if half_away_breaks_up { g_hi } else { g_lo })
+            };
             cases.push(CanaryCase {
                 label: format!("base={base} {tag}"),
                 x,
                 rne,
+                trunc,
+                half_away,
+                identity: x,
             });
         }
     }
@@ -412,18 +445,37 @@ fn run_bf16_canary(device: &str, plugin: &PluginConfig) -> bool {
         let got = u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
         if got != want {
             mismatches += 1;
-            let label = if i < n_battery {
-                battery[i].label.clone()
+            if i < n_battery {
+                let c = &battery[i];
+                // Which OTHER hypothesis (if any) the observed bits match --
+                // makes a real device failure diagnosable without re-deriving
+                // the battery by hand (ported from Python's run_canary).
+                let matched = if got == c.trunc.to_bits() {
+                    "trunc"
+                } else if got == c.half_away.to_bits() {
+                    "half_away"
+                } else if got == c.identity.to_bits() {
+                    "identity"
+                } else {
+                    "unknown"
+                };
+                warn!(
+                    target: "cascadia::glm5",
+                    case = %c.label,
+                    want = format!("0x{want:08x}"),
+                    got = format!("0x{got:08x}"),
+                    matches = matched,
+                    "bf16 canary case mismatch",
+                );
             } else {
-                format!("tie_case idx={}", i - n_battery)
-            };
-            warn!(
-                target: "cascadia::glm5",
-                case = %label,
-                want = format!("0x{want:08x}"),
-                got = format!("0x{got:08x}"),
-                "bf16 canary case mismatch",
-            );
+                warn!(
+                    target: "cascadia::glm5",
+                    case = %format!("tie_case idx={}", i - n_battery),
+                    want = format!("0x{want:08x}"),
+                    got = format!("0x{got:08x}"),
+                    "bf16 canary case mismatch",
+                );
+            }
         }
     }
     if mismatches > 0 {
@@ -489,9 +541,19 @@ pub struct OvAttn {
     hidden: usize,
     layers_ok: usize,
     layers_expected: usize,
+    /// Resolved minimum real rows a window needs to be eligible (spec
+    /// requirement: config→env→64, see [`OvAttn::from_opts`]). Stored (not
+    /// just logged) so the prefill-integration caller consumes the SAME
+    /// resolved value `ov_attn_config` reported, instead of re-deriving the
+    /// config/env/default precedence a second time.
+    pub min_rows: u32,
     poisoned: AtomicBool,
     transient_fails: AtomicU32,
     used: AtomicBool,
+    /// Latches the ONE-TIME warning for a caller-side contract violation in
+    /// [`OvAttn::prefill_window`] (bad shapes, `rows>rows_cap`,
+    /// `past_len>p_max`) — see `warn_contract_violation_once`'s doc.
+    contract_violation_warned: AtomicBool,
 }
 
 impl OvAttn {
@@ -565,6 +627,17 @@ impl OvAttn {
         let derived_w = derive_w(m);
         match check_stamp(&stamp, &found_sha, derived_w, owned_layers) {
             StampCheck::Ok => {}
+            StampCheck::CorruptDims => {
+                warn!(
+                    target: "cascadia::glm5",
+                    event = "ov_attn_ir_missing",
+                    reason = "corrupt_stamp_dims",
+                    p_max = stamp.p_max,
+                    rows = stamp.rows,
+                    w = stamp.w,
+                );
+                return None;
+            }
             StampCheck::ManifestMismatch => {
                 warn!(
                     target: "cascadia::glm5",
@@ -597,11 +670,15 @@ impl OvAttn {
         // Startup probe (spec Sec7): a real (non-stub) shim at the ABI this
         // crate was built against, and the target device actually present —
         // BEFORE declaring the path usable. `shim_abi_version() == None`
-        // covers both the stub build AND (defensively) any future build mode
-        // where the shim could be linked without being recompiled alongside
-        // this crate; today's `cc::Build` always recompiles it together, but
-        // the check costs nothing and is what the brief explicitly asked for
-        // given this fleet's stale-DLL history.
+        // covers the stub build; a version mismatch covers a shim compiled
+        // from stale C++ source. Honest scope (see cpp/shim.h's
+        // CASCADIA_SHIM_ABI_VERSION doc): `cc::Build` recompiles the shim
+        // fresh alongside every `--features openvino` Rust build today, so
+        // this check is defense-in-depth against a future build-model
+        // change, NOT protection against this fleet's actual stale-artifact
+        // hazard — a stale OpenVINO RUNTIME install behind
+        // `INTEL_OPENVINO_DIR` — which is a different mechanism entirely and
+        // this symbol cannot see.
         match cascadia_ov_genai_shim::shim_abi_version() {
             None => {
                 error!(target: "cascadia::glm5", event = "ov_attn_unavailable", reason = "stub_shim_build");
@@ -641,8 +718,11 @@ impl OvAttn {
         }
 
         // Blob cache: CASCADIA_GLM5_OV_CACHE_DIR/<stamp_hash prefix>, so a
-        // re-export or driver bump can never hit a stale blob (spec Sec6) —
-        // the subdirectory name changes whenever the stamp does.
+        // re-export can never hit a stale blob (spec Sec6) — the subdirectory
+        // name changes whenever the stamp does. NOTE: this covers re-export
+        // only; a driver bump is OV's own blob keying inside CACHE_DIR (the
+        // plugin embeds its own compatibility markers in what it writes
+        // there), not something this subdirectory scheme delivers.
         let cache_dir_env = std::env::var("CASCADIA_GLM5_OV_CACHE_DIR").ok();
         let mut layer_plugin = PluginConfig::new()
             .with("INFERENCE_PRECISION_HINT", "f32")
@@ -666,11 +746,22 @@ impl OvAttn {
         let mut compiled: Vec<Option<Runtime>> = Vec::with_capacity(owned_layers.len());
         let mut layers_ok = 0usize;
         let mut precision_checked = false;
+        // `(global_layer, reason)` for every layer that failed to compile —
+        // named in `ov_attn_partial` below rather than left as a bare count.
+        let mut failed_layers: Vec<(usize, String)> = Vec::new();
         for &gl in owned_layers {
             let xml = dir.join(format!("layer_{gl:02}.xml"));
             let path_str = match xml.to_str() {
                 Some(s) => s,
                 None => {
+                    let reason = format!("non-UTF8 IR path: {}", xml.display());
+                    warn!(
+                        target: "cascadia::glm5",
+                        event = "ov_attn_layer_compile_failed",
+                        layer = gl,
+                        reason = %reason,
+                    );
+                    failed_layers.push((gl, reason));
                     compiled.push(None);
                     continue;
                 }
@@ -693,12 +784,18 @@ impl OvAttn {
                     layers_ok += 1;
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    let reason = e.to_string();
+                    // WARN (not debug!): the most likely production failure
+                    // (GPU compile fails for every layer) must be visible at
+                    // default verbosity, not only to someone who already
+                    // knew to raise it.
+                    warn!(
                         target: "cascadia::glm5",
+                        event = "ov_attn_layer_compile_failed",
                         layer = gl,
-                        error = %e,
-                        "attn_ov layer compile failed; this layer stays on the Rust path",
+                        reason = %reason,
                     );
+                    failed_layers.push((gl, reason));
                     compiled.push(None);
                 }
             }
@@ -713,11 +810,16 @@ impl OvAttn {
             return None;
         }
         if layers_ok < owned_layers.len() {
+            let failed_summary: Vec<String> = failed_layers
+                .iter()
+                .map(|(gl, reason)| format!("{gl:02}: {reason}"))
+                .collect();
             warn!(
                 target: "cascadia::glm5",
                 event = "ov_attn_partial",
                 layers_ok,
                 layers_expected = owned_layers.len(),
+                failed_layers = %failed_summary.join("; "),
             );
         }
 
@@ -730,12 +832,13 @@ impl OvAttn {
         info!(
             target: "cascadia::glm5",
             event = "ov_attn_config",
+            enabled,
+            enabled_source = enabled_src,
             device = %device,
-            device_source = enabled_src, // enabled + device share one config-precedence story; both sources logged below explicitly
+            device_source = device_src,
             device_full_name = %device_full_name,
             min_rows,
             min_rows_source = min_rows_src,
-            device_source_actual = device_src,
             layers_ok,
             layers_expected = owned_layers.len(),
             w = derived_w,
@@ -760,9 +863,11 @@ impl OvAttn {
             hidden: stamp.hidden,
             layers_ok,
             layers_expected: owned_layers.len(),
+            min_rows,
             poisoned: AtomicBool::new(false),
             transient_fails: AtomicU32::new(0),
             used: AtomicBool::new(false),
+            contract_violation_warned: AtomicBool::new(false),
         })
     }
 
@@ -812,12 +917,25 @@ impl OvAttn {
             return None;
         }
         if rows == 0 || rows > self.rows_cap || past_len > self.p_max {
+            self.warn_contract_violation_once(&format!(
+                "rows={rows} rows_cap={} past_len={past_len} p_max={}",
+                self.rows_cap, self.p_max
+            ));
             return None;
         }
         if x.len() != rows * self.hidden
             || past_lc.len() != past_len * self.kv_lora
             || past_rc.len() != past_len * self.qk_rope
         {
+            self.warn_contract_violation_once(&format!(
+                "x.len={} want={} past_lc.len={} want={} past_rc.len={} want={}",
+                x.len(),
+                rows * self.hidden,
+                past_lc.len(),
+                past_len * self.kv_lora,
+                past_rc.len(),
+                past_len * self.qk_rope,
+            ));
             return None;
         }
 
@@ -869,9 +987,11 @@ impl OvAttn {
             .and_then(|_| rt.infer());
 
         if let Err(e) = infer_result {
+            // A real shim call just failed on THIS thread, so the typed
+            // last-error code (if any) is trustworthy here.
             let rt_snapshot_device = self.device.clone();
             drop(guard);
-            self.note_infer_failure(layer_local, &rt_snapshot_device, &e);
+            self.note_shim_failure(layer_local, &rt_snapshot_device, &e);
             return None;
         }
 
@@ -883,17 +1003,40 @@ impl OvAttn {
         drop(guard);
 
         let (Some(attn_out), Some(lc), Some(rc)) = (attn_out, lc, rc) else {
-            self.note_infer_failure(
-                layer_local,
-                &self.device,
-                &OvError::Native("unexpected output shape".to_string()),
-            );
+            // Every shim call above SUCCEEDED (we only reach here past the
+            // `infer_result` Err check) -- this is a Rust-side shape/dtype
+            // mismatch, not a device error. Must NOT consult the typed
+            // last-error code: it is thread-local and never cleared on
+            // success, so it can still hold whatever an EARLIER, unrelated
+            // failure on this thread left behind (e.g. an OvExperts GPU
+            // compile failure classified as resource exhaustion) and would
+            // misclassify this as fatal. `note_logic_error` never reads it.
+            self.note_logic_error(layer_local, "unexpected output shape");
             return None;
         };
 
-        self.transient_fails.store(0, Ordering::Relaxed);
-        self.used.store(true, Ordering::Relaxed);
+        self.note_infer_success();
         Some(AttnWindowOut { attn_out, lc, rc })
+    }
+
+    /// WARN once (not per-call) when `prefill_window` rejects its own
+    /// arguments before ever touching the device — a caller-side stride bug
+    /// would otherwise call this every window. Without this, a contract
+    /// violation turns the path into a permanent silent no-op: `state()`
+    /// still reports Enabled/Active and the startup `ov_attn_config` log
+    /// still claims success, while every window quietly falls back — the
+    /// exact silent-degrade mode this module's doc says it exists to
+    /// prevent.
+    fn warn_contract_violation_once(&self, detail: &str) {
+        if !self.contract_violation_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                target: "cascadia::glm5",
+                event = "ov_attn_contract_violation",
+                detail = %detail,
+                "prefill_window rejected its own arguments; every window on \
+                 this backend will silently fall back until the caller is fixed",
+            );
+        }
     }
 
     /// Slice the real-rows prefix (`rows*dim` elements) out of output `idx`'s
@@ -921,17 +1064,53 @@ impl OvAttn {
         )
     }
 
-    /// Classify one infer failure: typed resource exhaustion latches
-    /// immediately (same taxonomy as `OvExperts::poison`); otherwise counts
-    /// toward the consecutive-transient latch (default 3, see the module
-    /// doc). Every individual transient failure is logged (WARN) — the
-    /// silent-degrade weakness this module exists to not repeat.
-    fn note_infer_failure(&self, layer_local: usize, device: &str, err: &OvError) {
+    /// Reset the consecutive-transient-failure counter and mark the backend
+    /// as having served at least one window — called from `prefill_window`'s
+    /// ONLY success return path. An intervening success means the next
+    /// failure starts a fresh consecutive run (the latch is "N IN A ROW",
+    /// not "N ever"); factored into its own method (not inlined at the call
+    /// site) so tests can drive the exact bookkeeping `prefill_window` uses
+    /// without a real compiled device.
+    fn note_infer_success(&self) {
+        self.transient_fails.store(0, Ordering::Relaxed);
+        self.used.store(true, Ordering::Relaxed);
+    }
+
+    /// Classify a failure where a SHIM CALL just returned `Err` on this
+    /// thread — the typed last-error code is trustworthy here (set by the
+    /// call that just failed, per `cpp/shim.cpp`'s `set_last_error`).
+    /// Consults it; a fatal (typed OR string-classified) resource-exhaustion
+    /// error latches immediately (same taxonomy as `OvExperts::poison`).
+    fn note_shim_failure(&self, layer_local: usize, device: &str, err: &OvError) {
         let msg = err.to_string();
         let fatal = cascadia_ov_genai_shim::last_error_resource_exhausted()
             || is_fatal_resource_error(&msg);
-        if fatal {
-            self.poison(&format!("resource exhaustion on device {device}: {msg}"));
+        self.note_failure(
+            layer_local,
+            fatal.then(|| format!("resource exhaustion on device {device}: {msg}")),
+            &msg,
+        );
+    }
+
+    /// Classify a failure that is NOT a shim call failure — e.g. an output
+    /// shape/dtype mismatch discovered AFTER every shim call in the window
+    /// already succeeded. MUST NEVER consult the typed last-error code: it
+    /// is thread-local and is never cleared on success, so it can still hold
+    /// whatever an unrelated EARLIER failure on this thread left behind (a
+    /// real observed source: `OvExperts` GPU compile failures on the same
+    /// worker thread set exactly the `resource unavailable` class). Always
+    /// non-fatal — only the consecutive-transient latch can apply here.
+    fn note_logic_error(&self, layer_local: usize, msg: &str) {
+        self.note_failure(layer_local, None, msg);
+    }
+
+    /// Shared bookkeeping: `fatal_reason = Some(..)` latches immediately;
+    /// `None` counts toward the consecutive-transient latch (default 3, see
+    /// the module doc). Every individual transient failure is logged (WARN)
+    /// — the silent-degrade weakness this module exists to not repeat.
+    fn note_failure(&self, layer_local: usize, fatal_reason: Option<String>, msg: &str) {
+        if let Some(why) = fatal_reason {
+            self.poison(&why);
             return;
         }
         let n = self.transient_fails.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1080,6 +1259,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_stamp_flags_corrupt_dims() {
+        // The exporter guarantees p_max + rows == w by construction; a
+        // stamp that violates its own invariant is corrupt, checked before
+        // (and independent of) any comparison against the live manifest.
+        let mut stamp = test_stamp();
+        stamp.p_max = 3; // 3 + rows(4) = 7 != w(8)
+        assert_eq!(
+            check_stamp(&stamp, "abc123", 8, &[0, 1]),
+            StampCheck::CorruptDims
+        );
+    }
+
     // ---- Mask builder -------------------------------------------------
 
     #[test]
@@ -1150,6 +1342,35 @@ mod tests {
     }
 
     #[test]
+    fn canary_battery_hypotheses_match_the_documented_rule() {
+        // Ground truth for the competing-hypothesis diagnostic
+        // (run_bf16_canary reports which of these an on-device mismatch
+        // actually matched) -- pins the ported rule from
+        // tools/glm5_attn_ov.py::canary_cases() directly.
+        for c in canary_cases() {
+            assert_eq!(
+                c.identity, c.x,
+                "case {}: identity must equal the raw input",
+                c.label
+            );
+            if c.label.contains("f=.25") {
+                assert_eq!(
+                    c.trunc, c.half_away,
+                    "case {}: f<.5 -> trunc==half_away==g_lo",
+                    c.label
+                );
+            } else if c.label.contains("f=.75") {
+                assert_ne!(
+                    c.trunc.to_bits(),
+                    c.half_away.to_bits(),
+                    "case {}: f>.5 -> trunc(g_lo) != half_away(g_hi)",
+                    c.label
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bf16_tie_cases_want_matches_to_bf16() {
         // Ground-truth check on the ported table itself: to_bf16 (verified
         // bit-exact against half::bf16::from_f32 elsewhere in this crate)
@@ -1173,6 +1394,179 @@ mod tests {
         }
     }
 
+    // ---- Tracing capture: for asserting on `event=...` field values
+    // without a global logger, since no in-crate capture pattern existed
+    // (Task 5 Step 2 fallback). Thread-scoped (`with_default`), so parallel
+    // `cargo test` runs don't cross-contaminate captures. ------------------
+
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        use std::io;
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for BufWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let writer = BufWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // ---- from_opts handshake, end-to-end (tempfile, no OV) -----------------
+    //
+    // Every filesystem/stamp check runs BEFORE the shim probe, so a synthetic
+    // export_stamp.json + manifest.json exercises the real `from_opts`
+    // dispatch (not just the pure `check_stamp` function) with no device.
+
+    fn write_fixture(dir: &std::path::Path, stamp: &serde_json::Value, manifest_bytes: &[u8]) {
+        let attn_dir = dir.join("attn_ov");
+        std::fs::create_dir_all(&attn_dir).unwrap();
+        std::fs::write(
+            attn_dir.join("export_stamp.json"),
+            serde_json::to_vec(stamp).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest_bytes).unwrap();
+    }
+
+    fn stamp_json(
+        manifest_sha256: &str,
+        w: usize,
+        p_max: usize,
+        rows: usize,
+        layers: &[&str],
+    ) -> serde_json::Value {
+        let digest: HashMap<String, String> = layers
+            .iter()
+            .map(|l| (l.to_string(), "x".to_string()))
+            .collect();
+        serde_json::json!({
+            "manifest_sha256": manifest_sha256,
+            "per_layer_digest": digest,
+            "exporter_version": "1",
+            "w": w,
+            "p_max": p_max,
+            "rows": rows,
+            "hidden": 16,
+            "kv_lora": 4,
+            "qk_rope": 4,
+        })
+    }
+
+    #[test]
+    fn from_opts_ok_stamp_falls_through_to_the_shim_probe() {
+        // Proves the StampCheck::Ok arm does NOT erroneously short-circuit:
+        // the only event reaching the log must be the shim probe's (stub
+        // build), never a stale_ir/w_mismatch false positive.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = b"fake manifest bytes";
+        let sha = sha256_hex(manifest_bytes);
+        let stamp = stamp_json(&sha, 8, 4, 4, &["00", "01"]);
+        write_fixture(dir.path(), &stamp, manifest_bytes);
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8); // derive_w == 8, matches stamp.w
+        let log = capture_logs(|| {
+            let result = OvAttn::from_opts(dir.path(), &[0, 1], &manifest, &opts);
+            assert!(result.is_none(), "stub build must fail the shim probe");
+        });
+        assert!(!log.contains("ov_attn_stale_ir"), "log:\n{log}");
+        assert!(!log.contains("ov_attn_w_mismatch"), "log:\n{log}");
+        assert!(log.contains("ov_attn_unavailable"), "log:\n{log}");
+    }
+
+    #[test]
+    fn from_opts_rejects_manifest_sha_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = b"fake manifest bytes";
+        let stamp = stamp_json("deadbeefdeadbeef", 8, 4, 4, &["00", "01"]); // wrong hash
+        write_fixture(dir.path(), &stamp, manifest_bytes);
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8);
+        let log = capture_logs(|| {
+            let result = OvAttn::from_opts(dir.path(), &[0, 1], &manifest, &opts);
+            assert!(result.is_none());
+        });
+        assert!(log.contains("ov_attn_stale_ir"), "log:\n{log}");
+        assert!(log.contains("manifest_sha_mismatch"), "log:\n{log}");
+    }
+
+    #[test]
+    fn from_opts_rejects_w_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = b"fake manifest bytes";
+        let sha = sha256_hex(manifest_bytes);
+        // Internally consistent (995+4==999) but disagrees with the live
+        // manifest's derived W (8).
+        let stamp = stamp_json(&sha, 999, 995, 4, &["00", "01"]);
+        write_fixture(dir.path(), &stamp, manifest_bytes);
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8);
+        let log = capture_logs(|| {
+            let result = OvAttn::from_opts(dir.path(), &[0, 1], &manifest, &opts);
+            assert!(result.is_none());
+        });
+        assert!(log.contains("ov_attn_w_mismatch"), "log:\n{log}");
+    }
+
+    #[test]
+    fn from_opts_rejects_missing_layer_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = b"fake manifest bytes";
+        let sha = sha256_hex(manifest_bytes);
+        let stamp = stamp_json(&sha, 8, 4, 4, &["00", "01"]); // no digest for layer 2
+        write_fixture(dir.path(), &stamp, manifest_bytes);
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8);
+        let log = capture_logs(|| {
+            let result = OvAttn::from_opts(dir.path(), &[0, 1, 2], &manifest, &opts);
+            assert!(result.is_none());
+        });
+        assert!(log.contains("ov_attn_stale_ir"), "log:\n{log}");
+        assert!(log.contains("missing_layer_digest"), "log:\n{log}");
+    }
+
+    #[test]
+    fn from_opts_reports_ir_missing_when_stamp_absent() {
+        let dir = tempfile::tempdir().unwrap(); // no attn_ov/ created at all
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8);
+        let log = capture_logs(|| {
+            let result = OvAttn::from_opts(dir.path(), &[0, 1], &manifest, &opts);
+            assert!(result.is_none());
+        });
+        assert!(log.contains("ov_attn_ir_missing"), "log:\n{log}");
+    }
+
     // ---- State machine: poison latch (pure, no OV) -------------------------
 
     fn test_instance() -> OvAttn {
@@ -1187,9 +1581,11 @@ mod tests {
             hidden: 16,
             layers_ok: 2,
             layers_expected: 2,
+            min_rows: 64,
             poisoned: AtomicBool::new(false),
             transient_fails: AtomicU32::new(0),
             used: AtomicBool::new(false),
+            contract_violation_warned: AtomicBool::new(false),
         }
     }
 
@@ -1217,19 +1613,19 @@ mod tests {
     fn three_consecutive_transient_failures_latch() {
         let ov = test_instance();
         let err = OvError::Native("device busy".to_string());
-        ov.note_infer_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
         assert_eq!(
             ov.state(),
             OvAttnState::Enabled,
             "1st transient: not yet latched"
         );
-        ov.note_infer_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
         assert_eq!(
             ov.state(),
             OvAttnState::Enabled,
             "2nd transient: not yet latched"
         );
-        ov.note_infer_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
         assert_eq!(
             ov.state(),
             OvAttnState::Poisoned,
@@ -1237,21 +1633,36 @@ mod tests {
         );
     }
 
+    /// Drives the REAL success path `prefill_window` calls
+    /// (`note_infer_success`), not the raw atomic — a version of this test
+    /// that pokes `transient_fails.store(0, ..)` directly proves nothing
+    /// about whether `prefill_window`'s success branch actually resets it
+    /// (verified: deleting the `store` inside `note_infer_success` turns
+    /// this test red, since both `prefill_window` and this test now share
+    /// that one method).
     #[test]
-    fn a_reset_transient_counter_does_not_accumulate_across_successes() {
+    fn a_success_between_failures_resets_the_consecutive_counter() {
         let ov = test_instance();
         let err = OvError::Native("device busy".to_string());
-        ov.note_infer_failure(0, "CPU", &err);
-        ov.note_infer_failure(0, "CPU", &err);
-        // Simulate an intervening success (prefill_window resets the counter
-        // on every successful window).
-        ov.transient_fails.store(0, Ordering::Relaxed);
-        ov.note_infer_failure(0, "CPU", &err);
-        ov.note_infer_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
+        ov.note_infer_success(); // the exact method prefill_window's success return calls
+        ov.note_shim_failure(0, "CPU", &err);
+        ov.note_shim_failure(0, "CPU", &err);
+        assert_eq!(
+            ov.transient_fails.load(Ordering::Relaxed),
+            2,
+            "the post-reset pair must not add onto the pre-reset pair"
+        );
+        assert_ne!(
+            ov.state(),
+            OvAttnState::Poisoned,
+            "non-consecutive failures (reset by a success in between) must not latch"
+        );
         assert_eq!(
             ov.state(),
-            OvAttnState::Enabled,
-            "non-consecutive failures (reset by a success in between) must not latch"
+            OvAttnState::Active,
+            "the success marks it Active"
         );
     }
 
@@ -1261,12 +1672,31 @@ mod tests {
         let err = OvError::Native(
             "compile on GPU: openvino-genai error: resource unavailable try again".to_string(),
         );
-        ov.note_infer_failure(0, "GPU", &err);
+        ov.note_shim_failure(0, "GPU", &err);
         assert_eq!(
             ov.state(),
             OvAttnState::Poisoned,
             "fatal resource error must latch immediately"
         );
+    }
+
+    /// The bug this guards: `note_logic_error` (output-shape-mismatch path,
+    /// reached only after every shim call in the window already succeeded)
+    /// must NEVER consult the typed/string resource-exhaustion classifier —
+    /// the thread-local shim error code is never cleared on success and can
+    /// still hold whatever an unrelated earlier failure left behind. Proven
+    /// here by feeding it a message that WOULD trip the string classifier if
+    /// it were consulted; it must still only count as one transient.
+    #[test]
+    fn logic_error_never_latches_on_first_occurrence_even_with_fatal_looking_text() {
+        let ov = test_instance();
+        ov.note_logic_error(0, "resource unavailable try again (unrelated stale text)");
+        assert_ne!(
+            ov.state(),
+            OvAttnState::Poisoned,
+            "a logic error must never fatal-latch on the first occurrence"
+        );
+        assert_eq!(ov.transient_fails.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1275,5 +1705,22 @@ mod tests {
         ov.poison("first");
         ov.poison("second"); // must not double-log-crash or flip anything further
         assert_eq!(ov.state(), OvAttnState::Poisoned);
+    }
+
+    // ---- prefill_window contract-violation trace (item 7) ------------------
+
+    #[test]
+    fn prefill_window_contract_violation_warns_once_not_per_call() {
+        let ov = test_instance(); // rows_cap=4, p_max=4, hidden=16, kv_lora=4, qk_rope=4
+        let log = capture_logs(|| {
+            // rows == 0 is invalid.
+            assert!(ov.prefill_window(0, &[], 0, &[], &[], 0).is_none());
+            // rows > rows_cap is invalid.
+            assert!(ov
+                .prefill_window(0, &vec![0.0; 5 * 16], 5, &[], &[], 0)
+                .is_none());
+        });
+        let count = log.matches("ov_attn_contract_violation").count();
+        assert_eq!(count, 1, "warn should fire once, not per-call; log:\n{log}");
     }
 }
