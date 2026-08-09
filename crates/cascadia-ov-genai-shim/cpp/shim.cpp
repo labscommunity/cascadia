@@ -5,6 +5,7 @@
 
 #include "shim.h"
 
+#include "bf16_canary.hpp"
 #include "gemv_offload.hpp"
 
 #include <cstring>
@@ -205,6 +206,10 @@ struct cascadia_runtime_t {
 };
 
 extern "C" {
+
+int32_t cascadia_shim_abi_version() {
+    return CASCADIA_SHIM_ABI_VERSION;
+}
 
 int32_t cascadia_last_error_code() {
     return g_last_error_code;
@@ -1178,6 +1183,67 @@ int32_t cascadia_runtime_output_copy(
         return 0;
     } catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) { set_last_error("unknown exception in output_copy"); return 1; }
+}
+
+int32_t cascadia_runtime_get_property(
+    cascadia_runtime_t* handle, const char* property,
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    if (!handle || !handle->compiled || !property) {
+        set_last_error("null arg in runtime_get_property"); return 1;
+    }
+    try {
+        ov::Any v = handle->compiled->get_property(std::string(property));
+        std::ostringstream oss;
+        v.print(oss);
+        return copy_name_to_buf(oss.str(), out_buf, out_cap, out_len);
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in runtime_get_property"); return 1; }
+}
+
+int32_t cascadia_runtime_compile_bf16_canary(
+    size_t n, const char* device,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_runtime_t** out_handle) {
+    if (!device || !out_handle) {
+        set_last_error("null arg in runtime_compile_bf16_canary"); return 1;
+    }
+    if (n == 0 || n > MAX_TENSOR_BYTES / sizeof(float)) {
+        set_last_error("n out of range in runtime_compile_bf16_canary"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+        auto model = cascadia_bf16::build_canary_model(n);
+        auto compiled = handle->core.compile_model(model, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown C++ exception in runtime_compile_bf16_canary"); return 1; }
 }
 
 // ===================== Core enumeration =====================

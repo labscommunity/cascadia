@@ -29,6 +29,7 @@ pub mod lookahead;
 pub mod model;
 pub mod moe;
 pub mod mtp;
+pub mod ov_attn;
 pub mod ov_expert;
 pub mod prof;
 pub mod residency;

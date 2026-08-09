@@ -79,6 +79,7 @@ fn main() {
     build
         .file("cpp/shim.cpp")
         .file("cpp/gemv_offload.cpp")
+        .file("cpp/bf16_canary.cpp")
         .include(&runtime_include)
         .include(&genai_include)
         .include(&tbb_include);
@@ -116,6 +117,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/shim.h");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.cpp");
     println!("cargo:rerun-if-changed=cpp/gemv_offload.hpp");
+    println!("cargo:rerun-if-changed=cpp/bf16_canary.cpp");
+    println!("cargo:rerun-if-changed=cpp/bf16_canary.hpp");
     println!("cargo:rerun-if-env-changed=INTEL_OPENVINO_DIR");
     // Track the SDK's CONTENTS, not just the env value: fleets swap the SDK
     // behind a stable INTEL_OPENVINO_DIR (side-by-side install + junction),

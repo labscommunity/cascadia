@@ -190,6 +190,18 @@ pub struct StageOpts {
     /// OV expert cache byte budget (MiB), the primary bound. `None` →
     /// `CASCADIA_GLM5_OV_CACHE_MB`.
     pub ov_cache_mb: Option<u64>,
+    /// OV attention prefill offload (iGPU). `None` → `CASCADIA_GLM5_OV_ATTN`.
+    /// Resolved (with source logging) inside `OvAttn::from_opts`, not here —
+    /// same reasoning as the three `Option` fields above.
+    pub ov_attn: Option<bool>,
+    /// OV attention device. `None` → `CASCADIA_GLM5_OV_ATTN_DEVICE` (default
+    /// `GPU`, resolved in `OvAttn::from_opts`).
+    pub ov_attn_device: Option<String>,
+    /// Minimum real rows a window needs before it's eligible for OV attention
+    /// offload. `None` → `CASCADIA_GLM5_OV_ATTN_MIN_ROWS` (default 64).
+    /// REQUIRED to stay configurable: the tiny parity model has `W=8`, so a
+    /// hardcoded 64 floor would make the parity harness exercise nothing.
+    pub ov_attn_min_rows: Option<u32>,
 }
 
 impl StageOpts {
@@ -210,6 +222,9 @@ impl StageOpts {
             prefix_cache_depth: None,
             ov_cache_entries: None,
             ov_cache_mb: None,
+            ov_attn: None,
+            ov_attn_device: None,
+            ov_attn_min_rows: None,
         }
     }
 
@@ -242,6 +257,12 @@ impl StageOpts {
             prefix_cache_depth,
             ov_cache_entries,
             ov_cache_mb,
+            // No config-arg parameters yet (wired by a later task alongside
+            // SparseMoEBuilderConfig); `None` falls through to OvAttn::from_opts's
+            // own env fallback, same precedence story as the fields above.
+            ov_attn: None,
+            ov_attn_device: None,
+            ov_attn_min_rows: None,
         }
     }
 }
@@ -274,6 +295,14 @@ pub struct GlmRunner {
     /// Per-rank KV-prefix cache of this rank's layer slice, keyed by a prefix key
     /// rank 0 assigns. Disabled (cap 0) unless `CASCADIA_GLM5_PREFIX_CACHE` is set.
     prefix_cache: SliceKvCache,
+    /// Optional OpenVINO attention prefill backend (iGPU offload). `Some` only
+    /// when `ov_attn` is enabled AND the stamp/precision/canary preconditions
+    /// all pass at construction — every failure mode logs its own
+    /// distinguishable event (see `ov_attn.rs`). Threading this into
+    /// `forward_layers_batch`'s per-window routing is a later task; this field
+    /// exists so `load_staged` performs the startup probe / eager compile /
+    /// config log this task owns.
+    ov_attn: Option<super::ov_attn::OvAttn>,
 }
 
 impl GlmRunner {
@@ -396,6 +425,16 @@ impl GlmRunner {
                 }
             }
         }
+
+        // Optional OpenVINO attention backend (iGPU prefill offload). `Some`
+        // only when `ov_attn` is enabled and every startup precondition
+        // (stamp handshake, startup probe, bf16 device canary, eager compile)
+        // passes; `owned_layers` carries GLOBAL indices so `from_opts` can key
+        // its compiled-layer map by LOCAL offset (this rank's position in the
+        // slice) without a signature change rippling into
+        // `forward_layers_batch`.
+        let owned_layers: Vec<usize> = (lo..hi).collect();
+        let ov_attn = super::ov_attn::OvAttn::from_opts(dir, &owned_layers, &m, &opts);
 
         // `CASCADIA_GLM5_NOPIN=1` disables ALL residency pinning: the hard
         // minimum-working-set raise below AND both pin passes.
@@ -562,6 +601,7 @@ impl GlmRunner {
                     })
                     .unwrap_or(0),
             ),
+            ov_attn,
         })
     }
 
@@ -671,6 +711,16 @@ impl GlmRunner {
     /// Each node writes its own file (it only records its own layers); best-effort.
     pub fn save_usage(&self) -> std::io::Result<()> {
         self.usage.lock().unwrap().save(&self.usage_path)
+    }
+
+    /// This rank's OpenVINO attention backend, if `ov_attn` is enabled and
+    /// construction succeeded — `None` for any of the reasons `ov_attn.rs`'s
+    /// module doc enumerates (each already logged its own distinguishable
+    /// event at construction time). Prefill-window routing through this is a
+    /// later task; exposed now so that task's `forward_layers_batch` change
+    /// has a field to read instead of re-deriving construction.
+    pub fn ov_attn(&self) -> Option<&super::ov_attn::OvAttn> {
+        self.ov_attn.as_ref()
     }
 }
 

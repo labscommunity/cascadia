@@ -46,7 +46,11 @@ const SHARED: u32 = u32::MAX;
 /// to one bad IR. Only this latches [`OvExperts::poison`]: `CL_INVALID_EVENT`
 /// can be a one-off under momentary pressure and stays per-key. String fallback
 /// for the typed `last_error_resource_exhausted` check (stub builds, old shims).
-fn is_fatal_resource_error(msg: &str) -> bool {
+///
+/// `pub(crate)`: `ov_attn.rs` reuses this exact classifier for its own poison
+/// latch (same trigger taxonomy, by design — see its module doc) rather than
+/// keeping a second copy that could silently drift from this one.
+pub(crate) fn is_fatal_resource_error(msg: &str) -> bool {
     msg.contains("resource unavailable")
 }
 

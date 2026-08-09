@@ -70,6 +70,8 @@ mod sys {
     }
 
     extern "C" {
+        pub fn cascadia_shim_abi_version() -> i32;
+
         pub fn cascadia_last_error_message() -> *const c_char;
         pub fn cascadia_last_error_code() -> i32;
 
@@ -319,6 +321,22 @@ mod sys {
             out_buf_size: usize,
         ) -> c_int;
 
+        pub fn cascadia_runtime_get_property(
+            handle: *mut cascadia_runtime_t,
+            property: *const c_char,
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
+
+        pub fn cascadia_runtime_compile_bf16_canary(
+            n: usize,
+            device: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+
         pub fn cascadia_core_list_devices(
             out_buf: *mut c_char,
             out_cap: usize,
@@ -384,6 +402,23 @@ fn last_native_error() -> String {
         } else {
             CStr::from_ptr(p).to_string_lossy().into_owned()
         }
+    }
+}
+
+/// This shim build's C ABI version (see `cpp/shim.h`'s `CASCADIA_SHIM_ABI_VERSION`
+/// doc comment) — `None` on a stub build, since there is no linked C++ to
+/// version. Callers that need "is this a real, ABI-current shim?" compare the
+/// `Some` value against their own expected constant; treat `None` the same as
+/// a version mismatch (both mean "the precision-readback / canary path this
+/// caller depends on may not exist").
+pub fn shim_abi_version() -> Option<i32> {
+    #[cfg(feature = "openvino")]
+    {
+        Some(unsafe { sys::cascadia_shim_abi_version() })
+    }
+    #[cfg(not(feature = "openvino"))]
+    {
+        None
     }
 }
 
@@ -1258,6 +1293,71 @@ impl Runtime {
             return Err(Error::Native(last_native_error()));
         }
         Ok((Self { handle }, offloaded))
+    }
+
+    /// Compile the standalone bf16-roundtrip canary graph (`n` scalar
+    /// inputs) — see `cpp/shim.h`'s `cascadia_runtime_compile_bf16_canary`
+    /// doc comment. Used by the OV-attn enablement precondition (device
+    /// canary, spec Sec9 gate 0): the exact arithmetic subgraph every
+    /// exported attn_ov layer embeds after each linear/RMSNorm/rope, run in
+    /// isolation against controlled inputs so a silently-elided Convert or a
+    /// wrong-tie-mode Round on THIS device+compile config is caught before
+    /// any traffic uses the path. Input tensor "x", output tensor "y" (or
+    /// output index 0), both `[n]` f32 — drive via the ordinary
+    /// `set_input`/`infer`/`output` calls.
+    pub fn compile_bf16_canary(n: usize, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        Self::do_compile_bf16_canary(n, device, plugin)
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    fn do_compile_bf16_canary(_n: usize, _device: &str, _plugin: &PluginConfig) -> Result<Self> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    fn do_compile_bf16_canary(n: usize, device: &str, plugin: &PluginConfig) -> Result<Self> {
+        let device_c = cstr(device)?;
+        let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+        for (k, v) in &plugin.entries {
+            owned.push(cstr(k)?);
+            owned.push(cstr(v)?);
+        }
+        let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+        let rc = unsafe {
+            sys::cascadia_runtime_compile_bf16_canary(
+                n,
+                device_c.as_ptr(),
+                ptrs.as_ptr(),
+                plugin.entries.len(),
+                &mut handle,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Native(last_native_error()));
+        }
+        Ok(Self { handle })
+    }
+
+    /// Read a property back from THIS compiled model (as opposed to the
+    /// free-standing [`device_property`], which queries a device before any
+    /// compile) — e.g. the EFFECTIVE `INFERENCE_PRECISION_HINT` after
+    /// compilation, since a compile hint is not a guarantee.
+    pub fn property(&self, name: &str) -> Result<String> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = name;
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let name_c = cstr(name)?;
+            unsafe {
+                fetch_buffered_string(|buf, cap, len| {
+                    sys::cascadia_runtime_get_property(self.handle, name_c.as_ptr(), buf, cap, len)
+                })
+            }
+        }
     }
 
     /// Per-node profiling of the last inference as TSV lines

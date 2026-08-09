@@ -31,6 +31,17 @@ typedef struct cascadia_genconfig_t cascadia_genconfig_t;
 typedef struct cascadia_tokenizer_t cascadia_tokenizer_t;
 typedef struct cascadia_runtime_t cascadia_runtime_t;
 
+/// ABI marker for this compiled shim's C surface. Bump on every symbol
+/// addition/change that a Rust binding depends on. Rust asserts this against
+/// its own expected constant at startup (glm5 ov_attn's `from_opts`) so a
+/// shim built from a version that predates a required symbol fails LOUDLY
+/// (event=ov_attn_unavailable) instead of silently skipping a safety check —
+/// this fleet has a documented history of stale-DLL / stale-object rebuilds
+/// going unnoticed. Bumped to 2 for cascadia_runtime_get_property +
+/// cascadia_runtime_compile_bf16_canary (glm5-attn-igpu-t3 Task 5).
+#define CASCADIA_SHIM_ABI_VERSION 2
+int32_t cascadia_shim_abi_version();
+
 /// Get the last error message thrown anywhere in the shim. Static buffer;
 /// not thread-safe — read it on the same thread that triggered the error.
 const char* cascadia_last_error_message();
@@ -370,6 +381,32 @@ int32_t cascadia_runtime_output_byte_size(
 int32_t cascadia_runtime_output_copy(
     cascadia_runtime_t* handle, size_t output_idx,
     void* out_buf, size_t out_buf_size);
+
+/// Read a property back from a COMPILED model (as opposed to
+/// cascadia_core_get_property, which queries a device before any compile) —
+/// e.g. the EFFECTIVE INFERENCE_PRECISION_HINT / DYNAMIC_QUANTIZATION_GROUP_SIZE
+/// after compilation, since a compile hint is not a guarantee. Same
+/// size-query-then-fill convention as cascadia_core_get_property.
+int32_t cascadia_runtime_get_property(
+    cascadia_runtime_t* handle, const char* property,
+    char* out_buf, size_t out_cap, size_t* out_len);
+
+/// Compile a standalone `x[n] -> bf16-roundtrip -> y` canary graph: the exact
+/// arithmetic bf16-rounding subgraph every attn_ov layer graph embeds after
+/// each linear/RMSNorm/rope (see tools/glm5_attn_ov.py::_bf16_roundtrip and
+/// cpp/bf16_canary.cpp). Built from arithmetic ops, not Convert, because a
+/// plain Convert(f32->bf16)->Convert(bf16->f32) pair was observed silently
+/// elided as an identity by the CPU plugin under INFERENCE_PRECISION_HINT=f32
+/// — this is what the device canary (spec Sec9 gate 0) actually exercises.
+/// The returned handle is driven via the ordinary cascadia_runtime_set_input /
+/// cascadia_runtime_infer / cascadia_runtime_output_* calls (input "x",
+/// output "y", both `[n]` f32).
+int32_t cascadia_runtime_compile_bf16_canary(
+    size_t n,
+    const char* device,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_runtime_t** out_handle);
 
 // ---- Core enumeration (no compile) ----------------------------------------
 //
