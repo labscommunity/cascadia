@@ -144,9 +144,16 @@ impl GlmLayer {
         assert_eq!(xs.len(), rows * self.hidden);
         assert_eq!(carries.len(), rows, "one IndexShare carry per prompt row");
         let hd = self.hidden;
+        // T2 spike (G2): attention's share of prefill layer time, cumulative
+        // across layers and requests. Opt-in via CASCADIA_GLM5_ATTN_PROFILE=1;
+        // zero cost when off. Denominator = layer forward time (embed/head and
+        // cross-rank relay excluded — stated in the verdict doc).
+        let prof = attn_profile_enabled();
+        let t_all = prof.then(std::time::Instant::now);
         // h = x + attn(rmsnorm(x, in_ln)); nrm2 = rmsnorm(h, post_ln).  Sequential.
         let mut h = vec![0.0f32; rows * hd];
         let mut nrm2 = vec![0.0f32; rows * hd];
+        let t_attn = prof.then(std::time::Instant::now);
         for r in 0..rows {
             let x = &xs[r * hd..(r + 1) * hd];
             let mut nrm = x.to_vec();
@@ -157,6 +164,12 @@ impl GlmLayer {
             rmsnorm(&mut n2, &self.post_ln, self.eps);
             h[r * hd..(r + 1) * hd].copy_from_slice(&hrow);
             nrm2[r * hd..(r + 1) * hd].copy_from_slice(&n2);
+        }
+        if let Some(t) = t_attn {
+            ATTN_PREFILL_NS.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         // out = h + mlp(nrm2): MoE batched (dedup expert loads), dense per row.
         let f = match &self.mlp {
@@ -173,8 +186,31 @@ impl GlmLayer {
         for (hi, &fi) in h.iter_mut().zip(&f) {
             *hi += fi;
         }
+        if let Some(t) = t_all {
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = LAYER_PREFILL_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed)
+                + t.elapsed().as_nanos() as u64;
+            let attn = ATTN_PREFILL_NS.load(Relaxed);
+            tracing::info!(
+                target: "cascadia::glm5",
+                event = "attn_prefill_share",
+                attn_ms = attn / 1_000_000,
+                layer_ms = total / 1_000_000,
+                share_pct = (attn as f64 / total.max(1) as f64) * 100.0,
+            );
+        }
         h
     }
+}
+
+/// Cumulative prefill timers for the T2 attention-share measurement
+/// (`CASCADIA_GLM5_ATTN_PROFILE=1`); process-wide across layers and requests.
+static ATTN_PREFILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAYER_PREFILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn attn_profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CASCADIA_GLM5_ATTN_PROFILE").is_some())
 }
 
 /// Full GLM-5.2 model: embed → layers → final RMSNorm → lm_head. Single-stream
