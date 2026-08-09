@@ -104,7 +104,11 @@ pub enum OvSkipReason {
     InferFailed,
     /// The graph produced a NaN/Inf in a real row.
     NonFinite,
-    /// [`super::attn::AttentionLayer::commit_prefill_rows`] rejected the rows.
+    /// The window could not be committed:
+    /// [`super::attn::AttentionLayer::commit_prefill_rows`] returned `Err`, or
+    /// the pre-commit shape check rejected `attn_out`. The two are told apart by
+    /// the WARN that accompanies them (`ov_attn_commit_failed` vs
+    /// `ov_attn_bad_shape`); neither wrote anything.
     CommitFailed,
 }
 

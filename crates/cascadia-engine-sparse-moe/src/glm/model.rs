@@ -268,6 +268,29 @@ impl GlmLayer {
         };
 
         // Validate everything before touching live state.
+        //
+        // The `attn_out` length cannot be wrong today (`prefill_window` and
+        // `read_rows` both bound it), but the row loop that slices it runs AFTER
+        // `commit_prefill_rows` has advanced `len` — so an invariant break would
+        // panic mid-partial-state. `commit_prefill_rows` checks its own two
+        // slices; this is the third, checked in the same place rather than
+        // trusted. `lc`/`rc` stay the commit's business so its errors keep
+        // naming themselves.
+        if out.attn_out.len() != rows * hd {
+            tracing::warn!(
+                target: "cascadia::glm5",
+                event = "ov_attn_bad_shape",
+                layer_local = route.layer_local,
+                base,
+                rows,
+                attn_out_len = out.attn_out.len(),
+                want = rows * hd,
+            );
+            route
+                .tally
+                .note_skip(super::ov_attn::OvSkipReason::CommitFailed);
+            return false;
+        }
         let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
         if !finite(&out.attn_out) || !finite(&out.lc) || !finite(&out.rc) {
             tracing::warn!(
@@ -330,9 +353,14 @@ impl GlmLayer {
 }
 
 /// The eligibility gate: `Some(reason)` means this window does not go to OV.
-/// `rows > rows_cap` is folded into `WindowTooLarge` rather than left to
-/// `prefill_window` — that would trip its caller-bug contract WARN, which is
-/// meant for a stride bug, not for a legitimately oversized prompt window.
+///
+/// BOTH static-shape bounds are checked here, not left to `prefill_window`:
+/// `w == p_max + rows_cap`, so `base + rows <= w` implies neither
+/// `rows <= rows_cap` nor `base <= p_max` on its own (a short window late in the
+/// budget overruns `p_max`; a long window at base 0 overruns `rows_cap`).
+/// Letting either reach `prefill_window` trips its one-time contract WARN, whose
+/// text blames a caller-side stride bug — a misdiagnosis, since an oversized or
+/// late window is legitimate. Both are `WindowTooLarge` instead.
 fn ov_ineligible(
     ov: &super::ov_attn::OvAttn,
     layer_local: usize,
@@ -346,7 +374,7 @@ fn ov_ineligible(
     if !ov.layer_compiled(layer_local) {
         return Some(OvSkipReason::LayerNotCompiled);
     }
-    if base + rows > ov.w || rows > ov.rows_cap {
+    if base + rows > ov.w || rows > ov.rows_cap || base > ov.p_max {
         return Some(OvSkipReason::WindowTooLarge);
     }
     if rows < ov.min_rows as usize {
@@ -1179,6 +1207,20 @@ mod ov_prefill_tests {
                 ),
                 OvSkipReason::CommitFailed,
             ),
+            // Short attn_out: the pre-commit shape check must catch it, so the
+            // row loop can never slice past the end AFTER `len` advanced.
+            (
+                "bad_shape",
+                OvAttn::mock(
+                    mock_cfg(),
+                    Box::new(|_, _, n, _| {
+                        let mut o = canned(n, 5);
+                        o.attn_out.truncate(o.attn_out.len() - HIDDEN);
+                        Some(o)
+                    }),
+                ),
+                OvSkipReason::CommitFailed,
+            ),
             (
                 "layer_not_compiled",
                 OvAttn::mock(
@@ -1241,6 +1283,84 @@ mod ov_prefill_tests {
             assert_eq!(tally.layers_rust, 1, "{label}");
             assert_eq!(tally.skipped_reason(), reason.as_str(), "{label}");
         }
+    }
+
+    /// A window whose base overruns the graph's past capacity must be caught by
+    /// eligibility, not by `prefill_window`.
+    ///
+    /// `w == p_max + rows_cap` is a stamp invariant, so `base + rows <= w` does
+    /// NOT bound `base` by `p_max` once `rows < rows_cap` — here `base=10`,
+    /// `rows=5`, `w=16`, `p_max=8`: the budget check passes and the past check
+    /// is the only thing standing between this window and `prefill_window`'s
+    /// one-time contract WARN, which blames a caller-side stride bug and
+    /// reports the window as `infer_failed`. Production reaches this near the
+    /// end of the budget (W=2048, rows_cap=256 -> any `base > 1792`).
+    #[test]
+    fn a_base_past_p_max_is_window_too_large_not_a_contract_violation() {
+        let (warm, rows) = (10usize, 5usize);
+        let cfg = mock_cfg();
+        assert!(
+            warm + rows <= cfg.w && rows <= cfg.rows_cap && warm > cfg.p_max,
+            "the case must pass the budget/rows bounds and fail only the past bound"
+        );
+        let xs = rows_of(warm + rows, 11);
+        let (head, tail) = xs.split_at(warm * HIDDEN);
+
+        let mut layer = tiny_layer(Some(true));
+        let mut c: Option<Vec<usize>> = None;
+        for r in 0..warm {
+            layer.forward_token(&head[r * HIDDEN..(r + 1) * HIDDEN], &mut c);
+        }
+
+        let (ov, calls) = recording_mock(cfg, |n| canned(n, 5));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let mut tally = OvPrefillTally::default();
+        let log = capture_logs(|| {
+            let (_, t) = run_ov(&mut layer, &ov, tail, rows, &mut carries);
+            tally = t;
+        });
+
+        assert_eq!(
+            tally.skipped_reason(),
+            "window_too_large",
+            "a base past p_max must name the shape bound, not infer_failed"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the window must never reach prefill_window"
+        );
+        assert!(
+            !log.contains("ov_attn_contract_violation"),
+            "a legitimate late window must not be blamed on a caller stride bug; log:\n{log}"
+        );
+    }
+
+    /// Capture everything `tracing` emits while `f` runs.
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        use std::io;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for BufWriter {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = BufWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// A latched backend must report `poisoned` rather than fall back silently

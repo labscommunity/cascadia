@@ -350,3 +350,59 @@ fn glm5_ov_attn_disabled_is_silent_and_byte_identical() {
         "an ov_attn line escaped with the feature off; log:\n{log}"
     );
 }
+
+/// `ov_attn` on an accelerator implies `nopin`. Attention-IR GPU allocations
+/// plus expert pinning is the measured combination that killed ranks 100/100,
+/// so the pin-skip must be driven by the *request*, before and regardless of
+/// whether any IR compiles.
+///
+/// No env var and no `experts_ov/` fixture needed: `requested_on_accelerator`
+/// is true from `StageOpts` alone, `OvAttn::from_opts` returns `None` here (the
+/// fixture ships no `attn_ov/`), and the pin-skip branch is outside the
+/// `ExpertsMode::Mmap` guard — so the line still fires. The CPU-device control
+/// run is what makes this an assertion about `ov_attn` rather than about the
+/// line merely existing.
+#[test]
+fn glm5_ov_attn_on_an_accelerator_skips_expert_pinning() {
+    const SKIP_LINE: &str = "skipping expert pinning";
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
+    if !dir.join("manifest.json").exists() {
+        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
+        return;
+    }
+    if std::env::var_os("CASCADIA_GLM5_NOPIN").is_some() {
+        eprintln!("SKIP: CASCADIA_GLM5_NOPIN already suppresses the pin-skip line");
+        return;
+    }
+    let max_seq = 32usize;
+    let load = |opts: StageOpts| {
+        capture_logs(|| {
+            // `from_opts` returns None (no attn_ov/ in the fixture), which is
+            // the point: the pin decision must not wait on it.
+            let r = GlmRunner::load_staged(&dir, max_seq, 0, 1, 0, 0, opts).expect("load");
+            assert!(r.ov_attn().is_none());
+        })
+    };
+
+    let gpu = load(StageOpts {
+        ov_attn: Some(true),
+        ov_attn_device: Some("GPU".to_string()),
+        ..Default::default()
+    });
+    assert!(
+        gpu.contains(SKIP_LINE),
+        "ov_attn on GPU must skip expert pinning; log:\n{gpu}"
+    );
+
+    // Control: same knob, CPU device. CPU has no shared pool to starve, so
+    // pinning must stay on — otherwise the assertion above proves nothing.
+    let cpu = load(StageOpts {
+        ov_attn: Some(true),
+        ov_attn_device: Some("CPU".to_string()),
+        ..Default::default()
+    });
+    assert!(
+        !cpu.contains(SKIP_LINE),
+        "ov_attn on CPU must NOT disable pinning; log:\n{cpu}"
+    );
+}
