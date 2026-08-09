@@ -279,10 +279,24 @@ def _bf16_roundtrip(node):
     `ops.round`'s `half_to_even` mode was verified directly against known
     tie cases (0.5->0, 1.5->2, 2.5->2, -0.5->-0, -1.5->-2). `x==0` and
     `is_nan(x)` are special-cased (the bisection has no valid exponent for
-    either; NaN is canonicalized to `0x7FC0` widened, matching every
-    `BF16_TIE_CASES` NaN expectation, though not `half`'s payload-preserving
-    behavior -- unreachable in practice, matching `bf16_round`'s own doc
-    note that activations are never NaN)."""
+    either); NaN is canonicalized to `0x7FC0` widened, matching every
+    `BF16_TIE_CASES` NaN expectation, though NOT `half`'s payload- or
+    SIGN-preserving behavior (a negative NaN loses its sign bit here,
+    e.g. `0xffc00000 -> 0x7fc00000`) -- unreachable in practice, matching
+    `bf16_round`'s own doc note that activations are never NaN.
+
+    fix round 1 (#6): the bisection floor is `2**-64`, not the full f32
+    subnormal range (`_BF16_BISECT_STEPS`'s comment explains why -- a
+    starting constant at the true f32 floor, `2**-127`, is itself a
+    SUBNORMAL and got silently flushed to zero during development, corrupting
+    the search). The precise, verified consequence: every genuine f32
+    SUBNORMAL, and every normal value with magnitude below `2**-64`
+    (~5.4e-20), rounds to exactly `0.0` here -- NOT just "very extreme"
+    inputs like `1e-30`. `bf16_round` (the numpy reference) rounds those
+    correctly (down to the true bf16 subnormal boundary near `2**-133`).
+    Practical impact is nil for this contract's activations (bf16-native,
+    never remotely that small), but a later task reading this file should
+    trust the bound as stated here, not a narrower one."""
     ax = ops.abs(node)
     e = ops.constant(np.float32(-64.0))
     p = ops.constant(np.float32(2.0 ** -64))
@@ -378,12 +392,15 @@ def _bf16_roundtrip_graph(n: int) -> Model:
     cases (a narrower question than the per-op ULP gate). Originally built
     around a bare `Convert(f32->bf16)->Convert(bf16->f32)` pair; Task 2 found
     that pair gets silently eliminated as an identity by the CPU plugin under
-    `INFERENCE_PRECISION_HINT=f32` (see `_bf16_roundtrip`'s docstring), which
-    made this specific check vacuous (it re-derives the "expected" value from
-    `bf16_round(x)` in Python, so it couldn't tell a real round-trip from a
-    no-op). `_bf16_roundtrip` was replaced with an exact-arithmetic
-    implementation that does NOT suffer that elision, so this graph -- and
-    the check below -- are meaningful again without any change needed here."""
+    `INFERENCE_PRECISION_HINT=f32` (see `_bf16_roundtrip`'s docstring).
+    `_bf16_roundtrip` was replaced with an exact-arithmetic implementation
+    that does NOT suffer that elision — but that alone did NOT make the check
+    below meaningful again: `validate_bf16_roundtrip`'s comparison was
+    SEPARATELY tautological (re-rounds the graph's output via `bf16_round`
+    before comparing, which passes even for an untouched/identity output —
+    reverting `_bf16_roundtrip` to the broken Convert pair left it green, per
+    two independent reviews). Both bugs needed fixing; see
+    `validate_bf16_roundtrip`'s docstring for the second one."""
     x = ops.parameter(PartialShape([n]), Type.f32, name="x")
     x.get_output_tensor(0).set_names({"x"})
     y = _bf16_roundtrip(x)
@@ -414,6 +431,23 @@ def ulp_stats(ref: np.ndarray, got: np.ndarray):
     return int(diff.max()), float(np.mean(diff == 1)), worst, rb, gb
 
 
+def on_grid(x: np.ndarray) -> bool:
+    """`x == bf16_round(x)` — a STRUCTURAL check, independent of `ulp_stats`.
+
+    fix round 1 (#3, IMPORTANT): the ULP check alone re-rounds both sides
+    before comparing (see `validate_bf16_roundtrip`'s docstring for why that
+    class of comparison is elision-blind on its own). Every bf16-contract op
+    graph must be checked with BOTH assertions, not just one: `on_grid`
+    catches "rounding never happened" (a graph that silently passed its
+    input through would still often land within 1 ULP of the CORRECTLY
+    rounded reference after re-rounding, but its raw output would almost
+    never already BE on the bf16 grid); `ulp_stats`'s `max_ulp<=1` tolerance
+    covers only the reduction-order noise numpy/OV/Rust legitimately differ
+    on. Neither assertion subsumes the other."""
+    x = np.asarray(x, dtype=np.float32)
+    return bool(np.array_equal(x, bf16_round(x)))
+
+
 _effective_config_total = 0
 _effective_config_bad: list = []
 
@@ -442,6 +476,51 @@ def compile_checked(core, model: Model, name: str, device: str = None):
                 f"effective={effective!r} (required {required!r})"
             )
     return compiled
+
+
+# fix round 1 (#1, CRITICAL): `compile_checked` recorded drift into
+# `_effective_config_bad`, but only main()'s `--validate-ops`/`--validate-graph`
+# branch ever inspected it -- `--export` and `--bench` both `return`ed before
+# that inline check ran, so a real drift on those two paths (the one that
+# produces what ships, and the one that runs on the GPU plugin where
+# precision/dyn-quant drift is the documented risk) was silently swallowed.
+# Reproduced live: `--inject-bad-config` + `--export` wrote a complete
+# `attn_ov/` tree and exited 0 with 3 unread mismatches recorded.
+#
+# `_config_drift_ok()` is idempotent (prints once, caches the verdict) so it
+# can be called both inline (validate mode's existing report position) and
+# from `_exit_after_drift_check()`, which `main()` calls from a `finally` --
+# a single choke point every exit path passes through, so a future mode
+# can't forget to wire this in.
+_config_drift_report_done = False
+_config_drift_ok_cached = True
+
+
+def _config_drift_ok() -> bool:
+    global _config_drift_report_done, _config_drift_ok_cached
+    if not _config_drift_report_done:
+        _config_drift_report_done = True
+        print("\n== effective-config readback ==")
+        if _effective_config_bad:
+            for msg in _effective_config_bad:
+                print(f"  FAIL: {msg}")
+            print(f"  {len(_effective_config_bad)} mismatch(es) across {_effective_config_total} compiles")
+            _config_drift_ok_cached = False
+        else:
+            print(f"  OK: INFERENCE_PRECISION_HINT={REQUIRED_PRECISION_HINT} and "
+                  f"DYNAMIC_QUANTIZATION_GROUP_SIZE={REQUIRED_DYN_QUANT_GROUP_SIZE} "
+                  f"confirmed effective on all {_effective_config_total} compiles")
+    return _config_drift_ok_cached
+
+
+def _exit_after_drift_check():
+    """The single choke point: `main()` calls this from a `finally`, after
+    EVERY mode (validate-ops, validate-graph, export, bench). No-ops if
+    nothing was compiled (e.g. `--help`); otherwise raises `SystemExit(1)` on
+    drift regardless of what else passed, and never overrides a clean exit's
+    own code."""
+    if _effective_config_total and not _config_drift_ok():
+        raise SystemExit(1)
 
 
 def _kernel_names(compiled) -> set:
@@ -522,12 +601,13 @@ def validate_linear(core) -> bool:
         got = np.array(compiled.create_infer_request().infer({"x": x.reshape(1, in_dim)})[0]).reshape(-1)
 
         max_ulp, flip, worst, rb, gb = ulp_stats(ref, got)
+        grid = on_grid(got)
         _kernel_names_seen.update(_kernel_names(compiled))
-        passed = max_ulp <= 1 and flip <= 0.01
+        passed = max_ulp <= 1 and flip <= 0.01 and grid
         ok &= passed
         status = "PASS" if passed else "FAIL"
         print(f"  [{status}] seed={case['seed']:2d} out={out_dim:5d} in={in_dim:5d} "
-              f"({case['note']}) max_ulp_diff={max_ulp} flip_rate={flip:.4f}")
+              f"({case['note']}) max_ulp_diff={max_ulp} flip_rate={flip:.4f} on_grid={grid}")
         if not passed:
             print(f"    worst idx={worst} ref=0x{rb[worst]:04x}({ref[worst]!r}) "
                   f"ov=0x{gb[worst]:04x}({got[worst]!r})")
@@ -553,12 +633,13 @@ def validate_rmsnorm(core) -> bool:
             ref = ref_rmsnorm(x, w, eps)
             got = np.array(req.infer({"x": x.reshape(1, dim), "eps": np.float32(eps)})[0]).reshape(-1)
             max_ulp, flip, worst, rb, gb = ulp_stats(ref, got)
+            grid = on_grid(got)
             outs[tag] = got
-            passed = max_ulp <= 1 and flip <= 0.01
+            passed = max_ulp <= 1 and flip <= 0.01 and grid
             ok &= passed
             status = "PASS" if passed else "FAIL"
             print(f"  [{status}] seed={case['seed']:2d} dim={dim:5d} eps={tag} ({case['note']}) "
-                  f"max_ulp_diff={max_ulp} flip_rate={flip:.4f}")
+                  f"max_ulp_diff={max_ulp} flip_rate={flip:.4f} on_grid={grid}")
             if not passed:
                 print(f"    worst idx={worst} ref=0x{rb[worst]:04x}({ref[worst]!r}) "
                       f"ov=0x{gb[worst]:04x}({got[worst]!r})")
@@ -589,11 +670,12 @@ def validate_rope(core) -> bool:
         _kernel_names_seen.update(_kernel_names(compiled))
 
         max_ulp, flip, worst, rb, gb = ulp_stats(ref, got)
-        passed = max_ulp <= 1 and flip <= 0.01
+        grid = on_grid(got)
+        passed = max_ulp <= 1 and flip <= 0.01 and grid
         ok &= passed
         status = "PASS" if passed else "FAIL"
         print(f"  [{status}] seed={case['seed']:2d} rot_dims={rd:3d} theta={theta:.3e} pos={pos:4d} "
-              f"({case['note']}) max_ulp_diff={max_ulp} flip_rate={flip:.4f}")
+              f"({case['note']}) max_ulp_diff={max_ulp} flip_rate={flip:.4f} on_grid={grid}")
         if not passed:
             print(f"    worst idx={worst} ref=0x{rb[worst]:04x}({ref[worst]!r}) "
                   f"ov=0x{gb[worst]:04x}({got[worst]!r})")
@@ -602,26 +684,176 @@ def validate_rope(core) -> bool:
 
 def validate_bf16_roundtrip(core) -> bool:
     """The `_bf16_roundtrip` subgraph vs `bf16_round`, on the SAME 20 tie
-    cases verified against `half::bf16::from_f32` in Rust. Not an op under
-    the ULP gate (it IS the rounding primitive) — reported separately."""
+    cases verified against `half::bf16::from_f32` in Rust.
+
+    fix round 1 (#2, IMPORTANT): the previous version compared
+    `bf16_bits(core_out)` — which itself calls `bf16_round(core_out)` before
+    extracting bits — against the expected bf16 bits. Since `bf16_round` is
+    idempotent, that comparison is TAUTOLOGICAL for any `core_out` close
+    enough to re-round to the same bucket: an identity graph (the exact bug
+    `_bf16_roundtrip` had under `INFERENCE_PRECISION_HINT=f32`, see the
+    module's report) still "passes" because `bf16_round(xin)` re-derives the
+    same expected value the test table already encodes. Two independent
+    reviews caught this the same way: reverting `_bf16_roundtrip` to the
+    broken Convert pair left this check GREEN.
+
+    Fixed by comparing the RAW f32 bit pattern of `core_out` — no re-rounding
+    — against `want << 16` (the bf16-rounded value widened to f32, i.e. top
+    16 bits = the expected bf16 bits, low 16 bits = exactly zero). An
+    identity/untouched output fails this by construction: for every
+    non-already-on-grid tie case, `xin`'s raw bits differ from `want << 16`
+    in the low 16 bits. Comparing as `uint32` (not `float32 ==`) also makes
+    the two NaN tie cases correct for free — `_bf16_roundtrip` canonicalizes
+    NaN to a specific bit pattern (`0x7FC00000`), and integer equality on
+    that canonical pattern isn't subject to IEEE's `NaN != NaN`."""
     print("\n== bf16 Convert round-trip (OV vs numpy, tie cases) ==")
     xin = np.array([np.uint32(b) for b, _ in BF16_TIE_CASES], dtype=np.uint32).view(np.float32)
     model = _bf16_roundtrip_graph(len(BF16_TIE_CASES))
     compiled = compile_checked(core, model, "bf16_roundtrip")
     core_out = np.array(compiled.create_infer_request().infer({"x": xin})[0]).reshape(-1)
-    ov_bits = bf16_bits(core_out)
+    ov_bits_raw = core_out.view(np.uint32)  # RAW bits -- NOT re-rounded via bf16_bits/bf16_round
     np_bits = bf16_bits(bf16_round(xin))
     mismatches = [
-        (i, hex(bits), f"expect=0x{want:04x}", f"numpy=0x{np_bits[i]:04x}", f"ov=0x{ov_bits[i]:04x}")
+        (i, hex(bits), f"expect=0x{want:04x}", f"numpy=0x{np_bits[i]:04x}", f"ov_raw=0x{ov_bits_raw[i]:08x}")
         for i, (bits, want) in enumerate(BF16_TIE_CASES)
-        if ov_bits[i] != want or np_bits[i] != want
+        if ov_bits_raw[i] != (np.uint32(want) << np.uint32(16)) or np_bits[i] != want
     ]
     if mismatches:
         print(f"  {len(mismatches)}/{len(BF16_TIE_CASES)} mismatches vs half::bf16::from_f32 ground truth:")
         for m in mismatches:
             print(f"    {m}")
     else:
-        print(f"  all {len(BF16_TIE_CASES)} tie cases: numpy and OV Convert both match half::bf16::from_f32 exactly")
+        print(f"  all {len(BF16_TIE_CASES)} tie cases: numpy and OV round-trip both match "
+              "half::bf16::from_f32 exactly (raw-bits check, not re-rounded)")
+    return len(mismatches) == 0
+
+
+# --------------------------------------------------------------------------
+# fix round 1 (#5, NEW WORK, design review): device canary.
+#
+# Everything above (`--validate-ops`, `--validate-graph`) compiles on
+# `DEVICE="CPU"` — a deliberate choice for numerics validation (Task 1's own
+# comment: "no GPU on this dev machine; the graphs are device-agnostic"), but
+# the GPU plugin is a DIFFERENT compiler we cannot exercise here, with two
+# named defeat vectors specific to it: the `_bf16_roundtrip` subgraph
+# silently executing in f16 despite `INFERENCE_PRECISION_HINT=f32` (would
+# corrupt the exponent-bisection constants), and its `Round` kernel's tie
+# mode differing from CPU's verified `half_to_even` (would only show up at
+# an exact tie, i.e. the f=.5 cases below — f=.25/.75 cases can't
+# distinguish `half_to_even` from `half_away_from_zero`, only from
+# truncation/identity). Property readback (`compile_checked`) is NOT
+# sufficient on its own: on this stack a self-reported property has already
+# been observed to lie (`query_model` claiming kernels present that exist on
+# no device) — this canary asserts actual RAW OUTPUT BITS instead.
+# --------------------------------------------------------------------------
+
+def _bf16_ulp_at(x: float) -> float:
+    """The bf16 ULP (spacing between adjacent bf16-representable values)
+    at the magnitude of `x`. Pure python/`math.frexp` — this is host-side
+    battery GENERATION, not part of the numerics under test, so it doesn't
+    need to dodge the subnormal/overflow concerns `_bf16_roundtrip`'s
+    in-graph bisection does."""
+    _, e = math.frexp(abs(x))  # x = m * 2**e, 0.5 <= |m| < 1
+    return 2.0 ** (e - 8)  # 7 explicit + 1 implicit mantissa bit = 8 significant bits
+
+
+def _rnd1(x: float) -> float:
+    return float(bf16_round(np.array([x], dtype=np.float32))[0])
+
+
+# Bases deliberately NOT at a power-of-two magnitude boundary (±1.0, ±8.0,
+# ±0.015625 were tried first and rejected: at an exact power of two, the
+# NEXT bf16 grid point going toward zero crosses into a FINER-spaced
+# exponent bucket, so `g_lo + _bf16_ulp_at(g_lo)` silently computes the
+# wrong g_hi). Mix of even- and odd-bf16-mantissa `g_lo` (so the f=.5 tie
+# cases exercise RNE rounding BOTH directions, not just "always down") and
+# both signs (so truncation's round-toward-zero direction, which flips with
+# sign, is exercised both ways too).
+_CANARY_BASES = (1.5, 1.0234375, -1.5, -1.0234375,
+                  12.0, 12.1875, -12.0, -12.1875,
+                  100.0, -100.0, 0.0234375, -0.0234375)
+
+
+def canary_cases() -> list:
+    """Battery of `{x, rne, trunc, half_away, identity, label}` — the four
+    hypotheses predict DIFFERENT raw bits at least at the f=.5 (tie) point,
+    and RNE/half_away diverge from truncation/identity at f=.25/.75.
+    `rne` (ground truth) is `bf16_round`, itself verified bit-exact against
+    `half::bf16::from_f32` in Rust (Task 1's `bf16_ties` test). See the
+    module report's expected-value table for the full battery in one place.
+    """
+    cases = []
+    for base in _CANARY_BASES:
+        g_lo = _rnd1(base)
+        ulp = _bf16_ulp_at(g_lo)
+        g_hi = _rnd1(g_lo + ulp)
+        for frac, tag in ((0.25, "f=.25"), (0.5, "f=.5(tie)"), (0.75, "f=.75")):
+            x = np.float32(g_lo + frac * ulp)
+            rne = _rnd1(float(x))
+            if frac < 0.5:
+                trunc = half_away = g_lo
+            elif frac > 0.5:
+                trunc, half_away = g_lo, g_hi
+            else:  # exact tie: truncation always keeps g_lo (round toward
+                # zero == always drop the tie-breaking bit); half-away-from-
+                # zero breaks the tie toward whichever of g_lo/g_hi has the
+                # LARGER magnitude (g_hi for base>0, g_lo for base<0, since
+                # g_lo is the MORE-negative / larger-magnitude one there).
+                trunc = g_lo
+                half_away = g_hi if base > 0 else g_lo
+            cases.append({
+                "label": f"base={base:g} {tag}",
+                "x": x,
+                "rne": np.float32(rne),
+                "trunc": np.float32(trunc),
+                "half_away": np.float32(half_away),
+                "identity": x,
+            })
+    return cases
+
+
+def run_canary(core, device: str) -> bool:
+    """Compiles the SHIPPED `_bf16_roundtrip` subgraph (the same one every
+    op/layer graph in this file uses) on the ACTUAL target `device` with the
+    ACTUAL compile config (`compile_checked`, so a config drift on this
+    device is caught by the same choke point as everything else), feeds
+    `canary_cases()` plus the 20 `BF16_TIE_CASES`, and asserts RAW f32 bit
+    patterns against the RNE-correct expectation exactly. On a mismatch,
+    reports which of the OTHER three hypotheses (if any) the observed output
+    matches, so a real GPU failure is diagnosable without re-deriving the
+    battery by hand."""
+    print(f"\n== device canary ({device}) ==")
+    battery = canary_cases()
+    tie_x = np.array([np.uint32(b) for b, _ in BF16_TIE_CASES], dtype=np.uint32).view(np.float32)
+    xin = np.concatenate([np.array([c["x"] for c in battery], dtype=np.float32), tie_x])
+    model = _bf16_roundtrip_graph(len(xin))
+    compiled = compile_checked(core, model, f"canary({device})", device=device)
+    out = np.array(compiled.create_infer_request().infer({"x": xin})[0]).reshape(-1)
+    out_bits = out.view(np.uint32)
+
+    mismatches = []
+    for i, c in enumerate(battery):
+        want_bits = np.float32(c["rne"]).view(np.uint32)
+        if out_bits[i] != want_bits:
+            hyps = {k: np.float32(c[k]).view(np.uint32) for k in ("trunc", "half_away", "identity")}
+            matched = next((k for k, v in hyps.items() if v == out_bits[i]), "unknown")
+            mismatches.append(f"    [{c['label']}] x={c['x']!r} want(RNE)=0x{want_bits:08x} "
+                               f"got=0x{out_bits[i]:08x} (matches: {matched})")
+    n_battery = len(battery)
+    for j, (bits, want16) in enumerate(BF16_TIE_CASES):
+        i = n_battery + j
+        want_bits = np.uint32(want16) << np.uint32(16)
+        if out_bits[i] != want_bits:
+            mismatches.append(f"    [tie_case idx={j}] x_bits=0x{bits:08x} want=0x{want_bits:08x} "
+                               f"got=0x{out_bits[i]:08x}")
+
+    if mismatches:
+        print(f"  {len(mismatches)}/{len(xin)} mismatches (battery={n_battery}, tie_cases={len(BF16_TIE_CASES)}):")
+        for m in mismatches:
+            print(m)
+    else:
+        print(f"  all {len(xin)} cases ({n_battery} battery + {len(BF16_TIE_CASES)} tie) "
+              f"exact-match RNE on {device}")
     return len(mismatches) == 0
 
 
@@ -1278,17 +1510,22 @@ def validate_graph(core, rope_dump_path: str):
             max_ulp_a, flip_a, worst_a, rb_a, gb_a = ulp_stats(ref_out, got_attn)
             max_ulp_lc, _, _, _, _ = ulp_stats(ref_lc, got_lc)
             max_ulp_rc, _, _, _, _ = ulp_stats(ref_rc, got_rc)
-            on_grid_lc = bool(np.array_equal(got_lc, bf16_round(got_lc)))
-            on_grid_rc = bool(np.array_equal(got_rc, bf16_round(got_rc)))
+            # fix round 1 (#3): attn_out is `linear_bf16_w(ctx, wo)` in Rust,
+            # which ALWAYS bf16-rounds its output same as lc/rc's rmsnorm/rope
+            # — it was missing the on-grid structural check, leaving it
+            # elision-blind on its own (ULP alone re-rounds both sides).
+            on_grid_a = on_grid(got_attn)
+            on_grid_lc = on_grid(got_lc)
+            on_grid_rc = on_grid(got_rc)
 
-            passed = (max_ulp_a <= 1 and flip_a <= 0.01
+            passed = (max_ulp_a <= 1 and flip_a <= 0.01 and on_grid_a
                       and max_ulp_lc <= 1 and on_grid_lc
                       and max_ulp_rc <= 1 and on_grid_rc)
             ok &= passed
             status = "PASS" if passed else "FAIL"
             note = "  <- P=0 case" if past_len == 0 else ""
             print(f"  [{status}] past_len={past_len:2d} rows={real_rows:2d} "
-                  f"attn(ulp={max_ulp_a},flip={flip_a:.4f}) "
+                  f"attn(ulp={max_ulp_a},flip={flip_a:.4f},grid={on_grid_a}) "
                   f"lc(ulp={max_ulp_lc},grid={on_grid_lc}) rc(ulp={max_ulp_rc},grid={on_grid_rc}){note}")
             if not passed:
                 print(f"    worst attn idx={worst_a} ref=0x{rb_a.flat[worst_a]:04x} ov=0x{gb_a.flat[worst_a]:04x}")
@@ -1441,10 +1678,16 @@ def bench_layer(model_dir: str, layer: int, rope_dump_path: str, device: str, it
     med, p95 = statistics.median(ts), sorted(ts)[int(len(ts) * 0.95) - 1]
     print(f"OV layer_{layer:02d} (rows={rows}, past=p_max steady-state): "
           f"median={med:.3f}ms p95={p95:.3f}ms over {iters} iters")
+    # fix round 1 (#4): glm5_attn_bench.rs's default batch bucket list used
+    # to be [1, 512, 1024, 2048] -- no 256, so this command couldn't produce
+    # the "batch=256" numerator the line below asks for. 256 is now in its
+    # default list (dist.rs MAX_BATCH_COUNT = `rows` above), but the batch is
+    # still passed explicitly here so this stays correct even if that
+    # default list changes again.
     print(f"\nRust baseline (five-projection sum, comparable dims): "
           f"cargo run --release -p cascadia-engine-sparse-moe --example glm5_attn_bench "
-          f"-- {model_dir} {iters}")
-    print("speedup = (Rust batch=256 five-projection median ms) / "
+          f"-- {model_dir} {iters} {rows}")
+    print(f"speedup = (Rust batch={rows} five-projection median ms) / "
           f"(this script's median ms = {med:.3f})")
     print("Step 6b gate: speedup >= ~20x to proceed with Tasks 3-9 as scoped "
           "(spec Sec13); gates survive down to ~5x.")
@@ -1475,6 +1718,11 @@ def main():
     ap.add_argument("--bench-layer", type=int, default=0, help="--bench: which global layer index to time")
     ap.add_argument("--bench-device", default="GPU", help="--bench: OV device (default GPU)")
     ap.add_argument("--bench-iters", type=int, default=50, help="--bench: timed iterations")
+    ap.add_argument("--canary", action="store_true",
+                     help="fix round 1 (#5): device canary -- compiles the shipped bf16-rounding "
+                          "subgraph on --device with the real compile config and asserts raw bits "
+                          "(no model dir needed; run this on any device before trusting it)")
+    ap.add_argument("--device", default="CPU", help="--canary: OV device to canary (default CPU)")
     ap.add_argument("--rope-table-dump", default=os.path.join(tempfile.gettempdir(), "glm5_rope_freqs_dump.bin"),
                      help="path to the Rust Freqs dump for Step 3b's exact gate / --validate-graph / "
                           "--export / --bench (default matches dsv4/rope.rs::freqs_dump's default output path)")
@@ -1485,98 +1733,111 @@ def main():
     # passing vacuously. Not for normal use.
     args = ap.parse_args()
 
-    if args.export:
-        out_dir = args.out or args.export
-        layers_filter = {int(x) for x in args.layers.split(",")} if args.layers else None
-        stamp = export_all(args.export, out_dir, args.rope_table_dump, layers_filter)
-        print(f"\nexport_stamp: {json.dumps(stamp, indent=2)}")
-        return
-
-    if args.bench:
-        bench_layer(args.bench, args.bench_layer, args.rope_table_dump, args.bench_device, args.bench_iters)
-        return
-
-    if not (args.validate_ops or args.validate_graph):
-        ap.print_help()
-        return
-
     if args.inject_bad_config:
         COMPILE_CFG["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
         print("*** --inject-bad-config: requesting DYNAMIC_QUANTIZATION_GROUP_SIZE=32 "
               "(contract requires 0) to prove the readback gate fires ***")
+    # ^ fix round 1 (#1): moved ahead of ALL mode dispatch (was previously
+    # only wired for --validate-ops/--validate-graph) so this debug flag can
+    # prove the drift gate fires on --export/--bench/--canary too, now that
+    # `_exit_after_drift_check()` enforces it on every one of them.
 
-    print(f"openvino {ov.__version__}  device={DEVICE}  cfg={COMPILE_CFG}")
-    core = ov.Core()
+    # fix round 1 (#1): EVERY exit path below is wrapped by this `finally` --
+    # `_exit_after_drift_check()` is the single choke point that makes
+    # `--export`/`--bench` (which `return` well before validate mode's own
+    # inline checks) fail nonzero on effective-config drift too. See its
+    # docstring / the comment above `_config_drift_ok` for why this was a
+    # live bug, not a hypothetical one.
+    try:
+        if args.export:
+            out_dir = args.out or args.export
+            layers_filter = {int(x) for x in args.layers.split(",")} if args.layers else None
+            stamp = export_all(args.export, out_dir, args.rope_table_dump, layers_filter)
+            print(f"\nexport_stamp: {json.dumps(stamp, indent=2)}")
+            return
 
-    ok = True
-    critical_skips = []
+        if args.bench:
+            bench_layer(args.bench, args.bench_layer, args.rope_table_dump, args.bench_device, args.bench_iters)
+            return
 
-    if args.validate_ops:
-        ok &= validate_linear(core)
-        ok &= validate_rmsnorm(core)
-        ok &= validate_rope(core)
-        ok &= validate_bf16_roundtrip(core)
-        rope_table_dump_present = os.path.exists(args.rope_table_dump)
-        rope_table_exact = validate_rope_table_exact(args.rope_table_dump)
-        # A present-but-mismatched table IS a hard failure. A MISSING dump is
-        # kept non-fatal (a fresh checkout legitimately hasn't run the Rust
-        # test yet) but is tracked separately so the final summary can't read
-        # as "ALL PASS" while the one safety-critical exact-match gate never
-        # ran.
-        if rope_table_dump_present:
-            ok &= rope_table_exact
+        if args.canary:
+            core = ov.Core()
+            ok = run_canary(core, args.device)
+            if not ok:
+                print("\nFAILURES ABOVE")
+                raise SystemExit(1)
+            print("\nALL PASS")
+            raise SystemExit(0)
+
+        if not (args.validate_ops or args.validate_graph):
+            ap.print_help()
+            return
+
+        print(f"openvino {ov.__version__}  device={DEVICE}  cfg={COMPILE_CFG}")
+        core = ov.Core()
+
+        ok = True
+        critical_skips = []
+
+        if args.validate_ops:
+            ok &= validate_linear(core)
+            ok &= validate_rmsnorm(core)
+            ok &= validate_rope(core)
+            ok &= validate_bf16_roundtrip(core)
+            rope_table_dump_present = os.path.exists(args.rope_table_dump)
+            rope_table_exact = validate_rope_table_exact(args.rope_table_dump)
+            # A present-but-mismatched table IS a hard failure. A MISSING dump is
+            # kept non-fatal (a fresh checkout legitimately hasn't run the Rust
+            # test yet) but is tracked separately so the final summary can't read
+            # as "ALL PASS" while the one safety-critical exact-match gate never
+            # ran.
+            if rope_table_dump_present:
+                ok &= rope_table_exact
+            else:
+                critical_skips.append(
+                    "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
+                    f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
+                    "this harness was skipped, not passed"
+                )
+
+        if args.validate_graph:
+            vg_result = validate_graph(core, args.rope_table_dump)
+            # Same discipline as Step 3b above: a missing dump is a loud,
+            # non-fatal SKIPPED, not a silent pass.
+            if vg_result is None:
+                critical_skips.append(
+                    "--validate-graph did NOT run (no Rust rope-table dump found at "
+                    f"{args.rope_table_dump}) — regenerate per the message printed above"
+                )
+            else:
+                ok &= vg_result
+
+        print("\n== exec-graph kernels seen ==")
+        for k in sorted(_kernel_names_seen):
+            print(f"  {k}")
+        bad = [k for k in _kernel_names_seen if "int8" in k or "dynquant" in k.replace("_", "") or "dyn_quant" in k]
+        if bad:
+            print(f"  FAIL: dyn-quant/int8 kernel(s) present: {bad}")
+            ok = False
         else:
-            critical_skips.append(
-                "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
-                f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
-                "this harness was skipped, not passed"
-            )
+            print("  OK: no int8 / dyn-quant kernels")
 
-    if args.validate_graph:
-        vg_result = validate_graph(core, args.rope_table_dump)
-        # Same discipline as Step 3b above: a missing dump is a loud,
-        # non-fatal SKIPPED, not a silent pass.
-        if vg_result is None:
-            critical_skips.append(
-                "--validate-graph did NOT run (no Rust rope-table dump found at "
-                f"{args.rope_table_dump}) — regenerate per the message printed above"
-            )
-        else:
-            ok &= vg_result
+        ok &= _config_drift_ok()
 
-    print("\n== exec-graph kernels seen ==")
-    for k in sorted(_kernel_names_seen):
-        print(f"  {k}")
-    bad = [k for k in _kernel_names_seen if "int8" in k or "dynquant" in k.replace("_", "") or "dyn_quant" in k]
-    if bad:
-        print(f"  FAIL: dyn-quant/int8 kernel(s) present: {bad}")
-        ok = False
-    else:
-        print("  OK: no int8 / dyn-quant kernels")
-
-    print("\n== effective-config readback ==")
-    if _effective_config_bad:
-        for msg in _effective_config_bad:
-            print(f"  FAIL: {msg}")
-        print(f"  {len(_effective_config_bad)} mismatch(es) across {_effective_config_total} compiles")
-        ok = False
-    else:
-        print(f"  OK: INFERENCE_PRECISION_HINT={REQUIRED_PRECISION_HINT} and "
-              f"DYNAMIC_QUANTIZATION_GROUP_SIZE={REQUIRED_DYN_QUANT_GROUP_SIZE} "
-              f"confirmed effective on all {_effective_config_total} compiles")
-
-    if not ok:
-        print("\nFAILURES ABOVE")
-        raise SystemExit(1)
-    if critical_skips:
-        print("\n" + "!" * 78)
-        print("!! PASSED, BUT CRITICAL CHECK(S) SKIPPED — THIS IS NOT A FULL VALIDATION RUN !!")
-        for s in critical_skips:
-            print(f"!!   {s}")
-        print("!" * 78)
+        if not ok:
+            print("\nFAILURES ABOVE")
+            raise SystemExit(1)
+        if critical_skips:
+            print("\n" + "!" * 78)
+            print("!! PASSED, BUT CRITICAL CHECK(S) SKIPPED — THIS IS NOT A FULL VALIDATION RUN !!")
+            for s in critical_skips:
+                print(f"!!   {s}")
+            print("!" * 78)
+            raise SystemExit(0)
+        print("\nALL PASS")
         raise SystemExit(0)
-    print("\nALL PASS")
-    raise SystemExit(0)
+    finally:
+        _exit_after_drift_check()
 
 
 if __name__ == "__main__":

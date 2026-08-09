@@ -9,9 +9,19 @@
 //! Companion of `tools/glm5_attn_ov_probe.py`; spec lives in the enterprise
 //! repo (`docs/superpowers/specs/2026-08-09-glm5-attn-igpu-spike-spec.md`).
 //!
+//! fix round 1 (Task 2 review #4): the default batch bucket list used to be
+//! `[1, 512, 1024, 2048]` — no 256, so the Step 6b operator command
+//! (`tools/glm5_attn_ov.py --bench`, which always times at
+//! `rows=MAX_BATCH_COUNT=256`, the real prefill window size) had nothing to
+//! divide against; substituting 512 would silently bias the ratio 2x. 256 is
+//! now in the default list, and the batch list is overridable via a 3rd CLI
+//! arg so an operator can target the exact window size without recompiling.
+//!
 //! Usage:
 //!   cargo run --release -p cascadia-engine-sparse-moe \
-//!     --example glm5_attn_bench -- <model_dir> [iters]
+//!     --example glm5_attn_bench -- <model_dir> [iters] [batches_csv]
+//!   # batches_csv default: 1,256,512,1024,2048 (256 = dist.rs MAX_BATCH_COUNT,
+//!   # the real prefill window size tools/glm5_attn_ov.py's --bench times)
 
 use std::time::Instant;
 
@@ -21,10 +31,18 @@ use cascadia_engine_sparse_moe::glm::loader::read_manifest;
 fn main() {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| {
-        eprintln!("usage: glm5_attn_bench <model_dir> [iters]");
+        eprintln!("usage: glm5_attn_bench <model_dir> [iters] [batches_csv]");
         std::process::exit(2);
     });
     let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let batches: Vec<usize> = args
+        .next()
+        .map(|s| {
+            s.split(',')
+                .map(|b| b.trim().parse().expect("batches_csv: bad integer"))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1, 256, 512, 1024, 2048]);
 
     let m = read_manifest(std::path::Path::new(&dir)).expect("read manifest.json");
     let (h, ql, kvl) = (m.hidden_size, m.q_lora_rank, m.kv_lora_rank);
@@ -55,7 +73,7 @@ fn main() {
         (seed >> 40) as u16
     };
 
-    for batch in [1usize, 512, 1024, 2048] {
+    for batch in batches {
         println!("== batch {batch} ==");
         let mut total = 0.0f64;
         for (name, out_dim, in_dim) in proj {
