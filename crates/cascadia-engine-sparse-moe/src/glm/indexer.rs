@@ -223,3 +223,62 @@ impl Indexer {
         sel
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsv4::rope::precompute_freqs;
+
+    /// Direct proof the sparse path engages: `select()`'s returned length is
+    /// `min(query_pos+1, topk)`. At/below the budget it equals the cached
+    /// length (dense-equivalent, per the doc comment above); once cached length
+    /// exceeds `topk` the selection is pinned at `topk` — strictly shorter than
+    /// the cache — which is the observable a tiny model past its `index_topk`
+    /// must produce for a parity harness to exercise the sparse boundary at all.
+    #[test]
+    fn select_prunes_once_past_topk() {
+        let (hidden, q_lora, nh, hd, rope_dim, max_seq) =
+            (8usize, 6usize, 2usize, 4usize, 2usize, 16usize);
+        let topk = 3usize;
+
+        // A tiny xorshift LCG stands in for real weights — this test checks
+        // `select()`'s length contract, not its numeric output (that's
+        // `glm5_dsa_attn`'s job against the Python reference).
+        let mut seed = 1u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / u16::MAX as f32 - 0.5
+        };
+        let bf16_bits = |v: f32| -> u16 { (to_bf16(v).to_bits() >> 16) as u16 };
+        let w = IndexerWeights {
+            ix_wq: (0..nh * hd * q_lora).map(|_| bf16_bits(rnd())).collect(),
+            ix_wk: (0..hd * hidden).map(|_| bf16_bits(rnd())).collect(),
+            ix_wp: (0..nh * hidden).map(|_| bf16_bits(rnd())).collect(),
+            k_norm_w: vec![1.0; hd],
+            k_norm_b: vec![0.0; hd],
+        };
+        let freqs = precompute_freqs(rope_dim, max_seq, 0, 1.0e4, 1.0, 32.0, 1.0);
+        let mut ix = Indexer::new(hidden, q_lora, nh, hd, rope_dim, max_seq, 1e-6, w, freqs);
+
+        let x: Vec<f32> = (0..hidden).map(|_| rnd()).collect();
+        let qr: Vec<f32> = (0..q_lora).map(|_| rnd()).collect();
+        for pos in 0..10 {
+            ix.append_key(&x);
+            let n = pos + 1;
+            let sel = ix.select(&qr, &x, pos, topk);
+            if n <= topk {
+                assert_eq!(sel.len(), n, "at/below budget must select every cached key");
+            } else {
+                assert_eq!(
+                    sel.len(),
+                    topk,
+                    "past budget must pin the selection at topk"
+                );
+                assert!(
+                    sel.len() < n,
+                    "selection must be shorter than the cached length"
+                );
+            }
+        }
+    }
+}
