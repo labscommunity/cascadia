@@ -6,11 +6,10 @@
 //! appends KV per token in order, so the batch loop is sequential per row —
 //! that IS the production shape, not a pessimisation.
 //!
-//! Companion of `tools/glm5_attn_ov_probe.py`; spec lives in the enterprise
-//! repo (`docs/superpowers/specs/2026-08-09-glm5-attn-igpu-spike-spec.md`).
+//! Companion of `tools/glm5_attn_ov_probe.py`.
 //!
-//! fix round 1 (Task 2 review #4): the default batch bucket list used to be
-//! `[1, 512, 1024, 2048]` — no 256, so the Step 6b operator command
+//! The default batch bucket list used to be
+//! `[1, 512, 1024, 2048]` — no 256, so the operator command
 //! (`tools/glm5_attn_ov.py --bench`, which always times at
 //! `rows=MAX_BATCH_COUNT=256`, the real prefill window size) had nothing to
 //! divide against; substituting 512 would silently bias the ratio 2x. 256 is

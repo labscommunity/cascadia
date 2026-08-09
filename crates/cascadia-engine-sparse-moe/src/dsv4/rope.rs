@@ -142,7 +142,23 @@ mod freqs_dump {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(&path, &bytes).expect("write rope freqs dump");
-        let meta = format!("{{\"rot_dims\":{dim},\"seqlen\":{seqlen},\"theta\":{theta:e}}}\n");
+        // `sha256` binds the sidecar to THESE bytes, produced by THIS test.
+        // Without it the exporter's dims-only check accepts a table Python
+        // generated itself — the one thing the dump exists to forbid.
+        let sha = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write;
+            let mut s = String::with_capacity(64);
+            for b in Sha256::digest(&bytes) {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        let meta = format!(
+            "{{\"rot_dims\":{dim},\"seqlen\":{seqlen},\"theta\":{theta:e},\
+             \"producer\":\"cascadia-engine-sparse-moe::dsv4::rope::freqs_dump\",\
+             \"sha256\":\"{sha}\"}}\n"
+        );
         std::fs::write(format!("{path}.meta.json"), &meta).expect("write rope freqs dump meta");
         println!(
             "wrote {} f32 values ({} bytes) to {path} (meta: {meta:?})",

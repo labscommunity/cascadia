@@ -736,8 +736,15 @@ impl GlmRunner {
     /// This rank's OpenVINO attention backend, if `ov_attn` is enabled and
     /// construction succeeded — `None` for any of the reasons `ov_attn.rs`'s
     /// module doc enumerates (each already logged its own distinguishable
-    /// event at construction time). Exposed for the rank's `event=ready`
-    /// line / doctor output to report [`super::ov_attn::OvAttnState`].
+    /// event at construction time).
+    ///
+    /// KNOWN GAP: this is the accessor a rank ready-line would read to report
+    /// [`super::ov_attn::OvAttnState`], but no such line exists — the engine
+    /// is erased to `Box<dyn Engine>` in the control plane and the `Engine`
+    /// trait exposes no introspection, so there is nothing to plumb it
+    /// through. Today the only enablement signal is the startup
+    /// `event=ov_attn_config` / `event=ov_attn_*` WARNs, and doctor's
+    /// stamp advisory. Callers: tests only.
     pub fn ov_attn(&self) -> Option<&super::ov_attn::OvAttn> {
         self.ov_attn.as_ref()
     }

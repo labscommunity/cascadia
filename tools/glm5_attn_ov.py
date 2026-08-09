@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
-"""GLM-5.2 MLA attention exporter — per-op numerics validation harness.
+"""GLM-5.2 MLA attention: OpenVINO exporter and numerics validation harness.
 
-Gate 1c derisking for offloading GLM-5.2 prefill attention to an OpenVINO
-device: before any attention graph exists, prove that tiny OV graphs can
-reproduce the Rust engine's bf16 activation contract for the three ops that
-compose MLA attention (`linear`, `rmsnorm`, `rope`). No model dir, no
-attention graph — `--validate-ops` is entirely self-contained (synthetic
-weights).
+Builds the per-layer OpenVINO graphs a glm5 rank uses to run prefill attention
+on an Intel iGPU instead of the Rust path, and the self-checks that prove those
+graphs reproduce the Rust engine's numerics.
+
+Modes:
+  --validate-ops     per-op harness (`linear`, `rmsnorm`, `rope`, the bf16
+                     round-trip subgraph, and the rope-table exact gate).
+                     Self-contained: no model dir, synthetic weights.
+  --validate-graph   the same discipline on a whole assembled attention graph
+                     vs a numpy reference. Self-contained; needs a rope dump.
+  --export MODEL_DIR write MODEL_DIR/attn_ov/{layer_NN.xml,.bin,
+                     export_stamp.json}. Needs manifest.json +
+                     shells/layer_NN.safetensors, and a rope dump.
+  --canary           compile the shipped bf16-rounding subgraph on --device
+                     and assert its raw output bits. Run this on a node before
+                     trusting its GPU.
+  --bench MODEL_DIR  time one layer's graph against the Rust baseline. Needs a
+                     real model dir on the target machine.
+
+Exit codes: 0 all checks ran and passed; 1 a check failed, or a compile drifted
+off the required config, or a quantized kernel appeared; 2 everything that ran
+passed but a safety-critical check was SKIPPED (e.g. no rope-table dump).
 
 Numeric contract (see `dsv4/math.rs`, `dsv4/rope.rs`, `glm/attn.rs` header):
   * every linear / RMSNorm / rope output is rounded to bf16 (round-to-nearest-
     even); everything else accumulates in f32.
+  * the graph's `x` input is the RAW residual: the graph applies
+    `rmsnorm(input_layernorm)` itself, as its first op. The caller must not
+    pre-normalize.
   * `in_ln` uses the manifest's `rms_norm_eps` (1e-5); `q_a_ln`/`kv_a_ln` use
     `glm::attn::MLA_LATENT_EPS` (1e-6) — two DIFFERENT epsilons, so `rmsnorm`
     takes eps as a real graph input (not a baked constant) and validation
@@ -20,13 +39,16 @@ Numeric contract (see `dsv4/math.rs`, `dsv4/rope.rs`, `glm/attn.rs` header):
     NOT the gate for `linear`/`rmsnorm`/`rope`'s arithmetic — a bounded
     bf16-ULP tolerance is. The one thing that MUST be exact is the rope
     cos/sin table itself: a silently-wrong-basis table is a decode-breaking
-    bug that short-prompt parity would not catch. `--validate-ops` diffs the
-    table this exporter would embed against a bit-for-bit dump of the Rust
-    `Freqs` struct (see `dsv4/rope.rs::freqs_dump::dump_real_dims_freqs`).
+    bug that short-prompt parity would not catch. The table is never computed
+    here — it is loaded from a bit-for-bit dump of the Rust `Freqs` struct and
+    verified against the sha256 in that dump's sidecar. Produce one with:
+      cargo test -p cascadia-engine-sparse-moe --lib dump_real_dims_freqs
 
 Usage:
   python3 tools/glm5_attn_ov.py --validate-ops
-  python3 tools/glm5_attn_ov.py --validate-ops --rope-table-dump /path/to/dump.bin
+  python3 tools/glm5_attn_ov.py --validate-graph --rope-table-dump /path/dump.bin
+  python3 tools/glm5_attn_ov.py --export /models/glm5 --rope-table-dump /path/dump.bin
+  python3 tools/glm5_attn_ov.py --canary --device GPU
 """
 import argparse
 import ctypes
@@ -64,7 +86,7 @@ except OSError:
     _libm = None
     print("WARNING: could not load system libm via ctypes; rope table will use "
           "numpy's cos/sin/power, which do not bit-match Rust's libm calls "
-          "(Step 3b's exact gate will report NOT EXACT).")
+          "(the rope-table exact gate will report NOT EXACT).")
 
 COMPILE_CFG = {"INFERENCE_PRECISION_HINT": "f32", "DYNAMIC_QUANTIZATION_GROUP_SIZE": "0"}
 DEVICE = "CPU"  # no GPU on this dev machine; the graphs are device-agnostic
@@ -264,10 +286,10 @@ def _bf16_roundtrip(node):
     redundant identity (verified: the compiled exec graph literally drops
     both Converts, `out == x` bit-for-bit; the plugin can ALSO be caught
     doing plain truncation instead of round-to-nearest when the pair isn't
-    fully eliminated). Task 1's `--validate-ops` ULP gate never caught this
+    fully eliminated). The `--validate-ops` ULP gate never caught this
     because it re-rounds BOTH sides (ref and graph output) before comparing,
-    which mostly still lands in the same bf16 bucket -- Task 2's stricter
-    Step 3 requirement (`lc`/`rc` must land EXACTLY on the bf16 grid, since
+    which mostly still lands in the same bf16 bucket -- the stricter
+    requirement (`lc`/`rc` must land EXACTLY on the bf16 grid, since
     Rust caches literal bf16 bits) is what exposed it.
 
     Implemented instead as genuine arithmetic reproducing `bf16_round`'s
@@ -285,7 +307,7 @@ def _bf16_roundtrip(node):
     e.g. `0xffc00000 -> 0x7fc00000`) -- unreachable in practice, matching
     `bf16_round`'s own doc note that activations are never NaN.
 
-    fix round 1 (#6): the bisection floor is `2**-64`, not the full f32
+    The bisection floor is `2**-64`, not the full f32
     subnormal range (`_BF16_BISECT_STEPS`'s comment explains why -- a
     starting constant at the true f32 floor, `2**-127`, is itself a
     SUBNORMAL and got silently flushed to zero during development, corrupting
@@ -295,7 +317,7 @@ def _bf16_roundtrip(node):
     inputs like `1e-30`. `bf16_round` (the numpy reference) rounds those
     correctly (down to the true bf16 subnormal boundary near `2**-133`).
     Practical impact is nil for this contract's activations (bf16-native,
-    never remotely that small), but a later task reading this file should
+    never remotely that small), but a later reader of this file should
     trust the bound as stated here, not a narrower one."""
     ax = ops.abs(node)
     e = ops.constant(np.float32(-64.0))
@@ -390,8 +412,8 @@ def _bf16_roundtrip_graph(n: int) -> Model:
     """Standalone `x[n] -> _bf16_roundtrip -> y` graph, used only to
     cross-check the bf16 rounding subgraph against `bf16_round` on the tie
     cases (a narrower question than the per-op ULP gate). Originally built
-    around a bare `Convert(f32->bf16)->Convert(bf16->f32)` pair; Task 2 found
-    that pair gets silently eliminated as an identity by the CPU plugin under
+    around a bare `Convert(f32->bf16)->Convert(bf16->f32)` pair; that pair
+    gets silently eliminated as an identity by the CPU plugin under
     `INFERENCE_PRECISION_HINT=f32` (see `_bf16_roundtrip`'s docstring).
     `_bf16_roundtrip` was replaced with an exact-arithmetic implementation
     that does NOT suffer that elision — but that alone did NOT make the check
@@ -434,7 +456,7 @@ def ulp_stats(ref: np.ndarray, got: np.ndarray):
 def on_grid(x: np.ndarray) -> bool:
     """`x == bf16_round(x)` — a STRUCTURAL check, independent of `ulp_stats`.
 
-    fix round 1 (#3, IMPORTANT): the ULP check alone re-rounds both sides
+    The ULP check alone re-rounds both sides
     before comparing (see `validate_bf16_roundtrip`'s docstring for why that
     class of comparison is elision-blind on its own). Every bf16-contract op
     graph must be checked with BOTH assertions, not just one: `on_grid`
@@ -478,7 +500,7 @@ def compile_checked(core, model: Model, name: str, device: str = None):
     return compiled
 
 
-# fix round 1 (#1, CRITICAL): `compile_checked` recorded drift into
+# `compile_checked` recorded drift into
 # `_effective_config_bad`, but only main()'s `--validate-ops`/`--validate-graph`
 # branch ever inspected it -- `--export` and `--bench` both `return`ed before
 # that inline check ran, so a real drift on those two paths (the one that
@@ -506,6 +528,10 @@ def _config_drift_ok() -> bool:
                 print(f"  FAIL: {msg}")
             print(f"  {len(_effective_config_bad)} mismatch(es) across {_effective_config_total} compiles")
             _config_drift_ok_cached = False
+        elif not _effective_config_total:
+            # An "OK ... on all 0 compiles" line reads as evidence when it is
+            # the absence of evidence.
+            print("  (nothing compiled — no effective config to confirm)")
         else:
             print(f"  OK: INFERENCE_PRECISION_HINT={REQUIRED_PRECISION_HINT} and "
                   f"DYNAMIC_QUANTIZATION_GROUP_SIZE={REQUIRED_DYN_QUANT_GROUP_SIZE} "
@@ -513,30 +539,113 @@ def _config_drift_ok() -> bool:
     return _config_drift_ok_cached
 
 
-def _exit_after_drift_check():
+_kernel_scan_report_done = False
+_kernel_scan_ok_cached = True
+
+
+def _kernel_scan_ok() -> bool:
+    """Spec Sec3.1's "no int8 / dyn-quant kernels" gate. Idempotent in the same
+    way `_config_drift_ok` is, so validate mode can print it in its report
+    position and `_exit_after_contract_checks` can still enforce it for
+    `--export`/`--bench`/`--canary`, which never had it before."""
+    global _kernel_scan_report_done, _kernel_scan_ok_cached
+    if _kernel_scan_report_done:
+        return _kernel_scan_ok_cached
+    _kernel_scan_report_done = True
+    print("\n== exec-graph kernels seen ==")
+    if not _kernel_names_seen:
+        print("  (nothing inspected — no graph was compiled)")
+        return _kernel_scan_ok_cached
+    for k in sorted(_kernel_names_seen):
+        print(f"  {k}")
+    bad = sorted(k for k in _kernel_names_seen if _looks_quantized(k))
+    if bad:
+        print(f"  FAIL: quantized kernel(s)/precision(s) present: {bad}")
+        _kernel_scan_ok_cached = False
+    else:
+        print(f"  OK: no int8 / uint8 / dyn-quant kernels across "
+              f"{_effective_config_total} compile(s)")
+    return _kernel_scan_ok_cached
+
+
+def _exit_after_contract_checks():
     """The single choke point: `main()` calls this from a `finally`, after
-    EVERY mode (validate-ops, validate-graph, export, bench). No-ops if
+    EVERY mode (validate-ops, validate-graph, export, bench, canary). No-ops if
     nothing was compiled (e.g. `--help`); otherwise raises `SystemExit(1)` on
-    drift regardless of what else passed, and never overrides a clean exit's
-    own code."""
-    if _effective_config_total and not _config_drift_ok():
+    effective-config drift or a quantized kernel regardless of what else
+    passed, and never overrides a clean exit's own code."""
+    if not _effective_config_total:
+        return
+    drift_ok = _config_drift_ok()
+    kernels_ok = _kernel_scan_ok()
+    if not (drift_ok and kernels_ok):
         raise SystemExit(1)
 
 
+# Every exec-graph entry any compile in this process reported.
+_kernel_names_seen: set = set()
+
+# The quantization signal lives in `runtimePrecision` and `execType`, NOT in
+# `layerType`: `layerType` is a structural op name (`FullyConnected`, `Const`,
+# `Eltwise`, `Subgraph`, ...) and is byte-identical with dynamic quantization
+# on and off, so a scan over it can never fire.
+#
+# Signed/sub-byte precisions are unambiguous — nothing in a clean f32 graph
+# reports them. `u8` is NOT: a fused eltwise `Subgraph` legitimately reports
+# `runtimePrecision=u8` for the BOOLEAN intermediates of `_bf16_roundtrip`'s
+# comparison-based bisection, and every clean run of this harness prints
+# exactly that. So `u8` only counts on an op that can actually be quantized.
+_QUANT_PRECISIONS_ANY_OP = ("int8", "i8", "int4", "i4", "uint4", "u4")
+_QUANT_PRECISIONS_COMPUTE_ONLY = ("uint8", "u8")
+_QUANTIZABLE_OPS = ("fullyconnected", "matmul", "gemm", "convolution",
+                    "deconvolution", "innerproduct")
+
+_QUANT_TAG = "quantized:"
+
+
+def _looks_quantized(entry: str) -> bool:
+    return entry.startswith(_QUANT_TAG)
+
+
+def _rt_str(node, key: str):
+    try:
+        v = node.get_rt_info()[key]
+    except Exception:  # noqa: BLE001 — best-effort diagnostic
+        return None
+    s = v.astype(str) if hasattr(v, "astype") else str(v)
+    return s or None
+
+
+def _quant_hit(layer_type: str, rp: str, et: str) -> bool:
+    fields = (rp, *et.split("_"))
+    if any(p in fields for p in _QUANT_PRECISIONS_ANY_OP):
+        return True
+    if any(op in layer_type for op in _QUANTIZABLE_OPS) and any(
+            p in fields for p in _QUANT_PRECISIONS_COMPUTE_ONLY):
+        return True
+    return "dynquant" in (rp + et).replace("_", "")
+
+
 def _kernel_names(compiled) -> set:
-    """Best-effort exec-graph op kind set (mirrors
-    `glm5_attn_ov_probe.py::compiled_precisions`), used only to assert no
-    int8/dyn-quant kernel snuck into the compiled graph (spec Sec3.1)."""
+    """Best-effort exec-graph inventory: the structural `layerType` (context
+    for a human reading this tool's output) PLUS `runtimePrecision` and
+    `execType`. A node whose precision says it is quantized also emits a
+    `quantized:` entry, which is what `_kernel_scan_ok` fails on (spec
+    Sec3.1). Note `execType` is empty on some CPU plugin builds — the check
+    must not depend on it alone."""
     names = set()
     try:
         for node in compiled.get_runtime_model().get_ops():
-            t = node.get_type_name()
-            try:
-                any_v = node.get_rt_info()["layerType"]
-                t = any_v.astype(str) if hasattr(any_v, "astype") else str(any_v)
-            except Exception:  # noqa: BLE001 — best-effort diagnostic
-                pass
-            names.add(t.lower())
+            t = (_rt_str(node, "layerType") or node.get_type_name()).lower()
+            names.add(t)
+            rp = (_rt_str(node, "runtimePrecision") or "").lower()
+            et = (_rt_str(node, "execType") or "").lower()
+            if rp:
+                names.add(f"runtimeprecision={rp}")
+            if et:
+                names.add(f"exectype={et}")
+            if _quant_hit(t, rp, et):
+                names.add(f"{_QUANT_TAG}{t} runtimePrecision={rp or '?'} execType={et or '?'}")
     except Exception as e:  # noqa: BLE001 — best-effort diagnostic
         names.add(f"<unavailable: {type(e).__name__}>")
     return names
@@ -686,13 +795,12 @@ def validate_bf16_roundtrip(core) -> bool:
     """The `_bf16_roundtrip` subgraph vs `bf16_round`, on the SAME 20 tie
     cases verified against `half::bf16::from_f32` in Rust.
 
-    fix round 1 (#2, IMPORTANT): the previous version compared
+    The previous version compared
     `bf16_bits(core_out)` — which itself calls `bf16_round(core_out)` before
     extracting bits — against the expected bf16 bits. Since `bf16_round` is
     idempotent, that comparison is TAUTOLOGICAL for any `core_out` close
     enough to re-round to the same bucket: an identity graph (the exact bug
-    `_bf16_roundtrip` had under `INFERENCE_PRECISION_HINT=f32`, see the
-    module's report) still "passes" because `bf16_round(xin)` re-derives the
+    `_bf16_roundtrip` had under `INFERENCE_PRECISION_HINT=f32`) still "passes" because `bf16_round(xin)` re-derives the
     same expected value the test table already encodes. Two independent
     reviews caught this the same way: reverting `_bf16_roundtrip` to the
     broken Convert pair left this check GREEN.
@@ -729,11 +837,11 @@ def validate_bf16_roundtrip(core) -> bool:
 
 
 # --------------------------------------------------------------------------
-# fix round 1 (#5, NEW WORK, design review): device canary.
+# Device canary.
 #
 # Everything above (`--validate-ops`, `--validate-graph`) compiles on
-# `DEVICE="CPU"` — a deliberate choice for numerics validation (Task 1's own
-# comment: "no GPU on this dev machine; the graphs are device-agnostic"), but
+# `DEVICE="CPU"` — a deliberate choice for numerics validation (see `DEVICE`'s
+# own comment: the graphs are device-agnostic), but
 # the GPU plugin is a DIFFERENT compiler we cannot exercise here, with two
 # named defeat vectors specific to it: the `_bf16_roundtrip` subgraph
 # silently executing in f16 despite `INFERENCE_PRECISION_HINT=f32` (would
@@ -779,8 +887,7 @@ def canary_cases() -> list:
     hypotheses predict DIFFERENT raw bits at least at the f=.5 (tie) point,
     and RNE/half_away diverge from truncation/identity at f=.25/.75.
     `rne` (ground truth) is `bf16_round`, itself verified bit-exact against
-    `half::bf16::from_f32` in Rust (Task 1's `bf16_ties` test). See the
-    module report's expected-value table for the full battery in one place.
+    `half::bf16::from_f32` in Rust (the engine crate's `bf16_ties` test).
     """
     cases = []
     for base in _CANARY_BASES:
@@ -790,16 +897,22 @@ def canary_cases() -> list:
         for frac, tag in ((0.25, "f=.25"), (0.5, "f=.5(tie)"), (0.75, "f=.75")):
             x = np.float32(g_lo + frac * ulp)
             rne = _rnd1(float(x))
+            # Truncation rounds toward ZERO, so it lands on whichever of
+            # g_lo/g_hi has the smaller magnitude — and since g_hi = g_lo +
+            # ulp, that is g_lo for a positive base but g_hi for a NEGATIVE
+            # one. The direction flips with the sign at every frac, tie
+            # included. (Predicting g_lo unconditionally mislabels every
+            # negative-base case, so a real device truncation would report
+            # "unknown" instead of naming itself.)
+            trunc = g_lo if base > 0 else g_hi
+            # half-away-from-zero is plain nearest away from the tie; only the
+            # exact tie differs from RNE, breaking toward larger magnitude
+            # (g_hi for base>0; g_lo, the more-negative one, for base<0).
             if frac < 0.5:
-                trunc = half_away = g_lo
+                half_away = g_lo
             elif frac > 0.5:
-                trunc, half_away = g_lo, g_hi
-            else:  # exact tie: truncation always keeps g_lo (round toward
-                # zero == always drop the tie-breaking bit); half-away-from-
-                # zero breaks the tie toward whichever of g_lo/g_hi has the
-                # LARGER magnitude (g_hi for base>0, g_lo for base<0, since
-                # g_lo is the MORE-negative / larger-magnitude one there).
-                trunc = g_lo
+                half_away = g_hi
+            else:
                 half_away = g_hi if base > 0 else g_lo
             cases.append({
                 "label": f"base={base:g} {tag}",
@@ -858,12 +971,12 @@ def run_canary(core, device: str) -> bool:
 
 
 def validate_rope_table_exact(rope_dump_path: str) -> bool:
-    """Step 3b: the ONE exact gate. Diffs the exporter's precomputed cos/sin
+    """The ONE exact gate. Diffs the exporter's precomputed cos/sin
     table against a bit-for-bit dump of Rust's `Freqs.data` at GLM-5.2's real
     rope dims. `numpy`'s `cos`/`powf` need not agree with Rust's libm — a
     silently-different table is a wrong-basis bug that short-prompt parity
     would not catch, so this must be exact, not ULP-tolerant."""
-    print("\n== rope table EXACT gate (Step 3b) ==")
+    print("\n== rope table EXACT gate ==")
     if not os.path.exists(rope_dump_path):
         print(f"  SKIPPED: no dump at {rope_dump_path}")
         print("  regenerate with: cargo test -p cascadia-engine-sparse-moe --lib "
@@ -893,7 +1006,7 @@ def validate_rope_table_exact(rope_dump_path: str) -> bool:
 
 
 # ============================================================================
-# Task 2: full per-layer attention graph + export pipeline + stamp.
+# Full per-layer attention graph + export pipeline + stamp.
 #
 # Weight source: `<model>/shells/layer_NN.safetensors`, tensor names written by
 # `tools/export_glm5.py`'s `attn_shell()` (--tiny) / `export_real`'s per-layer
@@ -912,7 +1025,11 @@ MAX_BATCH_COUNT = 256  # dist.rs MAX_BATCH_COUNT (spec Sec2/Sec14 windowing
 NO_INDEXER_W = 2048  # spec Sec4: dense-exact domain cap when the manifest has
 # no DSA indexer (index_n_heads == 0) — never unbounded, never 0.
 
-EXPORTER_VERSION = "1"
+# Bump whenever the exported graph's numerics change. The engine compares this
+# against its own compiled-in EXPECTED_EXPORTER_VERSION (ov_attn.rs) and
+# refuses an IR set from a generation it makes no claim about.
+# "2": bf16 round-trip + layer-graph numerics corrections since "1".
+EXPORTER_VERSION = "2"
 
 # Additive-mask "invalid" sentinel. Finite (not literal -inf): avoids any
 # inf-vs-inf edge case inside the fused SDPA kernel while sitting far enough
@@ -998,7 +1115,7 @@ def derive_w(manifest: dict) -> int:
 
 # ----------------------------------------------------------------------------
 # Rope table sourcing (Step 0): a bit-for-bit Rust dump, never recomputed in
-# Python. Extends Task 1's `dsv4/rope.rs::freqs_dump::dump_real_dims_freqs`
+# Python. Extends `dsv4/rope.rs::freqs_dump::dump_real_dims_freqs`
 # (now parameterized via env vars, defaults unchanged) rather than inventing a
 # second mechanism.
 # ----------------------------------------------------------------------------
@@ -1020,7 +1137,7 @@ def load_rope_table(dump_path: str, rot_dims: int, seqlen: int, theta: float, *,
     `hard_fail=True` (export mode): missing/mismatched dump raises
     `SystemExit`. `hard_fail=False` (`--validate-graph`): a MISSING dump
     returns `None` (caller treats it as a loud, non-fatal SKIPPED — the SAME
-    discipline `--validate-ops` established for Step 3b); a PRESENT-but-
+    discipline `--validate-ops` established for its exact gate); a PRESENT-but-
     mismatched dump still raises regardless of `hard_fail`.
     """
     half = rot_dims // 2
@@ -1045,6 +1162,26 @@ def load_rope_table(dump_path: str, rot_dims: int, seqlen: int, theta: float, *,
             f"seqlen={meta['seqlen']} theta={meta['theta']}, but this export/test needs "
             f"rot_dims={rot_dims} seqlen={seqlen} theta={theta}.\n  regenerate with: {regen}"
         )
+    # Provenance, not just dims: the sidecar carries the sha256 of the bytes
+    # the Rust dump test wrote. Without this check a table Python generated
+    # itself passes, and numpy's cos/sin land ~1 ULP off Rust's libm on a
+    # minority of entries — a wrong-basis table survives short-prompt parity
+    # and breaks decode.
+    want_sha = meta.get("sha256")
+    if not want_sha:
+        raise SystemExit(
+            f"rope table dump at {dump_path}: sidecar has no sha256 (written by an "
+            f"older dump test, or hand-made)\n  regenerate with: {regen}"
+        )
+    with open(dump_path, "rb") as f:
+        got_sha = hashlib.sha256(f.read()).hexdigest()
+    if got_sha != want_sha:
+        raise SystemExit(
+            f"rope table dump at {dump_path}: sha256 {got_sha} does not match the "
+            f"sidecar's {want_sha} — the table was modified or regenerated outside "
+            f"the Rust dump test\n  regenerate with: {regen}"
+        )
+
     raw = np.fromfile(dump_path, dtype="<f4")
     if raw.size != seqlen * half * 2:
         raise SystemExit(f"rope table dump at {dump_path}: {raw.size} f32 values, "
@@ -1057,7 +1194,7 @@ def _scale_for_qk(qk_head: int) -> np.float32:
     """`(qk_head as f32).powf(-0.5)` — `attn.rs`'s `scale` field, computed via
     the SAME system-libm ctypes call `_rope_cos_sin` uses above, for
     bit-exactness with Rust's `f32::powf` (numpy's vectorized `power` can land
-    1 ULP off, per Task 1's finding)."""
+    1 ULP off)."""
     base = np.float32(qk_head)
     if _libm is not None:
         return np.float32(_libm.powf(ctypes.c_float(float(base)), ctypes.c_float(-0.5)))
@@ -1125,13 +1262,13 @@ def layer_dims(manifest: dict, w: int, rows: int) -> dict:
 
 def ref_attention(weights: dict, x_rows: np.ndarray, past_lc: np.ndarray,
                    past_rc: np.ndarray, dims: dict):
-    """Full numpy MLA-attention reference, built from Task 1's per-op refs
+    """Full numpy MLA-attention reference, built from the per-op refs above
     (`ref_rmsnorm`/`ref_linear_bf16`/`ref_rope_interleaved`) called per row so
     it is literally THEIR math under test, not a batched re-derivation.
     `past_lc`/`past_rc` are the TRUE (unpadded) past — `[P, kv_lora]` /
     `[P, qk_rope]` for whatever `P` the caller has; padding to a fixed graph
     shape is a `--validate-graph`-only concern layered on top of this
-    function (this is also why Task 7 can reuse it directly with no window
+    function (this is also why the tiny-model parity harness reuses it with no window
     concept at all).
 
     Returns `(attn_out[R,hidden], lc[R,kv_lora], rc[R,qk_rope])`,
@@ -1254,8 +1391,8 @@ def build_layer_graph(weights: dict, dims: dict) -> Model:
     guidance. The one wrinkle: SDPA requires rank >= 3 (`Query input rank
     length must be at least 3 or more`), so each head's Q/K/V/mask gets a
     leading size-1 dim added before the call and squeezed after — no
-    multi-head batching, one SDPA op per head (see the per-head Python loop
-    note in the module's report re: node count).
+    multi-head batching, one SDPA op per head — which is what makes the
+    exported graph's node count scale with head count.
     """
     rows, p_max = dims["rows"], dims["p_max"]
     hidden, h = dims["hidden"], dims["h"]
@@ -1306,7 +1443,7 @@ def build_layer_graph(weights: dict, dims: dict) -> Model:
     def apply_rope(vec, dim_total):
         """Rotate the LAST `rope_d` dims of `vec[rows, dim_total]` as
         adjacent (even, odd) complex pairs — same slice/concat/reshape
-        pattern as Task 1's `build_op_graph('rope', ...)`, generalized to a
+        pattern as `build_op_graph('rope', ...)`, generalized to a
         batch of rows sharing one gathered `[rows, half]` cos/sin table."""
         start = dim_total - rope_d
         a = ops.slice(vec, _i64(0, start), _i64(rows, dim_total), _i64(1, 2), _i64(0, 1))
@@ -1415,12 +1552,12 @@ def expected_bf16_layer_bytes(dims: dict) -> dict:
 # --------------------------------------------------------------------------
 # --validate-graph (Step 3) — synthetic dims small enough to compile/run fast;
 # `qk_rope=REAL_QK_ROPE`/`theta=REAL_ROPE_THETA`/`p_max+rows=16` deliberately
-# match Task 1's DEFAULT rope-table dump, so the common case needs no extra
+# match the DEFAULT rope-table dump, so the common case needs no extra
 # `cargo test` invocation beyond what `--validate-ops` already asked for.
 # --------------------------------------------------------------------------
 
 VG_HIDDEN, VG_H, VG_QK_NOPE, VG_V_HEAD, VG_KV_LORA, VG_Q_LORA = 48, 3, 12, 10, 8, 16
-VG_QK_ROPE = REAL_QK_ROPE   # 64 -- matches Task 1's default rope dump (seqlen=16)
+VG_QK_ROPE = REAL_QK_ROPE   # 64 -- matches the default rope dump (seqlen=16)
 VG_P_MAX, VG_ROWS_MAX = 8, 8  # p_max+rows_max = 16, matches that same dump exactly
 
 
@@ -1451,7 +1588,7 @@ def _vg_synthetic_weights(seed: int) -> dict:
 
 def validate_graph(core, rope_dump_path: str):
     """Returns True (pass), False (fail), or None (rope dump SKIPPED — same
-    non-fatal-but-loud discipline as `--validate-ops`'s Step 3b)."""
+    non-fatal-but-loud discipline as `--validate-ops`'s exact gate)."""
     print("\n== validate-graph (Step 3) ==")
     dims = {
         "hidden": VG_HIDDEN, "h": VG_H, "qk_nope": VG_QK_NOPE, "qk_rope": VG_QK_ROPE,
@@ -1510,7 +1647,7 @@ def validate_graph(core, rope_dump_path: str):
             max_ulp_a, flip_a, worst_a, rb_a, gb_a = ulp_stats(ref_out, got_attn)
             max_ulp_lc, _, _, _, _ = ulp_stats(ref_lc, got_lc)
             max_ulp_rc, _, _, _, _ = ulp_stats(ref_rc, got_rc)
-            # fix round 1 (#3): attn_out is `linear_bf16_w(ctx, wo)` in Rust,
+            # attn_out is `linear_bf16_w(ctx, wo)` in Rust,
             # which ALWAYS bf16-rounds its output same as lc/rc's rmsnorm/rope
             # — it was missing the on-grid structural check, leaving it
             # elision-blind on its own (ULP alone re-rounds both sides).
@@ -1570,7 +1707,7 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
     MAX_BATCH_COUNT, the production wire's window size). A small `W` model
     (e.g. the `--tiny` DSA fixture, `index_topk=8`) cannot fit MAX_BATCH_COUNT
     at all -- every window would need zero past capacity -- so the tiny-model
-    parity harness (T3 Task 7) passes a small `rows_cap` here to get a graph
+    parity harness passes a small `rows_cap` here to get a graph
     whose shape actually fits the tiny budget. Production exports never pass
     this (the default reproduces the exact prior behavior)."""
     manifest = read_manifest(model_dir)
@@ -1595,6 +1732,14 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
 
     attn_dir = os.path.join(out_dir, "attn_ov")
     os.makedirs(attn_dir, exist_ok=True)
+
+    # Drop any prior stamp BEFORE writing a single .xml/.bin. A crash halfway
+    # through would otherwise leave last run's valid-looking stamp beside a
+    # mixed-generation IR set, which the engine would accept.
+    stamp_path = os.path.join(attn_dir, "export_stamp.json")
+    if os.path.exists(stamp_path):
+        os.remove(stamp_path)
+
     core = ov.Core()
 
     manifest_path = os.path.join(model_dir, "manifest.json")
@@ -1603,6 +1748,7 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
 
     dims = layer_dims(manifest, w, rows)
     per_layer_digest = {}
+    ir_digest = {}
     total_bytes = 0
     for li in layers:
         shell_path = os.path.join(model_dir, "shells", f"layer_{li:02d}.safetensors")
@@ -1613,19 +1759,31 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
         w_layer["rope_cos"], w_layer["rope_sin"] = cos, sin
         model = build_layer_graph(w_layer, dims)
         # Compile once before committing to disk -- catches a broken export
-        # before it becomes a stale-looking .xml/.bin pair.
-        compile_checked(core, model, f"export layer_{li:02d}")
+        # before it becomes a stale-looking .xml/.bin pair. The compiles that
+        # produce what SHIPS are inspected for quantized kernels too; they
+        # used to be the only ones that weren't.
+        compiled = compile_checked(core, model, f"export layer_{li:02d}")
+        _kernel_names_seen.update(_kernel_names(compiled))
 
         xml_path = os.path.join(attn_dir, f"layer_{li:02d}.xml")
         bin_path = os.path.join(attn_dir, f"layer_{li:02d}.bin")
         ov.save_model(model, xml_path, compress_to_fp16=False)
         bin_size = os.path.getsize(bin_path)
         total_bytes += bin_size + os.path.getsize(xml_path)
+        # One digest over xml||bin, byte-for-byte what `ov_attn.rs::
+        # verify_artifact_digests` re-derives at load.
+        h = hashlib.sha256()
+        for p in (xml_path, bin_path):
+            with open(p, "rb") as f:
+                for chunk in iter(lambda f=f: f.read(1 << 20), b""):
+                    h.update(chunk)
+        ir_digest[f"{li:02d}"] = h.hexdigest()
         print(f"  layer_{li:02d}: {bin_size} bytes .bin")
 
     stamp = {
         "manifest_sha256": manifest_sha256,
         "per_layer_digest": per_layer_digest,
+        "ir_digest": ir_digest,
         "exporter_version": EXPORTER_VERSION,
         "w": w,
         "p_max": p_max,
@@ -1634,7 +1792,6 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
         "kv_lora": kv_lora,
         "qk_rope": qk_rope,
     }
-    stamp_path = os.path.join(attn_dir, "export_stamp.json")
     with open(stamp_path, "w") as f:
         json.dump(stamp, f, indent=2)
     print(f"  wrote {stamp_path}")
@@ -1644,8 +1801,8 @@ def export_all(model_dir: str, out_dir: str, rope_dump_path: str, layers_filter=
 
 # --------------------------------------------------------------------------
 # Step 6b — f32 throughput tripwire. Needs a fleet node + a real manifest;
-# this only BUILDS the harness (single command for an operator to run) and
-# never fabricates a number. See the report for the exact invocation.
+# this only BUILDS the harness (it prints the single command for an operator
+# to run) and never fabricates a number.
 # --------------------------------------------------------------------------
 
 def bench_layer(model_dir: str, layer: int, rope_dump_path: str, device: str, iters: int):
@@ -1686,7 +1843,7 @@ def bench_layer(model_dir: str, layer: int, rope_dump_path: str, device: str, it
     med, p95 = statistics.median(ts), sorted(ts)[int(len(ts) * 0.95) - 1]
     print(f"OV layer_{layer:02d} (rows={rows}, past=p_max steady-state): "
           f"median={med:.3f}ms p95={p95:.3f}ms over {iters} iters")
-    # fix round 1 (#4): glm5_attn_bench.rs's default batch bucket list used
+    # glm5_attn_bench.rs's default batch bucket list used
     # to be [1, 512, 1024, 2048] -- no 256, so this command couldn't produce
     # the "batch=256" numerator the line below asks for. 256 is now in its
     # default list (dist.rs MAX_BATCH_COUNT = `rows` above), but the batch is
@@ -1700,9 +1857,6 @@ def bench_layer(model_dir: str, layer: int, rope_dump_path: str, device: str, it
     print("Step 6b gate: speedup >= ~20x to proceed with Tasks 3-9 as scoped "
           "(spec Sec13); gates survive down to ~5x.")
     return med, p95
-
-
-_kernel_names_seen: set = set()
 
 
 def main():
@@ -1723,21 +1877,21 @@ def main():
                      help="--export only: override the graph's baked row capacity (default "
                           "MAX_BATCH_COUNT=256, the production wire's window size). Needed for a "
                           "small-W model (e.g. --tiny's index_topk=8) where MAX_BATCH_COUNT can't "
-                          "fit at all -- T3 Task 7's tiny-model parity harness uses this.")
+                          "fit at all -- the tiny-model parity harness uses this.")
     ap.add_argument("--bench", metavar="MODEL_DIR",
                      help="Step 6b throughput tripwire: time one layer's graph under the f32 contract "
                           "against the Rust five-projection baseline (needs a fleet node + a real "
-                          "manifest.json/shells -- BLOCKED-ON-OPERATOR here, see the report)")
+                          "manifest.json/shells; it cannot run on a machine without one)")
     ap.add_argument("--bench-layer", type=int, default=0, help="--bench: which global layer index to time")
     ap.add_argument("--bench-device", default="GPU", help="--bench: OV device (default GPU)")
     ap.add_argument("--bench-iters", type=int, default=50, help="--bench: timed iterations")
     ap.add_argument("--canary", action="store_true",
-                     help="fix round 1 (#5): device canary -- compiles the shipped bf16-rounding "
+                     help="device canary -- compiles the shipped bf16-rounding "
                           "subgraph on --device with the real compile config and asserts raw bits "
                           "(no model dir needed; run this on any device before trusting it)")
     ap.add_argument("--device", default="CPU", help="--canary: OV device to canary (default CPU)")
     ap.add_argument("--rope-table-dump", default=os.path.join(tempfile.gettempdir(), "glm5_rope_freqs_dump.bin"),
-                     help="path to the Rust Freqs dump for Step 3b's exact gate / --validate-graph / "
+                     help="path to the Rust Freqs dump for the rope-table exact gate / --validate-graph / "
                           "--export / --bench (default matches dsv4/rope.rs::freqs_dump's default output path)")
     ap.add_argument("--inject-bad-config", action="store_true", help=argparse.SUPPRESS)
     # ^ debug-only: deliberately requests DYNAMIC_QUANTIZATION_GROUP_SIZE=32
@@ -1750,12 +1904,12 @@ def main():
         COMPILE_CFG["DYNAMIC_QUANTIZATION_GROUP_SIZE"] = "32"
         print("*** --inject-bad-config: requesting DYNAMIC_QUANTIZATION_GROUP_SIZE=32 "
               "(contract requires 0) to prove the readback gate fires ***")
-    # ^ fix round 1 (#1): moved ahead of ALL mode dispatch (was previously
+    # ^ Deliberately ahead of ALL mode dispatch (it was previously
     # only wired for --validate-ops/--validate-graph) so this debug flag can
     # prove the drift gate fires on --export/--bench/--canary too, now that
     # `_exit_after_drift_check()` enforces it on every one of them.
 
-    # fix round 1 (#1): EVERY exit path below is wrapped by this `finally` --
+    # EVERY exit path below is wrapped by this `finally` --
     # `_exit_after_drift_check()` is the single choke point that makes
     # `--export`/`--bench` (which `return` well before validate mode's own
     # inline checks) fail nonzero on effective-config drift too. See its
@@ -1809,14 +1963,14 @@ def main():
                 ok &= rope_table_exact
             else:
                 critical_skips.append(
-                    "Step 3b rope-table EXACT gate did NOT run (no Rust dump found at "
+                    "the rope-table EXACT gate did NOT run (no Rust dump found at "
                     f"{args.rope_table_dump}) — the one bit-for-bit-required check in "
                     "this harness was skipped, not passed"
                 )
 
         if args.validate_graph:
             vg_result = validate_graph(core, args.rope_table_dump)
-            # Same discipline as Step 3b above: a missing dump is a loud,
+            # Same discipline as the rope-table gate above: a missing dump is a loud,
             # non-fatal SKIPPED, not a silent pass.
             if vg_result is None:
                 critical_skips.append(
@@ -1826,16 +1980,7 @@ def main():
             else:
                 ok &= vg_result
 
-        print("\n== exec-graph kernels seen ==")
-        for k in sorted(_kernel_names_seen):
-            print(f"  {k}")
-        bad = [k for k in _kernel_names_seen if "int8" in k or "dynquant" in k.replace("_", "") or "dyn_quant" in k]
-        if bad:
-            print(f"  FAIL: dyn-quant/int8 kernel(s) present: {bad}")
-            ok = False
-        else:
-            print("  OK: no int8 / dyn-quant kernels")
-
+        ok &= _kernel_scan_ok()
         ok &= _config_drift_ok()
 
         if not ok:
@@ -1847,11 +1992,14 @@ def main():
             for s in critical_skips:
                 print(f"!!   {s}")
             print("!" * 78)
-            raise SystemExit(0)
+            # Exit 2, not 0: a wrapper or CI job reading $? must not see green
+            # for a run where a safety-critical gate never executed. Distinct
+            # from 1 so "skipped" and "failed" stay tellable apart.
+            raise SystemExit(2)
         print("\nALL PASS")
         raise SystemExit(0)
     finally:
-        _exit_after_drift_check()
+        _exit_after_contract_checks()
 
 
 if __name__ == "__main__":

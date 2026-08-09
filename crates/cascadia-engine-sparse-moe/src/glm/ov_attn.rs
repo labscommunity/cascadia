@@ -203,8 +203,15 @@ pub struct OvRoute<'a> {
     pub tally: &'a mut OvPrefillTally,
 }
 
-/// Enablement state surfaced at the rank's `event=ready` line / doctor output
-/// (spec Sec7) — the closed vocabulary this module and its callers share. A
+/// The closed enablement-state vocabulary this module and its callers share.
+///
+/// KNOWN GAP: spec Sec7 asks for this on a rank `event=ready` line. No such
+/// line exists and there is no engine→control-plane path to carry it (see
+/// `GlmRunner::ov_attn`), so today it is only reachable in-process. The
+/// shipped operator-facing signals are the startup `event=ov_attn_*` logs and
+/// doctor's stamp advisory.
+///
+/// A
 /// LIVE [`OvAttn`] (i.e. [`OvAttn::from_opts`] returned `Some`) only ever
 /// reports `Enabled`/`Active`/`Partial`/`Poisoned`: the other three name the
 /// reason a `None` was returned, which callers recover from the specific
@@ -230,11 +237,24 @@ pub enum OvAttnState {
     StaleIr,
 }
 
+/// The exporter generation this engine accepts. Bumped whenever the exported
+/// graph's numerics change, so an IR set built by an older `glm5_attn_ov.py`
+/// is rejected rather than silently serving different math. Must track
+/// `tools/glm5_attn_ov.py::EXPORTER_VERSION`.
+const EXPECTED_EXPORTER_VERSION: &str = "2";
+
 #[derive(Deserialize)]
 struct ExportStamp {
     manifest_sha256: String,
+    /// sha256 of each owned layer's `shells/layer_NN.safetensors` at export
+    /// time — the "built from the same weights" half.
     per_layer_digest: HashMap<String, String>,
-    #[allow(dead_code)] // not compared today; kept for forward compat / logging
+    /// sha256 of `attn_ov/layer_NN.xml` concatenated with `layer_NN.bin` —
+    /// the "these are the artifacts that export produced" half. Defaulted so
+    /// a pre-v2 stamp reaches the version check with a legible reason instead
+    /// of failing as an unparseable blob.
+    #[serde(default)]
+    ir_digest: HashMap<String, String>,
     exporter_version: String,
     w: usize,
     p_max: usize,
@@ -261,8 +281,12 @@ enum StampCheck {
     ManifestMismatch,
     /// The stamp's baked `W` disagrees with what THIS manifest derives.
     WMismatch,
-    /// The stamp's `per_layer_digest` has no entry for an owned global layer
-    /// (e.g. exported with a `--layers` filter that missed this rank's slice).
+    /// The stamp was written by a different exporter generation, whose graph
+    /// numerics this engine makes no claim about.
+    ExporterVersionMismatch,
+    /// The stamp's `per_layer_digest` / `ir_digest` has no entry for an owned
+    /// global layer (e.g. exported with a `--layers` filter that missed this
+    /// rank's slice).
     MissingCoverage,
 }
 
@@ -275,6 +299,9 @@ fn check_stamp(
     if stamp.p_max + stamp.rows != stamp.w {
         return StampCheck::CorruptDims;
     }
+    if stamp.exporter_version != EXPECTED_EXPORTER_VERSION {
+        return StampCheck::ExporterVersionMismatch;
+    }
     if stamp.manifest_sha256 != manifest_sha256 {
         return StampCheck::ManifestMismatch;
     }
@@ -282,11 +309,86 @@ fn check_stamp(
         return StampCheck::WMismatch;
     }
     for &gl in owned_layers {
-        if !stamp.per_layer_digest.contains_key(&format!("{gl:02}")) {
+        let key = format!("{gl:02}");
+        if !stamp.per_layer_digest.contains_key(&key) || !stamp.ir_digest.contains_key(&key) {
             return StampCheck::MissingCoverage;
         }
     }
     StampCheck::Ok
+}
+
+/// Streaming sha256 of a file — the shells and IR `.bin`s are large enough
+/// that reading them whole just to hash them is not worth the resident bytes.
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut s = String::with_capacity(64);
+    for b in hasher.finalize() {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
+}
+
+/// Re-derive the digests the stamp recorded and compare them, so spec Sec6's
+/// "built from the same weights is verified, not assumed" covers all three
+/// artifacts and not just `manifest.json`. Returns the failing layer and the
+/// artifact class on the first mismatch.
+///
+/// `contains_key` alone (what this used to be) accepts a stale `layer_NN.bin`
+/// from an older exporter sitting beside a fresh stamp — the fleet's named
+/// stale-artifact class, and the one thing the handshake exists to stop.
+fn verify_artifact_digests(
+    model_dir: &Path,
+    ir_dir: &Path,
+    stamp: &ExportStamp,
+    owned_layers: &[usize],
+) -> Result<(), String> {
+    for &gl in owned_layers {
+        let key = format!("{gl:02}");
+
+        let shell = model_dir.join(format!("shells/layer_{gl:02}.safetensors"));
+        let got = sha256_file(&shell).map_err(|e| format!("layer {key}: {shell:?}: {e}"))?;
+        if Some(&got) != stamp.per_layer_digest.get(&key) {
+            return Err(format!(
+                "layer {key}: shell weights changed since export (shells/layer_{key}.safetensors)"
+            ));
+        }
+
+        // One digest over xml||bin: the pair is only ever produced and only
+        // ever consumed together, so a per-file split buys no extra signal.
+        let xml = ir_dir.join(format!("layer_{gl:02}.xml"));
+        let bin = ir_dir.join(format!("layer_{gl:02}.bin"));
+        let joined = {
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write;
+            let mut h = Sha256::new();
+            for p in [&xml, &bin] {
+                h.update(std::fs::read(p).map_err(|e| format!("layer {key}: {p:?}: {e}"))?);
+            }
+            let mut s = String::with_capacity(64);
+            for b in h.finalize() {
+                let _ = write!(s, "{b:02x}");
+            }
+            s
+        };
+        if Some(&joined) != stamp.ir_digest.get(&key) {
+            return Err(format!(
+                "layer {key}: IR does not match the stamp (layer_{key}.xml/.bin)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `W` per spec Sec4: `index_topk` when the manifest attaches an indexer with
@@ -333,16 +435,31 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 /// Config-wins-over-env resolution for a boolean knob, plus the source label
 /// every startup log records (spec Sec7: "config wins over env when both
 /// set... logs the effective value AND its source").
+/// The env value is PARSED, not merely probed for presence: the runbook's
+/// emergency rollback tells an operator to turn this knob off, and
+/// `CASCADIA_GLM5_OV_ATTN=0` must not be the thing that enables it.
 fn resolve_bool(cfg: Option<bool>, env_key: &str) -> (bool, &'static str) {
     match cfg {
         Some(v) => (v, "engine_arg"),
-        None => {
-            if std::env::var_os(env_key).is_some() {
-                (true, "env")
-            } else {
-                (false, "default")
-            }
-        }
+        None => match std::env::var_os(env_key) {
+            Some(raw) => (env_value_is_on(&raw), "env"),
+            None => (false, "default"),
+        },
+    }
+}
+
+/// `0` / `false` / `no` / `off` / empty (any case, surrounding space ignored)
+/// mean OFF; every other present value means ON. Deliberately permissive on
+/// the ON side — an operator who mistypes the enable value gets the safe
+/// answer only for the spellings that unambiguously say "off".
+fn env_value_is_on(raw: &std::ffi::OsStr) -> bool {
+    match raw.to_str() {
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        // Non-UTF-8 is not any of the off spellings, so it reads as "set".
+        None => true,
     }
 }
 
@@ -493,17 +610,18 @@ fn canary_cases() -> Vec<CanaryCase> {
         for (frac, tag) in [(0.25f32, "f=.25"), (0.5, "f=.5(tie)"), (0.75, "f=.75")] {
             let x = g_lo + frac * ulp;
             let rne = to_bf16(x);
-            // Matches Python's canary_cases(): frac<0.5 -> trunc=half_away=g_lo;
-            // frac>0.5 -> trunc=g_lo, half_away=g_hi; frac==0.5 (exact tie) ->
-            // trunc always keeps g_lo (round-toward-zero drops the
-            // tie-breaking bit), half_away breaks toward the LARGER-magnitude
-            // of g_lo/g_hi (g_hi for base>0, g_lo for base<0 -- g_lo is the
-            // more-negative / larger-magnitude one there).
-            let half_away_breaks_up = frac > 0.5 || base > 0.0;
-            let (trunc, half_away) = if frac < 0.5 {
-                (g_lo, g_lo)
+            // Matches Python's canary_cases(). Truncation rounds toward ZERO,
+            // so it lands on the smaller-magnitude of g_lo/g_hi -- and since
+            // g_hi = g_lo + ulp, that flips with the sign of the base, at
+            // every frac including the tie. half-away-from-zero is plain
+            // nearest except at the exact tie, where it breaks toward the
+            // larger magnitude (g_hi for base>0; g_lo, the more-negative one,
+            // for base<0).
+            let trunc = if base > 0.0 { g_lo } else { g_hi };
+            let half_away = if frac < 0.5 || (frac == 0.5 && base < 0.0) {
+                g_lo
             } else {
-                (g_lo, if half_away_breaks_up { g_hi } else { g_lo })
+                g_hi
             };
             cases.push(CanaryCase {
                 label: format!("base={base} {tag}"),
@@ -831,6 +949,16 @@ impl OvAttn {
                 );
                 return None;
             }
+            StampCheck::ExporterVersionMismatch => {
+                warn!(
+                    target: "cascadia::glm5",
+                    event = "ov_attn_stale_ir",
+                    reason = "exporter_version_mismatch",
+                    expected = EXPECTED_EXPORTER_VERSION,
+                    found = %stamp.exporter_version,
+                );
+                return None;
+            }
             StampCheck::MissingCoverage => {
                 warn!(
                     target: "cascadia::glm5",
@@ -839,6 +967,18 @@ impl OvAttn {
                 );
                 return None;
             }
+        }
+
+        // Values, not just presence. Runs before the device probe so a stale
+        // artifact set is diagnosed as such rather than as a device problem.
+        if let Err(reason) = verify_artifact_digests(model_dir, &dir, &stamp, owned_layers) {
+            warn!(
+                target: "cascadia::glm5",
+                event = "ov_attn_stale_ir",
+                reason = "artifact_digest_mismatch",
+                detail = %reason,
+            );
+            return None;
         }
 
         // Startup probe (spec Sec7): a real (non-stub) shim at the ABI this
@@ -1122,7 +1262,14 @@ impl OvAttn {
     }
 
     /// Run one window of layer `layer_local` (LOCAL offset — see the module
-    /// doc). `x` is `[rows, hidden]` (real rows only); `past_lc`/`past_rc` are
+    /// doc).
+    ///
+    /// `x` is `[rows, hidden]` (real rows only) and is the **RAW residual**,
+    /// PRE-`input_layernorm`: the graph applies `rmsnorm(in_ln)` itself as its
+    /// first op. Passing an already-normed row normalizes twice and produces
+    /// wrong-but-finite, on-grid KV rows that no downstream guard can detect.
+    ///
+    /// `past_lc`/`past_rc` are
     /// `[past_len, kv_lora]`/`[past_len, qk_rope]` (real past only, NOT
     /// pre-padded to `p_max` — this function pads). Returns `None` on ANY
     /// failure (bad shapes, poisoned, layer never compiled, device error) —
@@ -1488,7 +1635,13 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            exporter_version: "1".to_string(),
+            ir_digest: [
+                ("00".to_string(), "ix".to_string()),
+                ("01".to_string(), "iy".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            exporter_version: EXPECTED_EXPORTER_VERSION.to_string(),
             w: 8,
             p_max: 4,
             rows: 4,
@@ -1647,6 +1800,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_stamp_flags_an_older_exporter_generation() {
+        let mut stamp = test_stamp();
+        stamp.exporter_version = "1".to_string();
+        assert_eq!(
+            check_stamp(&stamp, "abc123", 8, &[0, 1]),
+            StampCheck::ExporterVersionMismatch
+        );
+    }
+
+    /// A pre-`ir_digest` stamp (the field defaults to empty) must not pass
+    /// coverage — otherwise the IR files stay unverified exactly as before.
+    #[test]
+    fn check_stamp_flags_missing_ir_digest_coverage() {
+        let mut stamp = test_stamp();
+        stamp.ir_digest.remove("01");
+        assert_eq!(
+            check_stamp(&stamp, "abc123", 8, &[0, 1]),
+            StampCheck::MissingCoverage
+        );
+    }
+
+    /// The digest VALUES are compared, not merely present — a stale IR beside
+    /// a fresh stamp used to pass the whole handshake.
+    #[test]
+    fn verify_artifact_digests_rejects_a_stale_ir_beside_a_fresh_stamp() {
+        let td = std::env::temp_dir().join(format!("ov_attn_digest_{}", std::process::id()));
+        let shells = td.join("shells");
+        let ir = td.join("attn_ov");
+        std::fs::create_dir_all(&shells).unwrap();
+        std::fs::create_dir_all(&ir).unwrap();
+        std::fs::write(shells.join("layer_00.safetensors"), b"weights").unwrap();
+        std::fs::write(ir.join("layer_00.xml"), b"<net/>").unwrap();
+        std::fs::write(ir.join("layer_00.bin"), b"ir-bytes").unwrap();
+
+        let mut stamp = test_stamp();
+        stamp
+            .per_layer_digest
+            .insert("00".into(), sha256_hex(b"weights"));
+        stamp
+            .ir_digest
+            .insert("00".into(), sha256_hex(b"<net/>ir-bytes"));
+        assert!(verify_artifact_digests(&td, &ir, &stamp, &[0]).is_ok());
+
+        // Same filename, older exporter's bytes.
+        std::fs::write(ir.join("layer_00.bin"), b"stale-ir-bytes").unwrap();
+        let err = verify_artifact_digests(&td, &ir, &stamp, &[0]).unwrap_err();
+        assert!(err.contains("IR does not match"), "got: {err}");
+
+        // And the shell half: weights re-exported without re-running this tool.
+        std::fs::write(ir.join("layer_00.bin"), b"ir-bytes").unwrap();
+        std::fs::write(shells.join("layer_00.safetensors"), b"new-weights").unwrap();
+        let err = verify_artifact_digests(&td, &ir, &stamp, &[0]).unwrap_err();
+        assert!(err.contains("shell weights changed"), "got: {err}");
+
+        std::fs::remove_dir_all(&td).ok();
+    }
+
+    // ---- env knob polarity (documented emergency rollback) ----------------
+
+    #[test]
+    fn env_off_spellings_disable_and_everything_else_enables() {
+        use std::ffi::OsStr;
+        for off in ["0", "false", "FALSE", "no", "off", "", "  off  "] {
+            assert!(!env_value_is_on(OsStr::new(off)), "{off:?} must mean OFF");
+        }
+        for on in ["1", "true", "yes", "on", "GPU"] {
+            assert!(env_value_is_on(OsStr::new(on)), "{on:?} must mean ON");
+        }
+    }
+
+    #[test]
+    fn resolve_bool_config_wins_and_env_value_is_honoured() {
+        // Config wins over env in both directions, whatever env says.
+        let key = "CASCADIA_GLM5_OV_ATTN_TEST_POLARITY";
+        // SAFETY: single-threaded within this test; key is test-local.
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(resolve_bool(Some(true), key), (true, "engine_arg"));
+        assert_eq!(
+            resolve_bool(None, key),
+            (false, "env"),
+            "=0 must NOT enable the feature — the runbook's rollback depends on it"
+        );
+        unsafe { std::env::set_var(key, "1") };
+        assert_eq!(resolve_bool(None, key), (true, "env"));
+        assert_eq!(resolve_bool(Some(false), key), (false, "engine_arg"));
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(resolve_bool(None, key), (false, "default"));
+    }
+
     // ---- Mask builder -------------------------------------------------
 
     #[test]
@@ -1728,19 +1971,48 @@ mod tests {
                 "case {}: identity must equal the raw input",
                 c.label
             );
+            // Truncation rounds toward zero, so whatever else is true, its
+            // prediction is never larger in magnitude than the input's.
+            assert!(
+                c.trunc.abs() <= c.x.abs(),
+                "case {}: trunc must round TOWARD zero (got {} for x={})",
+                c.label,
+                c.trunc,
+                c.x
+            );
+            let negative = c.label.contains("base=-");
             if c.label.contains("f=.25") {
-                assert_eq!(
-                    c.trunc, c.half_away,
-                    "case {}: f<.5 -> trunc==half_away==g_lo",
-                    c.label
-                );
+                // Nearest is g_lo; truncation agrees only for a positive base.
+                if negative {
+                    assert_ne!(
+                        c.trunc.to_bits(),
+                        c.half_away.to_bits(),
+                        "case {}: negative base -> trunc(g_hi) != half_away(g_lo)",
+                        c.label
+                    );
+                } else {
+                    assert_eq!(
+                        c.trunc, c.half_away,
+                        "case {}: positive base, f<.5 -> both g_lo",
+                        c.label
+                    );
+                }
             } else if c.label.contains("f=.75") {
-                assert_ne!(
-                    c.trunc.to_bits(),
-                    c.half_away.to_bits(),
-                    "case {}: f>.5 -> trunc(g_lo) != half_away(g_hi)",
-                    c.label
-                );
+                // Nearest is g_hi; truncation agrees only for a negative base.
+                if negative {
+                    assert_eq!(
+                        c.trunc, c.half_away,
+                        "case {}: negative base, f>.5 -> both g_hi",
+                        c.label
+                    );
+                } else {
+                    assert_ne!(
+                        c.trunc.to_bits(),
+                        c.half_away.to_bits(),
+                        "case {}: positive base -> trunc(g_lo) != half_away(g_hi)",
+                        c.label
+                    );
+                }
             }
         }
     }
@@ -1808,15 +2080,33 @@ mod tests {
     // export_stamp.json + manifest.json exercises the real `from_opts`
     // dispatch (not just the pure `check_stamp` function) with no device.
 
+    /// Stand-in artifact bytes; the fixture writer and `stamp_json` agree on
+    /// them so the digest comparison has something real to compare.
+    fn artifact_bytes(layer: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (
+            format!("shell-{layer}").into_bytes(),
+            format!("xml-{layer}").into_bytes(),
+            format!("bin-{layer}").into_bytes(),
+        )
+    }
+
     fn write_fixture(dir: &std::path::Path, stamp: &serde_json::Value, manifest_bytes: &[u8]) {
         let attn_dir = dir.join("attn_ov");
+        let shells = dir.join("shells");
         std::fs::create_dir_all(&attn_dir).unwrap();
+        std::fs::create_dir_all(&shells).unwrap();
         std::fs::write(
             attn_dir.join("export_stamp.json"),
             serde_json::to_vec(stamp).unwrap(),
         )
         .unwrap();
         std::fs::write(dir.join("manifest.json"), manifest_bytes).unwrap();
+        for l in stamp["per_layer_digest"].as_object().unwrap().keys() {
+            let (shell, xml, bin) = artifact_bytes(l);
+            std::fs::write(shells.join(format!("layer_{l}.safetensors")), shell).unwrap();
+            std::fs::write(attn_dir.join(format!("layer_{l}.xml")), xml).unwrap();
+            std::fs::write(attn_dir.join(format!("layer_{l}.bin")), bin).unwrap();
+        }
     }
 
     fn stamp_json(
@@ -1826,14 +2116,18 @@ mod tests {
         rows: usize,
         layers: &[&str],
     ) -> serde_json::Value {
-        let digest: HashMap<String, String> = layers
-            .iter()
-            .map(|l| (l.to_string(), "x".to_string()))
-            .collect();
+        let mut digest: HashMap<String, String> = HashMap::new();
+        let mut ir: HashMap<String, String> = HashMap::new();
+        for l in layers {
+            let (shell, xml, bin) = artifact_bytes(l);
+            digest.insert(l.to_string(), sha256_hex(&shell));
+            ir.insert(l.to_string(), sha256_hex(&[xml, bin].concat()));
+        }
         serde_json::json!({
             "manifest_sha256": manifest_sha256,
             "per_layer_digest": digest,
-            "exporter_version": "1",
+            "ir_digest": ir,
+            "exporter_version": EXPECTED_EXPORTER_VERSION,
             "w": w,
             "p_max": p_max,
             "rows": rows,
@@ -1925,6 +2219,29 @@ mod tests {
         });
         assert!(log.contains("ov_attn_stale_ir"), "log:\n{log}");
         assert!(log.contains("missing_layer_digest"), "log:\n{log}");
+    }
+
+    /// A stale `layer_NN.bin` from an older exporter beside a structurally
+    /// valid, freshly written stamp — the exact case `contains_key` accepted.
+    #[test]
+    fn from_opts_rejects_ir_bytes_that_do_not_match_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_bytes = b"fake manifest bytes";
+        let sha = sha256_hex(manifest_bytes);
+        let stamp = stamp_json(&sha, 8, 4, 4, &["00", "01"]);
+        write_fixture(dir.path(), &stamp, manifest_bytes);
+        std::fs::write(dir.path().join("attn_ov/layer_01.bin"), b"older-generation").unwrap();
+
+        let opts = StageOpts {
+            ov_attn: Some(true),
+            ..Default::default()
+        };
+        let manifest = test_manifest(2, 8);
+        let log = capture_logs(|| {
+            assert!(OvAttn::from_opts(dir.path(), &[0, 1], &manifest, &opts).is_none());
+        });
+        assert!(log.contains("artifact_digest_mismatch"), "log:\n{log}");
+        assert!(!log.contains("ov_attn_unavailable"), "log:\n{log}");
     }
 
     #[test]

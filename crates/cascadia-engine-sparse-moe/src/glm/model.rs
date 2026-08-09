@@ -248,8 +248,10 @@ impl GlmLayer {
             return false;
         }
 
-        // Both consumers of the pre-norm row want the same buffer: the graph's
-        // `x` input and (on a "full" layer) the DSA indexer key.
+        // The graph and the indexer want DIFFERENT buffers. The graph's `x` is
+        // the RAW residual — its own first op is `rmsnorm(in_ln)` — while the
+        // DSA indexer key is the POST-`in_ln` normed row. Feeding `normed` to
+        // the graph normalizes twice and silently commits wrong `lc`/`rc`.
         let mut normed = vec![0.0f32; rows * hd];
         for r in 0..rows {
             let dst = &mut normed[r * hd..(r + 1) * hd];
@@ -258,9 +260,14 @@ impl GlmLayer {
         }
 
         let (past_lc, past_rc) = self.attn.past_rows();
-        let Some(out) =
-            ov.prefill_window(route.layer_local, &normed, rows, &past_lc, &past_rc, base)
-        else {
+        let Some(out) = ov.prefill_window(
+            route.layer_local,
+            &xs[..rows * hd],
+            rows,
+            &past_lc,
+            &past_rc,
+            base,
+        ) else {
             route
                 .tally
                 .note_skip(super::ov_attn::OvSkipReason::InferFailed);
@@ -1088,6 +1095,53 @@ mod ov_prefill_tests {
             shuffled.attn.indexer_keys().unwrap(),
             want,
             "out-of-order feeding must NOT match — the key's rope makes position load-bearing"
+        );
+    }
+
+    /// The graph's `x` is the RAW residual, pre-`input_layernorm`: the exported
+    /// graph's own first op is `rmsnorm(in_ln)`. Handing it the already-normed
+    /// row normalizes twice and commits wrong `lc`/`rc` into the LIVE KV cache
+    /// while every finite / on-grid / canary / latch / stamp guard still
+    /// passes, so only a seam assertion can catch it.
+    #[test]
+    fn routed_window_hands_the_graph_the_raw_residual() {
+        let rows = 6usize;
+        let xs = rows_of(rows, 11);
+
+        let seen: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let ov = OvAttn::mock(
+            mock_cfg(),
+            Box::new(move |_ll, x, n, _past| {
+                *sink.lock().unwrap() = x.to_vec();
+                Some(canned(n, 555))
+            }),
+        );
+
+        let mut routed = tiny_layer(Some(true));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let (_, tally) = run_ov(&mut routed, &ov, &xs, rows, &mut carries);
+        assert!(tally.used(), "window must have been routed");
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(
+            got, xs,
+            "graph got something other than the raw residual (double-normalization)"
+        );
+
+        // Negative control: the normed row this layer would build is genuinely
+        // a different buffer, so the equality above is not trivially satisfied.
+        let mut normed = xs.clone();
+        for r in 0..rows {
+            rmsnorm(
+                &mut normed[r * HIDDEN..(r + 1) * HIDDEN],
+                &routed.in_ln,
+                routed.eps,
+            );
+        }
+        assert_ne!(
+            normed, xs,
+            "fixture must make raw and normed distinguishable"
         );
     }
 
