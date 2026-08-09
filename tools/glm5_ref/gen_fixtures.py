@@ -403,6 +403,16 @@ def main():
                             indexer_types=["full", "full", "full", "shared", "shared", "shared", "full", "shared"])
     print(f"[indexshare fixture] export {isml} (8 layers, mixed)")
 
+    # `--tiny` CLI-default indexer (index_n_heads=2, index_head_dim=16,
+    # index_topk=8, full/shared/full): proves the exporter's actual default —
+    # not just the ad-hoc DSA/IndexShare configs above — crosses the sparse
+    # boundary in real generation. Dense twin mirrors the DSA fixtures' pattern.
+    export_glm5.export_tiny(out.parent / "glm5_export_tiny_indexer", **export_glm5.TINY_INDEXER_KW)
+    print(f"[tiny-indexer fixture] export {out.parent / 'glm5_export_tiny_indexer'}")
+    tiny_dense_kw = dict(export_glm5.TINY_INDEXER_KW, index_topk=10_000)
+    export_glm5.export_tiny(out.parent / "glm5_export_tiny_indexer_dense", **tiny_dense_kw)
+    print(f"[tiny-indexer fixture] export {out.parent / 'glm5_export_tiny_indexer_dense'} (dense twin)")
+
     # ---- 11. real-exporter round-trip: synthetic FP8 ckpt -> export_real ----
     from glm5_ref.fp8_roundtrip import roundtrip
     fp8_export, fp8_greedy = roundtrip(out.parent, rt_prompt, rt_ngen)

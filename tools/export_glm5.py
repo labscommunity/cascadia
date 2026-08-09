@@ -244,6 +244,22 @@ def write_manifest(cfg: dict, out: Path):
 # --------------------------------------------------------------------------
 # --tiny: deterministic tiny model in the engine layout (smoke / M3 loader dev)
 # --------------------------------------------------------------------------
+
+# Default DSA indexer for the `--tiny` CLI path: small enough that ~10
+# generated tokens cross the index_topk boundary cheaply, so a loader/parity
+# test can exercise the sparse selection without a real-sized context. Kept as
+# a module constant (rather than inlined at the call site) so the Rust test's
+# fixture generator can build the byte-identical config instead of drifting.
+TINY_INDEXER_NUM_LAYERS = 3
+TINY_INDEXER_KW = dict(
+    num_layers=TINY_INDEXER_NUM_LAYERS,
+    index_n_heads=2,
+    index_head_dim=16,
+    index_topk=8,
+    indexer_types=["full" if i % 2 == 0 else "shared" for i in range(TINY_INDEXER_NUM_LAYERS)],
+)
+
+
 def export_tiny(out: Path, num_layers: int = 3, first_dense: int = 1,
                 index_n_heads: int = 0, index_head_dim: int = 8, index_topk: int = 0,
                 indexer_types: "list | None" = None):
@@ -643,7 +659,7 @@ def main():
               f"{cfg['n_routed']} experts, top-{cfg['top_k']}, hidden {cfg['hidden']})")
         return
     if args.tiny:
-        export_tiny(args.tiny)
+        export_tiny(args.tiny, **TINY_INDEXER_KW)
         return
     if args.model and args.out:
         export_real(args.model, args.out)
