@@ -247,6 +247,9 @@ impl StageOpts {
         prefix_cache_depth: Option<u32>,
         ov_cache_entries: Option<u32>,
         ov_cache_mb: Option<u64>,
+        ov_attn: Option<bool>,
+        ov_attn_device: Option<String>,
+        ov_attn_min_rows: Option<u32>,
     ) -> Self {
         let env = Self::from_env();
         Self {
@@ -257,12 +260,11 @@ impl StageOpts {
             prefix_cache_depth,
             ov_cache_entries,
             ov_cache_mb,
-            // No config-arg parameters yet (wired by a later task alongside
-            // SparseMoEBuilderConfig); `None` falls through to OvAttn::from_opts's
-            // own env fallback, same precedence story as the fields above.
-            ov_attn: None,
-            ov_attn_device: None,
-            ov_attn_min_rows: None,
+            // `None` falls through to OvAttn::from_opts's own env fallback,
+            // same precedence story as the fields above.
+            ov_attn,
+            ov_attn_device,
+            ov_attn_min_rows,
         }
     }
 }
@@ -298,10 +300,8 @@ pub struct GlmRunner {
     /// Optional OpenVINO attention prefill backend (iGPU offload). `Some` only
     /// when `ov_attn` is enabled AND the stamp/precision/canary preconditions
     /// all pass at construction — every failure mode logs its own
-    /// distinguishable event (see `ov_attn.rs`). Threading this into
-    /// `forward_layers_batch`'s per-window routing is a later task; this field
-    /// exists so `load_staged` performs the startup probe / eager compile /
-    /// config log this task owns.
+    /// distinguishable event (see `ov_attn.rs`). `forward_layers_batch` offers
+    /// each layer's prefill window to it and falls back per-window.
     ov_attn: Option<super::ov_attn::OvAttn>,
 }
 
@@ -426,6 +426,23 @@ impl GlmRunner {
             }
         }
 
+        // Attention-IR and expert-IR allocations both come out of the iGPU's
+        // shared pool; running both is the untested-and-unbudgeted combination
+        // of the two things that already exhausted it separately. Reject at
+        // load rather than WARN — a rank that silently keeps going here fails
+        // later as opaque device errors on whichever path lost the race.
+        // Keyed on the REQUEST (see `requested_on_accelerator`), so the
+        // rejection does not depend on whether either compile happened to
+        // succeed.
+        let ov_attn_accel = super::ov_attn::requested_on_accelerator(&opts);
+        if ov_attn_accel && ov.as_ref().is_some_and(|o| o.on_accelerator()) {
+            return Err(LoadError::Manifest(
+                "ov_attn and ov_experts both target an accelerator; they share one \
+                 device memory pool. Move one to CPU or disable it."
+                    .to_string(),
+            ));
+        }
+
         // Optional OpenVINO attention backend (iGPU prefill offload). `Some`
         // only when `ov_attn` is enabled and every startup precondition
         // (stamp handshake, startup probe, bf16 device canary, eager compile)
@@ -456,7 +473,10 @@ impl GlmRunner {
         // devices: pins + held compiled experts crowd the pool GPU builds
         // allocate from (measured: combined = 100/100 CL_INVALID_EVENT, either
         // half alone = 0 failures).
-        let ov_accel = ov.as_ref().is_some_and(|o| o.on_accelerator());
+        // `ov_attn` counts here too: the attention IRs are compiled and their
+        // weights uploaded out of the same shared pool, so pins starve that
+        // upload the same way they starve the expert one.
+        let ov_accel = ov.as_ref().is_some_and(|o| o.on_accelerator()) || ov_attn_accel;
         if ov_accel && !nopin_env {
             tracing::info!(
                 "skipping expert pinning: OV offload on an accelerator shares its RAM pool"
@@ -716,9 +736,8 @@ impl GlmRunner {
     /// This rank's OpenVINO attention backend, if `ov_attn` is enabled and
     /// construction succeeded — `None` for any of the reasons `ov_attn.rs`'s
     /// module doc enumerates (each already logged its own distinguishable
-    /// event at construction time). Prefill-window routing through this is a
-    /// later task; exposed now so that task's `forward_layers_batch` change
-    /// has a field to read instead of re-deriving construction.
+    /// event at construction time). Exposed for the rank's `event=ready`
+    /// line / doctor output to report [`super::ov_attn::OvAttnState`].
     pub fn ov_attn(&self) -> Option<&super::ov_attn::OvAttn> {
         self.ov_attn.as_ref()
     }
@@ -737,6 +756,7 @@ impl Drop for GlmRunner {
         // interval's worth of the run's tail never reaches the log. No-op unless
         // CASCADIA_GLM5_OV_STATS is set.
         super::ov_expert::stats::dump_now();
+        super::ov_attn::stats::dump_now();
     }
 }
 
@@ -868,10 +888,38 @@ impl StagedRunner for GlmRunner {
             "glm5 batch: bad hidden length"
         );
         // Each layer runs per-position attention (KV in order) + batch-union MoE.
+        //
+        // NOTE: speculative-decode verify batches arrive here too (the wire's
+        // `ForwardBatch`), so they are offered to the OV route on exactly the
+        // same terms as a prompt window — see `attn_window_ov`'s `min_rows`
+        // comment for why production settings exclude them.
         let mut x = hidden;
         let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows]; // per-row IndexShare
-        for l in &mut self.layers {
-            x = l.forward_prefill(&x, rows, &mut carries);
+        let mut tally = super::ov_attn::OvPrefillTally::default();
+        let ov = self.ov_attn.as_ref();
+        for (local, l) in self.layers.iter_mut().enumerate() {
+            let route = ov.map(|o| super::ov_attn::OvRoute {
+                ov: o,
+                layer_local: local,
+                tally: &mut tally,
+            });
+            x = l.forward_prefill(&x, rows, &mut carries, route);
+        }
+        // Emitted whenever the feature is enabled — including when the path is
+        // poisoned or every layer fell back, which is precisely when a missing
+        // line would let a dead path keep reporting Active.
+        if ov.is_some() {
+            tracing::info!(
+                target: "cascadia::glm5",
+                event = "ov_attn_prefill",
+                used = tally.used(),
+                base,
+                rows,
+                layers_ov = tally.layers_ov,
+                layers_rust = tally.layers_rust,
+                skipped_reason = tally.skipped_reason(),
+            );
+            super::ov_attn::stats::dump();
         }
         self.pos += rows;
         x

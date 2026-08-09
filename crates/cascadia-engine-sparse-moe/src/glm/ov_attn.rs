@@ -82,6 +82,123 @@ pub struct AttnWindowOut {
     pub rc: Vec<f32>,       // [rows, qk_rope]
 }
 
+/// Why one prefill window did NOT run on the OV path — the CLOSED vocabulary
+/// the `event=ov_attn_prefill` line and the cumulative [`stats`] summary both
+/// report. Every fallback must map to exactly one of these: a window that
+/// silently reverts to Rust while the rank still advertises `Active` is this
+/// project's signature defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OvSkipReason {
+    /// The backend latched off (see [`OvAttnState::Poisoned`]).
+    Poisoned,
+    /// This local layer's IR never compiled — permanently ineligible.
+    LayerNotCompiled,
+    /// `base + rows` exceeds the offload budget `W`, or `rows` exceeds the
+    /// graph's baked row capacity: the window does not fit the static shape.
+    WindowTooLarge,
+    /// Fewer real rows than the resolved `min_rows` floor — too small to pay
+    /// for the past-KV upload.
+    RowsBelowMin,
+    /// [`OvAttn::prefill_window`] returned `None` (device error, shape
+    /// mismatch, latch tripped mid-call).
+    InferFailed,
+    /// The graph produced a NaN/Inf in a real row.
+    NonFinite,
+    /// [`super::attn::AttentionLayer::commit_prefill_rows`] rejected the rows.
+    CommitFailed,
+}
+
+impl OvSkipReason {
+    /// Number of variants — the width of [`stats`]'s per-reason counter array.
+    const COUNT: usize = 7;
+
+    fn idx(self) -> usize {
+        match self {
+            OvSkipReason::Poisoned => 0,
+            OvSkipReason::LayerNotCompiled => 1,
+            OvSkipReason::WindowTooLarge => 2,
+            OvSkipReason::RowsBelowMin => 3,
+            OvSkipReason::InferFailed => 4,
+            OvSkipReason::NonFinite => 5,
+            OvSkipReason::CommitFailed => 6,
+        }
+    }
+
+    /// Stable log token. `"none"` is reserved for "nothing was skipped" and is
+    /// deliberately NOT a variant — it is not a reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OvSkipReason::Poisoned => "poisoned",
+            OvSkipReason::LayerNotCompiled => "layer_not_compiled",
+            OvSkipReason::WindowTooLarge => "window_too_large",
+            OvSkipReason::RowsBelowMin => "rows_below_min",
+            OvSkipReason::InferFailed => "infer_failed",
+            OvSkipReason::NonFinite => "non_finite",
+            OvSkipReason::CommitFailed => "commit_failed",
+        }
+    }
+
+    fn from_idx(i: usize) -> Self {
+        [
+            OvSkipReason::Poisoned,
+            OvSkipReason::LayerNotCompiled,
+            OvSkipReason::WindowTooLarge,
+            OvSkipReason::RowsBelowMin,
+            OvSkipReason::InferFailed,
+            OvSkipReason::NonFinite,
+            OvSkipReason::CommitFailed,
+        ][i]
+    }
+}
+
+/// Per-`forward_layers_batch` accounting for the OV attention route, filled in
+/// layer by layer and emitted once as `event=ov_attn_prefill`.
+#[derive(Default)]
+pub struct OvPrefillTally {
+    pub layers_ov: u32,
+    pub layers_rust: u32,
+    /// The FIRST layer's skip reason in this call. First (not last, not "most
+    /// severe") because the layers run in order and the earliest fallback is
+    /// the one an operator should chase — a later `infer_failed` is usually a
+    /// consequence of whatever made the first layer bail.
+    first_skip: Option<OvSkipReason>,
+}
+
+impl OvPrefillTally {
+    /// Record that one layer's window ran on OV.
+    pub fn note_used(&mut self) {
+        self.layers_ov += 1;
+        stats::record_used();
+    }
+
+    /// Record that one layer's window fell back to Rust, and why.
+    pub fn note_skip(&mut self, reason: OvSkipReason) {
+        self.layers_rust += 1;
+        self.first_skip.get_or_insert(reason);
+        stats::record_skip(reason);
+    }
+
+    /// The `skipped_reason` log field: `"none"` when every layer ran on OV.
+    pub fn skipped_reason(&self) -> &'static str {
+        self.first_skip.map(OvSkipReason::as_str).unwrap_or("none")
+    }
+
+    /// At least one layer's window ran on OV.
+    pub fn used(&self) -> bool {
+        self.layers_ov > 0
+    }
+}
+
+/// One layer's OV routing context, handed to
+/// [`super::model::GlmLayer::forward_prefill`]. Bundled into a struct (rather
+/// than three more parameters) so the OFF path stays a single `None`.
+pub struct OvRoute<'a> {
+    pub ov: &'a OvAttn,
+    /// LOCAL layer offset — see the module doc's indexing contract.
+    pub layer_local: usize,
+    pub tally: &'a mut OvPrefillTally,
+}
+
 /// Enablement state surfaced at the rank's `event=ready` line / doctor output
 /// (spec Sec7) — the closed vocabulary this module and its callers share. A
 /// LIVE [`OvAttn`] (i.e. [`OvAttn::from_opts`] returned `Some`) only ever
@@ -247,6 +364,28 @@ fn resolve_u32(cfg: Option<u32>, env_key: &str, default: u32) -> (u32, &'static 
         }
     }
     (default, "default")
+}
+
+/// Whether `ov_attn` is REQUESTED and targets a non-CPU device, resolved with
+/// the same config→env precedence [`OvAttn::from_opts`] uses.
+///
+/// Read before construction, and keyed on the request rather than on a
+/// successful compile, because both callers act on the *attempt*: the
+/// experts-OV conflict must be rejected even if the attention compile would
+/// later have failed, and expert pinning must be skipped because the compile
+/// is what needs the GPU's RAM pool — a run where pinning already starved it
+/// into failing is exactly the case a construction-keyed check would miss.
+pub fn requested_on_accelerator(opts: &StageOpts) -> bool {
+    let (enabled, _) = resolve_bool(opts.ov_attn, "CASCADIA_GLM5_OV_ATTN");
+    if !enabled {
+        return false;
+    }
+    let (device, _) = resolve_string(
+        opts.ov_attn_device.clone(),
+        "CASCADIA_GLM5_OV_ATTN_DEVICE",
+        "GPU",
+    );
+    !device.eq_ignore_ascii_case("CPU")
 }
 
 /// Host-side additive mask, matching `tools/glm5_attn_ov.py::build_window_mask`
@@ -554,6 +693,37 @@ pub struct OvAttn {
     /// [`OvAttn::prefill_window`] (bad shapes, `rows>rows_cap`,
     /// `past_len>p_max`) — see `warn_contract_violation_once`'s doc.
     contract_violation_warned: AtomicBool,
+    /// Test-only canned-output source; the field itself does not exist in a
+    /// non-test build. See [`OvAttn::mock`].
+    #[cfg(test)]
+    mock: Option<MockBackend>,
+}
+
+/// Canned per-window outputs for the prefill-seam tests: `(layer_local, x,
+/// rows, past_len) -> Option<AttnWindowOut>`.
+#[cfg(test)]
+pub(crate) type MockWindowFn =
+    Box<dyn Fn(usize, &[f32], usize, usize) -> Option<AttnWindowOut> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) struct MockBackend {
+    /// Per-LOCAL-offset compile success, standing in for the `compiled` vec a
+    /// real build fills — so `layer_not_compiled` is reachable in tests.
+    compiled: Vec<bool>,
+    window: MockWindowFn,
+}
+
+/// Shape/budget knobs for [`OvAttn::mock`]. A struct, not eight arguments.
+#[cfg(test)]
+pub(crate) struct MockCfg {
+    pub compiled: Vec<bool>,
+    pub w: usize,
+    pub p_max: usize,
+    pub rows_cap: usize,
+    pub hidden: usize,
+    pub kv_lora: usize,
+    pub qk_rope: usize,
+    pub min_rows: u32,
 }
 
 impl OvAttn {
@@ -868,7 +1038,58 @@ impl OvAttn {
             transient_fails: AtomicU32::new(0),
             used: AtomicBool::new(false),
             contract_violation_warned: AtomicBool::new(false),
+            #[cfg(test)]
+            mock: None,
         })
+    }
+
+    /// A device-free instance whose `prefill_window` returns canned outputs.
+    /// Exists so the prefill-seam integration (Task 6) is testable on a machine
+    /// with no OpenVINO SDK: the mock is consulted only AFTER the real poison
+    /// latch and argument-contract checks, and routes its success/failure
+    /// through the same `note_infer_success`/`note_logic_error` bookkeeping, so
+    /// a mock-routed test exercises the production control flow rather than a
+    /// parallel one.
+    #[cfg(test)]
+    pub(crate) fn mock(cfg: MockCfg, window: MockWindowFn) -> Self {
+        let layers_expected = cfg.compiled.len();
+        let layers_ok = cfg.compiled.iter().filter(|&&c| c).count();
+        Self {
+            compiled: Mutex::new(Vec::new()),
+            device: "MOCK".to_string(),
+            w: cfg.w,
+            p_max: cfg.p_max,
+            rows_cap: cfg.rows_cap,
+            kv_lora: cfg.kv_lora,
+            qk_rope: cfg.qk_rope,
+            hidden: cfg.hidden,
+            layers_ok,
+            layers_expected,
+            min_rows: cfg.min_rows,
+            poisoned: AtomicBool::new(false),
+            transient_fails: AtomicU32::new(0),
+            used: AtomicBool::new(false),
+            contract_violation_warned: AtomicBool::new(false),
+            mock: Some(MockBackend {
+                compiled: cfg.compiled,
+                window,
+            }),
+        }
+    }
+
+    /// Whether local layer `layer_local`'s IR compiled. Part of the caller's
+    /// eligibility check so an uncompiled layer is reported as
+    /// [`OvSkipReason::LayerNotCompiled`] instead of being lumped into the
+    /// generic `infer_failed` bucket a bare `None` would produce.
+    pub fn layer_compiled(&self, layer_local: usize) -> bool {
+        #[cfg(test)]
+        if let Some(mock) = &self.mock {
+            return mock.compiled.get(layer_local).copied().unwrap_or(false);
+        }
+        self.compiled
+            .lock()
+            .map(|g| g.get(layer_local).is_some_and(Option::is_some))
+            .unwrap_or(false)
     }
 
     /// Current enablement state — see [`OvAttnState`]'s doc for why a live
@@ -937,6 +1158,26 @@ impl OvAttn {
                 past_len * self.qk_rope,
             ));
             return None;
+        }
+
+        // Canned-output short-circuit — after the latch and contract checks
+        // above, so those still gate a mock-routed call exactly as they gate a
+        // real one.
+        #[cfg(test)]
+        if let Some(mock) = &self.mock {
+            if !mock.compiled.get(layer_local).copied().unwrap_or(false) {
+                return None;
+            }
+            return match (mock.window)(layer_local, x, rows, past_len) {
+                Some(out) => {
+                    self.note_infer_success();
+                    Some(out)
+                }
+                None => {
+                    self.note_logic_error(layer_local, "mock window failure");
+                    None
+                }
+            };
         }
 
         let mut x_pad = vec![0.0f32; self.rows_cap * self.hidden];
@@ -1142,6 +1383,94 @@ impl OvAttn {
     }
 }
 
+/// Cumulative OV-attention prefill accounting — the spec Sec7 periodic
+/// summary, emitted on the same cadence and behind the same
+/// `CASCADIA_GLM5_OV_STATS` gate as the expert-cache summary.
+///
+/// Counting is unconditional (a handful of relaxed adds per prefill layer) so
+/// the shutdown emission is complete regardless of when the gate was read;
+/// only the emission is gated and rate-limited.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::OvSkipReason;
+
+    static LAYERS_OV: AtomicU64 = AtomicU64::new(0);
+    static SKIPPED: [AtomicU64; OvSkipReason::COUNT] =
+        [const { AtomicU64::new(0) }; OvSkipReason::COUNT];
+
+    pub(super) fn record_used() {
+        LAYERS_OV.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_skip(reason: OvSkipReason) {
+        SKIPPED[reason.idx()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CASCADIA_GLM5_OV_STATS").is_ok())
+    }
+
+    fn dump_interval_secs() -> u64 {
+        std::env::var("CASCADIA_GLM5_OV_STATS_EVERY_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(10)
+    }
+
+    static LAST_DUMP_S: AtomicU64 = AtomicU64::new(0);
+
+    fn since_start_secs() -> u64 {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_secs()
+    }
+
+    /// Rate-limited emission (see [`dump_now`] for the unconditional one).
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let now = since_start_secs();
+        if now.saturating_sub(LAST_DUMP_S.load(Ordering::Relaxed)) < dump_interval_secs() {
+            return;
+        }
+        LAST_DUMP_S.store(now, Ordering::Relaxed);
+        dump_now();
+    }
+
+    /// Emit unconditionally, ignoring the rate limit (shutdown).
+    pub fn dump_now() {
+        if !enabled() {
+            return;
+        }
+        let ov = LAYERS_OV.load(Ordering::Relaxed);
+        let skips: Vec<(OvSkipReason, u64)> = (0..OvSkipReason::COUNT)
+            .map(|i| {
+                (
+                    OvSkipReason::from_idx(i),
+                    SKIPPED[i].load(Ordering::Relaxed),
+                )
+            })
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        let total = ov + skips.iter().map(|&(_, n)| n).sum::<u64>();
+        if total == 0 {
+            return;
+        }
+        let by_reason: Vec<String> = skips
+            .iter()
+            .map(|(r, n)| format!("{}:{n}", r.as_str()))
+            .collect();
+        eprintln!(
+            "GLM5_OVATTN layer_windows={total} ov={ov} rust={} ov_rate={:.1}% skipped=[{}]",
+            total - ov,
+            100.0 * ov as f64 / total as f64,
+            by_reason.join(","),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1550,48 @@ mod tests {
         let w = derive_w(&test_manifest(2, 0));
         assert_eq!(w, usize::MAX);
         assert_ne!(w, 0);
+    }
+
+    // ---- Accelerator predicate (drives nopin + the dual-accel rejection) ---
+
+    /// Both `load_staged` consumers — the expert-pinning exclusion and the
+    /// "reject ov_attn + ov_experts on one device" load error — are one-line
+    /// uses of this, so its polarity is the whole behaviour.
+    #[test]
+    fn requested_on_accelerator_tracks_enablement_and_device() {
+        let off = StageOpts {
+            ov_attn: Some(false),
+            ov_attn_device: Some("GPU".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !requested_on_accelerator(&off),
+            "disabled must never imply an accelerator, whatever the device says"
+        );
+
+        let cpu = StageOpts {
+            ov_attn: Some(true),
+            ov_attn_device: Some("cpu".to_string()), // case-insensitive
+            ..Default::default()
+        };
+        assert!(
+            !requested_on_accelerator(&cpu),
+            "CPU is not an accelerator: it must not disable pinning"
+        );
+
+        let gpu = StageOpts {
+            ov_attn: Some(true),
+            ov_attn_device: Some("GPU.0".to_string()),
+            ..Default::default()
+        };
+        assert!(requested_on_accelerator(&gpu));
+
+        let npu = StageOpts {
+            ov_attn: Some(true),
+            ov_attn_device: Some("NPU".to_string()),
+            ..Default::default()
+        };
+        assert!(npu.ov_attn_device.is_some() && requested_on_accelerator(&npu));
     }
 
     // ---- Stamp handshake (pure, no filesystem/OV) -------------------------
@@ -1586,6 +1957,7 @@ mod tests {
             transient_fails: AtomicU32::new(0),
             used: AtomicBool::new(false),
             contract_violation_warned: AtomicBool::new(false),
+            mock: None,
         }
     }
 

@@ -74,6 +74,15 @@ pub struct SparseMoEBuilderConfig {
     /// OV expert cache byte budget in MiB (primary bound). `None` →
     /// `CASCADIA_GLM5_OV_CACHE_MB` (2048).
     pub ov_cache_mb: Option<u64>,
+    /// OV attention prefill offload (iGPU). `None` → `CASCADIA_GLM5_OV_ATTN`
+    /// (off). Mutually exclusive with expert-OV on an accelerator — enabling
+    /// both is a load error, not a warning.
+    pub ov_attn: Option<bool>,
+    /// OV attention device. `None` → `CASCADIA_GLM5_OV_ATTN_DEVICE` (`GPU`).
+    pub ov_attn_device: Option<String>,
+    /// Minimum prefill rows a window needs to be offloaded. `None` →
+    /// `CASCADIA_GLM5_OV_ATTN_MIN_ROWS` (64).
+    pub ov_attn_min_rows: Option<u32>,
     /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
     /// Applied via the shared `PluginConfig` to every OV-compiled IR on this
     /// rank: embedding, transformer shells, head, and — for `ov_ir`-format
@@ -178,6 +187,9 @@ impl SparseMoEBuilderConfig {
             experts_mode: None,
             ov_cache_entries: None,
             ov_cache_mb: None,
+            ov_attn: None,
+            ov_attn_device: None,
+            ov_attn_min_rows: None,
             ov_properties: Vec::new(),
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
@@ -508,6 +520,9 @@ impl Builder for SparseMoEBuilder {
                     self.config.prefix_cache_depth,
                     self.config.ov_cache_entries,
                     self.config.ov_cache_mb,
+                    self.config.ov_attn,
+                    self.config.ov_attn_device.clone(),
+                    self.config.ov_attn_min_rows,
                 ),
             )
             .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;

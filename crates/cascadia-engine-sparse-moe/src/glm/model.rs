@@ -11,6 +11,7 @@ use super::attn::{AttentionLayer, AttnKv};
 use super::kv_cache::KvPrefixCache;
 use super::moe::{AnyExpert, MoeLayer};
 use super::mtp::MtpHead;
+use super::ov_attn::OvRoute;
 use super::prof;
 use crate::dsv4::math::{linear_f32, rmsnorm};
 
@@ -135,11 +136,17 @@ impl GlmLayer {
     /// per position (the causal KV must grow in order); the MoE runs as one
     /// batch-union over all rows, so overlapping experts are loaded once. Returns
     /// `[rows, hidden]`, bit-identical to calling [`Self::forward_token`] per row.
+    ///
+    /// `route = None` is the untouched Rust path. `Some(..)` offers this
+    /// window to the OpenVINO attention backend; the offer is refused (and the
+    /// Rust loop runs from scratch, having committed nothing) for any of the
+    /// [`OvSkipReason`] causes, all of which the route's tally records.
     pub fn forward_prefill(
         &mut self,
         xs: &[f32],
         rows: usize,
         carries: &mut [Option<Vec<usize>>],
+        route: Option<OvRoute<'_>>,
     ) -> Vec<f32> {
         assert_eq!(xs.len(), rows * self.hidden);
         assert_eq!(carries.len(), rows, "one IndexShare carry per prompt row");
@@ -154,16 +161,22 @@ impl GlmLayer {
         let mut h = vec![0.0f32; rows * hd];
         let mut nrm2 = vec![0.0f32; rows * hd];
         let t_attn = prof.then(std::time::Instant::now);
-        for r in 0..rows {
-            let x = &xs[r * hd..(r + 1) * hd];
-            let mut nrm = x.to_vec();
-            rmsnorm(&mut nrm, &self.in_ln, self.eps);
-            let a = self.attn.forward_token(&nrm, &mut carries[r]);
-            let hrow: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
-            let mut n2 = hrow.clone();
-            rmsnorm(&mut n2, &self.post_ln, self.eps);
-            h[r * hd..(r + 1) * hd].copy_from_slice(&hrow);
-            nrm2[r * hd..(r + 1) * hd].copy_from_slice(&n2);
+        let on_ov = match route {
+            Some(r) => self.attn_window_ov(xs, rows, carries, &mut h, &mut nrm2, r),
+            None => false,
+        };
+        if !on_ov {
+            for r in 0..rows {
+                let x = &xs[r * hd..(r + 1) * hd];
+                let mut nrm = x.to_vec();
+                rmsnorm(&mut nrm, &self.in_ln, self.eps);
+                let a = self.attn.forward_token(&nrm, &mut carries[r]);
+                let hrow: Vec<f32> = x.iter().zip(&a).map(|(&xi, &ai)| xi + ai).collect();
+                let mut n2 = hrow.clone();
+                rmsnorm(&mut n2, &self.post_ln, self.eps);
+                h[r * hd..(r + 1) * hd].copy_from_slice(&hrow);
+                nrm2[r * hd..(r + 1) * hd].copy_from_slice(&n2);
+            }
         }
         if let Some(t) = t_attn {
             ATTN_PREFILL_NS.fetch_add(
@@ -201,6 +214,145 @@ impl GlmLayer {
         }
         h
     }
+
+    /// Try to serve this whole window's attention from the OpenVINO backend.
+    /// Returns `true` only if the window was fully served AND committed; on
+    /// `false` NOTHING has been written (no KV rows, no indexer keys, no
+    /// carries), so the caller's Rust loop runs from scratch — the fallback is
+    /// per-window and total by construction, which is why the commit is the
+    /// last fallible step.
+    ///
+    /// On success this reproduces, per row, exactly what `forward_token` does:
+    /// the KV write (via `commit_prefill_rows`), the indexer key append (fed
+    /// the post-`in_ln` normed row, NOT the raw residual — see `attn.rs`
+    /// `ix.append_key(x)`, whose `x` is `forward_token`'s already-normed
+    /// input), the IndexShare carry, and the residual + post-norm composition.
+    fn attn_window_ov(
+        &mut self,
+        xs: &[f32],
+        rows: usize,
+        carries: &mut [Option<Vec<usize>>],
+        h: &mut [f32],
+        nrm2: &mut [f32],
+        route: OvRoute<'_>,
+    ) -> bool {
+        let hd = self.hidden;
+        let ov = route.ov;
+        let base = self.attn.len();
+        // Spec-decode verify batches (`ForwardBatch`) enter this same seam with
+        // g≈8 rows. Production `min_rows` is 64, so they are excluded here by
+        // the rows floor — NOT by anything structural. Lowering `min_rows`
+        // below the draft length would route decode-verify through OV.
+        if let Some(reason) = ov_ineligible(ov, route.layer_local, base, rows) {
+            route.tally.note_skip(reason);
+            return false;
+        }
+
+        // Both consumers of the pre-norm row want the same buffer: the graph's
+        // `x` input and (on a "full" layer) the DSA indexer key.
+        let mut normed = vec![0.0f32; rows * hd];
+        for r in 0..rows {
+            let dst = &mut normed[r * hd..(r + 1) * hd];
+            dst.copy_from_slice(&xs[r * hd..(r + 1) * hd]);
+            rmsnorm(dst, &self.in_ln, self.eps);
+        }
+
+        let (past_lc, past_rc) = self.attn.past_rows();
+        let Some(out) =
+            ov.prefill_window(route.layer_local, &normed, rows, &past_lc, &past_rc, base)
+        else {
+            route
+                .tally
+                .note_skip(super::ov_attn::OvSkipReason::InferFailed);
+            return false;
+        };
+
+        // Validate everything before touching live state.
+        let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
+        if !finite(&out.attn_out) || !finite(&out.lc) || !finite(&out.rc) {
+            tracing::warn!(
+                target: "cascadia::glm5",
+                event = "ov_attn_non_finite",
+                layer_local = route.layer_local,
+                base,
+                rows,
+            );
+            route
+                .tally
+                .note_skip(super::ov_attn::OvSkipReason::NonFinite);
+            return false;
+        }
+        // The bf16-grid guard lives inside `commit_prefill_rows` (round +
+        // debug-assert). Deliberately NOT pre-rounded here: doing so would make
+        // that assertion vacuous, which is the one thing standing between a
+        // silently-elided Convert on the GPU and a contaminated live KV cache.
+        if let Err(e) = self.attn.commit_prefill_rows(&out.lc, &out.rc, rows) {
+            tracing::warn!(
+                target: "cascadia::glm5",
+                event = "ov_attn_commit_failed",
+                layer_local = route.layer_local,
+                base,
+                rows,
+                error = %e,
+            );
+            route
+                .tally
+                .note_skip(super::ov_attn::OvSkipReason::CommitFailed);
+            return false;
+        }
+
+        // Past this point nothing can fail. Rows in position order, matching
+        // the order `forward_token` would have appended them.
+        let publishes_carry = self.attn.has_indexer();
+        for r in 0..rows {
+            self.attn
+                .indexer_append_normed(&normed[r * hd..(r + 1) * hd]);
+            // Carry semantics, mirroring `AttentionLayer::forward_token`: a
+            // "full" layer publishes its selection; "shared"/plain layers read
+            // `carry` and leave it untouched. Eligibility caps `base + rows` at
+            // W == index_topk, so every OV-served query is at or below the DSA
+            // budget and its selection is the full causal range `0..n` with
+            // PER-ROW `n = base + r + 1`.
+            if publishes_carry {
+                carries[r] = Some((0..base + r + 1).collect());
+            }
+            let x = &xs[r * hd..(r + 1) * hd];
+            let a = &out.attn_out[r * hd..(r + 1) * hd];
+            let hrow: Vec<f32> = x.iter().zip(a).map(|(&xi, &ai)| xi + ai).collect();
+            let mut n2 = hrow.clone();
+            rmsnorm(&mut n2, &self.post_ln, self.eps);
+            h[r * hd..(r + 1) * hd].copy_from_slice(&hrow);
+            nrm2[r * hd..(r + 1) * hd].copy_from_slice(&n2);
+        }
+        route.tally.note_used();
+        true
+    }
+}
+
+/// The eligibility gate: `Some(reason)` means this window does not go to OV.
+/// `rows > rows_cap` is folded into `WindowTooLarge` rather than left to
+/// `prefill_window` — that would trip its caller-bug contract WARN, which is
+/// meant for a stride bug, not for a legitimately oversized prompt window.
+fn ov_ineligible(
+    ov: &super::ov_attn::OvAttn,
+    layer_local: usize,
+    base: usize,
+    rows: usize,
+) -> Option<super::ov_attn::OvSkipReason> {
+    use super::ov_attn::{OvAttnState, OvSkipReason};
+    if ov.state() == OvAttnState::Poisoned {
+        return Some(OvSkipReason::Poisoned);
+    }
+    if !ov.layer_compiled(layer_local) {
+        return Some(OvSkipReason::LayerNotCompiled);
+    }
+    if base + rows > ov.w || rows > ov.rows_cap {
+        return Some(OvSkipReason::WindowTooLarge);
+    }
+    if rows < ov.min_rows as usize {
+        return Some(OvSkipReason::RowsBelowMin);
+    }
+    None
 }
 
 /// Cumulative prefill timers for the T2 attention-share measurement
@@ -348,7 +500,11 @@ impl GlmModel {
         }
         let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows]; // per-row IndexShare
         for l in &mut self.layers {
-            xs = l.forward_prefill(&xs, rows, &mut carries);
+            // Single-process `GlmModel` never routes through OV: the backend is
+            // keyed by this-rank-local layer offsets, which only `GlmRunner`
+            // owns. Keeping `None` here is also what makes this the reference
+            // path the goldens compare against.
+            xs = l.forward_prefill(&xs, rows, &mut carries, None);
         }
         let last = (rows - 1) * hd;
         let hlast = xs[last..last + hd].to_vec();
@@ -377,7 +533,7 @@ impl GlmModel {
         }
         let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
         for l in &mut self.layers {
-            xs = l.forward_prefill(&xs, rows, &mut carries);
+            xs = l.forward_prefill(&xs, rows, &mut carries, None);
         }
         let mut preds = Vec::with_capacity(rows);
         let mut hlasts = Vec::with_capacity(rows);
@@ -593,4 +749,539 @@ fn argmax(v: &[f32]) -> usize {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod ov_prefill_tests {
+    //! Prefill-seam tests. Every OV route here is driven by `OvAttn::mock`,
+    //! which returns canned window outputs *after* the real poison latch and
+    //! argument-contract checks — so these exercise the production control
+    //! flow on a machine with no OpenVINO SDK.
+
+    use super::*;
+    use crate::dsv4::math::to_bf16;
+    use crate::dsv4::rope::precompute_freqs;
+    use crate::glm::attn::AttnWeights;
+    use crate::glm::indexer::{Indexer, IndexerWeights};
+    use crate::glm::moe::ExpertW;
+    use crate::glm::ov_attn::{AttnWindowOut, MockCfg, OvAttn, OvPrefillTally, OvSkipReason};
+    use std::sync::{Arc, Mutex};
+
+    const HIDDEN: usize = 12;
+    const KV_LORA: usize = 6;
+    const QK_ROPE: usize = 4;
+    const Q_LORA: usize = 8;
+    const INDEX_HD: usize = 4;
+    const MAX_SEQ: usize = 32;
+    /// Stands in for `index_topk` — the offload budget W the mock advertises.
+    const W: usize = 16;
+
+    fn lcg(seed: u32) -> impl FnMut() -> f32 {
+        let mut s = seed;
+        move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / u16::MAX as f32 - 0.5
+        }
+    }
+
+    fn bits(v: f32) -> u16 {
+        half::bf16::from_f32(v).to_bits()
+    }
+
+    /// Deterministic tiny layer — same seed every call, so two instances are
+    /// byte-identical twins and can stand in for "the same layer" run twice.
+    /// `indexer`: `None` = plain, `Some(true)` = IndexShare `"full"` (owns an
+    /// indexer), `Some(false)` = `"shared"`.
+    fn tiny_layer(indexer: Option<bool>) -> GlmLayer {
+        let (h, nope, rope, vh, inter) = (2usize, 4usize, 4usize, 4usize, 8usize);
+        let mut rnd = lcg(7);
+        let aw = AttnWeights {
+            wq_a: (0..Q_LORA * HIDDEN).map(|_| bits(rnd())).collect(),
+            q_a_ln: (0..Q_LORA).map(|_| 1.0 + rnd() * 0.1).collect(),
+            wq_b: (0..h * (nope + rope) * Q_LORA)
+                .map(|_| bits(rnd()))
+                .collect(),
+            wkv_a: (0..(KV_LORA + rope) * HIDDEN)
+                .map(|_| bits(rnd()))
+                .collect(),
+            kv_a_ln: (0..KV_LORA).map(|_| 1.0 + rnd() * 0.1).collect(),
+            wkv_b: (0..h * (nope + vh) * KV_LORA)
+                .map(|_| bits(rnd()))
+                .collect(),
+            wo: (0..HIDDEN * h * vh).map(|_| bits(rnd())).collect(),
+        };
+        let freqs = precompute_freqs(rope, MAX_SEQ, 0, 1.0e4, 1.0, 32.0, 1.0);
+        let mut attn = AttentionLayer::new(
+            HIDDEN, h, nope, rope, vh, KV_LORA, Q_LORA, MAX_SEQ, aw, freqs,
+        );
+        match indexer {
+            Some(true) => {
+                let (nh, hd) = (2usize, INDEX_HD);
+                let iw = IndexerWeights {
+                    ix_wq: (0..nh * hd * Q_LORA).map(|_| bits(rnd())).collect(),
+                    ix_wk: (0..hd * HIDDEN).map(|_| bits(rnd())).collect(),
+                    ix_wp: (0..nh * HIDDEN).map(|_| bits(rnd())).collect(),
+                    k_norm_w: (0..hd).map(|_| 1.0 + rnd() * 0.1).collect(),
+                    k_norm_b: (0..hd).map(|_| rnd() * 0.1).collect(),
+                };
+                let ifreqs = precompute_freqs(QK_ROPE, MAX_SEQ, 0, 1.0e4, 1.0, 32.0, 1.0);
+                attn.attach_indexer(
+                    Indexer::new(HIDDEN, Q_LORA, nh, hd, QK_ROPE, MAX_SEQ, 1e-6, iw, ifreqs),
+                    W,
+                );
+            }
+            Some(false) => attn.mark_shared(W),
+            None => {}
+        }
+        let dense = ExpertW {
+            wg: (0..inter * HIDDEN).map(|_| bits(rnd())).collect(),
+            wu: (0..inter * HIDDEN).map(|_| bits(rnd())).collect(),
+            wd: (0..HIDDEN * inter).map(|_| bits(rnd())).collect(),
+        };
+        // in_ln / post_ln deliberately NOT all-ones: a caller that fed the raw
+        // residual where the normed row belongs must produce different numbers.
+        GlmLayer::new(
+            HIDDEN,
+            1e-5,
+            (0..HIDDEN).map(|_| 1.0 + rnd() * 0.4).collect(),
+            (0..HIDDEN).map(|_| 1.0 + rnd() * 0.4).collect(),
+            attn,
+            LayerMlp::Dense {
+                w: AnyExpert::Bf16(dense),
+                inter,
+            },
+        )
+    }
+
+    fn rows_of(n: usize, seed: u32) -> Vec<f32> {
+        let mut rnd = lcg(seed);
+        (0..n * HIDDEN).map(|_| rnd()).collect()
+    }
+
+    /// Canned window outputs, on the bf16 grid so `commit_prefill_rows`'s
+    /// on-grid debug assertion is satisfied. (An off-grid canned value is a
+    /// test bug, not a scenario — the real off-grid case is Task 4's own test.)
+    fn canned(rows: usize, seed: u32) -> AttnWindowOut {
+        let mut rnd = lcg(seed);
+        AttnWindowOut {
+            attn_out: (0..rows * HIDDEN).map(|_| to_bf16(rnd())).collect(),
+            lc: (0..rows * KV_LORA).map(|_| to_bf16(rnd())).collect(),
+            rc: (0..rows * QK_ROPE).map(|_| to_bf16(rnd())).collect(),
+        }
+    }
+
+    fn mock_cfg() -> MockCfg {
+        MockCfg {
+            compiled: vec![true],
+            w: W,
+            p_max: 8,
+            rows_cap: 8,
+            hidden: HIDDEN,
+            kv_lora: KV_LORA,
+            qk_rope: QK_ROPE,
+            min_rows: 4,
+        }
+    }
+
+    /// Every `(layer_local, rows, past_len)` the backend was asked for.
+    type Calls = Arc<Mutex<Vec<(usize, usize, usize)>>>;
+
+    fn recording_mock(
+        cfg: MockCfg,
+        out: impl Fn(usize) -> AttnWindowOut + Send + Sync + 'static,
+    ) -> (OvAttn, Calls) {
+        let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        let ov = OvAttn::mock(
+            cfg,
+            Box::new(move |ll, _x, rows, past| {
+                sink.lock().unwrap().push((ll, rows, past));
+                Some(out(rows))
+            }),
+        );
+        (ov, calls)
+    }
+
+    fn run_ov(
+        layer: &mut GlmLayer,
+        ov: &OvAttn,
+        xs: &[f32],
+        rows: usize,
+        carries: &mut [Option<Vec<usize>>],
+    ) -> (Vec<f32>, OvPrefillTally) {
+        let mut tally = OvPrefillTally::default();
+        let out = layer.forward_prefill(
+            xs,
+            rows,
+            carries,
+            Some(crate::glm::ov_attn::OvRoute {
+                ov,
+                layer_local: 0,
+                tally: &mut tally,
+            }),
+        );
+        (out, tally)
+    }
+
+    // ---- gate 3: off means off --------------------------------------------
+
+    /// `route = None` must be the pre-existing path, byte for byte — including
+    /// the KV, the indexer keys and the carries, not just the returned hidden.
+    #[test]
+    fn route_none_is_byte_identical_to_forward_token() {
+        let rows = 5usize;
+        let xs = rows_of(rows, 11);
+        let mut a = tiny_layer(Some(true));
+        let mut b = tiny_layer(Some(true));
+
+        let mut want = Vec::new();
+        let mut carry_a: Option<Vec<usize>> = None;
+        let mut carries_a = Vec::new();
+        for r in 0..rows {
+            want.extend(a.forward_token(&xs[r * HIDDEN..(r + 1) * HIDDEN], &mut carry_a));
+            carries_a.push(carry_a.clone());
+        }
+
+        let mut carries_b: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let got = b.forward_prefill(&xs, rows, &mut carries_b, None);
+
+        assert_eq!(got, want, "prefill output diverged from forward_token");
+        assert_eq!(a.attn.len(), b.attn.len());
+        assert_eq!(a.attn.past_rows(), b.attn.past_rows(), "KV diverged");
+        assert_eq!(
+            a.attn.indexer_keys(),
+            b.attn.indexer_keys(),
+            "indexer keys diverged"
+        );
+        assert_eq!(carries_a, carries_b, "IndexShare carries diverged");
+    }
+
+    // ---- the routed happy path --------------------------------------------
+
+    #[test]
+    fn routed_window_commits_the_graphs_rows_and_uses_its_attn_out() {
+        let rows = 5usize;
+        let xs = rows_of(rows, 11);
+        let out = canned(rows, 91);
+        let (want_lc, want_rc, want_attn) = (out.lc, out.rc, out.attn_out);
+        let (ov, calls) = recording_mock(mock_cfg(), |n| canned(n, 91));
+
+        let mut layer = tiny_layer(Some(true));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let (got, tally) = run_ov(&mut layer, &ov, &xs, rows, &mut carries);
+
+        assert_eq!(*calls.lock().unwrap(), vec![(0, rows, 0)]);
+        assert!(tally.used());
+        assert_eq!((tally.layers_ov, tally.layers_rust), (1, 0));
+        assert_eq!(tally.skipped_reason(), "none");
+
+        // The graph's lc/rc are what landed in the live KV cache.
+        assert_eq!(layer.attn.len(), rows);
+        assert_eq!(layer.attn.past_rows(), (want_lc, want_rc));
+
+        // The graph's attn_out is what the residual used:
+        //   h = x + attn_out;  out = h + mlp(rmsnorm(h, post_ln)).
+        let post_ln = layer.post_ln().to_vec();
+        let mut recomposed = vec![0.0f32; rows * HIDDEN];
+        for r in 0..rows {
+            let hrow: Vec<f32> = (0..HIDDEN)
+                .map(|c| xs[r * HIDDEN + c] + want_attn[r * HIDDEN + c])
+                .collect();
+            let mut n2 = hrow.clone();
+            rmsnorm(&mut n2, &post_ln, layer.eps);
+            let f = match &layer.mlp {
+                LayerMlp::Dense { w, inter } => w.forward(&n2, HIDDEN, *inter),
+                LayerMlp::Moe(_) => unreachable!("tiny layer is dense"),
+            };
+            for c in 0..HIDDEN {
+                recomposed[r * HIDDEN + c] = hrow[c] + f[c];
+            }
+        }
+        assert_eq!(got, recomposed, "residual/post-ln composition diverged");
+    }
+
+    // ---- the test that matters most: indexer feeding ----------------------
+
+    /// The DSA indexer must receive exactly what `forward_token` feeds it — the
+    /// post-`in_ln` normed row — for every row, in position order.
+    ///
+    /// The canned `attn_out` is deliberately unrelated to anything the Rust
+    /// path would produce: the indexer keys depend ONLY on the layer's input
+    /// rows, so they must still match the Rust run bit for bit. Feeding the raw
+    /// residual, or feeding rows out of order, breaks this — the two negative
+    /// controls below prove the assertion is not vacuous.
+    #[test]
+    fn routed_window_feeds_the_indexer_the_normed_row_in_order() {
+        let rows = 6usize;
+        let xs = rows_of(rows, 11);
+
+        let mut rust = tiny_layer(Some(true));
+        let mut carries_rust: Vec<Option<Vec<usize>>> = vec![None; rows];
+        rust.forward_prefill(&xs, rows, &mut carries_rust, None);
+        let want = rust
+            .attn
+            .indexer_keys()
+            .expect("full layer owns an indexer");
+
+        let (ov, _) = recording_mock(mock_cfg(), |n| canned(n, 555));
+        let mut routed = tiny_layer(Some(true));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let (_, tally) = run_ov(&mut routed, &ov, &xs, rows, &mut carries);
+        assert!(tally.used(), "window must have been routed");
+
+        assert_eq!(
+            routed.attn.indexer_keys().unwrap(),
+            want,
+            "OV route fed the indexer something other than what forward_token feeds it"
+        );
+        assert_eq!(want.len(), rows * INDEX_HD, "one key per row, no more");
+
+        // Negative control 1: the RAW residual instead of the normed row.
+        let mut raw = tiny_layer(Some(true));
+        for r in 0..rows {
+            raw.attn
+                .indexer_append_normed(&xs[r * HIDDEN..(r + 1) * HIDDEN]);
+        }
+        assert_ne!(
+            raw.attn.indexer_keys().unwrap(),
+            want,
+            "raw-residual feeding must NOT match — else the assertion above is vacuous"
+        );
+
+        // Negative control 2: correct rows, reversed order.
+        let mut shuffled = tiny_layer(Some(true));
+        let (in_ln, eps) = (shuffled.in_ln.clone(), shuffled.eps);
+        for r in (0..rows).rev() {
+            let mut n = xs[r * HIDDEN..(r + 1) * HIDDEN].to_vec();
+            rmsnorm(&mut n, &in_ln, eps);
+            shuffled.attn.indexer_append_normed(&n);
+        }
+        assert_ne!(
+            shuffled.attn.indexer_keys().unwrap(),
+            want,
+            "out-of-order feeding must NOT match — the key's rope makes position load-bearing"
+        );
+    }
+
+    /// A `"shared"` layer owns no indexer: the routed path must append no keys
+    /// and must not touch the carry it only ever reads.
+    #[test]
+    fn routed_shared_layer_appends_no_keys_and_leaves_the_carry_alone() {
+        let rows = 5usize;
+        let xs = rows_of(rows, 11);
+        let sentinel = || vec![Some(vec![0usize]); rows];
+
+        let mut rust = tiny_layer(Some(false));
+        let mut carries_rust = sentinel();
+        rust.forward_prefill(&xs, rows, &mut carries_rust, None);
+
+        let (ov, _) = recording_mock(mock_cfg(), |n| canned(n, 77));
+        let mut routed = tiny_layer(Some(false));
+        let mut carries = sentinel();
+        let (_, tally) = run_ov(&mut routed, &ov, &xs, rows, &mut carries);
+
+        assert!(tally.used());
+        assert!(routed.attn.indexer_keys().is_none());
+        assert_eq!(carries, carries_rust);
+        assert_eq!(carries, sentinel(), "shared layer must not write the carry");
+    }
+
+    // ---- carry semantics ---------------------------------------------------
+
+    /// A `"full"` layer publishes the same per-row carry the Rust path does:
+    /// full causal `0..n` with PER-ROW `n = base + r + 1`. Run at a nonzero
+    /// base so a `0..rows` off-by-base bug cannot pass.
+    #[test]
+    fn routed_carries_match_the_rust_path_at_a_nonzero_base() {
+        let (warm, rows) = (3usize, 5usize);
+        let xs = rows_of(warm + rows, 11);
+        let (head, tail) = xs.split_at(warm * HIDDEN);
+
+        let mut rust = tiny_layer(Some(true));
+        let mut routed = tiny_layer(Some(true));
+        for l in [&mut rust, &mut routed] {
+            let mut c: Option<Vec<usize>> = None;
+            for r in 0..warm {
+                l.forward_token(&head[r * HIDDEN..(r + 1) * HIDDEN], &mut c);
+            }
+        }
+        assert_eq!(routed.attn.len(), warm);
+
+        let mut carries_rust: Vec<Option<Vec<usize>>> = vec![None; rows];
+        rust.forward_prefill(tail, rows, &mut carries_rust, None);
+
+        let (ov, calls) = recording_mock(mock_cfg(), |n| canned(n, 33));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let (_, tally) = run_ov(&mut routed, &ov, tail, rows, &mut carries);
+
+        assert!(tally.used());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, rows, warm)],
+            "past_len must be the layer's committed length, not 0"
+        );
+        assert_eq!(carries, carries_rust);
+        for (r, c) in carries.iter().enumerate() {
+            assert_eq!(
+                c.as_deref(),
+                Some((0..warm + r + 1).collect::<Vec<_>>().as_slice()),
+                "row {r}"
+            );
+        }
+    }
+
+    // ---- fallback is per-window and total ----------------------------------
+
+    /// Every failure mode must leave the layer exactly as the Rust path would —
+    /// same output, same KV, same indexer keys, same carries — and must name
+    /// itself in the tally.
+    #[test]
+    fn every_failure_mode_falls_back_totally_and_names_itself() {
+        let rows = 5usize;
+        let xs = rows_of(rows, 11);
+
+        let mut rust = tiny_layer(Some(true));
+        let mut carries_rust: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let want = rust.forward_prefill(&xs, rows, &mut carries_rust, None);
+        let want_kv = rust.attn.past_rows();
+        let want_ix = rust.attn.indexer_keys();
+
+        let cases: Vec<(&str, OvAttn, OvSkipReason)> = vec![
+            // prefill_window returned None.
+            (
+                "infer_failed",
+                OvAttn::mock(mock_cfg(), Box::new(|_, _, _, _| None)),
+                OvSkipReason::InferFailed,
+            ),
+            // A NaN in a real row.
+            (
+                "non_finite",
+                OvAttn::mock(
+                    mock_cfg(),
+                    Box::new(|_, _, n, _| {
+                        let mut o = canned(n, 5);
+                        o.attn_out[0] = f32::NAN;
+                        Some(o)
+                    }),
+                ),
+                OvSkipReason::NonFinite,
+            ),
+            // Short lc: commit_prefill_rows rejects it before writing anything.
+            (
+                "commit_failed",
+                OvAttn::mock(
+                    mock_cfg(),
+                    Box::new(|_, _, n, _| {
+                        let mut o = canned(n, 5);
+                        o.lc.truncate(o.lc.len() - KV_LORA);
+                        Some(o)
+                    }),
+                ),
+                OvSkipReason::CommitFailed,
+            ),
+            (
+                "layer_not_compiled",
+                OvAttn::mock(
+                    MockCfg {
+                        compiled: vec![false],
+                        ..mock_cfg()
+                    },
+                    Box::new(|_, _, n, _| Some(canned(n, 5))),
+                ),
+                OvSkipReason::LayerNotCompiled,
+            ),
+            (
+                "rows_below_min",
+                OvAttn::mock(
+                    MockCfg {
+                        min_rows: (rows + 1) as u32,
+                        ..mock_cfg()
+                    },
+                    Box::new(|_, _, n, _| Some(canned(n, 5))),
+                ),
+                OvSkipReason::RowsBelowMin,
+            ),
+            (
+                "window_too_large_budget",
+                OvAttn::mock(
+                    MockCfg {
+                        w: rows - 1,
+                        ..mock_cfg()
+                    },
+                    Box::new(|_, _, n, _| Some(canned(n, 5))),
+                ),
+                OvSkipReason::WindowTooLarge,
+            ),
+            (
+                "window_too_large_rows_cap",
+                OvAttn::mock(
+                    MockCfg {
+                        rows_cap: rows - 1,
+                        ..mock_cfg()
+                    },
+                    Box::new(|_, _, n, _| Some(canned(n, 5))),
+                ),
+                OvSkipReason::WindowTooLarge,
+            ),
+        ];
+
+        for (label, ov, reason) in cases {
+            let mut layer = tiny_layer(Some(true));
+            let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+            let (got, tally) = run_ov(&mut layer, &ov, &xs, rows, &mut carries);
+            assert_eq!(got, want, "{label}: output diverged from the Rust path");
+            assert_eq!(layer.attn.past_rows(), want_kv, "{label}: KV diverged");
+            assert_eq!(
+                layer.attn.indexer_keys(),
+                want_ix,
+                "{label}: indexer keys diverged"
+            );
+            assert_eq!(carries, carries_rust, "{label}: carries diverged");
+            assert!(!tally.used(), "{label}: must not report used");
+            assert_eq!(tally.layers_rust, 1, "{label}");
+            assert_eq!(tally.skipped_reason(), reason.as_str(), "{label}");
+        }
+    }
+
+    /// A latched backend must report `poisoned` rather than fall back silently
+    /// or be misreported as `infer_failed` — the "dead path that still says
+    /// Active" defect this enum exists to prevent.
+    #[test]
+    fn a_poisoned_backend_reports_itself() {
+        let rows = 5usize;
+        let xs = rows_of(rows, 11);
+        let ov = OvAttn::mock(mock_cfg(), Box::new(|_, _, _, _| None));
+        // Latch it through the real bookkeeping: three consecutive failures.
+        for _ in 0..3 {
+            assert!(ov
+                .prefill_window(0, &[0.0; HIDDEN], 1, &[], &[], 0)
+                .is_none());
+        }
+
+        let mut layer = tiny_layer(Some(true));
+        let mut carries: Vec<Option<Vec<usize>>> = vec![None; rows];
+        let (_, tally) = run_ov(&mut layer, &ov, &xs, rows, &mut carries);
+        assert_eq!(
+            tally.skipped_reason(),
+            "poisoned",
+            "a latched path must be named, not lumped into infer_failed"
+        );
+        assert_eq!(tally.layers_rust, 1);
+        assert!(!tally.used());
+    }
+
+    /// The tally is a per-call aggregate over layers: both counts, and the
+    /// FIRST skip reason.
+    #[test]
+    fn tally_aggregates_mixed_layers_and_keeps_the_first_reason() {
+        let mut t = OvPrefillTally::default();
+        assert_eq!(t.skipped_reason(), "none");
+        t.note_used();
+        t.note_skip(OvSkipReason::RowsBelowMin);
+        t.note_skip(OvSkipReason::InferFailed);
+        t.note_used();
+        assert_eq!((t.layers_ov, t.layers_rust), (2, 2));
+        assert!(t.used());
+        assert_eq!(t.skipped_reason(), "rows_below_min");
+    }
 }

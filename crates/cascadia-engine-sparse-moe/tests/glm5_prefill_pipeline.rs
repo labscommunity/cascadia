@@ -271,3 +271,82 @@ fn glm5_bf16_head_pipeline_bounded_vs_f32() {
         "bf16-head logits diverged from f32 beyond bf16 tolerance: max rel {max_rel}"
     );
 }
+
+/// Capture everything `tracing` emits while `f` runs.
+fn capture_logs<F: FnOnce()>(f: F) -> String {
+    use std::io;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct BufWriter(Arc<StdMutex<Vec<u8>>>);
+    impl io::Write for BufWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buf = Arc::new(StdMutex::new(Vec::<u8>::new()));
+    let writer = BufWriter(buf.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Off means off. With `ov_attn` explicitly disabled the runner holds no
+/// backend, a batched prefill emits NOT ONE `ov_attn` line, and the logits are
+/// byte-identical to the single-process reference. `Some(false)` rather than
+/// `None` so the assertion holds regardless of what `CASCADIA_GLM5_OV_ATTN`
+/// happens to be set to in the test environment.
+#[test]
+fn glm5_ov_attn_disabled_is_silent_and_byte_identical() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
+    if !dir.join("manifest.json").exists() {
+        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
+        return;
+    }
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+    let max_seq = 32usize;
+
+    let want = load_model(&dir, max_seq)
+        .expect("load_model")
+        .prefill(&prompt);
+
+    let mut ranks = [GlmRunner::load_staged(
+        &dir,
+        max_seq,
+        0,
+        1,
+        0,
+        0,
+        StageOpts {
+            ov_attn: Some(false),
+            ..Default::default()
+        },
+    )
+    .expect("load")];
+    assert!(
+        ranks[0].ov_attn().is_none(),
+        "disabled ov_attn must leave no backend on the runner"
+    );
+
+    let mut got = Vec::new();
+    let log = capture_logs(|| {
+        ranks[0].reset();
+        got = drive_prefill(&mut ranks, &prompt, 0);
+    });
+
+    assert_eq!(got, want, "prefill diverged with ov_attn off");
+    assert!(
+        !log.contains("ov_attn"),
+        "an ov_attn line escaped with the feature off; log:\n{log}"
+    );
+}

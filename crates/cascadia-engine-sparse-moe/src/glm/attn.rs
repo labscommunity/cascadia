@@ -576,6 +576,32 @@ impl AttentionLayer {
             ix.append_key(normed_row);
         }
     }
+
+    /// Whether this is an IndexShare `"full"` layer (owns an indexer and so
+    /// PUBLISHES the top-k carry). The bulk-prefill path needs it to reproduce
+    /// `forward_token`'s carry writes: only a full layer writes `carry`;
+    /// `"shared"` and plain layers read it and leave it untouched.
+    pub fn has_indexer(&self) -> bool {
+        self.indexer.is_some()
+    }
+
+    /// The cached latent / roped-k_pe rows `[0, len)` as f32 — the "past" an
+    /// external windowed attention graph consumes, the read counterpart of
+    /// [`Self::commit_prefill_rows`]. Widened from bf16 when the cache is
+    /// narrowed, which is exactly what the Rust score path reads back too.
+    pub fn past_rows(&self) -> (Vec<f32>, Vec<f32>) {
+        (
+            self.lc.to_f32_prefix(self.len * self.kv_lora),
+            self.rc.to_f32_prefix(self.len * self.qk_rope),
+        )
+    }
+
+    /// The DSA indexer's key cache, for tests proving an alternate prefill
+    /// path fed the indexer exactly what `forward_token` would have.
+    #[cfg(test)]
+    pub(crate) fn indexer_keys(&self) -> Option<Vec<f32>> {
+        self.indexer.as_ref().map(|ix| ix.snapshot())
+    }
 }
 
 #[cfg(test)]
