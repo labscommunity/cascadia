@@ -432,6 +432,10 @@ impl Runner {
         self.start_with_listen(peers, shard, None).await
     }
 
+    /// Enqueue a task with the engine.
+    ///
+    /// Refuses (as a benign no-op `Ok(())`) any task whose id already carries
+    /// a `cancelled` tombstone — see the comment in the lock region below.
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
         // NOTE: blocks the calling thread for up to one engine step if a
         // step is in flight. Async callers must use [`Runner::generate`]'s
@@ -445,9 +449,37 @@ impl Runner {
         // while the engine was busy, freeing their slots before this task
         // asks for one.
         let mut guard = self.slot.lock_applying_cancels();
-        match guard.engine() {
-            Some(engine) => engine.submit(task),
-            None => Err(EngineError::NotLoaded),
+        // ==== BEGIN cancellation-safety check — keep INSIDE the lock ====
+        // NEVER hand the engine a task that is already tombstoned
+        // cancelled. `generate_async` arms a cancel guard BEFORE it
+        // dispatches this submit, so a caller future dropped at that
+        // await (axum drops handler futures on client disconnect) writes
+        // the tombstone while the detached submit closure is still queued
+        // or parked on this very mutex. Admitting the task then creates a
+        // ghost: no `ChunkStream` was ever constructed for it, so nothing
+        // drains its chunks and nothing cancels it — it occupies a packed
+        // slot and grinds through max_tokens driven by other streams'
+        // polls, buffering under an id nobody reads, until process exit.
+        //
+        // Task ids are per-request UUIDs at the API layer, so a
+        // tombstoned id can only mean "this exact request was already
+        // cancelled" — refusing is a no-op, not a lost request. Read
+        // while holding the engine mutex so it cannot interleave with a
+        // concurrent step's distribution pass; buffers-under-engine is
+        // the lock order used everywhere else (see `Runner::cancel`).
+        //
+        // "Inside the lock" now means inside `guard`'s scope: the refusal
+        // is an arm of this expression rather than an early `return`, so
+        // the guard is still live and still owes — and on drop pays — the
+        // drain + wake every engine-lock release owes its parked streams.
+        if self.slot.buffers.lock().cancelled.contains(&task.task_id) {
+            Ok(())
+        } else {
+            // ==== END; the branch below is the original submit path ====
+            match guard.engine() {
+                Some(engine) => engine.submit(task),
+                None => Err(EngineError::NotLoaded),
+            }
         }
     }
 
@@ -481,16 +513,62 @@ impl Runner {
     /// the engine mutex for up to a full engine step, and enough worker
     /// threads parked there starve the tokio I/O + timer drivers, which is
     /// the #122 pipeline wedge.
+    ///
+    /// **Cancellation-safe**: this future may be dropped at any await point
+    /// (axum drops handler futures on client disconnect, and disconnects
+    /// cluster exactly when the submit wait is longest) without leaking a
+    /// task. Dropping the `JoinHandle` detaches rather than cancels, so the
+    /// submit closure still runs and may admit the task with no `ChunkStream`
+    /// to own it — a ghost that would occupy an engine slot and grind through
+    /// `max_tokens` with nobody draining its chunks. Two mechanisms close
+    /// that, both required:
+    ///
+    /// * A cancel guard armed BEFORE the submit is dispatched. Unless the
+    ///   stream is successfully constructed (which disarms it), the guard's
+    ///   `Drop` calls [`Runner::cancel`] — non-blocking by construction, so
+    ///   it is safe on any thread a dropped future lands on.
+    /// * [`Runner::submit`] refuses tombstoned ids, for the reverse ordering
+    ///   where the guard's cancel runs BEFORE the queued/parked submit does.
+    ///
+    /// Guarantee: on return of this future, either the caller owns a
+    /// [`ChunkStream`] for the task, or the task is cancelled — never
+    /// submitted-and-unowned.
     pub async fn generate_async(
         self: &Arc<Self>,
         task: GenerationTask,
     ) -> Result<ChunkStream, EngineError> {
+        let task_id = task.task_id.clone();
+        // Armed BEFORE the dispatch below: from here until `disarm()`, every
+        // exit path — `?`, a panic, or the caller's future being dropped at
+        // the await — cancels the task.
+        let mut guard = SubmitCancelGuard {
+            runner: self.clone(),
+            task_id: task_id.clone(),
+            armed: true,
+        };
         let this = self.clone();
-        let submitted = task.clone();
-        tokio::task::spawn_blocking(move || this.submit(submitted))
-            .await
-            .map_err(|e| EngineError::Backend(format!("submit task join: {e}")))??;
-        Ok(self.stream_for(task.task_id))
+        let joined = tokio::task::spawn_blocking(move || this.submit(task)).await;
+        match joined {
+            // The engine rejected the task (QueueFull, NotLoaded, …). Per the
+            // `Engine::submit` contract nothing was enqueued, so there is
+            // nothing to cancel — disarm rather than write a tombstone for a
+            // task that never existed (an overload burst would otherwise grow
+            // the tombstone set with ids no stream will ever consume).
+            Ok(Err(e)) => {
+                guard.disarm();
+                return Err(e);
+            }
+            // Join error: the submit panicked (or was cancelled). Whether it
+            // landed is unknowable from here, so leave the guard ARMED and
+            // let it cancel — cancelling an id the engine never admitted is a
+            // documented no-op for every `Engine` impl.
+            Err(e) => return Err(EngineError::Backend(format!("submit task join: {e}"))),
+            Ok(Ok(())) => {}
+        }
+        // The task now has an owner: from here its `Drop` handles cancellation.
+        let stream = self.stream_for(task_id);
+        guard.disarm();
+        Ok(stream)
     }
 
     fn stream_for(&self, task_id: TaskId) -> ChunkStream {
@@ -598,6 +676,44 @@ impl Runner {
         }
         if let Some(builder) = self.builder.lock().as_mut() {
             builder.close();
+        }
+    }
+}
+
+/// Cancels a task on drop unless disarmed — the ownership hand-off between
+/// "submitted" and "a [`ChunkStream`] exists to own it".
+///
+/// [`Runner::generate_async`] arms one before dispatching its submit, so the
+/// window in which a task is submitted but unowned is covered by an RAII
+/// cancel rather than by hoping the caller's future is never dropped. It is
+/// disarmed the instant a `ChunkStream` exists, because from then on that
+/// stream's own `Drop` is the cancel path.
+///
+/// `Drop` may run on any thread (a dropped axum handler future lands on
+/// whichever worker polled it last), so it must never block: it goes through
+/// [`Runner::cancel`], which try_locks the engine and defers when a step is
+/// in flight (#122).
+struct SubmitCancelGuard {
+    runner: Arc<Runner>,
+    task_id: TaskId,
+    armed: bool,
+}
+
+impl SubmitCancelGuard {
+    /// The task found an owner (or was never admitted): stand down.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SubmitCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Writes the `cancelled` tombstone and cancels the engine-side
+            // task (or defers the engine half). The tombstone is what makes a
+            // submit that has not run yet refuse the task — see the check in
+            // `Runner::submit`.
+            self.runner.cancel(&self.task_id);
         }
     }
 }
@@ -2644,6 +2760,388 @@ mod tests {
                 .get_sample_count(),
             1
         );
+    }
+
+    // -----------------------------------------------------------------
+    // H1: `generate_async` cancellation-safety.
+    //
+    // `spawn_blocking(...).await` is a cancellation point that can pend for
+    // a full engine step. Dropping the caller's future there DETACHES the
+    // closure rather than cancelling it, so the submit still runs — and
+    // before the fix no `ChunkStream` was ever constructed for the task, so
+    // nothing cancelled it and nothing drained it.
+    // -----------------------------------------------------------------
+
+    /// What the engine was actually asked to do. Enough to tell "never
+    /// admitted" from "admitted and ground through tokens nobody read".
+    #[derive(Default, Debug)]
+    struct EngineLog {
+        submitted: Vec<TaskId>,
+        cancelled: Vec<TaskId>,
+        produced: Vec<TaskId>,
+    }
+
+    /// Lets a test pin the engine mutex down for a deterministic window:
+    /// `step()` parks inside the lock until the gate opens.
+    #[derive(Default)]
+    struct Gate {
+        open: AtomicBool,
+        entered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate {
+        fn opened() -> Arc<Self> {
+            let g = Arc::new(Gate::default());
+            g.open.store(true, Ordering::SeqCst);
+            g
+        }
+        fn closed() -> Arc<Self> {
+            Arc::new(Gate::default())
+        }
+        fn release(&self) {
+            self.open.store(true, Ordering::SeqCst);
+        }
+        fn steps_entered(&self) -> usize {
+            self.entered.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Recording engine: one token per active task per `step()`, final marker
+    /// at `max_tokens`, and a log of every submit / cancel / emission.
+    struct RecordingEngine {
+        log: Arc<Mutex<EngineLog>>,
+        gate: Arc<Gate>,
+        active: Vec<(GenerationTask, u32)>,
+    }
+
+    impl Engine for RecordingEngine {
+        fn warmup(&mut self) {}
+
+        fn submit(&mut self, task: GenerationTask) -> Result<(), EngineError> {
+            self.log.lock().submitted.push(task.task_id.clone());
+            self.active.push((task, 0));
+            Ok(())
+        }
+
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.log.lock().cancelled.push(task_id.clone());
+            // An id the engine never admitted is a harmless no-op here, as
+            // the `Engine::cancel` contract requires and every real impl
+            // (ov-runtime, genai, dist_spec, sparse-moe) implements via
+            // `retain` / an id-matched conditional.
+            self.active.retain(|(t, _)| &t.task_id != task_id);
+        }
+
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.gate.entered.fetch_add(1, Ordering::SeqCst);
+            while !self.gate.open.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if self.active.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut out = Vec::new();
+            let mut still = Vec::new();
+            let mut produced = Vec::new();
+            for (task, emitted) in self.active.drain(..) {
+                let n = emitted + 1;
+                produced.push(task.task_id.clone());
+                out.push((
+                    task.task_id.clone(),
+                    Chunk::token(&task.task_id, n as i64, "x "),
+                ));
+                if n >= task.max_tokens {
+                    out.push((task.task_id.clone(), Chunk::final_marker(&task.task_id, "")));
+                } else {
+                    still.push((task, n));
+                }
+            }
+            self.active = still;
+            self.log.lock().produced.extend(produced);
+            Ok(out)
+        }
+    }
+
+    struct RecordingBuilder {
+        log: Arc<Mutex<EngineLog>>,
+        gate: Arc<Gate>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for RecordingBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(RecordingEngine {
+                log: self.log,
+                gate: self.gate,
+                active: Vec::new(),
+            }))
+        }
+    }
+
+    async fn recording_runner(gate: Arc<Gate>) -> (Arc<Runner>, Arc<Mutex<EngineLog>>) {
+        let log = Arc::new(Mutex::new(EngineLog::default()));
+        let runner = Arc::new(Runner::new(Box::new(RecordingBuilder {
+            log: log.clone(),
+            gate,
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+        (runner, log)
+    }
+
+    /// Poll `cond` until it holds, or fail the test. Used instead of a fixed
+    /// sleep so the blocking-pool hand-offs below are waited on, not guessed.
+    async fn await_until(label: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {label}");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// (a) The caller's future is dropped while its submit is parked on the
+    /// engine mutex behind another stream's in-flight step — the axum
+    /// client-disconnect shape, hitting at the moment the wait is longest.
+    ///
+    /// The detached submit runs anyway. It must not leave a ghost: no engine
+    /// admission, no chunks accreting under an id nobody drains, once the
+    /// lock churns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_generate_async_leaves_no_ghost_task() {
+        let gate = Gate::closed();
+        let (runner, log) = recording_runner(gate.clone()).await;
+
+        // A holder stream takes the engine mutex and parks inside `step()`.
+        let holder_runner = runner.clone();
+        let holder = tokio::spawn(async move {
+            let mut s = holder_runner
+                .generate_async(GenerationTask::new("holder", "x").with_max_tokens(4))
+                .await
+                .unwrap();
+            let mut n = 0usize;
+            while let Some(c) = s.next().await {
+                assert!(c.error.is_none(), "holder failed: {:?}", c.error);
+                n += 1;
+            }
+            n
+        });
+        await_until("the holder to enter step() with the engine locked", || {
+            gate.steps_entered() >= 1
+        })
+        .await;
+
+        // The engine mutex is held for the whole of this window, so the
+        // ghost's submit cannot complete and the caller goes away first.
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            runner.generate_async(GenerationTask::new("ghost", "x").with_max_tokens(64)),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the submit must still be in flight when the caller's future is dropped"
+        );
+        // Release BEFORE asserting: the holder is parked inside `step()` with
+        // the engine mutex held, so a panic here would wedge the runtime's
+        // teardown instead of reporting the failure. `timeout` has already
+        // dropped the inner future (and run the guard) by the time it returns
+        // Err, so the window under test is closed either way.
+        gate.release();
+        assert!(
+            runner.slot.buffers.lock().cancelled.contains("ghost"),
+            "the drop guard must have tombstoned the abandoned task"
+        );
+
+        // Churn the lock: the holder finishes, then two more full generations
+        // run. Every one of those polls would step a ghost that got admitted.
+        assert!(holder.await.unwrap() > 0);
+        for i in 0..2 {
+            let mut s = runner
+                .generate_async(GenerationTask::new(format!("after-{i}"), "x").with_max_tokens(2))
+                .await
+                .unwrap();
+            while s.next().await.is_some() {}
+        }
+
+        let log = log.lock();
+        assert!(
+            !log.produced.iter().any(|t| t == "ghost"),
+            "abandoned task was admitted and generated tokens nobody reads: {log:?}"
+        );
+        assert!(
+            !log.submitted.iter().any(|t| t == "ghost")
+                || log.cancelled.iter().any(|t| t == "ghost"),
+            "abandoned task was neither refused at submit nor cancelled: {log:?}"
+        );
+        drop(log);
+        assert!(
+            !runner.slot.buffers.lock().chunks.contains_key("ghost"),
+            "chunks accreted for a task with no owner"
+        );
+    }
+
+    /// The other half of (a): the submit LANDS, and only then is the caller's
+    /// future dropped. Nothing refuses it, so the drop guard is the only
+    /// thing that can retire the task — it must cancel it at the engine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generate_async_dropped_after_submit_landed_cancels_the_task() {
+        let (runner, log) = recording_runner(Gate::opened()).await;
+
+        {
+            let fut = runner.generate_async(GenerationTask::new("ghost", "x").with_max_tokens(64));
+            futures::pin_mut!(fut);
+            // First poll dispatches the submit; the join is still pending.
+            assert!(futures::poll!(fut.as_mut()).is_pending());
+            await_until("the detached submit to reach the engine", || {
+                log.lock().submitted.iter().any(|t| t == "ghost")
+            })
+            .await;
+            // Dropped without ever being polled again — no stream is built.
+        }
+
+        assert!(
+            log.lock().cancelled.iter().any(|t| t == "ghost"),
+            "an admitted-but-unowned task must be cancelled at the engine: {:?}",
+            log.lock()
+        );
+        // Churn the engine: a still-admitted ghost would generate here.
+        let mut s = runner
+            .generate_async(GenerationTask::new("after", "x").with_max_tokens(2))
+            .await
+            .unwrap();
+        while s.next().await.is_some() {}
+        assert!(
+            !log.lock().produced.iter().any(|t| t == "ghost"),
+            "cancelled ghost still generated: {:?}",
+            log.lock()
+        );
+    }
+
+    /// (b), unit form: a tombstoned id is refused inside `submit` — a benign
+    /// no-op `Ok(())`, and the engine never sees the task. A fresh id still
+    /// lands, so the check refuses exactly one thing.
+    #[tokio::test]
+    async fn submit_refuses_an_already_tombstoned_id() {
+        let (runner, log) = recording_runner(Gate::opened()).await;
+        runner.cancel(&"ghost".to_string());
+        runner
+            .submit(GenerationTask::new("ghost", "x").with_max_tokens(8))
+            .expect("a refused submit is a no-op Ok, not an error");
+        runner
+            .submit(GenerationTask::new("live", "x").with_max_tokens(8))
+            .unwrap();
+        let log = log.lock();
+        assert!(
+            !log.submitted.iter().any(|t| t == "ghost"),
+            "a cancelled task must never reach the engine: {log:?}"
+        );
+        assert!(
+            log.submitted.iter().any(|t| t == "live"),
+            "the tombstone check must not refuse healthy submits: {log:?}"
+        );
+    }
+
+    /// (b), the real ordering race: the caller's future is dropped BEFORE the
+    /// submit closure has run at all, so the guard's cancel executes FIRST
+    /// and the submit would admit the task afterwards. Forced deterministic
+    /// by capping the blocking pool at one thread and occupying it, which is
+    /// exactly the production shape (every worker busy) that makes the race
+    /// reachable.
+    #[test]
+    fn submit_queued_behind_a_drop_is_refused_when_it_finally_runs() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (runner, log) = recording_runner(Gate::opened()).await;
+
+            // Occupy the pool's only blocking thread.
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let started = Arc::new(AtomicBool::new(false));
+            let started_in = started.clone();
+            let occupier = tokio::task::spawn_blocking(move || {
+                started_in.store(true, Ordering::SeqCst);
+                let _ = blocked.recv();
+            });
+            await_until("the blocking pool's only thread to be occupied", || {
+                started.load(Ordering::SeqCst)
+            })
+            .await;
+
+            // Dispatch + drop. The submit closure is queued, never run.
+            let dropped = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                runner.generate_async(GenerationTask::new("ghost", "x").with_max_tokens(64)),
+            )
+            .await;
+            assert!(dropped.is_err());
+            assert!(
+                log.lock().submitted.is_empty(),
+                "the submit closure must still be queued behind the occupier"
+            );
+            assert!(runner.slot.buffers.lock().cancelled.contains("ghost"));
+
+            // Release the pool. The blocking queue is FIFO, so the barrier
+            // below can only run once the ghost's submit closure has finished.
+            drop(release);
+            occupier.await.unwrap();
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+
+            assert!(
+                !log.lock().submitted.iter().any(|t| t == "ghost"),
+                "a submit that runs after its caller cancelled must be refused: {:?}",
+                log.lock()
+            );
+
+            // And the runner is still usable for real work afterwards.
+            let mut s = runner
+                .generate_async(GenerationTask::new("fresh", "x").with_max_tokens(2))
+                .await
+                .unwrap();
+            let mut n = 0usize;
+            while let Some(c) = s.next().await {
+                assert!(c.error.is_none(), "{:?}", c.error);
+                n += 1;
+            }
+            assert!(n > 0, "a fresh request must still stream");
+        });
+    }
+
+    /// (c) The normal path is untouched: polled to completion,
+    /// `generate_async` streams exactly what it always did.
+    #[tokio::test]
+    async fn generate_async_polled_to_completion_is_unaffected() {
+        let runner = Arc::new(make_runner().await);
+        let task = GenerationTask::new("t-ga", "the quick brown fox").with_max_tokens(2);
+        let mut stream = runner.generate_async(task).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(c) = stream.next().await {
+            chunks.push(c);
+        }
+        // Two tokens then a final marker — same as the sync `generate()`.
+        // A guard that failed to disarm would have cancelled us to zero.
+        assert_eq!(chunks.len(), 3, "{chunks:?}");
+        assert_eq!(chunks[0].text, "the ");
+        assert_eq!(chunks[1].text, "quick ");
+        assert!(chunks.last().unwrap().is_final);
+        assert!(chunks.iter().all(|c| c.error.is_none()));
     }
 
     #[tokio::test]
