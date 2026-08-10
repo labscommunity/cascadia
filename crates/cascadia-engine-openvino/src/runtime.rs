@@ -475,6 +475,23 @@ fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
         .collect())
 }
 
+/// The relay failed to answer its upstream. When the step it was answering
+/// for ALSO failed, the send error on its own hides why the batch died — and
+/// those two failures are correlated, not independent: a dead upstream is
+/// precisely the case where the NACK cannot be delivered either. So carry
+/// both in one error.
+///
+/// The send error stays outermost: it is the transport failure, and its text
+/// is what [`EngineError::is_connection_fatal`] inspects to decide whether the
+/// relay loop exits for a supervisor rebuild. Embedding the body error's text
+/// after it keeps the root cause visible without hiding the link failure.
+fn nack_send_error(send_err: EngineError, body_err: Option<&EngineError>) -> EngineError {
+    match body_err {
+        Some(body) => EngineError::Backend(format!("{send_err} (NACK sent because: {body})")),
+        None => send_err,
+    }
+}
+
 /// Decode + strictly validate a wire position frame. Must be I64 with exactly
 /// 8 payload bytes and non-negative; anything else (a desynced stream, a
 /// stateful peer that sent a hidden tensor where a position was expected, or
@@ -1796,15 +1813,26 @@ impl OvRuntimeEngine {
         let step = self.relay_packed_body(plan_res, hidden, hshape);
         let frame = match &step {
             Ok(tokens) => encode_wire_tokens(tokens),
-            Err(_) => encode_wire_tokens(&[]),
+            Err(e) => {
+                // Log the root cause HERE, before the NACK goes out: a dead
+                // upstream is exactly when the send fails too, and then the
+                // send error is the only thing that would ever reach the
+                // operator. This rank is where the batch actually died, so
+                // this is where the reason has to be recorded.
+                warn!(error = %e, "packed relay step failed; NACKing the upstream");
+                encode_wire_tokens(&[])
+            }
         };
-        self.block_on(async {
+        let sent = self.block_on(async {
             let mut guard = up.lock().await;
             guard
                 .send(&frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
-        })?;
+        });
+        if let Err(send_err) = sent {
+            return Err(nack_send_error(send_err, step.as_ref().err()));
+        }
         step.map(|_| ())
     }
 
@@ -4129,6 +4157,34 @@ mod tests {
         assert!(decode_wire_tokens(&nack).is_err()); // NACK check must come first
         let real = encode_wire_tokens(&[7]);
         assert_ne!(real.elements(), Some(0));
+    }
+
+    /// A dead upstream fails the step AND the NACK that reports it, so the two
+    /// arrive together. Returning only the send error would drop the reason
+    /// the batch died — the operator would see "packed token send: …" and
+    /// never learn it was a plan decode error, a failed inference, or a
+    /// downstream NACK. Both texts must survive, and the send error must stay
+    /// classifiable so the relay loop still exits for a supervisor rebuild.
+    #[test]
+    fn nack_send_failure_carries_the_step_error_too() {
+        let send = EngineError::Backend("packed token send: broken pipe".into());
+        let body = EngineError::Backend("packed plan decode: slot 9 beyond 4 slots".into());
+        let combined = nack_send_error(send, Some(&body));
+        let msg = combined.to_string();
+        assert!(msg.contains("packed token send: broken pipe"), "{msg}");
+        assert!(msg.contains("slot 9 beyond 4 slots"), "{msg}");
+        // The transport failure still classifies: a dead link must not be
+        // downgraded to a retryable error just because it now carries context.
+        assert!(combined.is_connection_fatal(), "{msg}");
+
+        // A successful step that merely failed to send back keeps the send
+        // error untouched — there is no root cause to attach.
+        let send = EngineError::Backend("packed token send: broken pipe".into());
+        let alone = nack_send_error(send, None);
+        assert_eq!(
+            alone.to_string(),
+            "backend error: packed token send: broken pipe"
+        );
     }
 
     /// Prefill chunks (several rows for one slot) get the widened reply
