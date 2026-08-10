@@ -284,8 +284,14 @@ impl Runner {
         // wedges the pipeline (#122).
         let res = {
             let mut guard = self.engine.lock();
-            let engine = guard.as_mut().ok_or(EngineError::NotLoaded)?;
-            engine.submit(task)
+            // Route the empty slot through `res` rather than `?`: an early
+            // return here released the engine lock and skipped the wake
+            // below, and an empty slot means `close()` already ran — no
+            // later lock holder is coming to wake them instead.
+            match guard.as_mut() {
+                Some(engine) => engine.submit(task),
+                None => Err(EngineError::NotLoaded),
+            }
         };
         self.wake_parked_streams();
         res
