@@ -56,7 +56,16 @@ pub struct SparseMoEBuilderConfig {
     // Deliberately absent: `profile`. `CASCADIA_GLM5_PROFILE` is read from a
     // `OnceLock` process global in the decode loop, which no config can reach;
     // it stays env-only rather than becoming a field that silently does nothing.
-    /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    /// Context budget. Per-arch env fallback and default: glm5 →
+    /// `CASCADIA_GLM5_MAX_SEQ` / [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`];
+    /// dsv4 → `CASCADIA_DSV4_MAX_SEQ` / [`crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ`].
+    ///
+    /// **Zero means different things per arch.** dsv4 treats `Some(0)` as unset
+    /// and falls through to env/default ([`resolve_dsv4_max_seq`]); glm5 uses it
+    /// verbatim as the cache-sizing budget. A config layer that defaults this to
+    /// `0` rather than omitting it therefore works on dsv4 and ships a
+    /// zero-sized budget to glm5. dsv4's polarity is the intended one; aligning
+    /// glm5 is a follow-up.
     pub max_seq: Option<usize>,
     /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
     pub prefix_cache_depth: Option<u32>,
@@ -67,7 +76,16 @@ pub struct SparseMoEBuilderConfig {
     pub f32_head: Option<bool>,
     /// Async lookahead expert prefetch. `None` → `CASCADIA_GLM5_LOOKAHEAD` (off).
     pub lookahead: Option<bool>,
-    /// Expert storage mode (`"eager"` | `"mmap"`). `None` → `CASCADIA_GLM5_EXPERTS`.
+    /// Expert storage mode (`"eager"` | `"mmap"`). `None` → per-arch env:
+    /// glm5 `CASCADIA_GLM5_EXPERTS`, dsv4 `CASCADIA_DSV4_EXPERTS`.
+    ///
+    /// Unknown values differ per arch: dsv4 warns and falls through to
+    /// env/heuristic ([`crate::dsv4::stage::resolve_experts_mode`]); glm5's
+    /// `or_else` short-circuits, so a typo there masks the env silently.
+    ///
+    /// dsv4 does NOT accept `"ov"` — its OpenVINO expert backend is gated on
+    /// `CASCADIA_DSV4_OV_EXPERTS`, so routing `ov_experts` through this field
+    /// reaches the unknown-value path and leaves the Rust kernel selected.
     pub experts_mode: Option<String>,
     /// OV expert cache count backstop. `None` → `CASCADIA_GLM5_OV_CACHE` (64).
     pub ov_cache_entries: Option<u32>,
@@ -3901,6 +3919,50 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two lines that make "the builder honours config" true are the
+    /// `resolve_dsv4_max_seq(self.config.max_seq, ..)` and
+    /// `self.config.experts_mode.as_deref()` arguments inside `load`'s dsv4
+    /// arm. The pure resolvers are unit-tested elsewhere; nothing covered those
+    /// two call sites, so passing the wrong field or swapping the config/env
+    /// argument order stayed green. This drives the real builder and reads the
+    /// constructed runner's budget back — reachable here because `dsv4_runner`
+    /// is private to this module.
+    #[tokio::test]
+    async fn dsv4_builder_threads_config_max_seq_into_the_runner() {
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsv4_export");
+        if !dir.join("manifest.json").exists() {
+            eprintln!("dsv4 export fixture absent; skipping");
+            return;
+        }
+
+        // Config value must win and reach the runner verbatim.
+        let mut cfg = SparseMoEBuilderConfig::new(dir.clone(), "CPU");
+        cfg.max_seq = Some(48);
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.load(ShardSpec::single_stage("dsv4-test", "CPU"))
+            .await
+            .expect("dsv4 load");
+        assert_eq!(
+            b.dsv4_runner.as_ref().expect("dsv4 runner").max_seq(),
+            48,
+            "config.max_seq must reach the runner, not the env fallback"
+        );
+
+        // Absent config falls through to the default (no env set in test env).
+        let mut cfg = SparseMoEBuilderConfig::new(dir, "CPU");
+        cfg.max_seq = None;
+        let mut b = SparseMoEBuilder::new(cfg);
+        b.load(ShardSpec::single_stage("dsv4-test", "CPU"))
+            .await
+            .expect("dsv4 load");
+        assert_eq!(
+            b.dsv4_runner.as_ref().expect("dsv4 runner").max_seq(),
+            crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ,
+            "None must fall through to the dsv4 default"
+        );
+    }
 
     /// The per-token streaming deltas (PipelineEngine::decode_step) must
     /// reconstruct the full text exactly, never emit a lone U+FFFD, and hold a
