@@ -11,6 +11,8 @@
 
 use std::path::Path;
 
+use tracing::warn;
+
 use super::loader::{load_stage_mode, ExpertsMode, LoadError, Manifest};
 use super::model::DsV4Model;
 
@@ -27,6 +29,41 @@ pub struct Dsv4Runner {
     pub total: u32,
 }
 
+/// Expert storage mode precedence: explicit `override_val` → `env_val` (the
+/// caller's read of `CASCADIA_DSV4_EXPERTS`) → the `n_routed_experts > 32`
+/// size heuristic (real-model expert sets don't fit in RAM dequantized;
+/// tiny/dev ones are faster eager). An unrecognized `override_val` is logged
+/// and treated as absent rather than panicking.
+///
+/// Takes the env value as a parameter (rather than reading `std::env` itself)
+/// so it's a pure function tests can exercise without mutating process-global
+/// state (`set_var` is `unsafe` under edition 2024 and racy under a parallel
+/// test runner regardless).
+pub fn resolve_experts_mode(
+    override_val: Option<&str>,
+    env_val: Option<&str>,
+    n_routed_experts: usize,
+) -> ExpertsMode {
+    let from_env_or_heuristic = || match env_val {
+        Some("eager") => ExpertsMode::Eager,
+        Some("mmap") => ExpertsMode::Mmap,
+        _ if n_routed_experts > 32 => ExpertsMode::Mmap,
+        _ => ExpertsMode::Eager,
+    };
+    match override_val {
+        Some("eager") => ExpertsMode::Eager,
+        Some("mmap") => ExpertsMode::Mmap,
+        Some(other) => {
+            warn!(
+                value = other,
+                "unrecognized dsv4 experts_mode override; falling back to env/heuristic"
+            );
+            from_env_or_heuristic()
+        }
+        None => from_env_or_heuristic(),
+    }
+}
+
 /// Contiguous even split of `n` layers across `total` ranks.
 pub fn even_layer_split(n: usize, rank: u32, total: u32) -> (usize, usize) {
     let total = total.max(1) as usize;
@@ -41,6 +78,10 @@ pub fn even_layer_split(n: usize, rank: u32, total: u32) -> (usize, usize) {
 impl Dsv4Runner {
     /// Load rank `rank` of `total`. `layer_start/layer_end` from the
     /// ShardSpec override the even split when nonzero.
+    ///
+    /// Resolves the experts mode from `CASCADIA_DSV4_EXPERTS`, else the size
+    /// heuristic. Kept signature-stable for its many call sites; use
+    /// [`Self::load_staged_with_experts`] to pass a config-first override.
     pub fn load_staged(
         model_dir: &Path,
         max_seq: usize,
@@ -48,6 +89,35 @@ impl Dsv4Runner {
         total: u32,
         layer_start: u32,
         layer_end: u32,
+    ) -> Result<Self, LoadError> {
+        Self::load_staged_with_experts(
+            model_dir,
+            max_seq,
+            rank,
+            total,
+            layer_start,
+            layer_end,
+            None,
+        )
+    }
+
+    /// [`Self::load_staged`] with an explicit experts-mode override
+    /// (`"eager"` | `"mmap"`), taking precedence over both
+    /// `CASCADIA_DSV4_EXPERTS` and the size heuristic. An unrecognized value
+    /// is logged and treated as `None` — the env/heuristic path decides
+    /// instead of panicking.
+    ///
+    /// Exists because in-process hosts cannot set the environment for a
+    /// single engine (`set_var` is `unsafe` under edition 2024, and
+    /// process-global).
+    pub fn load_staged_with_experts(
+        model_dir: &Path,
+        max_seq: usize,
+        rank: u32,
+        total: u32,
+        layer_start: u32,
+        layer_end: u32,
+        experts_override: Option<&str>,
     ) -> Result<Self, LoadError> {
         let m: Manifest =
             serde_json::from_str(&std::fs::read_to_string(model_dir.join("manifest.json"))?)
@@ -62,14 +132,11 @@ impl Dsv4Runner {
         };
         let first = rank == 0;
         let last = rank == total - 1;
-        // Real-model expert sets don't fit in RAM dequantized; tiny/dev ones
-        // are faster eager. CASCADIA_DSV4_EXPERTS=eager|mmap overrides.
-        let mode = match std::env::var("CASCADIA_DSV4_EXPERTS").as_deref() {
-            Ok("eager") => ExpertsMode::Eager,
-            Ok("mmap") => ExpertsMode::Mmap,
-            _ if m.n_routed_experts > 32 => ExpertsMode::Mmap,
-            _ => ExpertsMode::Eager,
-        };
+        let mode = resolve_experts_mode(
+            experts_override,
+            std::env::var("CASCADIA_DSV4_EXPERTS").ok().as_deref(),
+            m.n_routed_experts,
+        );
         let model = load_stage_mode(model_dir, max_seq, lo, hi, first, last, mode)?;
         let eos = m.eos_token_ids.iter().map(|&e| e as u32).collect();
         let hidden = m.hc_mult * m.hidden_size;

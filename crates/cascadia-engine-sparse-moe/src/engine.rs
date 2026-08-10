@@ -294,6 +294,25 @@ pub(crate) fn resolve_runner_options(cfg: &SparseMoEBuilderConfig) -> RunnerOpti
     }
 }
 
+/// dsv4 context-budget precedence: config → `env` (the caller's read of
+/// `CASCADIA_DSV4_MAX_SEQ`) → [`crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ`].
+/// `Some(0)`/absent config and a missing, unparseable, or zero env value all
+/// fall through — `0` keeps meaning "fall through to the default", not
+/// "zero context", for both sources alike.
+///
+/// Takes `env` as a parameter (rather than reading `std::env` itself) so
+/// it's a pure function tests can exercise without mutating process-global
+/// state.
+pub fn resolve_dsv4_max_seq(config: Option<usize>, env: Option<&str>) -> usize {
+    config
+        .filter(|&n| n > 0)
+        .or_else(|| {
+            env.and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+        })
+        .unwrap_or(crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ)
+}
+
 pub struct SparseMoEBuilder {
     pub config: SparseMoEBuilderConfig,
     runner: Option<Runner>,
@@ -426,27 +445,27 @@ impl Builder for SparseMoEBuilder {
             let total = self.config.total.max(1);
             let rank = self.config.rank.min(total - 1);
             // Context budget sizes the rope table + KV/compressed/indexer
-            // caches (memory scales with it). Overridable for long-context
-            // deployments via CASCADIA_DSV4_MAX_SEQ; fall back to the default on
-            // a missing, unparseable, or zero value.
-            let max_seq = std::env::var("CASCADIA_DSV4_MAX_SEQ")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(crate::dsv4::stage::DSV4_DEFAULT_MAX_SEQ);
+            // caches (memory scales with it). Config-first, then
+            // CASCADIA_DSV4_MAX_SEQ; fall back to the default on a missing,
+            // unparseable, or zero value.
+            let max_seq = resolve_dsv4_max_seq(
+                self.config.max_seq,
+                std::env::var("CASCADIA_DSV4_MAX_SEQ").ok().as_deref(),
+            );
             if max_seq > 131072 {
                 warn!(
                     max_seq,
-                    "CASCADIA_DSV4_MAX_SEQ is large; per-layer caches scale with it"
+                    "dsv4 max_seq is large; per-layer caches scale with it"
                 );
             }
-            let runner = crate::dsv4::stage::Dsv4Runner::load_staged(
+            let runner = crate::dsv4::stage::Dsv4Runner::load_staged_with_experts(
                 &self.config.model_dir,
                 max_seq,
                 rank,
                 total,
                 shard.layer_start,
                 shard.layer_end,
+                self.config.experts_mode.as_deref(),
             )
             .map_err(|e| EngineError::Backend(format!("dsv4 load: {e}")))?;
             if rank == 0 {
