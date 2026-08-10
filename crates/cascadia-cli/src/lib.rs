@@ -2003,7 +2003,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             enable_thinking: false,
             trust_remote_code: false,
         };
-        let mut stream = runner.generate(task)?;
+        // `generate_async`, not `generate`: this loop runs on the tokio
+        // runtime, and the sync path would block a worker on the engine
+        // mutex for a full step (#122). Benign while stdin is serial, but
+        // it is the exact pattern the API layer had to unwind.
+        let mut stream = runner.generate_async(task).await?;
         while let Some(chunk) = stream.next().await {
             print!("{}", chunk.text);
             if chunk.is_final {
