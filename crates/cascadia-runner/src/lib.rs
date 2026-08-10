@@ -130,6 +130,55 @@ struct Buffers {
     deferred_cancels: Vec<TaskId>,
 }
 
+/// Drains + wakes [`Buffers::step_wakers`] when it leaves scope — including
+/// when a panic unwinds out of that scope.
+///
+/// The drain after an engine-lock release is straight-line code, so an
+/// unwind skips it: a panic inside `step()` (or anything else run under the
+/// engine guard) leaves every parked stream `Pending` forever with nothing
+/// in the log to say why. `parking_lot` does not poison, so the engine
+/// itself is released and perfectly usable — there is simply no one left to
+/// poll it. Running the drain from a destructor covers the unwind path too.
+///
+/// DECLARE THIS BEFORE the engine guard it protects: locals drop in reverse
+/// declaration order, so the engine lock is released first and the wake runs
+/// with the engine free. Waking while the lock is still held lets a woken
+/// stream re-park behind it and be stranded exactly as before.
+struct WakeParkedOnDrop<'a> {
+    buffers: &'a Mutex<Buffers>,
+    /// Armed only once the engine lock is actually held. A contended
+    /// `poll_next` that gives up and returns `Pending` has just registered
+    /// its OWN waker; draining from there would wake it straight back and
+    /// spin the worker for the whole of the holder's step.
+    armed: bool,
+}
+
+impl<'a> WakeParkedOnDrop<'a> {
+    /// Inert until [`arm`](Self::arm) is called.
+    fn disarmed(buffers: &'a Mutex<Buffers>) -> Self {
+        Self {
+            buffers,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+}
+
+impl Drop for WakeParkedOnDrop<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
 pub struct Runner {
     /// Mutex so the Runner is `Sync` even with a `dyn Builder` inside;
     /// taken once during `start()` and dropped.
@@ -644,6 +693,13 @@ impl Stream for ChunkStream {
             //    someone else is stepping; park with a registered waker and
             //    let their release wake us.
             let step_result = {
+                // Wake-on-release, unwind included: `step()` runs arbitrary
+                // engine code under this lock, and a panic there must not
+                // strand the streams parked behind it (see
+                // `WakeParkedOnDrop`). Declared BEFORE the engine guard so
+                // reverse-declaration drop order releases the engine first
+                // and wakes second, on the normal path and on the unwind.
+                let mut wake_on_release = WakeParkedOnDrop::disarmed(&this.buffers);
                 let mut guard = match this.engine.try_lock() {
                     Some(g) => g,
                     None => {
@@ -658,6 +714,9 @@ impl Stream for ChunkStream {
                         }
                     }
                 };
+                // The engine is ours: every exit from here — value, early
+                // return, or panic — owes the parked streams a wake.
+                wake_on_release.arm();
                 let result = match guard.as_mut() {
                     // Slot empty: `Runner::close` took the engine, i.e. server
                     // teardown. Handled below rather than here because
@@ -688,12 +747,9 @@ impl Stream for ChunkStream {
                         })
                     }
                 };
+                // Engine released here; `wake_on_release` drains + wakes
+                // every stream parked on contention right after.
                 drop(guard);
-                // Engine released: wake every stream parked on contention.
-                let wakers = std::mem::take(&mut this.buffers.lock().step_wakers);
-                for w in wakers {
-                    w.wake();
-                }
                 result
             };
             let Some(step_result) = step_result else {
@@ -838,22 +894,25 @@ impl Drop for ChunkStream {
         // during another stream's step counts toward the worker starvation
         // that wedges the pipeline (#122). Busy engine = defer; the next
         // engine-lock holder applies it before stepping.
-        match self.engine.try_lock() {
-            Some(mut guard) => {
-                if let Some(engine) = guard.as_mut() {
-                    engine.cancel(&self.task_id);
+        {
+            // Same wake-on-release protocol as `poll_next`, unwind
+            // included: `engine.cancel()` is engine code too, and a panic
+            // here would otherwise strand every parked stream. Declared
+            // BEFORE the guard so the engine lock is released first.
+            let mut wake_on_release = WakeParkedOnDrop::disarmed(&self.buffers);
+            match self.engine.try_lock() {
+                Some(mut guard) => {
+                    wake_on_release.arm();
+                    if let Some(engine) = guard.as_mut() {
+                        engine.cancel(&self.task_id);
+                    }
                 }
-                drop(guard);
-                let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
-                for w in wakers {
-                    w.wake();
+                None => {
+                    self.buffers
+                        .lock()
+                        .deferred_cancels
+                        .push(self.task_id.clone());
                 }
-            }
-            None => {
-                self.buffers
-                    .lock()
-                    .deferred_cancels
-                    .push(self.task_id.clone());
             }
         }
         let mut bufs = self.buffers.lock();
@@ -1407,6 +1466,153 @@ mod tests {
             !runner.buffers.lock().chunks.contains_key("dead"),
             "routing a failure to a cancelled task must not recreate its buffer entry"
         );
+    }
+
+    /// Engine whose first `step()` panics while holding the engine lock —
+    /// an engine bug, but one whose unwind passes straight through
+    /// `ChunkStream::poll_next`. It blocks in `step()` until the test has a
+    /// second stream parked behind the lock, then panics. Later steps fail
+    /// cleanly so a woken stream can terminate instead of panicking in turn.
+    struct PanicStepEngine {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        panicked: Arc<AtomicBool>,
+    }
+
+    impl Engine for PanicStepEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            if self.panicked.load(Ordering::SeqCst) {
+                return Err(EngineError::Backend("engine panicked earlier".into()));
+            }
+            self.entered.store(true, Ordering::SeqCst);
+            // Bounded, so a broken test fails rather than hangs.
+            let start = Instant::now();
+            while !self.release.load(Ordering::SeqCst)
+                && start.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.panicked.store(true, Ordering::SeqCst);
+            panic!("engine step blew up");
+        }
+    }
+
+    struct PanicStepBuilder {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        panicked: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for PanicStepBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(PanicStepEngine {
+                entered: self.entered,
+                release: self.release,
+                panicked: self.panicked,
+            }))
+        }
+    }
+
+    /// A panic inside `step()` must still wake the streams parked on the
+    /// engine lock.
+    ///
+    /// `parking_lot` doesn't poison, so the unwind releases the engine and
+    /// the next poller could drive it fine — but the drain + wake used to be
+    /// straight-line code after the release, which an unwind skips. Every
+    /// parked stream then waited `Pending` forever, with no log line and a
+    /// perfectly healthy-looking engine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn step_panic_still_wakes_parked_streams() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(Runner::new(Box::new(PanicStepBuilder {
+            entered: entered.clone(),
+            release: release.clone(),
+            panicked: panicked.clone(),
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+
+        let stream_a = runner
+            .generate(GenerationTask::new("panic-a", "x").with_max_tokens(4))
+            .unwrap();
+        let mut stream_b = runner
+            .generate(GenerationTask::new("panic-b", "y").with_max_tokens(4))
+            .unwrap();
+
+        // Poll A on a blocking thread and catch the panic THERE, keeping A's
+        // ChunkStream alive across the unwind: dropping it would run
+        // `ChunkStream::drop`, whose own release wakes B and would mask the
+        // bug under test.
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let a = tokio::task::spawn_blocking(move || {
+            let mut sa = stream_a;
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = Pin::new(&mut sa).poll_next(&mut cx);
+            }));
+            let _ = hold_rx.recv(); // hold A's stream until the test is done
+            caught.is_err()
+        });
+
+        // Wait until A is inside step(), holding the engine lock.
+        let start = Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "stream A never entered step()"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // B polls, finds the engine contended, and parks with a waker.
+        let b = tokio::spawn(async move { stream_b.next().await });
+        let start = Instant::now();
+        while runner.buffers.lock().step_wakers.is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "stream B never parked on the engine lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // Blow up the step with B parked behind the lock.
+        release.store(true, Ordering::SeqCst);
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), b)
+            .await
+            .expect("parked stream was never woken after a panicking step()")
+            .unwrap();
+        let chunk = chunk.expect("woken stream must terminate loud, not silently");
+        assert!(chunk.is_final);
+        assert!(
+            chunk.error.is_some(),
+            "woken stream must surface the broken engine: {chunk:?}"
+        );
+
+        let _ = hold_tx.send(());
+        assert!(a.await.unwrap(), "step() was expected to panic");
     }
 
     /// Engine that never errors and never produces: every step is Ok(empty).
