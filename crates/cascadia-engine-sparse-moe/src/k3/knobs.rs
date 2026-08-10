@@ -10,7 +10,9 @@ use std::sync::OnceLock;
 /// Explicit knob values from the builder config. `None` defers to the env var.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Overrides {
-    pub max_seq: Option<usize>,
+    // No `max_seq`: the engine resolves `k3_max_seq` itself and hands the value
+    // to `K3Runner::load`, so a copy here would be a second source with
+    // different semantics (unfiltered `Some(0)` vs the engine's zero filter).
     pub prefix_cache_bytes: Option<u64>,
     pub read: Option<bool>,
     pub prefetch: Option<bool>,
@@ -22,7 +24,6 @@ pub struct Overrides {
 static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
 
 const NONE: Overrides = Overrides {
-    max_seq: None,
     prefix_cache_bytes: None,
     read: None,
     prefetch: None,

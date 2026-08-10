@@ -157,12 +157,18 @@ impl PrefixStore {
 /// `pinned == 0` and no env var, and used to skip the write-back entirely.
 ///
 /// Only write back when pinning is in use, so a plain run never touches the
-/// model dir. A `k3_autopin` override wins over the env var, same as
-/// `autopin_budget()` — otherwise a cold first run under the override
-/// (`pinned == 0`, no env var) never writes the histogram and autopin never
-/// bootstraps.
+/// model dir. A `k3_autopin` override wins over the env var in BOTH directions,
+/// same as `autopin_budget()`: `Some(true)` bootstraps a cold first run
+/// (`pinned == 0`, no env var) that would otherwise never write the histogram,
+/// and `Some(false)` suppresses the write an inherited `CASCADIA_K3_AUTOPIN`
+/// would trigger — an in-process host cannot unset that env var, so the config
+/// field is its only opt-out.
 fn should_save_usage(pinned: usize, autopin_override: Option<bool>, env_set: bool) -> bool {
-    pinned > 0 || autopin_override == Some(true) || env_set
+    pinned > 0
+        || match autopin_override {
+            Some(v) => v,
+            None => env_set,
+        }
 }
 
 impl Drop for K3Runner {
@@ -217,8 +223,9 @@ impl K3Runner {
         };
         // Learned residency: throughput is decided by what stays resident, so
         // the pin set comes from recorded traffic. Off unless
-        // CASCADIA_K3_AUTOPIN is set — an over-large pin set evicts the cache
-        // serving the cold tail and is worse than no pinning.
+        // CASCADIA_K3_AUTOPIN or the `k3_autopin` builder override is set — an
+        // over-large pin set evicts the cache serving the cold tail and is
+        // worse than no pinning.
         let usage_p = residency::usage_path(dir);
         if usage_p.exists() {
             if let Err(e) = residency::load_global(&usage_p) {
@@ -382,12 +389,6 @@ impl StagedRunner for K3Runner {
         self.prefix.enabled()
     }
 
-    /// Restore every layer's state as it stood after the cached prefix, and
-    /// report how many prompt tokens that covers so the caller can skip them.
-    ///
-    /// Restoring is a whole-model swap because K3 carries state in both layer
-    /// kinds — the KDA recurrence and the MLA latent cache — and they must agree
-    /// on position or the run is silently wrong.
     /// Restore every layer's state as it stood after the cached prefix and report
     /// how many tokens that covers, so the caller prefills only the suffix.
     ///
@@ -614,6 +615,13 @@ mod tests {
     #[test]
     fn an_explicit_autopin_opt_out_is_honoured() {
         assert!(!should_save_usage(0, Some(false), false));
+    }
+
+    #[test]
+    fn an_explicit_opt_out_beats_an_inherited_env_var() {
+        // The lever an in-process host has: it cannot unset the deployment's
+        // CASCADIA_K3_AUTOPIN, so `Some(false)` must suppress the write-back.
+        assert!(!should_save_usage(0, Some(false), true));
     }
 
     #[test]

@@ -51,7 +51,6 @@ pub mod spec_decode;
 pub mod staged;
 pub mod tensors;
 
-pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 /// Contiguous even split of `n` layers across `total` ranks, half-open
 /// `(lo, hi)`. Re-exported so an embedding host can report the same layer
 /// range the runner loads instead of reimplementing the formula.
@@ -67,6 +66,7 @@ pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 /// assert_eq!(even_layer_split(93, 0, 1), (0, 93));
 /// ```
 pub use dsv4::stage::even_layer_split;
+pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};
 pub use kv_prefix_cache::{KvPrefixCache, KvSnapshot, LayerKvSlice, ModelFingerprint};
 pub use manifest::Manifest;
 pub use ngram_draft::{Draft, DEFAULT_DRAFT_K, MAX_NGRAM, MIN_NGRAM};

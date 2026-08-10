@@ -57,6 +57,10 @@ pub struct SparseMoEBuilderConfig {
     // `OnceLock` process global in the decode loop, which no config can reach;
     // it stays env-only rather than becoming a field that silently does nothing.
     /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    ///
+    /// glm5 only, despite the generic name: the dsv4 arm reads
+    /// `CASCADIA_DSV4_MAX_SEQ` and the kimi_k3 arm reads [`Self::k3_max_seq`],
+    /// so setting this for either backend is a silent no-op.
     pub max_seq: Option<usize>,
     /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
     pub prefix_cache_depth: Option<u32>,
@@ -567,8 +571,19 @@ impl Builder for SparseMoEBuilder {
             .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("kimi_k3"))
             .unwrap_or(false);
         if is_k3 {
+            // Checked before anything process-global is seeded, so a rejected
+            // spec leaves no state behind.
+            if k3_rejects_explicit_range(shard.layer_end) {
+                return Err(EngineError::Backend(format!(
+                    "kimi_k3 does not support an explicit per-rank layer range \
+                     (layer_start={}, layer_end={}): the K3 loader always derives its \
+                     slice via even_layer_split(num_hidden_layers, rank, total). \
+                     Remove layer_start/layer_end from the shard spec — otherwise the \
+                     rank would load a different slice than the descriptor advertises.",
+                    shard.layer_start, shard.layer_end
+                )));
+            }
             crate::k3::knobs::seed(crate::k3::knobs::Overrides {
-                max_seq: self.config.k3_max_seq,
                 prefix_cache_bytes: self.config.k3_prefix_cache_bytes,
                 read: self.config.k3_read,
                 prefetch: self.config.k3_prefetch,
@@ -851,10 +866,12 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
-                // Same value the per-rank SliceKvCache got, so the rank-0 index
-                // and the per-rank caches stay in lockstep. `None` falls through
-                // to the env var and then to whether the store is enabled.
-                self.config.prefix_cache_depth.map(|d| d as usize),
+                // K3 has no SliceKvCache to stay in lockstep with — its per-rank
+                // store is the byte-budgeted PrefixStore fed by
+                // `k3_prefix_cache_bytes`. `None` so the cap derives from that
+                // store; taking glm5's `prefix_cache_depth` here would let a
+                // glm-scoped knob zero K3's index and kill prefix reuse.
+                None,
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -1111,6 +1128,17 @@ fn prefill_reply_budget(
         Some(ceiling) => widened.min(ceiling.saturating_sub(PREFILL_BUDGET_CEILING_MARGIN)),
         None => widened,
     }
+}
+
+/// Whether a `ShardSpec` carries a per-rank layer range the K3 loader cannot
+/// honour. `layer_end == 0` is the "unset" encoding the dsv4/glm/OV arms use.
+///
+/// K3's loader is built around `even_layer_split`: the AttnRes block structure
+/// and the KDA recurrent state both assume that split, so an arbitrary range
+/// would load a different slice than the descriptor advertises. Rejecting is
+/// the only outcome that isn't silent drift. Pure, for testing.
+fn k3_rejects_explicit_range(layer_end: u32) -> bool {
+    layer_end != 0
 }
 
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
@@ -4269,5 +4297,16 @@ mod tests {
         // Garbage falls back to the store-derived default rather than panicking
         // or silently disabling the feature.
         assert_eq!(super::prefix_index_cap(Some("not-a-number"), true), 4);
+    }
+
+    #[test]
+    fn k3_refuses_an_explicit_layer_range() {
+        // `layer_end == 0` is the "unset" encoding every other arm uses, and is
+        // the only shape K3 can serve: its split is even_layer_split, full stop.
+        assert!(!super::k3_rejects_explicit_range(0));
+        // Anything else would have loaded a slice the descriptor did not
+        // advertise — silently, before this check existed.
+        assert!(super::k3_rejects_explicit_range(24));
+        assert!(super::k3_rejects_explicit_range(93));
     }
 }

@@ -19,5 +19,5 @@ fn seed_is_once_and_unseeded_defers_to_env() {
         "second seed must be ignored"
     );
     assert_eq!(get().simd, Some(false));
-    assert_eq!(get().max_seq, None, "unset fields stay None");
+    assert_eq!(get().prefix_cache_bytes, None, "unset fields stay None");
 }

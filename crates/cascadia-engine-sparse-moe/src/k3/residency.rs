@@ -127,8 +127,9 @@ pub fn autopin_count(total_selections: u64, budget_experts: usize) -> usize {
 
 /// The pin budget for this rank, from `CASCADIA_K3_PIN_BYTES` or available RAM.
 ///
-/// Returns 0 unless `CASCADIA_K3_AUTOPIN` is set — pinning the wrong set is
-/// worse than pinning nothing, so it never engages by default.
+/// Returns 0 unless `CASCADIA_K3_AUTOPIN` or the `k3_autopin` builder override
+/// is set — pinning the wrong set is worse than pinning nothing, so it never
+/// engages by default.
 pub fn autopin_budget(expert_bytes: u64, reserve_bytes: u64) -> usize {
     let k = crate::k3::knobs::get();
     let on = match k.autopin {
