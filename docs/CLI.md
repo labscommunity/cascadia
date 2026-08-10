@@ -173,7 +173,7 @@ dropped, with a warning in the log.
 | `--cb-dynamic-split-fuse <BOOL>` | ov-genai default (on) | Dynamic-split-fuse scheduler toggle for `--cb`. |
 | `--cb-prefix-caching <BOOL>` | ov-genai default (off) | KV-block prefix reuse across requests for `--cb`. |
 | `--packed-slots <N>` | `0` | Continuous batching on the **NPU** (`--engine ov-runtime`, static `--target npu` exports): serve N concurrent requests in ONE inference by packing them into the sequence dimension with a per-row mask. Needs a packed variant beside the decode IR (`tools/packed_variant.py --slots N`). A different mechanism to `--cb` — the NPU has no paged attention. Works single- and multi-stage; every stage must run the same `--packed-slots` value (baked into the packed IR shape). See [docs/perf/NPU_PACKED_SLOTS.md](perf/NPU_PACKED_SLOTS.md). |
-| `--packed-prefix <N>` | `0` | Reserve N KV slots as a read-only shared prefix every packed slot may attend to — prefix caching without paging. Costs per-slot context. Requires `--packed-slots`. |
+| `--packed-prefix <N>` | `0` | Reserve N KV slots as a read-only shared prefix every packed slot may attend to — prefix caching without paging. Costs per-slot context. Requires `--packed-slots`. Single-stage only (`--total 1`): only the first stage admits requests, so a relay stage never populates the shared prefix. |
 
 For distributed speculative decode, every rank needs `--engine ov-dist-spec` —
 they share a wire protocol. See [engines/ov-dist-spec.md](engines/ov-dist-spec.md).

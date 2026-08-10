@@ -1516,6 +1516,19 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
              KV window)"
         ));
     }
+    // Prefix reuse is first-stage-only state. Only rank 0 admits requests, and
+    // admission is what populates the shared prefix region; a relay stage never
+    // admits, so its `prefix_valid` stays 0 and it clamps every plan row's reuse
+    // length to 0. Rank 0 would then skip prefilling the reused tokens while the
+    // downstream stages hold no KV for them — wrong tokens, no error, on any rank.
+    if args.packed_prefix > 0 && args.total != 1 {
+        return Err(anyhow!(
+            "--packed-prefix is single-stage only (--total 1); a relay stage cannot populate the \
+             shared prefix, so it would open zero shared columns for the prompt tokens rank 0 \
+             skipped prefilling and silently corrupt multi-stage output. Drop --packed-prefix to \
+             keep packed multi-stage decode, or run the worker as a single stage"
+        ));
+    }
     // Packed multi-slot decode lives in the ov-runtime static (NPU-target) path.
     if args.packed_slots > 0 {
         if args.engine != EngineKind::OvRuntime {
@@ -2422,6 +2435,39 @@ mod python_tests {
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 4;
         a.packed_prefix = 128;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// Prefix reuse is first-stage-only state: only rank 0 admits requests, and
+    /// admission is what fills the shared prefix region, so a relay stage clamps
+    /// every plan row's reuse to 0 and holds no KV for the tokens rank 0 skipped
+    /// prefilling — wrong output with no error anywhere. Rejected at the CLI
+    /// until relay-side prefix population exists. Multi-stage packed WITHOUT
+    /// --packed-prefix must stay accepted (it was un-gated deliberately).
+    #[test]
+    fn worker_flags_gate_packed_prefix_multi_stage() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
+        a.total = 2;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("--packed-prefix is single-stage only"),
+            "{err}"
+        );
+        assert!(err.contains("--total 1"), "{err}");
+
+        // Single stage is the supported configuration.
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
+        a.total = 1;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+
+        // Packed multi-stage decode without prefix reuse is untouched.
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.total = 2;
         assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 

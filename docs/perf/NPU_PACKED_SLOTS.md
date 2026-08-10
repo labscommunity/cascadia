@@ -237,6 +237,10 @@ populated by whichever request arrives first; no block-level dedup between
 partially-overlapping prompts beyond that single shared run; and the cached
 prefix persists for the worker's lifetime rather than being evicted by pressure.
 
+Single-stage only for now (`--total 1`, enforced by the CLI): the prefix is
+populated at admission, which only the first stage does, so a relay stage would
+open zero shared columns for the tokens rank 0 skipped prefilling.
+
 ### Accuracy parity
 
 Harness and method: [tests-e2e/accuracy](../../tests-e2e/accuracy). Full-text
