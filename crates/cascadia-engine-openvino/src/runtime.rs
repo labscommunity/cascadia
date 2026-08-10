@@ -43,7 +43,7 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
@@ -496,6 +496,93 @@ fn packed_abort_error(e: EngineError) -> EngineError {
     }
 }
 
+/// The client-facing text every task retired by one aborted packed batch
+/// receives. A [`EngineError::BatchAborted`] already reads "batch aborted: …"
+/// in its Display, and a cause left connection-fatal keeps its own wording, so
+/// name the abort here rather than prefixing it twice.
+fn packed_abort_message(aborted: &EngineError) -> String {
+    match aborted {
+        EngineError::BatchAborted(_) => aborted.to_string(),
+        fatal => format!("packed batch aborted: {fatal}"),
+    }
+}
+
+/// One-way latch: this stage's packed downstream link is dead for the rest of
+/// the process.
+///
+/// A reply-deadline miss POISONS the downstream socket (the transport drops
+/// it, so every later use answers `NotConnected`), and nothing reconnects:
+/// [`ActivationClient`] dials once, at startup. On a relay rank that is
+/// survivable — the step error is connection-fatal, the relay loop exits, and
+/// the supervisor rebuilds the stage. Rank 0 has no relay loop: it is driven
+/// by stream polls, so it would otherwise admit every new request, run the
+/// local prefill, fail the exchange on a socket that can never come back, and
+/// abort the batch — 100% failures, forever, behind one uniform per-batch WARN
+/// while the rebuilt relay ranks sit in `accept()`.
+///
+/// The latch turns that into fail-fast-and-loud: the first fatal cause is
+/// recorded once (with an `error!` naming the restart as the remedy) and every
+/// later request is refused immediately, before any local inference is burned.
+/// It is deliberately NOT a recovery mechanism — see [`Self::fail_fast_error`].
+#[derive(Default)]
+struct WireDeadLatch {
+    /// Display text of the FIRST connection-fatal cause observed. `Some` means
+    /// latched; the value is kept for attribution, never re-classified.
+    cause: Option<String>,
+}
+
+impl WireDeadLatch {
+    /// Feed the typed cause that just retired a packed batch.
+    ///
+    /// Classification is structural — [`EngineError::is_connection_fatal`] on
+    /// the typed value, exactly as `packed_abort_error` left it. The message is
+    /// only ever stored, never re-parsed: a batch abort whose text happens to
+    /// quote some other rank's transport failure must not arm this latch, and
+    /// [`EngineError::BatchAborted`] answers `false` before any substring is
+    /// examined.
+    ///
+    /// Returns `true` on the latching transition ONLY — the caller logs there,
+    /// so the operator-facing error is emitted once per process rather than
+    /// once per aborted batch. Later fatal causes are redundant (the first one
+    /// killed the link) and leave the stored cause untouched.
+    fn observe(&mut self, aborted: &EngineError) -> bool {
+        if self.cause.is_some() || !aborted.is_connection_fatal() {
+            return false;
+        }
+        self.cause = Some(aborted.to_string());
+        true
+    }
+
+    /// The first fatal cause, once latched.
+    fn cause(&self) -> Option<&str> {
+        self.cause.as_deref()
+    }
+
+    /// The error every request gets while latched, or `None` when the wire is
+    /// still believed good.
+    ///
+    /// Two properties are load-bearing:
+    ///
+    /// * It is `Backend` carrying the literal "not connected", so
+    ///   [`EngineError::is_connection_fatal`] answers `true` — fatality stays
+    ///   observable to any supervisor plumbing added later. It must never be
+    ///   [`EngineError::BatchAborted`], which is structurally non-fatal. The
+    ///   phrase is written here rather than inherited from `cause`, because the
+    ///   stored text need not match the classifier at all (a latch armed by the
+    ///   structural [`EngineError::NotConnected`] displays as "not YET
+    ///   connected", which no substring rule catches).
+    /// * It quotes the original cause, so the operator and the SSE client both
+    ///   learn what actually killed the link, not just that it is gone.
+    fn fail_fast_error(&self) -> Option<EngineError> {
+        self.cause.as_deref().map(|cause| {
+            EngineError::Backend(format!(
+                "packed downstream link is not connected: this stage latched a dead wire and \
+                 fails every request until the process is restarted (first cause: {cause})"
+            ))
+        })
+    }
+}
+
 /// The relay failed to answer its upstream. When the step it was answering
 /// for ALSO failed, the send error on its own hides why the batch died — and
 /// those two failures are correlated, not independent: a dead upstream is
@@ -937,6 +1024,11 @@ pub struct OvRuntimeEngine {
     /// Reload source for a parked prefill model.
     prefill_reload: Option<PrefillReload>,
     step_warn: StepWarnLimiter,
+    /// Packed path only: armed the first time a packed batch dies of this
+    /// stage's own dead downstream socket. Once armed, `submit` and
+    /// `step_first_packed` refuse work immediately instead of serving
+    /// guaranteed failures for the life of the process. See [`WireDeadLatch`].
+    wire_dead: WireDeadLatch,
 }
 
 impl OvRuntimeEngine {
@@ -1580,6 +1672,28 @@ impl OvRuntimeEngine {
     /// several tasks at once — which is exactly what the runner's per-task
     /// chunk buffers were built to demultiplex.
     fn step_first_packed(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // ---- dead-wire latch ----
+        // The downstream socket is poisoned for the life of this process, so
+        // every exchange below can only fail — after tokenizing, admitting and
+        // running a shared local inference first. Short-circuit ahead of all of
+        // it. Whatever the engine still holds is retired through the SAME abort
+        // machinery a live failure uses, so per-task attribution and slot
+        // release happen exactly once; queued-but-unadmitted tasks are folded
+        // into the same answer instead of sitting in the queue until the runner
+        // gives up on their streams.
+        if let Some(fatal) = self.wire_dead.fail_fast_error() {
+            if self.pending.is_empty() && self.packed.as_ref().unwrap().occupied() == 0 {
+                return Ok(Vec::new());
+            }
+            let msg = packed_abort_message(&fatal);
+            let out = self
+                .pending
+                .drain(..)
+                .map(|t| (t.task_id.clone(), Chunk::error(t.task_id, msg.clone())))
+                .collect();
+            return self.abort_packed_batch(fatal, out);
+        }
+
         let mut out = Vec::new();
         // ---- admission ----
         while !self.pending.is_empty() {
@@ -1659,10 +1773,12 @@ impl OvRuntimeEngine {
 
     /// A packed step failed in a way that loses the in-flight batch: retire
     /// every active slot (freeing its KV region) and hand each task its own
-    /// final error chunk. The single-task recovery in `step_first_body`
-    /// cannot express a multi-task failure. Slot state downstream is stale
-    /// but harmless — the next admission resets its slot in-band (a row
-    /// whose position equals its reuse length starts that slot fresh).
+    /// final error chunk. The single-task recovery in `step_first` (the
+    /// wrapper around `step_first_body`, which the packed path returns before
+    /// ever reaching) cannot express a multi-task failure. Slot state
+    /// downstream is stale but harmless — the next admission resets its slot
+    /// in-band (a row whose position equals its reuse length starts that slot
+    /// fresh).
     fn abort_packed_batch(
         &mut self,
         e: EngineError,
@@ -1670,13 +1786,20 @@ impl OvRuntimeEngine {
     ) -> EngineResult<Vec<(TaskId, Chunk)>> {
         warn!(error = %e, "packed step failed; aborting the in-flight packed batch");
         let aborted = packed_abort_error(e);
-        // A `BatchAborted` already says "batch aborted: …" in its Display;
-        // a cause left connection-fatal keeps its own wording, so name the
-        // abort for the client here rather than prefixing it twice.
-        let msg = match &aborted {
-            EngineError::BatchAborted(_) => aborted.to_string(),
-            fatal => format!("packed batch aborted: {fatal}"),
-        };
+        // The cause is typed, and `packed_abort_error` has already decided
+        // whether it is this stage's own dead socket or merely a lost batch —
+        // hand the VALUE to the latch, which asks `is_connection_fatal()`
+        // rather than re-reading these words. `observe` answers true exactly
+        // once, so this is a transition log, not per-batch noise.
+        if self.wire_dead.observe(&aborted) {
+            error!(
+                cause = %aborted,
+                "packed downstream link is dead and cannot be reconnected in-process; this \
+                 stage now fails every request immediately — restart the process to rebuild \
+                 the pipeline connection"
+            );
+        }
+        let msg = packed_abort_message(&aborted);
         let packed = self.packed.as_mut().unwrap();
         for slot in 0..packed.slots.len() {
             if let Some(ps) = packed.retire(slot) {
@@ -2825,6 +2948,22 @@ impl Engine for OvRuntimeEngine {
                 "non-first stage does not accept tasks directly".into(),
             ));
         }
+        // Dead-wire latch: refuse before the request costs anything. This is
+        // synchronous with the HTTP request, so the non-streaming path answers
+        // 5xx (and the API's readiness tracker sees a failure) rather than
+        // committing a 200 and delivering the same error inside a stream, and a
+        // streaming client gets an attributed error immediately instead of
+        // after a full local prefill. Connection-fatal by construction — see
+        // `WireDeadLatch::fail_fast_error`.
+        // DEBUG, not WARN: the latching `error!` is the operator signal, and it
+        // is emitted once on purpose — a per-request WARN would flood exactly
+        // the log the operator has to read it out of, at the request rate. Each
+        // refusal is already visible to the caller as an attributed 5xx.
+        if let Some(fatal) = self.wire_dead.fail_fast_error() {
+            debug!(task = %task.task_id, cause = self.wire_dead.cause().unwrap_or_default(),
+                   "refusing task: packed downstream link is dead");
+            return Err(fatal);
+        }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
                 .active
@@ -3959,6 +4098,7 @@ impl Builder for OvRuntimeBuilder {
             park_prefill: self.park_prefill,
             prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
         }))
     }
 }
@@ -4250,6 +4390,112 @@ mod tests {
             alone.to_string(),
             "backend error: packed token send: broken pipe"
         );
+    }
+
+    /// The dead-wire latch arms on this stage's own dead socket and on
+    /// nothing else. A lost batch (a downstream NACK, a bad plan, a failed
+    /// inference) leaves a working link and MUST leave the engine serving —
+    /// arming there would take a healthy rank 0 permanently offline on one
+    /// unlucky batch.
+    #[test]
+    fn wire_dead_latch_arms_only_on_a_connection_fatal_cause() {
+        let mut latch = WireDeadLatch::default();
+        assert!(latch.cause().is_none());
+        assert!(latch.fail_fast_error().is_none());
+
+        // A downstream NACK: structurally non-fatal, whatever it says.
+        assert!(!latch.observe(&EngineError::BatchAborted(
+            "downstream stage failed its packed step and NACKed this batch".into()
+        )));
+        // Even one quoting words the substring classifier hunts for — the
+        // dead socket in that text belongs to some OTHER rank.
+        assert!(!latch.observe(&EngineError::BatchAborted(
+            "the packed step failed: backend error: packed token recv: broken pipe".into()
+        )));
+        // A plain local step failure.
+        assert!(!latch.observe(&EngineError::Backend(
+            "packed plan decode: slot 9 beyond 4 slots".into()
+        )));
+        assert!(latch.cause().is_none(), "{:?}", latch.cause());
+        assert!(latch.fail_fast_error().is_none());
+
+        // This stage's own poisoned socket, as `packed_abort_error` passes it
+        // through: fatal, and it arms the latch.
+        let dead = packed_abort_error(EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into(),
+        ));
+        assert!(latch.observe(&dead));
+        let cause = latch.cause().expect("latched");
+        assert!(cause.contains("recv_exact timed out after 60s"), "{cause}");
+    }
+
+    /// Once latched, every request is refused with an error that is (a)
+    /// connection-fatal, so the failure stays visible to the API's readiness
+    /// tracker and to any supervisor plumbing added later, (b) never
+    /// `BatchAborted`, which is fatality-false by construction, and (c)
+    /// carrying the original cause so the operator learns what killed the wire.
+    #[test]
+    fn latched_wire_fails_fast_with_a_connection_fatal_error() {
+        let mut latch = WireDeadLatch::default();
+        latch.observe(&EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into(),
+        ));
+        let err = latch.fail_fast_error().expect("latched");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+        assert!(err.is_connection_fatal(), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("recv_exact timed out after 60s"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+
+        // Fatality must not depend on the stored cause's wording. `NotConnected`
+        // is fatal STRUCTURALLY and displays as "not YET connected", which no
+        // substring rule matches — a fail-fast error that merely echoed the
+        // cause would silently become non-fatal here.
+        let mut latch = WireDeadLatch::default();
+        assert!(EngineError::NotConnected.is_connection_fatal());
+        assert!(!EngineError::NotConnected.to_string().contains(
+            // the classifier's substring, absent from this Display
+            "not connected"
+        ));
+        latch.observe(&EngineError::NotConnected);
+        let err = latch.fail_fast_error().expect("latched");
+        assert!(err.is_connection_fatal(), "{err}");
+        // And the chunk text a retired task receives names the abort once.
+        let chunk_msg = packed_abort_message(&err);
+        assert!(
+            chunk_msg.starts_with("packed batch aborted: "),
+            "{chunk_msg}"
+        );
+        assert!(
+            !chunk_msg.contains("batch aborted: batch aborted"),
+            "{chunk_msg}"
+        );
+    }
+
+    /// The operator-facing `error!` fires on the LATCHING TRANSITION only —
+    /// `observe` returns true exactly once, so a stage that keeps aborting
+    /// batches does not re-log the same dead link per batch. The first cause
+    /// is also the one kept: it is the failure that actually killed the wire,
+    /// every later one is a consequence.
+    #[test]
+    fn wire_dead_latch_transition_reports_once_and_keeps_the_first_cause() {
+        let mut latch = WireDeadLatch::default();
+        assert!(latch.observe(&EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into()
+        )));
+        // Every later fatal cause: no transition, no overwrite.
+        for _ in 0..3 {
+            assert!(!latch.observe(&EngineError::NotConnected));
+            assert!(!latch.observe(&EngineError::Backend(
+                "packed plan send: not connected".into()
+            )));
+        }
+        let cause = latch.cause().expect("latched");
+        assert!(cause.contains("recv_exact timed out after 60s"), "{cause}");
+        assert!(!cause.contains("packed plan send"), "{cause}");
+        // A benign cause after latching cannot disarm it either.
+        assert!(!latch.observe(&EngineError::BatchAborted("lost batch".into())));
+        assert!(latch.fail_fast_error().is_some());
     }
 
     /// Prefill chunks (several rows for one slot) get the widened reply
