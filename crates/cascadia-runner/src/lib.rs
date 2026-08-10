@@ -36,6 +36,13 @@ const MAX_CONSECUTIVE_EMPTY_STEPS: usize = 3;
 /// situation (`WORKER_BACKOFF`).
 const RELAY_ERR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Ceiling on [`Buffers::deferred_cancels`]. Matches the `cancelled`
+/// tombstone bound: every engine-lock acquisition drains the queue, so
+/// reaching this means the engine is not being locked at all and the
+/// cancels are moot anyway — but an unbounded vec on that path would grow
+/// for the life of the process.
+const MAX_DEFERRED_CANCELS: usize = 4096;
+
 /// Why [`Runner::run_relay_loop`] returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayExit {
@@ -125,9 +132,21 @@ struct Buffers {
     /// between the check and the registration.
     step_wakers: Vec<std::task::Waker>,
     /// Cancels that could not take the engine lock without blocking a
-    /// worker thread (#122). Applied by the next engine-lock holder before
-    /// it steps — the same effective timing a blocking cancel had, since a
-    /// running step can't be interrupted anyway.
+    /// worker thread (#122). Applied by the next holder to ACQUIRE the
+    /// engine lock — `submit`, `poll_next`, another `cancel`, or a relay
+    /// round — before it does anything else with the engine. That is the
+    /// same effective timing a blocking cancel had, since a running step
+    /// can't be interrupted anyway.
+    ///
+    /// Draining only from `poll_next` was not enough: cancelling the one
+    /// in-flight request leaves nobody polling, so its engine-side slot and
+    /// KV region stayed occupied until some later request happened along —
+    /// hours, on an idle server. A relay-stage runner takes `cancel()`
+    /// calls and never polls a stream at all, so the queue there only grew.
+    ///
+    /// Deduped on push, and capped at [`MAX_DEFERRED_CANCELS`] like the
+    /// `cancelled` tombstone set, so a queue that is somehow not being
+    /// drained cannot grow without bound.
     deferred_cancels: Vec<TaskId>,
 }
 
@@ -198,6 +217,22 @@ impl EngineGuard<'_> {
             **g = engine;
         }
     }
+
+    /// Hand the engine the cancels that arrived while it was busy, before
+    /// this holder does anything else with it (see
+    /// [`Buffers::deferred_cancels`]). Draining an emptied slot's queue is
+    /// still correct: `close()` has run, so there is nothing left to cancel.
+    fn apply_deferred_cancels(&mut self) {
+        let deferred = std::mem::take(&mut self.slot.buffers.lock().deferred_cancels);
+        if deferred.is_empty() {
+            return;
+        }
+        if let Some(engine) = self.engine() {
+            for tid in &deferred {
+                engine.cancel(tid);
+            }
+        }
+    }
 }
 
 impl Drop for EngineGuard<'_> {
@@ -239,6 +274,24 @@ impl EngineSlot {
         })
     }
 
+    /// [`lock`](Self::lock), then hand the engine everything queued in
+    /// [`Buffers::deferred_cancels`]. Every acquisition that can act on
+    /// that queue goes through this or its `try_` twin, which is what makes
+    /// the queue's contract ("applied by the next engine-lock holder") true
+    /// rather than "applied by the next stream poll, if one ever comes".
+    fn lock_applying_cancels(&self) -> EngineGuard<'_> {
+        let mut guard = self.lock();
+        guard.apply_deferred_cancels();
+        guard
+    }
+
+    /// [`try_lock`](Self::try_lock) + [`lock_applying_cancels`] semantics.
+    fn try_lock_applying_cancels(&self) -> Option<EngineGuard<'_>> {
+        let mut guard = self.try_lock()?;
+        guard.apply_deferred_cancels();
+        Some(guard)
+    }
+
     /// Cancel `task_id` on the engine, or queue it for the next lock holder
     /// when a step is in flight.
     ///
@@ -250,14 +303,38 @@ impl EngineSlot {
     /// anyway, so the next holder applies it at the same effective time a
     /// blocking cancel would have.
     fn cancel_or_defer(&self, task_id: &TaskId) {
-        match self.try_lock() {
+        match self.try_lock_applying_cancels() {
             Some(mut guard) => {
                 if let Some(engine) = guard.engine() {
                     engine.cancel(task_id);
                 }
             }
-            None => self.buffers.lock().deferred_cancels.push(task_id.clone()),
+            None => self.defer_cancel(task_id),
         }
+    }
+
+    /// Queue a cancel for the next engine-lock holder.
+    ///
+    /// Deduped: the queue is a to-do list, and cancelling the same task
+    /// twice buys nothing. Capped at [`MAX_DEFERRED_CANCELS`], dropping the
+    /// newest with a warning rather than clearing the queue wholesale — the
+    /// tombstone set can afford a wholesale clear because re-buffering one
+    /// late chunk is the whole cost, whereas dropping queued cancels leaves
+    /// that many engine-side slots occupied.
+    fn defer_cancel(&self, task_id: &TaskId) {
+        let mut bufs = self.buffers.lock();
+        if bufs.deferred_cancels.iter().any(|t| t == task_id) {
+            return;
+        }
+        if bufs.deferred_cancels.len() >= MAX_DEFERRED_CANCELS {
+            warn!(
+                task = %task_id,
+                "deferred cancel queue is full ({MAX_DEFERRED_CANCELS}); dropping this cancel — \
+                 the engine keeps the task until it finishes on its own"
+            );
+            return;
+        }
+        bufs.deferred_cancels.push(task_id.clone());
     }
 }
 
@@ -364,8 +441,10 @@ impl Runner {
         // Releasing the guard wakes the streams parked on contention, on
         // the empty-slot path as much as the submitting one — an empty slot
         // means `close()` already ran, so no later lock holder is coming to
-        // wake them instead.
-        let mut guard = self.slot.lock();
+        // wake them instead. Taking the lock also flushes cancels deferred
+        // while the engine was busy, freeing their slots before this task
+        // asks for one.
+        let mut guard = self.slot.lock_applying_cancels();
         match guard.engine() {
             Some(engine) => engine.submit(task),
             None => Err(EngineError::NotLoaded),
@@ -456,8 +535,10 @@ impl Runner {
             // runner serves no streams today, so it has nothing to wake —
             // but a runner that both relays and generates would strand
             // every parked stream behind this loop, and the guard makes
-            // that impossible for free.
-            let mut guard = self.slot.lock();
+            // that impossible for free. It is also the only thing that ever
+            // drains a relay-stage runner's deferred cancels: nobody polls a
+            // stream here, so without this round the queue only grows.
+            let mut guard = self.slot.lock_applying_cancels();
             let Some(engine) = guard.engine() else {
                 drop(guard);
                 info!("relay loop exited: engine slot empty");
@@ -764,7 +845,11 @@ impl Stream for ChunkStream {
             //    someone else is stepping; park with a registered waker and
             //    let their release wake us.
             let step_result = {
-                let mut guard = match this.slot.try_lock() {
+                //    Acquiring also applies the cancels deferred while the
+                //    engine was busy (Runner::cancel / stream Drop never
+                //    block on the engine mutex — see deferred_cancels), so
+                //    this step doesn't spend a round on abandoned tasks.
+                let mut guard = match this.slot.try_lock_applying_cancels() {
                     Some(g) => g,
                     None => {
                         this.slot
@@ -779,7 +864,7 @@ impl Stream for ChunkStream {
                         // No guard exists on this path, so returning Pending
                         // does NOT wake — waking the waker just registered
                         // would spin this worker for the holder's whole step.
-                        match this.slot.try_lock() {
+                        match this.slot.try_lock_applying_cancels() {
                             Some(g) => g,
                             None => return Poll::Pending,
                         }
@@ -791,30 +876,20 @@ impl Stream for ChunkStream {
                     // `fail_teardown` needs `&mut *this` and this guard still
                     // borrows `this.slot`.
                     None => None,
-                    Some(engine) => {
-                        // Apply cancels that arrived while the engine was
-                        // busy (Runner::cancel / stream Drop never block on
-                        // the engine mutex — see deferred_cancels).
-                        let deferred =
-                            std::mem::take(&mut this.slot.buffers.lock().deferred_cancels);
-                        for tid in &deferred {
-                            engine.cancel(tid);
-                        }
-                        Some(match engine.step() {
-                            Ok(produced) => {
-                                let empty = produced.is_empty();
-                                let mut bufs = this.slot.buffers.lock();
-                                for (tid, chunk) in produced {
-                                    if bufs.cancelled.contains(&tid) {
-                                        continue;
-                                    }
-                                    bufs.chunks.entry(tid).or_default().push_back(chunk);
+                    Some(engine) => Some(match engine.step() {
+                        Ok(produced) => {
+                            let empty = produced.is_empty();
+                            let mut bufs = this.slot.buffers.lock();
+                            for (tid, chunk) in produced {
+                                if bufs.cancelled.contains(&tid) {
+                                    continue;
                                 }
-                                Ok(empty)
+                                bufs.chunks.entry(tid).or_default().push_back(chunk);
                             }
-                            Err(e) => Err(e),
-                        })
-                    }
+                            Ok(empty)
+                        }
+                        Err(e) => Err(e),
+                    }),
                 };
                 // Releasing the guard is what drains + wakes every stream
                 // parked on contention — engine first, wake second, and on
@@ -1662,6 +1737,197 @@ mod tests {
 
         let _ = hold_tx.send(());
         assert!(a.await.unwrap(), "step() was expected to panic");
+    }
+
+    /// Engine that blocks inside `step()` until the test releases it and
+    /// records every `cancel()` it is handed. Lets a test hold the engine
+    /// lock at a chosen moment, then observe exactly which later lock
+    /// acquisition delivered a deferred cancel.
+    struct GatedCancelEngine {
+        serve: TaskId,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        cancels: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    impl Engine for GatedCancelEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, _task: GenerationTask) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn cancel(&mut self, task_id: &TaskId) {
+            self.cancels.lock().push(task_id.clone());
+        }
+        fn step(&mut self) -> Result<Vec<(TaskId, Chunk)>, EngineError> {
+            self.entered.store(true, Ordering::SeqCst);
+            // Bounded, so a broken test fails rather than hangs.
+            let start = Instant::now();
+            while !self.release.load(Ordering::SeqCst)
+                && start.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(vec![(
+                self.serve.clone(),
+                Chunk::token(self.serve.clone(), 0, "x"),
+            )])
+        }
+    }
+
+    struct GatedCancelBuilder {
+        serve: TaskId,
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        cancels: Arc<Mutex<Vec<TaskId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Builder for GatedCancelBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> Result<cascadia_engine::LoadStream, EngineError> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+        fn build(self: Box<Self>) -> Result<Box<dyn Engine>, EngineError> {
+            Ok(Box::new(GatedCancelEngine {
+                serve: self.serve,
+                entered: self.entered,
+                release: self.release,
+                cancels: self.cancels,
+            }))
+        }
+    }
+
+    /// A cancel deferred past a busy engine must be applied by the next
+    /// engine-lock ACQUISITION, not only by the next stream poll.
+    ///
+    /// Cancelling the sole in-flight request leaves nobody polling, so a
+    /// poll-only drain kept the task's engine-side slot and KV region
+    /// occupied until some unrelated request happened along — hours, on an
+    /// idle server — while the queue's own contract said "the next
+    /// engine-lock holder". A plain `submit` is such a holder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deferred_cancel_is_applied_by_the_next_lock_acquisition() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let polled = Arc::new(AtomicBool::new(false));
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let runner = Arc::new(Runner::new(Box::new(GatedCancelBuilder {
+            serve: "holder".to_string(),
+            entered: entered.clone(),
+            release: release.clone(),
+            cancels: cancels.clone(),
+        })));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("m", "CPU"),
+            )
+            .await
+            .unwrap();
+
+        let holder = runner
+            .generate(GenerationTask::new("holder", "x").with_max_tokens(64))
+            .unwrap();
+        // Exactly ONE manual poll, on a blocking thread: one engine-lock
+        // acquisition, and the stream is kept alive afterwards so its Drop
+        // (which also takes the lock) can't be what applies the cancel.
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let polled_by_task = polled.clone();
+        let poll = tokio::task::spawn_blocking(move || {
+            let mut s = holder;
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let out = Pin::new(&mut s).poll_next(&mut cx);
+            polled_by_task.store(true, Ordering::SeqCst);
+            let _ = hold_rx.recv();
+            out.is_ready()
+        });
+
+        // Wait until the poll is inside step(), holding the engine lock.
+        let start = Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the holding stream never entered step()"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // Mid-step: this cancel cannot take the lock, so it is deferred.
+        // Twice, because the queue is a to-do list, not a log.
+        runner.cancel(&"victim".to_string());
+        runner.cancel(&"victim".to_string());
+        assert_eq!(
+            runner.slot.buffers.lock().deferred_cancels,
+            vec!["victim".to_string()],
+            "a cancel behind a busy engine must be deferred, and deduped"
+        );
+        assert!(
+            cancels.lock().is_empty(),
+            "the engine was mid-step; no cancel could have reached it yet"
+        );
+
+        // Let the step finish. The poll returns, releasing the engine.
+        release.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while !polled.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the holding stream's poll never returned"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            cancels.lock().is_empty(),
+            "nothing has taken the engine lock since the cancel was deferred"
+        );
+
+        // A plain submit — no stream polled anywhere — is the next holder.
+        runner
+            .submit(GenerationTask::new("later", "y").with_max_tokens(1))
+            .unwrap();
+        assert_eq!(
+            &*cancels.lock(),
+            &["victim".to_string()],
+            "the next engine-lock acquisition must apply the deferred cancel"
+        );
+        assert!(
+            runner.slot.buffers.lock().deferred_cancels.is_empty(),
+            "applying the queue must clear it"
+        );
+
+        let _ = hold_tx.send(());
+        assert!(poll.await.unwrap(), "the gated poll should have produced");
+    }
+
+    /// The deferred-cancel queue is a bounded to-do list. A runner whose
+    /// engine nobody locks (a relay stage taking cancel() calls) would
+    /// otherwise accrete one entry per cancelled request for the life of
+    /// the process.
+    #[test]
+    fn deferred_cancel_queue_dedups_and_is_bounded() {
+        let slot = EngineSlot::new(None);
+        for _ in 0..8 {
+            slot.defer_cancel(&"same".to_string());
+        }
+        assert_eq!(
+            slot.buffers.lock().deferred_cancels,
+            vec!["same".to_string()],
+            "re-cancelling one task must not queue it twice"
+        );
+        for i in 0..MAX_DEFERRED_CANCELS + 16 {
+            slot.defer_cancel(&format!("t{i}"));
+        }
+        assert_eq!(
+            slot.buffers.lock().deferred_cancels.len(),
+            MAX_DEFERRED_CANCELS,
+            "the queue must stop growing at its cap"
+        );
     }
 
     /// Engine that never errors and never produces: every step is Ok(empty).
