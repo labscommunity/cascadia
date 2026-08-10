@@ -117,11 +117,12 @@ pub fn run_async<F: std::future::Future>(handle: &tokio::runtime::Handle, fut: F
 struct Buffers {
     chunks: HashMap<TaskId, VecDeque<Chunk>>,
     cancelled: std::collections::HashSet<TaskId>,
-    /// Streams parked because another caller held the engine (#122). Every
-    /// engine-lock release drains + wakes these, so a parked stream re-polls
-    /// as soon as the engine may be free. Registration happens ONLY after a
-    /// failed `try_lock`, and the registrant re-checks the lock afterwards,
-    /// so a release can't slip between the check and the registration.
+    /// Streams parked because another caller held the engine (#122).
+    /// [`EngineGuard`] drains + wakes these on every engine-lock release,
+    /// so a parked stream re-polls as soon as the engine may be free.
+    /// Registration happens ONLY after a failed `try_lock`, and the
+    /// registrant re-checks the lock afterwards, so a release can't slip
+    /// between the check and the registration.
     step_wakers: Vec<std::task::Waker>,
     /// Cancels that could not take the engine lock without blocking a
     /// worker thread (#122). Applied by the next engine-lock holder before
@@ -130,51 +131,132 @@ struct Buffers {
     deferred_cancels: Vec<TaskId>,
 }
 
-/// Drains + wakes [`Buffers::step_wakers`] when it leaves scope — including
-/// when a panic unwinds out of that scope.
+/// The engine, plus the state every release of it has to service: the
+/// wakers of the streams parked on contention, and the cancels deferred
+/// while it was busy (#122).
 ///
-/// The drain after an engine-lock release is straight-line code, so an
-/// unwind skips it: a panic inside `step()` (or anything else run under the
-/// engine guard) leaves every parked stream `Pending` forever with nothing
-/// in the log to say why. `parking_lot` does not poison, so the engine
-/// itself is released and perfectly usable — there is simply no one left to
-/// poll it. Running the drain from a destructor covers the unwind path too.
-///
-/// DECLARE THIS BEFORE the engine guard it protects: locals drop in reverse
-/// declaration order, so the engine lock is released first and the wake runs
-/// with the engine free. Waking while the lock is still held lets a woken
-/// stream re-park behind it and be stranded exactly as before.
-struct WakeParkedOnDrop<'a> {
-    buffers: &'a Mutex<Buffers>,
-    /// Armed only once the engine lock is actually held. A contended
-    /// `poll_next` that gives up and returns `Pending` has just registered
-    /// its OWN waker; draining from there would wake it straight back and
-    /// spin the worker for the whole of the holder's step.
-    armed: bool,
+/// One `Arc<EngineSlot>` is shared by the [`Runner`] and every
+/// [`ChunkStream`] it hands out. They used to hold loose `Arc` clones of an
+/// engine mutex and a buffers mutex, which is why the release protocol
+/// ("drop the engine lock, THEN drain + wake") could only be a convention,
+/// re-implemented by hand at six sites and silently skippable at a seventh.
+/// Going through [`EngineSlot::lock`] / [`EngineSlot::try_lock`] makes it a
+/// property of the type instead: there is no way to hold the engine without
+/// holding an [`EngineGuard`], and no way to drop that guard without waking.
+struct EngineSlot {
+    /// `Mutex<Option<...>>` so `close()` can drop the engine while other
+    /// callers hold references to the runner; subsequent calls fail
+    /// cleanly with [`EngineError::NotLoaded`].
+    ///
+    /// Deliberately a SYNC `parking_lot` mutex: `run_relay_loop` takes it
+    /// from a `spawn_blocking` thread and `submit` from the blocking pool,
+    /// neither of which can await. Contended async callers must park on a
+    /// failed `try_lock` rather than block a tokio worker here (#122).
+    engine: Mutex<Option<Box<dyn Engine>>>,
+    buffers: Mutex<Buffers>,
 }
 
-impl<'a> WakeParkedOnDrop<'a> {
-    /// Inert until [`arm`](Self::arm) is called.
-    fn disarmed(buffers: &'a Mutex<Buffers>) -> Self {
-        Self {
-            buffers,
-            armed: false,
+/// An engine lock that cannot be released without paying what the release
+/// owes: draining [`Buffers::step_wakers`] and waking every parked stream.
+///
+/// Two orderings this encodes, both of which were load-bearing bugs when
+/// left to hand-written call sites:
+///
+/// * **Release, THEN wake.** Waking while the engine lock is still held
+///   lets a woken stream re-poll, fail its `try_lock`, and re-park —
+///   stranded again, and this time with no one left to wake it. Rust drops
+///   struct fields AFTER `Drop::drop` returns, so the inner `parking_lot`
+///   guard lives in an `Option` that `drop` explicitly takes and releases
+///   first; making it a plain field would reintroduce exactly this bug.
+/// * **Wake on unwind too.** A panic inside `step()` unwinds past any
+///   straight-line drain. `parking_lot` doesn't poison, so the engine comes
+///   out of it usable — but every parked stream waits `Pending` forever,
+///   with nothing in the log. A destructor covers that path by
+///   construction.
+///
+/// A failed `try_lock` never produces a guard, so the contended
+/// `poll_next` path still returns `Pending` without waking the waker it
+/// just registered (which would spin the worker for the holder's step).
+struct EngineGuard<'a> {
+    slot: &'a EngineSlot,
+    /// `Some` for the guard's whole life; taken by `drop` to release the
+    /// engine lock before the wake. See the ordering note above.
+    guard: Option<parking_lot::MutexGuard<'a, Option<Box<dyn Engine>>>>,
+}
+
+impl EngineGuard<'_> {
+    /// The engine, or `None` once `close()` has emptied the slot.
+    fn engine(&mut self) -> Option<&mut Box<dyn Engine>> {
+        self.guard.as_mut().and_then(|g| g.as_mut())
+    }
+
+    /// Fill the slot (`start`) or empty it (`close`). An emptied slot makes
+    /// every later lock holder fail cleanly with [`EngineError::NotLoaded`];
+    /// the outgoing engine is dropped under the lock.
+    fn set(&mut self, engine: Option<Box<dyn Engine>>) {
+        if let Some(g) = self.guard.as_mut() {
+            **g = engine;
         }
     }
-
-    fn arm(&mut self) {
-        self.armed = true;
-    }
 }
 
-impl Drop for WakeParkedOnDrop<'_> {
+impl Drop for EngineGuard<'_> {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
+        // Release the engine FIRST: `Option::take` + drop, because struct
+        // fields would otherwise drop after this body has already woken.
+        drop(self.guard.take());
+        let wakers = std::mem::take(&mut self.slot.buffers.lock().step_wakers);
         for w in wakers {
             w.wake();
+        }
+    }
+}
+
+impl EngineSlot {
+    fn new(engine: Option<Box<dyn Engine>>) -> Self {
+        Self {
+            engine: Mutex::new(engine),
+            buffers: Mutex::new(Buffers::default()),
+        }
+    }
+
+    /// Take the engine lock, blocking the calling thread until it is free.
+    /// Sync callers only — see the mutex's note on #122.
+    fn lock(&self) -> EngineGuard<'_> {
+        EngineGuard {
+            slot: self,
+            guard: Some(self.engine.lock()),
+        }
+    }
+
+    /// Take the engine lock only if it is free right now. `None` means
+    /// someone is mid-step and the caller must park (`poll_next`) or defer
+    /// (`cancel_or_defer`) instead of blocking a tokio worker (#122).
+    fn try_lock(&self) -> Option<EngineGuard<'_>> {
+        self.engine.try_lock().map(|g| EngineGuard {
+            slot: self,
+            guard: Some(g),
+        })
+    }
+
+    /// Cancel `task_id` on the engine, or queue it for the next lock holder
+    /// when a step is in flight.
+    ///
+    /// Shared by [`Runner::cancel`] and [`ChunkStream::drop`], which have
+    /// the same constraint: both run on whatever (often tokio worker)
+    /// thread calls them, and a hard `lock()` during another stream's step
+    /// counts toward the worker starvation that wedges the pipeline (#122).
+    /// Deferring costs nothing — a running step can't be interrupted
+    /// anyway, so the next holder applies it at the same effective time a
+    /// blocking cancel would have.
+    fn cancel_or_defer(&self, task_id: &TaskId) {
+        match self.try_lock() {
+            Some(mut guard) => {
+                if let Some(engine) = guard.engine() {
+                    engine.cancel(task_id);
+                }
+            }
+            None => self.buffers.lock().deferred_cancels.push(task_id.clone()),
         }
     }
 }
@@ -183,11 +265,9 @@ pub struct Runner {
     /// Mutex so the Runner is `Sync` even with a `dyn Builder` inside;
     /// taken once during `start()` and dropped.
     builder: Mutex<Option<Box<dyn Builder>>>,
-    /// `Mutex<Option<...>>` so `close()` can drop the engine while other
-    /// callers hold references to the runner; subsequent calls fail
-    /// cleanly with [`EngineError::NotLoaded`].
-    engine: Arc<Mutex<Option<Box<dyn Engine>>>>,
-    buffers: Arc<Mutex<Buffers>>,
+    /// Engine + parked-stream bookkeeping, shared with every
+    /// [`ChunkStream`] this runner hands out.
+    slot: Arc<EngineSlot>,
     /// Model id captured from the [`ShardSpec`] at `start()`, used as the
     /// `model` label on generation metrics (#16). `None` until started.
     model: Mutex<Option<Arc<str>>>,
@@ -203,8 +283,7 @@ impl Runner {
     pub fn new(builder: Box<dyn Builder>) -> Self {
         Self {
             builder: Mutex::new(Some(builder)),
-            engine: Arc::new(Mutex::new(None)),
-            buffers: Arc::new(Mutex::new(Buffers::default())),
+            slot: Arc::new(EngineSlot::new(None)),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
         }
@@ -264,7 +343,7 @@ impl Runner {
         info!("runner ready");
 
         *self.model.lock() = Some(Arc::from(model));
-        *self.engine.lock() = Some(engine);
+        self.slot.lock().set(Some(engine));
         Ok(())
     }
 
@@ -282,28 +361,14 @@ impl Runner {
         // async submit path (or their own `spawn_blocking`) — a worker
         // thread blocked here counts toward the driver starvation that
         // wedges the pipeline (#122).
-        let res = {
-            let mut guard = self.engine.lock();
-            // Route the empty slot through `res` rather than `?`: an early
-            // return here released the engine lock and skipped the wake
-            // below, and an empty slot means `close()` already ran — no
-            // later lock holder is coming to wake them instead.
-            match guard.as_mut() {
-                Some(engine) => engine.submit(task),
-                None => Err(EngineError::NotLoaded),
-            }
-        };
-        self.wake_parked_streams();
-        res
-    }
-
-    /// Drain + wake every stream that parked on engine-lock contention.
-    /// Called after every engine-lock release (#122): a parked stream is
-    /// only ever woken from here, so skipping a release site would strand it.
-    fn wake_parked_streams(&self) {
-        let wakers = std::mem::take(&mut self.buffers.lock().step_wakers);
-        for w in wakers {
-            w.wake();
+        // Releasing the guard wakes the streams parked on contention, on
+        // the empty-slot path as much as the submitting one — an empty slot
+        // means `close()` already ran, so no later lock holder is coming to
+        // wake them instead.
+        let mut guard = self.slot.lock();
+        match guard.engine() {
+            Some(engine) => engine.submit(task),
+            None => Err(EngineError::NotLoaded),
         }
     }
 
@@ -316,27 +381,11 @@ impl Runner {
         // chunk that lands in between is dropped by the cancelled-check on the
         // distribution path, which is the behaviour either way.
         {
-            let mut bufs = self.buffers.lock();
+            let mut bufs = self.slot.buffers.lock();
             bufs.cancelled.insert(task_id.clone());
             bufs.chunks.remove(task_id);
         }
-        // Never block a (possibly async) caller on the engine mutex — a
-        // worker thread parked here counts toward the driver starvation
-        // that wedges the pipeline (#122). If a step is in flight, defer:
-        // the next engine-lock holder applies it before stepping, which is
-        // when a blocking cancel would have run anyway.
-        match self.engine.try_lock() {
-            Some(mut guard) => {
-                if let Some(engine) = guard.as_mut() {
-                    engine.cancel(task_id);
-                }
-                drop(guard);
-                self.wake_parked_streams();
-            }
-            None => {
-                self.buffers.lock().deferred_cancels.push(task_id.clone());
-            }
-        }
+        self.slot.cancel_or_defer(task_id);
     }
 
     /// Submit a task and return a stream of chunks. Stops on the final
@@ -368,8 +417,7 @@ impl Runner {
     fn stream_for(&self, task_id: TaskId) -> ChunkStream {
         ChunkStream {
             task_id,
-            engine: self.engine.clone(),
-            buffers: self.buffers.clone(),
+            slot: self.slot.clone(),
             consecutive_empty: 0,
             last_errored_task: None,
             consecutive_foreign_err: 0,
@@ -404,8 +452,13 @@ impl Runner {
     pub fn run_relay_loop(&self) -> RelayExit {
         let _blocking = BlockingContextGuard::enter();
         loop {
-            let mut guard = self.engine.lock();
-            let Some(engine) = guard.as_mut() else {
+            // Through the guard like every other holder: a relay-stage
+            // runner serves no streams today, so it has nothing to wake —
+            // but a runner that both relays and generates would strand
+            // every parked stream behind this loop, and the guard makes
+            // that impossible for free.
+            let mut guard = self.slot.lock();
+            let Some(engine) = guard.engine() else {
                 drop(guard);
                 info!("relay loop exited: engine slot empty");
                 return RelayExit::SlotEmpty;
@@ -447,13 +500,21 @@ impl Runner {
         // whole point: set it after, and a stream that polls in between books
         // a client cancellation for a server restart.
         self.closing.store(true, Ordering::SeqCst);
-        if let Some(engine) = self.engine.lock().as_mut() {
-            engine.close();
+        {
+            // Tear down and empty the slot under ONE guard, where this used
+            // to take the lock twice. Releasing in between now means waking,
+            // and a stream woken there would find the engine closed but
+            // still present, step a torn-down transport, and book a failure
+            // instead of the teardown outcome. One acquisition closes that
+            // window; the single release still wakes the streams parked on
+            // contention, which must re-poll to observe the emptied slot or
+            // a teardown would strand them Pending forever.
+            let mut guard = self.slot.lock();
+            if let Some(engine) = guard.engine() {
+                engine.close();
+            }
+            guard.set(None);
         }
-        *self.engine.lock() = None;
-        // Streams parked on engine-lock contention must re-poll to observe
-        // the emptied slot, or a teardown would strand them Pending forever.
-        self.wake_parked_streams();
         if let Some(builder) = self.builder.lock().as_mut() {
             builder.close();
         }
@@ -462,8 +523,12 @@ impl Runner {
 
 pub struct ChunkStream {
     task_id: TaskId,
-    engine: Arc<Mutex<Option<Box<dyn Engine>>>>,
-    buffers: Arc<Mutex<Buffers>>,
+    /// The engine slot, shared with the [`Runner`] that made this stream and
+    /// with every sibling stream. One `Arc` rather than loose clones of the
+    /// engine and buffer handles, so a stream reaches the engine through the
+    /// same [`EngineGuard`] every other holder uses and cannot re-implement
+    /// the release protocol by hand.
+    slot: Arc<EngineSlot>,
     consecutive_empty: usize,
     /// Foreign-task hot-spin guard: the last foreign task-id an engine `step()`
     /// failed, and how many times in a row it has failed *that same* id. A
@@ -565,7 +630,7 @@ impl ChunkStream {
     /// site in `poll_next` gets terminal accounting by construction.
     fn fail_stream(&mut self, reason: String) -> Poll<Option<Chunk>> {
         self.done = true;
-        self.buffers.lock().chunks.remove(&self.task_id);
+        self.slot.buffers.lock().chunks.remove(&self.task_id);
         let chunk = Chunk::error(self.task_id.clone(), reason);
         self.record_chunk_metrics(&chunk);
         Poll::Ready(Some(chunk))
@@ -584,7 +649,7 @@ impl ChunkStream {
     /// a planned restart must not land on the primary failure SLO.
     fn fail_teardown(&mut self) -> Poll<Option<Chunk>> {
         self.done = true;
-        self.buffers.lock().chunks.remove(&self.task_id);
+        self.slot.buffers.lock().chunks.remove(&self.task_id);
         warn!(
             task = %self.task_id,
             "engine slot emptied mid-generation (server teardown); failing the \
@@ -654,7 +719,7 @@ impl Stream for ChunkStream {
 
             // 1) Drain anything already buffered for us.
             {
-                let mut bufs = this.buffers.lock();
+                let mut bufs = this.slot.buffers.lock();
                 if bufs.cancelled.contains(&this.task_id) {
                     this.done = true;
                     bufs.chunks.remove(&this.task_id);
@@ -699,48 +764,46 @@ impl Stream for ChunkStream {
             //    someone else is stepping; park with a registered waker and
             //    let their release wake us.
             let step_result = {
-                // Wake-on-release, unwind included: `step()` runs arbitrary
-                // engine code under this lock, and a panic there must not
-                // strand the streams parked behind it (see
-                // `WakeParkedOnDrop`). Declared BEFORE the engine guard so
-                // reverse-declaration drop order releases the engine first
-                // and wakes second, on the normal path and on the unwind.
-                let mut wake_on_release = WakeParkedOnDrop::disarmed(&this.buffers);
-                let mut guard = match this.engine.try_lock() {
+                let mut guard = match this.slot.try_lock() {
                     Some(g) => g,
                     None => {
-                        this.buffers.lock().step_wakers.push(cx.waker().clone());
+                        this.slot
+                            .buffers
+                            .lock()
+                            .step_wakers
+                            .push(cx.waker().clone());
                         // Re-check after registering: the holder may have
                         // released (and drained wakers) between the failed
                         // try_lock and the registration. A stale registration
                         // from the success arm only costs a spurious wake.
-                        match this.engine.try_lock() {
+                        // No guard exists on this path, so returning Pending
+                        // does NOT wake — waking the waker just registered
+                        // would spin this worker for the holder's whole step.
+                        match this.slot.try_lock() {
                             Some(g) => g,
                             None => return Poll::Pending,
                         }
                     }
                 };
-                // The engine is ours: every exit from here — value, early
-                // return, or panic — owes the parked streams a wake.
-                wake_on_release.arm();
-                let result = match guard.as_mut() {
+                let result = match guard.engine() {
                     // Slot empty: `Runner::close` took the engine, i.e. server
                     // teardown. Handled below rather than here because
                     // `fail_teardown` needs `&mut *this` and this guard still
-                    // borrows `this.engine`.
+                    // borrows `this.slot`.
                     None => None,
                     Some(engine) => {
                         // Apply cancels that arrived while the engine was
                         // busy (Runner::cancel / stream Drop never block on
                         // the engine mutex — see deferred_cancels).
-                        let deferred = std::mem::take(&mut this.buffers.lock().deferred_cancels);
+                        let deferred =
+                            std::mem::take(&mut this.slot.buffers.lock().deferred_cancels);
                         for tid in &deferred {
                             engine.cancel(tid);
                         }
                         Some(match engine.step() {
                             Ok(produced) => {
                                 let empty = produced.is_empty();
-                                let mut bufs = this.buffers.lock();
+                                let mut bufs = this.slot.buffers.lock();
                                 for (tid, chunk) in produced {
                                     if bufs.cancelled.contains(&tid) {
                                         continue;
@@ -753,8 +816,9 @@ impl Stream for ChunkStream {
                         })
                     }
                 };
-                // Engine released here; `wake_on_release` drains + wakes
-                // every stream parked on contention right after.
+                // Releasing the guard is what drains + wakes every stream
+                // parked on contention — engine first, wake second, and on
+                // an unwind out of `step()` just the same.
                 drop(guard);
                 result
             };
@@ -780,7 +844,7 @@ impl Stream for ChunkStream {
                             error = %e,
                             "engine step failed for another task; routing failure to it"
                         );
-                        let mut bufs = this.buffers.lock();
+                        let mut bufs = this.slot.buffers.lock();
                         // Cancelled task = no consumer left; recreating its
                         // buffer entry would leak until close() (mirror the
                         // cancelled-check on the distribution path below).
@@ -899,29 +963,11 @@ impl Drop for ChunkStream {
         // (often tokio worker) thread drops the stream, and a hard lock()
         // during another stream's step counts toward the worker starvation
         // that wedges the pipeline (#122). Busy engine = defer; the next
-        // engine-lock holder applies it before stepping.
-        {
-            // Same wake-on-release protocol as `poll_next`, unwind
-            // included: `engine.cancel()` is engine code too, and a panic
-            // here would otherwise strand every parked stream. Declared
-            // BEFORE the guard so the engine lock is released first.
-            let mut wake_on_release = WakeParkedOnDrop::disarmed(&self.buffers);
-            match self.engine.try_lock() {
-                Some(mut guard) => {
-                    wake_on_release.arm();
-                    if let Some(engine) = guard.as_mut() {
-                        engine.cancel(&self.task_id);
-                    }
-                }
-                None => {
-                    self.buffers
-                        .lock()
-                        .deferred_cancels
-                        .push(self.task_id.clone());
-                }
-            }
-        }
-        let mut bufs = self.buffers.lock();
+        // engine-lock holder applies it before stepping. Same helper
+        // `Runner::cancel` uses, and the guard inside it handles the
+        // release-then-wake ordering for both.
+        self.slot.cancel_or_defer(&self.task_id);
+        let mut bufs = self.slot.buffers.lock();
         bufs.chunks.remove(&self.task_id);
         // Tombstone rather than remove: an engine that defers its final
         // chunk past cancel would re-buffer it for this dead stream via
@@ -1087,8 +1133,7 @@ mod tests {
         let engine: Box<dyn Engine> = Box::new(CountingFailingEngine(calls.clone()));
         let runner = Arc::new(Runner {
             builder: Mutex::new(None),
-            engine: Arc::new(Mutex::new(Some(engine))),
-            buffers: Arc::new(Mutex::new(Buffers::default())),
+            slot: Arc::new(EngineSlot::new(Some(engine))),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
         });
@@ -1139,8 +1184,7 @@ mod tests {
         let engine: Box<dyn Engine> = Box::new(DeadLinkEngine(calls.clone()));
         let runner = Arc::new(Runner {
             builder: Mutex::new(None),
-            engine: Arc::new(Mutex::new(Some(engine))),
-            buffers: Arc::new(Mutex::new(Buffers::default())),
+            slot: Arc::new(EngineSlot::new(Some(engine))),
             model: Mutex::new(None),
             closing: Arc::new(AtomicBool::new(false)),
         });
@@ -1188,8 +1232,7 @@ mod tests {
             let engine: Box<dyn Engine> = Box::new(RstStepEngine(EngineError::Backend(msg.into())));
             let runner = Arc::new(Runner {
                 builder: Mutex::new(None),
-                engine: Arc::new(Mutex::new(Some(engine))),
-                buffers: Arc::new(Mutex::new(Buffers::default())),
+                slot: Arc::new(EngineSlot::new(Some(engine))),
                 model: Mutex::new(None),
                 closing: Arc::new(AtomicBool::new(false)),
             });
@@ -1469,7 +1512,7 @@ mod tests {
         // Drive until our stream closes (the engine never serves us).
         while stream.next().await.is_some() {}
         assert!(
-            !runner.buffers.lock().chunks.contains_key("dead"),
+            !runner.slot.buffers.lock().chunks.contains_key("dead"),
             "routing a failure to a cancelled task must not recreate its buffer entry"
         );
     }
@@ -1595,7 +1638,7 @@ mod tests {
         // B polls, finds the engine contended, and parks with a waker.
         let b = tokio::spawn(async move { stream_b.next().await });
         let start = Instant::now();
-        while runner.buffers.lock().step_wakers.is_empty() {
+        while runner.slot.buffers.lock().step_wakers.is_empty() {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(10),
                 "stream B never parked on the engine lock"
