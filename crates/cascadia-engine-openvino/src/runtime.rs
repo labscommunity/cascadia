@@ -475,6 +475,27 @@ fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
         .collect())
 }
 
+/// Type the error that retires an in-flight packed batch.
+///
+/// A lost batch is not a lost link, and [`EngineError::BatchAborted`] says so
+/// structurally instead of leaving the answer to whichever substrings the
+/// message happens to carry — abort messages quote their cause, and that
+/// cause is routinely a transport failure on some *other* rank's socket.
+///
+/// A cause that is itself connection-fatal (this stage's own poisoned or dead
+/// socket) is passed through untouched: that link really is gone, and
+/// anything downstream of here that classifies the error — the relay loop
+/// today, a dead-wire latch later — must still see it as fatal.
+fn packed_abort_error(e: EngineError) -> EngineError {
+    match e {
+        // Already a lost batch (a downstream NACK relayed up to this stage):
+        // reuse it rather than wrapping the same words twice.
+        already @ EngineError::BatchAborted(_) => already,
+        fatal if fatal.is_connection_fatal() => fatal,
+        other => EngineError::BatchAborted(format!("the packed step failed: {other}")),
+    }
+}
+
 /// The relay failed to answer its upstream. When the step it was answering
 /// for ALSO failed, the send error on its own hides why the batch died — and
 /// those two failures are correlated, not independent: a dead upstream is
@@ -1648,12 +1669,20 @@ impl OvRuntimeEngine {
         mut out: Vec<(TaskId, Chunk)>,
     ) -> EngineResult<Vec<(TaskId, Chunk)>> {
         warn!(error = %e, "packed step failed; aborting the in-flight packed batch");
+        let aborted = packed_abort_error(e);
+        // A `BatchAborted` already says "batch aborted: …" in its Display;
+        // a cause left connection-fatal keeps its own wording, so name the
+        // abort for the client here rather than prefixing it twice.
+        let msg = match &aborted {
+            EngineError::BatchAborted(_) => aborted.to_string(),
+            fatal => format!("packed batch aborted: {fatal}"),
+        };
         let packed = self.packed.as_mut().unwrap();
         for slot in 0..packed.slots.len() {
             if let Some(ps) = packed.retire(slot) {
                 out.push((
                     ps.task.task_id.clone(),
-                    Chunk::error(ps.task.task_id, format!("packed batch aborted: {e}")),
+                    Chunk::error(ps.task.task_id, msg.clone()),
                 ));
             }
         }
@@ -1705,7 +1734,8 @@ impl OvRuntimeEngine {
             // poisoned-socket errors ("recv_exact timed out" / "not
             // connected") are connection-fatal, so a middle rank's relay
             // loop exits for a supervisor rebuild rather than grinding on a
-            // desynced stream.
+            // desynced stream. Those keep their `Backend` type on purpose:
+            // the link really is dead, and that classification must survive.
             let (reply, _) = if prefill {
                 guard.recv_reply_prefill().await
             } else {
@@ -1716,8 +1746,15 @@ impl OvRuntimeEngine {
             // `step_relay_packed`): its step failed AFTER it consumed our
             // pair, so the batch is lost but the link is still
             // frame-aligned. Abort the batch; do not poison the connection.
+            //
+            // `BatchAborted`, not `Backend`: this error travels up a middle
+            // rank's relay loop, which must back off and keep driving rather
+            // than exit for a supervisor rebuild. The variant says "healthy
+            // link" structurally instead of relying on this message never
+            // happening to contain a word the fatal-substring classifier
+            // looks for.
             if reply.elements() == Some(0) {
-                return Err(EngineError::Backend(
+                return Err(EngineError::BatchAborted(
                     "downstream stage failed its packed step and NACKed this batch \
                      (empty token frame); the pipeline link stays aligned"
                         .into(),
@@ -4157,6 +4194,34 @@ mod tests {
         assert!(decode_wire_tokens(&nack).is_err()); // NACK check must come first
         let real = encode_wire_tokens(&[7]);
         assert_ne!(real.elements(), Some(0));
+    }
+
+    /// Aborting a packed batch types its cause, so classification never rides
+    /// on the message text. A downstream NACK or a plain step failure lost the
+    /// batch, not the link, and must not push a relay rank into a rebuild — but
+    /// this stage's own dead socket has to stay connection-fatal.
+    #[test]
+    fn packed_abort_error_types_the_cause() {
+        // A downstream NACK arrives already typed — no double wrapping.
+        let nack = EngineError::BatchAborted("downstream NACKed this batch".into());
+        let out = packed_abort_error(nack);
+        assert_eq!(
+            out.to_string(),
+            "batch aborted: downstream NACKed this batch"
+        );
+        assert!(!out.is_connection_fatal());
+
+        // A local step failure becomes an abort, keeping its cause readable.
+        let out = packed_abort_error(EngineError::Backend("bad logits shape [1, 0]".into()));
+        assert!(matches!(out, EngineError::BatchAborted(_)), "{out:?}");
+        assert!(out.to_string().contains("bad logits shape [1, 0]"), "{out}");
+        assert!(!out.is_connection_fatal());
+
+        // This stage's own poisoned socket keeps its type AND its fatality.
+        let dead = EngineError::Backend("packed token recv: recv_exact timed out after 60s".into());
+        let out = packed_abort_error(dead);
+        assert!(matches!(out, EngineError::Backend(_)), "{out:?}");
+        assert!(out.is_connection_fatal(), "{out}");
     }
 
     /// A dead upstream fails the step AND the NACK that reports it, so the two

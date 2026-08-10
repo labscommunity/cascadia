@@ -1865,7 +1865,10 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         EngineError::QueueFull { .. } => "capacity",
         EngineError::PromptTooLong(_) => "prompt_over_window",
         EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
-        EngineError::Backend(_) | EngineError::Io(_) | EngineError::Task { .. } => "engine_error",
+        EngineError::Backend(_)
+        | EngineError::Io(_)
+        | EngineError::Task { .. }
+        | EngineError::BatchAborted(_) => "engine_error",
         EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_)
@@ -1885,6 +1888,9 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // A task-attributed step failure: the engine abandoned a task; the
         // underlying cause is a backend/transport failure.
         EngineError::Task { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // A pipeline stage abandoned the in-flight batch. Server-side and
+        // this node's to explain, like any other engine failure.
+        EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }
@@ -1949,6 +1955,7 @@ mod tests {
             (EngineError::NotLoaded, "engine_unavailable"),
             (EngineError::NotConnected, "engine_unavailable"),
             (EngineError::Backend("boom".into()), "engine_error"),
+            (EngineError::BatchAborted("x".into()), "engine_error"),
             (EngineError::InvalidConfig("bad".into()), "invalid_request"),
             (EngineError::ModelNotFound("nope".into()), "invalid_request"),
         ];
