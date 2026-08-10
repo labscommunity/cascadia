@@ -1132,11 +1132,13 @@ async fn chat_completions(
         trust_remote_code: false,
     };
 
-    // Acquire a request slot before touching the engine. Without this
-    // a flood of concurrent SSE callers would hammer one engine mutex
-    // and starve everyone (the `MAX_CONSECUTIVE_EMPTY_STEPS=3` guard
-    // in the runner would then truncate streams). Backpressure is
-    // 503; clients should retry with backoff.
+    // Acquire a request slot before touching the engine. Contended streams
+    // no longer block a tokio worker (#122: they park on a failed `try_lock`,
+    // and submits go out via `spawn_blocking`), so this gate is not what
+    // keeps the runtime alive — it bounds the two resources that are still
+    // finite: the engine's own queue/slot depth, and the blocking pool the
+    // submits land on. Backpressure is 503; clients should retry with
+    // backoff.
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {

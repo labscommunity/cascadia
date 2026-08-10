@@ -172,10 +172,13 @@ saving a full NPU compile and a second resident weight copy.
 > timer driver — the runner's sync engine mutex was hard-locked from enough
 > worker-thread tasks (stream polls, submits, drops) that no worker remained
 > to poll the driver, so the readable event could never be dispatched and no
-> recv deadline could fire either. Fixed in `cascadia-runner` (non-blocking
-> poll/submit/cancel/drop) with the packed wire hardened alongside
-> (deadlined + poisoning reply recvs, an on-wire NACK from a failed relay
-> step, whole-batch abort with per-task attribution).
+> recv deadline could fire either. Fixed in `cascadia-runner` — no tokio
+> worker blocks on the engine mutex any more: stream polls park on a failed
+> `try_lock`, cancels and drops defer to the next lock holder, and submits
+> (which do still block for up to a step) run off-worker via
+> `spawn_blocking`. The packed wire was hardened alongside (deadlined +
+> poisoning reply recvs, an on-wire NACK from a failed relay step,
+> whole-batch abort with per-task attribution).
 
 Packing works across a pipeline. Stage 0 ships an I64 `[1, 3, S]` **plan frame**
 (per row: slot id with `-1` for idle, absolute position, and shared-prefix reuse
@@ -296,9 +299,12 @@ diverged on 2/10 prompts, TinyLlama on 5/10.
 ### Per-slot cancel
 
 A disconnecting client's slot is retired and its KV region returned to the free
-pool immediately, leaving the other in-flight slots untouched — the single-task
-path can only drop *queued* tasks, never reclaim a running one. Observed in the
-2-stage run: four disconnects released slots one at a time
+pool at the next engine-lock acquisition — a cancel arriving mid-step is
+deferred rather than blocking on the mutex, so the retire lands as soon as the
+in-flight step ends, which is the same effective moment a blocking cancel would
+have reached the engine. Other in-flight slots are untouched; the single-task
+path, by contrast, can only drop *queued* tasks, never reclaim a running one.
+Observed in the 2-stage run: four disconnects released slots one at a time
 (`in_flight=3, 2, 1, 0`).
 
 Side benefit worth remembering: at ~0.21-0.29 ms marginal per row, speculative

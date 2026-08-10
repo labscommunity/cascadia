@@ -1543,10 +1543,12 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         // Multi-stage packed is allowed again: the #122 wedge was driver
         // starvation on rank 0 (sync engine-mutex blocking pinned every
         // tokio worker, so the token-frame reply could neither be read nor
-        // timed out), fixed in cascadia-runner (non-blocking poll/submit/
-        // cancel) plus deadlined+poisoning reply recvs and an on-wire NACK
-        // in the packed exchange. Every stage must run the same
-        // --packed-slots value (baked into the packed IR shape).
+        // timed out), fixed in cascadia-runner (tokio workers never block on
+        // the engine mutex: polls park on a failed try_lock, cancels/drops
+        // defer, and submits go off-worker via spawn_blocking) plus
+        // deadlined+poisoning reply recvs and an on-wire NACK in the packed
+        // exchange. Every stage must run the same --packed-slots value
+        // (baked into the packed IR shape).
     }
     // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
     // different mechanism to --packed-slots above: OV's paged attention on the

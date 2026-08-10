@@ -434,14 +434,19 @@ impl Runner {
 
     /// Enqueue a task with the engine.
     ///
+    /// **Blocks the calling thread** for up to a full engine step when one is
+    /// in flight. Async contexts must not call this directly — use
+    /// [`Runner::generate_async`], which dispatches it via `spawn_blocking`.
+    ///
     /// Refuses (as a benign no-op `Ok(())`) any task whose id already carries
     /// a `cancelled` tombstone — see the comment in the lock region below.
     pub fn submit(&self, task: GenerationTask) -> Result<(), EngineError> {
-        // NOTE: blocks the calling thread for up to one engine step if a
-        // step is in flight. Async callers must use [`Runner::generate`]'s
-        // async submit path (or their own `spawn_blocking`) — a worker
-        // thread blocked here counts toward the driver starvation that
-        // wedges the pipeline (#122).
+        // NOTE: the lock below is a hard `lock()`, not a `try_lock()` — this
+        // is the one engine-lock caller that must not give up, since there is
+        // nowhere to park a submit. A tokio worker thread blocked here counts
+        // toward the driver starvation that wedges the pipeline (#122), which
+        // is why the async entry point (`Runner::generate_async`) keeps this
+        // call off the runtime.
         // Releasing the guard wakes the streams parked on contention, on
         // the empty-slot path as much as the submitting one — an empty slot
         // means `close()` already ran, so no later lock holder is coming to
@@ -503,6 +508,10 @@ impl Runner {
     /// chunk, on cancellation, on an engine step error, or after
     /// MAX_CONSECUTIVE_EMPTY_STEPS empty engine polls (engine appears
     /// stuck).
+    ///
+    /// **Blocks the calling thread** for up to a full engine step: the submit
+    /// runs inline via [`Runner::submit`], and only the returned stream is
+    /// async. Async contexts must use [`Runner::generate_async`] instead.
     pub fn generate(&self, task: GenerationTask) -> Result<ChunkStream, EngineError> {
         self.submit(task.clone())?;
         Ok(self.stream_for(task.task_id))
