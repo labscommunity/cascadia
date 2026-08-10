@@ -75,14 +75,22 @@ from openvino import opset15 as ops
 # can't be loaded — the exact-match check then reports NOT EXACT instead of
 # silently accepting numpy's approximation.
 try:
-    _libm = ctypes.CDLL(ctypes.util.find_library("m"))
+    _libm_name = ctypes.util.find_library("m")
+    if _libm_name is None and os.name == "nt":
+        # Windows has no libm: C99 float math lives in the UCRT, which is
+        # where Rust std lowers f32::cos/sin/powf on windows-msvc — so this
+        # keeps the same-symbols property the bit-exact gate depends on.
+        _libm_name = "ucrtbase"
+    if _libm_name is None:
+        raise OSError("no system libm found")
+    _libm = ctypes.CDLL(_libm_name)
     _libm.cosf.restype = ctypes.c_float
     _libm.cosf.argtypes = [ctypes.c_float]
     _libm.sinf.restype = ctypes.c_float
     _libm.sinf.argtypes = [ctypes.c_float]
     _libm.powf.restype = ctypes.c_float
     _libm.powf.argtypes = [ctypes.c_float, ctypes.c_float]
-except OSError:
+except (OSError, TypeError, AttributeError):
     _libm = None
     print("WARNING: could not load system libm via ctypes; rope table will use "
           "numpy's cos/sin/power, which do not bit-match Rust's libm calls "

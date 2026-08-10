@@ -28,7 +28,9 @@
 #include <openvino/op/constant.hpp>
 #include <openvino/op/divide.hpp>
 #include <openvino/op/equal.hpp>
-#include <openvino/op/greater_equal.hpp>
+// OpenVINO spells this `greater_eq.hpp` (cf. `less_eq.hpp`), not
+// `greater_equal.hpp` — the latter does not exist in the include tree.
+#include <openvino/op/greater_eq.hpp>
 #include <openvino/op/is_nan.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/parameter.hpp>
