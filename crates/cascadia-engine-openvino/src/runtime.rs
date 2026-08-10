@@ -475,6 +475,38 @@ fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
         .collect())
 }
 
+/// The NACK a stage sends instead of a token reply: an EMPTY token frame,
+/// `[1, 1, 0]` I64 with no payload.
+///
+/// A stage that has consumed a (plan, hidden) pair OWES its upstream a reply,
+/// so a failed step must still answer — and this is the answer that means
+/// "the batch is lost, the link is not". Emptiness is what carries that: the
+/// frame is wire-valid (shape and payload agree, so the stream stays aligned)
+/// while a real reply always carries one token per row and can never be
+/// empty. Paired with [`is_packed_nack`] deliberately — the sender and the
+/// recogniser have to agree on one shape, so they are defined together and
+/// tested together.
+fn packed_nack_frame() -> WireTensor {
+    encode_wire_tokens(&[])
+}
+
+/// Is this reply the downstream's NACK rather than a token frame?
+///
+/// The test is "carries no tokens" — a zero element count, exactly what
+/// [`packed_nack_frame`] sends and exactly what a real reply (one token per
+/// row, rows >= 1) can never be.
+///
+/// Deliberately NOT an equality check against the whole frame: a zero-element
+/// frame holds no tokens whatever its dtype byte claims, so reading it as a
+/// lost batch is right either way, and a stricter test would instead hand it
+/// to [`decode_wire_tokens`] to be reported as wire corruption.
+///
+/// Call this BEFORE `decode_wire_tokens`, which rejects an empty payload as
+/// malformed and would otherwise turn every NACK into a bogus frame error.
+fn is_packed_nack(reply: &WireTensor) -> bool {
+    reply.elements() == Some(0)
+}
+
 /// Type the error that retires an in-flight packed batch.
 ///
 /// A lost batch is not a lost link, and [`EngineError::BatchAborted`] says so
@@ -1876,7 +1908,7 @@ impl OvRuntimeEngine {
             // link" structurally instead of relying on this message never
             // happening to contain a word the fatal-substring classifier
             // looks for.
-            if reply.elements() == Some(0) {
+            if is_packed_nack(&reply) {
                 return Err(EngineError::BatchAborted(
                     "downstream stage failed its packed step and NACKed this batch \
                      (empty token frame); the pipeline link stays aligned"
@@ -1980,7 +2012,7 @@ impl OvRuntimeEngine {
                 // operator. This rank is where the batch actually died, so
                 // this is where the reason has to be recorded.
                 warn!(error = %e, "packed relay step failed; NACKing the upstream");
-                encode_wire_tokens(&[])
+                packed_nack_frame()
             }
         };
         let sent = self.block_on(async {
@@ -4322,18 +4354,44 @@ mod tests {
 
     /// The relay's NACK is an EMPTY token frame — it must be wire-valid
     /// (shape/payload consistent so the transport delivers it), detectable
-    /// via `elements() == 0` BEFORE `decode_wire_tokens` (which rejects
-    /// empties as malformed), and impossible to confuse with a real reply
-    /// (a real reply always carries one token per row, S >= 1).
+    /// BEFORE `decode_wire_tokens` (which rejects empties as malformed), and
+    /// impossible to confuse with a real reply (a real reply always carries
+    /// one token per row, S >= 1).
+    ///
+    /// Pinned to the NAMED pair, [`packed_nack_frame`] + [`is_packed_nack`],
+    /// rather than to an open-coded `elements() == 0`: the sender and the
+    /// recogniser only work if they agree, and an anonymous predicate at the
+    /// consumer could drift from the producer without anything failing here.
     #[test]
     fn packed_nack_frame_is_empty_and_detectable() {
-        let nack = encode_wire_tokens(&[]);
+        let nack = packed_nack_frame();
+        // The frame the relay puts on the wire is exactly "no tokens".
+        assert_eq!(nack, encode_wire_tokens(&[]));
         assert_eq!(nack.shape, [1, 1, 0]);
         assert!(nack.data.is_empty());
         assert_eq!(nack.elements(), Some(0));
+        // Same dtype as a real token reply: only the emptiness distinguishes
+        // it, so a peer reading the header cannot mistake it for a hidden
+        // state or a plan frame.
+        assert_eq!(nack.dtype, WireDType::I64);
+        // Payload length and shape agree, or the transport would reject the
+        // frame outright and the NACK would never arrive.
+        assert_eq!(
+            nack.data.len() as u64,
+            nack.elements().unwrap() * nack.dtype.bytes_per_element() as u64
+        );
+        assert!(is_packed_nack(&nack));
         assert!(decode_wire_tokens(&nack).is_err()); // NACK check must come first
-        let real = encode_wire_tokens(&[7]);
-        assert_ne!(real.elements(), Some(0));
+
+        // No real reply is ever mistaken for one, at any row count — and
+        // each of them still decodes to exactly its tokens.
+        for rows in 1..=8usize {
+            let toks: Vec<i32> = (0..rows as i32).collect();
+            let real = encode_wire_tokens(&toks);
+            assert!(!is_packed_nack(&real), "{rows}-row reply read as a NACK");
+            assert_ne!(real.elements(), Some(0));
+            assert_eq!(decode_wire_tokens(&real).expect("real reply"), toks);
+        }
     }
 
     /// Aborting a packed batch types its cause, so classification never rides

@@ -3184,4 +3184,107 @@ mod tests {
             0
         );
     }
+
+    // -----------------------------------------------------------------
+    // M7(b): `close()` while a stream is parked Pending.
+    //
+    // A stream that parked on engine contention is woken by exactly one
+    // thing: an engine-lock RELEASE (`EngineGuard::drop` drains
+    // `step_wakers`). Teardown is the release with nobody coming after it —
+    // if `close()` ever empties the slot without paying that drain, every
+    // parked stream waits `Pending` forever with no error, no log and no
+    // later holder to rescue it, and its client hangs until it gives up.
+    // Every wait below is bounded, so that regression FAILS the test
+    // instead of hanging the suite.
+    // -----------------------------------------------------------------
+
+    /// Stream A pins the engine inside a gated `step()`; stream B parks on
+    /// the contention; `close()` starts while B is parked. B must wake and
+    /// terminate on the teardown outcome — an error chunk saying the server
+    /// is going away, not a bare end-of-stream (which the API layer would
+    /// turn into a truncated 200) and not silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_wakes_a_stream_parked_on_engine_contention() {
+        let gate = Gate::closed();
+        let (runner, _log) = recording_runner(gate.clone()).await;
+
+        // Both tasks are submitted up front: `generate_async` takes the
+        // engine lock only for the submit itself, never for a step, so this
+        // runs before anyone is holding it.
+        let mut a = runner
+            .generate_async(GenerationTask::new("parked-holder", "x").with_max_tokens(2))
+            .await
+            .unwrap();
+        let mut b = runner
+            // Far more tokens than this test will ever let it produce: B
+            // cannot reach a normal final chunk, so the ONLY terminal
+            // outcome available to it is the teardown one.
+            .generate_async(GenerationTask::new("parked-waiter", "x").with_max_tokens(1_000_000))
+            .await
+            .unwrap();
+
+        // A takes the engine lock and parks inside `step()`, holding it.
+        let holder = tokio::spawn(async move {
+            let mut n = 0usize;
+            while a.next().await.is_some() {
+                n += 1;
+            }
+            n
+        });
+        await_until("the holder to enter step() with the engine locked", || {
+            gate.steps_entered() >= 1
+        })
+        .await;
+
+        // B polls, fails its `try_lock`, registers a waker and parks. From
+        // here nothing but a release can move it.
+        let waiter = tokio::spawn(async move {
+            let mut last = None;
+            while let Some(c) = b.next().await {
+                last = Some(c);
+            }
+            last
+        });
+        await_until("the waiter to park on engine contention", || {
+            !runner.slot.buffers.lock().step_wakers.is_empty()
+        })
+        .await;
+
+        // Teardown begins WHILE B is parked. `close()` blocks on the engine
+        // lock until the gate opens, so it needs its own thread; the
+        // `closing` flag it sets first (before it reaches for the lock) is
+        // the handshake that it is really in flight.
+        let closer = {
+            let runner = runner.clone();
+            tokio::task::spawn_blocking(move || runner.close())
+        };
+        await_until("close() to start tearing the runner down", || {
+            runner.closing.load(Ordering::SeqCst)
+        })
+        .await;
+
+        // Released LAST, so B spends the whole window parked with a
+        // teardown already underway. Two releases follow — A's and
+        // `close()`'s — and B must be woken by one of them.
+        gate.release();
+
+        let last = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("the parked stream never woke: teardown stranded it Pending")
+            .unwrap()
+            .expect("the parked stream ended with no chunk at all (a truncated success)");
+        assert_eq!(
+            last.error.as_deref(),
+            Some("server is shutting down"),
+            "a stream parked across teardown must end on the teardown error: {last:?}"
+        );
+        assert!(last.is_final, "{last:?}");
+
+        closer.await.unwrap();
+        // The holder must not be stranded by the teardown either.
+        tokio::time::timeout(std::time::Duration::from_secs(10), holder)
+            .await
+            .expect("the lock holder never finished after teardown")
+            .unwrap();
+    }
 }
