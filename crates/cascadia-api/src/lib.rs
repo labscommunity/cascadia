@@ -933,8 +933,14 @@ pub fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             let Some(end) = after.find("</tool_call>") else {
                 break;
             };
-            if let Some(c) = call_from_xml_function(&after[..end]) {
-                // Qwen3/MoE <function=…><parameter=…> XML dialect (non-JSON).
+            // Two non-JSON dialects share this delimiter. Try the Qwen3/MoE
+            // `<function=…><parameter=…>` shape first, then GLM's bare-name +
+            // `<arg_key>`/`<arg_value>` shape. Order is irrelevant to
+            // correctness — each requires a marker the other never emits — but
+            // keeping the older one first leaves its behaviour untouched.
+            if let Some(c) = call_from_xml_function(&after[..end])
+                .or_else(|| call_from_glm_arg_kv(&after[..end]))
+            {
                 calls.push(c);
             }
             rest = &after[end + "</tool_call>".len()..];
@@ -1064,6 +1070,66 @@ fn call_from_xml_function(block: &str) -> Option<ToolCall> {
         r#type: "function".to_string(),
         function: FunctionCall {
             name,
+            arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
+        },
+    })
+}
+
+/// GLM-4.5+/GLM-5 `<tool_call>` dialect: the function name sits bare right
+/// after the open tag, followed by `<arg_key>`/`<arg_value>` pairs.
+///
+/// ```text
+/// <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>
+/// ```
+///
+/// Neither of the other dialects matches this: [`call_from_xml_function`]
+/// requires `<function=`, and the JSON arm requires the block to start with a
+/// brace. Without this the block parses as nothing and the whole generation
+/// ships as ordinary content — a tool call the model genuinely made, silently
+/// dropped. Measured on a GLM-5 fleet: the model's own `chat_template.jinja`
+/// contains `arg_key`/`arg_value` and neither `<function=` nor `<|python_tag|>`,
+/// so tool calling could never work for that model.
+///
+/// Values follow the template's own encoding — `v | tojson if v is not string
+/// else v` — so a value that parses as JSON is kept as that JSON type and
+/// anything else stays a string. Parsing a bare `Paris` as JSON fails, which is
+/// correct: it is a string.
+fn call_from_glm_arg_kv(block: &str) -> Option<ToolCall> {
+    // The name is everything before the first key, so a block with no
+    // `<arg_key>` at all is either a different dialect or malformed — bail
+    // rather than invent a zero-argument call out of arbitrary prose.
+    let first_key = block.find("<arg_key>")?;
+    let name = block[..first_key].trim();
+    if name.is_empty() || name.contains('<') {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &block[first_key..];
+    while let Some(ks) = rest.find("<arg_key>") {
+        let ka = &rest[ks + "<arg_key>".len()..];
+        let Some(ke) = ka.find("</arg_key>") else { break };
+        let key = ka[..ke].trim().to_string();
+        let after_key = &ka[ke + "</arg_key>".len()..];
+        let Some(vs) = after_key.find("<arg_value>") else {
+            break;
+        };
+        let va = &after_key[vs + "<arg_value>".len()..];
+        let Some(ve) = va.find("</arg_value>") else {
+            break;
+        };
+        let raw = va[..ve].trim();
+        if !key.is_empty() {
+            let value = serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            args.insert(key, value);
+        }
+        rest = &va[ve + "</arg_value>".len()..];
+    }
+    Some(ToolCall {
+        id: format!("call_{}", Uuid::new_v4().simple()),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
             arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
         },
     })
@@ -3002,6 +3068,50 @@ mod tests {
         assert_eq!(calls[0].function.name, "echo");
         let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
         assert_eq!(args["text"], "</tool_call> bye");
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_arg_kv_dialect() {
+        // EXACTLY the shape GLM-4.5+/GLM-5's own chat_template.jinja emits:
+        //   '<tool_call>' + tc.name, then per argument
+        //   <arg_key>k</arg_key><arg_value>v</arg_value>, then </tool_call>.
+        // Before this dialect was handled the block parsed as nothing and the
+        // whole generation shipped as ordinary content — a call the model made,
+        // silently dropped, with finish_reason "stop".
+        let calls = parse_tool_calls(
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        )
+        .expect("GLM arg_key/arg_value dialect must parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        // A bare string value is NOT valid JSON, so it must stay a string
+        // rather than being dropped.
+        assert_eq!(args["city"], "Paris");
+
+        // The template JSON-encodes non-string values (`v | tojson if v is not
+        // string else v`), so those must come back as their JSON type, not as
+        // the string "7".
+        let calls = parse_tool_calls(
+            "<tool_call>book<arg_key>days</arg_key><arg_value>7</arg_value>\
+             <arg_key>opts</arg_key><arg_value>{\"bags\":2}</arg_value></tool_call>",
+        )
+        .expect("multi-argument GLM block must parse");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["days"], 7);
+        assert_eq!(args["opts"]["bags"], 2);
+
+        // Prose inside a <tool_call> block with no <arg_key> is not a call —
+        // inventing a zero-argument call from arbitrary text would be worse
+        // than dropping it.
+        assert!(parse_tool_calls("<tool_call>just some prose</tool_call>").is_none());
+
+        // The older dialects must be untouched by the added fallback.
+        let calls = parse_tool_calls(
+            "<tool_call><function=lookup><parameter=id>42</parameter></function></tool_call>",
+        )
+        .expect("Qwen3 XML dialect must still parse");
+        assert_eq!(calls[0].function.name, "lookup");
     }
 
     #[test]
