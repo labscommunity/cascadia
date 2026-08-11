@@ -697,6 +697,143 @@ fn render_prompt_legacy(messages: &[ChatMessage]) -> String {
 /// across every request — the ~17 KB Gemma 3/4 macro template is parsed once,
 /// not on each `/v1/chat/completions` call. Returns Err on parse failure so the
 /// caller can fall back to the legacy formatter.
+/// serde_json formatter matching Python's default `json.dumps` separators
+/// (`", "` and `": "`). serde_json's compact formatter omits both spaces.
+struct PyDumpsCompact;
+
+impl serde_json::ser::Formatter for PyDumpsCompact {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
+
+/// Escape every non-ASCII scalar as `\uXXXX` (surrogate pairs above the BMP),
+/// the way `json.dumps(ensure_ascii=True)` does. Safe to run over serialized
+/// JSON: structural bytes are all ASCII, so only string contents are touched.
+fn escape_non_ascii(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut buf = [0u16; 2];
+            for unit in c.encode_utf16(&mut buf) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
+
+/// `tojson` with Python `json.dumps` semantics, shadowing minijinja's builtin.
+///
+/// transformers replaces Jinja2's `tojson` with a bare `json.dumps(...,
+/// ensure_ascii=False)`, so every HF chat template was authored against that
+/// output. minijinja's builtin differs twice over: it escapes `< > & '` to
+/// `\uXXXX` for HTML safety, and it uses serde_json's space-free separators.
+/// Rendering through it puts tool schemas on the wire in bytes the model never
+/// saw during training. The builtin also rejects any kwarg but `indent`, and a
+/// rejected kwarg fails the whole render — which is how `ensure_ascii=False`
+/// silently cost GLM-5 its tools.
+fn py_tojson(
+    value: minijinja::value::Value,
+    indent: Option<minijinja::value::Value>,
+    args: minijinja::value::Kwargs,
+) -> Result<minijinja::value::Value, minijinja::Error> {
+    use minijinja::value::Value;
+    use minijinja::{Error, ErrorKind};
+
+    let indent = match indent {
+        Some(v) => Some(v),
+        None => args.get::<Option<Value>>("indent")?,
+    };
+    let indent = match indent {
+        None => None,
+        Some(v) => match bool::try_from(v.clone()).ok() {
+            Some(true) => Some(2),
+            Some(false) => None,
+            None => Some(usize::try_from(v)?),
+        },
+    };
+    let ensure_ascii = args.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
+    // transformers' shim also accepts sort_keys and separators. Consume them so
+    // an unknown-kwarg error can't reroute the render into the legacy
+    // formatter, but refuse non-default values instead of ignoring them — a
+    // silently wrong prompt is the failure mode this whole filter exists to
+    // remove.
+    if args.get::<Option<bool>>("sort_keys")?.unwrap_or(false) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "tojson: sort_keys=True is not supported",
+        ));
+    }
+    if args.get::<Option<Value>>("separators")?.is_some() {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            "tojson: separators= is not supported",
+        ));
+    }
+    args.assert_all_used()?;
+
+    let mut out = Vec::<u8>::new();
+    let res = match indent {
+        // Python switches to `(',', ': ')` under indent, which is exactly what
+        // serde_json's pretty formatter already emits.
+        Some(n) => {
+            let pad = " ".repeat(n);
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, fmt);
+            serde::Serialize::serialize(&value, &mut ser)
+        }
+        None => {
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, PyDumpsCompact);
+            serde::Serialize::serialize(&value, &mut ser)
+        }
+    };
+    res.map_err(|err| {
+        Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
+    })?;
+
+    let json = String::from_utf8(out).map_err(|err| {
+        Error::new(ErrorKind::InvalidOperation, "JSON output was not UTF-8").with_source(err)
+    })?;
+    let json = if ensure_ascii {
+        escape_non_ascii(&json)
+    } else {
+        json
+    };
+    // Safe-string like the builtin: the value is already JSON-encoded and must
+    // not be HTML-escaped again if a caller enables autoescape.
+    Ok(Value::from_safe_string(json))
+}
+
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
     use minijinja::value::Value;
     use minijinja::{Environment, Error, ErrorKind};
@@ -716,10 +853,23 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
-    // Some templates (Llama 3) call strftime_now() to embed the current
-    // date in the system prompt. We don't actually need a real date for
-    // inference correctness — a fixed empty string is a safe stand-in.
-    env.add_function("strftime_now", |_fmt: String| -> String { String::new() });
+    // Some templates (Llama 3) call strftime_now() to embed the current date in
+    // the system prompt. UTC keeps the render reproducible across a fleet whose
+    // nodes need not share a timezone. An unsupported format is an error, not
+    // an empty string: a blank date reads as a model quirk, not a bug.
+    env.add_function("strftime_now", |fmt: String| -> Result<Value, Error> {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        write!(out, "{}", chrono::Utc::now().format(&fmt)).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                format!("strftime_now: unsupported format string {fmt:?}"),
+            )
+        })?;
+        Ok(Value::from(out))
+    });
+    // Shadows minijinja's HTML-safe builtin; see `py_tojson`.
+    env.add_filter("tojson", py_tojson);
 
     // HF templates authored for Jinja2 use the Python `.N` subscript
     // (`m.content.0.type`) which minijinja's parser rejects as a float
@@ -1233,7 +1383,9 @@ fn call_from_glm_arg_kv(block: &str) -> Option<ToolCall> {
     let mut rest = &block[first_key..];
     while let Some(ks) = rest.find("<arg_key>") {
         let ka = &rest[ks + "<arg_key>".len()..];
-        let Some(ke) = ka.find("</arg_key>") else { break };
+        let Some(ke) = ka.find("</arg_key>") else {
+            break;
+        };
         let key = ka[..ke].trim().to_string();
         let after_key = &ka[ke + "</arg_key>".len()..];
         let Some(vs) = after_key.find("<arg_value>") else {
@@ -3251,7 +3403,10 @@ mod tests {
         let mut s = ReasoningSplitter::new(true);
         s.push("partial");
         s.finish();
-        assert!(!s.saw_close(), "an unterminated stream must report saw_close=false");
+        assert!(
+            !s.saw_close(),
+            "an unterminated stream must report saw_close=false"
+        );
     }
 
     #[test]
@@ -3468,6 +3623,182 @@ mod tests {
         assert!(
             out.contains("get_weather"),
             "tojson did not serialize tools: {out}"
+        );
+    }
+
+    /// Run `py_tojson` over a JSON literal. Expectations in these tests are
+    /// verbatim `json.dumps` output — transformers substitutes exactly that for
+    /// Jinja2's `tojson`, so it is the byte-level reference for every HF
+    /// template.
+    fn tojson_of(
+        v: serde_json::Value,
+        kwargs: &[(&str, minijinja::value::Value)],
+    ) -> Result<String, minijinja::Error> {
+        let args = minijinja::value::Kwargs::from_iter(kwargs.iter().map(|(k, v)| (*k, v.clone())));
+        py_tojson(minijinja::value::Value::from_serialize(&v), None, args)
+            .map(|out| out.to_string())
+    }
+
+    #[test]
+    fn tojson_matches_python_separators_and_leaves_punctuation_alone() {
+        // minijinja's builtin writes `{"a":1}` and escapes `'`/`<`/`&` into
+        // \uXXXX for HTML safety. json.dumps does neither, so the builtin puts
+        // tool schemas on the wire in bytes no model was trained on.
+        // Keys are written alphabetically here so the expectation isolates
+        // separators and escaping: `serde_json::Value` is a BTreeMap, which
+        // re-sorts client key order independently of this filter. See
+        // `tool_schema_key_order_is_alphabetical_not_client_order`.
+        let out = tojson_of(
+            serde_json::json!([{
+                "function": {
+                    "description": "the user's city <b> & more",
+                    "name": "get_weather",
+                    "parameters": {
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "type": "object"
+                    }
+                },
+                "type": "function"
+            }]),
+            &[],
+        )
+        .expect("tojson must render");
+        assert_eq!(
+            out,
+            r#"[{"function": {"description": "the user's city <b> & more", "name": "get_weather", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"], "type": "object"}}, "type": "function"}]"#
+        );
+    }
+
+    #[test]
+    fn tojson_empty_containers_match_python() {
+        let out = tojson_of(serde_json::json!({"a": [], "b": {}}), &[]).unwrap();
+        assert_eq!(out, r#"{"a": [], "b": {}}"#);
+    }
+
+    #[test]
+    fn tojson_ensure_ascii_false_keeps_utf8_and_true_escapes_it() {
+        let v = serde_json::json!({"city": "Köln", "emoji": "🌦"});
+        let raw = tojson_of(v.clone(), &[("ensure_ascii", false.into())]).unwrap();
+        assert_eq!(raw, "{\"city\": \"Köln\", \"emoji\": \"🌦\"}");
+
+        // Above the BMP json.dumps emits a surrogate pair, not one \U escape.
+        let escaped = tojson_of(v, &[("ensure_ascii", true.into())]).unwrap();
+        let expected = concat!(
+            "{\"city\": \"K",
+            "\\u00f6",
+            "ln\", \"emoji\": \"",
+            "\\ud83c\\udf26",
+            "\"}"
+        );
+        assert_eq!(escaped, expected);
+    }
+
+    #[test]
+    fn tojson_indent_matches_python() {
+        let out = tojson_of(
+            serde_json::json!({"a": 1, "b": [1, 2]}),
+            &[("indent", 4.into())],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "{\n    \"a\": 1,\n    \"b\": [\n        1,\n        2\n    ]\n}"
+        );
+    }
+
+    #[test]
+    fn tojson_refuses_unsupported_kwargs_rather_than_ignoring_them() {
+        // Consumed so the render doesn't die on an unknown kwarg, but honoured
+        // or refused — never silently dropped.
+        let err = tojson_of(
+            serde_json::json!({"b": 1, "a": 2}),
+            &[("sort_keys", true.into())],
+        )
+        .expect_err("sort_keys=True must not be silently ignored");
+        assert!(err.to_string().contains("sort_keys"), "{err}");
+
+        assert!(
+            tojson_of(serde_json::json!({}), &[("sort_keys", false.into())]).is_ok(),
+            "sort_keys=False is the default and must be accepted"
+        );
+    }
+
+    #[test]
+    fn chat_env_renders_glm_style_tojson_ensure_ascii_kwarg() {
+        // Regression: GLM-5's tool block calls `tojson(ensure_ascii=False)`.
+        // minijinja's builtin rejects the kwarg at RENDER time — inside a
+        // branch only taken when tools are present — so the template parsed
+        // clean, every tool-less request worked, and every tool request
+        // silently fell back to a formatter that cannot express tools at all.
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "get_weather", "description": "user's city"}),
+        }];
+        let env = build_chat_env(
+            "{% if tools %}{{ tools[0].function | tojson(ensure_ascii=False) }}{% endif %}",
+        )
+        .expect("template must parse");
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools))
+            .expect("tojson(ensure_ascii=False) must render");
+        assert_eq!(
+            out,
+            r#"{"description": "user's city", "name": "get_weather"}"#
+        );
+    }
+
+    #[test]
+    fn tool_schema_key_order_is_alphabetical_not_client_order() {
+        // Pins a known divergence rather than hiding it. `Tool.function` is a
+        // `serde_json::Value`, whose map is a BTreeMap without the
+        // `preserve_order` feature, so a client's `{name, description}` reaches
+        // the prompt as `{description, name}`. transformers and vLLM preserve
+        // client order. This test fails the day that feature is enabled, which
+        // is the point — the goldens above must be regenerated with it.
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "b", "description": "a"}),
+        }];
+        let env = build_chat_env("{{ tools[0].function | tojson }}").unwrap();
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools)).unwrap();
+        assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
+    }
+
+    #[test]
+    fn strftime_now_returns_a_real_date_and_rejects_bad_formats() {
+        // A stubbed empty string here reads as a model quirk downstream, not a
+        // bug: Llama-3.2 templates put the result straight into the system
+        // prompt.
+        let env = build_chat_env(r#"{{ strftime_now("%Y") }}"#).unwrap();
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
+        assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
+        assert!(out.chars().all(|c| c.is_ascii_digit()), "{out:?}");
+
+        let bad = build_chat_env(r#"{{ strftime_now("%Q") }}"#).unwrap();
+        assert!(
+            render_with_chat_env(&bad, &msgs, "", "", true, None).is_err(),
+            "an unsupported strftime specifier must error, not render empty"
         );
     }
 
