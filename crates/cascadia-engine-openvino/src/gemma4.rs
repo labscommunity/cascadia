@@ -1169,10 +1169,22 @@ impl Gemma4Engine {
         // emit a partial UTF-8 sequence on token N and complete the
         // glyph on token N+1, in which case the prefix bytes change).
         // Slicing past a UTF-8 boundary panics.
-        let delta = full_text
-            .strip_prefix(active.last_text.as_str())
-            .unwrap_or(&full_text)
-            .to_string();
+        //
+        // On divergence RE-ANCHOR (empty delta), never `unwrap_or(&full_text)`:
+        // that re-emits everything decoded so far, which under Option B resume is
+        // the whole forced prefix duplicated into the client stream. Same contract
+        // as the shim's `advance_emitted` — bounded loss at the seam, never
+        // duplication.
+        let delta = match full_text.strip_prefix(active.last_text.as_str()) {
+            Some(d) => d.to_string(),
+            None => {
+                warn!(
+                    task = %active.task.task_id,
+                    "decode diverged from the emitted prefix; re-anchoring (delta dropped)"
+                );
+                String::new()
+            }
+        };
         active.last_text = full_text;
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
