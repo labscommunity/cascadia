@@ -811,6 +811,39 @@ async fn recv_hidden_frames(
 /// generation has a tight real deadline regardless, so cap it here.
 const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Consecutive token-wait timeouts after which a RELAY rank gives up on its
+/// downstream and exits for a supervisor rebuild (see
+/// `escalate_if_downstream_is_gone`). Each timeout already burns a full token
+/// budget, so a small count is minutes of grace, not seconds.
+const RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT: u32 = 3;
+
+/// Why a bounded token wait ended without a token.
+///
+/// The distinction exists so relay escalation can key on "the downstream never
+/// answered" WITHOUT re-reading error text — the fragility
+/// `EngineError::BatchAborted` was introduced to end. A typed two-way split is
+/// cheaper than a substring rule and cannot be broken by rewording a message.
+#[derive(Debug)]
+enum TokenWaitFailure {
+    /// The budget elapsed with no answer: a frame-start timeout, or the overall
+    /// deadline running out between discards. The only failure that says
+    /// anything about the LINK, and so the only one that counts toward
+    /// escalating a relay rank.
+    TimedOut(EngineError),
+    /// Anything else — a downstream NACK, a malformed frame, a dead socket.
+    /// Bytes arrived or the verdict is already decided elsewhere, so the link
+    /// is not the suspect and the escalation counter resets.
+    Other(EngineError),
+}
+
+impl TokenWaitFailure {
+    fn into_error(self) -> EngineError {
+        match self {
+            TokenWaitFailure::TimedOut(e) | TokenWaitFailure::Other(e) => e,
+        }
+    }
+}
+
 /// Read a seq-tagged token from `downstream`, discarding any STALE orphan
 /// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
 /// bounded by ONE overall deadline = `min(recv_timeout(), TOKEN_RECV_DEADLINE_CEILING)`:
@@ -820,22 +853,33 @@ const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::fr
 async fn recv_token_seq_checked(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     awaiting_seq: u32,
-) -> EngineResult<i32> {
+) -> Result<i32, TokenWaitFailure> {
     let deadline_at = std::time::Instant::now()
         + cascadia_transport::recv_timeout().min(TOKEN_RECV_DEADLINE_CEILING);
     loop {
         let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(EngineError::Backend(
+            return Err(TokenWaitFailure::TimedOut(EngineError::Backend(
                 "timed out waiting for the downstream token (overall deadline)".into(),
-            ));
+            )));
         }
-        let (tensor, _) = {
+        let recv = {
             let mut guard = downstream.lock().await;
             guard.recv_token(remaining).await
-        }
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
-        let (token, echo_seq) = decode_token_with_seq(&tensor)?;
+        };
+        let (tensor, _) = recv.map_err(|e| {
+            let flat = EngineError::Backend(e.to_string());
+            // Classify on the TYPED transport error, before flattening: a
+            // frame-start timeout means the downstream never answered, which is
+            // the only thing relay escalation may count.
+            match e {
+                cascadia_transport::TransportError::FrameStartTimeout(_) => {
+                    TokenWaitFailure::TimedOut(flat)
+                }
+                _ => TokenWaitFailure::Other(flat),
+            }
+        })?;
+        let (token, echo_seq) = decode_token_with_seq(&tensor).map_err(TokenWaitFailure::Other)?;
         if echo_seq != awaiting_seq {
             warn!(
                 event = "stale_token_discarded",
@@ -855,11 +899,11 @@ async fn recv_token_seq_checked(
         // A NACK for a generation we already abandoned is a stale orphan and
         // was discarded above, by seq, before reaching here.
         if token < 0 {
-            return Err(EngineError::BatchAborted(
+            return Err(TokenWaitFailure::Other(EngineError::BatchAborted(
                 "downstream stage failed its step and NACKed this generation; the pipeline \
                  link stays aligned"
                     .into(),
-            ));
+            )));
         }
         return Ok(token);
     }
@@ -1282,6 +1326,10 @@ pub struct OvRuntimeEngine {
     /// Seq read from the upstream hidden; echoed back on the token this stage
     /// sends upstream.
     inbound_seq: u32,
+    /// Relay ranks only: consecutive token-wait TIMEOUTS on the downstream
+    /// link. Reset by any answer at all (a token, a NACK, even a malformed
+    /// frame). Drives `escalate_if_downstream_is_gone`.
+    consecutive_token_timeouts: u32,
 }
 
 impl OvRuntimeEngine {
@@ -1738,7 +1786,22 @@ impl OvRuntimeEngine {
         // token whose echoed seq != the one we stamped is discarded (it would
         // otherwise be read by the next request → silent token desync).
         let awaiting = self.awaiting_token_seq;
-        self.block_on(recv_token_seq_checked(&downstream, awaiting))
+        match self.block_on(recv_token_seq_checked(&downstream, awaiting)) {
+            Ok(token) => {
+                self.consecutive_token_timeouts = 0;
+                Ok(token)
+            }
+            Err(TokenWaitFailure::TimedOut(e)) => {
+                self.consecutive_token_timeouts = self.consecutive_token_timeouts.saturating_add(1);
+                Err(e)
+            }
+            // Bytes arrived, or the verdict is already decided: the link is not
+            // the suspect, so the escalation counter starts over.
+            Err(other) => {
+                self.consecutive_token_timeouts = 0;
+                Err(other.into_error())
+            }
+        }
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
@@ -3090,7 +3153,53 @@ impl OvRuntimeEngine {
         // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
         let step = self.relay_middle_body(hidden, shape, pos_opt);
-        self.answer_upstream(step)
+        let answered = self.answer_upstream(step);
+        self.escalate_if_downstream_is_gone(answered)
+    }
+
+    /// A middle rank whose downstream has stopped answering must eventually
+    /// exit so the supervisor rebuilds the stage.
+    ///
+    /// Bounding the token wait made its failure NON-fatal, which is right for
+    /// the head — it has no relay loop, it is driven by stream polls, and it
+    /// dialed its downstream once and cannot re-dial, so tearing it down on a
+    /// transient miss strands it permanently. A middle rank is the opposite
+    /// case: it has a supervisor, and before the bounded recv its timeout
+    /// classified fatal and produced exactly that rebuild. Without this, a
+    /// permanently wedged (as opposed to closed) downstream leaves the relay
+    /// loop backing off and retrying forever, with no self-heal and no
+    /// operator-visible terminal state.
+    ///
+    /// Only CONSECUTIVE token-wait timeouts count, and only timeouts: a NACK or
+    /// a malformed frame proves bytes are still flowing, and
+    /// `recv_token_from_downstream` resets the counter on both. Each timeout
+    /// already costs a full token budget, so the threshold is a small count
+    /// rather than a wall-clock window — no extra clock plumbing for the same
+    /// answer.
+    ///
+    /// The escalation error is `Io(TimedOut)`, which `is_connection_fatal`
+    /// answers structurally. It must not be a `Backend` string chosen to
+    /// contain a fatal substring: that is the fragility the typed
+    /// `BatchAborted` variant was introduced to end.
+    fn escalate_if_downstream_is_gone(&mut self, res: EngineResult<()>) -> EngineResult<()> {
+        if res.is_err() && self.consecutive_token_timeouts >= RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT {
+            error!(
+                timeouts = self.consecutive_token_timeouts,
+                "downstream has not answered a token in {} consecutive attempts; this stage \
+                 cannot re-dial it in-process, so it is exiting for the supervisor to rebuild \
+                 the pipeline connection",
+                self.consecutive_token_timeouts
+            );
+            return Err(EngineError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "downstream stage stopped answering ({} consecutive token-wait timeouts); \
+                     rebuilding this stage",
+                    self.consecutive_token_timeouts
+                ),
+            )));
+        }
+        res
     }
 
     /// Everything `step_middle` does between consuming the activation group and
@@ -4373,6 +4482,7 @@ impl Builder for OvRuntimeBuilder {
             downstream_seq: 0,
             awaiting_token_seq: 0,
             inbound_seq: 0,
+            consecutive_token_timeouts: 0,
         }))
     }
 }
@@ -5295,6 +5405,10 @@ mod tests {
         let err = recv_token_seq_checked(&downstream, awaiting)
             .await
             .unwrap_err();
+        // `Other`, not `TimedOut`: a NACK proves the link delivered bytes, so
+        // it must not count toward relay escalation.
+        assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
+        let err = err.into_error();
         assert!(matches!(err, EngineError::BatchAborted(_)), "{err:?}");
         assert!(
             !err.is_connection_fatal(),
@@ -5324,6 +5438,49 @@ mod tests {
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         let tok = recv_token_seq_checked(&downstream, 5).await.unwrap();
         assert_eq!(tok, 42, "a stale NACK must be discarded, not honoured");
+    }
+
+    /// A frame-start timeout is the ONLY token-wait failure that says anything
+    /// about the link, so it is the only one that may count toward escalating a
+    /// relay rank. Pinned on the TYPED split rather than on message text —
+    /// keying escalation off a substring is the fragility `BatchAborted` exists
+    /// to end.
+    #[tokio::test]
+    async fn only_a_timeout_counts_toward_relay_escalation() {
+        // Silent peer → the bounded frame-start elapses → TimedOut.
+        let (client, _server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        cascadia_transport::set_activation_timeout_secs(1);
+        let err = recv_token_seq_checked(&downstream, 0).await.unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+        assert!(matches!(err, TokenWaitFailure::TimedOut(_)), "{err:?}");
+
+        // A malformed frame is an answer, not a silence: bytes arrived, so the
+        // link is not the suspect and the counter must reset.
+        let (client, mut server) = loopback().await;
+        server.send(&encode_wire_tokens(&[7])).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 0).await.unwrap_err();
+        assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
+    }
+
+    /// The escalation error must be classifiable by TYPE. `Io(TimedOut)` is
+    /// what makes the relay loop exit for a supervisor rebuild; a `Backend`
+    /// string that merely happens to contain a fatal substring would be one
+    /// rewording away from silently ceasing to escalate.
+    #[test]
+    fn relay_escalation_error_is_structurally_connection_fatal() {
+        let e = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "downstream stage stopped answering (3 consecutive token-wait timeouts)",
+        ));
+        assert!(e.is_connection_fatal());
+        // And a NACK, which shares the "downstream failed" wording space, does
+        // NOT escalate however it is phrased.
+        assert!(!EngineError::BatchAborted(
+            "downstream stage failed its step and NACKed this generation".into()
+        )
+        .is_connection_fatal());
     }
 
     /// The sentinel must be unreachable as a real token: sampling returns a

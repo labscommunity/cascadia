@@ -149,13 +149,17 @@ impl EngineError {
                     // Mid-frame deadline (recv_exact wall-clock bound).
                     || msg.contains("recv_exact timed out")
             }
-            // A structurally-typed io error — should a future `?`-on-io path
-            // ever produce one instead of the flattened `Backend` string —
-            // is fatal for the same kinds the transport layer treats as fatal
-            // (see `recv_error_is_connection_fatal`). Belt-and-suspenders: the
-            // dist-spec worker flattens recv errors to `Backend` today, so this
-            // arm is unreachable now, but it keeps the classifier correct if
-            // that ever changes.
+            // A structurally-typed io error is fatal for the same kinds the
+            // transport layer treats as fatal (see
+            // `recv_error_is_connection_fatal`).
+            //
+            // This arm is LIVE, and deliberately so: the ov-runtime relay
+            // escalation raises `Io(TimedOut)` when a middle rank's downstream
+            // has stopped answering, precisely so that "this link is gone" is
+            // answered by the error's TYPE rather than by a `Backend` string
+            // hand-crafted to contain a substring below. Anything that needs to
+            // be classifiable should arrive here, not there. (The dist-spec
+            // worker still flattens its recv errors to `Backend`.)
             EngineError::Io(e) => matches!(
                 e.kind(),
                 std::io::ErrorKind::TimedOut
