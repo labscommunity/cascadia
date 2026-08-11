@@ -738,6 +738,29 @@ fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
     Ok((token, echo_seq))
 }
 
+/// The token value a relay stage sends when its step FAILED after it had
+/// already consumed the upstream's activation group.
+///
+/// A stage that consumed a group OWES its upstream a reply, so a failed step
+/// must still answer — this is the answer that means "the batch is lost, the
+/// link is not", the same contract the packed path states at
+/// `step_relay_packed`. Real tokens are vocab indices produced by
+/// `argmax_last_row`, which starts at `0usize` and only ever returns an index,
+/// so a negative value can never be a legitimate token.
+///
+/// It rides the ORDINARY seq-tagged token frame rather than a distinctly-shaped
+/// one, and that is load-bearing in two directions. The upstream's own token
+/// wait is bounded by the same budget this stage's was, so by the time a
+/// timeout-driven NACK is sent the upstream has usually already given up: the
+/// NACK lands in the socket as a stale frame and is read by the NEXT request. A
+/// shape-distinguished NACK carries no seq, so nothing could reject it and it
+/// would abort the next, healthy generation. Carrying the seq means the
+/// existing stale-discard loop throws it away for free. Second, a
+/// distinctly-shaped NACK would collide with the two foreign 8-byte frames
+/// `decode_token_with_seq` exists to reject — a legacy `[1,1,1]` token and a
+/// packed I64 reply.
+const NACK_TOKEN: i32 = -1;
+
 /// Send the downstream activation frames in wire order: `[lead] [hidden]`,
 /// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
 ///
@@ -821,6 +844,22 @@ async fn recv_token_seq_checked(
                 "discarding a stale orphan token from downstream (chain re-formed mid-wait)"
             );
             continue;
+        }
+        // A NACK for THIS generation: the downstream consumed our activation
+        // group and then failed. The batch is lost, the link is not — so this
+        // is `BatchAborted`, which `is_connection_fatal` answers false to
+        // structurally, exactly as the packed path does for its empty-frame
+        // NACK. A relay rank must back off and keep driving on one of these,
+        // not exit for a supervisor rebuild.
+        //
+        // A NACK for a generation we already abandoned is a stale orphan and
+        // was discarded above, by seq, before reaching here.
+        if token < 0 {
+            return Err(EngineError::BatchAborted(
+                "downstream stage failed its step and NACKed this generation; the pipeline \
+                 link stays aligned"
+                    .into(),
+            ));
         }
         return Ok(token);
     }
@@ -2971,11 +3010,57 @@ impl OvRuntimeEngine {
         Ok(primary)
     }
 
+    /// Answer the upstream for an activation group this stage has ALREADY
+    /// consumed: the sampled token, or [`NACK_TOKEN`] if the step failed.
+    ///
+    /// Once the group is off the wire the upstream is owed a reply. Returning
+    /// the step's error without answering leaves it waiting out its whole token
+    /// budget for a frame that will never come — a wasted deadline per failure,
+    /// and on a relay rank the error is then swallowed by the loop and retried,
+    /// so the upstream pays it again. The packed path states the same rule at
+    /// `step_relay_packed`; this is the non-packed half of it.
+    ///
+    /// The body's error is what propagates, so the caller still sees why the
+    /// step died. A send failure subsumes it via `nack_send_error`, which keeps
+    /// the transport error outermost (it is what decides whether the relay loop
+    /// exits) while carrying the root cause in its text — a dead upstream is
+    /// exactly when the NACK cannot be delivered either.
+    fn answer_upstream(&mut self, step: EngineResult<i32>) -> EngineResult<()> {
+        let token = match &step {
+            Ok(t) => *t,
+            Err(e) => {
+                warn!(error = %e, "relay step failed; NACKing the upstream");
+                NACK_TOKEN
+            }
+        };
+        match self.send_token_to_upstream(token) {
+            Ok(()) => step.map(|_| ()),
+            Err(send_err) => Err(nack_send_error(send_err, step.as_ref().err())),
+        }
+    }
+
     fn step_last(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
         }
+        // Before this point nothing is owed: a failed recv either got no group
+        // at all, or lost frame alignment, in which case the socket is gone and
+        // there is nothing to answer on. After it, `inbound_seq` is set and
+        // every failure must answer.
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let step = self.relay_last_body(hidden, shape, pos_opt);
+        self.answer_upstream(step)
+    }
+
+    /// Everything `step_last` does between consuming the activation group and
+    /// answering the upstream. Split out so the caller can turn any failure
+    /// into an on-wire NACK instead of a silent one.
+    fn relay_last_body(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos_opt: Option<i64>,
+    ) -> EngineResult<i32> {
         // A seq=1 static frame means this task's prefill chunks are done —
         // with --park-prefill, release the prefill model's weights now.
         if pos_opt.is_some() && shape[1] == 1 {
@@ -2995,16 +3080,30 @@ impl OvRuntimeEngine {
                 r
             }
         };
-        let next = argmax_logits(&out, &out_shape)?;
-        self.send_token_to_upstream(next)?;
-        Ok(())
+        argmax_logits(&out, &out_shape)
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
         }
+        // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let step = self.relay_middle_body(hidden, shape, pos_opt);
+        self.answer_upstream(step)
+    }
+
+    /// Everything `step_middle` does between consuming the activation group and
+    /// answering the upstream — including the downstream hop, so a downstream
+    /// failure (its NACK included) propagates as an Err and this stage NACKs its
+    /// own upstream in turn. That is what carries an abort all the way to the
+    /// head however deep the pipeline is.
+    fn relay_middle_body(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos_opt: Option<i64>,
+    ) -> EngineResult<i32> {
         // Multi-token hidden = prefill work downstream: a stateful
         // whole-prompt frame, or (static path) a prefill CHUNK — either way
         // the token reply waits on multi-token compute across every remaining
@@ -3033,9 +3132,7 @@ impl OvRuntimeEngine {
         };
         let s3 = to_shape3(&out_shape);
         self.send_hidden_downstream(&out, s3, fwd_pos)?;
-        let token = self.recv_token_from_downstream(prefill_reply)?;
-        self.send_token_to_upstream(token)?;
-        Ok(())
+        self.recv_token_from_downstream(prefill_reply)
     }
 }
 
@@ -5183,6 +5280,66 @@ mod tests {
     /// through — the packed one silently produced a token on the first exchange
     /// of a mismatched pipeline, because `echo_seq` decoded as 0 and the first
     /// stamped seq was 0 too.
+    /// A NACK for the generation we are waiting on aborts it — and does so as
+    /// `BatchAborted`, which is structurally non-fatal, so a relay rank backs
+    /// off and keeps driving instead of exiting for a supervisor rebuild.
+    #[tokio::test]
+    async fn matching_seq_nack_aborts_the_generation_without_killing_the_link() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 5u32;
+        server
+            .send(&encode_token_with_seq(NACK_TOKEN, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, awaiting)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::BatchAborted(_)), "{err:?}");
+        assert!(
+            !err.is_connection_fatal(),
+            "a NACKed generation must not tear the stage down: {err}"
+        );
+    }
+
+    /// The reason the NACK rides the ordinary seq-tagged frame instead of a
+    /// distinctly-shaped one.
+    ///
+    /// Upstream and downstream run the same token budget, so a timeout-driven
+    /// NACK is typically sent AFTER the upstream already gave up: it sits in
+    /// the socket and is read by the NEXT request. Carrying the seq means the
+    /// existing stale-discard loop throws it away. A shapewise NACK would carry
+    /// no seq, so nothing could reject it and it would abort the next, healthy
+    /// generation instead.
+    #[tokio::test]
+    async fn a_stale_nack_cannot_poison_the_next_generation() {
+        let (client, mut server) = loopback().await;
+        // The abandoned generation's NACK, still in the socket...
+        server
+            .send(&encode_token_with_seq(NACK_TOKEN, 4))
+            .await
+            .unwrap();
+        // ...then the current generation's real token.
+        server.send(&encode_token_with_seq(42, 5)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, 5).await.unwrap();
+        assert_eq!(tok, 42, "a stale NACK must be discarded, not honoured");
+    }
+
+    /// The sentinel must be unreachable as a real token: sampling returns a
+    /// vocab INDEX from `argmax_last_row`, which starts at `0usize`.
+    #[test]
+    fn nack_sentinel_can_never_be_a_sampled_token() {
+        assert!(NACK_TOKEN < 0);
+        let logits = [0.1f32, 0.9, 0.3];
+        assert!(argmax_last_row(&logits, 3) >= 0);
+        // And it survives the wire as itself.
+        assert_eq!(
+            decode_token_with_seq(&encode_token_with_seq(NACK_TOKEN, 7)).unwrap(),
+            (NACK_TOKEN, 7)
+        );
+    }
+
     #[test]
     fn token_frame_rejects_foreign_8_byte_frames() {
         // A packed stage's single-row reply: I64 [1,1,1], 8 bytes.
