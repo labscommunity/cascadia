@@ -550,7 +550,14 @@ fn clamp_frame_idle_ceiling(
 /// [`TransportError::SocketClosed`], needs no drop, and the next call fails
 /// cleanly on its own. Pure, for testing.
 fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
+    // Exhaustive on purpose — no `_` arm. Whether a recv error drops the
+    // once-dialed socket is the single most consequential classification in
+    // this crate, and a wildcard silently answers "keep the socket" for every
+    // variant added later. Adding a variant must be a compile error here until
+    // its fatality is stated.
     match err {
+        // The peer is connected but silent past the idle ceiling: a frame it
+        // sends later must never land in a different request.
         TransportError::FrameIdleCeiling(_) => true,
         TransportError::Io(e) => matches!(
             e.kind(),
@@ -560,7 +567,23 @@ fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::UnexpectedEof
         ),
-        _ => false,
+        // NOT fatal, deliberately: zero bytes were consumed (cancel-safe
+        // `read`), so the socket stays frame-aligned and the caller retries on
+        // it. The late frame this admits is handled a layer up by the engine's
+        // per-hop seq echo, which discards a stale token instead of reading it
+        // as the next request's. See `recv_tensor_token`.
+        TransportError::FrameStartTimeout(_) => false,
+        // A clean EOF needs no drop — the next call fails cleanly on its own.
+        TransportError::SocketClosed => false,
+        // Protocol/validation failures on a live link: the peer misbehaved on
+        // one frame, but the connection can still deliver a good one next.
+        TransportError::RankTooHigh(_)
+        | TransportError::PayloadTooLarge(_)
+        | TransportError::RawSizeTooLarge(_) => false,
+        // Lifecycle states, not recv failures on a live socket.
+        TransportError::ConnectTimeout(_)
+        | TransportError::NotStarted
+        | TransportError::NotConnected => false,
     }
 }
 
