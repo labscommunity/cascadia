@@ -332,17 +332,24 @@ async fn recv_tensor_inner(
         Some(to) => recv_exact_within(sock, &mut header, to).await?,
         None => recv_exact_frame_start(sock, &mut header).await?,
     }
-    decode_header_and_recv_body(sock, &header, start).await
+    decode_header_and_recv_body(sock, &header, start, None).await
 }
 
-/// Decode a validated tensor header + read the body under the strict
-/// [`recv_timeout`]. Shared by [`recv_tensor`] (lenient frame-start) and
-/// [`recv_tensor_token`] (bounded frame-start) so the header validation +
-/// body read can't diverge between the two entry points.
+/// Decode a validated tensor header + read the body. Shared by every recv
+/// entry point — the lenient [`recv_tensor`], the deadlined
+/// [`recv_tensor_reply`] / [`recv_tensor_reply_prefill`], and the bounded
+/// [`recv_tensor_token`] — so the header validation and the body read can't
+/// diverge between them. It is also where PR #112's payload metrics are
+/// booked, so every caller feeds the same histograms.
+///
+/// `body_timeout` bounds the payload read: `None` uses the strict
+/// [`recv_timeout`] (the three frame-start-only callers), `Some(d)` charges the
+/// body against a caller-owned overall deadline — see [`recv_tensor_token`].
 async fn decode_header_and_recv_body(
     sock: &mut TcpStream,
     header: &[u8; HEADER_SIZE],
     start: Instant,
+    body_timeout: Option<Duration>,
 ) -> TransportResult<(Tensor, TransferStats)> {
     let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
     let dtype_code = u32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -375,7 +382,10 @@ async fn decode_header_and_recv_body(
     // includes idle time between requests (frame-start exemption), which
     // would swamp a latency histogram with idle gaps.
     let payload_started = Instant::now();
-    recv_exact(sock, &mut data).await?;
+    match body_timeout {
+        Some(to) => recv_exact_within(sock, &mut data, to).await?,
+        None => recv_exact(sock, &mut data).await?,
+    }
     cascadia_metrics::TRANSPORT_RECV_PAYLOAD_SECONDS
         .observe(payload_started.elapsed().as_secs_f64());
     cascadia_metrics::TRANSPORT_RECV_BYTES_TOTAL
@@ -390,20 +400,52 @@ async fn decode_header_and_recv_body(
     Ok((tensor, stats))
 }
 
-/// Active-response tensor recv: the header frame-START is bounded by
-/// `frame_start_deadline` (returning the NON-fatal
-/// [`TransportError::FrameStartTimeout`] on elapse), the body reads under the
-/// strict [`recv_timeout`]. For recvs whose response has a real deadline (the
-/// head/middle awaiting a generation's token) so an ORPHANED wait releases the
-/// caller's engine lock without dropping the once-dialed socket it can't re-dial.
+/// Grace floor for the post-frame-start phases of [`recv_tensor_token`].
+///
+/// Once the first header byte lands, the header remainder and the body are
+/// charged against the SAME overall deadline — but a first byte that arrives at
+/// `deadline - epsilon` would otherwise leave an epsilon budget for the rest of
+/// the frame. That read would time out as `Io(TimedOut)`, which is
+/// connection-FATAL (alignment is genuinely lost mid-frame), and dropping the
+/// socket is precisely the outcome the bounded recv exists to avoid: the engine
+/// dialed its downstream once and cannot re-dial. So the tail phases get at
+/// least this long. On a live link a 20-byte header plus an 8-byte token body
+/// completes in microseconds, so this only ever absorbs scheduler jitter — the
+/// honest overall bound is `deadline + FRAME_PHASE_GRACE`, not `deadline`.
+const FRAME_PHASE_GRACE: Duration = Duration::from_secs(3);
+
+/// Budget left until `deadline_at`, floored at [`FRAME_PHASE_GRACE`].
+fn remaining_with_grace(deadline_at: Instant) -> Duration {
+    deadline_at
+        .saturating_duration_since(Instant::now())
+        .max(FRAME_PHASE_GRACE)
+}
+
+/// Active-response tensor recv: EVERY phase — the header frame-start, the
+/// header remainder, and the body — is charged against ONE overall deadline
+/// derived from `frame_start_deadline`, floored per-phase by
+/// [`FRAME_PHASE_GRACE`] once the frame has started.
+///
+/// Elapsing at the frame START (zero bytes consumed) yields the NON-fatal
+/// [`TransportError::FrameStartTimeout`], so an ORPHANED wait releases the
+/// caller's engine lock without dropping the once-dialed socket it can't
+/// re-dial. Elapsing MID-FRAME stays connection-fatal — alignment is lost, so
+/// the socket must go.
+///
+/// Bounding all three phases is the point: charging only the frame start let a
+/// peer that dribbled a partial header then wedged hold the caller's engine
+/// mutex for `deadline + 2 × recv_timeout` (measured: a 200ms deadline took
+/// 3.0s at `recv_timeout = 3s`), which is the opposite of what a bounded token
+/// wait is for.
 pub(crate) async fn recv_tensor_token(
     sock: &mut TcpStream,
     frame_start_deadline: Duration,
 ) -> TransportResult<(Tensor, TransferStats)> {
     let start = Instant::now();
+    let deadline_at = start + frame_start_deadline;
     let mut header = [0u8; HEADER_SIZE];
-    recv_exact_frame_start_strict(sock, &mut header, frame_start_deadline).await?;
-    decode_header_and_recv_body(sock, &header, start).await
+    recv_exact_frame_start_strict(sock, &mut header, deadline_at).await?;
+    decode_header_and_recv_body(sock, &header, start, Some(remaining_with_grace(deadline_at))).await
 }
 
 /// Config override (seconds) for the activation recv timeout; 0 = unset.
@@ -579,28 +621,38 @@ async fn recv_exact_frame_start(sock: &mut TcpStream, buf: &mut [u8]) -> Transpo
     Ok(())
 }
 
-/// Active-response variant of [`recv_exact_frame_start`]: wait up to `deadline`
-/// for the FIRST byte, then read the remainder under the strict [`recv_timeout`].
+/// Active-response variant of [`recv_exact_frame_start`]: wait until
+/// `deadline_at` for the FIRST byte, then read the remainder against that SAME
+/// deadline (floored by [`FRAME_PHASE_GRACE`]).
+///
 /// On elapse with ZERO bytes read, returns the NON-fatal, retryable
 /// [`TransportError::FrameStartTimeout`] — `tokio::io::AsyncReadExt::read` is
 /// cancel-safe, so the dropped read consumed nothing and the socket stays frame-
-/// aligned for the caller to retry on the next step. Used by [`recv_tensor_token`]
-/// for recvs whose response has a real deadline (token/logits coming back), as
-/// opposed to the idle-between-requests frame-start exemption.
+/// aligned for the caller to retry on the next step. **Do not generify this over
+/// `AsyncRead` without re-verifying cancel safety**: a buffering reader that
+/// consumed bytes into its own buffer before being dropped would desync the
+/// stream silently, and the failure mode is corrupted tokens, not an error.
+///
+/// Once `n > 0` the frame has STARTED, so a timeout on the remainder is a
+/// mid-frame stall: alignment is lost and the resulting `Io(TimedOut)` is
+/// correctly connection-fatal. Used by [`recv_tensor_token`] for recvs whose
+/// response has a real deadline (token/logits coming back), as opposed to the
+/// idle-between-requests frame-start exemption.
 async fn recv_exact_frame_start_strict(
     sock: &mut TcpStream,
     buf: &mut [u8],
-    deadline: Duration,
+    deadline_at: Instant,
 ) -> TransportResult<()> {
-    let n = match tokio::time::timeout(deadline, sock.read(buf)).await {
+    let first_byte = deadline_at.saturating_duration_since(Instant::now());
+    let n = match tokio::time::timeout(first_byte, sock.read(buf)).await {
         Ok(res) => res?,
-        Err(_) => return Err(TransportError::FrameStartTimeout(deadline)),
+        Err(_) => return Err(TransportError::FrameStartTimeout(first_byte)),
     };
     if n == 0 {
         return Err(TransportError::SocketClosed);
     }
     if n < buf.len() {
-        recv_exact(sock, &mut buf[n..]).await?;
+        recv_exact_within(sock, &mut buf[n..], remaining_with_grace(deadline_at)).await?;
     }
     Ok(())
 }
@@ -1432,6 +1484,59 @@ mod tests {
             got.data,
             7i32.to_le_bytes().to_vec(),
             "retry must read the token on the surviving socket"
+        );
+    }
+
+    /// #40: a peer that DRIBBLES a partial header and then wedges must not
+    /// escape the caller's deadline. Charging only the frame start left the
+    /// header remainder and the body each running under a fresh full
+    /// `recv_timeout`, so the caller's engine mutex was held for
+    /// `deadline + 2 × recv_timeout` — with `recv_timeout` at the rig's 120s
+    /// that is 360s against a documented 120s ceiling, i.e. worse than the
+    /// unbounded path this recv replaced.
+    ///
+    /// The bound is `deadline + FRAME_PHASE_GRACE`, not `deadline`: once the
+    /// frame has started the tail phases get a floor so a first byte landing at
+    /// the deadline edge can't be handed an epsilon budget and fatally drop a
+    /// socket the engine cannot re-dial.
+    #[tokio::test]
+    async fn recv_token_partial_header_still_honors_the_overall_deadline() {
+        let _g = TIMEOUT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Deliberately LARGE relative to the deadline: if any phase escapes the
+        // overall deadline it runs for this long instead, which the bound below
+        // catches. Pre-fix this test observed ~recv_timeout, not ~deadline.
+        set_activation_timeout_secs(30);
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let mut server = h.await.unwrap();
+
+        // 4 of the HEADER_SIZE bytes, then silence forever.
+        server.send_raw(&[0u8; 4]).await.unwrap();
+
+        let t0 = Instant::now();
+        let err = client
+            .recv_token(Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        let elapsed = t0.elapsed();
+        set_activation_timeout_secs(0);
+
+        // Mid-frame: alignment lost, so this is correctly FATAL and the socket
+        // goes. What must hold is that it happened on OUR deadline's clock.
+        assert!(
+            matches!(err, TransportError::Io(_)),
+            "a mid-frame stall must stay fatal, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200) + FRAME_PHASE_GRACE + Duration::from_secs(2),
+            "partial header escaped the overall deadline: {elapsed:?}"
         );
     }
 
