@@ -710,10 +710,26 @@ fn encode_token_with_seq(token: i32, seq: u32) -> WireTensor {
 
 /// Decode an I32 `[1,1,2]` token frame into `(token, echo_seq)`. The seq cast
 /// round-trips the bit pattern (i32 -> u32), so wrap-around values survive.
+///
+/// Validation is STRICT — dtype, shape and length, matching `decode_wire_lead`
+/// and `decode_wire_tokens` rather than checking length alone. A length-only
+/// check accepted any 8-byte frame, and the packed path's reply is exactly
+/// that: `encode_wire_tokens` for one row is I64 `[1,1,1]`, 8 bytes. It decoded
+/// as `token` = the low word and `echo_seq` = 0, and since the first stamped
+/// seq was also 0 the FIRST exchange of a non-packed head wired to a packed
+/// neighbour matched and emitted a token from a structurally mismatched
+/// pipeline; every later step then discarded every reply and stalled the full
+/// deadline. A legacy 4-byte I32 `[1,1,1]` token from a pre-seq peer is caught
+/// here too, with the remedy named.
 fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
-    if t.data.len() < 8 {
+    if t.dtype != WireDType::I32 || t.shape != [1, 1, 2] || t.data.len() != 8 {
         return Err(EngineError::Backend(format!(
-            "downstream sent {}-byte token tensor; need at least 8 ([token, seq])",
+            "expected an I32 [1,1,2] 8-byte token frame ([token, seq]), got dtype={:?} \
+             shape={:?} len={} — a 4-byte I32 [1,1,1] frame means the downstream runs a build \
+             predating the seq-tagged token wire (upgrade both stages); an I64 frame means a \
+             packed stage is wired to a non-packed one",
+            t.dtype,
+            t.shape,
             t.data.len()
         )));
     }
@@ -5160,6 +5176,39 @@ mod tests {
         assert_eq!(&t.data[0..4], &42i32.to_le_bytes());
         assert_eq!(&t.data[4..8], &9i32.to_le_bytes());
         assert_eq!(decode_token_with_seq(&t).unwrap(), (42, 9));
+    }
+
+    /// The token frame must be validated by dtype AND shape, not length alone.
+    /// Both rejections below are 8-byte frames that a length-only check waved
+    /// through — the packed one silently produced a token on the first exchange
+    /// of a mismatched pipeline, because `echo_seq` decoded as 0 and the first
+    /// stamped seq was 0 too.
+    #[test]
+    fn token_frame_rejects_foreign_8_byte_frames() {
+        // A packed stage's single-row reply: I64 [1,1,1], 8 bytes.
+        let packed_reply = encode_wire_tokens(&[7]);
+        assert_eq!(packed_reply.data.len(), 8, "the collision needs 8 bytes");
+        let err = decode_token_with_seq(&packed_reply)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("packed stage is wired to a non-packed"),
+            "{err}"
+        );
+
+        // A pre-seq peer's legacy token: I32 [1,1,1], 4 bytes.
+        let legacy = WireTensor::new(WireDType::I32, [1, 1, 1], 42i32.to_le_bytes().to_vec());
+        let err = decode_token_with_seq(&legacy).unwrap_err().to_string();
+        assert!(err.contains("predating the seq-tagged token wire"), "{err}");
+
+        // A non-packed lead frame that desynced into the token slot.
+        assert!(decode_token_with_seq(&encode_wire_lead(3, None)).is_err());
+
+        // The real thing still decodes.
+        assert_eq!(
+            decode_token_with_seq(&encode_token_with_seq(42, 9)).unwrap(),
+            (42, 9)
+        );
     }
 
     #[test]
