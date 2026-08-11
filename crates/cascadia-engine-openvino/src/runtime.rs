@@ -700,7 +700,9 @@ fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option
 }
 
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
-/// (8 bytes). The seq rides as the low i32; `decode_token_with_seq` reverses it.
+/// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
+/// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
+/// `decode_token_with_seq` reverses it.
 fn encode_token_with_seq(token: i32, seq: u32) -> WireTensor {
     let mut bytes = Vec::with_capacity(8);
     bytes.extend_from_slice(&token.to_le_bytes());
@@ -1883,16 +1885,28 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        // #40: the token response has a REAL deadline (this is an ACTIVE
-        // generation), unlike the idle-between-requests wait in
-        // `recv_hidden_from_upstream`. The bounded, NON-fatal frame-start recv
-        // (inside recv_token_seq_checked) means an orphaned token-wait (the
-        // chain re-formed under us) times out + propagates as a step Err so the
-        // caller releases the engine lock for a retry, instead of blocking
-        // deadline-exempt on the frame-idle ceiling and wedging the lock for the
-        // whole budget (cascadia-enterprise #40). On top of that, a LATE orphan
-        // token whose echoed seq != the one we stamped is discarded (it would
-        // otherwise be read by the next request → silent token desync).
+        // #40. This wait was ALREADY deadlined before the bounded recv landed —
+        // it used `recv_reply`/`recv_reply_prefill`, whose frame-start runs
+        // under `recv_timeout`. What it was not is SURVIVABLE: a reply timeout
+        // surfaced as "recv_exact timed out", which both
+        // `recv_error_is_connection_fatal` and `EngineError::is_connection_fatal`
+        // read as fatal, so the transport dropped the socket — and
+        // `ActivationClient` dials once, at startup, with nothing to re-dial it.
+        // A head that timed out on an orphaned token wait (its chain re-formed
+        // under it after a rank restart) therefore lost its downstream for the
+        // life of the process and answered every later request `NotConnected`.
+        //
+        // So the fix here is the CLASSIFICATION, not the bound: elapsing at the
+        // frame start consumes zero bytes (cancel-safe read), leaves the socket
+        // aligned, and returns a retryable error, so the caller releases the
+        // engine lock and the next request serves on the re-formed chain.
+        //
+        // Keeping the socket is what admits a late orphan token, which the
+        // per-hop seq echo then discards — without it that token would be read
+        // as the NEXT request's and silently desync the stream.
+        //
+        // Unlike the idle-between-requests wait in `recv_hidden_from_upstream`,
+        // this one has a real deadline: an active generation owes a token.
         let awaiting = self.awaiting_token_seq;
         match self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill)) {
             Ok(token) => {
@@ -5437,11 +5451,20 @@ mod tests {
     // -------- per-hop sequence echo (token desync guard) --------
     //
     // `OvRuntimeEngine` can't be constructed without a compiled OpenVINO IR
-    // (stub mode errors), so these exercise the extracted wire helpers — the
-    // actual bodies of send_hidden_downstream / recv_hidden_from_upstream /
-    // send_token_to_upstream / recv_token_from_downstream — over real
+    // (stub mode errors), so these exercise the extracted wire helpers over real
     // ActivationServer/ActivationClient loopback pairs, mirroring the transport
     // crate's roundtrip tests.
+    //
+    // send_hidden_frames / recv_hidden_frames / recv_token_seq_checked ARE the
+    // bodies of send_hidden_downstream / recv_hidden_from_upstream /
+    // recv_token_from_downstream, so those three are covered here.
+    // send_token_to_upstream is NOT: its body inlines the encode, the lock and
+    // the send, so what these tests cover of it is the encoder alone.
+    //
+    // Still untested for want of a constructible engine: the field wiring
+    // itself — the stamp/echo assignments and the escalation counter — and the
+    // engine-lock release that motivates the bounded wait. Those need either a
+    // seam that does not exist yet or hardware.
 
     /// Stand up a connected (client, server) loopback pair. `client` is the
     /// engine's `downstream` (an ActivationClient); `server` plays the
@@ -5477,8 +5500,10 @@ mod tests {
         assert_eq!(tok, 42, "stale token must be skipped, correct one returned");
     }
 
+    /// A matching echo returns that token. (Named for what it asserts — the
+    /// value — not for timing, which nothing here measures.)
     #[tokio::test]
-    async fn recv_token_seq_match_returns_immediately() {
+    async fn recv_token_seq_match_returns_the_token() {
         let (client, mut server) = loopback().await;
         let awaiting = 7u32;
         server
@@ -5888,10 +5913,13 @@ mod tests {
         assert_eq!(hid_t.data, hid.data, "hidden is the second frame");
     }
 
+    /// The seq is carried as an i64 lane on the lead wire and an i32 lane on
+    /// the token wire, so the extreme value has to survive both casts and still
+    /// compare equal in the stale check. (This covers the ENCODING, not the
+    /// `wrapping_add` at the stamp site — that lives on the engine struct and
+    /// is not reachable without a compiled IR.)
     #[tokio::test]
-    async fn seq_wraps_past_u32_max_without_panic() {
-        // The stamp uses wrapping_add; u32::MAX wraps to 0.
-        assert_eq!(u32::MAX.wrapping_add(1), 0);
+    async fn seq_at_u32_max_survives_both_wires() {
         // A seq at u32::MAX must survive the i32 round-trip on both wires and
         // still match in the stale check (u32::MAX as i32 == -1, back to MAX).
         assert_eq!(

@@ -99,7 +99,14 @@ pub enum TransportError {
     /// partial frame was read, so the socket stays aligned + usable — the caller
     /// re-issues the recv on the next step. Lets an ORPHANED token-wait (its
     /// chain re-formed under it) release the engine lock without dropping the
-    /// once-dialed loopback the engine cannot re-dial. See `recv_token`.
+    /// once-dialed downstream socket the engine cannot re-dial. See
+    /// [`ActivationClient::recv_token`].
+    ///
+    /// The late frame this admits is handled a layer up: the ov-runtime stamps
+    /// a per-hop sequence number on each activation and the neighbour echoes it
+    /// on the token, so a token belonging to an abandoned generation is
+    /// discarded rather than read as the next one's. That guard is what makes
+    /// keeping the socket safe here — see `recv_error_is_connection_fatal`.
     #[error("frame-start wait timed out after {0:?} with no bytes (retryable)")]
     FrameStartTimeout(Duration),
 }
@@ -378,9 +385,12 @@ async fn decode_header_and_recv_body(
     }
 
     let mut data = vec![0u8; payload_len as usize];
-    // Time only the payload phase: the header wait above legitimately
-    // includes idle time between requests (frame-start exemption), which
-    // would swamp a latency histogram with idle gaps.
+    // Time only the payload phase. The header wait happens in the CALLER, and
+    // for the lenient entry point it legitimately includes idle time between
+    // requests (the frame-start exemption), which would swamp a latency
+    // histogram with idle gaps. The deadlined callers do bound their header
+    // wait, but the histogram stays payload-only across all of them so the
+    // series measures one thing.
     let payload_started = Instant::now();
     match body_timeout {
         Some(to) => recv_exact_within(sock, &mut data, to).await?,
@@ -541,7 +551,17 @@ fn clamp_frame_idle_ceiling(
 ///
 /// * frame-START idle ceiling ([`TransportError::FrameIdleCeiling`]) — the
 ///   peer is connected but silent; a frame it sends later must never land in
-///   the next request (token frames carry no task id).
+///   the next request.
+///
+///   Note the BOUNDED frame-start wait ([`TransportError::FrameStartTimeout`])
+///   is deliberately NOT in this list, even though it is the same event. The
+///   difference is who is waiting and what protects them. The idle ceiling
+///   fires on a wait with no request behind it, on a wire whose frames carry no
+///   request identity, so the only safe move is to drop the socket. The bounded
+///   wait fires on an ACTIVE generation whose caller stamps a per-hop sequence
+///   number and rejects a token echoing the wrong one — the late frame is
+///   identifiable there, so the socket can be kept. Keeping it is the point: it
+///   is dialed once and cannot be re-dialed.
 /// * MID-frame deadline — a frame began but stalled past the strict
 ///   [`recv_timeout`]; [`recv_exact`] surfaces this as `Io(TimedOut)`,
 ///   leaving a half-consumed frame on the wire that the next recv would read
@@ -984,7 +1004,8 @@ impl ActivationClient {
     /// is kept (no partial frame consumed) so the caller retries on its next
     /// step. Used by the ov-runtime head/middle `recv_token_from_downstream`:
     /// an orphaned token-wait (its chain re-formed under it) must release the
-    /// engine lock WITHOUT dropping the once-dialed loopback it cannot re-dial.
+    /// engine lock WITHOUT dropping the once-dialed downstream socket it cannot
+    /// re-dial.
     /// A mid-frame stall still surfaces fatally (alignment lost).
     pub async fn recv_token(
         &mut self,
@@ -1383,9 +1404,13 @@ mod tests {
     }
 
     /// Client twin of `reply_wait_longer_than_timeout_fails_fast`: the
-    /// engine's downstream leg is an `ActivationClient` (the production
-    /// path for `recv_token_from_downstream`), and its reply methods are
-    /// separate near-verbatim copies of the server's — pin them
+    /// engine's downstream leg is an `ActivationClient`, and its reply methods
+    /// are separate near-verbatim copies of the server's — pin them
+    ///
+    /// (Production users of these client reply methods are `gemma4`'s
+    /// `recv_token_from_downstream` and the ov-runtime PACKED exchange. The
+    /// ov-runtime's non-packed token wait uses `recv_token` instead, which is
+    /// covered by `recv_token_frame_start_timeout_is_nonfatal_then_retryable`.)
     /// independently so the twins can't drift apart.
     #[tokio::test]
     async fn client_reply_wait_longer_than_timeout_fails_fast() {
@@ -1473,7 +1498,7 @@ mod tests {
     /// #40: `recv_token` (active-response recv) on a connected-but-silent peer
     /// must return the NON-fatal `FrameStartTimeout` within the bounded deadline
     /// WITHOUT dropping the socket — so an orphaned token-wait releases the
-    /// engine lock yet the once-dialed loopback survives, and a retry on the
+    /// engine lock yet the once-dialed downstream socket survives, and a retry on the
     /// SAME socket reads the token once it arrives.
     #[tokio::test]
     async fn recv_token_frame_start_timeout_is_nonfatal_then_retryable() {
@@ -1491,10 +1516,16 @@ mod tests {
         let mut server = h.await.unwrap();
 
         // 1) silent peer → bounded frame-start times out NON-fatally; socket kept.
+        let t0 = Instant::now();
         let err = client
             .recv_token(Duration::from_millis(200))
             .await
             .unwrap_err();
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "the bounded wait must honour its deadline, took {:?}",
+            t0.elapsed()
+        );
         assert!(
             matches!(err, TransportError::FrameStartTimeout(_)),
             "expected non-fatal FrameStartTimeout, got {err:?}"
@@ -1505,14 +1536,18 @@ mod tests {
         );
 
         // 2) peer now sends the token → retry on the SAME socket succeeds.
-        let token = Tensor::new(DType::I32, [1, 1, 1], 7i32.to_le_bytes().to_vec());
+        // Shaped like the ov-runtime's real token frame (I32 [1,1,2] =
+        // [token, seq]); the transport is format-agnostic, but a reader
+        // cross-referencing the engine shouldn't trip over a stale shape here.
+        let mut payload = 7i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&3i32.to_le_bytes());
+        let token = Tensor::new(DType::I32, [1, 1, 2], payload);
         server.send(&token).await.unwrap();
         let (got, _) = client.recv_token(Duration::from_secs(2)).await.unwrap();
         set_activation_timeout_secs(0);
         assert_eq!(
-            got.data,
-            7i32.to_le_bytes().to_vec(),
-            "retry must read the token on the surviving socket"
+            got.data, token.data,
+            "retry must read the whole frame on the surviving socket"
         );
     }
 
