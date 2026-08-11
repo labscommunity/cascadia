@@ -481,6 +481,20 @@ pub struct ChatCompletionRequest {
     /// <think> block (engines that can't, ignore it).
     #[serde(default = "default_true")]
     pub enable_thinking: bool,
+    /// Reasoning depth for hybrid-reasoning templates. GLM-5's template reads
+    /// it directly:
+    ///
+    /// ```jinja
+    /// {%- set effective_reasoning_effort =
+    ///      'high' if reasoning_effort is defined and reasoning_effort == 'high'
+    ///      else 'max' -%}
+    /// ```
+    ///
+    /// Undefined therefore means **Max** — the template injects a
+    /// `Reasoning Effort: Max` system line on every thinking request. Only the
+    /// literal `"high"` changes anything; anything else is Max.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
@@ -918,7 +932,7 @@ fn chat_template_smoke_failures(
     cases
         .into_iter()
         .filter_map(|(name, msgs, tools, thinking)| {
-            match render_with_chat_env(env, msgs, "", "", thinking, tools) {
+            match render_with_chat_env(env, msgs, "", "", thinking, None, tools) {
                 Err(PromptRenderError::Failed(e)) => Some((name, e)),
                 _ => None,
             }
@@ -1028,6 +1042,7 @@ fn render_with_chat_env(
     bos_token: &str,
     eos_token: &str,
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     use minijinja::context;
@@ -1075,6 +1090,11 @@ fn render_with_chat_env(
         messages => messages_value,
         add_generation_prompt => true,
         enable_thinking => enable_thinking,
+        // Left undefined when None so the template's own default applies —
+        // GLM-5 resolves undefined to 'max'. Passing an empty string instead
+        // would define it and still resolve to 'max', but would misrepresent
+        // "caller said nothing" as "caller chose".
+        reasoning_effort => reasoning_effort,
         bos_token => bos_token,
         eos_token => eos_token,
         tools => tools_value,
@@ -1145,6 +1165,7 @@ fn render_or_fallback(
     bos_token: &str,
     eos_token: &str,
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
@@ -1158,7 +1179,15 @@ fn render_or_fallback(
         }
         return Ok(render_prompt_legacy(messages));
     };
-    match render_with_chat_env(env, messages, bos_token, eos_token, enable_thinking, tools) {
+    match render_with_chat_env(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+    ) {
         Ok(s) => Ok(s),
         // A raise_exception is the template validating its own input; other
         // engines surface it rather than papering over it.
@@ -1178,6 +1207,7 @@ fn render_prompt(
     state: &AppState,
     messages: &[ChatMessage],
     enable_thinking: bool,
+    reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
@@ -1197,6 +1227,7 @@ fn render_prompt(
         &state.bos_token,
         &state.eos_token,
         enable_thinking,
+        reasoning_effort,
         tools,
     )
 }
@@ -1650,12 +1681,29 @@ impl ChatPromptRenderer {
         tools: Option<&[Tool]>,
         enable_thinking: bool,
     ) -> Result<String, PromptRenderError> {
+        self.render_with_effort(messages, tools, enable_thinking, None)
+    }
+
+    /// As [`render_with_opts`](Self::render_with_opts) but also setting the
+    /// template's `reasoning_effort`.
+    ///
+    /// GLM-5's template resolves an undefined `reasoning_effort` to `'max'` and
+    /// injects a `Reasoning Effort: Max` system line, so leaving it unset is not
+    /// neutral — it is the most expensive setting, chosen by omission.
+    pub fn render_with_effort(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String, PromptRenderError> {
         render_or_fallback(
             self.env.as_deref(),
             messages,
             &self.bos_token,
             &self.eos_token,
             enable_thinking,
+            reasoning_effort,
             tools,
         )
     }
@@ -1689,6 +1737,7 @@ async fn chat_completions(
         &state,
         &req.messages,
         req.enable_thinking,
+        req.reasoning_effort.as_deref(),
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -3317,7 +3366,7 @@ mod tests {
             tool_call_id: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
             .expect("macro-based template must render");
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
@@ -3379,7 +3428,7 @@ mod tests {
             tool_call_id: None,
         }];
         let env = build_chat_env(T).expect("template parses");
-        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None)
+        let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
             .expect("arguments|items must not fail the render");
         assert!(out.contains("fn=get_weather"), "out={out}");
         assert!(out.contains("city=Tokyo"), "out={out}");
@@ -3829,7 +3878,7 @@ mod tests {
             r#type: "function".into(),
             function: serde_json::json!({"name":"get_weather"}),
         }];
-        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools)).unwrap();
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert!(
             out.contains("[TOOLS:get_weather]"),
             "tools not forwarded: {out}"
@@ -3856,7 +3905,7 @@ mod tests {
         }];
         let env = build_chat_env("{% if tools %}{{ tools | tojson }}{% endif %}")
             .expect("tojson template must parse");
-        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools))
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools))
             .expect("tojson template must render (needs minijinja `json` feature)");
         assert!(
             out.contains("get_weather"),
@@ -3999,7 +4048,7 @@ mod tests {
             "{% if tools %}{{ tools[0].function | tojson(ensure_ascii=False) }}{% endif %}",
         )
         .expect("template must parse");
-        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools))
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools))
             .expect("tojson(ensure_ascii=False) must render");
         assert_eq!(
             out,
@@ -4064,15 +4113,48 @@ mod tests {
         // Renders fine without tools; explodes inside the tools branch.
         let env = build_chat_env("{% if tools %}{{ nope.missing.deeper }}{% endif %}ok").unwrap();
 
-        let err = render_or_fallback(Some(&env), &msgs, "", "", true, Some(&tools))
+        let err = render_or_fallback(Some(&env), &msgs, "", "", true, None, Some(&tools))
             .expect_err("a tools request must not fall back");
         assert!(matches!(err, PromptRenderError::Failed(_)), "{err:?}");
 
         // Same broken template, no tools: fallback is still allowed, because a
         // degraded prompt beats a dead endpoint.
-        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None)
+        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None, None)
             .expect("tool-less requests keep the fallback");
         assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn undefined_reasoning_effort_resolves_to_max_not_neutral() {
+        // GLM-5's own template, reduced to the branch that matters:
+        //
+        //   {%- set effective = 'high' if reasoning_effort is defined
+        //        and reasoning_effort == 'high' else 'max' -%}
+        //
+        // Leaving it unset is NOT neutral — it selects Max, the most expensive
+        // setting, by omission. That is what the fleet did on every thinking
+        // request, and the likely reason a one-line question could not finish
+        // inside 256 tokens.
+        const T: &str = "{%- set effective = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' -%}Reasoning Effort: {{ effective }}";
+        let env = build_chat_env(T).unwrap();
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let unset = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
+        assert_eq!(unset, "Reasoning Effort: max", "omission selects max");
+
+        let high = render_with_chat_env(&env, &msgs, "", "", true, Some("high"), None).unwrap();
+        assert_eq!(high, "Reasoning Effort: high");
+
+        // Only the literal "high" does anything; every other value is max, so a
+        // typo silently costs maximum reasoning.
+        let typo = render_with_chat_env(&env, &msgs, "", "", true, Some("High"), None).unwrap();
+        assert_eq!(typo, "Reasoning Effort: max", "template is case-sensitive");
     }
 
     #[test]
@@ -4088,12 +4170,12 @@ mod tests {
             r#type: "function".into(),
             function: serde_json::json!({"name": "get_weather"}),
         }];
-        let err = render_or_fallback(None, &msgs, "", "", true, Some(&tools))
+        let err = render_or_fallback(None, &msgs, "", "", true, None, Some(&tools))
             .expect_err("no template + tools must not be answered");
         assert!(matches!(err, PromptRenderError::Rejected(_)), "{err:?}");
 
         assert!(
-            render_or_fallback(None, &msgs, "", "", true, None).is_ok(),
+            render_or_fallback(None, &msgs, "", "", true, None, None).is_ok(),
             "tool-less requests still render without a template"
         );
     }
@@ -4112,7 +4194,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        match render_or_fallback(Some(&env), &msgs, "", "", true, None) {
+        match render_or_fallback(Some(&env), &msgs, "", "", true, None, None) {
             Err(PromptRenderError::Rejected(m)) => {
                 assert!(m.contains("system role not supported"), "{m}")
             }
@@ -4163,7 +4245,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let out = render_with_chat_env(&env, &msgs, "", "", true, Some(&tools)).unwrap();
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
     }
 
@@ -4180,13 +4262,13 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
         assert!(out.chars().all(|c| c.is_ascii_digit()), "{out:?}");
 
         let bad = build_chat_env(r#"{{ strftime_now("%Q") }}"#).unwrap();
         assert!(
-            render_with_chat_env(&bad, &msgs, "", "", true, None).is_err(),
+            render_with_chat_env(&bad, &msgs, "", "", true, None, None).is_err(),
             "an unsupported strftime specifier must error, not render empty"
         );
     }
@@ -4217,7 +4299,7 @@ mod tests {
                 tool_call_id: Some("call_1".into()),
             },
         ];
-        let out = render_with_chat_env(&env, &msgs, "", "", true, None).unwrap();
+        let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert!(
             out.contains("[CALLS:get_weather]"),
             "assistant tool_calls not rendered: {out}"
