@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.1.8](https://github.com/labscommunity/cascadia/compare/v0.1.7...v0.1.8) (2026-08-11)
+
+
+### Features
+
+* **cli:** allow --packed-slots with --total &gt; 1 ([#122](https://github.com/labscommunity/cascadia/issues/122) fixed) ([1f55d68](https://github.com/labscommunity/cascadia/commit/1f55d681e45071c6dd079007f27cb54a9f5b3db7))
+
+
+### Bug Fixes
+
+* **cli:** reject --packed-prefix with --total &gt; 1 ([e93a394](https://github.com/labscommunity/cascadia/commit/e93a3944f04c29d09daa55c712762bb69ac0d769))
+* **cli:** use generate_async in the stdin loop ([c464538](https://github.com/labscommunity/cascadia/commit/c46453860f240f54951a949adaad7cd653581add))
+* **deps:** upgrade lru to 0.18 (RUSTSEC-2026-0253) ([740c88c](https://github.com/labscommunity/cascadia/commit/740c88ce154e295b95764887cd89333c8767cc74))
+* **deps:** upgrade lru to 0.18 (RUSTSEC-2026-0253) ([6728209](https://github.com/labscommunity/cascadia/commit/6728209fb169c103416189a3f04d41420eebcd7c))
+* **engine:** add BatchAborted error variant so NACKs can't be misclassified as connection-fatal ([af1e8e2](https://github.com/labscommunity/cascadia/commit/af1e8e2ca0730aa23543a8b55ef106a895e47eb7))
+* **ov-runtime:** fail fast and loud after the packed downstream link is poisoned ([64a28b4](https://github.com/labscommunity/cascadia/commit/64a28b42964eb6308513d871e01046d577e5a709))
+* **ov-runtime:** harden the packed multi-stage wire against loss and silence ([#122](https://github.com/labscommunity/cascadia/issues/122)) ([3b0eefd](https://github.com/labscommunity/cascadia/commit/3b0eefd1244e7fa5ba05617f6253afd7ba8c2b9f))
+* **ov-runtime:** surface the step error when a NACK send also fails ([8fec1a1](https://github.com/labscommunity/cascadia/commit/8fec1a1819097821814fda795a2ec9357f9aa3ee))
+* **runner:** apply deferred cancels on lock acquisition and bound the queue ([984dbcd](https://github.com/labscommunity/cascadia/commit/984dbcd069e229a9895b1a2cd2e243e12352edd2))
+* **runner:** never block tokio workers on the engine mutex ([#122](https://github.com/labscommunity/cascadia/issues/122)) ([48047c7](https://github.com/labscommunity/cascadia/commit/48047c73751e9d10dcdbdd69e145fdcaa0aeb8bb))
+* **runner:** wake parked streams even when a step panics ([84b81ab](https://github.com/labscommunity/cascadia/commit/84b81ab54ade8689c509bbcf4788859f6efda10a))
+* **runner:** wake parked streams on submit's NotLoaded early return ([628ef9b](https://github.com/labscommunity/cascadia/commit/628ef9b3b22b1b98c4a86ace577350b38d605e50))
+
+
+### Refactor
+
+* **runner:** enforce wake-on-release via an engine lock guard ([3633f22](https://github.com/labscommunity/cascadia/commit/3633f22fcf949d6ab9fc4417790552981a9133cc))
+
+
+### Documentation
+
+* correct lock-protocol and blocking-API comments ([d2f5e16](https://github.com/labscommunity/cascadia/commit/d2f5e168ed42c6ec5323a9dbc192fb60488429c8))
+* multi-stage packed is available again; record the [#122](https://github.com/labscommunity/cascadia/issues/122) root cause ([da8a892](https://github.com/labscommunity/cascadia/commit/da8a892c1f381e9b2e0ff17678e7122ba982e304))
+
+
+### Testing
+
+* **runner:** cover NACK-driven batch aborts and close-while-parked ([d157382](https://github.com/labscommunity/cascadia/commit/d1573820655501640f8af39ad19793ed27c3cfd7))
+
 ## [0.1.7](https://github.com/labscommunity/cascadia/compare/v0.1.6...v0.1.7) (2026-08-06)
 
 
