@@ -898,6 +898,132 @@ fn build_choice(
     )
 }
 
+/// Closing delimiter every hybrid-reasoning template this stack serves uses
+/// (GLM-4.5+, Qwen3, R1-distill). Deliberately NOT a dialect registry: unlike
+/// tool-call markers, which are self-announcing, a reasoning delimiter is not,
+/// so arming is decided by the REQUEST (see [`ReasoningSplitter::new`]) rather
+/// than by sniffing the text. Add a second delimiter the day a second one ships
+/// on real hardware, not before.
+const THINK_CLOSE: &str = "</think>";
+const THINK_OPEN: &str = "<think>";
+
+/// Splits a hybrid-reasoning model's stream into reasoning and answer.
+///
+/// Chat templates for these models END THE PROMPT with an open `<think>`, so
+/// the model generates from inside the block: the opening tag never appears in
+/// the output and only the closing `</think>` does. A client looking for a
+/// matched pair therefore finds nothing and renders the entire scratchpad as
+/// the answer — and since thinking is enabled by default, that is what every
+/// default request gets today.
+///
+/// Feed output chunks through [`push`](Self::push) and call
+/// [`finish`](Self::finish) at end of stream. Both return
+/// `(reasoning_delta, content_delta)`.
+///
+/// Rules, chosen so streaming and buffered paths classify identically:
+/// - Disarmed (`enable_thinking: Some(false)`): everything is content. A stray
+///   `</think>` from a non-thinking model passes through untouched.
+/// - Armed: text before the first `</think>` is reasoning, text after is
+///   content. A leading `<think>` is stripped for templates that do NOT
+///   pre-open the block.
+/// - Armed with NO `</think>` ever (truncated mid-reasoning): everything is
+///   reasoning and content stays empty. Retroactively relabelling already-sent
+///   deltas is impossible, so the alternative would make streaming and buffered
+///   disagree — and would keep delivering a scratchpad as the answer in exactly
+///   the case that motivated this. `finish_reason=length` tells the client why.
+#[derive(Debug, Clone)]
+pub struct ReasoningSplitter {
+    armed: bool,
+    /// Delimiter seen: everything from here on is content.
+    closed: bool,
+    /// Whether any text has been inspected yet (for leading-`<think>` strip).
+    started: bool,
+    /// Withheld tail that could be the start of a split delimiter.
+    pending: String,
+}
+
+impl ReasoningSplitter {
+    /// `enable_thinking` is the value the backend uses to render the prompt —
+    /// `req.enable_thinking.unwrap_or(true)`. Deciding from the request, not
+    /// from markers in the output, is what keeps a stray `</think>` in ordinary
+    /// prose from silently relabelling an answer as reasoning.
+    pub fn new(enable_thinking: bool) -> Self {
+        Self {
+            armed: enable_thinking,
+            closed: false,
+            started: false,
+            pending: String::new(),
+        }
+    }
+
+    /// Longest suffix of `s` that is a proper prefix of `THINK_CLOSE`, so a
+    /// delimiter split across chunk boundaries (`</th` + `ink>`) is not missed.
+    /// Bounded by the delimiter length, so at most 7 bytes are ever withheld.
+    fn partial_delim_len(s: &str) -> usize {
+        let max = THINK_CLOSE.len() - 1;
+        let start = s.len().saturating_sub(max);
+        // Byte offsets must land on char boundaries or the slice panics.
+        (start..s.len())
+            .filter(|i| s.is_char_boundary(*i))
+            .find(|i| THINK_CLOSE.starts_with(&s[*i..]))
+            .map(|i| s.len() - i)
+            .unwrap_or(0)
+    }
+
+    /// Feed one chunk. Returns `(reasoning_delta, content_delta)`; either may
+    /// be empty.
+    pub fn push(&mut self, text: &str) -> (String, String) {
+        if !self.armed || self.closed {
+            return (String::new(), text.to_string());
+        }
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(text);
+        if !self.started {
+            // Templates that pre-open the block emit no opening tag; those that
+            // don't, emit one. Strip it either way so the reasoning text is the
+            // same shape for both.
+            let trimmed_is_empty = buf.trim_start().is_empty();
+            if let Some(rest) = buf.trim_start().strip_prefix(THINK_OPEN) {
+                let rest = rest.to_string();
+                buf = rest;
+            }
+            // Only commit to "started" once there is something besides
+            // whitespace, so a partial opening tag isn't misjudged.
+            if !trimmed_is_empty {
+                self.started = true;
+            }
+        }
+        if let Some(idx) = buf.find(THINK_CLOSE) {
+            self.closed = true;
+            let reasoning = buf[..idx].to_string();
+            let content = buf[idx + THINK_CLOSE.len()..].to_string();
+            return (reasoning, content);
+        }
+        // Withhold a possible split delimiter; emit the rest as reasoning.
+        let hold = Self::partial_delim_len(&buf);
+        let split = buf.len() - hold;
+        self.pending = buf[split..].to_string();
+        (buf[..split].to_string(), String::new())
+    }
+
+    /// End of stream: release anything withheld. Armed-but-never-closed means
+    /// the whole generation was reasoning.
+    pub fn finish(&mut self) -> (String, String) {
+        let tail = std::mem::take(&mut self.pending);
+        if !self.armed || self.closed {
+            (String::new(), tail)
+        } else {
+            (tail, String::new())
+        }
+    }
+
+    /// Whether the closing delimiter was seen. False at end of stream on an
+    /// armed splitter means the answer never arrived.
+    pub fn saw_close(&self) -> bool {
+        self.closed
+    }
+}
+
 /// Parse model tool-call output into structured calls; None when none found.
 /// Shape-based + engine-agnostic; never panics (each block parsed independently,
 /// malformed blocks skipped).
@@ -3068,6 +3194,92 @@ mod tests {
         assert_eq!(calls[0].function.name, "echo");
         let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
         assert_eq!(args["text"], "</tool_call> bye");
+    }
+
+    /// Drive a splitter over `chunks`, returning the concatenated
+    /// (reasoning, content) — the same generation must classify identically
+    /// however it happens to be chunked.
+    fn split_all(enable_thinking: bool, chunks: &[&str]) -> (String, String) {
+        let mut s = ReasoningSplitter::new(enable_thinking);
+        let (mut r, mut c) = (String::new(), String::new());
+        for ch in chunks {
+            let (rd, cd) = s.push(ch);
+            r.push_str(&rd);
+            c.push_str(&cd);
+        }
+        let (rd, cd) = s.finish();
+        r.push_str(&rd);
+        c.push_str(&cd);
+        (r, c)
+    }
+
+    #[test]
+    fn reasoning_splitter_splits_at_close_tag() {
+        // The fleet's shape: no opening tag in the output (the template ends
+        // the PROMPT with it), reasoning, then </think>, then the answer.
+        let (r, c) = split_all(true, &["thinking hard", "</think>", "The answer."]);
+        assert_eq!(r, "thinking hard");
+        assert_eq!(c, "The answer.");
+    }
+
+    #[test]
+    fn reasoning_splitter_handles_delimiter_split_across_chunks() {
+        // A delimiter straddling chunk boundaries must still be found, and no
+        // fragment of it may leak into either side. One token per chunk is the
+        // normal streaming case, so this is the default shape, not an edge one.
+        for chunks in [
+            vec!["reason", "</th", "ink>", "answer"],
+            vec!["reason<", "/", "t", "h", "i", "n", "k", ">", "answer"],
+            vec!["reason</think", ">answer"],
+        ] {
+            let (r, c) = split_all(true, &chunks);
+            assert_eq!(r, "reason", "chunks: {chunks:?}");
+            assert_eq!(c, "answer", "chunks: {chunks:?}");
+        }
+    }
+
+    #[test]
+    fn reasoning_splitter_truncated_generation_is_all_reasoning() {
+        // Armed, no </think> ever (cap hit mid-reasoning — observed on the
+        // fleet). Everything is reasoning; content stays empty. The opposite
+        // rule would hand a client a scratchpad as the answer, and could not be
+        // implemented in streaming anyway: deltas are labelled before the
+        // outcome is known.
+        let (r, c) = split_all(true, &["still thinking, no close tag"]);
+        assert_eq!(r, "still thinking, no close tag");
+        assert_eq!(c, "");
+        let mut s = ReasoningSplitter::new(true);
+        s.push("partial");
+        s.finish();
+        assert!(!s.saw_close(), "an unterminated stream must report saw_close=false");
+    }
+
+    #[test]
+    fn reasoning_splitter_disarmed_passes_everything_through() {
+        // enable_thinking=false: a stray </think> from a non-thinking model is
+        // ordinary content and must not silently relabel the answer. This is
+        // why arming is keyed on the REQUEST rather than sniffed from markers.
+        let (r, c) = split_all(false, &["a </think> b"]);
+        assert_eq!(r, "");
+        assert_eq!(c, "a </think> b");
+    }
+
+    #[test]
+    fn reasoning_splitter_strips_self_opened_tag() {
+        // Templates that do NOT pre-open the block emit the opening tag; strip
+        // it so reasoning has the same shape for both template styles.
+        let (r, c) = split_all(true, &["<think>weighing it", "</think>", "done"]);
+        assert_eq!(r, "weighing it");
+        assert_eq!(c, "done");
+    }
+
+    #[test]
+    fn reasoning_splitter_content_after_close_is_never_reasoning() {
+        // Once closed, later text is content even if it contains another
+        // delimiter — only the FIRST close splits.
+        let (r, c) = split_all(true, &["r", "</think>", "a </think> b"]);
+        assert_eq!(r, "r");
+        assert_eq!(c, "a </think> b");
     }
 
     #[test]
