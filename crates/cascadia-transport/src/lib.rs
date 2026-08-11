@@ -445,7 +445,13 @@ pub(crate) async fn recv_tensor_token(
     let deadline_at = start + frame_start_deadline;
     let mut header = [0u8; HEADER_SIZE];
     recv_exact_frame_start_strict(sock, &mut header, deadline_at).await?;
-    decode_header_and_recv_body(sock, &header, start, Some(remaining_with_grace(deadline_at))).await
+    decode_header_and_recv_body(
+        sock,
+        &header,
+        start,
+        Some(remaining_with_grace(deadline_at)),
+    )
+    .await
 }
 
 /// Config override (seconds) for the activation recv timeout; 0 = unset.

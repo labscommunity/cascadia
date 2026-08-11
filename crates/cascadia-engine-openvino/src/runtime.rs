@@ -14,18 +14,27 @@
 //!     stage_N/...
 //! ```
 //!
-//! Wire format between stages: hidden_states f16. Stateful shards have each
-//! stage track its own absolute-position counter (computing cos/sin locally,
-//! no position metadata on the wire); the counter resets when an activation
-//! with seq_len > 1 arrives (a prefill signal for relay/last stages).
+//! Wire format between stages (non-packed path): each activation is TWO frames,
+//! `[lead] [hidden_states f16]`. The lead is an I64 tensor carrying the per-hop
+//! sequence number, which the downstream neighbour echoes back on its token so
+//! a late orphan token can be discarded rather than read by the next request
+//! (see `encode_wire_lead`). The token reply is I32 `[1,1,2]` = `[token, seq]`.
+//!
+//! Stateful shards send lead `[1,1,1]` = `[seq]`: each stage tracks its own
+//! absolute-position counter (computing cos/sin locally, no position on the
+//! wire), and that counter resets when an activation with seq_len > 1 arrives
+//! (a prefill signal for relay/last stages).
 //!
 //! Stateless static-shape (NPU) shards (`stage_config.stateful == false`)
 //! instead drive a host-side bounded KV ring per stage (see `StaticKv`).
 //! Because static shards are seq=1, the seq>1 prefill signal is unavailable,
-//! so the first stage carries the absolute `position` as an 8-byte prefix on
-//! each activation; downstream stages reset their ring at position 0 and
-//! derive the visible-past count from it, keeping every stage's ring in
-//! lockstep. This path works single- or multi-stage (pipeline-parallel NPU).
+//! so they send lead `[1,1,2]` = `[seq, position]` carrying the absolute
+//! position; downstream stages reset their ring at position 0 and derive the
+//! visible-past count from it, keeping every stage's ring in lockstep. This
+//! path works single- or multi-stage (pipeline-parallel NPU).
+//!
+//! The lead frame's shape is what distinguishes the two paths on the wire, and
+//! a stage rejects a lead that does not match its own staticness.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -304,16 +313,6 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
         2 => [1, shape[0], shape[1]],
         _ => [1, 1, shape.last().copied().unwrap_or(0)],
     }
-}
-
-/// Encode the absolute position as its own framed wire tensor (I64 `[1,1,1]`).
-/// The static (NPU) path sends this immediately before each hidden activation
-/// so relay stages reset/align their KV ring; the transport requires
-/// `payload_len == shape*dtype`, so position cannot be packed into the hidden
-/// tensor (and MAX_RANK=3 leaves no spare shape slot). Paired with
-/// `decode_wire_position` — keep the two in sync.
-fn encode_wire_position(position: i64) -> WireTensor {
-    WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
 /// Refuse a packed variant whose query window is narrower than its slot count.
@@ -632,61 +631,72 @@ fn nack_send_error(send_err: EngineError, body_err: Option<&EngineError>) -> Eng
     }
 }
 
-/// Decode + strictly validate a wire position frame. Must be I64 with exactly
-/// 8 payload bytes and non-negative; anything else (a desynced stream, a
-/// stateful peer that sent a hidden tensor where a position was expected, or
-/// a corrupted frame) is a hard error rather than a silently wrong position.
-/// The sign check matters: downstream ring math casts to usize and the chunk
-/// path adds per-row offsets — a negative value would wrap instead of erroring.
-fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
-    if t.dtype != WireDType::I64 || t.data.len() != 8 {
-        return Err(EngineError::Backend(format!(
-            "expected an I64 8-byte position frame, got dtype={:?} len={} — likely a \
-             stateful/static pipeline mismatch or a desynced activation stream",
-            t.dtype,
-            t.data.len()
-        )));
-    }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&t.data);
-    let position = i64::from_le_bytes(b);
-    if position < 0 {
-        return Err(EngineError::Backend(format!(
-            "negative wire position {position} — corrupted or desynced activation stream"
-        )));
-    }
-    Ok(position)
-}
-
 // -------- per-hop sequence echo (token desync guard) --------
 
-/// Encode a per-hop sequence number as its own framed I64 `[1,1,1]` tensor.
+/// Encode the LEAD activation frame: the per-hop sequence number, plus the
+/// absolute position when the sending stage is static (NPU).
+///
 /// Each stage stamps a monotonic seq on the hidden it sends downstream; the
 /// downstream neighbor echoes it back on the token so a LATE orphaned token
 /// (from a slow/recovering peer) can be detected and discarded instead of
-/// silently read by the next request. Paired with `decode_wire_seq`.
-fn encode_wire_seq(seq: u32) -> WireTensor {
-    WireTensor::new(
-        WireDType::I64,
-        [1, 1, 1],
-        (seq as i64).to_le_bytes().to_vec(),
-    )
+/// silently read by the next request. Paired with `decode_wire_lead`.
+///
+/// The SHAPE is the discriminator: `[1,1,1]` = `[seq]` on the stateful path,
+/// `[1,1,2]` = `[seq, position]` on the static path. Carrying the position in
+/// this frame rather than a separate one is what makes the wire unambiguous —
+/// a standalone seq frame and a standalone position frame were both I64
+/// `[1,1,1]` with 8 bytes, i.e. byte-identical, so a static peer predating the
+/// seq wire had its position silently bound as a sequence number and the
+/// failure surfaced one frame later as a bogus complaint about the hidden
+/// frame. It also drops one frame per token per hop, which matters because
+/// `set_nodelay` is on: that was a third small TCP segment on every decode step.
+fn encode_wire_lead(seq: u32, position: Option<i64>) -> WireTensor {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&(seq as i64).to_le_bytes());
+    if let Some(p) = position {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    let lanes = if position.is_some() { 2 } else { 1 };
+    WireTensor::new(WireDType::I64, [1, 1, lanes], bytes)
 }
 
-/// Decode + strictly validate a leading seq frame (I64, 8 bytes). Symmetric
-/// with `encode_wire_seq`; the i64 carries a u32, so the cast round-trips.
-fn decode_wire_seq(t: &WireTensor) -> EngineResult<u32> {
-    if t.dtype != WireDType::I64 || t.data.len() != 8 {
+/// Decode + strictly validate the lead frame. Symmetric with
+/// `encode_wire_lead`; the seq lane's i64 carries a u32, so the cast
+/// round-trips (wrap-around values included).
+///
+/// `want_pos` is the RECEIVING stage's own staticness. The frame must carry
+/// exactly the lanes this stage expects, so a stateful/static pipeline
+/// mismatch, a desynced stream, or a peer predating the seq wire is a hard
+/// error here instead of a silent mis-bind. The sign check on the position
+/// lane matters for the same reason it did standalone: ring math casts to
+/// usize and a negative value would wrap rather than error.
+fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option<i64>)> {
+    let lanes: u32 = if want_pos { 2 } else { 1 };
+    let want_len = lanes as usize * 8;
+    if t.dtype != WireDType::I64 || t.shape != [1, 1, lanes] || t.data.len() != want_len {
         return Err(EngineError::Backend(format!(
-            "expected an I64 8-byte seq frame, got dtype={:?} len={} — likely a desynced \
-             activation stream or a peer that predates the seq-tagged token wire",
+            "expected an I64 [1,1,{lanes}] {want_len}-byte lead frame ([seq{}]), got \
+             dtype={:?} shape={:?} len={} — likely a stateful/static pipeline mismatch, a \
+             desynced activation stream, or a peer that predates the seq-tagged wire",
+            if want_pos { ", position" } else { "" },
             t.dtype,
+            t.shape,
             t.data.len()
         )));
     }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&t.data);
-    Ok(i64::from_le_bytes(b) as u32)
+    let seq = i64::from_le_bytes(t.data[0..8].try_into().unwrap()) as u32;
+    let position = if want_pos {
+        let p = i64::from_le_bytes(t.data[8..16].try_into().unwrap());
+        if p < 0 {
+            return Err(EngineError::Backend(format!(
+                "negative wire position {p} — corrupted or desynced activation stream"
+            )));
+        }
+        Some(p)
+    } else {
+        None
+    };
+    Ok((seq, position))
 }
 
 /// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
@@ -712,47 +722,46 @@ fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
     Ok((token, echo_seq))
 }
 
-/// Send the downstream activation frames in wire order: `[seq] [pos?] [hidden]`.
-/// Shared by `send_hidden_downstream` and its loopback tests so the order is
-/// defined in exactly one place.
+/// Send the downstream activation frames in wire order: `[lead] [hidden]`,
+/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
+///
+/// Takes the VALUES, not pre-encoded frames, and encodes here: the lead and the
+/// hidden are both `WireTensor`, so a pre-encoded signature let the two be
+/// transposed at the call site and still compile — on a wire whose frames were
+/// already hard to tell apart. Shared by `send_hidden_downstream` and its
+/// loopback tests so the order is defined in exactly one place.
 async fn send_hidden_frames(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
-    seq: WireTensor,
-    pos: Option<WireTensor>,
+    seq: u32,
+    position: Option<i64>,
     hid: WireTensor,
 ) -> Result<(), cascadia_transport::TransportError> {
+    let lead = encode_wire_lead(seq, position);
     let mut guard = downstream.lock().await;
-    guard.send(&seq).await?;
-    if let Some(p) = pos {
-        guard.send(&p).await?;
-    }
+    guard.send(&lead).await?;
     guard.send(&hid).await?;
     Ok(())
 }
 
-/// Receive the upstream activation frames in wire order: `[seq] [pos?] [hidden]`.
-/// Lenient (idle-between-requests) recv — the inverse of `send_hidden_frames`.
+/// Receive the upstream activation frames in wire order: `[lead] [hidden]` —
+/// the inverse of `send_hidden_frames`. Returns the raw frames so decoding
+/// happens outside the transport closure, where a bad frame yields a clear
+/// `EngineError` instead of a desync.
+///
+/// The LEAD frame is the IDLE "next request" wait (bounded only by the
+/// transport frame-idle ceiling — "no next request yet" is fine). The hidden
+/// frame is a mid-group reply the peer owes promptly once the group has
+/// started, so it is deadlined (`recv_reply`): a half-sent pair must not wedge
+/// the stage for the whole idle ceiling (#75 mid-pair protection, carried over
+/// to the seq-prefixed wire). Note this deadlines the hidden on the STATEFUL
+/// path too, which the pre-seq wire left lenient.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
-    want_pos: bool,
-) -> Result<(WireTensor, Option<WireTensor>, WireTensor), cascadia_transport::TransportError> {
+) -> Result<(WireTensor, WireTensor), cascadia_transport::TransportError> {
     let mut guard = upstream.lock().await;
-    // The leading seq frame is the IDLE "next request" wait (bounded only by
-    // the transport frame-idle ceiling — "no next request yet" is fine). Every
-    // frame AFTER it is a mid-group reply the peer owes promptly once the group
-    // has started, so deadline those (`recv_reply`) — a half-sent frame group
-    // must not wedge the stage for the whole idle ceiling (#75 mid-pair
-    // protection, generalized to the seq-prefixed wire).
-    let seq = guard.recv().await?.0;
-    let pos = if want_pos {
-        let p = guard.recv_reply().await?.0;
-        debug!("upstream recv: position frame arrived");
-        Some(p)
-    } else {
-        None
-    };
+    let lead = guard.recv().await?.0;
     let hid = guard.recv_reply().await?.0;
-    Ok((seq, pos, hid))
+    Ok((lead, hid))
 }
 
 /// Hard ceiling on the active token-response wait, independent of the body
@@ -1635,7 +1644,6 @@ impl OvRuntimeEngine {
         let seq = self.downstream_seq;
         self.downstream_seq = self.downstream_seq.wrapping_add(1);
         self.awaiting_token_seq = seq;
-        let seq_frame = encode_wire_seq(seq);
         let mut wire_shape = [1u32; MAX_RANK];
         for (i, d) in shape.iter().enumerate().take(MAX_RANK) {
             wire_shape[i] = *d as u32;
@@ -1645,15 +1653,12 @@ impl OvRuntimeEngine {
         // stage can reset its ring at position 0 and align the visible-past
         // count. The wire shape has only MAX_RANK=3 dims (all used by
         // [1,1,hidden]) and the transport requires payload_len == shape*dtype,
-        // so we can't pack it into the hidden tensor — send it as its own
-        // framed I64 tensor. Wire order: [seq] [pos if static] [hidden];
+        // so it cannot ride in the hidden tensor — it travels in the lead frame
+        // alongside the seq. Wire order: [lead] [hidden], where lead is
+        // [seq] (stateful) or [seq, position] (static);
         // recv_hidden_from_upstream mirrors it.
-        let pos = if self.static_kv.is_some() {
-            Some(encode_wire_position(position))
-        } else {
-            None
-        };
-        self.block_on(send_hidden_frames(&downstream, seq_frame, pos, hid))
+        let pos = self.static_kv.is_some().then_some(position);
+        self.block_on(send_hidden_frames(&downstream, seq, pos, hid))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
@@ -1686,24 +1691,21 @@ impl OvRuntimeEngine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Wire order is [seq] [pos if static] [hidden] (see send_hidden_frames).
-        // Each frame's payload must match its shape*dtype, so we recv each as a
-        // separate tensor. This recv stays LENIENT (idle-between-requests) — the
-        // bounded deadline lives only on the active token wait downstream.
+        // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
+        // [seq] or [seq, position]. The LEAD frame's wait is lenient
+        // (idle-between-requests); the hidden that must follow it is deadlined,
+        // and the bounded token deadline lives on the active wait downstream.
         let want_pos = self.static_kv.is_some();
         debug!(want_pos, "upstream recv: waiting");
-        let (seq_tensor, pos_tensor, tensor) = self
-            .block_on(recv_hidden_frames(&upstream, want_pos))
+        let (lead, tensor) = self
+            .block_on(recv_hidden_frames(&upstream))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!("upstream recv: frames arrived");
         // Record the seq this stage must echo back on the token it sends
         // upstream; decode/validate outside the transport closure so a bad
         // frame yields a clear EngineError, not a desync.
-        self.inbound_seq = decode_wire_seq(&seq_tensor)?;
-        let position = match pos_tensor {
-            Some(p) => Some(decode_wire_position(&p)?),
-            None => None,
-        };
+        let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+        self.inbound_seq = inbound_seq;
         let shape = [
             tensor.shape[0] as usize,
             tensor.shape[1] as usize,
@@ -4456,9 +4458,9 @@ mod tests {
 
     #[test]
     fn packed_plan_frame_rejects_bad_frames() {
-        // wrong rank/shape (a scalar position frame from a non-packed peer)
-        let pos = encode_wire_position(5);
-        assert!(decode_wire_plan(&pos, 4).is_err());
+        // wrong rank/shape (a non-packed peer's lead frame)
+        let lead = encode_wire_lead(5, None);
+        assert!(decode_wire_plan(&lead, 4).is_err());
         // slot id beyond this stage's slot count
         let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
         let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
@@ -5161,16 +5163,49 @@ mod tests {
     }
 
     #[test]
-    fn seq_frame_roundtrips() {
-        let f = encode_wire_seq(12345);
+    fn lead_frame_roundtrips_on_both_paths() {
+        // Stateful: one lane, seq only.
+        let f = encode_wire_lead(12345, None);
         assert_eq!(f.dtype, WireDType::I64);
         assert_eq!(f.shape, [1, 1, 1]);
-        assert_eq!(decode_wire_seq(&f).unwrap(), 12345);
+        assert_eq!(decode_wire_lead(&f, false).unwrap(), (12345, None));
+        // Static: two lanes, seq THEN position (lane order, not just presence).
+        let f = encode_wire_lead(7, Some(11));
+        assert_eq!(f.shape, [1, 1, 2]);
+        assert_eq!(&f.data[0..8], &7i64.to_le_bytes());
+        assert_eq!(&f.data[8..16], &11i64.to_le_bytes());
+        assert_eq!(decode_wire_lead(&f, true).unwrap(), (7, Some(11)));
+    }
+
+    /// The lead frame's SHAPE is what separates the stateful and static wires.
+    /// A stage must reject a lead that doesn't match its own staticness — this
+    /// is the check that turns a pre-seq peer, or a mismatched pipeline, into a
+    /// hard error instead of a silent mis-bind. Before the position moved into
+    /// this frame, a standalone seq frame and a standalone position frame were
+    /// byte-identical (I64 `[1,1,1]`, 8 bytes) and nothing could tell them apart.
+    #[test]
+    fn lead_frame_shape_mismatch_is_rejected_both_ways() {
+        // A static peer's lead read by a stateful stage.
+        let err = decode_wire_lead(&encode_wire_lead(1, Some(2)), false).unwrap_err();
+        assert!(err.to_string().contains("[1,1,1]"), "{err}");
+        // A stateful peer's lead — and equally a PRE-SEQ static peer's bare
+        // position frame, which has exactly this shape — read by a static stage.
+        let err = decode_wire_lead(&encode_wire_lead(1, None), true).unwrap_err();
+        assert!(err.to_string().contains("[1,1,2]"), "{err}");
+        assert!(err.to_string().contains("predates"), "{err}");
+        // Wrong dtype (an F16 hidden where the lead belongs).
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 1], vec![0, 0]);
+        assert!(decode_wire_lead(&hid, false).is_err());
+        // A negative position would wrap the ring math.
+        let mut bad = encode_wire_lead(1, Some(0));
+        bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
+        let err = decode_wire_lead(&bad, true).unwrap_err();
+        assert!(err.to_string().contains("negative wire position"), "{err}");
     }
 
     #[tokio::test]
     async fn hidden_to_token_roundtrip_preserves_seq() {
-        // HEAD sends [seq][hidden] downstream; TAIL recvs them, echoes the
+        // HEAD sends [lead][hidden] downstream; TAIL recvs them, echoes the
         // seq on the token; HEAD reads it back and matches on the same seq.
         let (client, server) = loopback().await;
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
@@ -5178,13 +5213,13 @@ mod tests {
 
         let stamped = 7u32;
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
-        send_hidden_frames(&downstream, encode_wire_seq(stamped), None, hid.clone())
+        send_hidden_frames(&downstream, stamped, None, hid.clone())
             .await
             .unwrap();
 
-        let (seq_t, pos_t, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
-        assert!(pos_t.is_none());
-        let inbound = decode_wire_seq(&seq_t).unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
+        assert!(pos.is_none());
         assert_eq!(inbound, stamped, "seq must survive the hidden hop");
         assert_eq!(hid_t.dtype, WireDType::F16);
         assert_eq!(hid_t.data, hid.data);
@@ -5201,35 +5236,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_shard_frame_order_is_seq_pos_hidden() {
-        // With a position frame present, order must be seq, then position,
-        // then hidden — distinct values catch a swap.
+    async fn static_shard_wire_is_lead_then_hidden() {
+        // Static path: lead carries [seq, position], hidden follows. Distinct
+        // values catch a lane swap or a frame transposition.
         let (client, server) = loopback().await;
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         let upstream = Arc::new(tokio::sync::Mutex::new(server));
 
         let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
-        send_hidden_frames(
-            &downstream,
-            encode_wire_seq(3),
-            Some(encode_wire_position(11)),
-            hid.clone(),
-        )
-        .await
-        .unwrap();
+        send_hidden_frames(&downstream, 3, Some(11), hid.clone())
+            .await
+            .unwrap();
 
-        let (seq_t, pos_t, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
         assert_eq!(
-            decode_wire_seq(&seq_t).unwrap(),
-            3,
-            "first frame is the seq"
+            decode_wire_lead(&lead, true).unwrap(),
+            (3, Some(11)),
+            "lead carries seq then position"
         );
-        assert_eq!(
-            decode_wire_position(&pos_t.unwrap()).unwrap(),
-            11,
-            "second frame is the position"
-        );
-        assert_eq!(hid_t.data, hid.data, "third frame is the hidden");
+        assert_eq!(hid_t.data, hid.data, "hidden is the second frame");
     }
 
     #[tokio::test]
@@ -5239,8 +5264,8 @@ mod tests {
         // A seq at u32::MAX must survive the i32 round-trip on both wires and
         // still match in the stale check (u32::MAX as i32 == -1, back to MAX).
         assert_eq!(
-            decode_wire_seq(&encode_wire_seq(u32::MAX)).unwrap(),
-            u32::MAX
+            decode_wire_lead(&encode_wire_lead(u32::MAX, None), false).unwrap(),
+            (u32::MAX, None)
         );
         let (client, mut server) = loopback().await;
         server

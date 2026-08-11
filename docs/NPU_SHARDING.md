@@ -140,13 +140,20 @@ What makes it *sharded* NPU rather than single-device NPU (`runtime.rs`
   each track their own absolute-position counter locally and reset it when a
   `seq>1` prefill activation arrives, so they need no position on the wire.
   Static (NPU) shards are `seq=1`, so that prefill signal does not exist.
-  Instead, **stage 0 sends the absolute `position` as its own 8-byte framed
-  tensor (I64 `[1,1,1]`) immediately before each hidden activation**
-  (`encode_wire_position`). Downstream stages read it (`decode_wire_position`),
-  reset their ring at `position == 0`, and derive their visible-past count from
-  it — keeping **every stage's ring in lockstep**. The frame is strictly
-  validated: a stateful/static pipeline mismatch is a hard error, not a silently
-  mis-padded position.
+  Instead, **stage 0 sends the absolute `position` in the LEAD frame that
+  precedes each hidden activation** (`encode_wire_lead`). The lead frame is an
+  I64 tensor carrying the per-hop sequence number, and its shape says which wire
+  this is: `[1,1,1]` = `[seq]` on the stateful path, `[1,1,2]` = `[seq,
+  position]` on the static path. Downstream stages read it
+  (`decode_wire_lead`), reset their ring at `position == 0`, and derive their
+  visible-past count from it — keeping **every stage's ring in lockstep**.
+
+  The frame is strictly validated against the receiving stage's own staticness,
+  so a stateful/static pipeline mismatch is a hard error rather than a silently
+  mis-padded position. Carrying the position here rather than in a frame of its
+  own is what makes that possible: a standalone position frame was byte-identical
+  to a standalone seq frame (both I64 `[1,1,1]`, 8 bytes), so the two could not
+  be told apart on the wire.
 - **Loop close.** The last stage (`has_head`) emits logits -> sample -> the token
   is fed back to stage 0 for the next step.
 
