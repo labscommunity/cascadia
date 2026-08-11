@@ -851,7 +851,8 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     // the message as a render error so the caller can decide whether to
     // fall back; either way the request shouldn't 500.
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
-        Err(Error::new(ErrorKind::InvalidOperation, msg))
+        Err(Error::new(ErrorKind::InvalidOperation, msg.clone())
+            .with_source(TemplateRejection(msg)))
     });
     // Some templates (Llama 3) call strftime_now() to embed the current date in
     // the system prompt. UTC keeps the render reproducible across a fleet whose
@@ -936,12 +937,12 @@ fn render_with_chat_env(
     eos_token: &str,
     enable_thinking: bool,
     tools: Option<&[Tool]>,
-) -> Result<String, String> {
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
         .get_template("chat")
-        .map_err(|e| format!("template lookup: {e}"))?;
+        .map_err(|e| PromptRenderError::Failed(format!("template lookup: {e}")))?;
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
@@ -986,8 +987,99 @@ fn render_with_chat_env(
         eos_token => eos_token,
         tools => tools_value,
     };
-    tmpl.render(ctx)
-        .map_err(|e| format!("template render: {e}"))
+    tmpl.render(ctx).map_err(|e| classify_render_error(&e))
+}
+
+/// Marker attached to `raise_exception(...)` errors so a template's own
+/// validation stays distinguishable from an engine compatibility gap after
+/// minijinja has wrapped it in template context.
+#[derive(Debug)]
+struct TemplateRejection(String);
+
+impl std::fmt::Display for TemplateRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRejection {}
+
+/// Why a chat-prompt render produced no prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptRenderError {
+    /// The request cannot be served as asked: the template rejected it via
+    /// `raise_exception(...)` (role ordering, an unsupported role), or it needs
+    /// a capability this model lacks. A client error — resending unchanged
+    /// cannot help.
+    Rejected(String),
+    /// The template could not be rendered, or none is loaded and the request
+    /// needs one. A server error — the request was well-formed.
+    Failed(String),
+}
+
+impl std::fmt::Display for PromptRenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) => write!(f, "chat template rejected the request: {m}"),
+            Self::Failed(m) => write!(f, "chat template render failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for PromptRenderError {}
+
+fn classify_render_error(err: &minijinja::Error) -> PromptRenderError {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(reject) = e.downcast_ref::<TemplateRejection>() {
+            return PromptRenderError::Rejected(reject.0.clone());
+        }
+        cur = e.source();
+    }
+    PromptRenderError::Failed(format!("template render: {err}"))
+}
+
+/// The one place that decides what a failed render means.
+///
+/// A template render is the only thing that can put tool definitions into a
+/// prompt — [`render_prompt_legacy`] has no way to express them, and emits none
+/// of the model's role markers. Falling back on a tools request therefore
+/// returns a confident answer to a question the model was never asked, so tools
+/// requests fail loudly instead. Tool-less requests keep the fallback, since a
+/// degraded prompt still beats a dead endpoint.
+fn render_or_fallback(
+    env: Option<&minijinja::Environment<'static>>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    tools: Option<&[Tool]>,
+) -> Result<String, PromptRenderError> {
+    let has_tools = tools.is_some_and(|t| !t.is_empty());
+    let Some(env) = env else {
+        if has_tools {
+            // vLLM likewise refuses tool use without a chat template rather
+            // than answering as if no tools had been sent.
+            return Err(PromptRenderError::Rejected(
+                "this model has no chat template, so tool definitions cannot be rendered".into(),
+            ));
+        }
+        return Ok(render_prompt_legacy(messages));
+    };
+    match render_with_chat_env(env, messages, bos_token, eos_token, enable_thinking, tools) {
+        Ok(s) => Ok(s),
+        // A raise_exception is the template validating its own input; other
+        // engines surface it rather than papering over it.
+        Err(e @ PromptRenderError::Rejected(_)) => Err(e),
+        Err(e @ PromptRenderError::Failed(_)) if has_tools => Err(e),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
+            );
+            Ok(render_prompt_legacy(messages))
+        }
+    }
 }
 
 fn render_prompt(
@@ -995,26 +1087,26 @@ fn render_prompt(
     messages: &[ChatMessage],
     enable_thinking: bool,
     tools: Option<&[Tool]>,
-) -> String {
-    let defer_to_engine = state.defer_template_on_thinking && enable_thinking;
-    if !defer_to_engine {
-        if let Some(env) = &state.chat_env {
-            match render_with_chat_env(
-                env,
-                messages,
-                &state.bos_token,
-                &state.eos_token,
-                enable_thinking,
-                tools,
-            ) {
-                Ok(s) => return s,
-                Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter")
-                }
-            }
+) -> Result<String, PromptRenderError> {
+    // ov-genai applies the model's own template, so the engine gets raw text.
+    // Tools would be dropped on the floor here, so refuse rather than pretend.
+    if state.defer_template_on_thinking && enable_thinking {
+        if tools.is_some_and(|t| !t.is_empty()) {
+            return Err(PromptRenderError::Failed(
+                "engine-side templating is active for thinking requests; tools cannot be forwarded"
+                    .into(),
+            ));
         }
+        return Ok(render_prompt_legacy(messages));
     }
-    render_prompt_legacy(messages)
+    render_or_fallback(
+        state.chat_env.as_deref(),
+        messages,
+        &state.bos_token,
+        &state.eos_token,
+        enable_thinking,
+        tools,
+    )
 }
 
 /// Decide the response message + finish_reason from accumulated text.
@@ -1443,11 +1535,14 @@ impl ChatPromptRenderer {
         }
     }
 
-    /// Render `messages` with optional `tools`, falling back to
-    /// [`render_prompt_legacy`] when no template is set or rendering fails.
-    /// `enable_thinking = true` — use [`render_with_opts`](Self::render_with_opts)
-    /// to control the template's thinking branch.
-    pub fn render_with_tools(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> String {
+    /// Render `messages` with optional `tools`. `enable_thinking = true` — use
+    /// [`render_with_opts`](Self::render_with_opts) to control the template's
+    /// thinking branch.
+    pub fn render_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+    ) -> Result<String, PromptRenderError> {
         self.render_with_opts(messages, tools, true)
     }
 
@@ -1459,28 +1554,21 @@ impl ChatPromptRenderer {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
         enable_thinking: bool,
-    ) -> String {
-        if let Some(env) = &self.env {
-            match render_with_chat_env(
-                env,
-                messages,
-                &self.bos_token,
-                &self.eos_token,
-                enable_thinking,
-                tools,
-            ) {
-                Ok(s) => return s,
-                Err(e) => {
-                    warn!(error = %e, "chat_template render failed; falling back to legacy formatter")
-                }
-            }
-        }
-        render_prompt_legacy(messages)
+    ) -> Result<String, PromptRenderError> {
+        render_or_fallback(
+            self.env.as_deref(),
+            messages,
+            &self.bos_token,
+            &self.eos_token,
+            enable_thinking,
+            tools,
+        )
     }
 
-    /// Render `messages`, falling back to [`render_prompt_legacy`] when no
-    /// template is set or rendering fails.
-    pub fn render(&self, messages: &[ChatMessage]) -> String {
+    /// Render `messages` with no tools. Falls back to
+    /// [`render_prompt_legacy`] when no template is set or rendering fails;
+    /// still errors if the template rejected the messages outright.
+    pub fn render(&self, messages: &[ChatMessage]) -> Result<String, PromptRenderError> {
         self.render_with_tools(messages, None)
     }
 }
@@ -1490,7 +1578,10 @@ impl ChatPromptRenderer {
 /// outside the router's `AppState`. Builds a [`ChatPromptRenderer`] per call;
 /// callers that render repeatedly should construct one [`ChatPromptRenderer`]
 /// and reuse it. Falls back to [`render_prompt_legacy`] on parse/render failure.
-pub fn render_chat_prompt(cfg: &ChatTemplateConfig, messages: &[ChatMessage]) -> String {
+pub fn render_chat_prompt(
+    cfg: &ChatTemplateConfig,
+    messages: &[ChatMessage],
+) -> Result<String, PromptRenderError> {
     ChatPromptRenderer::new(cfg).render(messages)
 }
 
@@ -1499,12 +1590,32 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let prompt = render_prompt(
+    let prompt = match render_prompt(
         &state,
         &req.messages,
         req.enable_thinking,
         req.tools.as_deref(),
-    );
+    ) {
+        Ok(p) => p,
+        // A tools request that cannot be templated must not return a 200: the
+        // model would answer without ever seeing the tools, and the caller
+        // cannot tell that from "the model chose not to call one".
+        Err(e @ PromptRenderError::Rejected(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e @ PromptRenderError::Failed(_)) => {
+            tracing::error!(error = %e, "chat_template render failed for a request that needs it");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
     // Degenerate input (no messages, or a render that collapses to nothing)
     // is a client error. Reject here with 400 rather than admitting an empty
     // prompt to the engine, which would generate nothing and return a 200
@@ -2501,7 +2612,9 @@ mod tests {
 
         // No template (a dsv4 export before the fix): generic formatter, no
         // R1 turn markers — the state that degrades instruct chat.
-        let legacy = ChatPromptRenderer::new(&ChatTemplateConfig::default()).render(&msgs);
+        let legacy = ChatPromptRenderer::new(&ChatTemplateConfig::default())
+            .render(&msgs)
+            .unwrap();
         assert!(
             !legacy.contains("<｜User｜>") && !legacy.contains("<｜Assistant｜>"),
             "legacy formatter must NOT emit R1 markers, got: {legacy}"
@@ -2513,7 +2626,7 @@ mod tests {
             bos_token: Some("<｜begin▁of▁sentence｜>".to_string()),
             eos_token: Some("<｜end▁of▁sentence｜>".to_string()),
         };
-        let r1 = ChatPromptRenderer::new(&cfg).render(&msgs);
+        let r1 = ChatPromptRenderer::new(&cfg).render(&msgs).unwrap();
         let want = "<｜begin▁of▁sentence｜><｜User｜>What is 2+2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3+3?<｜Assistant｜>";
         assert_eq!(r1, want, "R1 render mismatch");
     }
@@ -2542,7 +2655,9 @@ mod tests {
         assert_eq!(cfg.eos_token.as_deref(), Some("<｜end▁of▁sentence｜>"));
 
         // ...and it renders end-to-end through the same public renderer.
-        let out = ChatPromptRenderer::new(&cfg).render(&[msg("user", "hi")]);
+        let out = ChatPromptRenderer::new(&cfg)
+            .render(&[msg("user", "hi")])
+            .unwrap();
         assert_eq!(out, "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜>");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2558,6 +2673,34 @@ mod tests {
             .await
             .unwrap();
         make_router(Arc::new(runner), "mock-model")
+    }
+
+    /// A router whose model carries a (minimal) tools-capable chat template.
+    /// Tool requests need one: without a template there is nothing that can
+    /// render tool definitions, and the API refuses rather than answering as
+    /// though none were sent.
+    async fn make_tool_app() -> Router {
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}\
+                     {% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
     }
 
     #[tokio::test]
@@ -3107,9 +3250,9 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }];
-        let on = renderer.render_with_tools(&msgs, None);
+        let on = renderer.render_with_tools(&msgs, None).unwrap();
         assert!(on.ends_with("<think>"), "thinking-on render: {on}");
-        let off = renderer.render_with_opts(&msgs, None, false);
+        let off = renderer.render_with_opts(&msgs, None, false).unwrap();
         assert!(
             off.ends_with("<think></think>"),
             "thinking-off render: {off}"
@@ -3163,13 +3306,13 @@ mod tests {
             bos_token: Some("<bos>".into()),
             eos_token: Some("<eos>".into()),
         });
-        let out = r.render(&msgs);
+        let out = r.render(&msgs).unwrap();
         assert!(out.contains("<bos>"), "out={out}");
         assert!(out.contains("<start_of_turn>user"), "out={out}");
 
         // No template: falls back to the legacy formatter.
         let none = ChatPromptRenderer::new(&ChatTemplateConfig::default());
-        assert_eq!(none.render(&msgs), render_prompt_legacy(&msgs));
+        assert_eq!(none.render(&msgs).unwrap(), render_prompt_legacy(&msgs));
 
         // Unparseable template is treated as absent → legacy fallback, not a panic.
         let broken = ChatPromptRenderer::new(&ChatTemplateConfig {
@@ -3177,7 +3320,7 @@ mod tests {
             bos_token: None,
             eos_token: None,
         });
-        assert_eq!(broken.render(&msgs), render_prompt_legacy(&msgs));
+        assert_eq!(broken.render(&msgs).unwrap(), render_prompt_legacy(&msgs));
     }
 
     #[test]
@@ -3755,6 +3898,105 @@ mod tests {
     }
 
     #[test]
+    fn tools_request_errors_instead_of_silently_falling_back() {
+        // The incident this whole path exists for: a render failure inside a
+        // tools-only branch dropped to a formatter that cannot express tools,
+        // and the caller got a confident 200 answering a question the model was
+        // never asked.
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "get_weather"}),
+        }];
+        // Renders fine without tools; explodes inside the tools branch.
+        let env = build_chat_env("{% if tools %}{{ nope.missing.deeper }}{% endif %}ok").unwrap();
+
+        let err = render_or_fallback(Some(&env), &msgs, "", "", true, Some(&tools))
+            .expect_err("a tools request must not fall back");
+        assert!(matches!(err, PromptRenderError::Failed(_)), "{err:?}");
+
+        // Same broken template, no tools: fallback is still allowed, because a
+        // degraded prompt beats a dead endpoint.
+        let out = render_or_fallback(Some(&env), &msgs, "", "", true, None)
+            .expect("tool-less requests keep the fallback");
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn tools_without_a_chat_template_are_refused() {
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let tools = vec![Tool {
+            r#type: "function".into(),
+            function: serde_json::json!({"name": "get_weather"}),
+        }];
+        let err = render_or_fallback(None, &msgs, "", "", true, Some(&tools))
+            .expect_err("no template + tools must not be answered");
+        assert!(matches!(err, PromptRenderError::Rejected(_)), "{err:?}");
+
+        assert!(
+            render_or_fallback(None, &msgs, "", "", true, None).is_ok(),
+            "tool-less requests still render without a template"
+        );
+    }
+
+    #[test]
+    fn raise_exception_is_a_client_error_not_a_fallback() {
+        // A template validating its own input (Gemma on a system message,
+        // Mistral on non-alternating roles) is not an engine bug, and other
+        // engines surface it. Swallowing it into the legacy formatter turns a
+        // 400 into a plausible-looking 200.
+        let env = build_chat_env(r#"{{ raise_exception("system role not supported") }}"#).unwrap();
+        let msgs = [ChatMessage {
+            role: "system".into(),
+            content: "be nice".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        match render_or_fallback(Some(&env), &msgs, "", "", true, None) {
+            Err(PromptRenderError::Rejected(m)) => {
+                assert!(m.contains("system role not supported"), "{m}")
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_without_template_return_400_not_200() {
+        let app = make_app().await; // no chat template
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "stream": false
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn tool_schema_key_order_is_alphabetical_not_client_order() {
         // Pins a known divergence rather than hiding it. `Tool.function` is a
         // `serde_json::Value`, whose map is a BTreeMap without the
@@ -3887,7 +4129,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_request_returns_tool_calls_finish_e2e() {
-        let app = make_app().await;
+        let app = make_tool_app().await;
         let tc =
             "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
         let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
@@ -3916,7 +4158,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_tool_request_emits_indexed_tool_delta() {
-        let app = make_app().await;
+        let app = make_tool_app().await;
         let tc =
             "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
         let payload = serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":tc}],
@@ -3982,7 +4224,7 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_tool_engine_error_emits_error_event() {
-        let app = make_app().await;
+        let app = make_tool_app().await;
         let payload = serde_json::json!({"model":"mock-model",
             "messages":[{"role":"user","content":"__engine_error__"}],
             "tool_choice":"auto","tools":[{"type":"function","function":{"name":"x"}}],"stream":true});
