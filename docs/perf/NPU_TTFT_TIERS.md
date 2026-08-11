@@ -124,10 +124,12 @@ The *mechanism* is prior art; the *measurement direction* is not:
    slow for bulk (~1–5 MB/s/stream); parallel part-streams aggregate.
 6. **A pipeline stage that prefills tokenwise starves its downstream links**:
    the transport's data-frame recv timeout (60 s) fires while a big stage
-   grinds seq=1 steps, collapsing the pipeline. Graceful degradation
-   (`--no-chunked-prefill`, missing prefill variants) is therefore only safe
-   for stages small/fast enough to emit within the timeout — or the
-   transport needs progress keep-alives (follow-up).
+   grinds seq=1 steps, collapsing the pipeline. This is a recv-budget
+   problem, distinct from the #122 driver starvation (tokio workers blocked
+   on the runner's engine mutex, fixed in `cascadia-runner`). Graceful
+   degradation (`--no-chunked-prefill`, missing prefill variants) is
+   therefore only safe for stages small/fast enough to emit within the
+   timeout — or the transport needs progress keep-alives (follow-up).
 7. **Mixed Windows shell defaults make inline ssh commands non-portable**
    (cmd vs PowerShell hosts parse quoting differently; `-File` arg parsing
    treats single quotes as literal). The only robust remote-orchestration

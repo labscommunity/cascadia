@@ -53,6 +53,24 @@ pub enum EngineError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The in-flight batch was abandoned, but the engine and its peer links
+    /// are healthy. A pipeline stage that fails its packed step NACKs its
+    /// upstream (an empty token frame) instead of going silent; the batch is
+    /// lost, the wire stays frame-aligned, and the next batch can proceed.
+    ///
+    /// Its own variant on purpose. This is the one failure that MUST NOT be
+    /// [connection-fatal](EngineError::is_connection_fatal): a NACK has to
+    /// make the relay loop back off and continue, not exit for a supervisor
+    /// rebuild. Left as a [`EngineError::Backend`] string that correctness
+    /// hung on a substring classifier never matching the message — one
+    /// reworded message mentioning a dropped or unreachable peer and every
+    /// NACK would start tearing stages down. The variant makes that
+    /// structural: `is_connection_fatal` answers `false` here before it looks
+    /// at any text, so the message is free to say whatever an operator (and
+    /// the SSE client that receives it) needs to read.
+    #[error("batch aborted: {0}")]
+    BatchAborted(String),
+
     /// A `step()` failure attributed to a specific task. Engines wrap their
     /// underlying error in this at the failure site when the active task is
     /// known, so the runner can route the failure to that task's stream
@@ -104,9 +122,19 @@ impl EngineError {
     /// dead-peer case), and a mid-frame stall ("recv_exact timed out"). A
     /// connected-but-misbehaving peer (bad frame kind, stray response) is
     /// NOT fatal — that link can still deliver a good frame next.
+    ///
+    /// [`EngineError::BatchAborted`] is answered structurally, ahead of any
+    /// string inspection: an aborted batch leaves a healthy link, so the
+    /// relay loop must back off and continue. Because the check never reads
+    /// its message, no rewording of an abort text can turn a NACK into a
+    /// stage teardown.
     pub fn is_connection_fatal(&self) -> bool {
         match self {
             EngineError::NotConnected => true,
+            // Structural, and BEFORE any substring matching: the batch is
+            // gone, the link is not. Its message is operator/SSE-facing text
+            // and must never be able to reclassify the error.
+            EngineError::BatchAborted(_) => false,
             EngineError::Task { source, .. } => source.is_connection_fatal(),
             EngineError::Backend(msg) => {
                 let msg = msg.to_ascii_lowercase();
@@ -272,5 +300,53 @@ mod tests {
         // A task-attributed fatal error unwraps to its source.
         let wrapped = EngineError::Backend("socket closed".into()).for_task(TaskId::from("t1"));
         assert!(wrapped.is_connection_fatal());
+    }
+
+    /// An aborted batch is never a dead link. The relay loop must back off
+    /// and keep driving on a NACK — exiting would hand the supervisor a
+    /// rebuild for a stage whose socket is perfectly fine.
+    ///
+    /// The point of the variant is that this holds for ANY message: the abort
+    /// text is operator- and SSE-facing prose that names the underlying cause,
+    /// and that cause is frequently a transport failure on the *other* side of
+    /// the pipeline, so it quotes exactly the substrings the classifier hunts
+    /// for. As a `Backend` string every one of these would have been
+    /// misclassified as fatal.
+    #[test]
+    fn batch_aborted_is_never_connection_fatal() {
+        for msg in [
+            "downstream stage failed its packed step and NACKed this batch \
+             (empty token frame); the pipeline link stays aligned",
+            // Abort messages that quote a peer's transport failure — the
+            // exact fragility a substring classifier could not survive.
+            "the packed step failed: backend error: packed token recv: recv_exact timed out",
+            "the packed step failed: backend error: not connected; call connect() first",
+            "the packed step failed: backend error: socket closed during recv",
+            "the packed step failed: backend error: io error: broken pipe",
+            "the packed step failed: backend error: connection reset by peer",
+            "",
+        ] {
+            let e = EngineError::BatchAborted(msg.into());
+            assert!(!e.is_connection_fatal(), "must not be fatal: {msg}");
+            // And attribution must not resurrect fatality either.
+            assert!(
+                !e.for_task(TaskId::from("t1")).is_connection_fatal(),
+                "{msg}"
+            );
+        }
+        // The same texts as genuine transport failures ARE still fatal — the
+        // variant narrows the classifier, it does not blunt it.
+        for msg in [
+            "packed token recv: recv_exact timed out",
+            "not connected; call connect() first",
+            "socket closed during recv",
+            "io error: broken pipe",
+            "connection reset by peer",
+        ] {
+            assert!(
+                EngineError::Backend(msg.into()).is_connection_fatal(),
+                "must stay fatal: {msg}"
+            );
+        }
     }
 }

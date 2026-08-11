@@ -1516,6 +1516,19 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
              KV window)"
         ));
     }
+    // Prefix reuse is first-stage-only state. Only rank 0 admits requests, and
+    // admission is what populates the shared prefix region; a relay stage never
+    // admits, so its `prefix_valid` stays 0 and it clamps every plan row's reuse
+    // length to 0. Rank 0 would then skip prefilling the reused tokens while the
+    // downstream stages hold no KV for them — wrong tokens, no error, on any rank.
+    if args.packed_prefix > 0 && args.total != 1 {
+        return Err(anyhow!(
+            "--packed-prefix is single-stage only (--total 1); a relay stage cannot populate the \
+             shared prefix, so it would open zero shared columns for the prompt tokens rank 0 \
+             skipped prefilling and silently corrupt multi-stage output. Drop --packed-prefix to \
+             keep packed multi-stage decode, or run the worker as a single stage"
+        ));
+    }
     // Packed multi-slot decode lives in the ov-runtime static (NPU-target) path.
     if args.packed_slots > 0 {
         if args.engine != EngineKind::OvRuntime {
@@ -1527,23 +1540,15 @@ fn validate_worker_runtime_flags(args: &WorkerArgs) -> Result<()> {
         if args.packed_slots < 2 {
             return Err(anyhow!("--packed-slots must be 0 (off) or >= 2"));
         }
-        // Multi-stage packed is withheld pending a wire fault. The mechanism
-        // works — stage 0 ships an I64 [1,3,S] plan frame (slot, absolute
-        // position and prefix-reuse length per row) ahead of the [1,S,hidden]
-        // block, and the tail replies one token per row — but a token frame
-        // intermittently goes missing between the ranks, and rank 0 then blocks
-        // forever on a reply that never comes. Instrumented on NPU: rank 1
-        // logged the reply and advanced, rank 0 never saw it, no error on
-        // either side. Reproduces after sustained load, roughly two runs in
-        // three. Single-stage is unaffected and verified.
-        if args.total != 1 {
-            return Err(anyhow!(
-                "--packed-slots is single-stage only (--total 1); multi-stage packed can lose a \
-                 token frame between ranks and wedge the pipeline (issue #122). Run the packed \
-                 worker as a single stage, or drop --packed-slots to use the multi-stage baseline \
-                 path"
-            ));
-        }
+        // Multi-stage packed is allowed again: the #122 wedge was driver
+        // starvation on rank 0 (sync engine-mutex blocking pinned every
+        // tokio worker, so the token-frame reply could neither be read nor
+        // timed out), fixed in cascadia-runner (tokio workers never block on
+        // the engine mutex: polls park on a failed try_lock, cancels/drops
+        // defer, and submits go off-worker via spawn_blocking) plus
+        // deadlined+poisoning reply recvs and an on-wire NACK in the packed
+        // exchange. Every stage must run the same --packed-slots value
+        // (baked into the packed IR shape).
     }
     // Continuous batching (#20) lives in the ov-genai CBP path only. It is a
     // different mechanism to --packed-slots above: OV's paged attention on the
@@ -1998,7 +2003,11 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             enable_thinking: false,
             trust_remote_code: false,
         };
-        let mut stream = runner.generate(task)?;
+        // `generate_async`, not `generate`: this loop runs on the tokio
+        // runtime, and the sync path would block a worker on the engine
+        // mutex for a full step (#122). Benign while stdin is serial, but
+        // it is the exact pattern the API layer had to unwind.
+        let mut stream = runner.generate_async(task).await?;
         while let Some(chunk) = stream.next().await {
             print!("{}", chunk.text);
             if chunk.is_final {
@@ -2398,7 +2407,10 @@ mod python_tests {
     }
 
     /// Packed multi-slot decode is an ov-runtime static-path feature; using it
-    /// on another engine, at N<2, or multi-stage is rejected loudly.
+    /// on another engine or at N<2 is rejected loudly. Multi-stage packed is
+    /// ACCEPTED again — the #122 wedge (worker-thread starvation on rank 0)
+    /// is fixed, so the old `--total 1` gate would only block a working
+    /// configuration.
     #[test]
     fn worker_flags_gate_packed_slots() {
         let mut a = worker("m", EngineKind::OvGenai);
@@ -2411,15 +2423,10 @@ mod python_tests {
         let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
         assert!(err.contains(">= 2"), "{err}");
 
-        // Multi-stage packed wedges: a token frame goes missing on the wire and
-        // rank 0 blocks on a reply that never arrives. Refuse it rather than
-        // hand an operator a pipeline that hangs after a while under load.
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
         a.total = 2;
-        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
-        assert!(err.contains("--total 1"), "{err}");
-        assert!(err.contains("single-stage"), "{err}");
+        assert!(validate_worker_runtime_flags(&a).is_ok());
 
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 8;
@@ -2434,6 +2441,39 @@ mod python_tests {
         let mut a = worker("m", EngineKind::OvRuntime);
         a.packed_slots = 4;
         a.packed_prefix = 128;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+    }
+
+    /// Prefix reuse is first-stage-only state: only rank 0 admits requests, and
+    /// admission is what fills the shared prefix region, so a relay stage clamps
+    /// every plan row's reuse to 0 and holds no KV for the tokens rank 0 skipped
+    /// prefilling — wrong output with no error anywhere. Rejected at the CLI
+    /// until relay-side prefix population exists. Multi-stage packed WITHOUT
+    /// --packed-prefix must stay accepted (it was un-gated deliberately).
+    #[test]
+    fn worker_flags_gate_packed_prefix_multi_stage() {
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
+        a.total = 2;
+        let err = validate_worker_runtime_flags(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("--packed-prefix is single-stage only"),
+            "{err}"
+        );
+        assert!(err.contains("--total 1"), "{err}");
+
+        // Single stage is the supported configuration.
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.packed_prefix = 128;
+        a.total = 1;
+        assert!(validate_worker_runtime_flags(&a).is_ok());
+
+        // Packed multi-stage decode without prefix reuse is untouched.
+        let mut a = worker("m", EngineKind::OvRuntime);
+        a.packed_slots = 4;
+        a.total = 2;
         assert!(validate_worker_runtime_flags(&a).is_ok());
     }
 

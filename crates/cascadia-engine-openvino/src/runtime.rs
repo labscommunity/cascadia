@@ -43,7 +43,7 @@ use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec,
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::rotary::{load_model_config, Rotary};
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
@@ -433,6 +433,19 @@ fn decode_wire_plan(
     Ok(out)
 }
 
+/// True when a packed plan carries a prefill chunk: some slot owns more than
+/// one row (decode frames have at most one row per slot). Picks the token
+/// reply's deadline budget — a prefill reply waits on multi-token compute
+/// across every remaining stage. A single-row prefill chunk is
+/// indistinguishable from a decode row here and gets the strict decode
+/// deadline, which a one-row tail inference fits comfortably.
+fn plan_has_prefill_rows(rows: &[Option<(usize, i64, usize)>]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .flatten()
+        .any(|(slot, _, _)| !seen.insert(*slot))
+}
+
 /// Encode the head stage's per-row sampled tokens as I64 `[1, 1, S]`. The
 /// non-packed path returns one token; packed returns one per active row, in
 /// row order, with 0 for idle rows (never read).
@@ -460,6 +473,163 @@ fn decode_wire_tokens(t: &WireTensor) -> EngineResult<Vec<i32>> {
             i64::from_le_bytes(b) as i32
         })
         .collect())
+}
+
+/// The NACK a stage sends instead of a token reply: an EMPTY token frame,
+/// `[1, 1, 0]` I64 with no payload.
+///
+/// A stage that has consumed a (plan, hidden) pair OWES its upstream a reply,
+/// so a failed step must still answer — and this is the answer that means
+/// "the batch is lost, the link is not". Emptiness is what carries that: the
+/// frame is wire-valid (shape and payload agree, so the stream stays aligned)
+/// while a real reply always carries one token per row and can never be
+/// empty. Paired with [`is_packed_nack`] deliberately — the sender and the
+/// recogniser have to agree on one shape, so they are defined together and
+/// tested together.
+fn packed_nack_frame() -> WireTensor {
+    encode_wire_tokens(&[])
+}
+
+/// Is this reply the downstream's NACK rather than a token frame?
+///
+/// The test is "carries no tokens" — a zero element count, exactly what
+/// [`packed_nack_frame`] sends and exactly what a real reply (one token per
+/// row, rows >= 1) can never be.
+///
+/// Deliberately NOT an equality check against the whole frame: a zero-element
+/// frame holds no tokens whatever its dtype byte claims, so reading it as a
+/// lost batch is right either way, and a stricter test would instead hand it
+/// to [`decode_wire_tokens`] to be reported as wire corruption.
+///
+/// Call this BEFORE `decode_wire_tokens`, which rejects an empty payload as
+/// malformed and would otherwise turn every NACK into a bogus frame error.
+fn is_packed_nack(reply: &WireTensor) -> bool {
+    reply.elements() == Some(0)
+}
+
+/// Type the error that retires an in-flight packed batch.
+///
+/// A lost batch is not a lost link, and [`EngineError::BatchAborted`] says so
+/// structurally instead of leaving the answer to whichever substrings the
+/// message happens to carry — abort messages quote their cause, and that
+/// cause is routinely a transport failure on some *other* rank's socket.
+///
+/// A cause that is itself connection-fatal (this stage's own poisoned or dead
+/// socket) is passed through untouched: that link really is gone, and
+/// anything downstream of here that classifies the error — the relay loop
+/// today, a dead-wire latch later — must still see it as fatal.
+fn packed_abort_error(e: EngineError) -> EngineError {
+    match e {
+        // Already a lost batch (a downstream NACK relayed up to this stage):
+        // reuse it rather than wrapping the same words twice.
+        already @ EngineError::BatchAborted(_) => already,
+        fatal if fatal.is_connection_fatal() => fatal,
+        other => EngineError::BatchAborted(format!("the packed step failed: {other}")),
+    }
+}
+
+/// The client-facing text every task retired by one aborted packed batch
+/// receives. A [`EngineError::BatchAborted`] already reads "batch aborted: …"
+/// in its Display, and a cause left connection-fatal keeps its own wording, so
+/// name the abort here rather than prefixing it twice.
+fn packed_abort_message(aborted: &EngineError) -> String {
+    match aborted {
+        EngineError::BatchAborted(_) => aborted.to_string(),
+        fatal => format!("packed batch aborted: {fatal}"),
+    }
+}
+
+/// One-way latch: this stage's packed downstream link is dead for the rest of
+/// the process.
+///
+/// A reply-deadline miss POISONS the downstream socket (the transport drops
+/// it, so every later use answers `NotConnected`), and nothing reconnects:
+/// [`ActivationClient`] dials once, at startup. On a relay rank that is
+/// survivable — the step error is connection-fatal, the relay loop exits, and
+/// the supervisor rebuilds the stage. Rank 0 has no relay loop: it is driven
+/// by stream polls, so it would otherwise admit every new request, run the
+/// local prefill, fail the exchange on a socket that can never come back, and
+/// abort the batch — 100% failures, forever, behind one uniform per-batch WARN
+/// while the rebuilt relay ranks sit in `accept()`.
+///
+/// The latch turns that into fail-fast-and-loud: the first fatal cause is
+/// recorded once (with an `error!` naming the restart as the remedy) and every
+/// later request is refused immediately, before any local inference is burned.
+/// It is deliberately NOT a recovery mechanism — see [`Self::fail_fast_error`].
+#[derive(Default)]
+struct WireDeadLatch {
+    /// Display text of the FIRST connection-fatal cause observed. `Some` means
+    /// latched; the value is kept for attribution, never re-classified.
+    cause: Option<String>,
+}
+
+impl WireDeadLatch {
+    /// Feed the typed cause that just retired a packed batch.
+    ///
+    /// Classification is structural — [`EngineError::is_connection_fatal`] on
+    /// the typed value, exactly as `packed_abort_error` left it. The message is
+    /// only ever stored, never re-parsed: a batch abort whose text happens to
+    /// quote some other rank's transport failure must not arm this latch, and
+    /// [`EngineError::BatchAborted`] answers `false` before any substring is
+    /// examined.
+    ///
+    /// Returns `true` on the latching transition ONLY — the caller logs there,
+    /// so the operator-facing error is emitted once per process rather than
+    /// once per aborted batch. Later fatal causes are redundant (the first one
+    /// killed the link) and leave the stored cause untouched.
+    fn observe(&mut self, aborted: &EngineError) -> bool {
+        if self.cause.is_some() || !aborted.is_connection_fatal() {
+            return false;
+        }
+        self.cause = Some(aborted.to_string());
+        true
+    }
+
+    /// The first fatal cause, once latched.
+    fn cause(&self) -> Option<&str> {
+        self.cause.as_deref()
+    }
+
+    /// The error every request gets while latched, or `None` when the wire is
+    /// still believed good.
+    ///
+    /// Two properties are load-bearing:
+    ///
+    /// * It is `Backend` carrying the literal "not connected", so
+    ///   [`EngineError::is_connection_fatal`] answers `true` — fatality stays
+    ///   observable to any supervisor plumbing added later. It must never be
+    ///   [`EngineError::BatchAborted`], which is structurally non-fatal. The
+    ///   phrase is written here rather than inherited from `cause`, because the
+    ///   stored text need not match the classifier at all (a latch armed by the
+    ///   structural [`EngineError::NotConnected`] displays as "not YET
+    ///   connected", which no substring rule catches).
+    /// * It quotes the original cause, so the operator and the SSE client both
+    ///   learn what actually killed the link, not just that it is gone.
+    fn fail_fast_error(&self) -> Option<EngineError> {
+        self.cause.as_deref().map(|cause| {
+            EngineError::Backend(format!(
+                "packed downstream link is not connected: this stage latched a dead wire and \
+                 fails every request until the process is restarted (first cause: {cause})"
+            ))
+        })
+    }
+}
+
+/// The relay failed to answer its upstream. When the step it was answering
+/// for ALSO failed, the send error on its own hides why the batch died — and
+/// those two failures are correlated, not independent: a dead upstream is
+/// precisely the case where the NACK cannot be delivered either. So carry
+/// both in one error.
+///
+/// The send error stays outermost: it is the transport failure, and its text
+/// is what [`EngineError::is_connection_fatal`] inspects to decide whether the
+/// relay loop exits for a supervisor rebuild. Embedding the body error's text
+/// after it keeps the root cause visible without hiding the link failure.
+fn nack_send_error(send_err: EngineError, body_err: Option<&EngineError>) -> EngineError {
+    match body_err {
+        Some(body) => EngineError::Backend(format!("{send_err} (NACK sent because: {body})")),
+        None => send_err,
+    }
 }
 
 /// Decode + strictly validate a wire position frame. Must be I64 with exactly
@@ -886,6 +1056,11 @@ pub struct OvRuntimeEngine {
     /// Reload source for a parked prefill model.
     prefill_reload: Option<PrefillReload>,
     step_warn: StepWarnLimiter,
+    /// Packed path only: armed the first time a packed batch dies of this
+    /// stage's own dead downstream socket. Once armed, `submit` and
+    /// `step_first_packed` refuse work immediately instead of serving
+    /// guaranteed failures for the life of the process. See [`WireDeadLatch`].
+    wire_dead: WireDeadLatch,
 }
 
 impl OvRuntimeEngine {
@@ -1529,6 +1704,28 @@ impl OvRuntimeEngine {
     /// several tasks at once — which is exactly what the runner's per-task
     /// chunk buffers were built to demultiplex.
     fn step_first_packed(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        // ---- dead-wire latch ----
+        // The downstream socket is poisoned for the life of this process, so
+        // every exchange below can only fail — after tokenizing, admitting and
+        // running a shared local inference first. Short-circuit ahead of all of
+        // it. Whatever the engine still holds is retired through the SAME abort
+        // machinery a live failure uses, so per-task attribution and slot
+        // release happen exactly once; queued-but-unadmitted tasks are folded
+        // into the same answer instead of sitting in the queue until the runner
+        // gives up on their streams.
+        if let Some(fatal) = self.wire_dead.fail_fast_error() {
+            if self.pending.is_empty() && self.packed.as_ref().unwrap().occupied() == 0 {
+                return Ok(Vec::new());
+            }
+            let msg = packed_abort_message(&fatal);
+            let out = self
+                .pending
+                .drain(..)
+                .map(|t| (t.task_id.clone(), Chunk::error(t.task_id, msg.clone())))
+                .collect();
+            return self.abort_packed_batch(fatal, out);
+        }
+
         let mut out = Vec::new();
         // ---- admission ----
         while !self.pending.is_empty() {
@@ -1540,14 +1737,19 @@ impl OvRuntimeEngine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
-            let enc = tok
-                .encode(task.prompt.clone(), false)
-                .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
+            // Admission failures are attributed to the failed task so the
+            // runner routes them to its stream — a bare Err here would kill
+            // whichever concurrent stream happened to be polling.
+            let enc = tok.encode(task.prompt.clone(), false).map_err(|e| {
+                EngineError::Backend(format!("tokenizer encode: {e}"))
+                    .for_task(task.task_id.clone())
+            })?;
             let prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             if prompt_ids.is_empty() {
-                return Err(EngineError::Backend(
-                    "empty prompt: no tokens to prefill".into(),
-                ));
+                return Err(
+                    EngineError::Backend("empty prompt: no tokens to prefill".into())
+                        .for_task(task.task_id),
+                );
             }
             info!(
                 task = %task.task_id,
@@ -1565,23 +1767,78 @@ impl OvRuntimeEngine {
         // exactly as the single-task static path already does.
         let single_stage = self.spec.is_first_stage && self.spec.is_last_stage;
         for _ in 0..Self::PACKED_MAX_INFERS_PER_STEP {
-            let Some((odt, oshape, obytes, kind)) = self.packed.as_mut().unwrap().step()? else {
+            // Any failure past admission loses the whole in-flight packed
+            // batch (a shared inference, or a shared downstream exchange) —
+            // route it through `abort_packed_batch` so every affected stream
+            // gets its own attributed error and every slot is retired. A
+            // bare `?` would kill whichever stream happened to be polling
+            // and leave the other slots wedged-active forever.
+            let stepped = match self.packed.as_mut().unwrap().step() {
+                Ok(s) => s,
+                Err(e) => return self.abort_packed_batch(e, out),
+            };
+            let Some((odt, oshape, obytes, kind)) = stepped else {
                 break;
             };
-            if single_stage {
-                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)?;
+            let emitted = if single_stage {
+                self.emit_packed_rows(odt, &oshape, &obytes, kind, &mut out)
             } else {
                 // Pipeline: this stage produced hidden rows. Ship the plan (so
                 // every downstream stage can rebuild the same mask and route
                 // rows to the same slots) plus the hidden block, then take back
                 // one sampled token per row from the tail.
-                let hidden = bytes_to_f32(odt, &obytes)?;
-                let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
-                let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
-                self.emit_packed_tokens(&tokens, kind, &mut out)?;
+                bytes_to_f32(odt, &obytes).and_then(|hidden| {
+                    let plan_rows = self.packed.as_ref().unwrap().last_plan_rows();
+                    let tokens = self.exchange_packed_downstream(&hidden, &oshape, &plan_rows)?;
+                    self.emit_packed_tokens(&tokens, kind, &mut out)
+                })
+            };
+            if let Err(e) = emitted {
+                return self.abort_packed_batch(e, out);
             }
             if !out.is_empty() {
                 break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// A packed step failed in a way that loses the in-flight batch: retire
+    /// every active slot (freeing its KV region) and hand each task its own
+    /// final error chunk. The single-task recovery in `step_first` (the
+    /// wrapper around `step_first_body`, which the packed path returns before
+    /// ever reaching) cannot express a multi-task failure. Slot state
+    /// downstream is stale but harmless — the next admission resets its slot
+    /// in-band (a row whose position equals its reuse length starts that slot
+    /// fresh).
+    fn abort_packed_batch(
+        &mut self,
+        e: EngineError,
+        mut out: Vec<(TaskId, Chunk)>,
+    ) -> EngineResult<Vec<(TaskId, Chunk)>> {
+        warn!(error = %e, "packed step failed; aborting the in-flight packed batch");
+        let aborted = packed_abort_error(e);
+        // The cause is typed, and `packed_abort_error` has already decided
+        // whether it is this stage's own dead socket or merely a lost batch —
+        // hand the VALUE to the latch, which asks `is_connection_fatal()`
+        // rather than re-reading these words. `observe` answers true exactly
+        // once, so this is a transition log, not per-batch noise.
+        if self.wire_dead.observe(&aborted) {
+            error!(
+                cause = %aborted,
+                "packed downstream link is dead and cannot be reconnected in-process; this \
+                 stage now fails every request immediately — restart the process to rebuild \
+                 the pipeline connection"
+            );
+        }
+        let msg = packed_abort_message(&aborted);
+        let packed = self.packed.as_mut().unwrap();
+        for slot in 0..packed.slots.len() {
+            if let Some(ps) = packed.retire(slot) {
+                out.push((
+                    ps.task.task_id.clone(),
+                    Chunk::error(ps.task.task_id, msg.clone()),
+                ));
             }
         }
         Ok(out)
@@ -1608,6 +1865,9 @@ impl OvRuntimeEngine {
             [s3[0] as u32, s3[1] as u32, s3[2] as u32],
             f32_to_f16_bytes(hidden),
         );
+        // A prefill reply waits on multi-token compute across every remaining
+        // stage — widen its deadline like the non-packed path does.
+        let prefill = plan_has_prefill_rows(plan_rows);
         self.block_on(async {
             let mut guard = down.lock().await;
             guard
@@ -1618,29 +1878,43 @@ impl OvRuntimeEngine {
                 .send(&hidden_frame)
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden send: {e}")))?;
-            // Bound the reply wait. Having just sent both frames this stage is
-            // OWED a token frame, so a downstream that never answers must not
-            // pin the thread forever — the same reasoning as `reply_bounded` on
-            // the qwen36 path, and the same configured activation timeout. This
-            // is what turns a dropped token frame from a silent permanent wedge
-            // into a reportable error; it does not prevent the drop.
-            let (reply, _) = match tokio::time::timeout(
-                cascadia_transport::recv_timeout(),
-                guard.recv(),
-            )
-            .await
-            {
-                Ok(r) => r.map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?,
-                Err(_) => {
-                    return Err(EngineError::Backend(
-                        "packed token recv timed out: the downstream stage did not answer a \
-                             plan+hidden pair. Multi-stage packed is known to drop a token frame \
-                             under load (issue #122); run the packed worker \
-                             single-stage (--total 1)"
-                            .into(),
-                    ))
-                }
-            };
+            // Having just sent both frames this stage is OWED a token frame.
+            // `recv_reply*`, NOT plain `recv` under an external
+            // `tokio::time::timeout` (#122): the deadline lives inside the
+            // transport, so a miss surfaces as an error instead of a dropped
+            // future (which silently discarded any partially-read bytes and
+            // left the stream misaligned), and a failed reply POISONS the
+            // connection — the socket is dropped so a late token frame can
+            // never be read into the next exchange as fresh data. The
+            // poisoned-socket errors ("recv_exact timed out" / "not
+            // connected") are connection-fatal, so a middle rank's relay
+            // loop exits for a supervisor rebuild rather than grinding on a
+            // desynced stream. Those keep their `Backend` type on purpose:
+            // the link really is dead, and that classification must survive.
+            let (reply, _) = if prefill {
+                guard.recv_reply_prefill().await
+            } else {
+                guard.recv_reply().await
+            }
+            .map_err(|e| EngineError::Backend(format!("packed token recv: {e}")))?;
+            // An EMPTY token frame is the downstream's NACK (see
+            // `step_relay_packed`): its step failed AFTER it consumed our
+            // pair, so the batch is lost but the link is still
+            // frame-aligned. Abort the batch; do not poison the connection.
+            //
+            // `BatchAborted`, not `Backend`: this error travels up a middle
+            // rank's relay loop, which must back off and keep driving rather
+            // than exit for a supervisor rebuild. The variant says "healthy
+            // link" structurally instead of relying on this message never
+            // happening to contain a word the fatal-substring classifier
+            // looks for.
+            if is_packed_nack(&reply) {
+                return Err(EngineError::BatchAborted(
+                    "downstream stage failed its packed step and NACKed this batch \
+                     (empty token frame); the pipeline link stays aligned"
+                        .into(),
+                ));
+            }
             decode_wire_tokens(&reply)
         })
     }
@@ -1689,17 +1963,27 @@ impl OvRuntimeEngine {
             .clone()
             .ok_or_else(|| EngineError::Backend("packed relay stage has no upstream".into()))?;
         let slots = self.packed.as_ref().unwrap().kv.slots;
-        let (plan_rows, hidden, hshape) = self.block_on(async {
+        let (plan_res, hidden, hshape) = self.block_on(async {
             let mut guard = up.lock().await;
+            // The plan frame is this stage's idle wait for the next unit of
+            // work — idle-tolerant `recv`. Once it arrives the upstream owes
+            // the hidden frame promptly, so the SECOND frame of the pair is
+            // a deadlined `recv_reply` (same rule as the non-packed
+            // `recv_hidden_from_upstream`): a half-sent pair must fail fast
+            // and poison the socket, not park this stage for the whole
+            // frame-idle ceiling. The plan is decoded only AFTER the hidden
+            // frame is consumed — bailing between the two frames would
+            // leave the hidden frame in the socket and permanently desync
+            // every later frame (#122).
             let (pf, _) = guard
                 .recv()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed plan recv: {e}")))?;
-            let plan_rows = decode_wire_plan(&pf, slots)?;
             let (hf, _) = guard
-                .recv()
+                .recv_reply()
                 .await
                 .map_err(|e| EngineError::Backend(format!("packed hidden recv: {e}")))?;
+            let plan_res = decode_wire_plan(&pf, slots);
             let hidden: Vec<f32> = match hf.dtype {
                 WireDType::F16 => f16_bytes_to_f32(&hf.data),
                 _ => hf
@@ -1708,9 +1992,52 @@ impl OvRuntimeEngine {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect(),
             };
-            Ok::<_, EngineError>((plan_rows, hidden, hf.shape))
+            Ok::<_, EngineError>((plan_res, hidden, hf.shape))
         })?;
 
+        // The pair is consumed. From here on, any failure MUST still answer
+        // the upstream — otherwise it blocks awaiting a token frame that
+        // never comes while this loop swallows the error and moves on: the
+        // silent-deadlock half of issue #122. The NACK is an EMPTY token
+        // frame ([1,1,0]): wire-aligned, unambiguous (a real reply always
+        // has one token per row), and it tells the upstream "batch lost,
+        // link healthy".
+        let step = self.relay_packed_body(plan_res, hidden, hshape);
+        let frame = match &step {
+            Ok(tokens) => encode_wire_tokens(tokens),
+            Err(e) => {
+                // Log the root cause HERE, before the NACK goes out: a dead
+                // upstream is exactly when the send fails too, and then the
+                // send error is the only thing that would ever reach the
+                // operator. This rank is where the batch actually died, so
+                // this is where the reason has to be recorded.
+                warn!(error = %e, "packed relay step failed; NACKing the upstream");
+                packed_nack_frame()
+            }
+        };
+        let sent = self.block_on(async {
+            let mut guard = up.lock().await;
+            guard
+                .send(&frame)
+                .await
+                .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
+        });
+        if let Err(send_err) = sent {
+            return Err(nack_send_error(send_err, step.as_ref().err()));
+        }
+        step.map(|_| ())
+    }
+
+    /// Everything `step_relay_packed` does between consuming the (plan,
+    /// hidden) pair and answering the upstream. Split out so the caller can
+    /// turn any failure into an on-wire NACK instead of a swallowed error.
+    fn relay_packed_body(
+        &mut self,
+        plan_res: EngineResult<Vec<Option<(usize, i64, usize)>>>,
+        hidden: Vec<f32>,
+        hshape: [u32; MAX_RANK],
+    ) -> EngineResult<Vec<i32>> {
+        let plan_rows = plan_res?;
         let hidden_size = hshape[2] as usize;
         let plan = crate::packed::PackedPlan {
             rows: plan_rows
@@ -1752,27 +2079,14 @@ impl OvRuntimeEngine {
                     0
                 });
             }
-            let frame = encode_wire_tokens(&tokens);
-            self.block_on(async {
-                let mut guard = up.lock().await;
-                guard
-                    .send(&frame)
-                    .await
-                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
-            })?;
+            Ok(tokens)
         } else {
             let hidden_out = bytes_to_f32(odt, &obytes)?;
-            let tokens = self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)?;
-            let frame = encode_wire_tokens(&tokens);
-            self.block_on(async {
-                let mut guard = up.lock().await;
-                guard
-                    .send(&frame)
-                    .await
-                    .map_err(|e| EngineError::Backend(format!("packed token send: {e}")))
-            })?;
+            // A downstream failure (including its NACK) propagates as Err —
+            // the caller NACKs our own upstream in turn, so the abort
+            // reaches rank 0 no matter how deep the pipeline is.
+            self.exchange_packed_downstream(&hidden_out, &oshape, &plan_rows)
         }
-        Ok(())
     }
 
     /// Sample the rows one packed inference produced and append their chunks.
@@ -2665,6 +2979,22 @@ impl Engine for OvRuntimeEngine {
             return Err(EngineError::Backend(
                 "non-first stage does not accept tasks directly".into(),
             ));
+        }
+        // Dead-wire latch: refuse before the request costs anything. This is
+        // synchronous with the HTTP request, so the non-streaming path answers
+        // 5xx (and the API's readiness tracker sees a failure) rather than
+        // committing a 200 and delivering the same error inside a stream, and a
+        // streaming client gets an attributed error immediately instead of
+        // after a full local prefill. Connection-fatal by construction — see
+        // `WireDeadLatch::fail_fast_error`.
+        // DEBUG, not WARN: the latching `error!` is the operator signal, and it
+        // is emitted once on purpose — a per-request WARN would flood exactly
+        // the log the operator has to read it out of, at the request rate. Each
+        // refusal is already visible to the caller as an attributed 5xx.
+        if let Some(fatal) = self.wire_dead.fail_fast_error() {
+            debug!(task = %task.task_id, cause = self.wire_dead.cause().unwrap_or_default(),
+                   "refusing task: packed downstream link is dead");
+            return Err(fatal);
         }
         if self.pending.iter().any(|t| t.task_id == task.task_id)
             || self
@@ -3800,6 +4130,7 @@ impl Builder for OvRuntimeBuilder {
             park_prefill: self.park_prefill,
             prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
+            wire_dead: WireDeadLatch::default(),
         }))
     }
 }
@@ -4019,6 +4350,235 @@ mod tests {
         // a hidden (F32) frame where tokens were expected is a hard error
         let wrong = WireTensor::new(WireDType::F32, [1, 1, 2], vec![0u8; 8]);
         assert!(decode_wire_tokens(&wrong).is_err());
+    }
+
+    /// The relay's NACK is an EMPTY token frame — it must be wire-valid
+    /// (shape/payload consistent so the transport delivers it), detectable
+    /// BEFORE `decode_wire_tokens` (which rejects empties as malformed), and
+    /// impossible to confuse with a real reply (a real reply always carries
+    /// one token per row, S >= 1).
+    ///
+    /// Pinned to the NAMED pair, [`packed_nack_frame`] + [`is_packed_nack`],
+    /// rather than to an open-coded `elements() == 0`: the sender and the
+    /// recogniser only work if they agree, and an anonymous predicate at the
+    /// consumer could drift from the producer without anything failing here.
+    #[test]
+    fn packed_nack_frame_is_empty_and_detectable() {
+        let nack = packed_nack_frame();
+        // The frame the relay puts on the wire is exactly "no tokens".
+        assert_eq!(nack, encode_wire_tokens(&[]));
+        assert_eq!(nack.shape, [1, 1, 0]);
+        assert!(nack.data.is_empty());
+        assert_eq!(nack.elements(), Some(0));
+        // Same dtype as a real token reply: only the emptiness distinguishes
+        // it, so a peer reading the header cannot mistake it for a hidden
+        // state or a plan frame.
+        assert_eq!(nack.dtype, WireDType::I64);
+        // Payload length and shape agree, or the transport would reject the
+        // frame outright and the NACK would never arrive.
+        assert_eq!(
+            nack.data.len() as u64,
+            nack.elements().unwrap() * nack.dtype.bytes_per_element() as u64
+        );
+        assert!(is_packed_nack(&nack));
+        assert!(decode_wire_tokens(&nack).is_err()); // NACK check must come first
+
+        // No real reply is ever mistaken for one, at any row count — and
+        // each of them still decodes to exactly its tokens.
+        for rows in 1..=8usize {
+            let toks: Vec<i32> = (0..rows as i32).collect();
+            let real = encode_wire_tokens(&toks);
+            assert!(!is_packed_nack(&real), "{rows}-row reply read as a NACK");
+            assert_ne!(real.elements(), Some(0));
+            assert_eq!(decode_wire_tokens(&real).expect("real reply"), toks);
+        }
+    }
+
+    /// Aborting a packed batch types its cause, so classification never rides
+    /// on the message text. A downstream NACK or a plain step failure lost the
+    /// batch, not the link, and must not push a relay rank into a rebuild — but
+    /// this stage's own dead socket has to stay connection-fatal.
+    #[test]
+    fn packed_abort_error_types_the_cause() {
+        // A downstream NACK arrives already typed — no double wrapping.
+        let nack = EngineError::BatchAborted("downstream NACKed this batch".into());
+        let out = packed_abort_error(nack);
+        assert_eq!(
+            out.to_string(),
+            "batch aborted: downstream NACKed this batch"
+        );
+        assert!(!out.is_connection_fatal());
+
+        // A local step failure becomes an abort, keeping its cause readable.
+        let out = packed_abort_error(EngineError::Backend("bad logits shape [1, 0]".into()));
+        assert!(matches!(out, EngineError::BatchAborted(_)), "{out:?}");
+        assert!(out.to_string().contains("bad logits shape [1, 0]"), "{out}");
+        assert!(!out.is_connection_fatal());
+
+        // This stage's own poisoned socket keeps its type AND its fatality.
+        let dead = EngineError::Backend("packed token recv: recv_exact timed out after 60s".into());
+        let out = packed_abort_error(dead);
+        assert!(matches!(out, EngineError::Backend(_)), "{out:?}");
+        assert!(out.is_connection_fatal(), "{out}");
+    }
+
+    /// A dead upstream fails the step AND the NACK that reports it, so the two
+    /// arrive together. Returning only the send error would drop the reason
+    /// the batch died — the operator would see "packed token send: …" and
+    /// never learn it was a plan decode error, a failed inference, or a
+    /// downstream NACK. Both texts must survive, and the send error must stay
+    /// classifiable so the relay loop still exits for a supervisor rebuild.
+    #[test]
+    fn nack_send_failure_carries_the_step_error_too() {
+        let send = EngineError::Backend("packed token send: broken pipe".into());
+        let body = EngineError::Backend("packed plan decode: slot 9 beyond 4 slots".into());
+        let combined = nack_send_error(send, Some(&body));
+        let msg = combined.to_string();
+        assert!(msg.contains("packed token send: broken pipe"), "{msg}");
+        assert!(msg.contains("slot 9 beyond 4 slots"), "{msg}");
+        // The transport failure still classifies: a dead link must not be
+        // downgraded to a retryable error just because it now carries context.
+        assert!(combined.is_connection_fatal(), "{msg}");
+
+        // A successful step that merely failed to send back keeps the send
+        // error untouched — there is no root cause to attach.
+        let send = EngineError::Backend("packed token send: broken pipe".into());
+        let alone = nack_send_error(send, None);
+        assert_eq!(
+            alone.to_string(),
+            "backend error: packed token send: broken pipe"
+        );
+    }
+
+    /// The dead-wire latch arms on this stage's own dead socket and on
+    /// nothing else. A lost batch (a downstream NACK, a bad plan, a failed
+    /// inference) leaves a working link and MUST leave the engine serving —
+    /// arming there would take a healthy rank 0 permanently offline on one
+    /// unlucky batch.
+    #[test]
+    fn wire_dead_latch_arms_only_on_a_connection_fatal_cause() {
+        let mut latch = WireDeadLatch::default();
+        assert!(latch.cause().is_none());
+        assert!(latch.fail_fast_error().is_none());
+
+        // A downstream NACK: structurally non-fatal, whatever it says.
+        assert!(!latch.observe(&EngineError::BatchAborted(
+            "downstream stage failed its packed step and NACKed this batch".into()
+        )));
+        // Even one quoting words the substring classifier hunts for — the
+        // dead socket in that text belongs to some OTHER rank.
+        assert!(!latch.observe(&EngineError::BatchAborted(
+            "the packed step failed: backend error: packed token recv: broken pipe".into()
+        )));
+        // A plain local step failure.
+        assert!(!latch.observe(&EngineError::Backend(
+            "packed plan decode: slot 9 beyond 4 slots".into()
+        )));
+        assert!(latch.cause().is_none(), "{:?}", latch.cause());
+        assert!(latch.fail_fast_error().is_none());
+
+        // This stage's own poisoned socket, as `packed_abort_error` passes it
+        // through: fatal, and it arms the latch.
+        let dead = packed_abort_error(EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into(),
+        ));
+        assert!(latch.observe(&dead));
+        let cause = latch.cause().expect("latched");
+        assert!(cause.contains("recv_exact timed out after 60s"), "{cause}");
+    }
+
+    /// Once latched, every request is refused with an error that is (a)
+    /// connection-fatal, so the failure stays visible to the API's readiness
+    /// tracker and to any supervisor plumbing added later, (b) never
+    /// `BatchAborted`, which is fatality-false by construction, and (c)
+    /// carrying the original cause so the operator learns what killed the wire.
+    #[test]
+    fn latched_wire_fails_fast_with_a_connection_fatal_error() {
+        let mut latch = WireDeadLatch::default();
+        latch.observe(&EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into(),
+        ));
+        let err = latch.fail_fast_error().expect("latched");
+        assert!(matches!(err, EngineError::Backend(_)), "{err:?}");
+        assert!(err.is_connection_fatal(), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("recv_exact timed out after 60s"), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+
+        // Fatality must not depend on the stored cause's wording. `NotConnected`
+        // is fatal STRUCTURALLY and displays as "not YET connected", which no
+        // substring rule matches — a fail-fast error that merely echoed the
+        // cause would silently become non-fatal here.
+        let mut latch = WireDeadLatch::default();
+        assert!(EngineError::NotConnected.is_connection_fatal());
+        assert!(!EngineError::NotConnected.to_string().contains(
+            // the classifier's substring, absent from this Display
+            "not connected"
+        ));
+        latch.observe(&EngineError::NotConnected);
+        let err = latch.fail_fast_error().expect("latched");
+        assert!(err.is_connection_fatal(), "{err}");
+        // And the chunk text a retired task receives names the abort once.
+        let chunk_msg = packed_abort_message(&err);
+        assert!(
+            chunk_msg.starts_with("packed batch aborted: "),
+            "{chunk_msg}"
+        );
+        assert!(
+            !chunk_msg.contains("batch aborted: batch aborted"),
+            "{chunk_msg}"
+        );
+    }
+
+    /// The operator-facing `error!` fires on the LATCHING TRANSITION only —
+    /// `observe` returns true exactly once, so a stage that keeps aborting
+    /// batches does not re-log the same dead link per batch. The first cause
+    /// is also the one kept: it is the failure that actually killed the wire,
+    /// every later one is a consequence.
+    #[test]
+    fn wire_dead_latch_transition_reports_once_and_keeps_the_first_cause() {
+        let mut latch = WireDeadLatch::default();
+        assert!(latch.observe(&EngineError::Backend(
+            "packed token recv: recv_exact timed out after 60s".into()
+        )));
+        // Every later fatal cause: no transition, no overwrite.
+        for _ in 0..3 {
+            assert!(!latch.observe(&EngineError::NotConnected));
+            assert!(!latch.observe(&EngineError::Backend(
+                "packed plan send: not connected".into()
+            )));
+        }
+        let cause = latch.cause().expect("latched");
+        assert!(cause.contains("recv_exact timed out after 60s"), "{cause}");
+        assert!(!cause.contains("packed plan send"), "{cause}");
+        // A benign cause after latching cannot disarm it either.
+        assert!(!latch.observe(&EngineError::BatchAborted("lost batch".into())));
+        assert!(latch.fail_fast_error().is_some());
+    }
+
+    /// Prefill chunks (several rows for one slot) get the widened reply
+    /// budget; decode frames (at most one row per slot) keep the strict
+    /// deadline. Idle rows never count.
+    #[test]
+    fn plan_prefill_detection_by_duplicate_slot() {
+        // decode: three distinct slots + an idle row
+        assert!(!plan_has_prefill_rows(&[
+            Some((0, 5, 0)),
+            Some((1, 9, 0)),
+            None,
+            Some((3, 2, 0)),
+        ]));
+        // prefill chunk: slot 2 owns several rows
+        assert!(plan_has_prefill_rows(&[
+            Some((2, 0, 0)),
+            Some((2, 1, 0)),
+            Some((2, 2, 0)),
+            None,
+        ]));
+        // single-row prefill is indistinguishable from decode — strict
+        // deadline by design
+        assert!(!plan_has_prefill_rows(&[Some((0, 0, 0))]));
+        assert!(!plan_has_prefill_rows(&[]));
     }
 
     /// Which token sits in each ring slot, recovered by matching the

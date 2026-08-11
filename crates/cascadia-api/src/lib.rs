@@ -1132,11 +1132,13 @@ async fn chat_completions(
         trust_remote_code: false,
     };
 
-    // Acquire a request slot before touching the engine. Without this
-    // a flood of concurrent SSE callers would hammer one engine mutex
-    // and starve everyone (the `MAX_CONSECUTIVE_EMPTY_STEPS=3` guard
-    // in the runner would then truncate streams). Backpressure is
-    // 503; clients should retry with backoff.
+    // Acquire a request slot before touching the engine. Contended streams
+    // no longer block a tokio worker (#122: they park on a failed `try_lock`,
+    // and submits go out via `spawn_blocking`), so this gate is not what
+    // keeps the runtime alive — it bounds the two resources that are still
+    // finite: the engine's own queue/slot depth, and the blocking pool the
+    // submits land on. Backpressure is 503; clients should retry with
+    // backoff.
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -1183,7 +1185,7 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate(task.clone()) {
+    let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -1381,7 +1383,7 @@ async fn completions(
 
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate(task) {
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
     };
@@ -1476,7 +1478,7 @@ async fn stream_text_completion(
     include_usage: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
-    let chunk_stream = match state.runner.generate(task) {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
@@ -1599,7 +1601,7 @@ async fn stream_completion(
     let task_id = task.task_id.clone();
     let _ = SystemTime::now();
 
-    let chunk_stream = match state.runner.generate(task) {
+    let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
@@ -1865,7 +1867,10 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         EngineError::QueueFull { .. } => "capacity",
         EngineError::PromptTooLong(_) => "prompt_over_window",
         EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
-        EngineError::Backend(_) | EngineError::Io(_) | EngineError::Task { .. } => "engine_error",
+        EngineError::Backend(_)
+        | EngineError::Io(_)
+        | EngineError::Task { .. }
+        | EngineError::BatchAborted(_) => "engine_error",
         EngineError::InvalidConfig(_)
         | EngineError::PeerRejected(_)
         | EngineError::ShardRejected(_)
@@ -1885,6 +1890,9 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // A task-attributed step failure: the engine abandoned a task; the
         // underlying cause is a backend/transport failure.
         EngineError::Task { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // A pipeline stage abandoned the in-flight batch. Server-side and
+        // this node's to explain, like any other engine failure.
+        EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
 }
@@ -1949,6 +1957,7 @@ mod tests {
             (EngineError::NotLoaded, "engine_unavailable"),
             (EngineError::NotConnected, "engine_unavailable"),
             (EngineError::Backend("boom".into()), "engine_error"),
+            (EngineError::BatchAborted("x".into()), "engine_error"),
             (EngineError::InvalidConfig("bad".into()), "invalid_request"),
             (EngineError::ModelNotFound("nope".into()), "invalid_request"),
         ];
