@@ -1351,14 +1351,21 @@ pub struct OvRuntimeEngine {
     /// stamps a monotonic seq on the hidden it sends downstream and the
     /// neighbor echoes it on the token; a mismatched echo is discarded.
     ///
-    /// `downstream_seq`: next seq to stamp on a hidden sent downstream.
-    downstream_seq: u32,
-    /// Seq stamped on the LAST hidden sent downstream; the token echo must
-    /// equal this or it is a stale orphan.
+    /// `awaiting_token_seq`: seq stamped on the LAST hidden sent downstream —
+    /// PRE-incremented per send, so it doubles as the next seq to stamp. The
+    /// token echo must equal it or the token is a stale orphan. Monotonic for
+    /// the engine's lifetime (never reset on cancel/reset_state) so a re-formed
+    /// generation cannot collide with an orphan of the old one.
+    ///
+    /// Pre-incrementing also means the first stamped seq is 1, never 0, so a
+    /// zero echo — the value a foreign or zero-filled frame decodes to — cannot
+    /// match the virgin state of a link that has not sent anything yet.
     awaiting_token_seq: u32,
-    /// Seq read from the upstream hidden; echoed back on the token this stage
-    /// sends upstream.
-    inbound_seq: u32,
+    /// Seq read from the upstream hidden, echoed back on the token this stage
+    /// sends upstream. `None` until a hidden has actually been received:
+    /// "you may only echo a seq you were given" is then enforced by the type
+    /// rather than by a zero that is indistinguishable from a real seq 0.
+    inbound_seq: Option<u32>,
     /// Relay ranks only: consecutive token-wait TIMEOUTS on the downstream
     /// link. Reset by any answer at all (a token, a NACK, even a malformed
     /// frame). Drives `escalate_if_downstream_is_gone`.
@@ -1777,9 +1784,8 @@ impl OvRuntimeEngine {
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         // Stamp the monotonic per-link seq this stage expects the downstream
         // neighbor to echo back on the token (so a late orphan is detectable).
-        let seq = self.downstream_seq;
-        self.downstream_seq = self.downstream_seq.wrapping_add(1);
-        self.awaiting_token_seq = seq;
+        self.awaiting_token_seq = self.awaiting_token_seq.wrapping_add(1);
+        let seq = self.awaiting_token_seq;
         let mut wire_shape = [1u32; MAX_RANK];
         for (i, d) in shape.iter().enumerate().take(MAX_RANK) {
             wire_shape[i] = *d as u32;
@@ -1856,7 +1862,7 @@ impl OvRuntimeEngine {
         // upstream; decode/validate outside the transport closure so a bad
         // frame yields a clear EngineError, not a desync.
         let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
-        self.inbound_seq = inbound_seq;
+        self.inbound_seq = Some(inbound_seq);
         let shape = [
             tensor.shape[0] as usize,
             tensor.shape[1] as usize,
@@ -1885,7 +1891,15 @@ impl OvRuntimeEngine {
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
         // Echo the seq the upstream stamped on the hidden it sent us, so it can
         // detect a stale orphan if this token arrives after its wait moved on.
-        let tensor = encode_token_with_seq(token, self.inbound_seq);
+        // There is no seq to echo before a hidden has been received, and every
+        // call site is preceded by one in the same step — so this is a bug
+        // guard, not a runtime condition.
+        let inbound = self.inbound_seq.ok_or_else(|| {
+            EngineError::Backend(
+                "no upstream seq recorded: a token was sent before any hidden was received".into(),
+            )
+        })?;
+        let tensor = encode_token_with_seq(token, inbound);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -4512,9 +4526,8 @@ impl Builder for OvRuntimeBuilder {
             prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
             wire_dead: WireDeadLatch::default(),
-            downstream_seq: 0,
             awaiting_token_seq: 0,
-            inbound_seq: 0,
+            inbound_seq: None,
             consecutive_token_timeouts: 0,
         }))
     }
