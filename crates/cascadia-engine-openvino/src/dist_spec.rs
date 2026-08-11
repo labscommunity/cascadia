@@ -1607,9 +1607,12 @@ impl OvDistSpecEngine {
             Vec::new()
         } else {
             let seed_u32: Vec<u32> = out.iter().map(|&t| t as u32).collect();
+            // Propagate, never `unwrap_or_default()`: an empty seed here would make the
+            // first delta re-emit the entire forced prefix to the client. Failing the
+            // task is the honest outcome — same call as the qwen36 seed-decode fix.
             self.tokenizer
                 .decode(&seed_u32, true)
-                .unwrap_or_default()
+                .map_err(|e| EngineError::Backend(format!("resume seed decode failed: {e}")))?
                 .into_bytes()
         };
         out.push(first);

@@ -2297,6 +2297,22 @@ impl OvRuntimeEngine {
                 break;
             };
             let task = self.pending.remove(0);
+            // Option B: the packed path has no forced-prefix support — it neither
+            // appends `resume_token_ids` to the prompt nor seeds `generated`/`emitted`.
+            // Admitting a resume task here would regenerate the turn FROM SCRATCH and
+            // report success, i.e. silently hand the client a different completion than
+            // the prefix it already received. Refuse loudly so the scheduler can surface
+            // or re-route it, rather than being told the resume succeeded.
+            // (Unreachable at the `packed_slots = 0` default; guards enabling it.)
+            if task
+                .resume_token_ids
+                .as_ref()
+                .is_some_and(|r| !r.is_empty())
+            {
+                return Err(EngineError::Backend(
+                    "resume (Option B forced prefix) is unsupported on packed slots".into(),
+                ));
+            }
             let tok = self
                 .tokenizer
                 .clone()
