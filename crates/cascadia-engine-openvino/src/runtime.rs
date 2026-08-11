@@ -811,6 +811,38 @@ async fn recv_hidden_frames(
 /// generation has a tight real deadline regardless, so cap it here.
 const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Overall budget for one token wait.
+///
+/// A DECODE reply is one token of compute per remaining stage, so it gets the
+/// base `recv_timeout` capped at [`TOKEN_RECV_DEADLINE_CEILING`]. A PREFILL
+/// reply waits on whole-prompt (or whole-chunk) compute across every remaining
+/// stage, so it scales with tokens-per-frame x pipeline depth — the same
+/// reasoning, and the same factor, as the transport's
+/// [`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`]. Both the budget and
+/// the ceiling widen, so the cap keeps its meaning ("an operator-raised
+/// recv_timeout cannot grow the engine-lock hold without bound") on a path
+/// where the wait legitimately scales.
+///
+/// The ceiling is not absolute for prefill on purpose: a tuned-up `recv_timeout`
+/// exists precisely because some stages are slow, and prefill is the case that
+/// legitimately needs it. At the default 60s this yields 60s / 600s; at the
+/// rig's 120s, 120s / 1200s — the same prefill budget `recv_reply_prefill` gave
+/// before, and strictly tighter than it at pathological settings.
+///
+/// Pure, for testing.
+fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std::time::Duration {
+    let factor = if prefill {
+        cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR
+    } else {
+        1
+    };
+    // saturating_mul: an absurdly large configured base must clamp, not panic
+    // the engine thread (Duration's Mul panics on overflow).
+    recv_timeout
+        .saturating_mul(factor)
+        .min(TOKEN_RECV_DEADLINE_CEILING.saturating_mul(factor))
+}
+
 /// Consecutive token-wait timeouts after which a RELAY rank gives up on its
 /// downstream and exits for a supervisor rebuild (see
 /// `escalate_if_downstream_is_gone`). Each timeout already burns a full token
@@ -853,9 +885,10 @@ impl TokenWaitFailure {
 async fn recv_token_seq_checked(
     downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
     awaiting_seq: u32,
+    prefill: bool,
 ) -> Result<i32, TokenWaitFailure> {
     let deadline_at = std::time::Instant::now()
-        + cascadia_transport::recv_timeout().min(TOKEN_RECV_DEADLINE_CEILING);
+        + token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
     loop {
         let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -1767,10 +1800,10 @@ impl OvRuntimeEngine {
         Ok(())
     }
 
-    // `_prefill` (main's widened token-reply budget hint) is intentionally
-    // ignored here: `recv_token_seq_checked` caps the whole token wait itself,
-    // so the prefill vs decode distinction does not change it.
-    fn recv_token_from_downstream(&mut self, _prefill: bool) -> EngineResult<i32> {
+    /// `prefill` widens the wait: the reply is owed only after every remaining
+    /// stage has run multi-token inference, so the budget scales with the
+    /// frame's token count and the pipeline depth (see `token_recv_deadline`).
+    fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
@@ -1786,7 +1819,7 @@ impl OvRuntimeEngine {
         // token whose echoed seq != the one we stamped is discarded (it would
         // otherwise be read by the next request → silent token desync).
         let awaiting = self.awaiting_token_seq;
-        match self.block_on(recv_token_seq_checked(&downstream, awaiting)) {
+        match self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill)) {
             Ok(token) => {
                 self.consecutive_token_timeouts = 0;
                 Ok(token)
@@ -5356,7 +5389,9 @@ mod tests {
             .await
             .unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let tok = recv_token_seq_checked(&downstream, awaiting).await.unwrap();
+        let tok = recv_token_seq_checked(&downstream, awaiting, false)
+            .await
+            .unwrap();
         assert_eq!(tok, 42, "stale token must be skipped, correct one returned");
     }
 
@@ -5369,7 +5404,9 @@ mod tests {
             .await
             .unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let tok = recv_token_seq_checked(&downstream, awaiting).await.unwrap();
+        let tok = recv_token_seq_checked(&downstream, awaiting, false)
+            .await
+            .unwrap();
         assert_eq!(tok, 123);
     }
 
@@ -5402,7 +5439,7 @@ mod tests {
             .await
             .unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let err = recv_token_seq_checked(&downstream, awaiting)
+        let err = recv_token_seq_checked(&downstream, awaiting, false)
             .await
             .unwrap_err();
         // `Other`, not `TimedOut`: a NACK proves the link delivered bytes, so
@@ -5436,8 +5473,54 @@ mod tests {
         // ...then the current generation's real token.
         server.send(&encode_token_with_seq(42, 5)).await.unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let tok = recv_token_seq_checked(&downstream, 5).await.unwrap();
+        let tok = recv_token_seq_checked(&downstream, 5, false).await.unwrap();
         assert_eq!(tok, 42, "a stale NACK must be discarded, not honoured");
+    }
+
+    /// The token budget: decode gets the base `recv_timeout`, prefill gets the
+    /// widened one, and BOTH are capped so an operator-raised `recv_timeout`
+    /// cannot grow the engine-lock hold without bound (#40).
+    ///
+    /// This was untestable while the `min()` lived inline in an async fn that
+    /// needed a live socket — flipping it to `max()` passed the whole suite.
+    #[test]
+    fn token_recv_deadline_widens_for_prefill_and_clamps_both() {
+        use std::time::Duration;
+        let f = cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR;
+        // Below the ceiling: the configured value governs, x factor for prefill.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(60), false),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(60), true),
+            Duration::from_secs(60) * f
+        );
+        // At the rig's config: decode sits exactly on the ceiling, and prefill
+        // gets the same 1200s `recv_reply_prefill` used to give it.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), false),
+            TOKEN_RECV_DEADLINE_CEILING
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // Above it, the cap binds on both paths — this is the assertion a
+        // `max()` typo fails.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(600), false),
+            TOKEN_RECV_DEADLINE_CEILING
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(600), true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // An absurd configured base clamps rather than panicking on overflow.
+        assert_eq!(
+            token_recv_deadline(Duration::MAX, true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
     }
 
     /// A frame-start timeout is the ONLY token-wait failure that says anything
@@ -5451,7 +5534,9 @@ mod tests {
         let (client, _server) = loopback().await;
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         cascadia_transport::set_activation_timeout_secs(1);
-        let err = recv_token_seq_checked(&downstream, 0).await.unwrap_err();
+        let err = recv_token_seq_checked(&downstream, 0, false)
+            .await
+            .unwrap_err();
         cascadia_transport::set_activation_timeout_secs(0);
         assert!(matches!(err, TokenWaitFailure::TimedOut(_)), "{err:?}");
 
@@ -5460,7 +5545,9 @@ mod tests {
         let (client, mut server) = loopback().await;
         server.send(&encode_wire_tokens(&[7])).await.unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let err = recv_token_seq_checked(&downstream, 0).await.unwrap_err();
+        let err = recv_token_seq_checked(&downstream, 0, false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
     }
 
@@ -5594,7 +5681,9 @@ mod tests {
             .send(&encode_token_with_seq(55, inbound))
             .await
             .unwrap();
-        let tok = recv_token_seq_checked(&downstream, stamped).await.unwrap();
+        let tok = recv_token_seq_checked(&downstream, stamped, false)
+            .await
+            .unwrap();
         assert_eq!(tok, 55);
     }
 
@@ -5636,7 +5725,9 @@ mod tests {
             .await
             .unwrap();
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
-        let tok = recv_token_seq_checked(&downstream, u32::MAX).await.unwrap();
+        let tok = recv_token_seq_checked(&downstream, u32::MAX, false)
+            .await
+            .unwrap();
         assert_eq!(tok, 8);
     }
 }
