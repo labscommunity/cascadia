@@ -246,7 +246,10 @@ pub fn make_router_with_stats(
             .template
             .as_deref()
             .and_then(|src| match build_chat_env(src) {
-                Ok(env) => Some(Arc::new(env)),
+                Ok(env) => {
+                    report_chat_template_smoke(&env);
+                    Some(Arc::new(env))
+                }
                 Err(e) => {
                     warn!(error = %e, "chat_template failed to parse at startup; using legacy formatter");
                     None
@@ -832,6 +835,95 @@ fn py_tojson(
     // Safe-string like the builtin: the value is already JSON-encoded and must
     // not be HTML-escaped again if a caller enables autoescape.
     Ok(Value::from_safe_string(json))
+}
+
+/// Render a spread of message shapes through `env` and report the ones that
+/// fail for engine-compatibility reasons.
+///
+/// A template that parses is not a template that renders. Every compatibility
+/// gap found so far — a `tojson` kwarg, a Python string method, `strftime_now`
+/// — lives inside a branch that only executes for a particular message shape,
+/// so a tools-only failure stays invisible until the first tools request.
+/// Running the shapes at load turns that into a startup signal.
+///
+/// `Rejected` outcomes are omitted: a template refusing a system role is it
+/// doing its job, not a defect.
+/// Log the smoke battery's verdict once, at load.
+fn report_chat_template_smoke(env: &minijinja::Environment<'static>) {
+    for (case, err) in chat_template_smoke_failures(env) {
+        tracing::error!(
+            case,
+            error = %err,
+            "chat_template does not render this message shape; requests of this shape will fail"
+        );
+    }
+}
+
+fn chat_template_smoke_failures(
+    env: &minijinja::Environment<'static>,
+) -> Vec<(&'static str, String)> {
+    fn m(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+    let tools = [Tool {
+        r#type: "function".into(),
+        function: serde_json::json!({
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }),
+    }];
+    let call = m("assistant", "");
+    let call = ChatMessage {
+        tool_calls: Some(vec![ToolCall {
+            id: "call_0".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: r#"{"city":"Paris"}"#.into(),
+            },
+        }]),
+        ..call
+    };
+    let tool_reply = ChatMessage {
+        tool_call_id: Some("call_0".into()),
+        ..m("tool", "18C and clear")
+    };
+
+    let plain = [m("user", "hi")];
+    let with_system = [m("system", "be brief"), m("user", "hi")];
+    let multi_turn = [m("user", "hi"), m("assistant", "hello"), m("user", "more")];
+    let round_trip = [m("user", "weather in Paris?"), call, tool_reply];
+
+    let cases: [(&'static str, &[ChatMessage], Option<&[Tool]>, bool); 7] = [
+        ("plain", &plain, None, true),
+        ("system", &with_system, None, true),
+        ("multi-turn", &multi_turn, None, true),
+        ("tools", &plain, Some(&tools), true),
+        ("tools+thinking-off", &plain, Some(&tools), false),
+        ("tool-call round trip", &round_trip, Some(&tools), true),
+        ("thinking-off", &plain, None, false),
+    ];
+
+    cases
+        .into_iter()
+        .filter_map(|(name, msgs, tools, thinking)| {
+            match render_with_chat_env(env, msgs, "", "", thinking, tools) {
+                Err(PromptRenderError::Failed(e)) => Some((name, e)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
@@ -1522,7 +1614,10 @@ impl ChatPromptRenderer {
             .template
             .as_deref()
             .and_then(|src| match build_chat_env(src) {
-                Ok(env) => Some(Arc::new(env)),
+                Ok(env) => {
+                    report_chat_template_smoke(&env);
+                    Some(Arc::new(env))
+                }
                 Err(e) => {
                     warn!(error = %e, "chat_template failed to parse; using legacy formatter");
                     None
@@ -3814,6 +3909,21 @@ mod tests {
     }
 
     #[test]
+    fn tojson_number_formatting_matches_python() {
+        // Schemas carry numeric bounds (minimum/maximum/multipleOf), so number
+        // formatting is on the byte-parity path too. serde_json emits
+        // shortest-roundtrip via ryu; Python uses repr. They agree except that
+        // Python zero-pads the exponent to two digits: `1e-07` vs our `1e-7`.
+        // Left as-is — rewriting exponents in serialized JSON risks mangling
+        // string contents, and it takes a bound like `multipleOf: 1e-7` in a
+        // tool schema to reach it.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"a":1e30,"b":1.0,"c":0.1,"d":1e-7}"#).unwrap();
+        let out = tojson_of(v, &[]).unwrap();
+        assert_eq!(out, r#"{"a": 1e+30, "b": 1.0, "c": 0.1, "d": 1e-7}"#);
+    }
+
+    #[test]
     fn tojson_empty_containers_match_python() {
         let out = tojson_of(serde_json::json!({"a": [], "b": {}}), &[]).unwrap();
         assert_eq!(out, r#"{"a": [], "b": {}}"#);
@@ -3895,6 +4005,43 @@ mod tests {
             out,
             r#"{"description": "user's city", "name": "get_weather"}"#
         );
+    }
+
+    #[test]
+    fn smoke_battery_catches_a_tools_only_render_failure_at_load() {
+        // The exact shape of the GLM-5 incident: parses clean, renders clean
+        // for every tool-less request, fails only once tools are present.
+        let env = build_chat_env("ok{% if tools %}{{ boom.nope.deeper }}{% endif %}").unwrap();
+        let failures = chat_template_smoke_failures(&env);
+        let cases: Vec<_> = failures.iter().map(|(c, _)| *c).collect();
+        assert!(cases.contains(&"tools"), "battery missed it: {cases:?}");
+        assert!(
+            !cases.contains(&"plain"),
+            "tool-less shapes must still pass: {cases:?}"
+        );
+    }
+
+    #[test]
+    fn smoke_battery_is_quiet_for_a_healthy_template_and_for_rejections() {
+        let ok = build_chat_env(
+            "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}\
+             {% if tools %}{{ tools | tojson(ensure_ascii=False) }}{% endif %}",
+        )
+        .unwrap();
+        assert!(chat_template_smoke_failures(&ok).is_empty());
+
+        // A template refusing a system role is validating input, not broken —
+        // it must not show up as a startup defect.
+        let strict = build_chat_env(
+            r#"{% for m in messages %}{% if m.role == "system" %}\
+{{ raise_exception("no system role") }}{% endif %}{{ m.content }}{% endfor %}"#,
+        )
+        .unwrap();
+        let cases: Vec<_> = chat_template_smoke_failures(&strict)
+            .iter()
+            .map(|(c, _)| *c)
+            .collect();
+        assert!(!cases.contains(&"system"), "rejection reported: {cases:?}");
     }
 
     #[test]
