@@ -876,6 +876,38 @@ impl TokenWaitFailure {
     }
 }
 
+/// The terminal error for a token wait that ran out of budget.
+///
+/// Both exits — the overall deadline elapsing between discards, and a
+/// frame-start timeout inside one recv — come through here, so the diagnosis
+/// does not depend on which one happened to fire. Naming the discard count and
+/// the last echoed seq is the point: without them a persistent seq mismatch
+/// reads as a slow or wedged stage, and the operator investigates the network
+/// instead of a mismatched build. The wording deliberately avoids the
+/// substrings `EngineError::is_connection_fatal` treats as fatal — a token wait
+/// timing out must stay retryable so the head keeps its un-redialable socket.
+fn token_wait_timeout_error(
+    budget: std::time::Duration,
+    awaiting_seq: u32,
+    discarded: u64,
+    last_echo: Option<u32>,
+    cause: &str,
+) -> EngineError {
+    let detail = match (discarded, last_echo) {
+        (0, _) => "no token frame arrived".to_string(),
+        (n, Some(got)) => format!(
+            "{n} stale token frame(s) arrived and were discarded, last echoing seq {got} — a \
+             non-zero count with no match means the downstream is answering a different request, \
+             or runs a build without the seq-echo wire (restart both stages on the same build)"
+        ),
+        (n, None) => format!("{n} frame(s) discarded"),
+    };
+    EngineError::Backend(format!(
+        "timed out after {budget:?} waiting for the downstream token (expected seq \
+         {awaiting_seq}): {detail} [{cause}]"
+    ))
+}
+
 /// Read a seq-tagged token from `downstream`, discarding any STALE orphan
 /// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
 /// bounded by ONE overall deadline = `min(recv_timeout(), TOKEN_RECV_DEADLINE_CEILING)`:
@@ -887,13 +919,24 @@ async fn recv_token_seq_checked(
     awaiting_seq: u32,
     prefill: bool,
 ) -> Result<i32, TokenWaitFailure> {
-    let deadline_at = std::time::Instant::now()
-        + token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    let budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    let deadline_at = std::time::Instant::now() + budget;
+    // Discards are summarised into the terminal error rather than logged per
+    // frame. A peer echoing the wrong seq every time — a version skew, or a
+    // downstream answering a different request — can stream thousands of frames
+    // inside one budget, and a per-frame WARN floods exactly the log an operator
+    // has to read the diagnosis out of.
+    let mut discarded = 0u64;
+    let mut last_echo: Option<u32> = None;
     loop {
         let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err(TokenWaitFailure::TimedOut(EngineError::Backend(
-                "timed out waiting for the downstream token (overall deadline)".into(),
+            return Err(TokenWaitFailure::TimedOut(token_wait_timeout_error(
+                budget,
+                awaiting_seq,
+                discarded,
+                last_echo,
+                "the overall deadline elapsed",
             )));
         }
         let recv = {
@@ -901,26 +944,52 @@ async fn recv_token_seq_checked(
             guard.recv_token(remaining).await
         };
         let (tensor, _) = recv.map_err(|e| {
-            let flat = EngineError::Backend(e.to_string());
             // Classify on the TYPED transport error, before flattening: a
             // frame-start timeout means the downstream never answered, which is
             // the only thing relay escalation may count.
             match e {
                 cascadia_transport::TransportError::FrameStartTimeout(_) => {
-                    TokenWaitFailure::TimedOut(flat)
+                    // Report through the same formatter as the overall-deadline
+                    // exit. Whether the budget runs out inside one recv or
+                    // between two discards is a race, and the operator needs the
+                    // discard context either way — returning the bare transport
+                    // message here would drop it in the common case.
+                    TokenWaitFailure::TimedOut(token_wait_timeout_error(
+                        budget,
+                        awaiting_seq,
+                        discarded,
+                        last_echo,
+                        &e.to_string(),
+                    ))
                 }
-                _ => TokenWaitFailure::Other(flat),
+                other => TokenWaitFailure::Other(EngineError::Backend(other.to_string())),
             }
         })?;
         let (token, echo_seq) = decode_token_with_seq(&tensor).map_err(TokenWaitFailure::Other)?;
         if echo_seq != awaiting_seq {
-            warn!(
-                event = "stale_token_discarded",
-                expected = awaiting_seq,
-                got = echo_seq,
-                "discarding a stale orphan token from downstream (chain re-formed mid-wait)"
-            );
+            // First discard only: one line says the guard fired and names the
+            // seqs, which is what the rig validation looks for. Any further
+            // discards in the same wait are counted, not logged, and reported
+            // together in the terminal error.
+            if discarded == 0 {
+                warn!(
+                    event = "stale_token_discarded",
+                    expected = awaiting_seq,
+                    got = echo_seq,
+                    "discarding a stale orphan token from downstream (chain re-formed mid-wait); \
+                     further discards in this wait are counted, not logged"
+                );
+            }
+            discarded += 1;
+            last_echo = Some(echo_seq);
             continue;
+        }
+        if discarded > 0 {
+            debug!(
+                discarded,
+                expected = awaiting_seq,
+                "downstream token arrived after discarding stale orphans"
+            );
         }
         // A NACK for THIS generation: the downstream consumed our activation
         // group and then failed. The batch is lost, the link is not — so this
@@ -5488,6 +5557,69 @@ mod tests {
         let downstream = Arc::new(tokio::sync::Mutex::new(client));
         let tok = recv_token_seq_checked(&downstream, 5, false).await.unwrap();
         assert_eq!(tok, 42, "a stale NACK must be discarded, not honoured");
+    }
+
+    /// A wait that only ever sees WRONG-seq frames must report why it gave up.
+    /// Without the discard count and the last echoed seq, a version skew or a
+    /// downstream answering a different request is indistinguishable from a
+    /// slow stage, and the operator goes looking at the network.
+    #[tokio::test]
+    async fn a_wait_that_only_discards_reports_the_discards() {
+        let (client, mut server) = loopback().await;
+        cascadia_transport::set_activation_timeout_secs(1);
+        // Three frames, none of them echoing the seq we are waiting on.
+        for s in [11u32, 12, 13] {
+            server.send(&encode_token_with_seq(5, s)).await.unwrap();
+        }
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 99, false)
+            .await
+            .unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+
+        assert!(matches!(err, TokenWaitFailure::TimedOut(_)), "{err:?}");
+        let msg = err.into_error().to_string();
+        assert!(msg.contains("expected seq 99"), "{msg}");
+        assert!(msg.contains("3 stale token frame(s)"), "{msg}");
+        assert!(msg.contains("last echoing seq 13"), "{msg}");
+        assert!(msg.contains("same build"), "no remedy named: {msg}");
+    }
+
+    /// A wait that saw nothing at all says so, rather than implying frames were
+    /// discarded — the two point at completely different causes.
+    #[tokio::test]
+    async fn a_silent_wait_says_no_frame_arrived() {
+        let (client, _server) = loopback().await;
+        cascadia_transport::set_activation_timeout_secs(1);
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 7, false)
+            .await
+            .unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+        let msg = err.into_error().to_string();
+        assert!(msg.contains("no token frame arrived"), "{msg}");
+        // The transport's own wording is carried as the cause, not replaced.
+        assert!(msg.contains("frame-start wait timed out"), "{msg}");
+    }
+
+    /// Whichever exit fires, the wait must stay RETRYABLE. The head cannot
+    /// re-dial its downstream, so a token timeout classifying fatal would drop
+    /// the socket permanently — the #40 brick this bounded recv exists to avoid.
+    #[test]
+    fn a_token_wait_timeout_is_never_connection_fatal() {
+        for (discarded, last) in [(0u64, None), (7, Some(3u32))] {
+            let e = token_wait_timeout_error(
+                std::time::Duration::from_secs(120),
+                42,
+                discarded,
+                last,
+                &cascadia_transport::TransportError::FrameStartTimeout(
+                    std::time::Duration::from_secs(120),
+                )
+                .to_string(),
+            );
+            assert!(!e.is_connection_fatal(), "{e}");
+        }
     }
 
     /// The token budget: decode gets the base `recv_timeout`, prefill gets the
