@@ -5602,6 +5602,40 @@ mod tests {
         assert!(msg.contains("frame-start wait timed out"), "{msg}");
     }
 
+    /// #40: a bounded frame-start timeout must classify NON-fatal at the ENGINE
+    /// layer too, where the verdict is a substring rule over the flattened
+    /// message.
+    ///
+    /// This assertion lives here, in the crate that depends on BOTH
+    /// `cascadia-transport` and `cascadia-engine`, and builds the string from
+    /// the real `TransportError` Display. The equivalent test in
+    /// `cascadia-engine` hardcoded its own copy of the text — and that crate
+    /// does not depend on the transport at all, so rewording the `#[error]`
+    /// attribute left the test green while production flipped to fatal and
+    /// started dropping a socket the engine cannot re-dial. A pin that cannot
+    /// observe what it pins is not a pin.
+    #[test]
+    fn transport_frame_start_timeout_is_non_fatal_at_the_engine_layer() {
+        let display = cascadia_transport::TransportError::FrameStartTimeout(
+            std::time::Duration::from_secs(120),
+        )
+        .to_string();
+        assert!(
+            !EngineError::Backend(display.clone()).is_connection_fatal(),
+            "a retryable frame-start timeout must not read as fatal: {display}"
+        );
+        // The sibling ceiling stays fatal — the classifier is narrowed, not
+        // blunted, and these two differ only in which recv asked.
+        let ceiling = cascadia_transport::TransportError::FrameIdleCeiling(
+            std::time::Duration::from_secs(900),
+        )
+        .to_string();
+        assert!(
+            EngineError::Backend(ceiling.clone()).is_connection_fatal(),
+            "the idle ceiling must stay fatal: {ceiling}"
+        );
+    }
+
     /// Whichever exit fires, the wait must stay RETRYABLE. The head cannot
     /// re-dial its downstream, so a token timeout classifying fatal would drop
     /// the socket permanently — the #40 brick this bounded recv exists to avoid.
