@@ -916,7 +916,21 @@ fn cmd_engines() -> Result<()> {
     Ok(())
 }
 
+/// Unix-domain-socket address form (#17): `unix:/path.sock`, an absolute
+/// path, or a `.sock`-suffixed name. Valid for --listen/--next (in-host
+/// pipeline hand-offs); NOT for --api (HTTP stays TCP).
+fn is_unix_addr(s: &str) -> bool {
+    s.starts_with("unix:") || s.starts_with('/') || s.ends_with(".sock")
+}
+
 fn parse_addr(s: &str, default_host: &str) -> Result<(String, u16)> {
+    // A UDS address travels whole in the host slot with port 0 — the
+    // transport layer classifies it (TransportAddr::from_host_port).
+    // Recognized before the colon split: "unix:/tmp/x.sock" would
+    // otherwise split at its last ':' and fail the port parse.
+    if is_unix_addr(s) {
+        return Ok((s.to_string(), 0));
+    }
     if let Some(port) = s.strip_prefix(':') {
         return Ok((default_host.to_string(), port.parse().context("port")?));
     }
@@ -1616,7 +1630,17 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         "cascadia worker starting"
     );
 
+    // HTTP must stay TCP: reject a unix --api up-front, before any engine
+    // work, rather than failing the TcpListener bind minutes later.
+    if args.api.as_deref().is_some_and(is_unix_addr) {
+        return Err(anyhow!(
+            "--api must be a TCP address (host:port); unix socket addresses are \
+             supported only for --listen/--next (in-host pipeline hand-offs)"
+        ));
+    }
+
     let (listen_host, listen_port) = parse_addr(&args.listen, "0.0.0.0")?;
+    let listen_is_unix = is_unix_addr(&listen_host);
 
     let upstream = if is_first {
         None
@@ -1669,31 +1693,40 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
     // dashboard demo. If the engine already bound the port, `bind`
     // fails with AddrInUse and we silently step aside (the engine's
     // listener handles probes identically at the TCP layer).
+    //
+    // A unix --listen has no TCP relay port: binding 0.0.0.0:0 here would
+    // grab a meaningless ephemeral port, so skip it (the node also
+    // advertises port 0 via mDNS — cross-host latency probes don't apply
+    // to an in-host UDS stage).
     let probe_addr = format!("0.0.0.0:{listen_port}");
-    match tokio::net::TcpListener::bind(&probe_addr).await {
-        Ok(listener) => {
-            info!(addr = %probe_addr, "probe listener bound");
-            tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok(_) => {
-                            // Drop the connection immediately — the
-                            // probe only needs the connect handshake.
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "probe accept failed");
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if listen_is_unix {
+        tracing::debug!("unix --listen; skipping TCP probe listener");
+    } else {
+        match tokio::net::TcpListener::bind(&probe_addr).await {
+            Ok(listener) => {
+                info!(addr = %probe_addr, "probe listener bound");
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok(_) => {
+                                // Drop the connection immediately — the
+                                // probe only needs the connect handshake.
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "probe accept failed");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
                         }
                     }
-                }
-            });
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                addr = %probe_addr,
-                "probe listener could not bind; engine likely owns the port"
-            );
+                });
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    addr = %probe_addr,
+                    "probe listener could not bind; engine likely owns the port"
+                );
+            }
         }
     }
 

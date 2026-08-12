@@ -17,8 +17,11 @@ use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
 use tokio::sync::Mutex;
 
-async fn make_pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
-    let mut server = ActivationServer::new("127.0.0.1", 0);
+async fn make_pair_at(
+    server_host: &str,
+    client_host_of: impl FnOnce(u16) -> (String, u16),
+) -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
+    let mut server = ActivationServer::new(server_host, 0);
     server.start().await.expect("server.start");
     let port = server.port();
     let server = Arc::new(Mutex::new(server));
@@ -31,7 +34,8 @@ async fn make_pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClien
             .await
             .expect("server.accept");
     });
-    let mut client = ActivationClient::new("127.0.0.1", port);
+    let (client_host, client_port) = client_host_of(port);
+    let mut client = ActivationClient::new(client_host, client_port);
     client
         .connect_with_timeout(std::time::Duration::from_secs(5))
         .await
@@ -39,6 +43,29 @@ async fn make_pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClien
     let client = Arc::new(Mutex::new(client));
     server_task.await.expect("server task panicked");
     (server, client)
+}
+
+async fn make_pair() -> (Arc<Mutex<ActivationServer>>, Arc<Mutex<ActivationClient>>) {
+    make_pair_at("127.0.0.1", |port| ("127.0.0.1".to_string(), port)).await
+}
+
+/// Same pair over a Unix domain socket (#17) — the engine wire protocol
+/// must be byte-identical on both stream flavors.
+#[cfg(unix)]
+async fn make_pair_uds(
+    tag: &str,
+) -> (
+    Arc<Mutex<ActivationServer>>,
+    Arc<Mutex<ActivationClient>>,
+    std::path::PathBuf,
+) {
+    let dir = std::env::temp_dir().join("cascadia-dist-wire-uds");
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join(format!("{tag}-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let addr = format!("unix:{}", sock.display());
+    let (server, client) = make_pair_at(&addr, |_| (addr.clone(), 0)).await;
+    (server, client, sock)
 }
 
 #[tokio::test]
@@ -421,6 +448,59 @@ async fn forward_batch_rejects_mismatched_shape() {
         res.is_err(),
         "send_forward_batch with K vs shape mismatch should error"
     );
+}
+
+/// #17 acceptance (UDS wire smoke): the FULL driver↔worker frame sequence —
+/// Reset → Forward(K2.6-sized hidden state) downstream, Token upstream —
+/// over a Unix domain socket, consumed on both ends. The engine wire
+/// protocol must be byte-identical on UDS and TCP; this is the same
+/// sequence `sequence_reset_then_forward_then_token` pins on TCP.
+#[cfg(unix)]
+#[tokio::test]
+async fn uds_sequence_reset_then_forward_then_token() {
+    let (server, client, sock_path) = make_pair_uds("seq").await;
+    let hidden: Vec<f32> = vec![0.123; 7168];
+    let hidden_for_send = hidden.clone();
+    let shape = [1u32, 1, 7168];
+
+    let server_for_token = server.clone();
+    let client_for_token = client.clone();
+    let cfg = SamplingConfig::default();
+    let send_task = tokio::spawn(async move {
+        send_reset(&client).await.unwrap();
+        send_forward(&client, 0, &cfg, &hidden_for_send, shape)
+            .await
+            .unwrap();
+    });
+
+    assert_eq!(
+        recv_kind_server(&server).await.unwrap(),
+        Some(FrameKind::Reset)
+    );
+    assert_eq!(
+        recv_kind_server(&server).await.unwrap(),
+        Some(FrameKind::Forward)
+    );
+    let (past, _cfg_back, h_back, sh) = recv_forward_body_server(&server).await.unwrap();
+    assert_eq!(past, 0);
+    assert_eq!(sh, shape);
+    assert_eq!(h_back.len(), 7168);
+    for (i, &got) in h_back.iter().enumerate() {
+        assert!((got - 0.123).abs() < 1e-6, "hidden[{i}] corrupted: {got}");
+    }
+    send_task.await.unwrap();
+
+    // The worker rank returns a token upstream on the same unix socket;
+    // the driver must receive it intact.
+    send_token_upstream(&server_for_token, 42).await.unwrap();
+    assert_eq!(
+        recv_kind_client(&client_for_token).await.unwrap(),
+        Some(FrameKind::Token)
+    );
+    let token = recv_token_body_client(&client_for_token).await.unwrap();
+    assert_eq!(token, 42);
+
+    let _ = std::fs::remove_file(&sock_path);
 }
 
 #[test]
