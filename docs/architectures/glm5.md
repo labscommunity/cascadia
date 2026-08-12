@@ -7,7 +7,7 @@ is a runtime parameter (`total`), never hardcoded; layers split evenly across
 ranks. Attention is DeepSeek-V3-style **MLA + DSA**, a different family from the
 V4 shell in this crate, so `src/glm/` is mostly a rewrite, not an adapt.
 
-**Status: implemented** on `pawan/glm-5-2` (single branch, incremental commits).
+**Status: implemented.**
 Numerics are golden-tested 1:1 against a Python CPU reference (`tools/glm5_ref`);
 the FP8→int4 exporter is validated by a synthetic round-trip; the pipeline is
 parity-tested across N ranks over the real loopback transport. Not yet run on the

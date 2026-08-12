@@ -49,3 +49,5 @@ crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer_dense/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_ckpt/
 crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_export/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_boundary/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_windowed/
