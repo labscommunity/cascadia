@@ -58,10 +58,14 @@ These are **non-negotiable** for this repo:
 
 ## Releases (maintainers)
 
-Releases are automated by release-please from the Conventional Commits
-above — another reason they're non-negotiable. On every push to `main` it
-maintains a `chore(main): release X.Y.Z` PR carrying the version bump,
-`CHANGELOG.md`, and `Cargo.lock`. **Merging that PR is the release**: the same run tags
+Releases are cut by release-please from the Conventional Commits
+above — another reason they're non-negotiable. **Starting a release is manual**:
+run the `release-please` workflow from Actions → *Run workflow* on `main`, and
+it opens (or refreshes) a `chore(main): release X.Y.Z` PR carrying the version
+bump, `CHANGELOG.md`, and `Cargo.lock`. Pushes to `main` don't open that PR, so
+commits just accumulate until you dispatch.
+
+From there it's hands-off: **merging that PR is the release**: the same run tags
 `vX.Y.Z`, publishes a pre-release, builds the Linux + Windows OpenVINO
 bundles, attaches them, and promotes to a full release. Wrong version
 proposed? Edit the release PR. Hotfix path: push a `v*` tag by hand and
