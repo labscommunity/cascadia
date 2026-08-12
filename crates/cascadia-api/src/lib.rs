@@ -476,23 +476,22 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
-    /// Hybrid-reasoning switch (Qwen3+ convention). Default true =
-    /// model-default behavior; false asks the engine to skip the
-    /// <think> block (engines that can't, ignore it).
-    #[serde(default = "default_true")]
-    pub enable_thinking: bool,
-    /// Reasoning depth for hybrid-reasoning templates. GLM-5's template reads
-    /// it directly:
+    /// Hybrid-reasoning switch (Qwen3+ convention). Omitted = model-default
+    /// (thinking on, subject to the `reasoning_effort: "none"` override below);
+    /// an explicit `true`/`false` always wins. `Option` rather than `bool` so
+    /// "explicitly set" is distinguishable from "defaulted" — see
+    /// [`ChatCompletionRequest::effective_enable_thinking`].
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Reasoning depth, mapped onto GLM-5's two template levels (High, Max) by
+    /// [`ChatCompletionRequest::effective_reasoning_effort`] before it reaches
+    /// the template — see that method for the mapping table.
     ///
-    /// ```jinja
-    /// {%- set effective_reasoning_effort =
-    ///      'high' if reasoning_effort is defined and reasoning_effort == 'high'
-    ///      else 'max' -%}
-    /// ```
-    ///
-    /// Undefined therefore means **Max** — the template injects a
-    /// `Reasoning Effort: Max` system line on every thinking request. Only the
-    /// literal `"high"` changes anything; anything else is Max.
+    /// `"none"` additionally disables thinking (sets the effective
+    /// `enable_thinking` to false), unless the request explicitly set
+    /// `enable_thinking` itself, which always wins. This exists so
+    /// OpenAI-shaped clients, which have no thinking toggle, still have an
+    /// off-switch.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
@@ -530,10 +529,41 @@ impl ChatCompletionRequest {
             0
         }
     }
-}
 
-fn default_true() -> bool {
-    true
+    /// Resolves `enable_thinking`: an explicit value always wins; otherwise
+    /// `reasoning_effort: "none"` turns thinking off, and omission of both
+    /// means on. This is the coupling that gives OpenAI-shaped clients (no
+    /// thinking toggle) an off-switch without letting `"none"` override a
+    /// client that set the toggle directly.
+    fn effective_enable_thinking(&self) -> bool {
+        self.enable_thinking
+            .unwrap_or_else(|| self.reasoning_effort.as_deref() != Some("none"))
+    }
+
+    /// Maps the OpenAI effort vocabulary onto what GLM-5's template can
+    /// express — exactly two levels, selected by the literal string `"high"`
+    /// vs. anything else (including undefined), which resolves to Max:
+    ///
+    /// | client sends                                       | template sees   |
+    /// | --------------------------------------------------- | --------------- |
+    /// | omitted, `minimal`, `low`, `medium`, `high`, `none`, unrecognised | `"high"` |
+    /// | `xhigh`, `max`                                       | undefined (Max) |
+    ///
+    /// Omission must NOT reach the template as undefined — that is the Max-by
+    /// -omission defect this mapping exists to close. `"none"` sits in the
+    /// conservative `"high"` bucket rather than with `xhigh`/`max`: it signals
+    /// *less* than minimal effort, not more, and its value is moot for the
+    /// common case anyway since `effective_enable_thinking` gates the whole
+    /// effort line off. It only matters when an explicit `enable_thinking:
+    /// true` keeps thinking on despite `"none"` — bucketing it with Max there
+    /// would silently escalate, which is the exact failure this mapping exists
+    /// to prevent.
+    fn effective_reasoning_effort(&self) -> Option<&'static str> {
+        match self.reasoning_effort.as_deref() {
+            Some("xhigh") | Some("max") => None,
+            _ => Some("high"),
+        }
+    }
 }
 
 fn default_max_tokens() -> u32 {
@@ -1747,11 +1777,12 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let enable_thinking = req.effective_enable_thinking();
     let prompt = match render_prompt(
         &state,
         &req.messages,
-        req.enable_thinking,
-        req.reasoning_effort.as_deref(),
+        enable_thinking,
+        req.effective_reasoning_effort(),
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -1809,7 +1840,7 @@ async fn chat_completions(
         temperature: req.temperature,
         logprobs: req.logprobs_count(),
         sampling: req.sampling_params(),
-        enable_thinking: req.enable_thinking,
+        enable_thinking,
         trust_remote_code: false,
     };
 
@@ -4169,16 +4200,17 @@ mod tests {
     }
 
     #[test]
-    fn undefined_reasoning_effort_resolves_to_max_not_neutral() {
+    fn raw_template_resolves_undefined_reasoning_effort_to_max() {
         // GLM-5's own template, reduced to the branch that matters:
         //
         //   {%- set effective = 'high' if reasoning_effort is defined
         //        and reasoning_effort == 'high' else 'max' -%}
         //
-        // Leaving it unset is NOT neutral — it selects Max, the most expensive
-        // setting, by omission. That is what the fleet did on every thinking
-        // request, and the likely reason a one-line question could not finish
-        // inside 256 tokens.
+        // Leaving it unset is NOT neutral at this layer — it selects Max, the
+        // most expensive setting, by omission. This is ground truth about the
+        // template, not the server's behavior: `ChatCompletionRequest::
+        // effective_reasoning_effort` maps omission (and everything but an
+        // explicit high-ish request) to `"high"` before it ever reaches here.
         const T: &str = "{%- set effective = 'high' if reasoning_effort is defined and reasoning_effort == 'high' else 'max' -%}Reasoning Effort: {{ effective }}";
         let env = build_chat_env(T).unwrap();
         let msgs = [ChatMessage {
@@ -4199,6 +4231,95 @@ mod tests {
         // typo silently costs maximum reasoning.
         let typo = render_with_chat_env(&env, &msgs, "", "", true, Some("High"), None).unwrap();
         assert_eq!(typo, "Reasoning Effort: max", "template is case-sensitive");
+    }
+
+    /// Deserializes a `ChatCompletionRequest` from a JSON fragment, filling in
+    /// the required `model`/`messages` fields so callers only spell out the
+    /// keys the test cares about.
+    fn chat_request(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut v = serde_json::json!({ "model": "x", "messages": [] });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reasoning_effort_maps_openai_vocabulary_to_glm_levels() {
+        // Omitted must resolve to "high", not undefined (Max) — the defect
+        // this mapping exists to close.
+        assert_eq!(
+            chat_request(serde_json::json!({})).effective_reasoning_effort(),
+            Some("high")
+        );
+        // "none" belongs in the conservative bucket, not with xhigh/max: it
+        // signals *less* than minimal effort, and grouping it with the
+        // expensive values would silently escalate whenever thinking stays on
+        // despite "none" (see reasoning_effort_none_plus_explicit_thinking_stays_high).
+        for cheap in ["minimal", "low", "medium", "high", "none"] {
+            assert_eq!(
+                chat_request(serde_json::json!({ "reasoning_effort": cheap }))
+                    .effective_reasoning_effort(),
+                Some("high"),
+                "{cheap} should map to high"
+            );
+        }
+        for expensive in ["xhigh", "max"] {
+            assert_eq!(
+                chat_request(serde_json::json!({ "reasoning_effort": expensive }))
+                    .effective_reasoning_effort(),
+                None,
+                "{expensive} should leave the template value undefined (Max)"
+            );
+        }
+        // Unrecognised: conservative default, never silently escalate to Max.
+        assert_eq!(
+            chat_request(serde_json::json!({ "reasoning_effort": "bogus" }))
+                .effective_reasoning_effort(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_none_disables_thinking_unless_explicit() {
+        // "none" with no explicit toggle: thinking goes off.
+        assert!(!chat_request(serde_json::json!({ "reasoning_effort": "none" }))
+            .effective_enable_thinking());
+
+        // "none" cannot override an explicit `enable_thinking: true` — the
+        // direct instruction from a client that has the toggle wins.
+        assert!(chat_request(serde_json::json!({
+            "reasoning_effort": "none",
+            "enable_thinking": true,
+        }))
+        .effective_enable_thinking());
+
+        // Omitted reasoning_effort, omitted enable_thinking: still on.
+        assert!(chat_request(serde_json::json!({})).effective_enable_thinking());
+
+        // Explicit enable_thinking: false stands on its own, no reasoning_effort needed.
+        assert!(
+            !chat_request(serde_json::json!({ "enable_thinking": false }))
+                .effective_enable_thinking()
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_none_plus_explicit_thinking_stays_high_not_max() {
+        // A client that asks for "none" but separately keeps thinking on via
+        // an explicit toggle asked for less reasoning, not more — the template
+        // value must not fall into the Max bucket just because "none" also
+        // disables thinking in the common (no-override) case.
+        let req = chat_request(serde_json::json!({
+            "reasoning_effort": "none",
+            "enable_thinking": true,
+        }));
+        assert!(req.effective_enable_thinking(), "explicit toggle wins");
+        assert_eq!(
+            req.effective_reasoning_effort(),
+            Some("high"),
+            "\"none\" must not silently escalate to Max once thinking stays on"
+        );
     }
 
     #[test]
