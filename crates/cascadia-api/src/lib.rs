@@ -494,10 +494,28 @@ pub struct ChatCompletionRequest {
     /// off-switch.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// vLLM/SGLang's convention for reaching the underlying chat template:
+    /// `{"enable_thinking": false}`. Outranks the legacy top-level
+    /// `enable_thinking` and the `reasoning_effort: "none"` off-switch — see
+    /// [`ChatCompletionRequest::effective_enable_thinking`] for the full
+    /// precedence chain. The map is free-form in the ecosystem; members other
+    /// than `enable_thinking` are accepted and ignored, never forwarded to
+    /// the template.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+}
+
+/// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
+/// `enable_thinking` is consumed; unknown members deserialize to nothing and
+/// are silently dropped rather than erroring.
+#[derive(Deserialize, Debug, Default)]
+pub struct ChatTemplateKwargs {
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 impl ChatCompletionRequest {
@@ -530,13 +548,18 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// Resolves `enable_thinking`: an explicit value always wins; otherwise
-    /// `reasoning_effort: "none"` turns thinking off, and omission of both
-    /// means on. This is the coupling that gives OpenAI-shaped clients (no
-    /// thinking toggle) an off-switch without letting `"none"` override a
-    /// client that set the toggle directly.
+    /// Resolves `enable_thinking`, highest precedence first:
+    /// `chat_template_kwargs.enable_thinking` (the vLLM/SGLang convention),
+    /// then the legacy top-level `enable_thinking`, then `reasoning_effort:
+    /// "none"` turning thinking off; omission of all three means on. Both
+    /// explicit toggles must beat `"none"` for the same reason: `"none"`
+    /// exists to give clients *without* a toggle an off-switch, and must
+    /// never override a client that used one.
     fn effective_enable_thinking(&self) -> bool {
-        self.enable_thinking
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.enable_thinking)
+            .or(self.enable_thinking)
             .unwrap_or_else(|| self.reasoning_effort.as_deref() != Some("none"))
     }
 
@@ -4320,6 +4343,40 @@ mod tests {
             Some("high"),
             "\"none\" must not silently escalate to Max once thinking stays on"
         );
+    }
+
+    #[test]
+    fn chat_template_kwargs_enable_thinking_outranks_everything() {
+        // kwargs alone.
+        assert!(!chat_request(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": false }
+        }))
+        .effective_enable_thinking());
+
+        // kwargs beats the legacy top-level toggle.
+        assert!(chat_request(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": true },
+            "enable_thinking": false,
+        }))
+        .effective_enable_thinking());
+
+        // kwargs beats "none" too — a client that used the vLLM/SGLang
+        // toggle gets what it asked for, not the OpenAI-shaped off-switch.
+        assert!(chat_request(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": true },
+            "reasoning_effort": "none",
+        }))
+        .effective_enable_thinking());
+
+        // Unrelated members must not error and must not affect resolution —
+        // the map is free-form in the ecosystem.
+        assert!(chat_request(serde_json::json!({
+            "chat_template_kwargs": { "some_other_kwarg": "value" }
+        }))
+        .effective_enable_thinking());
+
+        // Absent entirely: unchanged from before this field existed.
+        assert!(chat_request(serde_json::json!({})).effective_enable_thinking());
     }
 
     #[test]
