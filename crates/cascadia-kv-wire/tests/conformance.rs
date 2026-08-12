@@ -94,6 +94,66 @@ fn envelope_variants_match_golden() {
                 partner: "c".into(),
             }),
         ),
+        (
+            "env_replicate_push",
+            KvMessage::ReplicatePush {
+                partner: PartnerId("c".into()),
+                epoch: 9,
+                prefix_token_len: 2,
+                model_fingerprint: 7,
+                rank: 1,
+            },
+        ),
+        (
+            "env_replicate",
+            KvMessage::Replicate {
+                key: CacheKey {
+                    partner_hash: 1,
+                    model_fingerprint: 7,
+                    prefix_token_hash: 9,
+                },
+                rank: 1,
+                manifest: fixed_manifest(),
+                tokens: vec![11, 22],
+                blob: vec![5u8; 4],
+            },
+        ),
+        (
+            "env_replicate_ack",
+            KvMessage::ReplicateAck {
+                key: CacheKey {
+                    partner_hash: 1,
+                    model_fingerprint: 7,
+                    prefix_token_hash: 9,
+                },
+                rank: 1,
+                outcome: ReplicateOutcome::Accepted,
+            },
+        ),
+        (
+            "env_replica_get",
+            KvMessage::ReplicaGet {
+                key: CacheKey {
+                    partner_hash: 1,
+                    model_fingerprint: 7,
+                    prefix_token_hash: 9,
+                },
+                rank: 1,
+                expected_epoch: 9,
+                expected_len: 2,
+            },
+        ),
+        (
+            "env_warm_resume_trigger_v2",
+            KvMessage::WarmResumeTriggerV2 {
+                partner: PartnerId("c".into()),
+                epoch: 9,
+                prefix_token_len: 2,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+            },
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();

@@ -11,7 +11,7 @@ mod manifest;
 mod reslice;
 
 pub use codec::{KvSnapshotCodec, ValidateError};
-pub use envelope::{Get, KvMessage, Negotiate, Offer, WarmHint};
+pub use envelope::{Get, KvMessage, Negotiate, Offer, ReplicateOutcome, WarmHint};
 pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_LEN};
 pub use manifest::{
     CacheKey, LayerMeta, Manifest, PartnerId, DTYPE_SIZE, KV_LAYOUT_VERSION, OPAQUE_KV_LAYOUT,
