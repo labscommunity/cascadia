@@ -1242,7 +1242,7 @@ fn build_choice(
     let parse_enabled =
         tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if parse_enabled {
-        if let Some(calls) = parse_tool_calls(&buf) {
+        if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf)) {
             return (
                 ChatChoiceMessage {
                     role: "assistant",
@@ -1387,6 +1387,20 @@ impl ReasoningSplitter {
     pub fn saw_close(&self) -> bool {
         self.closed
     }
+}
+
+/// Restrict tool-call scanning to text after the model's private scratchpad,
+/// so a `<tool_call>` block drafted while reasoning isn't executed as a real
+/// call. Splits on the FIRST `</think>` — the answer itself may go on to
+/// mention the literal string again, and that must not re-open the scratchpad.
+///
+/// A request truncated mid-reasoning has no `</think>` at all, so the whole
+/// buffer — scratchpad included — is still scanned and a drafted call can
+/// still fire. Closing that needs model-aware arming, which is deferred (see
+/// [`ReasoningSplitter`]).
+fn tool_call_scan_text(buf: &str) -> &str {
+    buf.find(THINK_CLOSE)
+        .map_or(buf, |idx| &buf[idx + THINK_CLOSE.len()..])
 }
 
 /// Parse model tool-call output into structured calls; None when none found.
@@ -2300,7 +2314,7 @@ async fn stream_completion(
                     "error": { "message": reason, "type": "engine_error" },
                 })
             ))]
-        } else if let Some(calls) = parse_tool_calls(&buf) {
+        } else if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf)) {
             let tool_calls: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| {
                 serde_json::json!({ "index": i, "id": c.id.clone(), "type": c.r#type.clone(),
                     "function": { "name": c.function.name.clone(), "arguments": c.function.arguments.clone() } })
@@ -3633,6 +3647,36 @@ mod tests {
         assert_eq!(calls[0].function.name, "echo");
         let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
         assert_eq!(args["text"], "</tool_call> bye");
+    }
+
+    #[test]
+    fn tool_call_drafted_before_think_close_is_not_parsed() {
+        // A call drafted in the scratchpad while deliberating must not fire.
+        let buf = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call></think>no calls needed";
+        assert!(parse_tool_calls(tool_call_scan_text(buf)).is_none());
+    }
+
+    #[test]
+    fn tool_call_after_think_close_is_parsed() {
+        let buf = "reasoning...</think><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>";
+        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn only_tool_call_after_think_close_is_parsed_when_both_present() {
+        let buf = "<tool_call>{\"name\":\"draft\",\"arguments\":{}}</tool_call></think><tool_call>{\"name\":\"real\",\"arguments\":{}}</tool_call>";
+        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "real");
+    }
+
+    #[test]
+    fn tool_call_with_no_think_close_is_parsed_unchanged() {
+        // Non-reasoning models never emit `</think>`; behaviour must be unchanged.
+        let buf = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>";
+        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        assert_eq!(calls[0].function.name, "get_weather");
     }
 
     /// Drive a splitter over `chunks`, returning the concatenated
