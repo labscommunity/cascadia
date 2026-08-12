@@ -29,7 +29,9 @@
 name: release-please
 
 on:
-  # Cut (or refresh) the release PR — on demand only.
+  # Cut (or refresh) the release PR — on demand only. `on:` has no branch
+  # filter for workflow_dispatch, so main-only is enforced by the guard step
+  # below; the run still starts, it just fails immediately elsewhere.
   workflow_dispatch:
   # Tag + release the merged release PR, and nothing else.
   push:
@@ -52,6 +54,17 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
+      # release-please always targets the repository's default branch, so a
+      # dispatch from a feature branch would silently run that branch's
+      # workflow file against main. Refuse it instead.
+      - name: Enforce dispatch from main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::release-please can only be dispatched from main (got $REF)"
+          exit 1
+
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the tag, matching ci.yml / release.yml.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
