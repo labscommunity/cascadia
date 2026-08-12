@@ -4306,8 +4306,10 @@ mod tests {
     #[test]
     fn reasoning_effort_none_disables_thinking_unless_explicit() {
         // "none" with no explicit toggle: thinking goes off.
-        assert!(!chat_request(serde_json::json!({ "reasoning_effort": "none" }))
-            .effective_enable_thinking());
+        assert!(
+            !chat_request(serde_json::json!({ "reasoning_effort": "none" }))
+                .effective_enable_thinking()
+        );
 
         // "none" cannot override an explicit `enable_thinking: true` — the
         // direct instruction from a client that has the toggle wins.
