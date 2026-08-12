@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{Manifest, PartnerId};
+use crate::manifest::{CacheKey, Manifest, PartnerId};
 
 /// Head probe — learn the holder's stamped epoch + longest-common-prefix length without streaming.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +36,17 @@ pub struct WarmHint {
     pub request_id: [u8; 16],
     pub prev_chain_id: [u8; 32],
     pub partner: String,
+}
+
+/// Closed-enum replica-push outcome (design §12.2). A NACK is a rejected variant, not a separate
+/// frame. `RejectedRankCollision` is retired: the store keys by `(CacheKey, rank)`, so distinct
+/// ranks on one node are not a collision (§11.17.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicateOutcome {
+    Accepted,
+    RejectedGuard,
+    RejectedTooLarge,
+    RejectedBudget,
 }
 
 /// Control envelope on `/cascadia/state/kv/v1`.
@@ -82,12 +93,96 @@ pub enum KvMessage {
     WarmResumeAbort {
         epoch: u64,
     },
+    /// Head→rank capture-time push trigger (design §12.2). Carries `partner` because the token-less
+    /// rank needs it for the H.1-confined `export`, the `CacheKey`, and HRW placement — a
+    /// partner-less trigger would file pushes under `partner_hash("")` while pullers derive keys
+    /// from the real partner: every pull misses, every metric green.
+    ReplicatePush {
+        partner: PartnerId,
+        epoch: u64,
+        prefix_token_len: u32,
+        model_fingerprint: u64,
+        rank: u16,
+    },
+    /// Rank→counterpart replica push. `blob` is the per-layer K/V payloads of one export,
+    /// concatenated in manifest layer order (k then v per layer); the receiver re-slices by the
+    /// manifest's `k_byte_len`/`v_byte_len`. `tokens` is on the wire for supersede-if-extends.
+    Replicate {
+        key: CacheKey,
+        rank: u16,
+        manifest: Manifest,
+        tokens: Vec<i32>,
+        blob: Vec<u8>,
+    },
+    /// Counterpart→rank ack/NACK. The sender NEVER blocks on it (D8) — it updates a metric and
+    /// nothing else. A missing ack is `push_dial_fail`, which is why the two are separable at all.
+    ReplicateAck {
+        key: CacheKey,
+        rank: u16,
+        outcome: ReplicateOutcome,
+    },
+    /// Asserted replica fetch. `rank` on the wire is what makes serving the wrong rank
+    /// unrepresentable (design §12.2): every rank of a session shares one `CacheKey` and one
+    /// `(epoch, len)`, so a rank-less fetch that lands on a neighbour would serve that neighbour's
+    /// rank with all guards passing.
+    ReplicaGet {
+        key: CacheKey,
+        rank: u16,
+        expected_epoch: u64,
+        expected_len: u32,
+    },
+    /// Head→rank: like [`KvMessage::WarmResumeTrigger`] but delivers `partner` too (design §12.2,
+    /// H.1). `WarmResumeTrigger` predates tenant-namespacing and has no `partner` field; a
+    /// token-less rank needs one to construct the `CacheKey` for its H.1-confined export, so this
+    /// variant carries it rather than overloading the original.
+    WarmResumeTriggerV2 {
+        partner: PartnerId,
+        epoch: u64,
+        prefix_token_len: u32,
+        model_fingerprint: u64,
+        prev_chain_id: [u8; 32],
+        rank: u16,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bincode::config::standard;
+
+    fn key() -> CacheKey {
+        CacheKey {
+            partner_hash: 1,
+            model_fingerprint: 7,
+            prefix_token_hash: 9,
+        }
+    }
+
+    // Mirrors tests/conformance.rs::fixed_manifest — not shared across the unit/integration test
+    // boundary, so duplicated here for the round-trip.
+    fn manifest() -> Manifest {
+        Manifest {
+            schema_version: crate::manifest::SCHEMA_VERSION,
+            kv_layout_version: crate::manifest::KV_LAYOUT_VERSION,
+            engine_rev: 0x0000_0000_dead_beef,
+            partner: PartnerId("conformance".into()),
+            model_fingerprint: 0x0000_0000_0000_1234,
+            prefix_token_hash: 0x0000_0000_0000_5678,
+            prefix_token_len: 2,
+            snapshot_epoch: 0xABCD_0000_0000_0001,
+            num_layers: 1,
+            layers: vec![crate::manifest::LayerMeta {
+                layer_index: 0,
+                k_shape: vec![1, 2, 3],
+                v_shape: vec![1, 2, 1],
+                k_byte_len: 12,
+                v_byte_len: 4,
+                k_crc32: 0xAAAA_AAAA,
+                v_crc32: 0xBBBB_BBBB,
+            }],
+            token_ids: vec![11, 22],
+        }
+    }
 
     #[test]
     fn envelope_roundtrips_bincode() {
@@ -127,6 +222,39 @@ mod tests {
             },
             KvMessage::WarmResumeCommit { epoch: 41 },
             KvMessage::WarmResumeAbort { epoch: 42 },
+            KvMessage::ReplicatePush {
+                partner: PartnerId("acme".into()),
+                epoch: 42,
+                prefix_token_len: 3,
+                model_fingerprint: 7,
+                rank: 1,
+            },
+            KvMessage::Replicate {
+                key: key(),
+                rank: 1,
+                manifest: manifest(),
+                tokens: vec![11, 22, 33],
+                blob: vec![5u8; 8],
+            },
+            KvMessage::ReplicateAck {
+                key: key(),
+                rank: 1,
+                outcome: ReplicateOutcome::RejectedGuard,
+            },
+            KvMessage::ReplicaGet {
+                key: key(),
+                rank: 1,
+                expected_epoch: 42,
+                expected_len: 3,
+            },
+            KvMessage::WarmResumeTriggerV2 {
+                partner: PartnerId("acme".into()),
+                epoch: 42,
+                prefix_token_len: 3,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+            },
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
@@ -134,5 +262,44 @@ mod tests {
                 bincode::serde::decode_from_slice(&bytes, standard()).unwrap();
             assert_eq!(m, back);
         }
+    }
+
+    #[test]
+    fn new_variants_are_appended_after_warm_resume_abort() {
+        // WarmResumeAbort was the last pre-replication variant; its encoded tag byte must not change.
+        let old =
+            bincode::serde::encode_to_vec(KvMessage::WarmResumeAbort { epoch: 1 }, standard())
+                .unwrap();
+        assert_eq!(
+            old[0], 10,
+            "WarmResumeAbort is variant index 10; appending must not shift it"
+        );
+        let get = bincode::serde::encode_to_vec(
+            KvMessage::ReplicaGet {
+                key: key(),
+                rank: 0,
+                expected_epoch: 0,
+                expected_len: 0,
+            },
+            standard(),
+        )
+        .unwrap();
+        assert_eq!(get[0], 14, "ReplicaGet is appended 4th, index 14");
+        let v2 = bincode::serde::encode_to_vec(
+            KvMessage::WarmResumeTriggerV2 {
+                partner: PartnerId("acme".into()),
+                epoch: 1,
+                prefix_token_len: 1,
+                model_fingerprint: 1,
+                prev_chain_id: [0u8; 32],
+                rank: 0,
+            },
+            standard(),
+        )
+        .unwrap();
+        assert_eq!(
+            v2[0], 15,
+            "WarmResumeTriggerV2 is the LAST appended variant (index 15)"
+        );
     }
 }
