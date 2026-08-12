@@ -107,6 +107,19 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
 - Deploy across the AI-PCs; measure real tok/s and residency hit-rate.
 - The deferred optimizations above, prioritized by what the measurements show.
 
+## Thinking / reasoning-effort wire contract
+
+- **`chat_template_kwargs`**: new public request field, vLLM/SGLang's
+  convention for `{"enable_thinking": false}`. Outranks the legacy top-level
+  `enable_thinking` and the `reasoning_effort: "none"` off-switch.
+- **`reasoning_effort: "none"`**: new off-switch for OpenAI-shaped clients
+  that have no thinking toggle of their own; turns `enable_thinking` off
+  unless an explicit toggle (either form above) says otherwise.
+- **Effort mapping**: every thinking request now gets GLM-5's `"high"`
+  template level by default (previously undefined, which the template
+  resolves to `"max"` — the most expensive setting, selected by omission).
+  Only an explicit `reasoning_effort: "xhigh"` or `"max"` opts back into Max.
+
 ## Open risks
 
 - **Residency / hit-rate** (highest) — mitigate with more nodes + the residency

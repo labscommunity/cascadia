@@ -570,7 +570,7 @@ impl ChatCompletionRequest {
     /// | client sends                                       | template sees   |
     /// | --------------------------------------------------- | --------------- |
     /// | omitted, `minimal`, `low`, `medium`, `high`, `none`, unrecognised | `"high"` |
-    /// | `xhigh`, `max`                                       | undefined (Max) |
+    /// | `xhigh`, `max`                                       | `"max"` (also resolves to Max) |
     ///
     /// Omission must NOT reach the template as undefined — that is the Max-by
     /// -omission defect this mapping exists to close. `"none"` sits in the
@@ -581,10 +581,17 @@ impl ChatCompletionRequest {
     /// true` keeps thinking on despite `"none"` — bucketing it with Max there
     /// would silently escalate, which is the exact failure this mapping exists
     /// to prevent.
-    fn effective_reasoning_effort(&self) -> Option<&'static str> {
+    ///
+    /// Returns a literal `"max"` rather than `None`/undefined for `xhigh`/
+    /// `max`: an explicit choice and an omitted one both currently render the
+    /// same template output (`defined and == 'high'` is false either way),
+    /// but they are not the same fact, and collapsing them to `None` would
+    /// make "caller chose max" indistinguishable from "caller said nothing"
+    /// at the Rust type level.
+    fn effective_reasoning_effort(&self) -> &'static str {
         match self.reasoning_effort.as_deref() {
-            Some("xhigh") | Some("max") => None,
-            _ => Some("high"),
+            Some("xhigh") | Some("max") => "max",
+            _ => "high",
         }
     }
 }
@@ -1265,6 +1272,9 @@ fn render_prompt(
 ) -> Result<String, PromptRenderError> {
     // ov-genai applies the model's own template, so the engine gets raw text.
     // Tools would be dropped on the floor here, so refuse rather than pretend.
+    // `reasoning_effort` (the caller's parameter above) is also dropped on
+    // this branch, intentionally: ov-genai applies its own template with the
+    // effort undefined, so there is nowhere for the mapped value to go.
     if state.defer_template_on_thinking && enable_thinking {
         if tools.is_some_and(|t| !t.is_empty()) {
             return Err(PromptRenderError::Failed(
@@ -1291,11 +1301,12 @@ fn build_choice(
     buf: String,
     tool_choice: &Option<serde_json::Value>,
     tools_present: bool,
+    enable_thinking: bool,
 ) -> (ChatChoiceMessage, &'static str) {
     let parse_enabled =
         tools_present && tool_choice.as_ref().and_then(|v| v.as_str()) != Some("none");
     if parse_enabled {
-        if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf)) {
+        if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf, enable_thinking)) {
             return (
                 ChatChoiceMessage {
                     role: "assistant",
@@ -1327,11 +1338,24 @@ const THINK_CLOSE: &str = "</think>";
 /// call. Splits on the FIRST `</think>` — the answer itself may go on to
 /// mention the literal string again, and that must not re-open the scratchpad.
 ///
+/// Armed by `enable_thinking` from the REQUEST, not by sniffing `buf`:
+/// tool-call markers are self-announcing, a reasoning delimiter is not, so
+/// arming is decided by the REQUEST. Sniffing the first `</think>` regardless
+/// of arming state is wrong in both directions — thinking-off has no
+/// scratchpad, so a real call whose own arguments happen to contain the
+/// literal `</think>` gets truncated and silently dropped (a regression this
+/// arming closes); thinking-on still cannot be fully unambiguous since the
+/// scratchpad and the delimiter both come from the model, but that is the
+/// pre-existing, narrower risk this function was written to bound.
+///
 /// A request truncated mid-reasoning has no `</think>` at all, so the whole
 /// buffer — scratchpad included — is still scanned and a drafted call can
 /// still fire. Closing that gap needs a request-armed reasoning/answer split,
 /// deferred to a follow-up along with the wiring that would use it.
-fn tool_call_scan_text(buf: &str) -> &str {
+fn tool_call_scan_text(buf: &str, enable_thinking: bool) -> &str {
+    if !enable_thinking {
+        return buf;
+    }
     buf.find(THINK_CLOSE)
         .map_or(buf, |idx| &buf[idx + THINK_CLOSE.len()..])
 }
@@ -1681,11 +1705,17 @@ async fn chat_completions(
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let enable_thinking = req.effective_enable_thinking();
+    // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
+    // applied to every model this server serves, not just GLM-5. Latent
+    // today because no other served template (Qwen3, minimax-m2, r1-distill)
+    // reads `reasoning_effort`, but a future template that honours a
+    // low/medium/high scale would see e.g. a client's "low" silently
+    // escalated to "high". Template-gating this is a follow-up, not this fix.
     let prompt = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
-        req.effective_reasoning_effort(),
+        Some(req.effective_reasoning_effort()),
         req.tools.as_deref(),
     ) {
         Ok(p) => p,
@@ -1869,6 +1899,7 @@ async fn chat_completions(
         buf,
         &req.tool_choice,
         req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+        enable_thinking,
     );
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
@@ -2214,6 +2245,9 @@ async fn stream_completion(
     tools_present: bool,
 ) -> axum::response::Response {
     let task_id = task.task_id.clone();
+    // Captured before `task` moves into `generate` below — arms the tool-call
+    // scan the same way the non-streaming path does (see `tool_call_scan_text`).
+    let enable_thinking = task.enable_thinking;
     let _ = SystemTime::now();
 
     let chunk_stream = match state.runner.generate_async(task).await {
@@ -2248,7 +2282,7 @@ async fn stream_completion(
                     "error": { "message": reason, "type": "engine_error" },
                 })
             ))]
-        } else if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf)) {
+        } else if let Some(calls) = parse_tool_calls(tool_call_scan_text(&buf, enable_thinking)) {
             let tool_calls: Vec<serde_json::Value> = calls.iter().enumerate().map(|(i, c)| {
                 serde_json::json!({ "index": i, "id": c.id.clone(), "type": c.r#type.clone(),
                     "function": { "name": c.function.name.clone(), "arguments": c.function.arguments.clone() } })
@@ -3585,22 +3619,23 @@ mod tests {
 
     #[test]
     fn tool_call_drafted_before_think_close_is_not_parsed() {
-        // A call drafted in the scratchpad while deliberating must not fire.
+        // A call drafted in the scratchpad while deliberating must not fire —
+        // armed (thinking on).
         let buf = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call></think>no calls needed";
-        assert!(parse_tool_calls(tool_call_scan_text(buf)).is_none());
+        assert!(parse_tool_calls(tool_call_scan_text(buf, true)).is_none());
     }
 
     #[test]
     fn tool_call_after_think_close_is_parsed() {
         let buf = "reasoning...</think><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>";
-        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        let calls = parse_tool_calls(tool_call_scan_text(buf, true)).expect("one");
         assert_eq!(calls[0].function.name, "get_weather");
     }
 
     #[test]
     fn only_tool_call_after_think_close_is_parsed_when_both_present() {
         let buf = "<tool_call>{\"name\":\"draft\",\"arguments\":{}}</tool_call></think><tool_call>{\"name\":\"real\",\"arguments\":{}}</tool_call>";
-        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        let calls = parse_tool_calls(tool_call_scan_text(buf, true)).expect("one");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "real");
     }
@@ -3609,8 +3644,46 @@ mod tests {
     fn tool_call_with_no_think_close_is_parsed_unchanged() {
         // Non-reasoning models never emit `</think>`; behaviour must be unchanged.
         let buf = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>";
-        let calls = parse_tool_calls(tool_call_scan_text(buf)).expect("one");
+        let calls = parse_tool_calls(tool_call_scan_text(buf, true)).expect("one");
         assert_eq!(calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn tool_call_scan_starts_after_first_think_close_not_last() {
+        // find, not rfind: the scan must resume right after the FIRST close.
+        let buf =
+            "</think>middle</think><tool_call>{\"name\":\"real\",\"arguments\":{}}</tool_call>";
+        assert_eq!(
+            tool_call_scan_text(buf, true),
+            "middle</think><tool_call>{\"name\":\"real\",\"arguments\":{}}</tool_call>"
+        );
+    }
+
+    // The regression the reviewer proved by execution: a REAL call whose own
+    // arguments contain the literal "</think>" must not be dropped. Disarmed
+    // (thinking off) is the exact case that was unbounded before — no
+    // scratchpad exists, so scanning must be a no-op and the whole buffer
+    // must reach `parse_tool_calls` unmodified.
+    #[test]
+    fn disarmed_scan_keeps_real_call_whose_argument_contains_think_close() {
+        let buf = r#"<tool_call>{"name":"echo","arguments":{"text":"</think>"}}</tool_call>"#;
+        let calls = parse_tool_calls(tool_call_scan_text(buf, false)).expect("one");
+        assert_eq!(calls[0].function.name, "echo");
+    }
+
+    #[test]
+    fn disarmed_scan_keeps_real_call_whose_argument_mentions_think_close_in_prose() {
+        let buf =
+            r#"<tool_call>{"name":"write","arguments":{"body":"strip </think> tags"}}</tool_call>"#;
+        let calls = parse_tool_calls(tool_call_scan_text(buf, false)).expect("one");
+        assert_eq!(calls[0].function.name, "write");
+    }
+
+    #[test]
+    fn disarmed_scan_keeps_real_call_when_think_close_trails_it() {
+        let buf = r#"<tool_call>{"name":"a","arguments":{}}</tool_call> aside: </think> ends it"#;
+        let calls = parse_tool_calls(tool_call_scan_text(buf, false)).expect("one");
+        assert_eq!(calls[0].function.name, "a");
     }
 
     #[test]
@@ -4064,7 +4137,7 @@ mod tests {
         // this mapping exists to close.
         assert_eq!(
             chat_request(serde_json::json!({})).effective_reasoning_effort(),
-            Some("high")
+            "high"
         );
         // "none" belongs in the conservative bucket, not with xhigh/max: it
         // signals *less* than minimal effort, and grouping it with the
@@ -4074,23 +4147,27 @@ mod tests {
             assert_eq!(
                 chat_request(serde_json::json!({ "reasoning_effort": cheap }))
                     .effective_reasoning_effort(),
-                Some("high"),
+                "high",
                 "{cheap} should map to high"
             );
         }
+        // An explicit choice of xhigh/max is distinguishable from omission at
+        // the Rust type level (a literal "max"), even though both currently
+        // render the same template output — see effective_reasoning_effort's
+        // doc comment.
         for expensive in ["xhigh", "max"] {
             assert_eq!(
                 chat_request(serde_json::json!({ "reasoning_effort": expensive }))
                     .effective_reasoning_effort(),
-                None,
-                "{expensive} should leave the template value undefined (Max)"
+                "max",
+                "{expensive} should map to max"
             );
         }
         // Unrecognised: conservative default, never silently escalate to Max.
         assert_eq!(
             chat_request(serde_json::json!({ "reasoning_effort": "bogus" }))
                 .effective_reasoning_effort(),
-            Some("high")
+            "high"
         );
     }
 
@@ -4133,7 +4210,7 @@ mod tests {
         assert!(req.effective_enable_thinking(), "explicit toggle wins");
         assert_eq!(
             req.effective_reasoning_effort(),
-            Some("high"),
+            "high",
             "\"none\" must not silently escalate to Max once thinking stays on"
         );
     }
@@ -4332,6 +4409,7 @@ mod tests {
                 .into(),
             &Some(serde_json::json!("auto")),
             true,
+            true,
         );
         assert_eq!(fr, "tool_calls");
         assert!(m.content.is_none());
@@ -4343,6 +4421,7 @@ mod tests {
         let (m, fr) = build_choice(
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
             &Some(serde_json::json!("none")),
+            true,
             true,
         );
         assert_eq!(fr, "stop");
@@ -4357,6 +4436,7 @@ mod tests {
             "<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>".into(),
             &Some(serde_json::json!("auto")),
             false,
+            true,
         );
         assert_eq!(fr, "stop");
         assert!(m.tool_calls.is_none());
@@ -4364,8 +4444,23 @@ mod tests {
     }
 
     #[test]
+    fn build_choice_disarmed_still_parses_call_with_think_close_in_arguments() {
+        // End-to-end (through build_choice) version of the regression test:
+        // thinking off must not lose a real call whose arguments literally
+        // contain "</think>".
+        let (m, fr) = build_choice(
+            r#"<tool_call>{"name":"echo","arguments":{"text":"</think>"}}</tool_call>"#.into(),
+            &Some(serde_json::json!("auto")),
+            true,
+            false,
+        );
+        assert_eq!(fr, "tool_calls");
+        assert_eq!(m.tool_calls.unwrap()[0].function.name, "echo");
+    }
+
+    #[test]
     fn build_choice_plain_is_stop() {
-        let (m, fr) = build_choice("hello".into(), &None, true);
+        let (m, fr) = build_choice("hello".into(), &None, true, true);
         assert_eq!(fr, "stop");
         assert!(m.tool_calls.is_none());
         assert_eq!(m.content.as_deref(), Some("hello"));
