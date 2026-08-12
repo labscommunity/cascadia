@@ -8,7 +8,7 @@
   <a href="https://github.com/labscommunity/cascadia/actions/workflows/ci.yml"><img src="https://github.com/labscommunity/cascadia/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="license"></a>
   <img src="https://img.shields.io/badge/rust-1.89%2B-orange.svg" alt="rust 1.89+">
-  <img src="https://img.shields.io/badge/status-pre--alpha-red.svg" alt="pre-alpha">
+  <img src="https://img.shields.io/badge/status-alpha-orange.svg" alt="alpha">
 </p>
 
 ---
@@ -28,7 +28,7 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 - **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
 
 > [!NOTE]
-> Cascadia is in **pre-alpha status**. It works on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake) and Arc B-series (Battlemage) discrete GPUs. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
+> Cascadia is in **alpha status**. It works on Intel AI PCs (Lunar Lake / Arrow Lake / Panther Lake) and Arc B-series (Battlemage) discrete GPUs. Intel Arc A-series discrete GPUs and Xeon CPU-only servers are on the roadmap.
 
 ## Quick start
 

@@ -1,16 +1,23 @@
 # release-please — versioning + changelog + release orchestration for cascadia.
 #
-# Driven by Conventional Commits. Two things happen here:
+# Driven by Conventional Commits. Two things happen here, split by trigger:
 #
-#   * Every push to main → release-please opens/updates ONE release PR that
-#     bumps the workspace version (Cargo.toml marker + manifest), refreshes
-#     Cargo.lock, and rewrites CHANGELOG.md. Merging feature PRs does NOT
-#     release; changes accumulate in that PR.
-#   * When the release PR is merged, release-please creates the tag `vX.Y.Z`
-#     and a GitHub Release marked PRE-RELEASE, then the build job (the reusable
-#     release.yml, same run) builds the binary bundles, attaches them, and
-#     promotes the release to a full release. A release only loses its
-#     pre-release badge once both bundles are attached.
+#   * MANUAL (Actions → release-please → Run workflow) → release-please
+#     opens/updates ONE release PR that bumps the workspace version
+#     (Cargo.toml marker + manifest), refreshes Cargo.lock, and rewrites
+#     CHANGELOG.md. Pushes to main never open that PR on their own; you decide
+#     when to cut a release and commits just accumulate until you dispatch.
+#   * AUTOMATIC (push to main) → release-please only looks for an already-merged
+#     release PR. When it finds one it creates the tag `vX.Y.Z` and a GitHub
+#     Release marked PRE-RELEASE, then the build job (the reusable release.yml,
+#     same run) builds the binary bundles, attaches them, and promotes the
+#     release to a full release. A release only loses its pre-release badge
+#     once both bundles are attached. So merging the release PR still ships
+#     with no further clicks; ordinary pushes to main are a no-op here.
+#
+# The split is the action's own `skip-github-pull-request` / `skip-github-release`
+# switches, keyed off `github.event_name` — one job, one of the two halves
+# enabled per run.
 #
 # Chosen over release-plz: release-please never touches cargo registries or
 # runs `cargo package`, so it works for this never-published workspace
@@ -22,6 +29,11 @@
 name: release-please
 
 on:
+  # Cut (or refresh) the release PR — on demand only. `on:` has no branch
+  # filter for workflow_dispatch, so main-only is enforced by the guard step
+  # below; the run still starts, it just fails immediately elsewhere.
+  workflow_dispatch:
+  # Tag + release the merged release PR, and nothing else.
   push:
     branches: [main]
 
@@ -42,6 +54,17 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
+      # release-please always targets the repository's default branch, so a
+      # dispatch from a feature branch would silently run that branch's
+      # workflow file against main. Refuse it instead.
+      - name: Enforce dispatch from main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::release-please can only be dispatched from main (got $REF)"
+          exit 1
+
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the tag, matching ci.yml / release.yml.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -53,6 +76,10 @@ jobs:
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Manual dispatch does the PR half; push-to-main does the tag/release
+          # half. Never both in one run, so a push can't sneak a release PR open.
+          skip-github-release: ${{ github.event_name == 'workflow_dispatch' }}
+          skip-github-pull-request: ${{ github.event_name != 'workflow_dispatch' }}
 
       # release-please edits manifests as text, so it can't refresh Cargo.lock
       # (which records every workspace member's version). Do it here whenever
@@ -86,8 +113,10 @@ jobs:
           fi
 
   # Build + attach the binary bundles in the SAME run (reusable workflow), then
-  # promote the release. No dispatch needed, so the GITHUB_TOKEN retrigger
-  # restriction never comes into play.
+  # promote the release. Nothing is dispatched between tag and build, so the
+  # GITHUB_TOKEN retrigger restriction never comes into play. Only reachable
+  # from the push-to-main half: a workflow_dispatch run skips the release, so
+  # release_created is empty and this job is skipped.
   build:
     name: build bundles
     needs: release-please
