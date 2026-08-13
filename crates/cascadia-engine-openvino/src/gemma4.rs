@@ -1203,8 +1203,9 @@ impl Gemma4Engine {
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(full.clone(), blob.clone());
-                        self.kv.capture(full, blob);
+                            .capture(crate::kv_coordination::LOCAL_NS, full.clone(), blob.clone());
+                        self.kv
+                            .capture(crate::kv_coordination::LOCAL_NS, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
                 }
@@ -1589,8 +1590,8 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         let enc = self.tokenizer.as_ref()?.encode(text, false).ok()?;
         Some(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
-    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
-        self.kv.lookup(token_ids)
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(partner, token_ids)
     }
     fn export(
         &mut self,
@@ -1599,7 +1600,7 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         expected_len: u32,
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let fp = self.kv_model_fingerprint();
-        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
         Some(crate::kv_coordination::blob_to_wire(
             &prefix,
             &blob,
@@ -1614,7 +1615,7 @@ impl cascadia_engine::KvCoordination for Gemma4Engine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.insert_both(tokens, blob);
+        self.kv.insert_both(&manifest.partner.0, tokens, blob);
         Ok(())
     }
 

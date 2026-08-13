@@ -431,8 +431,17 @@ pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
+/// Namespace for a capture made outside any admitted-tenant context. A local turn carries no tenant
+/// id today (nothing plumbs one as far as the engine), so its entries land here; once a tenant is
+/// plumbed, a wire `lookup`/`serve` under that tenant stops reaching them — cold, never cross-tenant.
+pub(crate) const LOCAL_NS: &str = "";
+
 /// One captured turn: the full token sequence and its opaque KV blob.
 struct OvKvEntry {
+    /// Issue-34 H.1a: the namespace this entry is visible in. `lookup`/`serve` filter on it so a
+    /// cross-namespace probe reads as an empty cache; `take_warm` (local resume) deliberately does
+    /// not — see the H.1 §5 prefix-sharing non-goal.
+    partner: String,
     tokens: Vec<i32>,
     blob: Vec<u8>,
     /// Pulled over the KV plane (`insert_both`), not captured from this rank's own turn.
@@ -445,10 +454,12 @@ pub(crate) struct OvKvCache {
     /// Captured full-sequence blobs, most-recent first, bounded (LRU). Head/single-stage path
     /// (token-keyed: this rank knows the tokens).
     entries: Vec<OvKvEntry>,
-    /// `epoch → (tokens, blob)` stashed at NEGOTIATE for the paired GET (short-lived, single-use).
-    offers: HashMap<u64, (Vec<i32>, Vec<u8>)>,
-    /// `offers` epochs in insertion order, oldest first.
-    offer_order: VecDeque<u64>,
+    /// `(partner, epoch) → (tokens, blob)` stashed at NEGOTIATE for the paired GET (short-lived,
+    /// single-use). Partner-keyed: the epoch is a pure function of the tokens, so an epoch-only key
+    /// let a prober who guessed a prefix collect another tenant's offer straight from `serve`.
+    offers: HashMap<(String, u64), (Vec<i32>, Vec<u8>)>,
+    /// `offers` keys in insertion order, oldest first.
+    offer_order: VecDeque<(String, u64)>,
     /// Live byte total of `offers`, against `KV_MAX_OFFER_BYTES`.
     offer_bytes: usize,
     /// Offers evicted before their paired GET, cumulative — the flood signal that survives suppression.
@@ -459,6 +470,10 @@ pub(crate) struct OvKvCache {
     /// §8 multi-stage worker stash: `epoch → (tokens, blob)`. A worker rank has no tokens of its
     /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
+    ///
+    /// NOT partner-keyed (H.1a residual R1): the CAPTURE frame carries no tenant, so a worker rank has
+    /// none to store under, and keying this would make it store under `LOCAL_NS` and turn the certified
+    /// multi-stage cross-chain warm pull cold. Leaves an exact-match probe open on worker ranks.
     captures: HashMap<u64, (Vec<i32>, Vec<u8>)>,
     /// Issue-34 multi-stage cross-chain warm-resume: `(epoch, rank) → that rank's pulled blob`. The head
     /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
@@ -473,19 +488,24 @@ pub(crate) struct OvKvCache {
 }
 
 impl OvKvCache {
-    /// Producer: stash a captured turn keyed by its full token sequence. Bounded LRU (oldest drop).
-    pub(crate) fn capture(&mut self, tokens: Vec<i32>, blob: Vec<u8>) {
-        self.insert_entry(tokens, blob, false);
+    /// Producer: stash a captured turn under `partner`, keyed by its full token sequence. Bounded
+    /// LRU (oldest drop).
+    pub(crate) fn capture(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>) {
+        self.insert_entry(partner, tokens, blob, false);
     }
 
-    fn insert_entry(&mut self, tokens: Vec<i32>, blob: Vec<u8>, plane_pulled: bool) {
+    fn insert_entry(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>, plane_pulled: bool) {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
-        self.entries.retain(|e| e.tokens != tokens); // de-dup exact key (refresh to front)
+        // De-dup within the namespace only (refresh to front). Matching on tokens alone would let one
+        // tenant evict another's entry by capturing the same sequence — a cross-tenant side effect.
+        self.entries
+            .retain(|e| !(e.partner == partner && e.tokens == tokens));
         self.entries.insert(
             0,
             OvKvEntry {
+                partner: partner.to_string(),
                 tokens,
                 blob,
                 plane_pulled,
@@ -512,12 +532,12 @@ impl OvKvCache {
     /// Consumer INSERT (pulled, validated blob): stash for BOTH restore paths — token-keyed
     /// `entries` (the head warm-resumes via `take_warm` by prompt prefix) and epoch-keyed `captures`
     /// (a worker rank warm-resumes via the head's RESTORE(epoch), having no tokens of its own).
-    pub(crate) fn insert_both(&mut self, tokens: Vec<i32>, blob: Vec<u8>) {
+    pub(crate) fn insert_both(&mut self, partner: &str, tokens: Vec<i32>, blob: Vec<u8>) {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
         self.capture_under_epoch(synth_epoch(&tokens), tokens.clone(), blob.clone());
-        self.insert_entry(tokens, blob, true); // pulled over the plane, not captured locally
+        self.insert_entry(partner, tokens, blob, true); // pulled over the plane, not captured locally
     }
 
     /// Worker RESTORE: take the blob stashed under `epoch` (from INSERT/CAPTURE) so the rank can
@@ -571,12 +591,18 @@ impl OvKvCache {
 
     /// Serve the snapshot asserted by `(epoch, len)` — `offers` first (head NEGOTIATE→GET, single
     /// use), then `captures` (worker stash, repeat-serve). `None` if absent or the length drifted.
-    pub(crate) fn serve(&mut self, epoch: u64, len: u32) -> Option<(Vec<i32>, Vec<u8>)> {
+    pub(crate) fn serve(
+        &mut self,
+        partner: &str,
+        epoch: u64,
+        len: u32,
+    ) -> Option<(Vec<i32>, Vec<u8>)> {
         tracing::info!(target: "cascadia::kv", event = "kv_serve", epoch, want_len = len,
-            in_offers = self.offers.contains_key(&epoch), in_captures = self.captures.contains_key(&epoch),
+            in_offers = self.offers.contains_key(&(partner.to_string(), epoch)),
+            in_captures = self.captures.contains_key(&epoch),
             n_offers = self.offers.len(), n_captures = self.captures.len(),
             cap_epochs = ?self.captures.keys().copied().collect::<Vec<_>>());
-        let (tokens, blob) = if let Some(off) = self.take_offer(epoch) {
+        let (tokens, blob) = if let Some(off) = self.take_offer(partner, epoch) {
             off
         } else if let Some(cap) = self.captures.get(&epoch) {
             cap.clone()
@@ -603,24 +629,25 @@ impl OvKvCache {
 
     /// NEGOTIATE: longest cached full-sequence that is a prefix of `token_ids`; stash it as an offer
     /// under its content epoch for the paired GET. Returns `(epoch, prefix_len)`. Engine-agnostic.
-    pub(crate) fn lookup(&mut self, token_ids: &[i32]) -> Option<(u64, u32)> {
+    pub(crate) fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         let (prefix, blob) = {
-            let Some(e) = self.longest_prefix(token_ids) else {
-                self.log_prefix_miss(token_ids);
+            let Some(e) = self.longest_prefix(partner, token_ids) else {
+                self.log_prefix_miss(partner, token_ids);
                 return None;
             };
             (e.tokens.clone(), e.blob.clone())
         };
         let len = prefix.len() as u32;
         let epoch = synth_epoch(&prefix);
-        self.stash_offer(epoch, prefix, blob);
+        self.stash_offer(partner, epoch, prefix, blob);
         Some((epoch, len))
     }
 
     /// Stash an offer for its paired GET, evicting until it fits both bounds.
-    fn stash_offer(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
+    fn stash_offer(&mut self, partner: &str, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
         // A re-NEGOTIATE of the same prefix replaces its offer instead of double-counting its bytes.
-        let _ = self.take_offer(epoch);
+        let _ = self.take_offer(partner, epoch);
+        let key = (partner.to_string(), epoch);
         // Loops on the order queue, not the map: if the two ever desync, evicting stops making
         // progress and this spins forever holding the engine lock. Stops at empty so a blob over the
         // whole budget is stashed alone, not evicted to death.
@@ -631,18 +658,19 @@ impl OvKvCache {
             self.evict_oldest_offer();
         }
         self.offer_bytes += blob.len();
-        self.offer_order.push_back(epoch);
-        self.offers.insert(epoch, (tokens, blob));
+        self.offer_order.push_back(key.clone());
+        self.offers.insert(key, (tokens, blob));
         debug_assert_eq!(self.offer_order.len(), self.offers.len());
     }
 
     /// Oldest first: arbitrary `HashMap` order can drop the offer whose paired GET is in flight and
     /// keep a stale one, turning a warm resume cold for no gain.
     fn evict_oldest_offer(&mut self) {
-        let Some(epoch) = self.offer_order.pop_front() else {
+        let Some(key) = self.offer_order.pop_front() else {
             return;
         };
-        let Some((_, blob)) = self.offers.remove(&epoch) else {
+        let epoch = key.1;
+        let Some((_, blob)) = self.offers.remove(&key) else {
             return;
         };
         self.offer_bytes = self.offer_bytes.saturating_sub(blob.len());
@@ -660,29 +688,32 @@ impl OvKvCache {
     }
 
     /// Remove an offer, keeping `offer_order` and `offer_bytes` in step.
-    fn take_offer(&mut self, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
-        let off = self.offers.remove(&epoch)?;
-        self.offer_order.retain(|&e| e != epoch);
+    fn take_offer(&mut self, partner: &str, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
+        let key = (partner.to_string(), epoch);
+        let off = self.offers.remove(&key)?;
+        self.offer_order.retain(|k| k != &key);
         self.offer_bytes = self.offer_bytes.saturating_sub(off.1.len());
         Some(off)
     }
 
     /// Longest cached entry whose `tokens` is a prefix of `req`. The blob is whole-sequence
     /// (opaque, not sliceable), so the served length == that entry's token count.
-    fn longest_prefix(&self, req: &[i32]) -> Option<&OvKvEntry> {
+    fn longest_prefix(&self, partner: &str, req: &[i32]) -> Option<&OvKvEntry> {
         self.entries
             .iter()
-            .filter(|e| !e.tokens.is_empty() && req.starts_with(&e.tokens))
+            .filter(|e| e.partner == partner && !e.tokens.is_empty() && req.starts_with(&e.tokens))
             .max_by_key(|e| e.tokens.len())
     }
 
     /// NEGOTIATE-miss diagnostic. A bare `None` reads the same whether nothing was captured or a
     /// captured turn diverges from the request; telling those apart previously cost a rig run.
-    fn log_prefix_miss(&self, req: &[i32]) {
+    /// Scoped to the caller's namespace: the fields below (`diverge_at`, `entry_tok`) describe a
+    /// cached sequence, so scanning all entries would put another tenant's tokens in the log.
+    fn log_prefix_miss(&self, partner: &str, req: &[i32]) {
         let Some((diverge_at, entry)) = self
             .entries
             .iter()
-            .filter(|e| !e.tokens.is_empty())
+            .filter(|e| e.partner == partner && !e.tokens.is_empty())
             .map(|e| {
                 (
                     e.tokens.iter().zip(req).take_while(|(a, b)| a == b).count(),
@@ -826,8 +857,8 @@ impl KvCoordination for OvRuntimeEngine {
         Some(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
 
-    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
-        self.kv_cache_mut().lookup(token_ids)
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv_cache_mut().lookup(partner, token_ids)
     }
 
     fn export(
@@ -839,7 +870,9 @@ impl KvCoordination for OvRuntimeEngine {
         let model_fp = self.kv_model_fingerprint();
         // offers (head NEGOTIATE→GET) OR captures (§8 worker stash) — a worker rank has no
         // NEGOTIATE, so its slice is served from the head-broadcast epoch.
-        let (prefix, blob) = self.kv_cache_mut().serve(expected_epoch, expected_len)?;
+        let (prefix, blob) = self
+            .kv_cache_mut()
+            .serve(partner, expected_epoch, expected_len)?;
         Some(blob_to_wire(
             &prefix,
             &blob,
@@ -852,7 +885,9 @@ impl KvCoordination for OvRuntimeEngine {
     fn insert(&mut self, manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ()> {
         let (tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
         // Stage the blob; the next prefill warm-resumes via `OvKvCache::take_warm` (rig-certified).
-        self.kv_cache_mut().insert_both(tokens, blob);
+        // Namespaced by the manifest's partner — the tenant this pull was served to.
+        self.kv_cache_mut()
+            .insert_both(&manifest.partner.0, tokens, blob);
         Ok(())
     }
 
@@ -1013,11 +1048,11 @@ impl KvSnapshotHolder for OvKvHolder {
         self.model_fp
     }
 
-    fn lookup(&self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+    fn lookup(&self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .lookup(token_ids)
+            .lookup(partner, token_ids)
     }
 
     fn export(
@@ -1026,11 +1061,11 @@ impl KvSnapshotHolder for OvKvHolder {
         expected_epoch: u64,
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
-        let (prefix, blob) = self
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .serve(expected_epoch, expected_len)?;
+        let (prefix, blob) = self.cache.lock().unwrap_or_else(|e| e.into_inner()).serve(
+            partner,
+            expected_epoch,
+            expected_len,
+        )?;
         Some(blob_to_wire(
             &prefix,
             &blob,
@@ -1070,22 +1105,25 @@ mod tests {
     #[test]
     fn cache_serves_longest_prefix() {
         let mut c = OvKvCache::default();
-        c.capture(vec![1, 2], vec![0xA]);
-        c.capture(vec![1, 2, 3, 4], vec![0xB]);
+        c.capture(LOCAL_NS, vec![1, 2], vec![0xA]);
+        c.capture(LOCAL_NS, vec![1, 2, 3, 4], vec![0xB]);
         // request [1,2,3,4,5] → longest cached prefix is [1,2,3,4]
-        let e = c.longest_prefix(&[1, 2, 3, 4, 5]).unwrap();
+        let e = c.longest_prefix(LOCAL_NS, &[1, 2, 3, 4, 5]).unwrap();
         assert_eq!(e.tokens, vec![1, 2, 3, 4]);
         assert_eq!(e.blob, vec![0xB]);
         // request [1,2,9] → only [1,2] qualifies
-        assert_eq!(c.longest_prefix(&[1, 2, 9]).unwrap().tokens, vec![1, 2]);
+        assert_eq!(
+            c.longest_prefix(LOCAL_NS, &[1, 2, 9]).unwrap().tokens,
+            vec![1, 2]
+        );
         // request [9] → no prefix
-        assert!(c.longest_prefix(&[9]).is_none());
+        assert!(c.longest_prefix(LOCAL_NS, &[9]).is_none());
     }
 
     #[test]
     fn take_warm_removes_and_returns_len() {
         let mut c = OvKvCache::default();
-        c.capture(vec![1, 2, 3], vec![0xC, 0xD]);
+        c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xC, 0xD]);
         let (blob, len, _) = c.take_warm(&[1, 2, 3, 4, 5]).unwrap();
         assert_eq!((blob, len), (vec![0xC, 0xD], 3));
         assert!(c.take_warm(&[1, 2, 3, 4, 5]).is_none(), "consumed on take");
@@ -1245,17 +1283,23 @@ mod tests {
         let mut c = OvKvCache::default();
         c.capture_under_epoch(0xE1, vec![11, 22, 33], vec![0xAA, 0xBB]);
         // served by (epoch, len); repeatable (workers answer multiple per-rank GETs)
-        assert_eq!(c.serve(0xE1, 3), Some((vec![11, 22, 33], vec![0xAA, 0xBB])));
-        assert_eq!(c.serve(0xE1, 3).map(|(_, b)| b), Some(vec![0xAA, 0xBB]));
+        assert_eq!(
+            c.serve(LOCAL_NS, 0xE1, 3),
+            Some((vec![11, 22, 33], vec![0xAA, 0xBB]))
+        );
+        assert_eq!(
+            c.serve(LOCAL_NS, 0xE1, 3).map(|(_, b)| b),
+            Some(vec![0xAA, 0xBB])
+        );
         // length drift ⇒ refuse
-        assert!(c.serve(0xE1, 2).is_none());
+        assert!(c.serve(LOCAL_NS, 0xE1, 2).is_none());
         // unknown epoch ⇒ None
-        assert!(c.serve(0xE2, 3).is_none());
+        assert!(c.serve(LOCAL_NS, 0xE2, 3).is_none());
     }
     #[test]
     fn insert_both_feeds_head_and_worker_restore_paths() {
         let mut c = OvKvCache::default();
-        c.insert_both(vec![1, 2, 3], vec![0xAB]);
+        c.insert_both(LOCAL_NS, vec![1, 2, 3], vec![0xAB]);
         // head path: take_warm by prompt prefix (strict)
         assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
         // worker path: take_capture by epoch
@@ -1267,15 +1311,18 @@ mod tests {
     #[test]
     fn offers_take_precedence_and_are_single_use() {
         let mut c = OvKvCache::default();
-        c.stash_offer(0xF0, vec![1, 2], vec![0x01]);
-        assert_eq!(c.serve(0xF0, 2), Some((vec![1, 2], vec![0x01])));
-        assert!(c.serve(0xF0, 2).is_none(), "offer consumed on serve");
+        c.stash_offer(LOCAL_NS, 0xF0, vec![1, 2], vec![0x01]);
+        assert_eq!(c.serve(LOCAL_NS, 0xF0, 2), Some((vec![1, 2], vec![0x01])));
+        assert!(
+            c.serve(LOCAL_NS, 0xF0, 2).is_none(),
+            "offer consumed on serve"
+        );
     }
 
     /// One NEGOTIATE→GET cycle: capture a turn, negotiate a superset of it, get back `(epoch, len)`.
     fn negotiate(c: &mut OvKvCache, tok: i32, blob: Vec<u8>) -> (u64, u32) {
-        c.capture(vec![tok], blob);
-        c.lookup(&[tok, 0])
+        c.capture(LOCAL_NS, vec![tok], blob);
+        c.lookup(LOCAL_NS, &[tok, 0])
             .expect("the just-captured turn prefixes the request")
     }
 
@@ -1307,11 +1354,12 @@ mod tests {
             .map(|i| negotiate(&mut c, i, vec![i as u8]).0)
             .collect();
         let (evicted, kept) = e.split_at(8);
+        let key = |epoch: &u64| (LOCAL_NS.to_string(), *epoch);
         assert!(
-            evicted.iter().all(|x| !c.offers.contains_key(x)),
+            evicted.iter().all(|x| !c.offers.contains_key(&key(x))),
             "the 8 oldest offers go first"
         );
-        assert!(kept.iter().all(|x| c.offers.contains_key(x)));
+        assert!(kept.iter().all(|x| c.offers.contains_key(&key(x))));
     }
 
     /// A re-NEGOTIATE of the same prefix replaces its offer: one map entry, one `offer_order` slot,
@@ -1326,7 +1374,7 @@ mod tests {
         assert_eq!(c.offers.len(), 1);
         assert_eq!(c.offer_order.len(), 1, "no stale order slot");
         assert_eq!(c.offer_bytes, 64, "bytes counted once");
-        assert!(c.serve(e2, len).is_some());
+        assert!(c.serve(LOCAL_NS, e2, len).is_some());
         assert_eq!(c.offer_bytes, 0);
     }
 
@@ -1338,7 +1386,7 @@ mod tests {
         let (epoch, len) = negotiate(&mut c, 7, vec![0u8; KV_MAX_OFFER_BYTES + 1]);
         assert_eq!(c.offers.len(), 1);
         assert_eq!(
-            c.serve(epoch, len).map(|(_, b)| b.len()),
+            c.serve(LOCAL_NS, epoch, len).map(|(_, b)| b.len()),
             Some(KV_MAX_OFFER_BYTES + 1)
         );
         assert_eq!(c.offer_bytes, 0);
@@ -1354,7 +1402,7 @@ mod tests {
         assert_eq!(c.offers.len(), KV_MAX_OFFERS);
         let (epoch, len) = e[n as usize - 1];
         assert_eq!(
-            c.serve(epoch, len),
+            c.serve(LOCAL_NS, epoch, len),
             Some((vec![n - 1], vec![(n - 1) as u8]))
         );
     }
@@ -1367,7 +1415,7 @@ mod tests {
             .map(|i| negotiate(&mut c, i, vec![i as u8]))
             .collect();
         for (epoch, len) in e {
-            let _ = c.serve(epoch, len);
+            let _ = c.serve(LOCAL_NS, epoch, len);
         }
         assert!(c.offers.is_empty() && c.offer_order.is_empty());
         assert_eq!(c.offer_bytes, 0);
@@ -1541,13 +1589,13 @@ mod tests {
     fn capture_bounded_and_dedups() {
         let mut c = OvKvCache::default();
         for i in 0..(KV_MAX_ENTRIES as i32 + 4) {
-            c.capture(vec![i], vec![i as u8]);
+            c.capture(LOCAL_NS, vec![i], vec![i as u8]);
         }
         assert_eq!(c.entries.len(), KV_MAX_ENTRIES);
         // de-dup: re-capturing an existing key doesn't grow / duplicate
         let n = c.entries.len();
         let key = c.entries[2].tokens.clone();
-        c.capture(key.clone(), vec![0xFF]);
+        c.capture(LOCAL_NS, key.clone(), vec![0xFF]);
         assert_eq!(c.entries.len(), n);
         assert_eq!(c.entries[0].tokens, key, "re-capture moves to front");
     }
@@ -1555,9 +1603,9 @@ mod tests {
     #[test]
     fn take_warm_reports_entry_provenance() {
         let mut c = OvKvCache::default();
-        c.capture(vec![1, 2, 3], vec![0xC]);
+        c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xC]);
         assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xC], 3, false)));
-        c.insert_both(vec![1, 2, 3], vec![0xAB]);
+        c.insert_both(LOCAL_NS, vec![1, 2, 3], vec![0xAB]);
         assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
     }
 
@@ -1566,10 +1614,10 @@ mod tests {
     #[test]
     fn evicting_a_plane_entry_leaves_a_local_mark() {
         let mut c = OvKvCache::default();
-        c.insert_both(vec![0, 1], vec![0xAB]);
-        c.capture(vec![0], vec![0x01]);
+        c.insert_both(LOCAL_NS, vec![0, 1], vec![0xAB]);
+        c.capture(LOCAL_NS, vec![0], vec![0x01]);
         for i in 1..=(KV_MAX_ENTRIES as i32 - 1) {
-            c.capture(vec![9, i], vec![i as u8]); // key 9 never prefixes [0,1,2]; one over the bound
+            c.capture(LOCAL_NS, vec![9, i], vec![i as u8]); // key 9 never prefixes [0,1,2]; one over the bound
         }
         assert!(
             c.entries.iter().all(|e| !e.plane_pulled),
@@ -1590,5 +1638,38 @@ mod tests {
             "P3: plane mode must not override a false verdict on a locally captured entry"
         );
         assert!(chain_verdict(false, true, true));
+    }
+
+    #[test]
+    fn lookup_is_confined_to_the_callers_namespace() {
+        let mut c = OvKvCache::default();
+        c.capture("tenant-a", vec![11, 22, 33], vec![9u8; 16]);
+        // Same tokens, different tenant: the result must be indistinguishable from an empty cache.
+        assert_eq!(c.lookup("tenant-b", &[11, 22, 33]), None);
+        // The oracle probe shape (H.1 §4): extend a guessed prefix one token at a time and watch the
+        // returned LENGTH grow — each correct guess confirmed. Every probe must read as empty-cache.
+        // A truncating implementation returns Some((_, shorter)) here and still leaks, so asserting
+        // `None` — not "less than the full match" — is what closes it.
+        for n in 1..=3 {
+            assert_eq!(
+                c.lookup("tenant-b", &[11, 22, 33][..n]),
+                None,
+                "probe len {n}"
+            );
+        }
+        assert_eq!(c.lookup("tenant-b", &[11, 22, 33, 44]), None);
+        // The owner still hits, at full length.
+        assert_eq!(c.lookup("tenant-a", &[11, 22, 33]).map(|(_, l)| l), Some(3));
+    }
+
+    #[test]
+    fn serve_is_confined_to_the_callers_namespace() {
+        let mut c = OvKvCache::default();
+        c.capture("tenant-a", vec![11, 22, 33], vec![9u8; 16]);
+        let (epoch, len) = c.lookup("tenant-a", &[11, 22, 33]).unwrap();
+        // The asserted-GET side door: a prober who guesses the prefix computes `synth_epoch` itself
+        // and probes `export`/`serve` directly, never touching `lookup`.
+        assert_eq!(c.serve("tenant-b", epoch, len), None);
+        assert!(c.serve("tenant-a", epoch, len).is_some());
     }
 }

@@ -3074,8 +3074,9 @@ impl OvRuntimeEngine {
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(full.clone(), blob.clone());
-                        self.kv.capture(full, blob);
+                            .capture(crate::kv_coordination::LOCAL_NS, full.clone(), blob.clone());
+                        self.kv
+                            .capture(crate::kv_coordination::LOCAL_NS, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
                 }
