@@ -882,12 +882,17 @@ impl KvCoordination for OvRuntimeEngine {
         ))
     }
 
-    fn insert(&mut self, manifest: &Manifest, payloads: &[(Vec<u8>, Vec<u8>)]) -> Result<(), ()> {
+    fn insert(
+        &mut self,
+        partner: &str,
+        manifest: &Manifest,
+        payloads: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ()> {
         let (tokens, blob) = wire_to_blob(manifest, payloads).ok_or(())?;
         // Stage the blob; the next prefill warm-resumes via `OvKvCache::take_warm` (rig-certified).
-        // Namespaced by the manifest's partner — the tenant this pull was served to.
-        self.kv_cache_mut()
-            .insert_both(&manifest.partner.0, tokens, blob);
+        // Namespaced by the ASSERTED partner, never `manifest.partner` — see the trait doc: the
+        // manifest's value is stamped by the serving holder and validated by nothing.
+        self.kv_cache_mut().insert_both(partner, tokens, blob);
         Ok(())
     }
 
@@ -1671,5 +1676,33 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// H.1b hard gate (design §12.10.0a): a pulled entry is keyed by the partner the PULLER
+    /// asserted, never the one echoed back in the manifest.
+    ///
+    /// The attack this closes: node A pulls for `tenant-a`; a hostile or misconfigured holder
+    /// returns the blob stamped `partner = "tenant-b"`. Keying on the echo would (i) send
+    /// `tenant-a`'s own warm resume cold, and (ii) hand `tenant-b` a NEGOTIATE that answers
+    /// `Some((epoch, len))` for a prefix it never sent — the incremental length oracle H.1 exists
+    /// to close, re-opened by a remote party.
+    ///
+    /// This pins the cache-level consequence; the wiring itself (`insert_both(partner, …)` rather
+    /// than `insert_both(&manifest.partner.0, …)`) is enforced by the trait signature, which now
+    /// takes the asserted partner explicitly so the echoed value is not even in scope to misuse.
+    #[test]
+    fn insert_keys_on_the_asserted_partner_not_the_manifest_echo() {
+        let mut c = OvKvCache::default();
+        let asserted = "tenant-a"; // what the puller put in its own GET
+        let echoed = "tenant-b"; // what a hostile holder stamped into the manifest
+        c.insert_both(asserted, vec![11, 22, 33], vec![9u8; 16]);
+        // The echoed tenant gains nothing: every probe must read as an empty cache, including the
+        // one-token-at-a-time climb — a truncated length still leaks (H.1 §4).
+        assert_eq!(c.lookup(echoed, &[11, 22, 33]), None);
+        for n in 1..=3 {
+            assert_eq!(c.lookup(echoed, &[11, 22, 33][..n]), None, "probe len {n}");
+        }
+        // ...and the tenant that actually asserted the pull still warms at full length.
+        assert_eq!(c.lookup(asserted, &[11, 22, 33]).map(|(_, l)| l), Some(3));
     }
 }
