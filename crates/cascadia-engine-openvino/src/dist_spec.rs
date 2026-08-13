@@ -1572,7 +1572,13 @@ impl Engine for OvDistSpecEngine {
             match self.do_one_round(max_tokens) {
                 Err(e) => {
                     warn!(task = %task_id, error = %e, "ov-dist-spec round failed");
-                    self.finish_task(task_id, String::new(), 0)
+                    // Surface, don't `finish_task`: finishing turns a dead-peer transport
+                    // error into a clean `[DONE]`, so the client gets a truncated answer
+                    // presented as complete and issue-34's splicer — which only triggers on
+                    // a surfaced error — never fires. Clearing `active` first (as runtime.rs
+                    // does) keeps a stale task from wedging the next `submit()`.
+                    self.active = None;
+                    return Err(e);
                 }
                 Ok(RoundResult {
                     delta,
@@ -1843,8 +1849,8 @@ impl OvDistSpecEngine {
         );
         // Multi-token final round (do_one_round's finished=true path): surface
         // every id this round appended, in order. Single/zero-token finals
-        // (first-chunk-hits-max/EOS, or the round-failed path) leave it empty —
-        // `token_id` alone already identifies the single accepted token.
+        // (first-chunk-hits-max/EOS) leave it empty — `token_id` alone already
+        // identifies the single accepted token.
         let token_ids = if n_tokens > 1 {
             let start = active.out.len().saturating_sub(n_tokens as usize);
             active.out[start..].to_vec()
