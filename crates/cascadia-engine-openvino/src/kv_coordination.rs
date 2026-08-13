@@ -344,6 +344,57 @@ pub(crate) fn parse_capture_body(b: &[u8]) -> Option<(u64, Vec<i32>)> {
     Some((epoch, tokens))
 }
 
+/// Upper bound on a CAPTURE frame's partner string, so a forged frame cannot make a rank allocate
+/// arbitrarily. Tenant ids are short; 1 KiB is far above any real value.
+pub(crate) const MAX_CAPTURE_PARTNER_LEN: usize = 1024;
+
+/// H.1b (ii): [`capture_body_bytes`] plus the TENANT this turn belongs to — base body ++
+/// `u32 partner_len | partner_len × u8` (UTF-8).
+///
+/// A separate function, and it must ride a separate frame opcode, rather than growing
+/// [`capture_body_bytes`]: that codec is positional and unversioned, [`parse_capture_body`] enforces
+/// an EXACT length (`b.len() != 12 + ntok*4`), and a mismatch hard-errors `"bad CAPTURE body"`
+/// mid-chain instead of degrading to Cold. Widening it in place is therefore a hard break between
+/// ranks running different builds inside one chain — with none of the unknown-variant tolerance
+/// §12.2 relies on for the peer-to-peer wire (design §12.10).
+///
+/// Downstream ranks never see the `GenerationTask`, so this frame is the only way they can tag their
+/// own captures with the same namespace the head used. Without it the head would capture under a
+/// real tenant while its workers captured under `LOCAL_NS`, and every multi-rank warm resume for
+/// that tenant would go cold — fail-closed, but silently (§12.10.0).
+pub(crate) fn capture_body_bytes_v2(epoch: u64, tokens: &[i32], partner: &str) -> Vec<u8> {
+    let mut b = capture_body_bytes(epoch, tokens);
+    let p = partner.as_bytes();
+    b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+    b.extend_from_slice(p);
+    b
+}
+
+/// Inverse of [`capture_body_bytes_v2`]. `None` on truncation, an over-bound count, or non-UTF-8 —
+/// a forged or corrupt frame is rejected rather than partially applied.
+pub(crate) fn parse_capture_body_v2(b: &[u8]) -> Option<(u64, Vec<i32>, String)> {
+    if b.len() < 12 {
+        return None;
+    }
+    let ntok = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
+    if ntok > MAX_CAPTURE_TOKENS {
+        return None;
+    }
+    let base = 12 + ntok * 4;
+    // The base must be a well-formed v1 body, and the partner block must follow it exactly.
+    let (epoch, tokens) = parse_capture_body(b.get(..base)?)?;
+    let rest = b.get(base..)?;
+    if rest.len() < 4 {
+        return None;
+    }
+    let plen = u32::from_le_bytes(rest[0..4].try_into().ok()?) as usize;
+    if plen > MAX_CAPTURE_PARTNER_LEN || rest.len() != 4 + plen {
+        return None;
+    }
+    let partner = std::str::from_utf8(&rest[4..]).ok()?.to_string();
+    Some((epoch, tokens, partner))
+}
+
 /// [`capture_body_bytes`] plus the host `valid_mask` (dist-spec only): base body ++ `u32 mask_len |
 /// mask_len × u8` (1=valid, 0=rejected draft). Workers carry no mask of their own, so the driver
 /// ships it down the CAPTURE chain and each rank compacts its blob with it ([`kv_compact_blob`]).
@@ -1703,6 +1754,49 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// H.1b (ii): the partner-bearing CAPTURE body round-trips, and — the property that forces it to
+    /// be a separate opcode — a v2 body is NOT parseable as v1.
+    #[test]
+    fn capture_body_v2_round_trips_and_is_not_v1_parseable() {
+        let tokens = vec![5i32, -3, 7];
+        let b = capture_body_bytes_v2(0xABCD, &tokens, "tenant-a");
+        assert_eq!(
+            parse_capture_body_v2(&b),
+            Some((0xABCD, tokens.clone(), "tenant-a".to_string()))
+        );
+        // v1's exact-length check rejects it. That rejection is a hard "bad CAPTURE body" error
+        // mid-chain, not a degrade-to-Cold — which is exactly why v2 rides its own opcode instead of
+        // widening v1 in place (design §12.10).
+        assert_eq!(parse_capture_body(&b), None);
+        // ...and a v1 body is not mistaken for v2 (no partner block ⇒ reject, never a silent "").
+        assert_eq!(
+            parse_capture_body_v2(&capture_body_bytes(0xABCD, &tokens)),
+            None
+        );
+    }
+
+    /// A forged or corrupt v2 frame is rejected outright rather than partially applied.
+    #[test]
+    fn capture_body_v2_rejects_malformed_frames() {
+        let good = capture_body_bytes_v2(1, &[9, 9], "t");
+        // Truncated partner block.
+        assert_eq!(parse_capture_body_v2(&good[..good.len() - 1]), None);
+        // Trailing garbage after the declared partner length.
+        let mut extra = good.clone();
+        extra.push(0xFF);
+        assert_eq!(parse_capture_body_v2(&extra), None);
+        // Over-bound partner length with no bytes behind it.
+        let mut huge = capture_body_bytes(1, &[9, 9]);
+        huge.extend_from_slice(&(u32::MAX).to_le_bytes());
+        assert_eq!(parse_capture_body_v2(&huge), None);
+        // An empty tenant is legitimate — that is LOCAL_NS, today's default.
+        let local = capture_body_bytes_v2(1, &[9], LOCAL_NS);
+        assert_eq!(
+            parse_capture_body_v2(&local).map(|(_, _, p)| p),
+            Some(String::new())
+        );
     }
 
     /// H.1b reader half: `take_warm` resumes only from the caller's OWN namespace.
