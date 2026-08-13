@@ -22,6 +22,7 @@ are int8 in deployment (int4 collapses acceptance); --tiny keeps them bf16.
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
