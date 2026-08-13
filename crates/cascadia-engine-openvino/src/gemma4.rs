@@ -1190,13 +1190,16 @@ impl Gemma4Engine {
                     .map(|&t| t as i32)
                     .chain(active.generated.iter().copied())
                     .collect();
+                // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
+                // plane-asserted value, which describes a pulled entry, not this turn.
+                let tenant = active.task.tenant.clone();
                 match self.runtime.get_state_blob() {
                     Ok(blob) => {
                         // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
                         // slice under this turn's content epoch. Best-effort.
                         if self.downstream.is_some() && !self.spec.is_last_stage {
                             let epoch = crate::kv_coordination::synth_epoch(&full);
-                            if let Err(e) = self.send_capture_downstream(epoch, &full) {
+                            if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
                                 warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
                             }
                         }
@@ -1205,9 +1208,8 @@ impl Gemma4Engine {
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(crate::kv_coordination::LOCAL_NS, full.clone(), blob.clone());
-                        self.kv
-                            .capture(crate::kv_coordination::LOCAL_NS, full, blob);
+                            .capture(&tenant, full.clone(), blob.clone());
+                        self.kv.capture(&tenant, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
                 }
@@ -1391,22 +1393,52 @@ const G_OPCODE_RESTORE_ACK: u8 = 4;
 const G_OPCODE_ABORT: u8 = 5;
 #[cfg(feature = "kv_coord")]
 const G_OPCODE_ABORT_ACK: u8 = 6;
+/// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
+/// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
+/// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+#[cfg(feature = "kv_coord")]
+/// Bound on a downstream CAPTURE ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT. RESTORE and
+/// ABORT have the same unbounded wait and the same wedge — separate follow-up, not v2-reachable.
+const G_CAPTURE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const G_OPCODE_CAPTURE_V2: u8 = 7;
 
 #[cfg(feature = "kv_coord")]
 impl Gemma4Engine {
-    fn send_capture_downstream(&mut self, epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+    /// A non-empty `tenant` upgrades the frame to `G_OPCODE_CAPTURE_V2` so the downstream rank —
+    /// which never sees the `GenerationTask` — can tag its own capture with the same namespace.
+    fn send_capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> EngineResult<()> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let mut data = vec![G_OPCODE_CAPTURE];
-        data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        let mut data = if tenant.is_empty() {
+            vec![G_OPCODE_CAPTURE]
+        } else {
+            vec![G_OPCODE_CAPTURE_V2]
+        };
+        if tenant.is_empty() {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        } else {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes_v2(
+                epoch, tokens, tenant,
+            ));
+        }
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
         let ack = self
             .block_on(async move {
                 let mut g = downstream.lock().await;
                 g.send(&t).await?;
-                let (ack, _) = g.recv().await?;
+                // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
+                // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
+                // unbounded wait here wedges this rank while it holds the downstream lock.
+                let (ack, _) = tokio::time::timeout(G_CAPTURE_ACK_TIMEOUT, g.recv())
+                    .await
+                    .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -1474,19 +1506,27 @@ impl Gemma4Engine {
     /// Handle an inbound I8 control tensor on a worker (called transparently inside the recv loop).
     fn handle_inbound_control(&mut self, t: &WireTensor) -> EngineResult<()> {
         match t.data.first().copied() {
-            Some(G_OPCODE_CAPTURE) => {
-                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
-                    .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
+            Some(op @ (G_OPCODE_CAPTURE | G_OPCODE_CAPTURE_V2)) => {
+                let (epoch, tokens, tenant) = if op == G_OPCODE_CAPTURE_V2 {
+                    crate::kv_coordination::parse_capture_body_v2(&t.data[1..])
+                        .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE_V2 body".into()))?
+                } else {
+                    let (e, tk) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                        .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
+                    (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
+                };
                 if let Ok(blob) = self.runtime.get_state_blob() {
                     // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch(epoch, tokens.clone(), blob.clone());
-                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                    self.kv
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                 }
                 if !self.spec.is_last_stage {
-                    if let Err(e) = self.send_capture_downstream(epoch, &tokens) {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens, &tenant) {
                         warn!(error = %e, "gemma4: CAPTURE chain downstream failed (best-effort)");
                     }
                 }

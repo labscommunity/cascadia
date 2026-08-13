@@ -73,6 +73,10 @@ pub struct OvMoeKvPrefixCache {
     entries: VecDeque<(CacheKey, Entry)>,
     hits: u64,
     misses: u64,
+    /// H.1b R2: namespace [`Self::insert`] (this rank's own turn) files entries under. Seeded from
+    /// `GenerationTask.tenant` at admission via [`Self::set_local_ns`]; `LOCAL_NS` until something
+    /// names a tenant, which is what keeps the local-capture path unchanged today.
+    local_ns: String,
 }
 
 impl OvMoeKvPrefixCache {
@@ -82,7 +86,16 @@ impl OvMoeKvPrefixCache {
             entries: VecDeque::with_capacity(capacity.max(1)),
             hits: 0,
             misses: 0,
+            local_ns: LOCAL_NS.to_string(),
         }
+    }
+
+    /// Set the namespace [`Self::insert`] files this turn's capture under. Call at task admission
+    /// with `GenerationTask.tenant` — NEVER with a plane-asserted partner, which describes a pulled
+    /// entry rather than the turn being run.
+    pub fn set_local_ns(&mut self, ns: &str) {
+        self.local_ns.clear();
+        self.local_ns.push_str(ns);
     }
 
     /// True if the cache stores anything. `capacity == 0` returns false.
@@ -194,7 +207,9 @@ impl OvMoeKvPrefixCache {
         fingerprint: &ModelFingerprint,
         snapshot: OvMoeKvSnapshot,
     ) {
-        self.store(LOCAL_NS, prefix, fingerprint, snapshot, false);
+        let ns = std::mem::take(&mut self.local_ns);
+        self.store(&ns, prefix, fingerprint, snapshot, false);
+        self.local_ns = ns;
     }
 
     /// As [`Self::insert`], but marks the entry as pulled over the KV plane so a later

@@ -1349,11 +1349,27 @@ impl Engine for SparseMoEEngine {
 }
 
 impl SparseMoEEngine {
+    /// H.1b R2: file this turn's LOCAL capture under the task's tenant, on both the engine cache
+    /// and the holder mirror (either can be the one a later NEGOTIATE reads). Seeded from
+    /// `GenerationTask.tenant` at admission — never from a plane-asserted partner, which describes
+    /// a pulled entry rather than the turn being run. Inert while nothing names a tenant.
+    #[cfg(feature = "kv_coord")]
+    fn kv_set_turn_tenant(&mut self, tenant: &str) {
+        self.kv_prefix_cache.set_local_ns(tenant);
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .set_local_ns(tenant);
+    }
+
     fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let tokenizer = match self.tokenizer.as_ref() {
             Some(t) => t,
             None => {
@@ -1453,6 +1469,8 @@ impl SparseMoEEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let started = std::time::Instant::now();
         let prompt_ids: Vec<i64> = {
             let Some(tok) = self.tokenizer.as_ref() else {
@@ -2897,11 +2915,27 @@ impl OvMoeEngine {
     }
 
     /// Single-stage path: tokenize, run the whole model, decode.
+    /// H.1b R2: file this turn's LOCAL capture under the task's tenant, on both the engine cache
+    /// and the holder mirror (either can be the one a later NEGOTIATE reads). Seeded from
+    /// `GenerationTask.tenant` at admission — never from a plane-asserted partner, which describes
+    /// a pulled entry rather than the turn being run. Inert while nothing names a tenant.
+    #[cfg(feature = "kv_coord")]
+    fn kv_set_turn_tenant(&mut self, tenant: &str) {
+        self.kv_prefix_cache.set_local_ns(tenant);
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefix
+            .set_local_ns(tenant);
+    }
+
     fn step_single_stage(&mut self) -> Vec<(TaskId, Chunk)> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "MiniMax-M2 engine has no tokenizer");
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -3019,6 +3053,8 @@ impl OvMoeEngine {
             Some(t) => t,
             None => return Vec::new(),
         };
+        #[cfg(feature = "kv_coord")]
+        self.kv_set_turn_tenant(&task.tenant);
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");

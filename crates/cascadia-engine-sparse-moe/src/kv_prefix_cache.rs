@@ -225,6 +225,13 @@ pub struct KvPrefixCache {
     pub inserts: u64,
     /// Total evictions due to capacity overflow.
     pub evictions: u64,
+    /// H.1b R2: namespace [`Self::insert`] (this rank's own turn) files entries under. Seeded from
+    /// `GenerationTask.tenant` at admission via [`Self::set_local_ns`]; `LOCAL_NS` until something
+    /// names a tenant, which is what keeps the local-capture path unchanged today.
+    ///
+    /// Held here rather than threaded through `generate_with_cache`: the deepest insert sites sit
+    /// inside the runner, which has no task. Single task in flight per engine, set at admission.
+    local_ns: String,
 }
 
 impl KvPrefixCache {
@@ -238,7 +245,16 @@ impl KvPrefixCache {
             misses: 0,
             inserts: 0,
             evictions: 0,
+            local_ns: LOCAL_NS.to_string(),
         }
+    }
+
+    /// Set the namespace [`Self::insert`] files this turn's capture under. Call at task admission
+    /// with `GenerationTask.tenant` — NEVER with a plane-asserted partner, which describes a pulled
+    /// entry rather than the turn being run.
+    pub fn set_local_ns(&mut self, ns: &str) {
+        self.local_ns.clear();
+        self.local_ns.push_str(ns);
     }
 
     /// True if the cache will store anything. `capacity == 0` returns false.
@@ -370,7 +386,10 @@ impl KvPrefixCache {
         fingerprint: &ModelFingerprint,
         snapshot: KvSnapshot,
     ) -> usize {
-        self.store(LOCAL_NS, prefix, fingerprint, snapshot, false)
+        let ns = std::mem::take(&mut self.local_ns);
+        let n = self.store(&ns, prefix, fingerprint, snapshot, false);
+        self.local_ns = ns;
+        n
     }
 
     /// As [`Self::insert`], but marks the entry as pulled over the KV plane so a later warm resume

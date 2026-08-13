@@ -438,6 +438,60 @@ pub(crate) fn parse_capture_body_masked(b: &[u8]) -> Option<(u64, Vec<i32>, Vec<
     Some((epoch, tokens, valid))
 }
 
+/// H.1b (R2): [`capture_body_bytes_masked`] plus the TENANT — base body ++ `u32 mask_len |
+/// mask_len × u8` ++ `u32 partner_len | partner_len × u8` (UTF-8). dist-spec only: its CAPTURE
+/// always carries a mask, so [`capture_body_bytes_v2`] (which has none) cannot serve it.
+///
+/// The two suffixes have the IDENTICAL `u32 len ++ len × u8` shape and a 0/1 mask is valid UTF-8,
+/// so nothing in the bytes tells a mask from a tenant: a masked body handed to
+/// [`parse_capture_body_v2`] parses into a garbage partner, and a v2 body handed to
+/// [`parse_capture_body_masked`] parses into a garbage mask. Only the frame opcode separates them.
+/// Hence: mask FIRST, fixed positionally; every parser enforces an exact total length; and each
+/// body shape rides its OWN opcode (design §12.10).
+pub(crate) fn capture_body_bytes_masked_v2(
+    epoch: u64,
+    tokens: &[i32],
+    valid: &[i64],
+    partner: &str,
+) -> Vec<u8> {
+    let mut b = capture_body_bytes_masked(epoch, tokens, valid);
+    let p = partner.as_bytes();
+    b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+    b.extend_from_slice(p);
+    b
+}
+
+/// Inverse of [`capture_body_bytes_masked_v2`]. `None` on truncation, an over-bound count,
+/// non-UTF-8, or trailing bytes — a forged or corrupt frame is rejected, never partially applied.
+pub(crate) fn parse_capture_body_masked_v2(b: &[u8]) -> Option<(u64, Vec<i32>, Vec<i64>, String)> {
+    if b.len() < 12 {
+        return None;
+    }
+    let ntok = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
+    if ntok > MAX_CAPTURE_TOKENS {
+        return None;
+    }
+    let tok_end = 12usize.checked_add(ntok.checked_mul(4)?)?;
+    let mask_len = u32::from_le_bytes(b.get(tok_end..tok_end + 4)?.try_into().ok()?) as usize;
+    if mask_len > MAX_CAPTURE_TOKENS {
+        return None;
+    }
+    // Walk the positional layout to find where the mask block ends, then hand that EXACT slice to
+    // the masked parser so its own exact-length check still does the validating.
+    let base = (tok_end + 4).checked_add(mask_len)?;
+    let (epoch, tokens, valid) = parse_capture_body_masked(b.get(..base)?)?;
+    let rest = b.get(base..)?;
+    if rest.len() < 4 {
+        return None;
+    }
+    let plen = u32::from_le_bytes(rest[0..4].try_into().ok()?) as usize;
+    if plen > MAX_CAPTURE_PARTNER_LEN || rest.len() != 4 + plen {
+        return None;
+    }
+    let partner = std::str::from_utf8(&rest[4..]).ok()?.to_string();
+    Some((epoch, tokens, valid, partner))
+}
+
 /// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
 /// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
 /// as a single opaque blob — `OvKvCache` and the wire treat it as one payload.
@@ -518,14 +572,16 @@ pub(crate) struct OvKvCache {
     /// A flood evicts once per NEGOTIATE, and one log line each is how a node's chain.log reached
     /// 770 GB (see `warn_limit`); bound the eviction log the same way.
     evict_log: crate::warn_limit::StepWarnLimiter,
-    /// §8 multi-stage worker stash: `epoch → (tokens, blob)`. A worker rank has no tokens of its
-    /// own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
+    /// §8 multi-stage worker stash: `epoch → (partner, tokens, blob)`. A worker rank has no tokens of
+    /// its own, so the head's `CAPTURE(epoch, tokens)` frame carries them; the rank blobs its slice and
     /// stashes here. Served by `export` for repeat/later per-rank GETs (clone, not remove). Bounded.
     ///
-    /// NOT partner-keyed (H.1a residual R1): the CAPTURE frame carries no tenant, so a worker rank has
-    /// none to store under, and keying this would make it store under `LOCAL_NS` and turn the certified
-    /// multi-stage cross-chain warm pull cold. Leaves an exact-match probe open on worker ranks.
-    captures: HashMap<u64, (Vec<i32>, Vec<u8>)>,
+    /// Keyed by epoch ALONE, with the tenant carried as a value: a v1 CAPTURE frame carries no
+    /// tenant, so partner-KEYING would file every legacy capture under `LOCAL_NS` and turn the
+    /// certified multi-stage cross-chain warm pull cold. `serve` instead confines a capture that
+    /// DOES carry a tenant (H.1b R2 `CAPTURE_V2`) to that tenant, and leaves an untagged one
+    /// readable by anyone — exactly today's behaviour for today's frames.
+    captures: HashMap<u64, (String, Vec<i32>, Vec<u8>)>,
     /// Issue-34 multi-stage cross-chain warm-resume: `(epoch, rank) → that rank's pulled blob`. The head
     /// pulls every rank's KV but can't use a downstream rank's slice locally, so it stashes it here and
     /// ships it inline in the `RESTORE(epoch)` frame to that rank (which `set_state`s it).
@@ -565,8 +621,22 @@ impl OvKvCache {
         self.entries.truncate(KV_MAX_ENTRIES);
     }
 
-    /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`. Bounded.
+    /// §8 worker: stash this rank's blob under the head-broadcast `(epoch, tokens)`, untagged. The
+    /// v1 CAPTURE frame carries no tenant, so the entry stays readable by any `serve`.
     pub(crate) fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>, blob: Vec<u8>) {
+        self.capture_under_epoch_ns(LOCAL_NS, epoch, tokens, blob);
+    }
+
+    /// H.1b R2: as [`Self::capture_under_epoch`], but tagged with the tenant the head put in its
+    /// `CAPTURE_V2` frame — the only way a worker rank, which never sees the `GenerationTask`, can
+    /// learn which namespace the turn belongs to. `LOCAL_NS` ⇒ untagged (the v1 path).
+    pub(crate) fn capture_under_epoch_ns(
+        &mut self,
+        partner: &str,
+        epoch: u64,
+        tokens: Vec<i32>,
+        blob: Vec<u8>,
+    ) {
         if blob.is_empty() {
             return;
         }
@@ -577,7 +647,8 @@ impl OvKvCache {
         }
         tracing::info!(target: "cascadia::kv", event = "kv_cap_under_epoch",
             epoch, tokens = tokens.len(), blob = blob.len());
-        self.captures.insert(epoch, (tokens, blob));
+        self.captures
+            .insert(epoch, (partner.to_string(), tokens, blob));
     }
 
     /// Consumer INSERT (pulled, validated blob): stash for BOTH restore paths — token-keyed
@@ -594,7 +665,9 @@ impl OvKvCache {
     /// Worker RESTORE: take the blob stashed under `epoch` (from INSERT/CAPTURE) so the rank can
     /// `set_state` it. Removed on take (one restore per inserted turn).
     pub(crate) fn take_capture(&mut self, epoch: u64) -> Option<(Vec<i32>, Vec<u8>)> {
-        self.captures.remove(&epoch)
+        // Not namespace-filtered: this is the rank's OWN restore of its OWN capture, driven by the
+        // head's RESTORE(epoch), not a wire read. `serve` is the wire-facing path.
+        self.captures.remove(&epoch).map(|(_, t, b)| (t, b))
     }
 
     /// Head: stash a pulled DOWNSTREAM rank's blob for inline delivery in `RESTORE(epoch)`. Bounded.
@@ -655,8 +728,15 @@ impl OvKvCache {
             cap_epochs = ?self.captures.keys().copied().collect::<Vec<_>>());
         let (tokens, blob) = if let Some(off) = self.take_offer(partner, epoch) {
             off
-        } else if let Some(cap) = self.captures.get(&epoch) {
-            cap.clone()
+        } else if let Some((cap_ns, tokens, blob)) = self.captures.get(&epoch) {
+            // A capture that carries a tenant (CAPTURE_V2) is confined to it. An UNTAGGED capture
+            // (`LOCAL_NS`, i.e. every v1 frame — all of them today) stays readable by any partner,
+            // so the certified multi-stage cross-chain pull is unchanged.
+            if !cap_ns.is_empty() && cap_ns != partner {
+                tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch", epoch);
+                return None;
+            }
+            (tokens.clone(), blob.clone())
         } else {
             return None;
         };
@@ -1336,6 +1416,77 @@ mod tests {
         // unmasked body (no mask_len trailer) ⇒ None under the masked parser
         assert!(parse_capture_body_masked(&capture_body_bytes(1, &[9])).is_none());
     }
+
+    #[test]
+    fn capture_body_masked_v2_round_trips() {
+        let body = capture_body_bytes_masked_v2(0xABCD, &[5, -3, 7], &[1, 0, 1, 1, 0], "tenant-a");
+        assert_eq!(
+            parse_capture_body_masked_v2(&body),
+            Some((
+                0xABCD,
+                vec![5, -3, 7],
+                vec![1, 0, 1, 1, 0],
+                "tenant-a".to_string()
+            ))
+        );
+        // An empty tenant is legitimate — that is LOCAL_NS.
+        assert_eq!(
+            parse_capture_body_masked_v2(&capture_body_bytes_masked_v2(1, &[9], &[1], LOCAL_NS))
+                .map(|(_, _, _, p)| p),
+            Some(String::new())
+        );
+        // truncation / trailing junk / an over-bound partner count are all rejected
+        assert!(parse_capture_body_masked_v2(&body[..body.len() - 1]).is_none());
+        let mut extra = body.clone();
+        extra.push(0);
+        assert!(parse_capture_body_masked_v2(&extra).is_none());
+        let mut huge = capture_body_bytes_masked(1, &[9], &[1]);
+        huge.extend_from_slice(&((MAX_CAPTURE_PARTNER_LEN as u32) + 1).to_le_bytes());
+        assert!(parse_capture_body_masked_v2(&huge).is_none());
+    }
+
+    /// The masked and partner suffixes are byte-for-byte the same SHAPE (`u32 len ++ len × u8`), so
+    /// the only thing that keeps a mask from being read as a tenant is the frame opcode. This pins
+    /// what the exact-length check DOES buy — mask-only vs mask+partner never confuse each other —
+    /// and pins the residual it does NOT, so nobody later "simplifies" the two onto one opcode.
+    #[test]
+    fn masked_and_partner_bodies_are_separated_by_length_and_opcode() {
+        let masked = capture_body_bytes_masked(7, &[1, 2], &[1, 0]);
+        let masked_v2 = capture_body_bytes_masked_v2(7, &[1, 2], &[1, 0], "tenant-a");
+        let v2 = capture_body_bytes_v2(7, &[1, 2], "tenant-a");
+
+        // Mask-only vs mask+partner: the extra suffix breaks the exact-length check both ways.
+        assert_eq!(parse_capture_body_masked(&masked_v2), None);
+        assert_eq!(parse_capture_body_masked_v2(&masked), None);
+        // v1+partner vs mask+partner: likewise, one suffix apart.
+        assert_eq!(parse_capture_body_v2(&masked_v2), None);
+        assert_eq!(parse_capture_body_masked_v2(&v2), None);
+        // v1 has no suffix at all, so every extended parser rejects it.
+        let v1 = capture_body_bytes(7, &[1, 2]);
+        assert_eq!(parse_capture_body_v2(&v1), None);
+        assert_eq!(parse_capture_body_masked(&v1), None);
+        assert_eq!(parse_capture_body_masked_v2(&v1), None);
+
+        // RESIDUAL, pinned deliberately: a one-suffix mask and a one-suffix partner are
+        // indistinguishable as bytes (a 0/1 mask is valid UTF-8), so these two DO cross-parse into
+        // garbage. Nothing in the body can fix that — only the opcode can, hence CAPTURE_V2.
+        assert!(parse_capture_body_masked(&v2).is_some());
+        assert!(parse_capture_body_v2(&masked).is_some());
+    }
+
+    #[test]
+    fn worker_capture_tagged_with_a_tenant_is_confined_to_it() {
+        let mut c = OvKvCache::default();
+        c.capture_under_epoch_ns("tenant-a", 0xE1, vec![11, 22, 33], vec![0xAA]);
+        assert_eq!(c.serve("tenant-b", 0xE1, 3), None);
+        assert!(c.serve("tenant-a", 0xE1, 3).is_some());
+        // An UNTAGGED capture — every v1 frame, i.e. everything on the wire today — is unchanged:
+        // readable by any partner, so the certified cross-chain pull stays warm.
+        c.capture_under_epoch(0xE2, vec![44, 55, 66], vec![0xBB]);
+        assert!(c.serve("tenant-b", 0xE2, 3).is_some());
+        assert!(c.serve(LOCAL_NS, 0xE2, 3).is_some());
+    }
+
     #[test]
     fn unframe_blobs_rejects_malformed() {
         assert!(unframe_blobs(&[0u8; 2]).is_none()); // too short for count
