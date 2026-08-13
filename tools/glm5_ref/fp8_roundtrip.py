@@ -99,6 +99,37 @@ def build_synthetic_fp8_ckpt(out: Path):
             put_fp8(sp + "up_proj.weight", rnd(MI, H))
             put_fp8(sp + "down_proj.weight", rnd(H, MI))
 
+    # MTP draft head (model.layers.{num_hidden_layers}., DeepSeek-V3 nextn):
+    # export_real reads this whenever num_nextn_predict_layers>0, and real
+    # GLM-5.2 always ships one (docs/architectures/glm5.md). Emit it so the
+    # roundtrip exercises the has_mtp export path instead of skipping it.
+    if C["num_nextn_predict_layers"] > 0:
+        mp = f"model.layers.{C['num_hidden_layers']}."
+        put_bf16(mp + "enorm.weight", nf(H))
+        put_bf16(mp + "hnorm.weight", nf(H))
+        put_bf16(mp + "shared_head.norm.weight", nf(H))
+        put_fp8(mp + "eh_proj.weight", rnd(H, 2 * H))
+        put_bf16(mp + "input_layernorm.weight", nf(H))
+        put_bf16(mp + "post_attention_layernorm.weight", nf(H))
+        put_fp8(mp + "self_attn.q_a_proj.weight", rnd(QL, H))
+        put_bf16(mp + "self_attn.q_a_layernorm.weight", nf(QL))
+        put_fp8(mp + "self_attn.q_b_proj.weight", rnd(Hh * QK, QL))
+        put_fp8(mp + "self_attn.kv_a_proj_with_mqa.weight", rnd(KVL + C["qk_rope_head_dim"], H))
+        put_bf16(mp + "self_attn.kv_a_layernorm.weight", nf(KVL))
+        put_fp8(mp + "self_attn.kv_b_proj.weight", rnd(Hh * (C["qk_nope_head_dim"] + VH), KVL))
+        put_fp8(mp + "self_attn.o_proj.weight", rnd(H, Hh * VH))
+        put_bf16(mp + "mlp.gate.weight", rnd(E, H))
+        put_bf16(mp + "mlp.gate.e_score_correction_bias", 0.3 * torch.randn(E, generator=g))
+        for e in range(E):
+            ep = mp + f"mlp.experts.{e}."
+            put_fp8(ep + "gate_proj.weight", rnd(MI, H))
+            put_fp8(ep + "up_proj.weight", rnd(MI, H))
+            put_fp8(ep + "down_proj.weight", rnd(H, MI))
+        sp = mp + "mlp.shared_experts."
+        put_fp8(sp + "gate_proj.weight", rnd(MI, H))
+        put_fp8(sp + "up_proj.weight", rnd(MI, H))
+        put_fp8(sp + "down_proj.weight", rnd(H, MI))
+
     save_file(tensors, str(out / "model.safetensors"))
     index = {"metadata": {}, "weight_map": {k: "model.safetensors" for k in tensors}}
     (out / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))

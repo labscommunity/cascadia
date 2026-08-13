@@ -479,7 +479,6 @@ def export_real(model_dir: Path, out: Path):
     cfg = load_and_validate_config(model_dir / "config.json")
     src = CkptSource(model_dir)
     cfg["mtp_emitted"] = cfg["n_mtp"] > 0  # MTP draft head emitted below (bf16 block)
-    write_manifest(cfg, out)
     (out / "shells").mkdir(parents=True, exist_ok=True)
     check_space(out, cfg)
 
@@ -599,6 +598,11 @@ def export_real(model_dir: Path, out: Path):
         print(f"[mtp] draft head written ({cfg['n_routed']}+1 bf16 experts)", flush=True)
     elif mtp_done.exists():
         print("[mtp] skip (done)", flush=True)
+
+    # Written only now that every tensor it describes is on disk: a crash
+    # earlier (dense loop, MTP block) must not leave a manifest claiming
+    # weights (e.g. has_mtp) that were never exported.
+    write_manifest(cfg, out)
 
     # Carry the serving sidecars from the source checkpoint. GLM-5.2 ships its
     # chat template as a standalone `chat_template.jinja`; without it the API
