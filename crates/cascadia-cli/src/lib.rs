@@ -340,6 +340,44 @@ pub struct WorkerArgs {
     #[arg(long, value_enum, value_name = "MODE")]
     pub ov_execution_mode: Option<OvExecutionMode>,
 
+    /// OV plugin property passthrough, `KEY=VALUE`, repeatable. Forwarded
+    /// verbatim to the OpenVINO plugin alongside the typed `--ov-*` flags —
+    /// the escape hatch for memory/runtime knobs that have no dedicated flag
+    /// yet (e.g. `--ov-config ENABLE_MMAP=YES`,
+    /// `--ov-config KV_CACHE_PRECISION=u8`,
+    /// `--ov-config CACHE_MODE=OPTIMIZE_SIZE`). Applied LAST so it overrides a
+    /// typed flag setting the same key. No allowlist: OV validates and rejects
+    /// unknown/ill-typed keys itself. NPU-only keys still require an NPU device
+    /// + ov-genai (same gate as the typed NPU flags); a `KEY=VALUE` with no
+    /// `=`, or an empty key, is rejected at parse time.
+    #[arg(long = "ov-config", value_name = "KEY=VALUE", value_parser = validate_ov_config)]
+    pub ov_config: Vec<String>,
+
+    /// Elastic memory posture: serve large allocations from file-backed
+    /// mappings so the engine's weight copies, KV state and scratch become
+    /// kernel-reclaimable instead of anonymous/committed. Measured in-tree
+    /// (ramlab exp 199): 2064→506 MB committed at −1% decode on an unmodified
+    /// OpenVINO CPU worker. Linux re-execs the worker once with an allocator
+    /// interposer preloaded; Windows inline-hooks the UCRT allocation family
+    /// in-process via Detours (built only when DETOURS_DIR was set — otherwise
+    /// the flag parses but reports inactive). The OV knobs cannot substitute:
+    /// they cannot disable oneDNN's dirty repacked copies (D-004).
+    #[arg(long)]
+    pub elastic: bool,
+
+    /// Elastic threshold in MB: route allocations at least this large through
+    /// the file-backed pool. 1 = maximum RAM cut; 16 = weights-only, zero
+    /// measured speed cost (ramlab exp 198 threshold sweep). Ignored without
+    /// `--elastic`.
+    #[arg(long, value_name = "MB", default_value_t = 1)]
+    pub elastic_min_mb: u32,
+
+    /// Elastic retained-mapping pool cap in MB: freed big mappings kept for
+    /// zero-cost reuse (0 disables the pool — reverts to the −35% eager-return
+    /// tax). Ignored without `--elastic`.
+    #[arg(long, value_name = "MB", default_value_t = 8192)]
+    pub elastic_pool_mb: u32,
+
     /// NPU LLM prefill chunk size (NPUW_LLM_PREFILL_CHUNK_SIZE, OV 2025.3+).
     /// Applied only with --engine ov-genai on an NPU device; dropped with a
     /// warning otherwise (only ov-genai routes it through an ov::genai
@@ -621,6 +659,13 @@ pub struct RunArgs {
     /// 8000). Pass e.g. `127.0.0.1:8000` to bind loopback only.
     #[arg(long, default_value = ":8000")]
     pub api: String,
+
+    /// Elastic memory posture — serve large allocations from file-backed
+    /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
+    /// `cascadia worker --help` for `--elastic-min-mb` / `--elastic-pool-mb`
+    /// tuning; `run` uses the measured defaults (1 MB threshold, pool on).
+    #[arg(long)]
+    pub elastic: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -657,6 +702,10 @@ impl WorkerArgs {
             ov_num_threads: None,
             ov_allow_auto_batching: false,
             ov_execution_mode: None,
+            ov_config: Vec::new(),
+            elastic: false,
+            elastic_min_mb: 1,
+            elastic_pool_mb: 8192,
             npu_prefill_chunk_size: None,
             npu_max_prompt_len: None,
             npu_min_response_len: None,
@@ -867,6 +916,39 @@ impl OvExecutionMode {
     }
 }
 
+/// Turn on the elastic memory posture if the subcommand asked for it, BEFORE
+/// the async runtime starts. On Linux success this re-executes the process (the
+/// call does not return); otherwise it returns and the run continues, with the
+/// OV memory knobs still seeded via [`ov_perf_properties`]. Kept out of [`run`]
+/// so `main` can call it while the process is still single-threaded — env
+/// mutation and `execv` are only safe there.
+pub fn activate_elastic_if_requested(cli: &Cli) {
+    let (min_mb, pool_mb) = match &cli.cmd {
+        Command::Worker(a) if a.elastic => (a.elastic_min_mb, a.elastic_pool_mb),
+        Command::Run(a) if a.elastic => (1, 8192),
+        _ => return,
+    };
+    if cascadia_elastic::is_active() {
+        eprintln!("cascadia: elastic posture active (min={min_mb}MB pool={pool_mb}MB)");
+        return;
+    }
+    let opts = cascadia_elastic::ElasticOpts { min_mb, pool_mb, dir: None };
+    match cascadia_elastic::activate(&opts) {
+        // On Linux success execv never returns; AlreadyActive is handled above.
+        Ok(cascadia_elastic::Activation::AlreadyActive) => {}
+        // Windows in-process hook installed this call.
+        Ok(cascadia_elastic::Activation::Activated) => {
+            eprintln!("cascadia: elastic posture active (in-process; min={min_mb}MB pool={pool_mb}MB)");
+        }
+        Ok(cascadia_elastic::Activation::UnsupportedPlatform(why)) => {
+            eprintln!("cascadia: --elastic interposer unavailable on this build: {why}");
+        }
+        Err(e) => {
+            eprintln!("cascadia: --elastic activation failed ({e}); continuing without the interposer");
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level);
     match cli.cmd {
@@ -886,7 +968,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    let worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    let mut worker = WorkerArgs::single_node(args.model, args.device, args.engine, args.api);
+    // Carry the elastic posture onto the worker so the OV memory-knob seeding
+    // (ov_perf_properties) fires; the interposer itself was already activated
+    // in main before the async runtime started.
+    worker.elastic = args.elastic;
     cmd_worker(worker).await
 }
 
@@ -976,6 +1062,14 @@ fn device_is_npu(device: &str) -> bool {
 fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     let mut props: Vec<(String, String)> = Vec::new();
 
+    // Elastic posture seeds memory-frugal OV props FIRST (lowest priority), so a
+    // typed --ov-* flag or an explicit --ov-config for the same key still wins.
+    // On Windows these knobs are the whole memory story (no interposer); on
+    // Linux they stack with the preloaded allocator (cascadia-elastic).
+    if args.elastic {
+        props.extend(cascadia_elastic::ov_memory_props());
+    }
+
     // General performance hints. PERFORMANCE_HINT / INFERENCE_PRECISION_HINT /
     // EXECUTION_MODE_HINT are plugin-agnostic ov::hint properties. NUM_STREAMS,
     // INFERENCE_NUM_THREADS (CPU-oriented) and ALLOW_AUTO_BATCHING (GPU/AUTO)
@@ -1009,7 +1103,8 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
     // rejects or ignores them). So gate on BOTH the device (NPU) and the engine
     // (ov-genai). Keeping the gate here (single source of truth) means the
     // builders and the C++ shim never see an NPU key on a run that can't use it.
-    if device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai) {
+    let npu_ok = device_is_npu(&args.device) && matches!(args.engine, EngineKind::OvGenai);
+    if npu_ok {
         if let Some(n) = args.npu_prefill_chunk_size {
             props.push(("NPUW_LLM_PREFILL_CHUNK_SIZE".into(), n.to_string()));
         }
@@ -1021,7 +1116,58 @@ fn ov_perf_properties(args: &WorkerArgs) -> Vec<(String, String)> {
         }
     }
 
+    // Raw `--ov-config KEY=VALUE` passthrough, applied LAST. A later entry for a
+    // key already present (from a typed flag or an earlier --ov-config) wins:
+    // OV takes a map, so we dedupe keeping the last write. NPU-prefixed keys go
+    // through the same device+engine gate as the typed NPU flags — passing one
+    // on a CPU run would make OV reject the whole property set, so drop it with
+    // a warning instead (parity with warn_ignored_ov_perf_flags). Malformed
+    // entries are already rejected at parse time (see parse_ov_config).
+    for (key, value) in parse_ov_config(&args.ov_config) {
+        if key.to_ascii_uppercase().starts_with("NPU") && !npu_ok {
+            eprintln!(
+                "warning: ignoring --ov-config {key}={value}: NPU-prefixed keys \
+                 apply only to --engine ov-genai on an NPU device"
+            );
+            continue;
+        }
+        props.retain(|(k, _)| k != &key);
+        props.push((key, value));
+    }
+
     props
+}
+
+/// clap value-parser for `--ov-config`: require a `KEY=VALUE` shape with a
+/// non-empty key, so `--ov-config foo` or `--ov-config =x` fail with a clear
+/// message at parse time rather than being silently dropped later. The value
+/// may be empty (some OV keys accept an empty string) and may contain `=`.
+fn validate_ov_config(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((k, _)) if !k.trim().is_empty() => Ok(s.to_string()),
+        Some(_) => Err("empty key before '=' (expected KEY=VALUE)".into()),
+        None => Err(format!("missing '=' in {s:?} (expected KEY=VALUE)")),
+    }
+}
+
+/// Split `KEY=VALUE` passthrough entries into `(key, value)` pairs. Parse
+/// validation (non-empty key, an `=` present) happens in clap via
+/// [`validate_ov_config`]; this is the infallible post-parse split, so a bad
+/// entry here would be a validator bug, not user error. The value MAY contain
+/// further `=` (e.g. a device string), so we split on the FIRST `=` only.
+fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
 }
 
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
@@ -2843,6 +2989,71 @@ mod ov_property_tests {
         args.ov_performance_mode = Some(OvPerformanceMode::Latency);
         let props = ov_perf_properties(&args);
         assert_eq!(prop(&props, "PERFORMANCE_HINT"), Some("LATENCY"));
+    }
+
+    #[test]
+    fn ov_config_passthrough_forwards_arbitrary_keys() {
+        let mut args = args_for("CPU");
+        args.ov_config = vec![
+            "ENABLE_MMAP=YES".into(),
+            "KV_CACHE_PRECISION=u8".into(),
+        ];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "ENABLE_MMAP"), Some("YES"));
+        assert_eq!(prop(&props, "KV_CACHE_PRECISION"), Some("u8"));
+    }
+
+    #[test]
+    fn ov_config_value_may_contain_equals() {
+        // Split on the FIRST '=' only, so compound values survive.
+        let mut args = args_for("CPU");
+        args.ov_config = vec!["DEVICE_PROPERTIES=CPU:NUM_STREAMS=4".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(
+            prop(&props, "DEVICE_PROPERTIES"),
+            Some("CPU:NUM_STREAMS=4")
+        );
+    }
+
+    #[test]
+    fn ov_config_overrides_a_typed_flag_for_the_same_key() {
+        // Passthrough is applied last and dedupes keeping the last write, so a
+        // user who sets both wins with the raw value.
+        let mut args = args_for("GPU");
+        args.ov_num_streams = Some(2); // -> NUM_STREAMS=2
+        args.ov_config = vec!["NUM_STREAMS=8".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NUM_STREAMS"), Some("8"));
+        // and only once — the typed entry was removed, not shadowed.
+        assert_eq!(
+            props.iter().filter(|(k, _)| k == "NUM_STREAMS").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ov_config_npu_key_gated_off_on_cpu() {
+        let mut args = args_for("CPU");
+        args.ov_config = vec!["NPUW_LLM_PREFILL_CHUNK_SIZE=512".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPUW_LLM_PREFILL_CHUNK_SIZE"), None);
+    }
+
+    #[test]
+    fn ov_config_npu_key_passes_on_npu_genai() {
+        let mut args = args_for_engine("NPU.0", EngineKind::OvGenai);
+        args.ov_config = vec!["NPU_USE_NPUW=YES".into()];
+        let props = ov_perf_properties(&args);
+        assert_eq!(prop(&props, "NPU_USE_NPUW"), Some("YES"));
+    }
+
+    #[test]
+    fn ov_config_validator_rejects_malformed() {
+        assert!(validate_ov_config("ENABLE_MMAP=YES").is_ok());
+        assert!(validate_ov_config("EMPTY_VALUE_OK=").is_ok());
+        assert!(validate_ov_config("no_equals").is_err());
+        assert!(validate_ov_config("=no_key").is_err());
+        assert!(validate_ov_config("   =x").is_err());
     }
 }
 
