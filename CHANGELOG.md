@@ -333,7 +333,7 @@
 * **api:** Ollama dialect + tool-call plumbing ([9fe99ed](https://github.com/labscommunity/cascadia/commit/9fe99ed3ef092977dc30ccd260a699504153fef2))
 * **api:** OpenAI sampling params + finish_reason + streaming usage ([#14](https://github.com/labscommunity/cascadia/issues/14)) ([58143e6](https://github.com/labscommunity/cascadia/commit/58143e6edeae7c7df4072f2a66b68ca527df582e))
 * **api:** OpenAI sampling params, finish_reason, streaming usage ([#14](https://github.com/labscommunity/cascadia/issues/14)) ([21c15f2](https://github.com/labscommunity/cascadia/commit/21c15f2e419ae787e055a442a09d80a49b65ff32))
-* **api:** OpenAI tool calling (function calling) [cascadia-enterprise[#44](https://github.com/labscommunity/cascadia/issues/44)] ([780cbf4](https://github.com/labscommunity/cascadia/commit/780cbf43ea9a90853066eb1a7026e5855da9d2d1))
+* **api:** OpenAI tool calling (function calling) ([#44](https://github.com/labscommunity/cascadia/issues/44)) ([780cbf4](https://github.com/labscommunity/cascadia/commit/780cbf43ea9a90853066eb1a7026e5855da9d2d1))
 * **api:** parse_tool_calls for Llama + Qwen tool output ([#44](https://github.com/labscommunity/cascadia/issues/44)) ([79ad3bc](https://github.com/labscommunity/cascadia/commit/79ad3bcbf38226fe4c85939ec01b14d0b3fad564))
 * **api:** render chat_template from tokenizer_config.json (Jinja2) ([339091a](https://github.com/labscommunity/cascadia/commit/339091a891ee839d02b94198002e0da6e6c3b448))
 * **api:** renderer forwards tools + message tool fields ([#44](https://github.com/labscommunity/cascadia/issues/44)) ([150748e](https://github.com/labscommunity/cascadia/commit/150748e5e963969fa8dc52695f58cf6c0f7e9cc2))
