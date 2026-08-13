@@ -128,3 +128,12 @@ jobs:
           -p cascadia-engine-openvino
           -p cascadia-engine-sparse-moe
           --features cascadia-engine-openvino/kv_coord,cascadia-engine-sparse-moe/kv_coord
+
+      - name: Check (workspace, --features kv_coord)
+        # The job above compiles kv_coord for TWO packages only, so a kv_coord-gated
+        # break anywhere else in the workspace is invisible to CI. Cheap `check`
+        # rather than `test` — this exists to catch compile breakage, and the tests
+        # that matter for kv_coord already run above.
+        run: >
+          cargo check --workspace --all-targets
+          --features cascadia-engine-openvino/kv_coord,cascadia-engine-sparse-moe/kv_coord
