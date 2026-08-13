@@ -1520,7 +1520,7 @@ impl OvDistSpecEngine {
         // Issue-34: warm-resume a cached strict prefix (restores draft+target+chain, all-or-nothing)
         // and feed only the suffix; else cold-reset + feed the full prompt. 0 on the default build.
         #[cfg(feature = "kv_coord")]
-        let warm_len = self.kv_try_warm_resume(prompt_ids);
+        let warm_len = self.kv_try_warm_resume(&task.tenant, prompt_ids);
         #[cfg(not(feature = "kv_coord"))]
         let warm_len = 0usize;
         if warm_len == 0 {
@@ -2631,7 +2631,7 @@ impl OvDistSpecEngine {
     /// Try to warm-resume: restore draft + target-stage0 + the whole target chain (all-or-nothing)
     /// for a cached strict prefix. Returns the warm prefix length (0 ⇒ cold). On partial restore,
     /// resets everything cold (a partial restore would corrupt spec-decode).
-    fn kv_try_warm_resume(&mut self, prompt_ids: &[i64]) -> usize {
+    fn kv_try_warm_resume(&mut self, tenant: &str, prompt_ids: &[i64]) -> usize {
         // Spec-decode leaves the KV padded with proposed-then-rejected tokens (rig: draft 148 / target
         // 168 deep for a 98-token accepted prefix). `kv_capture` now compacts every rank's blob with its
         // host valid_mask (shipped down the CAPTURE chain), so stored blobs are dense + self-describing —
@@ -2639,7 +2639,7 @@ impl OvDistSpecEngine {
         // target (the target holds the last bonus token the draft hasn't fed yet); the resume below
         // catches the draft up so both align before `start_task` feeds one shared suffix.
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-        let Some((blob, len, plane_pulled)) = self.kv.take_warm(&prompt_i32) else {
+        let Some((blob, len, plane_pulled)) = self.kv.take_warm(tenant, &prompt_i32) else {
             return 0;
         };
         let Some(parts) = crate::kv_coordination::unframe_blobs(&blob) else {

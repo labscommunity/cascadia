@@ -2098,7 +2098,9 @@ impl OvRuntimeEngine {
             #[cfg(feature = "kv_coord")]
             if self.static_kv.is_none() {
                 let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) = self.kv.take_warm(&prompt_i32) {
+                if let Some((blob, len, plane_pulled)) =
+                    self.kv.take_warm(&task.tenant, &prompt_i32)
+                {
                     match self.runtime.set_state_blob(&blob) {
                         Ok(()) => {
                             // Multi-stage: RESTORE the whole downstream chain too (all-or-nothing).

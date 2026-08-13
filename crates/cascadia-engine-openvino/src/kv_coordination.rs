@@ -737,13 +737,25 @@ impl OvKvCache {
     /// model needs a forward pass to produce the next token, and re-feeding tokens already in the
     /// restored state would double-count. Returns `(blob, prefix_len, plane_pulled)`, removed on
     /// take; `plane_pulled` scopes the chain verdict — see [`chain_verdict`].
-    pub(crate) fn take_warm(&mut self, prompt: &[i32]) -> Option<(Vec<u8>, usize, bool)> {
+    /// H.1b: `partner` namespaces the READER as `capture` already namespaces the writer, so one
+    /// tenant can never resume off another's prefix. It also removes a shadowing hazard §12.10.0
+    /// calls out: with de-dup keyed on `(partner, tokens)` one token sequence can hold both a
+    /// `LOCAL_NS` local capture and a real-partner plane pull, and an unfiltered `max_by_key`
+    /// returns the LAST maximum — the older `LOCAL_NS` entry — masking the plane entry's
+    /// `plane_pulled`, which loses the plane override in `chain_verdict` and votes a plane-armed
+    /// turn cold. Inert while everything is `LOCAL_NS`; load-bearing the moment it is not.
+    pub(crate) fn take_warm(
+        &mut self,
+        partner: &str,
+        prompt: &[i32],
+    ) -> Option<(Vec<u8>, usize, bool)> {
         let idx = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                !e.tokens.is_empty()
+                e.partner == partner
+                    && !e.tokens.is_empty()
                     && e.tokens.len() < prompt.len()
                     && prompt.starts_with(&e.tokens)
             })
@@ -1129,9 +1141,12 @@ mod tests {
     fn take_warm_removes_and_returns_len() {
         let mut c = OvKvCache::default();
         c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xC, 0xD]);
-        let (blob, len, _) = c.take_warm(&[1, 2, 3, 4, 5]).unwrap();
+        let (blob, len, _) = c.take_warm(LOCAL_NS, &[1, 2, 3, 4, 5]).unwrap();
         assert_eq!((blob, len), (vec![0xC, 0xD], 3));
-        assert!(c.take_warm(&[1, 2, 3, 4, 5]).is_none(), "consumed on take");
+        assert!(
+            c.take_warm(LOCAL_NS, &[1, 2, 3, 4, 5]).is_none(),
+            "consumed on take"
+        );
     }
 
     #[test]
@@ -1306,7 +1321,10 @@ mod tests {
         let mut c = OvKvCache::default();
         c.insert_both(LOCAL_NS, vec![1, 2, 3], vec![0xAB]);
         // head path: take_warm by prompt prefix (strict)
-        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
+        assert_eq!(
+            c.take_warm(LOCAL_NS, &[1, 2, 3, 4]),
+            Some((vec![0xAB], 3, true))
+        );
         // worker path: take_capture by epoch
         let epoch = synth_epoch(&[1, 2, 3]);
         assert_eq!(c.take_capture(epoch), Some((vec![1, 2, 3], vec![0xAB])));
@@ -1609,9 +1627,15 @@ mod tests {
     fn take_warm_reports_entry_provenance() {
         let mut c = OvKvCache::default();
         c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xC]);
-        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xC], 3, false)));
+        assert_eq!(
+            c.take_warm(LOCAL_NS, &[1, 2, 3, 4]),
+            Some((vec![0xC], 3, false))
+        );
         c.insert_both(LOCAL_NS, vec![1, 2, 3], vec![0xAB]);
-        assert_eq!(c.take_warm(&[1, 2, 3, 4]), Some((vec![0xAB], 3, true)));
+        assert_eq!(
+            c.take_warm(LOCAL_NS, &[1, 2, 3, 4]),
+            Some((vec![0xAB], 3, true))
+        );
     }
 
     /// LRU pressure must fail safe: with the plane entry evicted, the local entry that still matches
@@ -1628,7 +1652,10 @@ mod tests {
             c.entries.iter().all(|e| !e.plane_pulled),
             "the plane entry fell off the tail"
         );
-        assert_eq!(c.take_warm(&[0, 1, 2]), Some((vec![0x01], 1, false)));
+        assert_eq!(
+            c.take_warm(LOCAL_NS, &[0, 1, 2]),
+            Some((vec![0x01], 1, false))
+        );
     }
 
     #[test]
@@ -1676,6 +1703,44 @@ mod tests {
         // and probes `export`/`serve` directly, never touching `lookup`.
         assert_eq!(c.serve("tenant-b", epoch, len), None);
         assert!(c.serve("tenant-a", epoch, len).is_some());
+    }
+
+    /// H.1b reader half: `take_warm` resumes only from the caller's OWN namespace.
+    ///
+    /// H.1a namespaced `lookup`/`serve` (the remote surface) but deliberately left `take_warm`
+    /// unfiltered, so one tenant could locally warm-resume off another's captured prefix. It also
+    /// removes the §12.10.0 shadowing hazard: one token sequence can hold both a `LOCAL_NS` local
+    /// capture and a real-partner plane pull, and an unfiltered `max_by_key` returns the LAST
+    /// maximum — the older `LOCAL_NS` entry — masking the plane entry's `plane_pulled` and voting a
+    /// plane-armed turn cold.
+    #[test]
+    fn take_warm_is_confined_to_the_callers_namespace() {
+        let mut c = OvKvCache::default();
+        c.capture("tenant-a", vec![11, 22, 33], vec![9u8; 16]);
+        // Another tenant sends the very same tokens: no resume, and the entry is NOT consumed.
+        assert_eq!(c.take_warm("tenant-b", &[11, 22, 33, 44]), None);
+        // The owner still resumes at full prefix length — proving the miss above was the namespace
+        // filter and not an unrelated eviction.
+        assert_eq!(
+            c.take_warm("tenant-a", &[11, 22, 33, 44])
+                .map(|(_, l, _)| l),
+            Some(3)
+        );
+    }
+
+    /// The shadowing case §12.10.0 calls out, pinned: a `LOCAL_NS` local capture must not mask a
+    /// real-partner plane pull over the same tokens. Each namespace sees only its own entry, so the
+    /// plane entry's `plane_pulled = true` survives to `chain_verdict`.
+    #[test]
+    fn a_local_capture_does_not_shadow_a_plane_pull_in_another_namespace() {
+        let mut c = OvKvCache::default();
+        c.capture(LOCAL_NS, vec![1, 2, 3], vec![0xAA]); // local, plane_pulled = false
+        c.insert_both("tenant-a", vec![1, 2, 3], vec![0xBB]); // plane pull, plane_pulled = true
+        let (blob, len, plane_pulled) = c.take_warm("tenant-a", &[1, 2, 3, 4]).unwrap();
+        assert_eq!((blob, len, plane_pulled), (vec![0xBB], 3, true));
+        // ...and the local namespace still gets its own, unmasked.
+        let (blob, _, plane_pulled) = c.take_warm(LOCAL_NS, &[1, 2, 3, 4]).unwrap();
+        assert_eq!((blob, plane_pulled), (vec![0xAA], false));
     }
 
     /// H.1b hard gate (design §12.10.0a): a pulled entry is keyed by the partner the PULLER

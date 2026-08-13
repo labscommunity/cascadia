@@ -1185,7 +1185,7 @@ impl Qwen36Engine {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                    match self.kv.take_warm(&prompt_i32) {
+                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
                         Some((blob, len, plane_pulled)) => {
                             let kv_epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                             let local_ok = self.restore_local_stages(&blob);
@@ -1800,7 +1800,7 @@ impl Qwen36Engine {
                 #[cfg(feature = "kv_coord")]
                 {
                     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&u| u as i32).collect();
-                    match self.kv.take_warm(&prompt_i32) {
+                    match self.kv.take_warm(&task.tenant, &prompt_i32) {
                         Some((blob, len, plane_pulled)) if self.restore_local_stages(&blob) => {
                             // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
                             // See the sibling site: kv_seq_from_framed_blob now skips conv/ssm and returns
