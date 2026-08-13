@@ -294,21 +294,23 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         self.model_fp
     }
 
-    fn lookup(&self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+    fn lookup(&self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !g.prefix.enabled() {
             return None;
         }
         let fp = g.fp.clone();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let hit = g.prefix.lookup(&prompt, &fp);
+        // Namespaced (issue-34 H.1a): a cross-tenant NEGOTIATE reads as an empty cache, not a
+        // truncated length — see `OvMoeKvPrefixCache::lookup_ns`.
+        let hit = g.prefix.lookup_ns(partner, &prompt, &fp);
         tracing::debug!(target: "cascadia::kv", event = "ovmoe_holder_negotiate",
             query_len = prompt.len(), hit = hit.is_some(), "holder NEGOTIATE lookup");
         let (snap, _) = hit?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        g.offers.stash(epoch, prefix, snap);
+        g.offers.stash(partner, epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -319,7 +321,7 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (prefix, snap) = if let Some(off) = g.offers.take(expected_epoch) {
+        let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
             off
         } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -342,6 +344,7 @@ impl KvSnapshotHolder for OvMoeKvHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_prefix_cache::LOCAL_NS;
 
     fn snap(past: usize, fill: f32) -> OvMoeKvSnapshot {
         OvMoeKvSnapshot {
@@ -420,21 +423,24 @@ mod tests {
     #[test]
     fn holder_lookup_then_export_roundtrips() {
         let mut st = OvHolderState::new(4, fp());
-        // Source captured prefix [1,2,3] (its KV depth 3) into the holder's prefix mirror.
+        // Source captured prefix [1,2,3] (its KV depth 3) into the holder's prefix mirror. `insert`
+        // (unqualified) tags LOCAL_NS, so the NEGOTIATE below queries under the same namespace.
         st.prefix.insert(vec![1i64, 2, 3], &fp(), snap(3, 2.0));
         let holder = OvMoeKvHolder {
             cache: Arc::new(Mutex::new(st)),
             model_fp: fp().digest(),
         };
         // Consumer NEGOTIATEs a longer prompt sharing the prefix.
-        let (epoch, len) = holder.lookup("peer", &[1, 2, 3, 4]).expect("negotiate hit");
+        let (epoch, len) = holder
+            .lookup(LOCAL_NS, &[1, 2, 3, 4])
+            .expect("negotiate hit");
         assert_eq!(len, 3);
         // GET the offer back.
-        let (m, payloads) = holder.export("peer", epoch, len).expect("export");
+        let (m, payloads) = holder.export(LOCAL_NS, epoch, len).expect("export");
         let snap = ov_wire_to_snapshot(&m, &payloads).expect("decode");
         assert_eq!(snap.past_seq_len, 3);
         // Offer is single-use.
-        assert!(holder.export("peer", epoch, len).is_none());
+        assert!(holder.export(LOCAL_NS, epoch, len).is_none());
     }
 
     /// The OvMoe holder's NEGOTIATE path is bounded too, and the newest offer still has its GET.
@@ -451,7 +457,7 @@ mod tests {
         };
         let mut last = None;
         for i in 0..n {
-            last = holder.lookup("peer", &[i, 0]);
+            last = holder.lookup(LOCAL_NS, &[i, 0]);
         }
         {
             let g = holder.cache.lock().unwrap();
@@ -459,7 +465,33 @@ mod tests {
             assert!(g.offers.bytes() <= KV_MAX_OFFER_BYTES);
         }
         let (epoch, len) = last.expect("negotiate hit");
-        assert!(holder.export("peer", epoch, len).is_some());
+        assert!(holder.export(LOCAL_NS, epoch, len).is_some());
+    }
+
+    /// Issue-34 H.1a: `OvMoeKvHolder::lookup`/`export` confine a cross-tenant probe to `None`, never
+    /// a truncated length or a servable epoch.
+    #[test]
+    fn holder_lookup_and_export_are_confined_to_the_callers_namespace() {
+        let mut st = OvHolderState::new(4, fp());
+        st.prefix
+            .insert_pulled("tenant-a", vec![11i64, 22, 33], &fp(), snap(3, 2.0));
+        let holder = OvMoeKvHolder {
+            cache: Arc::new(Mutex::new(st)),
+            model_fp: fp().digest(),
+        };
+        for extra in [44, 55, 66] {
+            assert_eq!(
+                holder.lookup("tenant-b", &[11, 22, 33, extra]),
+                None,
+                "cross-tenant probe must miss, extra={extra}"
+            );
+        }
+        let (epoch, len) = holder
+            .lookup("tenant-a", &[11, 22, 33, 44])
+            .expect("owner negotiate hit");
+        assert_eq!(len, 3);
+        assert_eq!(holder.export("tenant-b", epoch, len), None);
+        assert!(holder.export("tenant-a", epoch, len).is_some());
     }
 
     fn ov_slot(model_fp: u64, past: usize) -> cascadia_engine::kv_handoff::KvHandoffSlot {

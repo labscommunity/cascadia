@@ -9,9 +9,16 @@
 //! - **GET has no tokens.** A `lookup` stashes `(prefix_tokens, snapshot)` under the epoch so the
 //!   paired `export` can rebuild the `Manifest.token_ids` the consumer re-compares.
 //!
-//! **Known gap (DiD, deferred):** the `KvPrefixCache` is content-keyed, not partner-keyed — `partner`
-//! is stamped on the exported `Manifest` but does not namespace the lookup. The content-key + the
-//! no-tenant-tokens invariant are the load-bearing controls (§13); partner-keying is defense-in-depth.
+//! **Issue-34 H.1a tenant namespacing:** `KvPrefixCache`/`OvMoeKvPrefixCache` entries carry a
+//! `partner` tag (set by [`crate::kv_prefix_cache::KvPrefixCache::insert_pulled`] from
+//! `manifest.partner`, or `LOCAL_NS` for a purely local capture). The wire-facing paths — this
+//! trait's `lookup`/`export` and `KvSnapshotHolder::lookup`/`export` — use the namespaced
+//! `lookup_ns`/`(partner, epoch)`-keyed [`KvOfferStash`] so a cross-tenant NEGOTIATE or GET reads as
+//! an empty cache, never a truncated length. The LOCAL resume path (`KvPrefixCache::lookup`, used by
+//! `generate_with_cache` and this module's own local warm-resume checks) deliberately stays
+//! unconfined — cross-tenant KV *reuse* on that path never crosses the wire and is an H.1 §5
+//! non-goal. `kv_capture`/`captures` (the multi-stage worker stash) is NOT namespaced (H.1a residual):
+//! the CAPTURE frame carries no tenant, so a worker rank has none to tag with.
 //! **Sharded serve:** under `kv_coord` a `total>1` engine gets the configured cache size and the
 //! head seeds it after a chain-wide `CAPTURE` (engine.rs), so a sharded holder does serve. WITHOUT
 //! the feature the cache is capacity-0 and lookup/insert degrade to None/no-op — the "sharded gap"
@@ -40,12 +47,14 @@ pub(crate) const KV_MAX_OFFER_BYTES: usize = if cfg!(test) { 4 << 20 } else { 25
 /// Floor between eviction log lines.
 const EVICT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Bounded NEGOTIATE→GET offer stash: `epoch → (prefix tokens, snapshot)`, held only until the paired
-/// GET. Generic over the snapshot type, so the K2.6 and OvMoe planes share it without a sizing trait.
+/// Bounded NEGOTIATE→GET offer stash: `(partner, epoch) → (prefix tokens, snapshot)`, held only until
+/// the paired GET. Generic over the snapshot type, so the K2.6 and OvMoe planes share it without a
+/// sizing trait. Partner-keyed (issue-34 H.1a): the epoch is a pure function of the tokens, so an
+/// epoch-only key let a prober who guessed a prefix collect another tenant's offer straight from GET.
 pub(crate) struct KvOfferStash<S> {
-    offers: std::collections::HashMap<u64, (Vec<i32>, S, usize)>,
-    /// Stashed epochs in insertion order, oldest first.
-    order: std::collections::VecDeque<u64>,
+    offers: std::collections::HashMap<(String, u64), (Vec<i32>, S, usize)>,
+    /// Stashed `(partner, epoch)` keys in insertion order, oldest first.
+    order: std::collections::VecDeque<(String, u64)>,
     bytes: usize,
     max_offers: usize,
     max_bytes: usize,
@@ -75,10 +84,10 @@ impl<S> KvOfferStash<S> {
     }
 
     /// Stash an offer for its paired GET, evicting until it fits both bounds.
-    pub(crate) fn stash(&mut self, epoch: u64, tokens: Vec<i32>, snapshot: S) {
+    pub(crate) fn stash(&mut self, partner: &str, epoch: u64, tokens: Vec<i32>, snapshot: S) {
         let bytes = (self.sizer)(&snapshot);
         // A re-NEGOTIATE of the same prefix replaces its offer instead of double-counting its bytes.
-        let _ = self.take(epoch);
+        let _ = self.take(partner, epoch);
         // Loops on `order`, not the map: a desync must not spin here while the caller holds a lock.
         // Stops at empty so an offer over the whole budget is stashed alone, not evicted to death.
         while !self.order.is_empty()
@@ -87,18 +96,19 @@ impl<S> KvOfferStash<S> {
             self.evict_oldest();
         }
         self.bytes += bytes;
-        self.order.push_back(epoch);
-        self.offers.insert(epoch, (tokens, snapshot, bytes));
+        let key = (partner.to_string(), epoch);
+        self.order.push_back(key.clone());
+        self.offers.insert(key, (tokens, snapshot, bytes));
         debug_assert_eq!(self.order.len(), self.offers.len());
     }
 
     /// Oldest first: arbitrary `HashMap` order can drop the offer whose paired GET is in flight and
     /// keep a stale one, turning a warm resume cold for no gain.
     fn evict_oldest(&mut self) {
-        let Some(epoch) = self.order.pop_front() else {
+        let Some(key) = self.order.pop_front() else {
             return;
         };
-        let Some((_, _, bytes)) = self.offers.remove(&epoch) else {
+        let Some((_, _, bytes)) = self.offers.remove(&key) else {
             return;
         };
         self.bytes = self.bytes.saturating_sub(bytes);
@@ -110,15 +120,16 @@ impl<S> KvOfferStash<S> {
         {
             self.last_log = Some(now);
             tracing::info!(target: "cascadia::kv", event = "kv_offer_evicted_unserved",
-                epoch, bytes, evicted_total = self.evicted, n_offers = self.offers.len(),
+                epoch = key.1, bytes, evicted_total = self.evicted, n_offers = self.offers.len(),
                 held = self.bytes);
         }
     }
 
     /// Remove an offer, keeping `order` and `bytes` in step.
-    pub(crate) fn take(&mut self, epoch: u64) -> Option<(Vec<i32>, S)> {
-        let (tokens, snapshot, bytes) = self.offers.remove(&epoch)?;
-        self.order.retain(|&e| e != epoch);
+    pub(crate) fn take(&mut self, partner: &str, epoch: u64) -> Option<(Vec<i32>, S)> {
+        let key = (partner.to_string(), epoch);
+        let (tokens, snapshot, bytes) = self.offers.remove(&key)?;
+        self.order.retain(|k| k != &key);
         self.bytes = self.bytes.saturating_sub(bytes);
         Some((tokens, snapshot))
     }
@@ -144,8 +155,8 @@ impl<S> KvOfferStash<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn contains(&self, epoch: u64) -> bool {
-        self.offers.contains_key(&epoch)
+    pub(crate) fn contains(&self, partner: &str, epoch: u64) -> bool {
+        self.offers.contains_key(&(partner.to_string(), epoch))
     }
 }
 
@@ -422,17 +433,19 @@ impl KvCoordination for SparseMoEEngine {
         Some(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
 
-    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         if !self.kv_prefix_cache.enabled() {
             return None; // capacity-0 (no kv_coord, or size 0) — nothing to offer
         }
         let fp = self.runner.fingerprint();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let (snap, _) = self.kv_prefix_cache.lookup(&prompt, &fp)?;
+        // Namespaced (issue-34 H.1a): a cross-tenant NEGOTIATE reads as an empty cache, not a
+        // truncated length — see `KvPrefixCache::lookup_ns`.
+        let (snap, _) = self.kv_prefix_cache.lookup_ns(partner, &prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        self.kv_offers.stash(epoch, prefix, snap);
+        self.kv_offers.stash(partner, epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -448,7 +461,7 @@ impl KvCoordination for SparseMoEEngine {
         //  - `kv_offers`: the head/single-stage NEGOTIATE→GET correlation (short-lived, single-use).
         //  - `kv_capture`: Task 1.3 multi-stage per-rank store (persistent; a worker has no NEGOTIATE,
         //    so its slice is stashed at CAPTURE time and may serve repeat/later GETs — clone, no remove).
-        let (prefix, snap) = if let Some(off) = self.kv_offers.take(expected_epoch) {
+        let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
         } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -495,13 +508,15 @@ impl KvCoordination for SparseMoEEngine {
         }
         let fp = self.runner.fingerprint();
         let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
-        // Mirror into the holder cache so a busy engine still serves this prefix lock-free.
+        // Mirror into the holder cache so a busy engine still serves this prefix lock-free. Tagged
+        // with the manifest's partner (issue-34 H.1a) — the tenant this pull was served to.
         self.kv_share
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prefix
-            .insert_pulled(prefix.clone(), &fp, snap.clone());
-        self.kv_prefix_cache.insert_pulled(prefix, &fp, snap);
+            .insert_pulled(&manifest.partner.0, prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache
+            .insert_pulled(&manifest.partner.0, prefix, &fp, snap);
         Ok(())
     }
 
@@ -573,7 +588,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         self.model_fp
     }
 
-    fn lookup(&self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+    fn lookup(&self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         // Replicates `KvCoordination::lookup` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if !g.prefix.enabled() {
@@ -583,11 +598,12 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         // is read — a simultaneous field split isn't possible through the mutex guard's Deref.
         let fp = g.fp.clone();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let (snap, _) = g.prefix.lookup(&prompt, &fp)?;
+        // Namespaced (issue-34 H.1a) — see `KvCoordination::lookup` above.
+        let (snap, _) = g.prefix.lookup_ns(partner, &prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = synth_epoch(&prefix);
-        g.offers.stash(epoch, prefix, snap);
+        g.offers.stash(partner, epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -599,7 +615,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         // Replicates `KvCoordination::export` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (prefix, snap) = if let Some(off) = g.offers.take(expected_epoch) {
+        let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
             off
         } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -622,6 +638,7 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kv_prefix_cache::LOCAL_NS;
     use cascadia_engine::KvSnapshotHolder;
     use cascadia_kv_wire::KvSnapshotCodec;
 
@@ -692,9 +709,12 @@ mod tests {
         }
     }
 
-    /// One NEGOTIATE's worth of stashing: epoch `e`, an offer of `bytes`.
+    /// One NEGOTIATE's worth of stashing: epoch `e`, an offer of `bytes`. Fixed partner — these tests
+    /// cover eviction/byte accounting, not namespace confinement (see `lookup_ns` tests for that).
+    const TEST_PARTNER: &str = "peer";
+
     fn offer(s: &mut KvOfferStash<KvSnapshot>, e: u64, bytes: usize) {
-        s.stash(e, vec![e as i32], snap_of(bytes));
+        s.stash(TEST_PARTNER, e, vec![e as i32], snap_of(bytes));
     }
 
     fn stash() -> KvOfferStash<KvSnapshot> {
@@ -726,8 +746,11 @@ mod tests {
         for e in 0..n {
             offer(&mut s, e, 4);
         }
-        assert!((0..8).all(|e| !s.contains(e)), "8 oldest offers go first");
-        assert!((8..n).all(|e| s.contains(e)));
+        assert!(
+            (0..8).all(|e| !s.contains(TEST_PARTNER, e)),
+            "8 oldest offers go first"
+        );
+        assert!((8..n).all(|e| s.contains(TEST_PARTNER, e)));
         assert_eq!(s.evicted(), 8, "every unserved eviction is counted");
     }
 
@@ -738,7 +761,9 @@ mod tests {
         for e in 0..n {
             offer(&mut s, e, 4);
         }
-        let (tokens, snap) = s.take(n - 1).expect("newest offer still stashed");
+        let (tokens, snap) = s
+            .take(TEST_PARTNER, n - 1)
+            .expect("newest offer still stashed");
         assert_eq!(tokens, vec![(n - 1) as i32]);
         assert_eq!(snap.approx_bytes(), 4);
     }
@@ -751,7 +776,10 @@ mod tests {
         offer(&mut s, 1, 8);
         offer(&mut s, 2, KV_MAX_OFFER_BYTES + 4);
         assert_eq!(s.len(), 1);
-        assert!(s.take(2).is_some(), "the over-budget offer is servable");
+        assert!(
+            s.take(TEST_PARTNER, 2).is_some(),
+            "the over-budget offer is servable"
+        );
         assert_eq!(s.bytes(), 0);
     }
 
@@ -764,7 +792,7 @@ mod tests {
             offer(&mut s, e, 4);
         }
         for e in 0..n {
-            let _ = s.take(e);
+            let _ = s.take(TEST_PARTNER, e);
         }
         assert_eq!((s.len(), s.order_len(), s.bytes()), (0, 0, 0));
     }
@@ -777,8 +805,22 @@ mod tests {
         offer(&mut s, 0xF0, 64);
         offer(&mut s, 0xF0, 64);
         assert_eq!((s.len(), s.order_len(), s.bytes()), (1, 1, 64));
-        assert!(s.take(0xF0).is_some());
+        assert!(s.take(TEST_PARTNER, 0xF0).is_some());
         assert_eq!(s.bytes(), 0);
+    }
+
+    /// Offers are keyed by `(partner, epoch)` (issue-34 H.1a): the epoch alone is a pure function of
+    /// the negotiated tokens, so an epoch-only key would let a prober who guessed a prefix take
+    /// another tenant's offer straight from GET, bypassing `lookup_ns` entirely.
+    #[test]
+    fn offers_are_confined_to_the_negotiating_partner() {
+        let mut s = stash();
+        s.stash("tenant-a", 0xE0, vec![1, 2, 3], snap_of(4));
+        assert!(
+            s.take("tenant-b", 0xE0).is_none(),
+            "wrong partner, same epoch"
+        );
+        assert!(s.take("tenant-a", 0xE0).is_some());
     }
 
     fn fp() -> ModelFingerprint {
@@ -805,6 +847,8 @@ mod tests {
         let n = KV_MAX_OFFERS as i32 + 8;
         let mut st = SparseHolderState::new(n as usize, fp());
         for i in 0..n {
+            // `insert` (unqualified) tags LOCAL_NS, so the NEGOTIATE below must query under the same
+            // namespace to hit — this test covers offer-flood bounding, not namespace confinement.
             st.prefix.insert(vec![i64::from(i)], &fp(), snap_of(4));
         }
         let holder = SparseMoeKvHolder {
@@ -813,7 +857,7 @@ mod tests {
         };
         let mut last = None;
         for i in 0..n {
-            last = holder.lookup("peer", &[i, 0]);
+            last = holder.lookup(LOCAL_NS, &[i, 0]);
         }
         {
             let g = holder.cache.lock().unwrap();
@@ -821,7 +865,39 @@ mod tests {
             assert!(g.offers.bytes() <= KV_MAX_OFFER_BYTES);
         }
         let (epoch, len) = last.expect("negotiate hit");
-        assert!(holder.export("peer", epoch, len).is_some());
+        assert!(holder.export(LOCAL_NS, epoch, len).is_some());
+    }
+
+    /// Issue-34 H.1a: `SparseMoeKvHolder::lookup`/`export` — the actual wire-facing oracle surface —
+    /// confine a cross-tenant probe to `None`, never a truncated length or a servable epoch.
+    #[test]
+    fn holder_lookup_and_export_are_confined_to_the_callers_namespace() {
+        let mut st = SparseHolderState::new(4, fp());
+        st.prefix
+            .insert_pulled("tenant-a", vec![11, 22, 33], &fp(), snap());
+        let holder = SparseMoeKvHolder {
+            cache: std::sync::Arc::new(std::sync::Mutex::new(st)),
+            model_fp: fp().digest(),
+        };
+        // The oracle probe shape (H.1 §4): a prober extends a guessed prefix one token at a time and
+        // watches the returned LENGTH grow. Every probe must read as an empty cache — never a
+        // truncated length — regardless of how much of tenant-a's sequence the guess gets right.
+        for extra in [44, 55, 66] {
+            assert_eq!(
+                holder.lookup("tenant-b", &[11, 22, 33, extra]),
+                None,
+                "cross-tenant probe must miss, extra={extra}"
+            );
+        }
+        // The owner still hits, at the full matched length.
+        let (epoch, len) = holder
+            .lookup("tenant-a", &[11, 22, 33, 44])
+            .expect("owner negotiate hit");
+        assert_eq!(len, 3);
+        // The asserted-GET side door: a prober who guesses the prefix computes `synth_epoch` itself
+        // and probes `export` directly, never touching `lookup`.
+        assert_eq!(holder.export("tenant-b", epoch, len), None);
+        assert!(holder.export("tenant-a", epoch, len).is_some());
     }
 
     fn slot_of(prefix: &[i32], snap: &KvSnapshot, model_fp: u64) -> KvHandoffSlot {
