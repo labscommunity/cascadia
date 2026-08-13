@@ -90,3 +90,41 @@ jobs:
         run: |
           cargo clippy -p cascadia-dashboard --features embed-spa --all-targets
           cargo test -p cascadia-dashboard --features embed-spa
+
+  kv-coord:
+    # `kv_coord` is off by default in both engine crates, so the `test` job
+    # above never compiles it — the tenant-namespace confinement tests
+    # (`lookup_is_confined_to_the_callers_namespace` and friends) ran in no
+    # job at all. Dropping the partner filter from a prefix lookup would have
+    # left CI green and silently reopened the cross-tenant prefix-recovery
+    # oracle. Two crates, no e2e binary: ~40 extra tests, seconds of runner.
+    name: cargo test (kv_coord engines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-kv-coord-${{ hashFiles('Cargo.lock') }}
+
+      - name: Test (engines, --features kv_coord)
+        # Per-package `pkg/feature` syntax: a bare `--features kv_coord` is
+        # ambiguous across a multi-package `-p` selection.
+        run: >
+          cargo test
+          -p cascadia-engine-openvino
+          -p cascadia-engine-sparse-moe
+          --features cascadia-engine-openvino/kv_coord,cascadia-engine-sparse-moe/kv_coord
