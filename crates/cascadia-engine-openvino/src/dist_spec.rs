@@ -2619,8 +2619,13 @@ impl OvDistSpecEngine {
         self.kv_share
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .capture(tokens.clone(), blob.clone());
-        self.kv.capture(tokens, blob);
+            .capture(
+                crate::kv_coordination::LOCAL_NS,
+                tokens.clone(),
+                blob.clone(),
+            );
+        self.kv
+            .capture(crate::kv_coordination::LOCAL_NS, tokens, blob);
     }
 
     /// Try to warm-resume: restore draft + target-stage0 + the whole target chain (all-or-nothing)
@@ -2733,8 +2738,8 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
         let enc = self.tokenizer.encode(text, false).ok()?;
         Some(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
-    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
-        self.kv.lookup(token_ids)
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+        self.kv.lookup(partner, token_ids)
     }
     fn export(
         &mut self,
@@ -2743,7 +2748,7 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
         expected_len: u32,
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let fp = self.kv_fingerprint();
-        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
         Some(crate::kv_coordination::blob_to_wire(
             &prefix,
             &blob,
@@ -2758,7 +2763,7 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.insert_both(tokens, blob);
+        self.kv.insert_both(&manifest.partner.0, tokens, blob);
         Ok(())
     }
     // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
@@ -2888,7 +2893,7 @@ impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
         expected_len: u32,
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let fp = self.kv_fingerprint();
-        let (prefix, blob) = self.kv.serve(expected_epoch, expected_len)?;
+        let (prefix, blob) = self.kv.serve(partner, expected_epoch, expected_len)?;
         Some(crate::kv_coordination::blob_to_wire(
             &prefix,
             &blob,
@@ -2903,7 +2908,7 @@ impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.insert_both(tokens, blob);
+        self.kv.insert_both(&manifest.partner.0, tokens, blob);
         Ok(())
     }
     // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
