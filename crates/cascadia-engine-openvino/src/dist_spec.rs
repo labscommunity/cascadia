@@ -67,6 +67,14 @@ pub enum FrameKind {
     Restore = 7,
     #[cfg(feature = "kv_coord")]
     RestoreAck = 8,
+    /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT
+    /// (`capture_body_bytes_masked_v2`). A separate kind, not a wider `Capture` body: `from_u32`
+    /// hard-errors on an unknown kind and the masked codec enforces an exact length, so widening
+    /// in place would break any chain whose ranks run different builds. dist-spec's CAPTURE always
+    /// carries a valid_mask, and mask and tenant are byte-indistinguishable suffixes — the kind is
+    /// the ONLY thing that tells the two bodies apart.
+    #[cfg(feature = "kv_coord")]
+    CaptureV2 = 9,
 }
 
 impl FrameKind {
@@ -83,6 +91,8 @@ impl FrameKind {
             7 => Some(Self::Restore),
             #[cfg(feature = "kv_coord")]
             8 => Some(Self::RestoreAck),
+            #[cfg(feature = "kv_coord")]
+            9 => Some(Self::CaptureV2),
             _ => None,
         }
     }
@@ -633,18 +643,38 @@ impl DistributedMaskedReq {
 
     /// §8 CAPTURE: broadcast `(epoch, tokens, valid_mask)` down the target chain; await the aggregate
     /// ACK. The mask lets each worker compact its own padded KV blob (workers hold no mask of their own).
+    /// A non-empty `tenant` upgrades the frame to `CaptureV2` so each worker — which never sees the
+    /// `GenerationTask` — can tag its own capture with the same namespace.
     pub(crate) fn capture_downstream(
         &mut self,
         epoch: u64,
         tokens: &[i32],
+        tenant: &str,
     ) -> Result<(), EngineError> {
-        let body =
-            crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, self.valid_prefix());
+        let (kind, body) = if tenant.is_empty() {
+            (
+                FrameKind::Capture,
+                crate::kv_coordination::capture_body_bytes_masked(
+                    epoch,
+                    tokens,
+                    self.valid_prefix(),
+                ),
+            )
+        } else {
+            (
+                FrameKind::CaptureV2,
+                crate::kv_coordination::capture_body_bytes_masked_v2(
+                    epoch,
+                    tokens,
+                    self.valid_prefix(),
+                    tenant,
+                ),
+            )
+        };
         let downstream = self.downstream.clone();
         run_async(&self.runtime_handle, async move {
             let mut g = downstream.lock().await;
-            g.send_raw(&(FrameKind::Capture as u32).to_be_bytes())
-                .await?;
+            g.send_raw(&(kind as u32).to_be_bytes()).await?;
             g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
             g.send_raw(&body).await?;
             let kb = g.recv_raw(4).await?;
@@ -1671,7 +1701,9 @@ impl OvDistSpecEngine {
                 .chain(active.out.iter())
                 .map(|&t| t as i32)
                 .collect();
-            self.kv_capture(tokens);
+            // H.1b R2: this turn's namespace, read off THIS task's own state — never off a
+            // plane-asserted value, which describes a pulled entry, not this turn.
+            self.kv_capture(&active.task.tenant, tokens);
         }
         info!(
             task = %active.task.task_id,
@@ -2073,8 +2105,9 @@ impl OvDistSpecWorkerEngine {
                 "worker received LOGITS_RESPONSE".into(),
             )),
             // Issue-34 §8: snapshot this rank's KV under the head epoch, chain downstream, ack up.
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
             #[cfg(feature = "kv_coord")]
-            FrameKind::Capture => {
+            kind @ (FrameKind::Capture | FrameKind::CaptureV2) => {
                 let up = self.upstream.clone();
                 let body = run_async(&self.runtime_handle, async move {
                     let mut g = up.lock().await;
@@ -2083,10 +2116,17 @@ impl OvDistSpecWorkerEngine {
                     g.recv_raw(n).await
                 })
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
-                let (epoch, tokens, valid) =
-                    crate::kv_coordination::parse_capture_body_masked(&body).ok_or_else(|| {
-                        EngineError::Backend("ov-dist-spec: bad CAPTURE body".into())
-                    })?;
+                let (epoch, tokens, valid, tenant) = if kind == FrameKind::CaptureV2 {
+                    crate::kv_coordination::parse_capture_body_masked_v2(&body).ok_or_else(
+                        || EngineError::Backend("ov-dist-spec: bad CAPTURE_V2 body".into()),
+                    )?
+                } else {
+                    let (e, tk, v) = crate::kv_coordination::parse_capture_body_masked(&body)
+                        .ok_or_else(|| {
+                            EngineError::Backend("ov-dist-spec: bad CAPTURE body".into())
+                        })?;
+                    (e, tk, v, crate::kv_coordination::LOCAL_NS.to_string())
+                };
                 // Compact this rank's KV with the driver's mask (shared across the target chain).
                 if let Ok(blob) = self.runtime.get_state_blob() {
                     match crate::kv_coordination::kv_compact_blob(&blob, &valid) {
@@ -2095,14 +2135,20 @@ impl OvDistSpecWorkerEngine {
                             self.kv_share
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .capture_under_epoch(epoch, tokens.clone(), blob.clone());
-                            self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                                .capture_under_epoch_ns(
+                                    &tenant,
+                                    epoch,
+                                    tokens.clone(),
+                                    blob.clone(),
+                                );
+                            self.kv
+                                .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                         }
                         None => warn!("ov-dist-spec worker: KV compaction failed; skip capture"),
                     }
                 }
                 if !self.is_last {
-                    let _ = self.kv_chain_capture(epoch, &tokens, &valid);
+                    let _ = self.kv_chain_capture(epoch, &tokens, &valid, &tenant);
                 }
                 self.kv_ack_upstream(FrameKind::CaptureAck as u32, &[])
             }
@@ -2596,7 +2642,7 @@ impl OvDistSpecEngine {
     }
     /// Snapshot draft + target stage0 into one bundle keyed by `tokens`, and broadcast CAPTURE down
     /// the target chain so every worker rank stashes its slice. Best-effort.
-    fn kv_capture(&mut self, tokens: Vec<i32>) {
+    fn kv_capture(&mut self, tenant: &str, tokens: Vec<i32>) {
         let (Some(d), Some(s)) = (self.draft.kv_blob(), self.target.stage0_blob()) else {
             return;
         };
@@ -2612,20 +2658,15 @@ impl OvDistSpecEngine {
         };
         let blob = crate::kv_coordination::frame_blobs(&[d, s]);
         let epoch = crate::kv_coordination::synth_epoch(&tokens);
-        if let Err(e) = self.target.capture_downstream(epoch, &tokens) {
+        if let Err(e) = self.target.capture_downstream(epoch, &tokens, tenant) {
             warn!(error = %e, "ov-dist-spec: CAPTURE broadcast failed (best-effort)");
         }
         // Mirror into the lock-free holder cache so a busy driver serves this turn's KV unblocked.
         self.kv_share
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .capture(
-                crate::kv_coordination::LOCAL_NS,
-                tokens.clone(),
-                blob.clone(),
-            );
-        self.kv
-            .capture(crate::kv_coordination::LOCAL_NS, tokens, blob);
+            .capture(tenant, tokens.clone(), blob.clone());
+        self.kv.capture(tenant, tokens, blob);
     }
 
     /// Try to warm-resume: restore draft + target-stage0 + the whole target chain (all-or-nothing)
@@ -2820,20 +2861,32 @@ impl OvDistSpecWorkerEngine {
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
+    /// Relay CAPTURE on. `tenant` is the one the frame carried (empty on a v1 frame) — a worker has
+    /// no other source for it, so the relayed frame keeps whatever shape it arrived in.
     fn kv_chain_capture(
         &mut self,
         epoch: u64,
         tokens: &[i32],
         valid: &[i64],
+        tenant: &str,
     ) -> Result<(), EngineError> {
         let Some(down) = self.downstream.clone() else {
             return Ok(());
         };
-        let body = crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, valid);
+        let (kind, body) = if tenant.is_empty() {
+            (
+                FrameKind::Capture,
+                crate::kv_coordination::capture_body_bytes_masked(epoch, tokens, valid),
+            )
+        } else {
+            (
+                FrameKind::CaptureV2,
+                crate::kv_coordination::capture_body_bytes_masked_v2(epoch, tokens, valid, tenant),
+            )
+        };
         run_async(&self.runtime_handle, async move {
             let mut g = down.lock().await;
-            g.send_raw(&(FrameKind::Capture as u32).to_be_bytes())
-                .await?;
+            g.send_raw(&(kind as u32).to_be_bytes()).await?;
             g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
             g.send_raw(&body).await?;
             let kb = g.recv_raw(4).await?;

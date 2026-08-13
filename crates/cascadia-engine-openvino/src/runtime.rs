@@ -3057,6 +3057,9 @@ impl OvRuntimeEngine {
             {
                 let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
                 full.extend_from_slice(&active.generated);
+                // H.1b R2: the namespace this turn belongs to, read off THIS task's own state —
+                // never off a plane-asserted value, which describes a pulled entry, not this turn.
+                let tenant = active.task.tenant.clone();
                 match self.runtime.get_state_blob() {
                     Ok(blob) => {
                         // Multi-stage head: broadcast CAPTURE so every downstream rank snapshots its
@@ -3067,7 +3070,7 @@ impl OvRuntimeEngine {
                             && !self.spec.is_last_stage
                         {
                             let epoch = crate::kv_coordination::synth_epoch(&full);
-                            if let Err(e) = self.send_capture_downstream(epoch, &full) {
+                            if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
                                 warn!(error = %e, "ov-runtime: CAPTURE broadcast failed (best-effort)");
                             }
                         }
@@ -3076,9 +3079,8 @@ impl OvRuntimeEngine {
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(crate::kv_coordination::LOCAL_NS, full.clone(), blob.clone());
-                        self.kv
-                            .capture(crate::kv_coordination::LOCAL_NS, full, blob);
+                            .capture(&tenant, full.clone(), blob.clone());
+                        self.kv.capture(&tenant, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "get_state_blob skipped (no KV capture)"),
                 }
@@ -4114,6 +4116,13 @@ const OPCODE_RESTORE_ACK: u8 = 4;
 const OPCODE_ABORT: u8 = 5;
 #[cfg(feature = "kv_coord")]
 const OPCODE_ABORT_ACK: u8 = 6;
+/// H.1b (R2): CAPTURE whose body also carries the TENANT the turn belongs to
+/// (`capture_body_bytes_v2`). A separate opcode, not a wider `OPCODE_CAPTURE` body: the v1 codec
+/// enforces an exact length and hard-errors `"bad CAPTURE body"` mid-chain on a mismatch, so
+/// widening it in place would break any chain whose ranks run different builds. Emitted only for a
+/// non-empty tenant, so a chain that never names one stays byte-for-byte on the v1 frame.
+#[cfg(feature = "kv_coord")]
+const OPCODE_CAPTURE_V2: u8 = 7;
 
 #[cfg(feature = "kv_coord")]
 impl OvRuntimeEngine {
@@ -4123,22 +4132,48 @@ impl OvRuntimeEngine {
     }
 
     /// Head/middle → downstream: send `CAPTURE(epoch, tokens)` as an I8 control tensor, await the ACK.
-    fn send_capture_downstream(&mut self, epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+    /// A non-empty `tenant` upgrades the frame to `OPCODE_CAPTURE_V2` so the downstream rank — which
+    /// never sees the `GenerationTask` — can tag its own capture with the same namespace.
+    fn send_capture_downstream(
+        &mut self,
+        epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> EngineResult<()> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let mut data = vec![OPCODE_CAPTURE];
-        data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        let mut data = if tenant.is_empty() {
+            vec![OPCODE_CAPTURE]
+        } else {
+            vec![OPCODE_CAPTURE_V2]
+        };
+        if tenant.is_empty() {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes(epoch, tokens));
+        } else {
+            data.extend_from_slice(&crate::kv_coordination::capture_body_bytes_v2(
+                epoch, tokens, tenant,
+            ));
+        }
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
-        let ack = self
-            .block_on(async move {
-                let mut g = downstream.lock().await;
-                g.send(&t).await?;
-                let (ack, _) = g.recv().await?;
-                Ok::<_, cascadia_transport::TransportError>(ack)
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
+        let ack = self.block_on(async move {
+            let mut g = downstream.lock().await;
+            g.send(&t)
+                .await
+                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            // Bounded like the RESTORE ack: a peer that errors on the frame (e.g. an old build
+            // meeting CAPTURE_V2) never ACKs, and an unbounded wait wedges the head while it holds
+            // the downstream lock. Timing out degrades exactly as a failed capture already does —
+            // the caller warns and the turn simply isn't cached.
+            match tokio::time::timeout(RESTORE_ACK_TIMEOUT, g.recv()).await {
+                Ok(Ok((ack, _))) => Ok(ack),
+                Ok(Err(e)) => Err(EngineError::Backend(e.to_string())),
+                Err(_) => Err(EngineError::Backend(
+                    "ov-runtime: CAPTURE ack timed out; turn not cached".into(),
+                )),
+            }
+        })?;
         if ack.dtype == WireDType::I8 && ack.data.first() == Some(&OPCODE_CAPTURE_ACK) {
             Ok(())
         } else {
@@ -4242,19 +4277,30 @@ impl OvRuntimeEngine {
         info!(opcode = ?t.data.first().copied(), is_last = self.spec.is_last_stage, "ov_tail_ctrl_recv");
         match t.data.first().copied() {
             // CAPTURE: snapshot this rank's KV under the head's epoch, chain downstream, ack up.
-            Some(OPCODE_CAPTURE) => {
-                let (epoch, tokens) = crate::kv_coordination::parse_capture_body(&t.data[1..])
-                    .ok_or_else(|| EngineError::Backend("ov-runtime: bad CAPTURE body".into()))?;
+            // V2 additionally carries the turn's tenant, which tags the stash and rides the chain on.
+            Some(op @ (OPCODE_CAPTURE | OPCODE_CAPTURE_V2)) => {
+                let (epoch, tokens, tenant) = if op == OPCODE_CAPTURE_V2 {
+                    crate::kv_coordination::parse_capture_body_v2(&t.data[1..]).ok_or_else(
+                        || EngineError::Backend("ov-runtime: bad CAPTURE_V2 body".into()),
+                    )?
+                } else {
+                    let (e, tk) = crate::kv_coordination::parse_capture_body(&t.data[1..])
+                        .ok_or_else(|| {
+                            EngineError::Backend("ov-runtime: bad CAPTURE body".into())
+                        })?;
+                    (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
+                };
                 if let Ok(blob) = self.runtime.get_state_blob() {
                     // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch(epoch, tokens.clone(), blob.clone());
-                    self.kv.capture_under_epoch(epoch, tokens.clone(), blob);
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                    self.kv
+                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                 }
                 if !self.spec.is_last_stage {
-                    if let Err(e) = self.send_capture_downstream(epoch, &tokens) {
+                    if let Err(e) = self.send_capture_downstream(epoch, &tokens, &tenant) {
                         warn!(error = %e, "ov-runtime: CAPTURE chain downstream failed (best-effort)");
                     }
                 }

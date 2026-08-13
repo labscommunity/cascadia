@@ -171,8 +171,22 @@ const FRAME_RESTORE_ACK: u32 = 11;
 /// this bounds what a peer can make us buffer, the job that cap was doing.
 #[cfg(feature = "kv_coord")]
 const MAX_CARRY_BLOB_BYTES: usize = 256 * 1024 * 1024;
+/// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). A new
+/// frame code, not a wider `FRAME_CAPTURE` body: the v1 codec enforces an exact length and an
+/// unknown/short frame here desyncs the stream (`TransportError::SocketClosed`) rather than
+/// degrading. Only emitted for a non-empty tenant AND a chain that advertised support at HELLO.
+#[cfg(feature = "kv_coord")]
+const FRAME_CAPTURE_V2: u32 = 12;
 /// Handshake schema version (spec §3.4).
 const PROTO_VERSION: u32 = 1;
+/// H.1b (R2) HELLO capability level for `FRAME_CAPTURE_V2`. Advertised in the payload (downstream
+/// ranks NAK a peer that names a different level) and echoed in `HELLO_ACK`'s `pos` field so the
+/// head learns the chain-wide FLOOR — an old build sends `pos = 0` there, which reads as "no v2"
+/// and keeps the whole chain on v1 instead of desyncing it on an unknown frame kind mid-turn.
+#[cfg(feature = "kv_coord")]
+const CAPTURE_V2_CAP: u32 = 1;
+#[cfg(not(feature = "kv_coord"))]
+const CAPTURE_V2_CAP: u32 = 0;
 
 fn frame_header(kind: u32, epoch: u32, pos: u32) -> [u8; 12] {
     let mut h = [0u8; 12];
@@ -465,6 +479,7 @@ impl Builder for Qwen36Builder {
             epoch: 0,
             peer_epoch: 0,
             handshake_done: false,
+            chain_capture_v2: 0,
             poisoned: None,
             pending: Vec::new(),
             active: None,
@@ -523,6 +538,11 @@ pub struct Qwen36Engine {
     /// Downstream side: epoch of the last RESET accepted.
     peer_epoch: u32,
     handshake_done: bool,
+    /// H.1b R2: chain-wide `FRAME_CAPTURE_V2` capability floor, negotiated at HELLO (0 ⇒ some rank
+    /// is a pre-R2 build). Gates emission so a tenant-bearing turn on a mixed chain falls back to
+    /// the v1 frame — the workers then capture un-namespaced, which is cold-but-correct, instead of
+    /// desyncing the stream on an unknown frame kind.
+    chain_capture_v2: u32,
     /// Set when the startup handshake found a config mismatch (handshake
     /// rule: refuse to serve). Admissions fail loud with this reason.
     poisoned: Option<String>,
@@ -560,6 +580,11 @@ pub struct Qwen36Engine {
 /// unreachable) and so streaming emits at the engine's real cadence.
 struct ActiveTask {
     task_id: TaskId,
+    /// H.1b R2: the KV namespace this turn belongs to, seeded from `GenerationTask.tenant` at
+    /// admission. The capture path reads it from HERE, never from a plane-asserted partner — that
+    /// value describes a pulled entry, not this turn.
+    #[cfg_attr(not(feature = "kv_coord"), allow(dead_code))] // only the capture path reads it
+    tenant: String,
     prompt_ids: Vec<u32>,
     prefill_idx: usize,
     step: usize,
@@ -623,10 +648,13 @@ enum InFrame {
         n: usize,
     },
     /// Issue-34 §8 CAPTURE: snapshot local KV under the head's content `kv_epoch` (body-carried).
+    /// `partner` is `Some` only for `FRAME_CAPTURE_V2` (H.1b R2); `None` keeps the v1 frame's
+    /// un-namespaced stash.
     #[cfg(feature = "kv_coord")]
     Capture {
         kv_epoch: u64,
         tokens: Vec<i32>,
+        partner: Option<String>,
     },
     /// Issue-34 consume RESTORE: `set_state` the pulled slice stashed under `kv_epoch`. `task_epoch`
     /// (frame header) advances `peer_epoch` exactly like RESET. `blob` is the head's inline carry for
@@ -790,11 +818,11 @@ impl Qwen36Engine {
             // token-keyed by kv_capture_local below (the NEGOTIATE/offers path).
             if self.total > 1 && self.rank == 0 && self.downstream.is_some() && !tokens.is_empty() {
                 let kv_epoch = crate::kv_coordination::synth_epoch(&tokens);
-                if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens) {
+                if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens, &t.tenant) {
                     warn!(error = %e, "qwen36: CAPTURE broadcast failed (best-effort)");
                 }
             }
-            self.kv_capture_local(tokens);
+            self.kv_capture_local(&t.tenant, tokens);
         }
         self.reset_all();
         let elapsed = t.started.elapsed().as_secs_f64();
@@ -858,14 +886,21 @@ impl Qwen36Engine {
     /// wire dtype, protocol version. The shim exposes no OV version
     /// string; the manifest compare covers export-level skew.
     fn hello_payload(&self) -> Vec<u8> {
-        serde_json::json!({
+        #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
+        let mut v = serde_json::json!({
             "proto": PROTO_VERSION,
             "total": self.total,
             "wire": "f32",
             "manifest": self.manifest_json,
-        })
-        .to_string()
-        .into_bytes()
+        });
+        // Advertised only by a build that can actually speak v2. A build without `kv_coord` has no
+        // CAPTURE path at all, so it must read to its peers as a LEGACY rank (key absent ⇒ chain
+        // floor 0 ⇒ v1) rather than as an explicit disagreement that would NAK the handshake.
+        #[cfg(feature = "kv_coord")]
+        {
+            v["capture_v2"] = serde_json::json!(CAPTURE_V2_CAP);
+        }
+        v.to_string().into_bytes()
     }
 
     /// Rank 0: HELLO → HELLO_ACK/NAK before the first admit.
@@ -873,15 +908,19 @@ impl Qwen36Engine {
     /// validated against this rank's manifest.
     fn handshake_a(&mut self) -> EngineResult<()> {
         let payload = self.hello_payload();
-        let nak = self.forward_hello_downstream(&payload)?;
+        let (nak, down_cap) = self.forward_hello_downstream(&payload)?;
         if let Some(reason) = nak {
             self.poisoned = Some(reason.clone());
             return Err(EngineError::Backend(format!(
                 "qwen36 pipeline handshake refused: {reason}"
             )));
         }
+        self.chain_capture_v2 = down_cap.min(CAPTURE_V2_CAP);
         self.handshake_done = true;
-        info!("qwen36 pipeline handshake ok");
+        info!(
+            capture_v2 = self.chain_capture_v2,
+            "qwen36 pipeline handshake ok"
+        );
         Ok(())
     }
 
@@ -969,9 +1008,10 @@ impl Qwen36Engine {
         Ok((token as u32, wire_ms))
     }
 
-    /// Middle/last shared: forward the rank-0 HELLO payload downstream
-    /// and return the reply (None = ACK, Some(reason) = NAK).
-    fn forward_hello_downstream(&mut self, payload: &[u8]) -> EngineResult<Option<String>> {
+    /// Middle/last shared: forward the rank-0 HELLO payload downstream and return
+    /// `(reply, downstream_capture_v2_floor)` — reply None = ACK, Some(reason) = NAK. The floor is
+    /// the ACK header's `pos`; a pre-R2 peer sends 0 there, which correctly reads as "no v2".
+    fn forward_hello_downstream(&mut self, payload: &[u8]) -> EngineResult<(Option<String>, u32)> {
         let downstream = self
             .downstream
             .clone()
@@ -986,16 +1026,16 @@ impl Qwen36Engine {
                 g.send_raw(&(payload.len() as u32).to_be_bytes()).await?;
                 g.send_raw(&payload).await?;
                 let hb = g.recv_raw(12).await?;
-                let (kind, _, _) = parse_header(&hb);
+                let (kind, _, cap) = parse_header(&hb);
                 match kind {
-                    FRAME_HELLO_ACK => Ok(None),
+                    FRAME_HELLO_ACK => Ok((None, cap)),
                     FRAME_HELLO_NAK => {
                         let lb = g.recv_raw(4).await?;
                         let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
                         let rb = g.recv_raw(n).await?;
-                        Ok(Some(String::from_utf8_lossy(&rb).into_owned()))
+                        Ok((Some(String::from_utf8_lossy(&rb).into_owned()), 0))
                     }
-                    other => Ok(Some(format!("unexpected handshake reply kind {other}"))),
+                    other => Ok((Some(format!("unexpected handshake reply kind {other}")), 0)),
                 }
             }),
         )
@@ -1028,21 +1068,39 @@ impl Qwen36Engine {
     /// Issue-34 §8: send `CAPTURE(kv_epoch, tokens)` to the downstream peer and await its ACK. Used
     /// by the head (rank 0, after a turn) and chained by each middle rank. Frame-header epoch is the
     /// current task epoch (stale-frame machinery); the KV content epoch rides the body.
+    /// A non-empty `tenant` upgrades the frame to `FRAME_CAPTURE_V2` so the downstream rank — which
+    /// never sees the `GenerationTask` — can tag its own capture with the same namespace. Requires a
+    /// chain that advertised v2 at HELLO; otherwise the v1 frame goes out unchanged.
     #[cfg(feature = "kv_coord")]
-    fn forward_capture_downstream(&mut self, kv_epoch: u64, tokens: &[i32]) -> EngineResult<()> {
+    fn forward_capture_downstream(
+        &mut self,
+        kv_epoch: u64,
+        tokens: &[i32],
+        tenant: &str,
+    ) -> EngineResult<()> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream peer".into()))?;
         let h = self.handle()?;
         let task_epoch = self.epoch;
-        let body = crate::kv_coordination::capture_body_bytes(kv_epoch, tokens);
+        let v2 = !tenant.is_empty() && self.chain_capture_v2 >= CAPTURE_V2_CAP;
+        let (kind, body) = if v2 {
+            (
+                FRAME_CAPTURE_V2,
+                crate::kv_coordination::capture_body_bytes_v2(kv_epoch, tokens, tenant),
+            )
+        } else {
+            (
+                FRAME_CAPTURE,
+                crate::kv_coordination::capture_body_bytes(kv_epoch, tokens),
+            )
+        };
         run_async(
             &h,
             reply_bounded(async move {
                 let mut g = downstream.lock().await;
-                g.send_raw(&frame_header(FRAME_CAPTURE, task_epoch, 0))
-                    .await?;
+                g.send_raw(&frame_header(kind, task_epoch, 0)).await?;
                 g.send_raw(&(body.len() as u32).to_be_bytes()).await?;
                 g.send_raw(&body).await?;
                 let hb = g.recv_raw(12).await?;
@@ -1239,6 +1297,7 @@ impl Qwen36Engine {
             };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
+                tenant: task.tenant,
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
@@ -1439,7 +1498,25 @@ impl Qwen36Engine {
                     let body = g.recv_raw(n).await?;
                     let (kv_epoch, tokens) = crate::kv_coordination::parse_capture_body(&body)
                         .ok_or(TransportError::SocketClosed)?;
-                    Ok(InFrame::Capture { kv_epoch, tokens })
+                    Ok(InFrame::Capture {
+                        kv_epoch,
+                        tokens,
+                        partner: None,
+                    })
+                }
+                #[cfg(feature = "kv_coord")]
+                FRAME_CAPTURE_V2 => {
+                    let lb = g.recv_raw(4).await?;
+                    let n = u32::from_be_bytes([lb[0], lb[1], lb[2], lb[3]]) as usize;
+                    let body = g.recv_raw(n).await?;
+                    let (kv_epoch, tokens, partner) =
+                        crate::kv_coordination::parse_capture_body_v2(&body)
+                            .ok_or(TransportError::SocketClosed)?;
+                    Ok(InFrame::Capture {
+                        kv_epoch,
+                        tokens,
+                        partner: Some(partner),
+                    })
                 }
                 #[cfg(feature = "kv_coord")]
                 FRAME_RESTORE => {
@@ -1500,22 +1577,31 @@ impl Qwen36Engine {
                 // rank-0 payload downstream so every rank checks against
                 // the origin; reply upstream with the combined verdict.
                 let mut reason = self.validate_hello(&payload);
+                // Chain floor: this rank's own capability, lowered by everything below it. The last
+                // rank has nothing below, so it reports its own.
+                let mut cap = CAPTURE_V2_CAP;
                 if reason.is_none() && !is_last {
-                    reason = match self.forward_hello_downstream(&payload) {
-                        Ok(r) => r.map(|r| format!("downstream: {r}")),
-                        Err(e) => Some(format!("downstream handshake forward failed: {e}")),
-                    };
+                    match self.forward_hello_downstream(&payload) {
+                        Ok((r, down_cap)) => {
+                            reason = r.map(|r| format!("downstream: {r}"));
+                            cap = cap.min(down_cap);
+                        }
+                        Err(e) => {
+                            reason = Some(format!("downstream handshake forward failed: {e}"))
+                        }
+                    }
                 }
+                self.chain_capture_v2 = cap;
                 let h = self.handle()?;
                 let upstream = self.upstream.clone().unwrap();
                 match reason {
                     None => {
                         run_async(&h, async move {
                             let mut g = upstream.lock().await;
-                            g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, 0)).await
+                            g.send_raw(&frame_header(FRAME_HELLO_ACK, 0, cap)).await
                         })
                         .map_err(map_wire)?;
-                        info!("qwen36 pipeline handshake ok");
+                        info!(capture_v2 = cap, "qwen36 pipeline handshake ok");
                     }
                     Some(reason) => {
                         warn!(reason = %reason, "qwen36 pipeline handshake mismatch; refusing to serve");
@@ -1551,20 +1637,26 @@ impl Qwen36Engine {
                 .map_err(map_wire)
             }
             #[cfg(feature = "kv_coord")]
-            InFrame::Capture { kv_epoch, tokens } => {
+            InFrame::Capture {
+                kv_epoch,
+                tokens,
+                partner,
+            } => {
                 // Snapshot this rank's local KV under the head's content epoch (state is still live —
                 // RESET comes at the next admission), chain CAPTURE downstream, then ack upstream.
                 // Best-effort: a blob/chain miss degrades to no warm-pull, never breaks generation.
+                let ns = partner.unwrap_or_else(|| crate::kv_coordination::LOCAL_NS.to_string());
                 if let Some(blob) = self.blob_local_stages() {
                     // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch(kv_epoch, tokens.clone(), blob.clone());
-                    self.kv.capture_under_epoch(kv_epoch, tokens.clone(), blob);
+                        .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob.clone());
+                    self.kv
+                        .capture_under_epoch_ns(&ns, kv_epoch, tokens.clone(), blob);
                 }
                 if !is_last {
-                    if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens) {
+                    if let Err(e) = self.forward_capture_downstream(kv_epoch, &tokens, &ns) {
                         warn!(error = %e, "qwen36: CAPTURE chain downstream failed (best-effort)");
                     }
                 }
@@ -1747,6 +1839,19 @@ impl Qwen36Engine {
         if theirs["manifest"].as_str() != Some(self.manifest_json.as_str()) {
             return Some("manifest mismatch between ranks".into());
         }
+        // H.1b R2. ABSENT ⇒ a pre-R2 (or non-`kv_coord`) build: accepted, and its `HELLO_ACK` carries
+        // no capability, so the head reads the chain floor as 0 and stays on v1. PRESENT and
+        // different ⇒ two v2-aware builds that disagree about the CAPTURE body shape; refuse now
+        // rather than desync the frame stream on an unknown kind mid-turn.
+        #[cfg(feature = "kv_coord")]
+        if !theirs["capture_v2"].is_null()
+            && theirs["capture_v2"] != serde_json::json!(CAPTURE_V2_CAP)
+        {
+            return Some(format!(
+                "CAPTURE v2 capability mismatch: theirs {} ours {CAPTURE_V2_CAP}",
+                theirs["capture_v2"]
+            ));
+        }
         None
     }
 
@@ -1830,6 +1935,7 @@ impl Qwen36Engine {
             };
             self.active = Some(ActiveTask {
                 task_id: task.task_id,
+                tenant: task.tenant,
                 prompt_ids,
                 prefill_idx: warm_prefix,
                 step: warm_prefix,
@@ -2221,7 +2327,7 @@ impl Qwen36Engine {
 
     /// Capture this rank's local KV under `tokens` (head/single-box token-keyed path). Called at the
     /// top of `finalize`, before `reset_all` wipes the state. Best-effort.
-    fn kv_capture_local(&mut self, tokens: Vec<i32>) {
+    fn kv_capture_local(&mut self, tenant: &str, tokens: Vec<i32>) {
         if tokens.is_empty() {
             return;
         }
@@ -2230,13 +2336,8 @@ impl Qwen36Engine {
             self.kv_share
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .capture(
-                    crate::kv_coordination::LOCAL_NS,
-                    tokens.clone(),
-                    blob.clone(),
-                );
-            self.kv
-                .capture(crate::kv_coordination::LOCAL_NS, tokens, blob);
+                .capture(tenant, tokens.clone(), blob.clone());
+            self.kv.capture(tenant, tokens, blob);
         }
     }
 }
@@ -2374,6 +2475,7 @@ mod tests {
             epoch: 0,
             peer_epoch: 0,
             handshake_done: false,
+            chain_capture_v2: 0,
             poisoned: None,
             pending: Vec::new(),
             active: None,
@@ -2407,6 +2509,25 @@ mod tests {
         let b = bare_engine(2, r#"{"arch":"qwen3_5_moe","stages":2}"#);
         let reason = b.validate_hello(&a.hello_payload());
         assert!(reason.is_some_and(|r| r.contains("manifest")));
+    }
+
+    /// H.1b R2. A pre-R2 peer omits `capture_v2` entirely; it must still handshake, and its
+    /// `HELLO_ACK` (`pos = 0`) leaves the head's chain floor at 0 so no v2 frame is ever emitted at
+    /// it. Two capability-aware builds that disagree refuse instead of desyncing mid-turn.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn hello_accepts_a_legacy_peer_and_refuses_a_capability_disagreement() {
+        let e = bare_engine(2, "{}");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&e.hello_payload()).expect("payload is json");
+        legacy.as_object_mut().unwrap().remove("capture_v2");
+        assert_eq!(e.validate_hello(legacy.to_string().as_bytes()), None);
+
+        let mut skewed: serde_json::Value =
+            serde_json::from_slice(&e.hello_payload()).expect("payload is json");
+        skewed["capture_v2"] = serde_json::json!(CAPTURE_V2_CAP + 1);
+        let reason = e.validate_hello(skewed.to_string().as_bytes());
+        assert!(reason.is_some_and(|r| r.contains("CAPTURE v2 capability")));
     }
 
     #[test]
@@ -2488,6 +2609,7 @@ mod tests {
         let mut e = bare_engine(2, "{}");
         e.active = Some(ActiveTask {
             task_id: "t0".into(),
+            tenant: String::new(),
             prompt_ids: vec![1, 2, 3],
             prefill_idx: 3,
             step: 4,
