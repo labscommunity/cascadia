@@ -357,11 +357,11 @@ pub struct WorkerArgs {
     /// mappings so the engine's weight copies, KV state and scratch become
     /// kernel-reclaimable instead of anonymous/committed. Measured in-tree
     /// (ramlab exp 199): 2064→506 MB committed at −1% decode on an unmodified
-    /// OpenVINO CPU worker. LINUX ONLY today — it re-execs the worker once with
-    /// an allocator interposer preloaded. On Windows the flag parses and seeds
-    /// ENABLE_MMAP=YES but does NOT yet cut committed RAM (needs a UCRT-heap
-    /// redirector; the OV knobs cannot disable oneDNN's dirty repacked copies —
-    /// D-004), and prints that it is inactive.
+    /// OpenVINO CPU worker. Linux re-execs the worker once with an allocator
+    /// interposer preloaded; Windows inline-hooks the UCRT allocation family
+    /// in-process via Detours (built only when DETOURS_DIR was set — otherwise
+    /// the flag parses but reports inactive). The OV knobs cannot substitute:
+    /// they cannot disable oneDNN's dirty repacked copies (D-004).
     #[arg(long)]
     pub elastic: bool,
 
@@ -936,8 +936,12 @@ pub fn activate_elastic_if_requested(cli: &Cli) {
     match cascadia_elastic::activate(&opts) {
         // On Linux success execv never returns; AlreadyActive is handled above.
         Ok(cascadia_elastic::Activation::AlreadyActive) => {}
+        // Windows in-process hook installed this call.
+        Ok(cascadia_elastic::Activation::Activated) => {
+            eprintln!("cascadia: elastic posture active (in-process; min={min_mb}MB pool={pool_mb}MB)");
+        }
         Ok(cascadia_elastic::Activation::UnsupportedPlatform(why)) => {
-            eprintln!("cascadia: --elastic interposer unavailable on this platform: {why}");
+            eprintln!("cascadia: --elastic interposer unavailable on this build: {why}");
         }
         Err(e) => {
             eprintln!("cascadia: --elastic activation failed ({e}); continuing without the interposer");

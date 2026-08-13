@@ -148,15 +148,19 @@ device + `--engine ov-genai`, like the typed NPU flags. Cross-platform.
 
 **`--elastic`** serves large allocations from file-backed mappings so the
 worker's weight copies, KV state and scratch are kernel-reclaimable rather than
-anonymous/committed (ramlab exp 198/199: 2064→506 MB committed at −1% decode on
-an unmodified OpenVINO CPU worker; `--elastic-min-mb 16` gives 2064→1549 MB at
-speed parity). **Linux only today**: it re-execs the worker once with an
-allocator interposer preloaded — the serving PID is unchanged (execv), and the
-log prints `elastic posture active`. On **Windows** the flag parses and asserts
-`ENABLE_MMAP=YES`, but does **not** yet cut committed RAM: OV exposes no property
-to disable oneDNN's dirty repacked weight copies (that is D-004, and why the
-interposer exists), so the Windows reduction waits on a UCRT-heap redirector.
-The flag prints that it is inactive on Windows rather than implying a win.
+committed. Measured on unmodified OpenVINO CPU workers (ramlab exp 199): Linux
+2064→506 MB committed at −1% decode (`--elastic-min-mb 16` → 1549 MB at parity);
+Windows 1329→223 MB private commit at −6% decode. Same file-backed mechanism,
+different injection vector: **Linux** re-execs the worker once with an allocator
+interposer `LD_PRELOAD`ed (serving PID unchanged via execv; logs `elastic
+posture active`); **Windows** inline-hooks the UCRT allocation family
+(`malloc`/`free`/`realloc`/`calloc`/`_msize` + `_aligned_*`) in-process with
+Microsoft Detours before the OV engine loads (logs `elastic posture active
+(in-process)`). The OV-native knobs cannot substitute — they cannot disable
+oneDNN's dirty repacked copies (D-004) — so `--elastic` still asserts
+`ENABLE_MMAP=YES` to keep the weight blob clean but relies on the interposer for
+the cut. The Windows hook is compiled in only when `cascadia-elastic` was built
+with `DETOURS_DIR` set; otherwise `--elastic` reports inactive there.
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to

@@ -26,22 +26,27 @@
 //!   once (guarded by an env marker, mirroring the low-RAM re-exec pattern).
 //!   Measured on the deployment target: 4.4× less committed RAM at −9% decode
 //!   on an unmodified OpenVINO stack (exp 198).
-//! * **Windows**: there is no `LD_PRELOAD`, and redirecting the whole C runtime
-//!   heap needs a trampoline-based redirector that catches every module's calls
-//!   into `ucrtbase` (the approach mimalloc ships as a separate signed DLL, and
-//!   the shape a Detours-based hook of the UCRT `malloc` family would take).
-//!   That is a self-contained systems project and is NOT implemented here yet,
-//!   so on Windows [`activate`] performs no interposition and returns
-//!   [`Activation::UnsupportedPlatform`].
+//! * **Windows**: there is no `LD_PRELOAD`, so [`activate`] instead inline-hooks
+//!   the UCRT allocation family (`malloc`/`free`/`realloc`/`calloc`/`_msize` and
+//!   the `_aligned_*` variants) with Microsoft Detours, in-process, before the
+//!   OpenVINO engine loads. Patching `ucrtbase`'s functions in place catches
+//!   every caller — including OV/oneDNN DLLs loaded later — and large
+//!   allocations are served from a `CreateFileMapping` section over a
+//!   DELETE_ON_CLOSE temp file, so their dirty pages leave private commit for
+//!   the backing file (the Windows analog of the Linux MAP_SHARED trick).
+//!   Proven to keep a 300 MB `malloc`/`_aligned_malloc` out of private commit
+//!   (+1 MB instead of +301). The C side is `src/elastic_win.cpp`; it is
+//!   compiled and linked only when `DETOURS_DIR` is set at build time (an
+//!   SDK-style build input, like `INTEL_OPENVINO_DIR`). Without it the hook is
+//!   compiled out and [`activate`] returns [`Activation::UnsupportedPlatform`].
 //!
-//!   Note the OV-native knobs do **not** substitute: measured on Linux
-//!   (ramlab exp 199), `ENABLE_MMAP=YES` + `CACHE_MODE=OPTIMIZE_SIZE` leave the
-//!   committed footprint unchanged, because the dirty bytes are oneDNN's
-//!   *repacked* weight copies, and OV exposes no property to disable those
-//!   (that is exactly D-004, and the reason the interposer exists). `--elastic`
-//!   still asserts `ENABLE_MMAP=YES` so the original weight blob stays clean
-//!   file pages, but the repacked-copy reduction on Windows waits on the
-//!   redirector.
+//!   The OV-native knobs do **not** substitute for the interposer on either OS:
+//!   measured (ramlab exp 199), `ENABLE_MMAP=YES` + `CACHE_MODE=OPTIMIZE_SIZE`
+//!   leave committed RAM unchanged, because the dirty bytes are oneDNN's
+//!   *repacked* weight copies and OV exposes no property to disable those
+//!   (D-004). `--elastic` still asserts `ENABLE_MMAP=YES` so the weight blob
+//!   stays clean file pages; the interposer is what reclaims the repacked
+//!   copies.
 
 use std::ffi::OsString;
 
@@ -82,6 +87,9 @@ pub enum Activation {
     /// The interposer is already active in this process (we are the re-exec'd
     /// child, or a parent set `LD_PRELOAD` for us). Nothing to do.
     AlreadyActive,
+    /// Installed in-process this call (Windows: the Detours hook is now live).
+    /// No re-exec happened; the current process continues.
+    Activated,
     /// This platform has no supported interposition path. The caller should
     /// fall back to engine-level knobs. Carries a human-readable reason.
     UnsupportedPlatform(&'static str),
@@ -193,16 +201,46 @@ fn activate_impl(opts: &ElasticOpts) -> Result<Activation, ActivateError> {
     Err(ActivateError::Exec(std::io::Error::last_os_error()))
 }
 
-#[cfg(not(unix))]
+// Windows WITH the Detours hook compiled in (DETOURS_DIR was set at build): the
+// interposer installs IN-PROCESS — no re-exec. Called first in `main`, before
+// the OpenVINO engine loads, so DLLs bind their `malloc` through the hook.
+#[cfg(all(windows, elastic_win_hook))]
+fn activate_impl(opts: &ElasticOpts) -> Result<Activation, ActivateError> {
+    let _ = ELASTIC_SO;
+    let dir_c = match &opts.dir {
+        Some(d) => std::ffi::CString::new(d.to_string_lossy().as_bytes()).ok(),
+        None => None,
+    };
+    let dir_ptr = dir_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // SAFETY: single-threaded at this point (called before the tokio runtime);
+    // the C side suspends no other threads because none exist yet.
+    let rc = unsafe { elastic_install_win(opts.min_mb, opts.pool_mb, dir_ptr) };
+    if rc == 0 {
+        Ok(Activation::Activated)
+    } else {
+        Err(ActivateError::Exec(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("DetourTransactionCommit failed (rc={rc})"),
+        )))
+    }
+}
+
+// Windows WITHOUT the hook (DETOURS_DIR unset at build).
+#[cfg(all(not(unix), not(all(windows, elastic_win_hook))))]
 fn activate_impl(_opts: &ElasticOpts) -> Result<Activation, ActivateError> {
-    let _ = ELASTIC_SO; // silence unused on non-unix
+    let _ = ELASTIC_SO;
     Ok(Activation::UnsupportedPlatform(
-        "no allocator interposer on this platform yet — the committed-RAM cut \
-         needs a UCRT-heap redirector (Detours/mimalloc-redirect class), which \
-         is not implemented. OV-native knobs do NOT substitute (they cannot \
-         disable oneDNN's dirty repacked weight copies — D-004); ENABLE_MMAP is \
+        "no allocator interposer compiled in — on Windows, build cascadia-elastic \
+         with DETOURS_DIR pointing at a built Microsoft Detours to enable the \
+         in-process UCRT-heap hook. OV-native knobs do NOT substitute (they \
+         cannot disable oneDNN's dirty repacked copies — D-004); ENABLE_MMAP is \
          still seeded so the weight blob stays clean file pages",
     ))
+}
+
+#[cfg(all(windows, elastic_win_hook))]
+extern "C" {
+    fn elastic_install_win(min_mb: u32, pool_mb: u32, dir: *const std::os::raw::c_char) -> i32;
 }
 
 /// The OpenVINO plugin properties `--elastic` seeds so the engine's own memory
