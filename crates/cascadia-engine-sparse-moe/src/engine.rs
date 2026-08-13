@@ -958,13 +958,50 @@ fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bo
     peer_disconnected && !already_reported
 }
 
+/// Per-token reply budget: no widening. Mirrors `reply_deadline`'s body
+/// (split out, same as `prefill_reply_budget` below, purely so a test can pin
+/// "prefill exceeds per-token" against the real function instead of a
+/// disconnected literal). Pure, for testing.
+fn per_token_reply_budget(recv_timeout: std::time::Duration) -> std::time::Duration {
+    recv_timeout
+}
+
+/// Safety margin the clamped prefill budget must stay under the frame-idle
+/// ceiling by. `recv_token_reply`'s outer `tokio::time::timeout` and the
+/// transport layer's OWN idle-ceiling timeout (inside
+/// `recv_exact_frame_start`, guarding `recv_kind_client`) race the same
+/// silent-peer wait — whichever fires first decides the outcome. If our
+/// budget reaches or exceeds the ceiling, the transport-layer timeout can win
+/// that race: it surfaces `TransportError::FrameIdleCeiling`, which
+/// `ActivationClient::drop_connection_if_recv_fatal` treats as
+/// connection-fatal and permanently drops the client socket (only
+/// `Builder::connect` redials it) — the exact defect D failure mode, just
+/// reached via a wide-open `PREFILL_REPLY_TIMEOUT_FACTOR` instead of an
+/// unbounded recv. 30s is generous next to scheduling jitter and small next
+/// to the ~900s default ceiling.
+const PREFILL_BUDGET_CEILING_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Widened deadline for a BATCHED prefill window's owed Token reply — see
 /// `PipelineEngine::reply_deadline_prefill`. Split out as a free function
 /// (rather than inline in the generic `impl<R: StagedRunner>` block) so the
-/// arithmetic is unit testable without standing up a `StagedRunner`. Pure,
+/// arithmetic is unit testable without standing up a `StagedRunner`.
+///
+/// Clamped to stay `PREFILL_BUDGET_CEILING_MARGIN` under `frame_idle_ceiling`
+/// when one is configured (`None` = disabled, nothing to stay under) — an
+/// operator raising `CASCADIA_ACTIVATION_TIMEOUT_SECS` (a natural response to
+/// prefills timing out on a slow fleet) widens `recv_timeout` and, with it,
+/// this budget; left unclamped, a high enough setting reaches the frame-idle
+/// ceiling and reinstates defect D (see `PREFILL_BUDGET_CEILING_MARGIN`). Pure,
 /// for testing.
-fn prefill_reply_budget(recv_timeout: std::time::Duration) -> std::time::Duration {
-    recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+fn prefill_reply_budget(
+    recv_timeout: std::time::Duration,
+    frame_idle_ceiling: Option<std::time::Duration>,
+) -> std::time::Duration {
+    let widened = recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR);
+    match frame_idle_ceiling {
+        Some(ceiling) => widened.min(ceiling.saturating_sub(PREFILL_BUDGET_CEILING_MARGIN)),
+        None => widened,
+    }
 }
 
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
@@ -2987,7 +3024,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// without a clean FIN/RST, the failure mode seen on this fleet — surfaces
     /// as a fast error inside a client's request window instead of a wedge.
     fn reply_deadline() -> std::time::Duration {
-        cascadia_transport::recv_timeout()
+        per_token_reply_budget(cascadia_transport::recv_timeout())
     }
 
     /// Strict deadline for the Token reply owed to a BATCHED prefill window
@@ -2998,9 +3035,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// per-token `reply_deadline` above is far too tight — the same widening
     /// `recv_token_from_downstream` in cascadia-engine-openvino applies for
     /// its chunked-prefill path, so the two crates agree on what "a prefill
-    /// budget" means.
+    /// budget" means. Clamped under the frame-idle ceiling — see
+    /// `prefill_reply_budget`.
     fn reply_deadline_prefill() -> std::time::Duration {
-        prefill_reply_budget(cascadia_transport::recv_timeout())
+        prefill_reply_budget(
+            cascadia_transport::recv_timeout(),
+            cascadia_transport::frame_idle_ceiling(),
+        )
     }
 
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -3869,14 +3910,20 @@ mod tests {
     // -------- batched-prefill reply deadline (regression for the unbounded
     // recv_kind_client/recv_token_body_client pair — see `prefill_reply_budget`
     // and its two call sites in `handle_forward_batch_prefill` /
-    // `forward_prompt_batch_first`) --------
+    // `forward_prompt_batch_first` — AND for the follow-up bug where an
+    // unclamped widened budget could reach the frame-idle ceiling and
+    // reinstate the same failure mode via a different path) --------
 
     #[test]
-    fn prefill_reply_budget_widens_by_the_shared_factor() {
+    fn prefill_reply_budget_widens_by_the_documented_factor() {
+        // Pins the concrete factor (10) and a concrete expected duration —
+        // NOT the implementation's own multiplication echoed back at itself,
+        // which would pass even if the multiplication were wrong.
+        assert_eq!(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR, 10);
         let recv_timeout = std::time::Duration::from_secs(60);
         assert_eq!(
-            prefill_reply_budget(recv_timeout),
-            recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+            prefill_reply_budget(recv_timeout, None),
+            std::time::Duration::from_secs(600)
         );
     }
 
@@ -3884,10 +3931,12 @@ mod tests {
     fn prefill_reply_budget_exceeds_the_per_token_reply_deadline() {
         // The defect under test: a batched prefill window waits on every
         // remaining stage's WHOLE window of compute, not one token, so its
-        // budget must be strictly wider than the per-token `reply_deadline`
-        // (== recv_timeout, unwidened) — never silently equal to it.
+        // budget must be strictly wider than the per-token reply deadline.
+        // Compares against `per_token_reply_budget` (the real function
+        // `reply_deadline` delegates to) rather than a disconnected literal,
+        // so it pins the actual relationship between the two, not a copy of it.
         let recv_timeout = std::time::Duration::from_secs(60);
-        assert!(prefill_reply_budget(recv_timeout) > recv_timeout);
+        assert!(prefill_reply_budget(recv_timeout, None) > per_token_reply_budget(recv_timeout));
     }
 
     #[test]
@@ -3895,6 +3944,63 @@ mod tests {
         // saturating_mul must not panic on an absurd configured recv_timeout;
         // Duration's `*` would.
         let huge = std::time::Duration::MAX;
-        assert_eq!(prefill_reply_budget(huge), std::time::Duration::MAX);
+        assert_eq!(prefill_reply_budget(huge, None), std::time::Duration::MAX);
+    }
+
+    #[test]
+    fn prefill_reply_budget_unclamped_when_no_ceiling_is_configured() {
+        // `None` == the operator disabled the ceiling entirely
+        // (`set_frame_idle_ceiling_secs(0)`) — nothing to stay under.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, None),
+            recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_clamps_below_the_frame_idle_ceiling() {
+        // The exact review scenario: CASCADIA_ACTIVATION_TIMEOUT_SECS=90 (a
+        // natural operator response to prefills timing out on a slow fleet)
+        // widens the naive budget to 900s == DEFAULT_FRAME_IDLE_CEILING. Left
+        // unclamped, the transport layer's own idle-ceiling timeout can then
+        // win the race inside `recv_token_reply` and drop the socket for
+        // good — reinstating defect D via a different path. The clamped
+        // budget must land strictly under the ceiling.
+        let recv_timeout = std::time::Duration::from_secs(90);
+        let ceiling = std::time::Duration::from_secs(900);
+        let budget = prefill_reply_budget(recv_timeout, Some(ceiling));
+        assert!(
+            budget < ceiling,
+            "budget {budget:?} must stay strictly under the frame-idle ceiling {ceiling:?}"
+        );
+        assert_eq!(budget, ceiling - PREFILL_BUDGET_CEILING_MARGIN);
+    }
+
+    #[test]
+    fn prefill_reply_budget_ceiling_clamp_never_underflows() {
+        // A ceiling configured at or below the margin must clamp to zero
+        // (fails prefill windows fast) rather than panicking on subtraction
+        // underflow — an operator can set an unusually small idle ceiling.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        let tiny_ceiling = std::time::Duration::from_secs(5);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, Some(tiny_ceiling)),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_leaves_the_default_config_unclamped() {
+        // With the fleet's actual defaults (60s recv_timeout, 900s ceiling)
+        // the widened budget (600s) must NOT be affected by the clamp — the
+        // clamp is a safety net for high operator-configured recv_timeout,
+        // not a silent shrink of the common case.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        let ceiling = cascadia_transport::DEFAULT_FRAME_IDLE_CEILING;
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, Some(ceiling)),
+            std::time::Duration::from_secs(600)
+        );
     }
 }
