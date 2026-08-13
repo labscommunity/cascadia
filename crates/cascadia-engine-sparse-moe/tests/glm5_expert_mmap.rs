@@ -30,10 +30,6 @@ fn argmax(v: &[f32]) -> usize {
 #[test]
 fn eager_and_mmap_experts_agree() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
 
     // Force each mode via the env override, load, then clear (single test in
     // this binary -> no env race).

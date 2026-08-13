@@ -122,10 +122,6 @@ async fn pipeline_generate(
 async fn indexshare_pipeline_matches_single_process_beyond_topk() {
     let dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_indexshare_ml");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export_indexshare_ml absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     // prompt longer than index_topk(2) so full layers prune and shared reuse.
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let (n_gen, max_seq) = (4usize, 32usize);

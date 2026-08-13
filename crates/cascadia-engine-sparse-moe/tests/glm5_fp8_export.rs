@@ -14,10 +14,6 @@ use cascadia_engine_sparse_moe::glm::loader::load_model;
 #[test]
 fn real_exporter_roundtrip_matches_reference() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_fp8_export");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_fp8_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     let mut model = load_model(&dir, 32).expect("load fp8-exported model");
     let got = model.generate(&[1, 2, 3, 4], 4);
     // meta printed by gen_fixtures: [fp8 round-trip] ... greedy [9, 15, 0, 0]

@@ -22,10 +22,10 @@ fn dir(tag: &str) -> Option<PathBuf> {
 
 #[test]
 fn dsa_model_prunes_and_differs_from_dense() {
-    let (Some(sparse), Some(dense)) = (dir("glm5_export_dsa"), dir("glm5_export_dsa_dense")) else {
-        eprintln!("SKIP: DSA export fixtures absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    };
+    let sparse = dir("glm5_export_dsa")
+        .expect("glm5_export_dsa fixture missing (run tools/glm5_ref/gen_fixtures.py)");
+    let dense = dir("glm5_export_dsa_dense")
+        .expect("glm5_export_dsa_dense fixture missing (run tools/glm5_ref/gen_fixtures.py)");
     let prompt = [1u32, 2, 3, 4];
     let (n_gen, max_seq) = (4usize, 32usize);
 

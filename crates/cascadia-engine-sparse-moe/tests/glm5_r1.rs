@@ -17,10 +17,6 @@ use cascadia_engine_sparse_moe::staged::StagedRunner;
 #[test]
 fn r1_read_matches_mmap_reference() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     // Force mmap experts (so the R1 read path is actually exercised) + R1 on.
     std::env::set_var("CASCADIA_GLM5_EXPERTS", "mmap");
     std::env::set_var("CASCADIA_GLM5_R1READ", "1");

@@ -28,10 +28,6 @@ fn argmax(v: &[f32]) -> u32 {
 #[tokio::test]
 async fn glm5_two_rank_over_real_transport_matches_reference() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     let prompt: Vec<u32> = vec![1, 2, 3, 4];
     let want: Vec<u32> = vec![4, 10, 3, 15]; // loader/reference greedy
 

@@ -16,13 +16,6 @@ use cascadia_engine_sparse_moe::glm::loader::load_model;
 #[test]
 fn loader_greedy_matches_reference() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
-    if !dir.join("manifest.json").exists() {
-        eprintln!(
-            "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
-            dir.display()
-        );
-        return;
-    }
     let mut model = load_model(&dir, 32).expect("load glm5 export");
     let got = model.generate(&[1, 2, 3, 4], 4);
     // meta printed by gen_fixtures: [loader round-trip] ... greedy [4, 10, 3, 15]

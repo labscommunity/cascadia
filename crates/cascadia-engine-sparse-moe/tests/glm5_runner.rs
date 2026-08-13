@@ -20,10 +20,8 @@ fn export_dir() -> Option<PathBuf> {
 
 #[test]
 fn runner_greedy_matches_reference() {
-    let Some(dir) = export_dir() else {
-        eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    };
+    let dir =
+        export_dir().expect("glm5_export fixture missing (run tools/glm5_ref/gen_fixtures.py)");
     let mut runner =
         GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("load glm5 stage");
     let got = runner.generate_argmax(&[1, 2, 3, 4], 4);
@@ -32,10 +30,8 @@ fn runner_greedy_matches_reference() {
 
 #[test]
 fn staged_composition_matches_full_model() {
-    let Some(dir) = export_dir() else {
-        eprintln!("SKIP: glm5_export absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    };
+    let dir =
+        export_dir().expect("glm5_export fixture missing (run tools/glm5_ref/gen_fixtures.py)");
     let mut model = load_model(&dir, 32).expect("load full");
     let mut runner =
         GlmRunner::load_staged(&dir, 32, 0, 1, 0, 0, Default::default()).expect("load stage");

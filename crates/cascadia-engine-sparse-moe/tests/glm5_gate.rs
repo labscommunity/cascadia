@@ -10,20 +10,11 @@ use std::path::PathBuf;
 use cascadia_engine_sparse_moe::dsv4::st::StFile;
 use cascadia_engine_sparse_moe::glm::gate::moe_gate;
 
-/// Open the gen_fixtures.py output, or SKIP the test (return early) when it is
-/// absent. The *.safetensors fixtures are gitignored, so a fresh CI checkout
-/// does not have them; they exist after running gen_fixtures.py.
+/// Open the gen_fixtures.py output (committed under tests/fixtures/glm5/).
 macro_rules! fixtures {
     () => {{
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
-        if !p.exists() {
-            eprintln!(
-                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
-                p.display()
-            );
-            return;
-        }
         StFile::open(&p).expect("open fixtures")
     }};
 }

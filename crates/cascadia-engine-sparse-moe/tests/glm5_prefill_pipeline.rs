@@ -107,10 +107,6 @@ async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) 
 #[tokio::test]
 async fn glm5_batched_prefill_pipeline_matches_single_process() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
     let max_seq = 32usize;
 
@@ -158,10 +154,6 @@ fn drive_prefill(ranks: &mut [GlmRunner], prompt: &[u32], base: usize) -> Vec<f3
 #[test]
 fn glm5_prefix_cache_pipeline_matches_full() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     std::env::set_var("CASCADIA_GLM5_PREFIX_CACHE", "4");
     let base: Vec<u32> = vec![1, 2, 3];
     let ext: Vec<u32> = vec![1, 2, 3, 4, 5, 6]; // `base` is a prefix of `ext`
@@ -223,10 +215,6 @@ fn glm5_prefix_cache_pipeline_matches_full() {
 #[test]
 fn glm5_bf16_head_pipeline_bounded_vs_f32() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export_ml absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    }
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
     let max_seq = 32usize;
 

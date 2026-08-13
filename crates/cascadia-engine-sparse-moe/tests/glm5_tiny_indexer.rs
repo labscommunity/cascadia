@@ -27,13 +27,11 @@ fn dir(tag: &str) -> Option<PathBuf> {
 
 #[test]
 fn tiny_default_indexer_prunes_and_differs_from_dense() {
-    let (Some(sparse), Some(dense)) = (
-        dir("glm5_export_tiny_indexer"),
-        dir("glm5_export_tiny_indexer_dense"),
-    ) else {
-        eprintln!("SKIP: tiny-indexer export fixtures absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    };
+    let sparse = dir("glm5_export_tiny_indexer")
+        .expect("glm5_export_tiny_indexer fixture missing (run tools/glm5_ref/gen_fixtures.py)");
+    let dense = dir("glm5_export_tiny_indexer_dense").expect(
+        "glm5_export_tiny_indexer_dense fixture missing (run tools/glm5_ref/gen_fixtures.py)",
+    );
     let prompt = [1u32, 2, 3, 4];
     // index_topk=8; prompt(4) + 10 generated tokens carries the cached length
     // to 14 — well past the boundary, not just brushing it.

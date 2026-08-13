@@ -15,13 +15,6 @@ macro_rules! fixtures {
     () => {{
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/glm5/fixtures.safetensors");
-        if !p.exists() {
-            eprintln!(
-                "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
-                p.display()
-            );
-            return;
-        }
         StFile::open(&p).expect("open fixtures")
     }};
 }

@@ -27,13 +27,11 @@ fn dir(tag: &str) -> Option<PathBuf> {
 
 #[test]
 fn indexshare_shared_layers_reuse_carried_topk() {
-    let (Some(sparse), Some(dense)) = (
-        dir("glm5_export_indexshare"),
-        dir("glm5_export_indexshare_dense"),
-    ) else {
-        eprintln!("SKIP: IndexShare fixtures absent (run tools/glm5_ref/gen_fixtures.py)");
-        return;
-    };
+    let sparse = dir("glm5_export_indexshare")
+        .expect("glm5_export_indexshare fixture missing (run tools/glm5_ref/gen_fixtures.py)");
+    let dense = dir("glm5_export_indexshare_dense").expect(
+        "glm5_export_indexshare_dense fixture missing (run tools/glm5_ref/gen_fixtures.py)",
+    );
     let prompt = [1u32, 2, 3, 4];
     let (n_gen, max_seq) = (4usize, 32usize);
 

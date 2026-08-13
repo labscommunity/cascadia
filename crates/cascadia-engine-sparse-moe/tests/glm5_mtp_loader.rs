@@ -16,13 +16,6 @@ use cascadia_engine_sparse_moe::glm::loader::load_model;
 #[test]
 fn loader_mtp_spec_matches_greedy() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export");
-    if !dir.join("mtp.safetensors").exists() {
-        eprintln!(
-            "SKIP: {} absent (run tools/glm5_ref/gen_fixtures.py)",
-            dir.display()
-        );
-        return;
-    }
     let prompt: Vec<u32> = vec![1, 2, 3, 4];
     let n_gen = 6usize;
     // Room for the transient verify KV peak (committed + g positions per round).

@@ -134,10 +134,6 @@ async fn run_pipeline(
 #[tokio::test]
 async fn glm5_pipeline_matches_reference_for_1_2_3_4_ranks() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
-    if !dir.join("manifest.json").exists() {
-        eprintln!("SKIP: glm5_export_ml absent (see the header for the one-liner)");
-        return;
-    }
     let prompt: Vec<u32> = vec![1, 2, 3, 4];
     let n_gen = 4usize;
     let max_seq = 32usize;
