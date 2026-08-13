@@ -33,6 +33,14 @@ fn fixed_manifest() -> Manifest {
     }
 }
 
+fn fixed_key() -> CacheKey {
+    CacheKey {
+        partner_hash: 1,
+        model_fingerprint: 7,
+        prefix_token_hash: 9,
+    }
+}
+
 fn check_golden(name: &str, bytes: &[u8]) {
     let path = format!(
         "{}/tests/fixtures/{name}.golden.bin",
@@ -154,9 +162,135 @@ fn envelope_variants_match_golden() {
                 rank: 1,
             },
         ),
+        (
+            "env_tenant_hint",
+            KvMessage::TenantHint {
+                request_id: [3u8; 16],
+                partner: "c".into(),
+            },
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();
         check_golden(name, &bytes);
+    }
+}
+
+/// The wire index every variant MUST encode as. Exhaustive on purpose — no `_` arm — so appending a
+/// variant without pinning its index fails to compile here rather than shipping unpinned.
+fn declared_index(msg: &KvMessage) -> u8 {
+    match msg {
+        KvMessage::Negotiate(_) => 0,
+        KvMessage::Offer(_) => 1,
+        KvMessage::Get(_) => 2,
+        KvMessage::Found(_) => 3,
+        KvMessage::NotFound => 4,
+        KvMessage::Error(_) => 5,
+        KvMessage::Hint(_) => 6,
+        KvMessage::WarmResumeTrigger { .. } => 7,
+        KvMessage::WarmResumeConfirm { .. } => 8,
+        KvMessage::WarmResumeCommit { .. } => 9,
+        KvMessage::WarmResumeAbort { .. } => 10,
+        KvMessage::ReplicatePush { .. } => 11,
+        KvMessage::Replicate { .. } => 12,
+        KvMessage::ReplicateAck { .. } => 13,
+        KvMessage::ReplicaGet { .. } => 14,
+        KvMessage::WarmResumeTriggerV2 { .. } => 15,
+        KvMessage::TenantHint { .. } => 16,
+    }
+}
+
+/// bincode derives the tag from DECLARATION ORDER, so inserting a variant anywhere but the end
+/// renumbers every later one — silently, because each build still round-trips against itself. The
+/// per-variant goldens only cover the variants that have one; this pins the tag of ALL of them, in
+/// contiguous order, so the insert itself is what goes red instead of a mismatched-build pair
+/// mis-decoding a live frame.
+#[test]
+fn every_variant_index_is_pinned() {
+    let all: Vec<KvMessage> = vec![
+        KvMessage::Negotiate(Negotiate {
+            partner: PartnerId("c".into()),
+            model_fingerprint: 7,
+            token_ids: vec![1],
+        }),
+        KvMessage::Offer(Offer {
+            snapshot_epoch: 9,
+            prefix_token_len: 2,
+        }),
+        KvMessage::Get(Get {
+            partner: PartnerId("c".into()),
+            model_fingerprint: 7,
+            expected_epoch: 9,
+            expected_len: 2,
+        }),
+        KvMessage::Found(fixed_manifest()),
+        KvMessage::NotFound,
+        KvMessage::Error("e".into()),
+        KvMessage::Hint(WarmHint {
+            request_id: [3u8; 16],
+            prev_chain_id: [9u8; 32],
+            partner: "c".into(),
+        }),
+        KvMessage::WarmResumeTrigger {
+            epoch: 9,
+            prefix_token_len: 2,
+            model_fingerprint: 7,
+            prev_chain_id: [9u8; 32],
+            rank: 1,
+        },
+        KvMessage::WarmResumeConfirm { epoch: 9, ok: true },
+        KvMessage::WarmResumeCommit { epoch: 9 },
+        KvMessage::WarmResumeAbort { epoch: 9 },
+        KvMessage::ReplicatePush {
+            partner: PartnerId("c".into()),
+            epoch: 9,
+            prefix_token_len: 2,
+            model_fingerprint: 7,
+            rank: 1,
+        },
+        KvMessage::Replicate {
+            key: fixed_key(),
+            rank: 1,
+            manifest: fixed_manifest(),
+            tokens: vec![11, 22],
+            blob: vec![5u8; 4],
+        },
+        KvMessage::ReplicateAck {
+            key: fixed_key(),
+            rank: 1,
+            outcome: ReplicateOutcome::Accepted,
+        },
+        KvMessage::ReplicaGet {
+            key: fixed_key(),
+            rank: 1,
+            expected_epoch: 9,
+            expected_len: 2,
+        },
+        KvMessage::WarmResumeTriggerV2 {
+            partner: PartnerId("c".into()),
+            epoch: 9,
+            prefix_token_len: 2,
+            model_fingerprint: 7,
+            prev_chain_id: [9u8; 32],
+            rank: 1,
+        },
+        KvMessage::TenantHint {
+            request_id: [3u8; 16],
+            partner: "c".into(),
+        },
+    ];
+    assert_eq!(all.len(), 17, "every declared variant must be listed here");
+    for (position, msg) in all.iter().enumerate() {
+        let tag = bincode::serde::encode_to_vec(msg, standard()).unwrap()[0];
+        assert_eq!(
+            usize::from(tag),
+            position,
+            "{msg:?} must encode as tag {position}"
+        );
+        assert_eq!(
+            tag,
+            declared_index(msg),
+            "{msg:?} drifted from its pinned index"
+        );
     }
 }
