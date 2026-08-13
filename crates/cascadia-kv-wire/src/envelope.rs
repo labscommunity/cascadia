@@ -143,7 +143,30 @@ pub enum KvMessage {
         prev_chain_id: [u8; 32],
         rank: u16,
     },
+    /// Entry→head per-request tenant carrier (issue-34 H.1b). [`KvMessage::Hint`] is the only frame
+    /// that tells a serving head which tenant a request belongs to, and it rides ONLY forced moves —
+    /// so a session's first turn is captured under `LOCAL_NS` (`""`) while the first move asserts a
+    /// real tenant, NEGOTIATE misses, and the warm pull can never hit on that move. This variant
+    /// carries the same `(request_id, partner)` pair on every request so the head can key the
+    /// capture on the real tenant from turn one.
+    ///
+    /// Field types deliberately mirror [`WarmHint`]'s (`request_id` = the 16-byte UUID, `partner` =
+    /// the raw tenant string) so the enterprise's existing request-id→tenant stash takes this frame
+    /// unchanged. `partner` is bounded by [`MAX_PARTNER_LEN`] at the frame boundary.
+    TenantHint {
+        request_id: [u8; 16],
+        partner: String,
+    },
 }
+
+/// Cap on the UTF-8 byte length of [`KvMessage::TenantHint`]'s `partner`, enforced by
+/// [`crate::encode_frame`]/[`crate::decode_frame`] so an over-long tenant is a rejected frame rather
+/// than a partially applied one. Real tenant ids are PASETO `sub` claims or `"default"` — tens of
+/// bytes — so 256 is far above any legitimate value while keeping a forged frame from making a head
+/// allocate, log, or cache-key on an attacker-sized string. Deliberately NOT applied to the older
+/// string-bearing variants: they predate the cap and tightening them would change which existing
+/// frames a head accepts.
+pub const MAX_PARTNER_LEN: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +278,10 @@ mod tests {
                 prev_chain_id: [9u8; 32],
                 rank: 1,
             },
+            KvMessage::TenantHint {
+                request_id: [3u8; 16],
+                partner: "acme".into(),
+            },
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
@@ -297,9 +324,18 @@ mod tests {
             standard(),
         )
         .unwrap();
+        assert_eq!(v2[0], 15, "WarmResumeTriggerV2 is appended 5th, index 15");
+        let tenant = bincode::serde::encode_to_vec(
+            KvMessage::TenantHint {
+                request_id: [0u8; 16],
+                partner: "acme".into(),
+            },
+            standard(),
+        )
+        .unwrap();
         assert_eq!(
-            v2[0], 15,
-            "WarmResumeTriggerV2 is the LAST appended variant (index 15)"
+            tenant[0], 16,
+            "TenantHint is the LAST appended variant (index 16)"
         );
     }
 }

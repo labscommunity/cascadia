@@ -5,7 +5,7 @@
 
 use bincode::config::standard;
 
-use crate::envelope::KvMessage;
+use crate::envelope::{KvMessage, MAX_PARTNER_LEN};
 
 /// Hard cap on a single control frame (DoS guard, §13). Bulk KV payloads are streamed as their own
 /// frames and bounded separately by `max_snapshot_bytes`.
@@ -13,7 +13,7 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// Declared length exceeds [`MAX_FRAME_LEN`].
+    /// A declared or embedded length exceeds its cap ([`MAX_FRAME_LEN`], [`MAX_PARTNER_LEN`]).
     TooLarge,
     /// Body did not decode as a `KvMessage`.
     Decode,
@@ -23,8 +23,23 @@ pub enum FrameError {
     Incomplete,
 }
 
+/// Per-variant field caps that bincode cannot express. Only `TenantHint` is checked: it is the one
+/// variant whose cap was declared with it. The other string-bearing variants predate the cap and are
+/// deliberately left alone — tightening them here would change which already-valid frames a head
+/// accepts, which is a wire behaviour change, not a bounds fix.
+fn fields_within_caps(msg: &KvMessage) -> bool {
+    match msg {
+        KvMessage::TenantHint { partner, .. } => partner.len() <= MAX_PARTNER_LEN,
+        _ => true,
+    }
+}
+
 /// Encode one `KvMessage` as a length-prefixed frame.
 pub fn encode_frame(msg: &KvMessage) -> Result<Vec<u8>, FrameError> {
+    // Symmetric with decode: a local bug must not emit a frame every peer is obliged to drop.
+    if !fields_within_caps(msg) {
+        return Err(FrameError::TooLarge);
+    }
     let body = bincode::serde::encode_to_vec(msg, standard()).map_err(|_| FrameError::Encode)?;
     if body.len() as u64 > u64::from(MAX_FRAME_LEN) {
         return Err(FrameError::TooLarge);
@@ -56,6 +71,11 @@ pub fn decode_frame(buf: &[u8]) -> Result<(KvMessage, usize), FrameError> {
     // structural anomaly; reject rather than silently swallow it.
     if consumed != len as usize {
         return Err(FrameError::Decode);
+    }
+    // Caps are enforced here, at the single ingress, so an over-long field can never reach a caller
+    // half-applied — the whole frame is rejected and the stream is torn down (→ reprefill).
+    if !fields_within_caps(&msg) {
+        return Err(FrameError::TooLarge);
     }
     Ok((msg, end))
 }
@@ -131,6 +151,41 @@ mod tests {
         buf.extend_from_slice(&body);
         buf.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // junk counted inside the frame length
         assert_eq!(decode_frame(&buf), Err(FrameError::Decode));
+    }
+
+    /// Wrap an already-encoded body in a length prefix, bypassing `encode_frame`'s own caps — the
+    /// only way to build the frame a hostile peer would send.
+    fn forge(body: &[u8]) -> Vec<u8> {
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn oversized_tenant_hint_partner_is_rejected_both_ways() {
+        let msg = KvMessage::TenantHint {
+            request_id: [1u8; 16],
+            partner: "a".repeat(crate::MAX_PARTNER_LEN + 1),
+        };
+        assert_eq!(encode_frame(&msg), Err(FrameError::TooLarge));
+        let body = bincode::serde::encode_to_vec(&msg, standard()).unwrap();
+        assert_eq!(decode_frame(&forge(&body)), Err(FrameError::TooLarge));
+        // The cap is a cap, not an off-by-one: exactly MAX_PARTNER_LEN still rides.
+        let at_cap = KvMessage::TenantHint {
+            request_id: [1u8; 16],
+            partner: "a".repeat(crate::MAX_PARTNER_LEN),
+        };
+        let bytes = encode_frame(&at_cap).unwrap();
+        assert_eq!(decode_frame(&bytes).unwrap().0, at_cap);
+    }
+
+    #[test]
+    fn non_utf8_tenant_hint_partner_is_rejected() {
+        // Tag 16 (TenantHint) ++ 16-byte request_id ++ varint len 2 ++ two invalid UTF-8 bytes.
+        let mut body = vec![16u8];
+        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&[2, 0xff, 0xfe]);
+        assert_eq!(decode_frame(&forge(&body)), Err(FrameError::Decode));
     }
 
     #[test]
