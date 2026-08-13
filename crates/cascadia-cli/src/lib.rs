@@ -2032,6 +2032,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             sampling: cascadia_types::SamplingParams::default(),
             enable_thinking: false,
             trust_remote_code: false,
+            tenant: String::new(), // H.1b: single-tenant CLI path — LOCAL_NS
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine

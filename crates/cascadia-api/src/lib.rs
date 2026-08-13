@@ -1835,6 +1835,10 @@ async fn chat_completions(
         sampling: req.sampling_params(),
         enable_thinking,
         trust_remote_code: false,
+        // H.1b: hardcoded, never read from the request. The tenant is a KV-namespace boundary; a
+        // client that could set it from request JSON could name another tenant's namespace and
+        // resume off its prefix. The real value is assigned server-side from the admitted identity.
+        tenant: String::new(),
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2049,6 +2053,8 @@ async fn completions(
         sampling: req.sampling_params(),
         enable_thinking: false,
         trust_remote_code: false,
+        // H.1b: hardcoded server-side; see the note on the chat endpoint's task above.
+        tenant: String::new(),
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
