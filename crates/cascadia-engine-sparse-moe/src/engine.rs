@@ -3792,6 +3792,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
 
     fn insert(
         &mut self,
+        partner: &str,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
@@ -3820,14 +3821,15 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let fp = self.runner.fingerprint();
         let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
         // Mirror into the holder cache so a busy engine still serves this prefix lock-free. Tagged
-        // with the manifest's partner (issue-34 H.1a) — the tenant this pull was served to.
+        // with the ASSERTED partner (H.1b §12.10.0a) — never manifest.partner, which the serving
+        // holder stamps and nothing validates.
         self.kv_share
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prefix
-            .insert_pulled(&manifest.partner.0, prefix.clone(), &fp, snap.clone());
+            .insert_pulled(partner, prefix.clone(), &fp, snap.clone());
         self.kv_prefix_cache
-            .insert_pulled(&manifest.partner.0, prefix, &fp, snap);
+            .insert_pulled(partner, prefix, &fp, snap);
         Ok(())
     }
 

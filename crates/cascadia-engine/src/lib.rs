@@ -216,9 +216,17 @@ pub trait KvCoordination {
     ) -> Option<(cascadia_kv_wire::Manifest, Vec<(Vec<u8>, Vec<u8>)>)>;
     /// Consumer INSERT: materialize a pulled, validated snapshot into the cache so the next prefill
     /// auto-hits. `Err(())` ⇒ rejected / OOM (the rank votes fail).
+    ///
+    /// `partner` is the tenant the PULLER asserted in its own GET — never `manifest.partner`, which
+    /// the serving holder stamps and nothing validates (H.1b hard gate, design §12.10.0a). Keying on
+    /// the echoed value lets a hostile or misconfigured holder return a blob stamped `tenant-b` for
+    /// `tenant-a`'s pull: `tenant-a`'s warm resume silently goes cold, and `tenant-b`'s next
+    /// NEGOTIATE against this node answers `Some((epoch, len))` for a prefix it never sent — the
+    /// incremental length oracle H.1 exists to close, re-opened by a remote party.
     #[allow(clippy::result_unit_err)]
     fn insert(
         &mut self,
+        partner: &str,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()>;

@@ -2759,11 +2759,14 @@ impl cascadia_engine::KvCoordination for OvDistSpecEngine {
     }
     fn insert(
         &mut self,
+        partner: &str,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.insert_both(&manifest.partner.0, tokens, blob);
+        // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
+        // the serving holder stamps and nothing validates.
+        self.kv.insert_both(partner, tokens, blob);
         Ok(())
     }
     // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
@@ -2904,11 +2907,14 @@ impl cascadia_engine::KvCoordination for OvDistSpecWorkerEngine {
     }
     fn insert(
         &mut self,
+        partner: &str,
         manifest: &cascadia_kv_wire::Manifest,
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
-        self.kv.insert_both(&manifest.partner.0, tokens, blob);
+        // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
+        // the serving holder stamps and nothing validates.
+        self.kv.insert_both(partner, tokens, blob);
         Ok(())
     }
     // Issue-34 cross-chain CHAIN path: a downstream rank's pulled blob can't be used locally; stash it
