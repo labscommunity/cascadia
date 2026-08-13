@@ -1537,6 +1537,20 @@ fn call_from_xml_function(block: &str) -> Option<ToolCall> {
     })
 }
 
+/// Shape test for a bare tool-call name with no arguments: `^[A-Za-z_][A-Za-z0-9_.-]*$`.
+/// Prose disqualifies itself — it contains spaces or punctuation this pattern
+/// excludes — so this is what separates GLM's zero-argument call shape
+/// (`<tool_call>get_current_time\n</tool_call>`) from arbitrary text that
+/// happens to land inside a `<tool_call>` block without `<arg_key>`.
+fn is_bare_function_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 /// GLM-4.5+/GLM-5 `<tool_call>` dialect: the function name sits bare right
 /// after the open tag, followed by `<arg_key>`/`<arg_value>` pairs.
 ///
@@ -1556,11 +1570,29 @@ fn call_from_xml_function(block: &str) -> Option<ToolCall> {
 /// else v` — so a value that parses as JSON is kept as that JSON type and
 /// anything else stays a string. Parsing a bare `Paris` as JSON fails, which is
 /// correct: it is a string.
+///
+/// A zero-argument call has no `<arg_key>` at all — just the bare name, e.g.
+/// `<tool_call>get_current_time\n</tool_call>` — and is emitted with
+/// `arguments: "{}"`. See [`is_bare_function_name`] for how that's told apart
+/// from prose landing in a block with no `<arg_key>`.
 fn call_from_glm_arg_kv(block: &str) -> Option<ToolCall> {
-    // The name is everything before the first key, so a block with no
-    // `<arg_key>` at all is either a different dialect or malformed — bail
-    // rather than invent a zero-argument call out of arbitrary prose.
-    let first_key = block.find("<arg_key>")?;
+    // No `<arg_key>` at all is either a different dialect, or GLM's
+    // zero-argument shape: `<tool_call>name\n</tool_call>`, a bare function
+    // name and nothing else. Distinguish by shape rather than bailing
+    // outright — arbitrary prose must still be rejected, but prose always
+    // contains whitespace/punctuation a bare identifier doesn't, so the shape
+    // test alone tells them apart without inventing a call from free text.
+    let Some(first_key) = block.find("<arg_key>") else {
+        let name = block.trim();
+        return is_bare_function_name(name).then(|| ToolCall {
+            id: format!("call_{}", Uuid::new_v4().simple()),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+    };
     let name = block[..first_key].trim();
     if name.is_empty() || name.contains('<') {
         return None;
@@ -3728,6 +3760,51 @@ mod tests {
         )
         .expect("Qwen3 XML dialect must still parse");
         assert_eq!(calls[0].function.name, "lookup");
+    }
+
+    #[test]
+    fn parse_tool_calls_glm_zero_argument_call() {
+        // EXACTLY the shape GLM's chat_template emits for a call with no
+        // arguments: the bare function name, no `<arg_key>` at all. Before
+        // this shape test existed, the missing `<arg_key>` bailed out
+        // entirely and the raw markup shipped as assistant content with
+        // finish_reason "stop" — every zero-argument tool (get_current_time,
+        // list_files, ...) was unusable.
+        let calls = parse_tool_calls("<tool_call>get_current_time</tool_call>")
+            .expect("bare zero-argument call must parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_current_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+
+        // Matching the template's actual output: newline before the close tag.
+        let calls = parse_tool_calls("<tool_call>get_current_time\n</tool_call>")
+            .expect("bare call with trailing newline must parse");
+        assert_eq!(calls[0].function.name, "get_current_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+
+        // Whitespace on both sides too.
+        let calls = parse_tool_calls("<tool_call>\n  list_files  \n</tool_call>")
+            .expect("bare call with surrounding whitespace must parse");
+        assert_eq!(calls[0].function.name, "list_files");
+        assert_eq!(calls[0].function.arguments, "{}");
+
+        // The guard against fabricating calls from prose must still hold:
+        // multi-word text has no `<arg_key>` either but must NOT parse.
+        assert!(parse_tool_calls("<tool_call>this is not a function name</tool_call>").is_none());
+
+        // A zero-arg call alongside a normal call with arguments: both must
+        // parse, in order, and the fallback must not consume the second block.
+        let calls = parse_tool_calls(
+            "<tool_call>get_current_time</tool_call>\
+             <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        )
+        .expect("both calls must parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "get_current_time");
+        assert_eq!(calls[0].function.arguments, "{}");
+        assert_eq!(calls[1].function.name, "get_weather");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[1].function.arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
     }
 
     #[test]
