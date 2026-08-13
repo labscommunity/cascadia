@@ -17,6 +17,7 @@ members = [
     "crates/cascadia-api",
     "crates/cascadia-dashboard",
     "crates/cascadia-cli",
+    "crates/cascadia-elastic",
     "crates/cascadia",
     "tests-e2e",
 ]
@@ -46,6 +47,7 @@ cascadia-download = { path = "crates/cascadia-download" }
 cascadia-api = { path = "crates/cascadia-api" }
 cascadia-dashboard = { path = "crates/cascadia-dashboard" }
 cascadia-cli = { path = "crates/cascadia-cli" }
+cascadia-elastic = { path = "crates/cascadia-elastic" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
