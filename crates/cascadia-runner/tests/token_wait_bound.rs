@@ -1,4 +1,4 @@
-//! cascadia-enterprise #40: a head whose downstream stops answering must
+//! Internal tracker, issue #40: a head whose downstream stops answering must
 //! release the engine mutex on its own deadline, and must NOT drop the socket.
 //!
 //! Both halves are the whole point of the bounded token recv, and neither is

@@ -809,7 +809,7 @@ async fn recv_hidden_frames(
 /// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
 /// letting it govern the token wait would re-couple the engine-lock hold to it —
 /// a high `recv_timeout` would re-grow the self-heal latency the bounded recv
-/// exists to cap (cascadia-enterprise #40). A token *response* of an ACTIVE
+/// exists to cap (internal tracker, issue #40). A token *response* of an ACTIVE
 /// generation has a tight real deadline regardless, so cap it here.
 const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
 
