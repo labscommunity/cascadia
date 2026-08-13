@@ -958,6 +958,15 @@ fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bo
     peer_disconnected && !already_reported
 }
 
+/// Widened deadline for a BATCHED prefill window's owed Token reply — see
+/// `PipelineEngine::reply_deadline_prefill`. Split out as a free function
+/// (rather than inline in the generic `impl<R: StagedRunner>` block) so the
+/// arithmetic is unit testable without standing up a `StagedRunner`. Pure,
+/// for testing.
+fn prefill_reply_budget(recv_timeout: std::time::Duration) -> std::time::Duration {
+    recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+}
+
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
 /// per call, so the OS-level backpressure of returning QueueFull is
 /// preferable to silently accreting tasks the engine will not reach for
@@ -2981,6 +2990,19 @@ impl<R: StagedRunner> PipelineEngine<R> {
         cascadia_transport::recv_timeout()
     }
 
+    /// Strict deadline for the Token reply owed to a BATCHED prefill window
+    /// (`forward_prompt_batch_first` / the mid-rank relay in
+    /// `handle_forward_batch_prefill`): unlike dsv4's per-token forwarding,
+    /// every remaining downstream stage must run the WHOLE window (up to
+    /// `MAX_BATCH_COUNT` rows) through compute before replying, so the
+    /// per-token `reply_deadline` above is far too tight — the same widening
+    /// `recv_token_from_downstream` in cascadia-engine-openvino applies for
+    /// its chunked-prefill path, so the two crates agree on what "a prefill
+    /// budget" means.
+    fn reply_deadline_prefill() -> std::time::Duration {
+        prefill_reply_budget(cascadia_transport::recv_timeout())
+    }
+
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
         // Token-streaming state machine. When idle, `begin_generation` pops the
         // next task, runs prefill (batched or per-token), and stashes the
@@ -3604,19 +3626,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                     .await
                     .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
                 }
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::Token)) => {
-                        let t = recv_token_body_client(down)
-                            .await
-                            .map_err(|e| format!("recv_token: {e}"))?;
-                        send_token_upstream(upstream, t)
-                            .await
-                            .map_err(|e| format!("relay token: {e}"))
-                    }
-                    Ok(Some(other)) => Err(format!("mid rank expected Token, got {other:?}")),
-                    Ok(None) => Err("downstream closed before Token".into()),
-                    Err(e) => Err(format!("recv_kind: {e}")),
-                }
+                // This window's Token reply is owed only after every downstream
+                // stage finishes the WHOLE window, not one token — the per-token
+                // `reply_deadline` above would read a merely-busy peer as dead.
+                // An unbounded recv here (the prior bug) falls through to the
+                // 900s frame-idle ceiling, which is connection-fatal and drops
+                // `ActivationClient::sock` for good (only `Builder::connect`
+                // redials it) — killing this link, and every rank upstream of
+                // it, for the rest of the process.
+                let t = crate::dist::recv_token_reply(down, Self::reply_deadline_prefill()).await?;
+                send_token_upstream(upstream, t)
+                    .await
+                    .map_err(|e| format!("relay token: {e}"))
             })
         }
     }
@@ -3669,14 +3690,13 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 .await
                 .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
             }
-            match recv_kind_client(downstream).await {
-                Ok(Some(FrameKind::Token)) => recv_token_body_client(downstream)
-                    .await
-                    .map_err(|e| format!("recv_token: {e}")),
-                Ok(Some(other)) => Err(format!("rank 0 expected Token, got {other:?}")),
-                Ok(None) => Err("downstream closed before Token".into()),
-                Err(e) => Err(format!("recv_kind: {e}")),
-            }
+            // Same rule as the mid-rank relay: this window's Token reply is
+            // owed only after every downstream stage finishes the whole
+            // window, so it needs the widened prefill deadline, not the
+            // per-token one — and never the raw, unbounded recv (see the
+            // comment on the mid-rank relay above `handle_forward_batch_prefill`
+            // for why that's connection-fatal, not just slow).
+            crate::dist::recv_token_reply(downstream, Self::reply_deadline_prefill()).await
         })
     }
 }
@@ -3844,5 +3864,37 @@ mod tests {
         // The Err step() returns on that one report is connection-fatal, so
         // run_relay_loop exits ConnectionFatal.
         assert!(EngineError::NotConnected.is_connection_fatal());
+    }
+
+    // -------- batched-prefill reply deadline (regression for the unbounded
+    // recv_kind_client/recv_token_body_client pair — see `prefill_reply_budget`
+    // and its two call sites in `handle_forward_batch_prefill` /
+    // `forward_prompt_batch_first`) --------
+
+    #[test]
+    fn prefill_reply_budget_widens_by_the_shared_factor() {
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout),
+            recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_exceeds_the_per_token_reply_deadline() {
+        // The defect under test: a batched prefill window waits on every
+        // remaining stage's WHOLE window of compute, not one token, so its
+        // budget must be strictly wider than the per-token `reply_deadline`
+        // (== recv_timeout, unwidened) — never silently equal to it.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert!(prefill_reply_budget(recv_timeout) > recv_timeout);
+    }
+
+    #[test]
+    fn prefill_reply_budget_saturates_instead_of_panicking() {
+        // saturating_mul must not panic on an absurd configured recv_timeout;
+        // Duration's `*` would.
+        let huge = std::time::Duration::MAX;
+        assert_eq!(prefill_reply_budget(huge), std::time::Duration::MAX);
     }
 }

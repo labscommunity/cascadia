@@ -768,3 +768,66 @@ impl StageTransport {
         self.downstream.is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand up a connected (client, server) loopback pair, mirroring the
+    /// cascadia-engine-openvino runtime tests' helper of the same shape.
+    async fn loopback() -> (ActivationClient, ActivationServer) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let server = h.await.unwrap();
+        (client, server)
+    }
+
+    /// `recv_token_reply` is the bounded helper the batched-prefill call
+    /// sites (`PipelineEngine::forward_prompt_batch_first`, the mid-rank
+    /// relay in `handle_forward_batch_prefill`) were switched to, replacing a
+    /// raw `recv_kind_client` / `recv_token_body_client` pair with no
+    /// deadline at all. A silent peer must surface as a timeout `Err` within
+    /// `deadline`, not hang past it — the pre-fix behavior fell through to
+    /// the ~900s frame-idle ceiling, which is connection-fatal and
+    /// permanently drops the client socket (only `Builder::connect` redials
+    /// it), killing the link for the rest of the process.
+    #[tokio::test]
+    async fn recv_token_reply_times_out_on_a_silent_peer_instead_of_hanging() {
+        let (client, _server) = loopback().await;
+        let downstream = Mutex::new(client);
+        let deadline = std::time::Duration::from_millis(150);
+        let start = std::time::Instant::now();
+        let err = recv_token_reply(&downstream, deadline).await.unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must surface near `deadline`, not fall through to the frame-idle \
+             ceiling: took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.contains("reply timeout"),
+            "expected a reply-timeout error, got: {err}"
+        );
+    }
+
+    /// Happy path: the token still arrives correctly through the bounded
+    /// helper when the peer replies promptly.
+    #[tokio::test]
+    async fn recv_token_reply_returns_the_token_within_deadline() {
+        let (client, server) = loopback().await;
+        let downstream = Mutex::new(client);
+        let upstream = Mutex::new(server);
+        send_token_upstream(&upstream, 42).await.unwrap();
+        let tok = recv_token_reply(&downstream, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(tok, 42);
+    }
+}
