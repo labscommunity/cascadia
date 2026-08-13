@@ -1516,7 +1516,7 @@ impl SparseMoEEngine {
         #[cfg(feature = "kv_coord")]
         let warm_prefix: usize = if !use_spec && self.kv_prefix_cache.enabled() {
             let fp = self.runner.fingerprint();
-            match self.kv_prefix_cache.lookup(&prompt_ids, &fp) {
+            match self.kv_prefix_cache.lookup_local(&prompt_ids, &fp) {
                 Some((snap, plane_pulled)) => {
                     let matched = snap.past_seq_len;
                     let prefix32: Vec<i32> =
@@ -3068,7 +3068,7 @@ impl OvMoeEngine {
         let warm_prefix: usize = if self.kv_prefix_cache.enabled() {
             let prompt64: Vec<i64> = prompt_ids.iter().map(|&t| i64::from(t)).collect();
             let fp = self.runner.fingerprint();
-            match self.kv_prefix_cache.lookup(&prompt64, &fp) {
+            match self.kv_prefix_cache.lookup_local(&prompt64, &fp) {
                 Some((snap, plane_pulled)) => {
                     let matched = snap.past_seq_len;
                     // The workers stashed their slices under E = synth_epoch(the captured token
@@ -3746,17 +3746,19 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         Some(enc.get_ids().iter().map(|&u| u as i32).collect())
     }
 
-    fn lookup(&mut self, _partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
+    fn lookup(&mut self, partner: &str, token_ids: &[i32]) -> Option<(u64, u32)> {
         if !self.kv_prefix_cache.enabled() {
             return None;
         }
         let fp = self.runner.fingerprint();
         let prompt: Vec<i64> = token_ids.iter().map(|&t| i64::from(t)).collect();
-        let (snap, _) = self.kv_prefix_cache.lookup(&prompt, &fp)?;
+        // Namespaced (issue-34 H.1a): a cross-tenant NEGOTIATE reads as an empty cache, not a
+        // truncated length — see `OvMoeKvPrefixCache::lookup_ns`.
+        let (snap, _) = self.kv_prefix_cache.lookup_ns(partner, &prompt, &fp)?;
         let len = snap.past_seq_len;
         let prefix = token_ids.get(..len)?.to_vec();
         let epoch = crate::kv_coordination::synth_epoch(&prefix);
-        self.kv_offers.stash(epoch, prefix, snap);
+        self.kv_offers.stash(partner, epoch, prefix, snap);
         Some((epoch, len as u32))
     }
 
@@ -3769,7 +3771,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         // Plane-level fp so a cross-chain consumer validating against the moved-to head's fp accepts
         // this (differently-sliced) rank's manifest.
         let model_fp = self.runner.fingerprint().plane_digest();
-        let (prefix, snap) = if let Some(off) = self.kv_offers.take(expected_epoch) {
+        let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
         } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
             (tokens.clone(), snap.clone())
@@ -3817,13 +3819,15 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         }
         let fp = self.runner.fingerprint();
         let prefix: Vec<i64> = manifest.token_ids.iter().map(|&t| i64::from(t)).collect();
-        // Mirror into the holder cache so a busy engine still serves this prefix lock-free.
+        // Mirror into the holder cache so a busy engine still serves this prefix lock-free. Tagged
+        // with the manifest's partner (issue-34 H.1a) — the tenant this pull was served to.
         self.kv_share
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .prefix
-            .insert_pulled(prefix.clone(), &fp, snap.clone());
-        self.kv_prefix_cache.insert_pulled(prefix, &fp, snap);
+            .insert_pulled(&manifest.partner.0, prefix.clone(), &fp, snap.clone());
+        self.kv_prefix_cache
+            .insert_pulled(&manifest.partner.0, prefix, &fp, snap);
         Ok(())
     }
 
