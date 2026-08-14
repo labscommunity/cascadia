@@ -33,8 +33,8 @@ const PREFETCH_EXPERTS: usize = 32;
 /// The layer range `[lo, hi)` that rank `rank` of `total` owns.
 ///
 /// Single source of truth for the split: [`GlmRunner::load_staged`] derives its
-/// slice from this, and out-of-process consumers (cascadia-enterprise) call it to
-/// fill the `ShardDescriptor` layer range the scheduler's contiguity rule reads.
+/// slice from this, and out-of-process consumers call it to fill the
+/// `ShardDescriptor` layer range the scheduler's contiguity rule reads.
 /// A descriptor that disagrees with what the engine actually loaded breaks chain
 /// formation silently, so there must be exactly one implementation.
 ///

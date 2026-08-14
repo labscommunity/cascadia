@@ -1,7 +1,7 @@
 //! `layer_split` is the single source of truth for a rank's layer range.
 //!
-//! `load_staged` derives its slice from it, and cascadia-enterprise publishes the
-//! same range in a `ShardDescriptor` that the scheduler's contiguity rule
+//! `load_staged` derives its slice from it, and the out-of-process scheduler
+//! publishes the same range in a `ShardDescriptor` whose contiguity rule
 //! consumes. A gap, an overlap, or an orphaned head layer does not surface as an
 //! inference error — it breaks chain formation silently — so the guarantees are
 //! asserted here rather than assumed by callers.
