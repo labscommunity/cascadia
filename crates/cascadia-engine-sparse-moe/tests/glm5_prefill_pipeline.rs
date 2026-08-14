@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cascadia_engine_sparse_moe::dist::{
-    recv_forward_batch_body_server, recv_kind_server, send_forward_batch_prefill, FrameKind,
+    recv_forward_batch_body_server, recv_kind_server, send_forward_batch_prefill,
+    send_forward_batch_prefill_nosample, FrameKind,
 };
 use cascadia_engine_sparse_moe::glm::loader::load_model;
 use cascadia_engine_sparse_moe::glm::stage::{GlmRunner, StageOpts};
@@ -102,6 +103,146 @@ async fn pipeline_prefill(dir: &Path, max_seq: usize, m: usize, prompt: &[u32]) 
     // last rank: head logits at the final position.
     let last = (rows - 1) * hsz as usize;
     ranks[m - 1].head_logits(&h[last..last + hsz as usize])
+}
+
+/// Push `prompt` through an `m`-rank pipeline as a SEQUENCE of `window`-row
+/// frames — the shape a prompt longer than `MAX_BATCH_COUNT` takes — and return
+/// the last rank's head logits at the final position. Every window but the last
+/// travels as `ForwardBatchPrefillNoSample`; `base` accumulates across them so
+/// each rank's KV grows exactly as it would token-by-token.
+async fn pipeline_prefill_windowed(
+    dir: &Path,
+    max_seq: usize,
+    m: usize,
+    prompt: &[u32],
+    window: usize,
+) -> Vec<f32> {
+    let mut ranks: Vec<GlmRunner> = (0..m)
+        .map(|r| {
+            GlmRunner::load_staged(dir, max_seq, r as u32, m as u32, 0, 0, Default::default())
+                .expect("load rank")
+        })
+        .collect();
+    for r in &mut ranks {
+        r.reset();
+    }
+    let hsz = ranks[0].hidden_size() as u32;
+
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..m.saturating_sub(1) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let server = Arc::new(Mutex::new(server));
+        let sc = server.clone();
+        let atask = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client
+            .connect_with_timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        atask.await.unwrap();
+        clients.push(Arc::new(Mutex::new(client)));
+        servers.push(server);
+    }
+
+    let cfg = SamplingConfig::default();
+    let mut base = 0usize;
+    let mut out = Vec::new();
+    for chunk in prompt.chunks(window) {
+        let rows = chunk.len();
+        let is_last = base + rows == prompt.len();
+
+        let mut batch = vec![0.0f32; rows * hsz as usize];
+        for (r, &t) in chunk.iter().enumerate() {
+            batch[r * hsz as usize..(r + 1) * hsz as usize]
+                .copy_from_slice(&ranks[0].embed_token(t));
+        }
+        let mut h = ranks[0].forward_layers_batch(batch, base, rows);
+
+        for i in 0..m - 1 {
+            let client = clients[i].clone();
+            let cfg2 = cfg.clone();
+            let hsend = h;
+            let rows32 = rows as u32;
+            let base32 = base as u32;
+            let send = tokio::spawn(async move {
+                let shape = [1, rows32, hsz];
+                if is_last {
+                    send_forward_batch_prefill(&client, base32, rows32, &cfg2, &hsend, shape)
+                        .await
+                        .unwrap();
+                } else {
+                    send_forward_batch_prefill_nosample(
+                        &client, base32, rows32, &cfg2, &hsend, shape,
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let k = recv_kind_server(&servers[i]).await.unwrap();
+            let want = if is_last {
+                FrameKind::ForwardBatchPrefill
+            } else {
+                FrameKind::ForwardBatchPrefillNoSample
+            };
+            assert_eq!(k, Some(want), "relay {i} at base {base}: wrong frame kind");
+            let (start, count, _s, hw, _shape) =
+                recv_forward_batch_body_server(&servers[i]).await.unwrap();
+            assert_eq!(start as usize, base, "relay {i}: wrong window base");
+            assert_eq!(count as usize, rows);
+            send.await.unwrap();
+            h = ranks[i + 1].forward_layers_batch(hw, base, rows);
+        }
+
+        if is_last {
+            let last = (rows - 1) * hsz as usize;
+            out = ranks[m - 1].head_logits(&h[last..last + hsz as usize]);
+        }
+        base += rows;
+    }
+    out
+}
+
+/// A prompt longer than `MAX_BATCH_COUNT` (256) cannot ride one frame, so it is
+/// prefilled as a sequence of windows. This pins the part that can silently
+/// corrupt output: KV continuity across windows on EVERY rank, over the real
+/// frames, for M ∈ {1,2,4}. A dropped window, a wrong `base`, or a rank that
+/// fails to accumulate would all change the final logits.
+///
+/// Deliberately NOT covered here, because neither is reachable from a test:
+/// `PipelineEngine`'s own window-loop arithmetic (its constructor is private and
+/// rank 0 needs a tokenizer the fixture doesn't ship), and the "no mid-prompt row
+/// enters the last rank's rep-penalty history" property (`last_rank_history` is
+/// private). The latter is structurally implied by the NoSample frame kind,
+/// which this test does assert is the one carrying every non-final window.
+#[tokio::test]
+async fn glm5_multi_window_prefill_matches_single_process() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
+    // 300 rows over a 16-token vocab: two windows at the real 256 cap.
+    let prompt: Vec<u32> = (0..300u32).map(|i| i % 16).collect();
+    let max_seq = 320usize;
+    let window = 256usize;
+    assert!(
+        prompt.len() > window,
+        "prompt must span more than one window or this test proves nothing"
+    );
+
+    let want = load_model(&dir, max_seq)
+        .expect("load_model")
+        .prefill(&prompt);
+    let want_tok = argmax(&want);
+
+    for m in [1usize, 2, 4] {
+        let got = pipeline_prefill_windowed(&dir, max_seq, m, &prompt, window).await;
+        assert_eq!(got.len(), want.len(), "M={m}: logit length mismatch");
+        assert_eq!(
+            got, want,
+            "M={m}: windowed prefill diverged from single-process prefill"
+        );
+        assert_eq!(argmax(&got), want_tok, "M={m}: first-token argmax mismatch");
+    }
 }
 
 #[tokio::test]
