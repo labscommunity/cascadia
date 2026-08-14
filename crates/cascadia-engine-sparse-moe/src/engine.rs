@@ -3171,8 +3171,14 @@ impl<R: StagedRunner> PipelineEngine<R> {
             // miss) is the original full-prefill behaviour.
             let reuse = if self.runner.prefix_cache_enabled() {
                 match self.prefix_reuse(&prompt_ids[..n_prefill]) {
-                    Some((key, k)) => {
-                        self.runner.restore_prefix(key);
+                    // Only reuse when this rank actually restored, and to the
+                    // length the index promised. A miss means the index and the
+                    // slice caches disagree; a different length means the cached
+                    // snapshot does not describe `k` tokens. Either way the peers
+                    // have not been told to restore yet, so falling back to a full
+                    // prefill is safe — but `restore_prefix` sets `pos` on a hit,
+                    // so undo it before prefilling from base 0.
+                    Some((key, k)) if self.runner.restore_prefix(key) == Some(k) => {
                         if let Err(e) = self.block_on(send_restore_prefix(&downstream, key)) {
                             warn!(task = %id, "send_restore_prefix failed: {e}");
                             return Some(vec![(
@@ -3188,6 +3194,18 @@ impl<R: StagedRunner> PipelineEngine<R> {
                             "glm5 kv-prefix cache HIT: prefilling suffix only"
                         );
                         k
+                    }
+                    Some((key, k)) => {
+                        warn!(
+                            task = %id,
+                            expected = k,
+                            "glm5 kv-prefix cache index/slice disagreement; full prefill"
+                        );
+                        // Drop the stale entry so the next turn of this
+                        // conversation does not re-miss on the same key.
+                        self.prefix_index.retain(|(_, k2)| *k2 != key);
+                        self.runner.reset();
+                        0
                     }
                     None => 0,
                 }
@@ -3472,12 +3490,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
             }
             FrameKind::RestorePrefix => match self.block_on(recv_key_body_server(&upstream)) {
                 Ok(key) => {
-                    self.runner.restore_prefix(key);
-                    match downstream.as_ref() {
-                        Some(down) => self
-                            .block_on(send_restore_prefix(down, key))
-                            .map_err(|e| format!("relay restore_prefix: {e}")),
-                        None => Ok(()),
+                    // Rank 0 only sends this after restoring the key itself, so a
+                    // miss here means this rank's slice cache has diverged from the
+                    // driver's index — every rank is meant to hold the same keys.
+                    // Continuing would leave this rank at position 0 while rank 0
+                    // prefills from the reused length, which trips the batch
+                    // position assert one frame later with a generic message.
+                    // Latch instead, the same way a malformed frame does, so the
+                    // stage tears down at the point of divergence. Don't relay: the
+                    // ranks below us must not restore either.
+                    if self.runner.restore_prefix(key).is_none() {
+                        self.peer_disconnected = true;
+                        Err(format!(
+                            "restore_prefix: key {key} absent from this rank's slice cache \
+                             (kv-prefix cache diverged from rank 0)"
+                        ))
+                    } else {
+                        match downstream.as_ref() {
+                            Some(down) => self
+                                .block_on(send_restore_prefix(down, key))
+                                .map_err(|e| format!("relay restore_prefix: {e}")),
+                            None => Ok(()),
+                        }
                     }
                 }
                 Err(e) => {
