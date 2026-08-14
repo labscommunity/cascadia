@@ -1614,19 +1614,26 @@ fn call_from_glm_arg_kv(block: &str) -> Option<ToolCall> {
     let mut args = serde_json::Map::new();
     let mut rest = &block[first_key..];
     while let Some(ks) = rest.find("<arg_key>") {
+        // A malformed pair means the block does not say what the model asked
+        // for, so no call is emitted. These used to `break`, which fell through
+        // to the unconditional `Some(..)` below and fired the call with the
+        // arguments parsed so far — `send(to = "a@b.com")` with `body` silently
+        // gone, reported as a clean `finish_reason: "tool_calls"`. Truncation
+        // here is not rare: an `<arg_value>` containing the literal
+        // `</tool_call>` ends the block early, which is routine when an agent
+        // writes about the tool-call format itself.
+        //
+        // A complete set of pairs followed by trailing junk is dropped too.
+        // Without consulting the request's tool schemas there is no way to tell
+        // that apart from a truncation, and dropping fires nothing wrong where
+        // the old behaviour fired something wrong.
         let ka = &rest[ks + "<arg_key>".len()..];
-        let Some(ke) = ka.find("</arg_key>") else {
-            break;
-        };
+        let ke = ka.find("</arg_key>")?;
         let key = ka[..ke].trim().to_string();
         let after_key = &ka[ke + "</arg_key>".len()..];
-        let Some(vs) = after_key.find("<arg_value>") else {
-            break;
-        };
+        let vs = after_key.find("<arg_value>")?;
         let va = &after_key[vs + "<arg_value>".len()..];
-        let Some(ve) = va.find("</arg_value>") else {
-            break;
-        };
+        let ve = va.find("</arg_value>")?;
         let raw = va[..ve].trim();
         if !key.is_empty() {
             let value = serde_json::from_str::<serde_json::Value>(raw)
@@ -3844,6 +3851,44 @@ mod tests {
         // inventing a zero-argument call from arbitrary text would be worse
         // than dropping it.
         assert!(parse_tool_calls("<tool_call>just some prose</tool_call>").is_none());
+
+        // A truncated pair must drop the whole call, not fire it with the
+        // arguments gathered so far. Each of the three exit points gets a case.
+        // The realistic trigger is the second one: an <arg_value> holding the
+        // literal </tool_call> ends the block early, so `body` never closes.
+        // Each case is a properly CLOSED block whose contents are cut short —
+        // the block only exists at all because a `</tool_call>` was found, so
+        // truncating that terminator away would test nothing.
+        for truncated in [
+            // missing </arg_key>
+            "<tool_call>send<arg_key>to</arg_key><arg_value>a@b.com</arg_value>\
+             <arg_key>body</tool_call>",
+            // <arg_value> never opens
+            "<tool_call>send<arg_key>to</arg_key><arg_value>a@b.com</arg_value>\
+             <arg_key>body</arg_key></tool_call>",
+            // missing </arg_value>, because the value itself contained the
+            // literal </tool_call> and ended the block early — what happens
+            // whenever an agent writes about the tool-call format itself
+            "<tool_call>send<arg_key>to</arg_key><arg_value>a@b.com</arg_value>\
+             <arg_key>body</arg_key><arg_value>see </tool_call> the docs</arg_value></tool_call>",
+        ] {
+            assert!(
+                parse_tool_calls(truncated).is_none(),
+                "a truncated argument pair must drop the call rather than fire it \
+                 with `body` missing: {truncated}"
+            );
+        }
+
+        // The complete form of that same call still parses — the guard above
+        // rejects truncation, not the arguments themselves.
+        let calls = parse_tool_calls(
+            "<tool_call>send<arg_key>to</arg_key><arg_value>a@b.com</arg_value>\
+             <arg_key>body</arg_key><arg_value>hello</arg_value></tool_call>",
+        )
+        .expect("a complete two-argument block must still parse");
+        let args = serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["to"], "a@b.com");
+        assert_eq!(args["body"], "hello");
 
         // The older dialects must be untouched by the added fallback.
         let calls = parse_tool_calls(
