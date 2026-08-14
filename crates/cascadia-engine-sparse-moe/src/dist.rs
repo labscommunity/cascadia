@@ -502,16 +502,30 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// peer, black-holed socket with no FIN/RST) would otherwise pin this recv on
 /// the idle ceiling — the task never finalizes, and every upstream rank plus
 /// the driving API request wedges behind it instead of surfacing a fast error.
-/// On timeout this returns `Err`, so the caller tears the stage down and
-/// reconnects. The caller picks `deadline` for the frame it just sent; for
-/// dsv4's token-at-a-time forwarding that is a single per-token budget
+/// On timeout this drops the connection and returns `Err`; later sends fail
+/// fast with `NotConnected` until a supervisor restarts the chain. The caller
+/// picks `deadline` for the frame it just sent; for dsv4's token-at-a-time
+/// forwarding that is a single per-token budget
 /// ([`cascadia_transport::recv_timeout`]) whether the token is prefill or
 /// decode, since each reply carries the same single-token downstream compute.
+///
+/// Dropping the socket is not optional. Timing out does not cancel the work
+/// downstream: the peer is usually alive and still computing, and its `Token`
+/// lands on the socket after we stopped waiting. The body is eight raw bytes
+/// with no sequence number, so a reused connection hands that reply to the
+/// NEXT request — every later token off by one frame, and coherent enough that
+/// nothing looks wrong. Where the stale reply is an intermediate window's `-1`
+/// ack it is worse than wrong output: rank 0 embeds it as `u32::MAX` and
+/// panics out of bounds.
+///
+/// This is the same hazard [`cascadia_transport::ActivationServer`] poisons its
+/// own connection for on a failed reply recv; the deadline here made this the
+/// one reply-wait that kept its socket.
 pub async fn recv_token_reply(
     down: &Mutex<ActivationClient>,
     deadline: std::time::Duration,
 ) -> Result<i64, String> {
-    tokio::time::timeout(deadline, async {
+    match tokio::time::timeout(deadline, async {
         match recv_kind_client(down).await {
             Ok(Some(FrameKind::Token)) => recv_token_body_client(down)
                 .await
@@ -522,7 +536,18 @@ pub async fn recv_token_reply(
         }
     })
     .await
-    .map_err(|_| format!("reply timeout after {deadline:?}: downstream silent (dead peer?)"))?
+    {
+        Ok(res) => res,
+        Err(_) => {
+            // The inner future — and any guard it held mid-read — is dropped by
+            // the time we get here, so re-locking cannot deadlock.
+            down.lock().await.close().await;
+            Err(format!(
+                "reply timeout after {deadline:?}: downstream silent (dead peer?); \
+                 connection dropped to avoid reading this reply as the next request's"
+            ))
+        }
+    }
 }
 
 /// Hard cap on the number of hidden positions one ForwardBatch /
