@@ -27,6 +27,13 @@ fn assert_close(name: &str, got: &[f32], want: &[f32], atol: f32, rtol: f32) {
     assert_eq!(got.len(), want.len(), "{name}: length mismatch");
     let mut worst = (0usize, 0.0f32, 0.0f32, 0.0f32);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        // A NaN never trips the tolerance test below (`NaN > x` is false), so an
+        // all-NaN kernel output would skip every element and pass. Reject
+        // non-finite values on both sides explicitly.
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "{name}: non-finite value at [{i}]: got {g} want {w}"
+        );
         let d = (g - w).abs();
         if d > atol + rtol * w.abs() && d > worst.1 {
             worst = (i, d, g, w);
