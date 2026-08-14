@@ -113,6 +113,18 @@ INTEL_OPENVINO_DIR=/opt/intel/openvino_genai_2026.2.0.0 \
 
 The binary is statically linked apart from the OpenVINO dynamic libraries. To run it elsewhere, copy the binary plus `INTEL_OPENVINO_DIR/runtime/lib/intel64/` **and** `runtime/3rdparty/tbb/lib/` (Linux), or `runtime/bin/intel64/Release/` + `runtime/3rdparty/tbb/bin/` (Windows), onto the target's library path. TBB ships beside the runtime, not inside it, and `libopenvino` imports it.
 
+### Web dashboard (optional, either mode)
+
+The browser dashboard served at `/` by `--api` workers is compiled into the binary behind the `dashboard-embed` feature. It needs the SPA built first (Node 20+); without the feature, `/` serves a pointer page and only the JSON/API endpoints are live. Release bundles ship with it embedded.
+
+```bash
+cd crates/cascadia-dashboard/web && npm ci && npm run build && cd -
+cargo build --release -p cascadia --features dashboard-embed        # stub mode
+# or: --features openvino,dashboard-embed                           # real inference
+```
+
+If cargo stops with "`embed-spa` is enabled, but the dashboard SPA has not been built", run the npm step above — `web/dist/` is generated, not checked in.
+
 ---
 
 ## Export-time Python (only for `cascadia shard`)
