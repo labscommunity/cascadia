@@ -851,6 +851,37 @@ fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std:
 /// budget, so a small count is minutes of grace, not seconds.
 const RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT: u32 = 3;
 
+/// Fold one token-wait outcome into the consecutive-timeout streak.
+///
+/// ANY answer resets it — a token, a downstream NACK, even a malformed frame.
+/// All three prove bytes are still crossing the link, so the link is not the
+/// suspect; only silence is. `saturating_add` because the streak is only ever
+/// compared against a small threshold and must not wrap on a stage that has
+/// been shouting into the void for a very long time.
+///
+/// Pure, for testing: the streak's reset semantics decide whether a healthy
+/// relay rank gets torn down, and that is not reachable from a unit test
+/// through `OvRuntimeEngine`, which needs a compiled IR to exist at all.
+fn next_timeout_streak(current: u32, timed_out: bool) -> u32 {
+    if timed_out {
+        current.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// Whether a relay rank should stop retrying and exit for a supervisor rebuild.
+///
+/// Both conditions are required. The streak alone is not enough: a step that
+/// SUCCEEDED after an earlier timeout must not trip the exit, and the streak is
+/// only cleared by `next_timeout_streak` on the recv path — a step can fail for
+/// reasons that never touch the token wait at all.
+///
+/// Pure, for testing. See [`RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT`].
+fn should_escalate(streak: u32, step_failed: bool) -> bool {
+    step_failed && streak >= RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT
+}
+
 /// Why a bounded token wait ended without a token.
 ///
 /// The distinction exists so relay escalation can key on "the downstream never
@@ -1908,22 +1939,13 @@ impl OvRuntimeEngine {
         // Unlike the idle-between-requests wait in `recv_hidden_from_upstream`,
         // this one has a real deadline: an active generation owes a token.
         let awaiting = self.awaiting_token_seq;
-        match self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill)) {
-            Ok(token) => {
-                self.consecutive_token_timeouts = 0;
-                Ok(token)
-            }
-            Err(TokenWaitFailure::TimedOut(e)) => {
-                self.consecutive_token_timeouts = self.consecutive_token_timeouts.saturating_add(1);
-                Err(e)
-            }
-            // Bytes arrived, or the verdict is already decided: the link is not
-            // the suspect, so the escalation counter starts over.
-            Err(other) => {
-                self.consecutive_token_timeouts = 0;
-                Err(other.into_error())
-            }
-        }
+        let outcome = self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill));
+        // Only SILENCE moves the escalation streak. A token, a downstream NACK
+        // and a malformed frame all reset it — see `next_timeout_streak`.
+        let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
+        self.consecutive_token_timeouts =
+            next_timeout_streak(self.consecutive_token_timeouts, timed_out);
+        outcome.map_err(TokenWaitFailure::into_error)
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
@@ -3312,7 +3334,7 @@ impl OvRuntimeEngine {
     /// contain a fatal substring: that is the fragility the typed
     /// `BatchAborted` variant was introduced to end.
     fn escalate_if_downstream_is_gone(&mut self, res: EngineResult<()>) -> EngineResult<()> {
-        if res.is_err() && self.consecutive_token_timeouts >= RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT {
+        if should_escalate(self.consecutive_token_timeouts, res.is_err()) {
             error!(
                 timeouts = self.consecutive_token_timeouts,
                 "downstream has not answered a token in {} consecutive attempts; this stage \
@@ -5753,6 +5775,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
+    }
+
+    /// The streak counts CONSECUTIVE silences and is cleared by any answer.
+    ///
+    /// The reset is the load-bearing half: without it, three timeouts spread
+    /// across an otherwise healthy day would eventually tear down a working
+    /// relay rank. Note a rebuilt middle also costs the head a restart (it
+    /// cannot re-dial), so a false positive takes down two ranks, not one.
+    #[test]
+    fn timeout_streak_counts_silence_and_resets_on_any_answer() {
+        assert_eq!(next_timeout_streak(0, true), 1);
+        assert_eq!(next_timeout_streak(1, true), 2);
+        assert_eq!(next_timeout_streak(2, true), 3);
+        // A token, a NACK, or a malformed frame all land here.
+        assert_eq!(next_timeout_streak(2, false), 0);
+        assert_eq!(next_timeout_streak(0, false), 0);
+        // A stage shouting into the void for a very long time must not wrap
+        // back under the threshold.
+        assert_eq!(next_timeout_streak(u32::MAX, true), u32::MAX);
+    }
+
+    /// Escalation needs BOTH a failed step and a full streak.
+    #[test]
+    fn relay_escalates_only_on_a_full_streak_of_failures() {
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+        // Short of the threshold: keep serving.
+        for s in 0..n {
+            assert!(!should_escalate(s, true), "escalated early at streak {s}");
+        }
+        assert!(should_escalate(n, true));
+        assert!(should_escalate(n + 1, true));
+        // A step that SUCCEEDED must never trip the exit, whatever the streak —
+        // the streak is only cleared on the recv path, and a success here means
+        // the pipeline just delivered.
+        for s in [0, n, n + 5, u32::MAX] {
+            assert!(!should_escalate(s, false), "escalated on success at {s}");
+        }
+    }
+
+    /// The sequence that distinguishes "dead link" from "unlucky day": an answer
+    /// in the middle of a run of timeouts must prevent the exit entirely.
+    #[test]
+    fn an_answer_between_timeouts_prevents_escalation() {
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+
+        // Uninterrupted silence -> escalates exactly at the threshold.
+        let mut streak = 0;
+        let mut fired_at = None;
+        for attempt in 1..=(n + 2) {
+            streak = next_timeout_streak(streak, true);
+            if should_escalate(streak, true) && fired_at.is_none() {
+                fired_at = Some(attempt);
+            }
+        }
+        assert_eq!(fired_at, Some(n), "should exit on the Nth consecutive miss");
+
+        // Same number of timeouts, one answer partway through -> never exits.
+        let mut streak = 0;
+        for timed_out in [true, true, false, true, true, true] {
+            streak = next_timeout_streak(streak, timed_out);
+            if timed_out && should_escalate(streak, true) {
+                // Only legitimate once the post-reset run reaches the threshold.
+                assert!(streak >= n, "escalated on a broken streak: {streak}");
+            }
+        }
+        // Two timeouts, an answer, then three: the trailing run is what counts.
+        assert_eq!(streak, 3);
     }
 
     /// The escalation error must be classifiable by TYPE. `Io(TimedOut)` is
