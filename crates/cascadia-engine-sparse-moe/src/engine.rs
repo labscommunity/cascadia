@@ -2892,14 +2892,28 @@ impl<R: StagedRunner> PipelineEngine<R> {
         best
     }
 
-    /// Record `prompt`'s KV under a fresh key (LRU-evicting in lockstep with the
-    /// ranks' `SliceKvCache`). Returns the assigned key.
+    /// Record `prompt`'s KV (LRU-evicting in lockstep with the ranks'
+    /// `SliceKvCache`). Returns the key to cache under — the existing one when
+    /// `prompt` is already indexed, a fresh one otherwise.
+    ///
+    /// Reusing the key on a repeat is what keeps the lockstep claim true. This
+    /// index dedups by token sequence; every rank's `SliceKvCache` dedups by
+    /// key. Minting a fresh key for an already-indexed sequence dropped the old
+    /// index entry without evicting anything, while the ranks saw an unfamiliar
+    /// key, appended it, and evicted their oldest — so the two sides drifted
+    /// apart and `prefix_reuse` could hand out a key no rank still held. With
+    /// the key reused, `cache_prefix` hits the key-dedup branch in
+    /// `SliceKvCache::insert` and both sides refresh the same entry to MRU.
     fn prefix_remember(&mut self, prompt: &[u32]) -> u64 {
+        if let Some(i) = self.prefix_index.iter().position(|(t, _)| t == prompt) {
+            // Refresh to MRU without changing the set; no trim can be due.
+            let entry = self.prefix_index.remove(i);
+            let key = entry.1;
+            self.prefix_index.push(entry);
+            return key;
+        }
         let key = self.prefix_next_key;
         self.prefix_next_key += 1;
-        if let Some(i) = self.prefix_index.iter().position(|(t, _)| t == prompt) {
-            self.prefix_index.remove(i);
-        }
         self.prefix_index.push((prompt.to_vec(), key));
         while self.prefix_index.len() > self.prefix_cap {
             self.prefix_index.remove(0);
