@@ -147,6 +147,42 @@ mod tests {
         assert!(c.get(2).is_none());
     }
 
+    /// Rank 0's token-keyed index and every rank's key-keyed slice cache only
+    /// stay in step because a repeat of an already-indexed sequence reuses its
+    /// key — and because both sides then move that entry to MRU instead of
+    /// replacing it where it sits. The recency half is load-bearing and easy to
+    /// lose: replacing in place (`entries[i].1 = snap`) would look like a
+    /// harmless optimisation and would silently change which key gets evicted
+    /// next, on the ranks but not in the index.
+    ///
+    /// So refresh the OLDEST entry here. Refreshing the newest cannot tell the
+    /// two policies apart, since both leave it at the back.
+    #[test]
+    fn slice_cache_reinserting_a_live_key_moves_it_to_mru() {
+        // Two conversations cached, A then B, at capacity.
+        let mut c = SliceKvCache::new(2);
+        c.insert(10, kv(3)); // A, the oldest
+        c.insert(11, kv(4)); // B
+
+        // A repeats under its own key: replaced, still resident, nothing
+        // evicted — and now the most recent, which is what `prefix_remember`
+        // does to the index entry.
+        c.insert(10, kv(5));
+        assert_eq!(c.len(), 2, "reusing a live key must not evict anything");
+        assert_eq!(c.get(10).unwrap()[0].len(), 5, "A's snapshot is replaced");
+        assert!(c.get(11).is_some());
+
+        // The next genuinely new key must therefore evict B. Under in-place
+        // replacement A would still be at the front and B would survive — the
+        // ranks would drop a different key than the index did.
+        c.insert(12, kv(6));
+        assert!(
+            c.get(11).is_none(),
+            "the entry that was NOT refreshed must be the one evicted"
+        );
+        assert!(c.get(10).is_some() && c.get(12).is_some());
+    }
+
     #[test]
     fn slice_cache_disabled_when_cap_zero() {
         let mut c = SliceKvCache::new(0);
