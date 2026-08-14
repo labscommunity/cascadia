@@ -322,9 +322,23 @@ async fn metrics() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, content_type)], body)
 }
 
+/// Marks a 5xx raised before the request ever reached the engine, so
+/// [`track_pipeline_health`] does not read it as the pipeline failing.
+///
+/// The readiness flip is a latch with an asymmetry: a 5xx that keeps serving
+/// other traffic (a capacity 503) heals on the next 2xx, but one that a load
+/// balancer gates on `/health` stops the traffic that would have healed it.
+/// A chat-template render failure is request-shape-determined and never
+/// touches the pipeline, so letting it latch drains a healthy node
+/// permanently on a single request.
+#[derive(Clone, Copy)]
+struct PreEngineFailure;
+
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
 /// the pipeline is actually serving. Non-completion routes don't touch it.
+/// 5xx responses tagged [`PreEngineFailure`] are excluded — they say nothing
+/// about the pipeline.
 async fn track_pipeline_health(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,
@@ -335,7 +349,7 @@ async fn track_pipeline_health(
     let resp = next.run(req).await;
     if is_completion {
         let s = resp.status();
-        if s.is_server_error() {
+        if s.is_server_error() && resp.extensions().get::<PreEngineFailure>().is_none() {
             state.ready.store(false, Ordering::Relaxed);
         } else if s.is_success() {
             state.ready.store(true, Ordering::Relaxed);
@@ -1763,11 +1777,17 @@ async fn chat_completions(
         }
         Err(e @ PromptRenderError::Failed(_)) => {
             tracing::error!(error = %e, "chat_template render failed for a request that needs it");
-            return (
+            // Stays a 5xx: a template that cannot render is a server-side fault
+            // an operator needs to see, not the caller's mistake. But it is
+            // raised before the engine is involved, so it must not latch
+            // readiness — see `PreEngineFailure`.
+            let mut resp = (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
             )
                 .into_response();
+            resp.extensions_mut().insert(PreEngineFailure);
+            return resp;
         }
     };
     // Degenerate input (no messages, or a render that collapses to nothing)
@@ -2859,6 +2879,77 @@ mod tests {
             ..Config::default()
         };
         make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    #[tokio::test]
+    async fn render_failure_5xx_does_not_latch_readiness() {
+        // A template that cannot render is a server-side fault worth a 5xx, but
+        // it is raised before the engine is touched, so it says nothing about
+        // pipeline health. Letting it flip `ready` drains a healthy node for
+        // good: behind a load balancer gating on /health, the traffic that
+        // would have produced the recovering 2xx never arrives.
+        let mut runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                // Renders only when tools are present — and then fails, because
+                // there is no such filter. Tool-less requests still fall back to
+                // the legacy formatter, which is why the request below sends one.
+                template: Some("{% if tools %}{{ tools | no_such_filter }}{% endif %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "f", "parameters": {"type": "object"}}
+            }],
+            "stream": false,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a render failure should stay a 5xx so operators see it"
+        );
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "a pre-engine 5xx must not latch readiness"
+        );
     }
 
     #[tokio::test]
