@@ -1623,10 +1623,11 @@ fn call_from_glm_arg_kv(block: &str) -> Option<ToolCall> {
         // `</tool_call>` ends the block early, which is routine when an agent
         // writes about the tool-call format itself.
         //
-        // A complete set of pairs followed by trailing junk is dropped too.
-        // Without consulting the request's tool schemas there is no way to tell
-        // that apart from a truncation, and dropping fires nothing wrong where
-        // the old behaviour fired something wrong.
+        // The loop only runs on a remaining `<arg_key>`, so trailing junk is
+        // ignored unless it opens one — in which case a complete set of pairs
+        // is dropped too. Without the request's tool schemas there is no way to
+        // tell that apart from a truncation, and dropping fires nothing wrong
+        // where the old behaviour fired something wrong.
         let ka = &rest[ks + "<arg_key>".len()..];
         let ke = ka.find("</arg_key>")?;
         let key = ka[..ke].trim().to_string();

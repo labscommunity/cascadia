@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use cascadia_engine_sparse_moe::dist::{
     recv_forward_batch_body_server, recv_kind_server, send_forward_batch_prefill,
-    send_forward_batch_prefill_nosample, FrameKind,
+    send_forward_batch_prefill_nosample, FrameKind, MAX_BATCH_COUNT,
 };
 use cascadia_engine_sparse_moe::glm::loader::load_model;
 use cascadia_engine_sparse_moe::glm::stage::{GlmRunner, StageOpts};
@@ -220,10 +220,11 @@ async fn pipeline_prefill_windowed(
 #[tokio::test]
 async fn glm5_multi_window_prefill_matches_single_process() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5_export_ml");
-    // 300 rows over a 16-token vocab: two windows at the real 256 cap.
-    let prompt: Vec<u32> = (0..300u32).map(|i| i % 16).collect();
-    let max_seq = 320usize;
-    let window = 256usize;
+    // Take the window from the production constant: hardcoding 256 would let a
+    // change to the cap silently stop this test exercising the windowed path.
+    let window = MAX_BATCH_COUNT as usize;
+    let prompt: Vec<u32> = (0..window as u32 + 44).map(|i| i % 16).collect();
+    let max_seq = prompt.len() + 20;
     assert!(
         prompt.len() > window,
         "prompt must span more than one window or this test proves nothing"
