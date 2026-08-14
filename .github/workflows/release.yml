@@ -11,9 +11,13 @@
 # The final job promotes the release (drops the pre-release badge) once both
 # bundles are attached — a release is never "full" without its binaries.
 #
-# Flavor : `--features openvino` (real inference). Each bundle ships the cascadia
+# Flavor : `--features openvino,dashboard-embed` (real inference + the web
+#          dashboard embedded in the binary). Each bundle ships the cascadia
 #          binary PLUS the OpenVINO GenAI runtime libraries it dynamically links.
-#          The binary does NOT work standalone — see INSTALL.md.
+#          The binary does NOT work standalone — see INSTALL.md. The dashboard
+#          SPA is built with npm right before the cargo build (web/dist is
+#          generated, not checked in); the cascadia-dashboard build script
+#          fails the job with instructions if that step is ever dropped.
 # Targets: linux-x86_64, windows-x86_64 (both Intel). macOS has no Intel GPU
 #          runtime — it is stub-only (dev) and intentionally not released here.
 # Runner : GitHub-hosted. The OpenVINO *build* only links against the SDK
@@ -139,7 +143,17 @@ jobs:
           tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
           echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
 
-      - name: Build cascadia (openvino)
+      # Runner-preinstalled Node (>= 20 on all hosted images) — the JS deps
+      # are pinned by package-lock.json via `npm ci`, and a Vite build has
+      # no native-addon sensitivity to the Node minor, so a setup-node
+      # action would only add a supply-chain pin to maintain.
+      - name: Build dashboard SPA
+        working-directory: crates/cascadia-dashboard/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build cascadia (openvino + dashboard)
         env:
           CXX: g++-12
           # Load the bundled .so's at runtime from a lib/ dir beside the binary.
@@ -150,7 +164,7 @@ jobs:
           # (which carries no runpath) must still resolve libtbb.so.12 from
           # the same lib/ dir. RPATH applies to those transitive lookups too.
           RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
-        run: cargo build --release -p cascadia --features openvino
+        run: cargo build --release -p cascadia --features openvino,dashboard-embed
 
       - name: Package bundle
         id: pkg
@@ -205,6 +219,14 @@ jobs:
         with:
           shared-key: release-windows-openvino
 
+      # See the linux job for why preinstalled Node rather than setup-node.
+      - name: Build dashboard SPA
+        working-directory: crates/cascadia-dashboard/web
+        shell: pwsh
+        run: |
+          npm ci
+          npm run build
+
       # MSVC (VS 2022 Build Tools) is preinstalled on windows-latest; cc-rs
       # locates it via vswhere, so no Developer Command Prompt is needed here.
       - name: Download + extract OpenVINO GenAI SDK
@@ -217,9 +239,9 @@ jobs:
           $root = (Get-ChildItem -Directory "$tmp/ov_raw")[0].FullName
           "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build cascadia (openvino)
+      - name: Build cascadia (openvino + dashboard)
         shell: pwsh
-        run: cargo build --release -p cascadia --features openvino
+        run: cargo build --release -p cascadia --features openvino,dashboard-embed
 
       - name: Package bundle
         id: pkg
