@@ -3314,7 +3314,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // did): the just-emitted token was the last one.
         if gen_len >= max_new || is_eos {
             let mut out = vec![(id, token_chunk)];
-            out.extend(self.finalize_pipeline());
+            out.extend(self.finalize_pipeline(true));
             return out;
         }
         // Stop before forwarding at pos == max_seq (the caches can't hold that
@@ -3323,7 +3323,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         if pos >= max_seq {
             self.active.as_mut().unwrap().hit_context_cap = true;
             let mut out = vec![(id, token_chunk)];
-            out.extend(self.finalize_pipeline());
+            out.extend(self.finalize_pipeline(true));
             return out;
         }
 
@@ -3350,17 +3350,27 @@ impl<R: StagedRunner> PipelineEngine<R> {
                 // tokens stand, finish_reason falls out of the token count.
                 warn!(task = %id, "decode forward failed; emitting partial output: {e}");
                 let mut out = vec![(id, token_chunk)];
-                out.extend(self.finalize_pipeline());
+                out.extend(self.finalize_pipeline(false));
                 out
             }
         }
     }
 
     /// Finish the in-flight task: log throughput, cache the full
-    /// [prompt + response] KV prefix (opt-in), and emit the final marker with
-    /// the OpenAI finish_reason. Consumes `self.active`. The final marker
-    /// carries no text — every visible byte already streamed as a token delta.
-    fn finalize_pipeline(&mut self) -> Vec<(TaskId, Chunk)> {
+    /// [prompt + response] KV prefix (opt-in, and only when `cache`), and emit
+    /// the final marker with the OpenAI finish_reason. Consumes `self.active`.
+    /// The final marker carries no text — every visible byte already streamed
+    /// as a token delta.
+    ///
+    /// `cache` is false when finalizing from a failed forward. `a.pos` only
+    /// advances on the `Ok` arm, but `forward_one_token_first` mutates the
+    /// runner's KV before it touches the wire — so after a failure the runner
+    /// holds one position more than `a.pos` describes. Caching there would
+    /// store a snapshot one longer than the key naming it, and the next turn
+    /// restoring that key would land every rank at a position rank 0 does not
+    /// prefill from. Skipping it also avoids inserting into the index while a
+    /// `send_cache_prefix` down the just-failed wire drops the peers' copy.
+    fn finalize_pipeline(&mut self, cache: bool) -> Vec<(TaskId, Chunk)> {
         let Some(a) = self.active.take() else {
             return Vec::new();
         };
@@ -3379,7 +3389,7 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // message — reuses the whole conversation (prompt AND response), not just
         // the prompt. The key is exactly the tokens whose KV is now cached (pos
         // covers the prompt plus every forwarded generated token).
-        if self.runner.prefix_cache_enabled() {
+        if cache && self.runner.prefix_cache_enabled() {
             let gen_cached = a.pos.saturating_sub(a.n_prefill).min(a.generated.len());
             let mut key_tokens = a.prompt_ids.clone();
             key_tokens.extend_from_slice(&a.generated[..gen_cached]);
