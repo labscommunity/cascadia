@@ -12,14 +12,32 @@
 //!
 //! (Linux; uses std::os::unix::fs::FileExt::read_at.)
 
+// `read_at` is the point of the B) phase and is unix-only, so the bench only
+// exists there. The fleet is Windows, where `--all-targets` builds every
+// example — without this gate the workspace does not compile at all.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "nvme_readbench measures std::os::unix::fs::FileExt::read_at against mmap \
+         faulting; there is nothing to run on this platform."
+    );
+}
+
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use memmap2::Mmap;
+#[cfg(unix)]
 use rayon::prelude::*;
 
+#[cfg(unix)]
 fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("read dir")
@@ -31,6 +49,7 @@ fn list_bins(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 // Deterministic LCG so token->expert selection is reproducible without rand.
+#[cfg(unix)]
 fn lcg(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -38,6 +57,7 @@ fn lcg(state: &mut u64) -> u64 {
     *state >> 16
 }
 
+#[cfg(unix)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = PathBuf::from(
