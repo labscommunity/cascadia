@@ -197,6 +197,7 @@ fn declared_index(msg: &KvMessage) -> u8 {
         KvMessage::ReplicaGet { .. } => 14,
         KvMessage::WarmResumeTriggerV2 { .. } => 15,
         KvMessage::TenantHint { .. } => 16,
+        KvMessage::GetV2 { .. } => 17,
     }
 }
 
@@ -278,8 +279,15 @@ fn every_variant_index_is_pinned() {
             request_id: [3u8; 16],
             partner: "c".into(),
         },
+        KvMessage::GetV2 {
+            partner: PartnerId("c".into()),
+            model_fingerprint: 7,
+            expected_epoch: 9,
+            expected_len: 2,
+            rank: 1,
+        },
     ];
-    assert_eq!(all.len(), 17, "every declared variant must be listed here");
+    assert_eq!(all.len(), 18, "every declared variant must be listed here");
     for (position, msg) in all.iter().enumerate() {
         let tag = bincode::serde::encode_to_vec(msg, standard()).unwrap()[0];
         assert_eq!(

@@ -157,6 +157,21 @@ pub enum KvMessage {
         request_id: [u8; 16],
         partner: String,
     },
+    /// Asserted per-rank fetch, rank-bound (issue-34 defect 1b, donor half). [`KvMessage::Get`]
+    /// carries no rank, so a node holding shard M answers a rank-N request with M's bytes and every
+    /// guard passes: the model fingerprint is model-level on all plane engines, and for symmetric
+    /// stages the canonical state names and the layer count are identical. Same reasoning
+    /// [`KvMessage::ReplicaGet`] already carries `rank` for — "a rank-less fetch that lands on a
+    /// neighbour would serve that neighbour's rank with all guards passing" — applied to the primary
+    /// fetch. The holder refuses when `rank` is not the shard it holds; legacy `Get` stays servable
+    /// for old peers.
+    GetV2 {
+        partner: PartnerId,
+        model_fingerprint: u64,
+        expected_epoch: u64,
+        expected_len: u32,
+        rank: u16,
+    },
 }
 
 /// Cap on the UTF-8 byte length of [`KvMessage::TenantHint`]'s `partner`, enforced by
@@ -333,9 +348,21 @@ mod tests {
             standard(),
         )
         .unwrap();
+        assert_eq!(tenant[0], 16, "TenantHint is appended 7th, index 16");
+        let get_v2 = bincode::serde::encode_to_vec(
+            KvMessage::GetV2 {
+                partner: PartnerId("acme".into()),
+                model_fingerprint: 1,
+                expected_epoch: 1,
+                expected_len: 1,
+                rank: 1,
+            },
+            standard(),
+        )
+        .unwrap();
         assert_eq!(
-            tenant[0], 16,
-            "TenantHint is the LAST appended variant (index 16)"
+            get_v2[0], 17,
+            "GetV2 is the LAST appended variant (index 17)"
         );
     }
 }
