@@ -1685,7 +1685,7 @@ impl Qwen36Engine {
                 // carried branch short-circuits the drain away and the rank warms from carried data
                 // while the plane slice goes unread. Chain mode parks nothing, so this is a false
                 // no-op there and the carried/capture path below is unchanged.
-                let local_ok = if self.drain_kv_handoff() {
+                let local_ok = if self.drain_kv_handoff(kv_epoch) {
                     true
                 } else if !blob.is_empty() {
                     let ok = self.restore_local_stages(&blob);
@@ -2209,10 +2209,10 @@ impl Qwen36Engine {
     ///
     /// Position 0 because this engine has no KV cursor to protect — see the note in
     /// `apply_warm_resume`, where the same absence is why the plane depth is logged, not guarded.
-    fn drain_kv_handoff(&mut self) -> bool {
+    fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
-        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, |blob| {
+        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
             self.restore_local_stages(blob)
         })
     }
@@ -2715,11 +2715,30 @@ mod tests {
         );
         mb.put(0xE7, manifest, payloads);
         assert!(
-            !e.drain_kv_handoff(),
+            !e.drain_kv_handoff(0xE7),
             "no stage loaded ⇒ the apply cannot arm"
         );
         assert!(!mb.clear(0xE7), "drain must have taken the parked slice");
+        // `clear` returning false no longer proves the drain TOOK it: since the drain became
+        // epoch-bound, a foreign-epoch take also empties the slot, so this assertion passed with a
+        // mismatched epoch too. `epoch_mismatches` is what discriminates, and it must be 0 — the
+        // drain above asked for the epoch the slice was parked under.
+        assert_eq!(
+            e.kv_handoff.epoch_mismatches(),
+            0,
+            "the slot must have been TAKEN by a matching drain, not dropped as foreign"
+        );
     }
+
+    // NOT UNIT-TESTABLE, stated rather than faked: the seven `drain_kv_handoff` CALL SITES forward
+    // the RESTORE's epoch, and every guard in `KvHandoffMailbox::take` is inert if a call site hands
+    // it the wrong value — pass `epoch ^ 1` at all seven and the whole suite stays green while every
+    // plane move colds. The arms live in `step_pipe_relay`/`OPCODE_RESTORE`, which need a live
+    // pipeline transport and a compiled stage, so no test in this crate reaches them. A first attempt
+    // here called `drain_kv_handoff` directly and was worthless: mutating the real call site left it
+    // green. The cover is the rig cert's `kv_handoff_epoch_mismatch` bar (OV engines only) — sparse-moe
+    // has no cert cell, so sites 4-7 are uncovered. Do not replace this note with a test that drives
+    // the drain directly.
 
     #[test]
     fn submit_caps_pending_queue() {

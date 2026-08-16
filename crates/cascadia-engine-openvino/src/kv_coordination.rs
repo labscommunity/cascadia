@@ -1156,13 +1156,17 @@ pub(crate) fn handoff_decision(
 /// `position` is the caller's own KV cursor, guarding against a slice shallower than where it already
 /// is; engines that hold no such cursor pass 0, which leaves the guard inert.
 #[cfg(feature = "kv_coord")]
+/// `expected_epoch` is the epoch of the RESTORE being served: a slice parked for any other epoch is
+/// dropped, not applied. See `KvHandoffMailbox::take` for why that is a correctness guard and not
+/// hygiene.
 pub(crate) fn drain_handoff(
     mailbox: &KvHandoffMailbox,
     model_fp: u64,
     position: i64,
+    expected_epoch: u64,
     apply: impl FnOnce(&[u8]) -> bool,
 ) -> bool {
-    let Some(slot) = mailbox.take() else {
+    let Some(slot) = mailbox.take(expected_epoch) else {
         return false;
     };
     let blob = match handoff_decision(&slot, model_fp, position) {
@@ -1701,7 +1705,7 @@ mod tests {
         park(&mb, 0xE7);
         assert!(mb.clear(0xE7), "a parked slice must report as retracted");
         assert!(
-            mb.take().is_none(),
+            mb.take(0xE7).is_none(),
             "cleared slice must not reach the engine"
         );
         assert_eq!(mb.aborts_too_late(), 0);
@@ -1713,7 +1717,7 @@ mod tests {
         assert!(!mb.clear(0xE8), "nothing parked ⇒ nothing retracted");
         park(&mb, 0xE9);
         assert!(!mb.clear(0xE8), "a stale abort must not drop a newer pull");
-        assert_eq!(mb.take().map(|s| s.epoch), Some(0xE9));
+        assert_eq!(mb.take(0xE9).map(|s| s.epoch), Some(0xE9));
         assert_eq!(mb.aborts_too_late(), 0, "neither case is the drain race");
     }
 
@@ -1723,7 +1727,7 @@ mod tests {
     fn handoff_clear_after_a_drain_counts_the_residual() {
         let mb = KvHandoffMailbox::new();
         park(&mb, 0xEA);
-        assert!(mb.take().is_some());
+        assert!(mb.take(0xEA).is_some());
         assert!(!mb.clear(0xEA), "already drained ⇒ retraction impossible");
         assert_eq!(mb.aborts_too_late(), 1);
     }
@@ -1735,7 +1739,7 @@ mod tests {
         park(&mb, 0xEB);
         assert!(mb.discard_any(), "a parked slice must report as discarded");
         assert!(
-            mb.take().is_none(),
+            mb.take(0xEB).is_none(),
             "discarded slice must not reach the engine"
         );
         assert!(!mb.discard_any(), "nothing parked ⇒ nothing discarded");
@@ -1760,19 +1764,19 @@ mod tests {
     #[test]
     fn an_empty_drain_is_counted_and_says_whether_a_slice_ever_landed() {
         let mb = KvHandoffMailbox::new();
-        assert!(mb.take().is_none());
+        assert!(mb.take(0xED).is_none());
         assert_eq!(mb.empty_drains(), 1);
         assert!(!mb.ever_parked(), "nothing ever parked ⇒ not the race");
 
         park(&mb, 0xED);
-        assert!(mb.take().is_some());
+        assert!(mb.take(0xED).is_some());
         assert_eq!(
             mb.empty_drains(),
             1,
             "a drain that found a slice is not empty"
         );
 
-        assert!(mb.take().is_none());
+        assert!(mb.take(0xED).is_none());
         assert_eq!(mb.empty_drains(), 2);
         assert!(
             mb.ever_parked(),
@@ -1804,6 +1808,177 @@ mod tests {
         }
         blob.extend_from_slice(&0u64.to_le_bytes()); // nbytes
         slot_of(&blob)
+    }
+
+    /// Apply-path cost split at the measured rig payload size (114.6 MB), so the Gate A verdict can
+    /// attribute its 21.7 s. Everything here is OUR side of the apply; whatever it does NOT account
+    /// for is OpenVINO's `set_state_blob`.
+    ///
+    /// `--ignored`, because it allocates ~500 MB and times things — not a correctness assertion.
+    /// Run: `cargo test -p cascadia-engine-openvino --features kv_coord --release
+    ///       apply_path_cost_split -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing probe, not an assertion; allocates ~500 MB"]
+    fn apply_path_cost_split() {
+        const MB: usize = 1 << 20;
+        // The rig's measured `set_state` payload. One opaque payload, as OPAQUE_KV_LAYOUT requires.
+        let target = 1146 * MB / 10;
+
+        let name = "past_key_values.0.key";
+        let mut blob = 1u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name.as_bytes());
+        blob.extend_from_slice(&[1, 4]);
+        for d in [1u64, 1, 4, 1] {
+            blob.extend_from_slice(&d.to_le_bytes());
+        }
+        blob.extend_from_slice(&0u64.to_le_bytes());
+        let header = blob.len();
+        blob.resize(target, 0xA5);
+        println!(
+            "blob = {:.1} MB (header {header} B)",
+            blob.len() as f64 / MB as f64
+        );
+
+        let t = std::time::Instant::now();
+        let slot = slot_of(&blob);
+        let t_build = t.elapsed();
+
+        let refs: Vec<(&[u8], &[u8])> = slot
+            .payloads
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let t = std::time::Instant::now();
+        let ok = KvSnapshotCodec::validate(
+            &slot.manifest,
+            &refs,
+            OPAQUE_KV_LAYOUT,
+            KV_ENGINE_REV,
+            DECISION_FP,
+            &slot.manifest.token_ids,
+        )
+        .is_ok();
+        let t_validate = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let (_tok, out) = wire_to_blob(&slot.manifest, &slot.payloads).expect("decodes");
+        let t_wire = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let d = byte_digest(&out);
+        let t_digest = t.elapsed();
+
+        let t = std::time::Instant::now();
+        let decided = handoff_decision(&slot, DECISION_FP, 0).expect("valid");
+        let t_decision = t.elapsed();
+
+        let ours = t_validate + t_wire + t_digest;
+        println!("blob_to_wire (donor-side stage) {:>9.3?}", t_build);
+        println!(
+            "KvSnapshotCodec::validate       {:>9.3?}  (ok={ok})",
+            t_validate
+        );
+        println!("wire_to_blob (full clone)       {:>9.3?}", t_wire);
+        println!(
+            "byte_digest (log field only)    {:>9.3?}  (0x{d:016x})",
+            t_digest
+        );
+        println!("handoff_decision (validate+wire){:>9.3?}", t_decision);
+        println!("---");
+        println!(
+            "OUR apply-side total            {:>9.3?}  ({} B)",
+            ours,
+            decided.len()
+        );
+        println!(
+            "rig-measured apply              {:>9.3?}",
+            std::time::Duration::from_millis(21_700)
+        );
+        println!(
+            "=> unaccounted (OV set_state)   {:>9.3?}",
+            std::time::Duration::from_millis(21_700).saturating_sub(ours)
+        );
+    }
+
+    /// `dropped` must not be sticky: epoch REUSE is guaranteed, so a stale marker makes a genuinely
+    /// drained slice read as "dropped as foreign, rank provably cold" and suppresses `too_late`.
+    ///
+    /// `synth_epoch` is a pure content hash, so two sessions of one tenant sharing a prefix mint the
+    /// same epoch — that is the whole premise of the move lease. Interleaving: park E, drop it on a
+    /// foreign RESTORE, then a NEW session parks E and drains it successfully; its abort must still
+    /// count as too-late, because that rank IS warm under a cold head.
+    #[test]
+    fn a_foreign_drop_marker_does_not_survive_a_later_successful_drain() {
+        const E: u64 = 0xE5;
+        let mailbox = KvHandoffMailbox::new();
+
+        // 1. park E, then drop it via a RESTORE for a different epoch.
+        let s = slot_at_depth(4);
+        mailbox.put(E, s.manifest, s.payloads);
+        assert!(
+            mailbox.take(0xE6).is_none(),
+            "foreign epoch drops the slice"
+        );
+        assert_eq!(mailbox.epoch_mismatches(), 1);
+
+        // 2. a NEW session parks the SAME content epoch and drains it successfully.
+        let s = slot_at_depth(4);
+        mailbox.put(E, s.manifest, s.payloads);
+        assert!(mailbox.take(E).is_some(), "its own epoch drains");
+
+        // 3. the abort must be counted as too-late: the engine really did take it.
+        assert!(!mailbox.clear(E), "already drained, nothing to retract");
+        assert_eq!(
+            mailbox.aborts_too_late(),
+            1,
+            "a stale `dropped` marker must not suppress the warm-rank-under-cold-head counter — \
+             `aborts_too_late` is documented as the UPPER BOUND on that residual"
+        );
+    }
+
+    /// A slice parked for one epoch must NOT be applied on a RESTORE for another.
+    ///
+    /// The drain used to take whatever was parked: `take()` had no epoch, `handoff_decision` never
+    /// saw one, and the `OPCODE_RESTORE` arm decoded the epoch and then drained FIRST, discarding
+    /// it — and beating the head's own carried blob. A slice stranded by an earlier turn (a race the
+    /// 2026-08-04 cert observed, a head that committed then died, a mis-picked `session_chain`)
+    /// therefore lands on the NEXT turn: different session, different tokens, and the rank acks
+    /// true. Warm head over another session's KV, with no taxonomy entry firing.
+    ///
+    /// Asserts on whether `apply` RAN, not on the return value — the `FnOnce` is the only
+    /// observable that distinguishes "refused before applying" from "applied and then failed".
+    #[test]
+    fn a_slice_parked_for_one_epoch_is_not_applied_on_another_epochs_restore() {
+        const PARKED: u64 = 0xE0;
+        const OTHER: u64 = 0xE1;
+        let mailbox = KvHandoffMailbox::new();
+        let s = slot_at_depth(4);
+        mailbox.put(PARKED, s.manifest, s.payloads);
+
+        let mut applied = false;
+        let ok = drain_handoff(&mailbox, DECISION_FP, 0, OTHER, |_| {
+            applied = true;
+            true
+        });
+        assert!(!ok, "a foreign-epoch drain must report cold");
+        assert!(
+            !applied,
+            "and must refuse BEFORE applying — this is the wrong-output path, not a cold one"
+        );
+
+        // Anti-collapse: the matching epoch still applies, or the fix is just 'never drain'.
+        let s = slot_at_depth(4);
+        mailbox.put(PARKED, s.manifest, s.payloads);
+        let mut applied = false;
+        let ok = drain_handoff(&mailbox, DECISION_FP, 0, PARKED, |_| {
+            applied = true;
+            true
+        });
+        assert!(
+            ok && applied,
+            "the slice's own epoch must still drain and apply"
+        );
     }
 
     #[test]

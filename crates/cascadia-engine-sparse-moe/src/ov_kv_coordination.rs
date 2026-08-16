@@ -215,13 +215,16 @@ pub(crate) fn ov_handoff_decision(
 
 /// Drain `mailbox` and hand the decided snapshot to `apply`. `true` ⇒ this rank is armed warm.
 /// Event names and fields are byte-identical to the other engines — the cert greps them.
+/// `expected_epoch` is the epoch of the RESTORE being served: a slice parked for any other epoch is
+/// dropped, not applied. See `KvHandoffMailbox::take` for why that is a correctness guard.
 pub(crate) fn ov_drain_handoff(
     mailbox: &cascadia_engine::kv_handoff::KvHandoffMailbox,
     model_fp: u64,
     position: usize,
+    expected_epoch: u64,
     apply: impl FnOnce(&OvMoeKvSnapshot) -> bool,
 ) -> bool {
-    let Some(slot) = mailbox.take() else {
+    let Some(slot) = mailbox.take(expected_epoch) else {
         return false;
     };
     let digest = ov_payload_digest(&slot.payloads);
@@ -537,19 +540,22 @@ mod tests {
     fn ov_drain_handoff_consumes_what_the_plane_parked() {
         let mailbox = cascadia_engine::kv_handoff::KvHandoffMailbox::new();
         assert!(
-            !ov_drain_handoff(&mailbox, 7, 0, |_| true),
+            !ov_drain_handoff(&mailbox, 7, 0, 0xE0, |_| true),
             "empty mailbox drains false"
         );
         let prefix: Vec<i32> = (0..3).collect();
         let (m, pl) = ov_snapshot_to_wire(&prefix, &snap(3, 1.0), "peer", 7, 0xE0);
         mailbox.put(0xE0, m, pl);
         let mut applied = None;
-        assert!(ov_drain_handoff(&mailbox, 7, 0, |s| {
+        assert!(ov_drain_handoff(&mailbox, 7, 0, 0xE0, |s| {
             applied = Some(s.past_seq_len);
             true
         }));
         assert_eq!(applied, Some(3));
-        assert!(!ov_drain_handoff(&mailbox, 7, 0, |_| true), "one slot only");
+        assert!(
+            !ov_drain_handoff(&mailbox, 7, 0, 0xE0, |_| true),
+            "one slot only"
+        );
     }
 
     #[test]
@@ -560,6 +566,6 @@ mod tests {
         let prefix: Vec<i32> = (0..3).collect();
         let (m, pl) = ov_snapshot_to_wire(&prefix, &snap(3, 1.0), "peer", 7, 0xE0);
         mailbox.put(0xE0, m, pl);
-        assert!(!ov_drain_handoff(&mailbox, 7, 0, |_| false));
+        assert!(!ov_drain_handoff(&mailbox, 7, 0, 0xE0, |_| false));
     }
 }

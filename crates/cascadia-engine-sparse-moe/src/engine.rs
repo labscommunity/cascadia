@@ -1170,15 +1170,19 @@ impl SparseMoEEngine {
     /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see the
     /// `FrameKind::Restore` arm for why that shape silently produces a hollow warm.
     #[cfg(feature = "kv_coord")]
-    pub(crate) fn drain_kv_handoff(&mut self) -> bool {
+    pub(crate) fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         // Plane fp, matching `KvCoordination::model_fingerprint` and this engine's holder.
         let model_fp = self.runner.fingerprint().plane_digest();
         let position = self.runner.kv_past_seq_len();
         let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
         let runner = &mut self.runner;
-        crate::kv_coordination::drain_handoff(&mailbox, model_fp, position, |snap| {
-            runner.restore_kv(snap).is_ok()
-        })
+        crate::kv_coordination::drain_handoff(
+            &mailbox,
+            model_fp,
+            position,
+            expected_epoch,
+            |snap| runner.restore_kv(snap).is_ok(),
+        )
     }
 
     /// Worker-side helper: if the runner's KV is AHEAD of the driver's
@@ -2581,7 +2585,7 @@ impl SparseMoEEngine {
                 // Fallback is same-chain: restore from this rank's own capture stash. `.get`+clone
                 // (not remove) — a repeat warm-resume over the same epoch may legitimately restore
                 // again.
-                let local_ok = if self.drain_kv_handoff() {
+                let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else {
                     match self.kv_capture.get(&epoch).cloned() {
@@ -2901,7 +2905,7 @@ impl OvMoeEngine {
     /// MUST run BEFORE the local capture branch, never as `local_ok || drain()` — see
     /// `handle_restore` for why that shape silently produces a hollow warm.
     #[cfg(feature = "kv_coord")]
-    fn drain_kv_handoff(&mut self) -> bool {
+    fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         // PLANE-level fp, matching this engine's `KvCoordination::model_fingerprint` and its holder:
         // a cross-chain pull asserts the moved-to head's single fp for every rank, so validating a
         // parked slice against the per-stage `digest()` would reject every pull this rank receives.
@@ -2909,9 +2913,13 @@ impl OvMoeEngine {
         let position = self.runner.kv_past_seq_len();
         let mailbox = std::sync::Arc::clone(&self.kv_handoff_mailbox);
         let runner = &mut self.runner;
-        crate::ov_kv_coordination::ov_drain_handoff(&mailbox, model_fp, position, |snap| {
-            runner.restore_kv(snap).is_ok()
-        })
+        crate::ov_kv_coordination::ov_drain_handoff(
+            &mailbox,
+            model_fp,
+            position,
+            expected_epoch,
+            |snap| runner.restore_kv(snap).is_ok(),
+        )
     }
 
     /// Single-stage path: tokenize, run the whole model, decode.
@@ -3425,7 +3433,7 @@ impl OvMoeEngine {
         //
         // Fallback is same-chain. `.get`+clone (not remove) — a repeat warm-resume over the same
         // epoch may restore again.
-        let local_ok = if self.drain_kv_handoff() {
+        let local_ok = if self.drain_kv_handoff(epoch) {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {
@@ -3917,7 +3925,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
     fn apply_warm_resume(&mut self, epoch: u64) -> bool {
         // Drain FIRST — the node parks EVERY rank's slice, rank 0 included, so a `||` here would let
         // a stale local capture mask the pulled one. See `handle_restore`.
-        let local_ok = if self.drain_kv_handoff() {
+        let local_ok = if self.drain_kv_handoff(epoch) {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {

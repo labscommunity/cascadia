@@ -33,6 +33,12 @@ pub struct KvHandoffMailbox {
 
 #[derive(Default)]
 struct MailboxInner {
+    /// Slices dropped because the RESTORE asked for a different epoch (see `take`).
+    epoch_mismatches: u64,
+    /// Last epoch DROPPED as foreign by `take`. Distinct from `drained` on purpose: a dropped slice
+    /// never reached the engine, so a later `clear` for it must not read as "the engine already took
+    /// it, this rank MAY be warm under a cold head" — that rank is provably COLD.
+    dropped: Option<u64>,
     slot: Option<KvHandoffSlot>,
     /// Last epoch the engine TOOK, so a `clear` that finds the slot empty can tell "already gone to
     /// the engine" from "this rank never held it" — the two have opposite consequences for the head.
@@ -64,6 +70,8 @@ impl KvHandoffMailbox {
         let n_payloads = payloads.len();
         let mut g = self.lock();
         g.ever_parked = true;
+        // A fresh park supersedes any earlier foreign-drop marker for this mailbox.
+        g.dropped = None;
         g.slot = Some(KvHandoffSlot {
             epoch,
             manifest,
@@ -73,11 +81,45 @@ impl KvHandoffMailbox {
         tracing::info!(target: "cascadia::kv", event = "kv_handoff_put", epoch, n_payloads);
     }
 
-    pub fn take(&self) -> Option<KvHandoffSlot> {
+    /// Drain the parked slice for `expected_epoch` — the epoch of the RESTORE being served.
+    ///
+    /// **Epoch-bound on purpose.** This used to take whatever was parked, and no layer below it
+    /// looked at the epoch either (`handoff_decision` is not given one), while the `OPCODE_RESTORE`
+    /// arm decodes the epoch and drains FIRST — ahead of the head's own carried blob. So a slice
+    /// stranded by an earlier turn was applied on the NEXT turn's RESTORE, for a different session
+    /// with different tokens, and the rank acked warm: wrong output with nothing in the failure
+    /// taxonomy firing. Stranding is not hypothetical — a drain that races ahead of the plane's
+    /// first `put` is recorded in `kv_handoff_drain_empty`'s note, and a head that commits and then
+    /// dies sends neither RESTORE nor abort while this mailbox has no TTL.
+    ///
+    /// A mismatch DROPS the slice rather than re-parking it: it belongs to a move whose RESTORE is
+    /// not coming, and leaving it parked keeps the landmine armed for the turn after this one. The
+    /// cost is a cold reprefill, which is the safety floor this path is supposed to have.
+    pub fn take(&self, expected_epoch: u64) -> Option<KvHandoffSlot> {
         let mut g = self.lock();
+        if let Some(s) = g.slot.as_ref() {
+            if s.epoch != expected_epoch {
+                let parked = s.epoch;
+                g.slot = None;
+                g.dropped = Some(parked);
+                g.epoch_mismatches += 1;
+                let n = g.epoch_mismatches;
+                drop(g);
+                tracing::warn!(target: "cascadia::kv", event = "kv_handoff_epoch_mismatch",
+                    parked, expected = expected_epoch, count = n);
+                return None;
+            }
+        }
         let slot = g.slot.take();
         match &slot {
-            Some(s) => g.drained = Some(s.epoch),
+            Some(s) => {
+                g.drained = Some(s.epoch);
+                // Clear the foreign-drop marker: `synth_epoch` is a content hash, so epoch REUSE is
+                // guaranteed, and a sticky `dropped` made a later `clear(E)` for a genuinely drained
+                // slice read as "dropped as foreign, rank provably cold" — suppressing `too_late`
+                // and breaking the upper-bound property `aborts_too_late` documents.
+                g.dropped = None;
+            }
             None => {
                 g.empty_drains += 1;
                 // An empty drain on a rank the plane never fed is routine and scales with turns, so
@@ -116,8 +158,16 @@ impl KvHandoffMailbox {
         if retracted {
             g.slot = None;
         }
-        let too_late = !retracted && g.drained == Some(epoch);
-        if too_late {
+        // A slice this mailbox DROPPED as foreign never reached the engine, so the abort is clean
+        // and the rank is provably cold. Counting it as `too_late` would raise the
+        // warm-under-a-cold-head hazard for a rank that cannot be warm, and would inflate
+        // `aborts_too_late`, which is documented as the UPPER BOUND on that residual.
+        let dropped_foreign = !retracted && g.dropped == Some(epoch);
+        let too_late = !retracted && !dropped_foreign && g.drained == Some(epoch);
+        if dropped_foreign {
+            tracing::info!(target: "cascadia::kv", event = "kv_handoff_cleared",
+                epoch, retracted = false, dropped_foreign = true);
+        } else if too_late {
             g.too_late += 1;
             tracing::warn!(target: "cascadia::kv", event = "kv_handoff_abort_too_late",
                 epoch, count = g.too_late);
@@ -141,6 +191,13 @@ impl KvHandoffMailbox {
     /// slice the drain then rejected leaves that rank cold and is counted here anyway.
     pub fn aborts_too_late(&self) -> u64 {
         self.lock().too_late
+    }
+
+    /// Slices dropped because the RESTORE asked for a different epoch. Nonzero means either a
+    /// genuinely stale parked slice was refused (the guard working) or the head's warm-entry
+    /// selection drifted off the plane-pulled entry (a warm→cold conversion worth investigating).
+    pub fn epoch_mismatches(&self) -> u64 {
+        self.lock().epoch_mismatches
     }
 
     /// Drains that found nothing parked. Read with [`Self::ever_parked`].
