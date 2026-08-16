@@ -544,8 +544,11 @@ pub(crate) const LOCAL_NS: &str = "";
 /// One captured turn: the full token sequence and its opaque KV blob.
 struct OvKvEntry {
     /// Issue-34 H.1a: the namespace this entry is visible in. `lookup`/`serve` filter on it so a
-    /// cross-namespace probe reads as an empty cache; `take_warm` (local resume) deliberately does
-    /// not — see the H.1 §5 prefix-sharing non-goal.
+    /// cross-namespace probe reads as an empty cache — and since H.1b so does `take_warm`, on strict
+    /// equality (see its `e.partner == partner` predicate). The earlier wording here said take_warm
+    /// "deliberately does not" filter; that was true pre-H.1b and is now the opposite of the code
+    /// 300-odd lines below. It cost a rig session: a turn whose tenant hint had expired built under
+    /// `LOCAL_NS`, could not see KV inserted under the real tenant, and silently reprefilled.
     partner: String,
     tokens: Vec<i32>,
     blob: Vec<u8>,
@@ -658,7 +661,14 @@ impl OvKvCache {
         if tokens.is_empty() || blob.is_empty() {
             return;
         }
-        self.capture_under_epoch(synth_epoch(&tokens), tokens.clone(), blob.clone());
+        // Tag the capture with the SAME tenant as the entry beside it. This used to call the
+        // untagged `capture_under_epoch` (LOCAL_NS) while `insert_entry` tagged its copy, which left
+        // a pulled cross-tenant blob readable by anyone: `serve` deliberately lets an UNTAGGED
+        // capture be read by any partner (the v1-frame compatibility rule), so a partner who can
+        // synthesize the content epoch could fetch KV pulled on another tenant's behalf. The
+        // rank's own restore is unaffected — `take_capture` is keyed by epoch and is not
+        // namespace-filtered, because it serves the rank's OWN RESTORE, not a wire read.
+        self.capture_under_epoch_ns(partner, synth_epoch(&tokens), tokens.clone(), blob.clone());
         self.insert_entry(partner, tokens, blob, true); // pulled over the plane, not captured locally
     }
 
@@ -867,13 +877,13 @@ impl OvKvCache {
     /// task start. Strict (`tokens.len() < prompt.len()`) guarantees ≥1 token left to prefill — the
     /// model needs a forward pass to produce the next token, and re-feeding tokens already in the
     /// restored state would double-count. Returns `(blob, prefix_len, plane_pulled)`, removed on
-    /// take; `plane_pulled` scopes the chain verdict — see [`chain_verdict`].
+    /// take; `plane_pulled` records that the blob came from the KV plane rather than a local capture.
     /// H.1b: `partner` namespaces the READER as `capture` already namespaces the writer, so one
     /// tenant can never resume off another's prefix. It also removes a shadowing hazard §12.10.0
     /// calls out: with de-dup keyed on `(partner, tokens)` one token sequence can hold both a
     /// `LOCAL_NS` local capture and a real-partner plane pull, and an unfiltered `max_by_key`
     /// returns the LAST maximum — the older `LOCAL_NS` entry — masking the plane entry's
-    /// `plane_pulled`, which loses the plane override in `chain_verdict` and votes a plane-armed
+    /// `plane_pulled`, which loses the plane provenance in the warm-resume log and reports a plane-armed
     /// turn cold. Inert while everything is `LOCAL_NS`; load-bearing the moment it is not.
     pub(crate) fn take_warm(
         &mut self,
@@ -891,28 +901,31 @@ impl OvKvCache {
                     && prompt.starts_with(&e.tokens)
             })
             .max_by_key(|(_, e)| e.tokens.len())
-            .map(|(i, _)| i)?;
+            .map(|(i, _)| i);
+        let Some(idx) = idx else {
+            // A miss here is a SILENT cold cliff — the turn simply reprefills and nothing says why.
+            // `lookup` has `log_prefix_miss`; this path had nothing, which is why an entry that was
+            // present but namespaced under a different tenant read as "no warm KV" for a whole rig
+            // session. `same_prefix_other_ns` is the discriminator: non-zero means the bytes ARE
+            // here and the NAMESPACE is wrong (tenant plumbing), zero means genuinely no prefix.
+            let same_prefix_other_ns = self
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.partner != partner
+                        && !e.tokens.is_empty()
+                        && e.tokens.len() < prompt.len()
+                        && prompt.starts_with(&e.tokens)
+                })
+                .count();
+            tracing::info!(target: "cascadia::kv", event = "take_warm_miss",
+                tenant_empty = partner.is_empty(), n_entries = self.entries.len(),
+                same_prefix_other_ns, prompt_len = prompt.len());
+            return None;
+        };
         let e = self.entries.remove(idx);
         Some((e.blob, e.tokens.len(), e.plane_pulled))
     }
-}
-
-/// Chain-restore verdict for a warm head. `down` — every downstream rank confirmed — is binding,
-/// except on a turn the KV plane armed, where the ranks arm themselves out-of-band and `false` only
-/// means "no CAPTURE under the donor chain's epoch".
-///
-/// `plane_pulled` scopes that override. The mode flag alone made every turn advisory, so a
-/// same-chain turn whose tail had no CAPTURE under the donor epoch still warmed the head —
-/// head-warm/tail-cold, a silent corrupt serve.
-///
-/// Only for engines whose plane ranks still arm out-of-band (qwen36; ov-runtime arms in-band from its
-/// `OPCODE_RESTORE` handler, so it takes `down` unmasked). Delete this with issue-34 Task 2.3.
-///
-/// Residual (accepted): the mark rides a CONTENT-keyed entry, not a request. A later prompt starting
-/// with an earlier plane-armed prefix consumes that entry and inherits the override. Closing it needs
-/// a request id carried across the node/engine boundary, which cannot be verified off-rig.
-pub(crate) fn chain_verdict(down: bool, plane_mode: bool, plane_pulled: bool) -> bool {
-    down || (plane_mode && plane_pulled)
 }
 
 /// Opaque blob → wire `Manifest` + single-payload `(blob, [])`. K carries the blob; V is empty.
@@ -1533,6 +1546,35 @@ mod tests {
         assert!(c.take_capture(epoch).is_none(), "consumed on take");
     }
 
+    /// H.1b: a PULLED blob must be tenant-confined on the wire path too.
+    ///
+    /// `insert_both` used to file the capture under `LOCAL_NS` while tagging only the `entries`
+    /// copy. `serve` lets an UNTAGGED capture be read by ANY partner (the v1-frame rule), so a
+    /// partner who can synthesize the content epoch could fetch KV that was pulled on another
+    /// tenant's behalf. Both halves must carry the same tenant.
+    #[test]
+    fn a_pulled_blob_is_not_servable_to_another_tenant() {
+        let mut c = OvKvCache::default();
+        c.insert_both("acme", vec![1, 2, 3], vec![0xAB]);
+        let epoch = synth_epoch(&[1, 2, 3]);
+
+        assert!(
+            c.serve("evil", epoch, 3).is_none(),
+            "a pulled blob must not be servable to a partner that did not pull it"
+        );
+        assert!(
+            c.serve("acme", epoch, 3).is_some(),
+            "the tenant that pulled it must still be served"
+        );
+        // The rank's OWN restore is keyed by epoch and stays namespace-free by design.
+        let mut c2 = OvKvCache::default();
+        c2.insert_both("acme", vec![1, 2, 3], vec![0xAB]);
+        assert!(
+            c2.take_capture(epoch).is_some(),
+            "tagging must not break the rank's own RESTORE path"
+        );
+    }
+
     #[test]
     fn offers_take_precedence_and_are_single_use() {
         let mut c = OvKvCache::default();
@@ -1861,20 +1903,6 @@ mod tests {
     }
 
     #[test]
-    fn chain_verdict_scopes_the_plane_override_to_plane_entries() {
-        for (mode, entry) in [(false, false), (false, true), (true, false), (true, true)] {
-            assert!(chain_verdict(true, mode, entry), "confirmed is always warm");
-        }
-        assert!(!chain_verdict(false, false, false));
-        assert!(!chain_verdict(false, false, true));
-        assert!(
-            !chain_verdict(false, true, false),
-            "P3: plane mode must not override a false verdict on a locally captured entry"
-        );
-        assert!(chain_verdict(false, true, true));
-    }
-
-    #[test]
     fn lookup_is_confined_to_the_callers_namespace() {
         let mut c = OvKvCache::default();
         c.capture("tenant-a", vec![11, 22, 33], vec![9u8; 16]);
@@ -1975,7 +2003,7 @@ mod tests {
 
     /// The shadowing case §12.10.0 calls out, pinned: a `LOCAL_NS` local capture must not mask a
     /// real-partner plane pull over the same tokens. Each namespace sees only its own entry, so the
-    /// plane entry's `plane_pulled = true` survives to `chain_verdict`.
+    /// plane entry's `plane_pulled = true` survives the take.
     #[test]
     fn a_local_capture_does_not_shadow_a_plane_pull_in_another_namespace() {
         let mut c = OvKvCache::default();

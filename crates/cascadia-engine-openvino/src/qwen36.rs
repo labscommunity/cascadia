@@ -561,9 +561,9 @@ pub struct Qwen36Engine {
     #[cfg(feature = "kv_coord")]
     kv_handoff: std::sync::Arc<crate::kv_coordination::KvHandoffMailbox>,
     /// Plane-restore MODE, parity with ov-runtime (`runtime.rs` `plane_restore`): downstream ranks
-    /// warm-resume over the KV plane, so a `false` chain verdict is advisory — cross-chain nothing
-    /// satisfies it and the chain cold-resets with rank 0 already warm. Read once from
-    /// `CASCADIA_KV_PLANE_RESTORE` at build; scoped per-turn by `kv_coordination::chain_verdict`.
+    /// warm-resume over the KV plane rather than from this rank's forwarded RESTORE. Read once from
+    /// `CASCADIA_KV_PLANE_RESTORE` at build. **Observability only** — it no longer softens the chain
+    /// verdict, because a plane rank now arms in-band inside its own `OPCODE_RESTORE` handler.
     #[cfg(feature = "kv_coord")]
     plane_restore: bool,
     /// A `set_state_blob` has been applied to the stages and not yet cleared. `reset_state` alone
@@ -1253,16 +1253,16 @@ impl Qwen36Engine {
                             // admission — short-circuiting it left every subsequent FORWARD dropped as
                             // "stale frame". It is also the real restore on the same-chain path, where
                             // no plane pull ever armed the downstream ranks.
+                            let plane_turn = self.plane_restore && plane_pulled;
                             let chain_ok = local_ok && {
-                                let down = self
-                                    .forward_restore_downstream(self.epoch, kv_epoch)
-                                    .unwrap_or(false);
-                                // Advisory only on a blob the plane pulled; local capture stays binding.
-                                crate::kv_coordination::chain_verdict(
-                                    down,
-                                    self.plane_restore,
-                                    plane_pulled,
-                                )
+                                // Binding in BOTH modes, matching ov-runtime: a plane rank arms
+                                // in-band inside its own OPCODE_RESTORE handler, so a `false` here
+                                // means it really is cold. The old `chain_verdict` override existed
+                                // for the out-of-band arm and would now mask exactly that — turning
+                                // a retracted or dropped downstream slice into a warm head over a
+                                // cold rank, which is wrong output rather than a cold reprefill.
+                                self.forward_restore_downstream(self.epoch, kv_epoch)
+                                    .unwrap_or(false)
                             };
                             if chain_ok {
                                 // Real KV depth, not the token count (off-by-one — see kv_seq_from_blob).
@@ -1275,7 +1275,7 @@ impl Qwen36Engine {
                                 let warm = crate::kv_coordination::kv_seq_from_framed_blob(&blob)
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
-                                info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, "qwen36 pipeline warm-resumed");
+                                info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
                                 warm
                             } else {
                                 warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
@@ -2384,6 +2384,15 @@ impl cascadia_engine::KvCoordination for Qwen36Engine {
         payloads: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ()> {
         let (tokens, blob) = crate::kv_coordination::wire_to_blob(manifest, payloads).ok_or(())?;
+        // Mirror into the lock-free holder cache, exactly as `kv_capture_local` does for a locally
+        // captured turn. Without this a warm-PULLED node can use the KV itself but cannot serve it
+        // onward — `OvKvHolder` reads the share, not `self.kv` — so a chained move A→B→C goes cold
+        // at C even though B is holding the bytes C needs. Pulled KV is a valid holding; D10 has
+        // replicas serve. Tenant-tagged with the ASSERTED partner, same as the line below.
+        self.kv_share
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_both(partner, tokens.clone(), blob.clone());
         // H.1b hard gate (§12.10.0a): key on the ASSERTED partner, never `manifest.partner`, which
         // the serving holder stamps and nothing validates.
         self.kv.insert_both(partner, tokens, blob);
@@ -2494,6 +2503,53 @@ mod tests {
             #[cfg(feature = "kv_coord")]
             kv_handoff: std::sync::Arc::new(crate::kv_coordination::KvHandoffMailbox::new()),
         }
+    }
+
+    /// A warm-PULLED node must be able to serve that KV onward.
+    ///
+    /// `kv_capture_local` mirrors a locally captured turn into the lock-free holder share; `insert`
+    /// (the pull path) used to write only `self.kv`. Since `OvKvHolder` serves from the SHARE, a node
+    /// that had just pulled 100+ MB could not answer for it — a chained move A→B→C went cold at C
+    /// while B was holding exactly the bytes C needed.
+    #[cfg(feature = "kv_coord")]
+    #[test]
+    fn a_warm_pulled_blob_is_servable_onward_from_the_holder_share() {
+        use cascadia_engine::KvCoordination;
+
+        let mut e = bare_engine(2, r#"{"arch":"qwen3_5_moe"}"#);
+        let tokens = vec![11, 22, 33];
+        let blob = vec![0xAB, 0xCD];
+        let (manifest, payloads) = crate::kv_coordination::blob_to_wire(
+            &tokens,
+            &blob,
+            "acme",
+            e.kv_fingerprint(),
+            crate::kv_coordination::synth_epoch(&tokens),
+        );
+
+        e.insert("acme", &manifest, &payloads)
+            .expect("pull insert must succeed");
+
+        // The share is what the wire path serves from.
+        let epoch = crate::kv_coordination::synth_epoch(&tokens);
+        let served = e
+            .kv_share
+            .lock()
+            .unwrap()
+            .serve("acme", epoch, tokens.len() as u32);
+        assert!(
+            served.is_some(),
+            "a pulled blob must land in the holder share, or this node cannot serve it onward              and a chained move goes cold one hop early"
+        );
+        // And it stays tenant-confined there.
+        assert!(
+            e.kv_share
+                .lock()
+                .unwrap()
+                .serve("evil", epoch, tokens.len() as u32)
+                .is_none(),
+            "sharing must not widen the tenant boundary"
+        );
     }
 
     #[test]
