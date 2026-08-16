@@ -2194,7 +2194,7 @@ impl OvDistSpecWorkerEngine {
                 // carried branch short-circuits the drain away and the rank warms from carried data
                 // while the plane slice goes unread. Chain mode parks nothing, so this is a false
                 // no-op there and the carried/capture path below is unchanged.
-                let local_ok = if self.drain_kv_handoff() {
+                let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else if !carried.is_empty() {
                     let ok = self.runtime.set_state_blob(&carried).is_ok();
@@ -2841,10 +2841,10 @@ impl OvDistSpecWorkerEngine {
     ///
     /// Position 0 because a worker holds no KV cursor of its own — the driver owns the spec-decode
     /// positions — so the depth guard has nothing to compare against.
-    fn drain_kv_handoff(&mut self) -> bool {
+    fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         let mailbox = std::sync::Arc::clone(&self.kv_handoff);
         let fp = self.kv_fingerprint();
-        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, |blob| {
+        crate::kv_coordination::drain_handoff(&mailbox, fp, 0, expected_epoch, |blob| {
             self.runtime.set_state_blob(blob).is_ok()
         })
     }

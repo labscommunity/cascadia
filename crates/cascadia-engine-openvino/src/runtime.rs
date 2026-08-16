@@ -3857,9 +3857,9 @@ impl OvRuntimeEngine {
     /// off the activation stream instead left the two unordered: at a short warm prefix the drain
     /// routinely ran first and the slice sat parked forever — rank cold under a warm head.
     #[cfg(feature = "kv_coord")]
-    pub(crate) fn drain_kv_handoff(&mut self) -> bool {
+    pub(crate) fn drain_kv_handoff(&mut self, expected_epoch: u64) -> bool {
         use crate::kv_coordination::HandoffReject;
-        let Some(slot) = self.kv_handoff.take() else {
+        let Some(slot) = self.kv_handoff.take(expected_epoch) else {
             return false;
         };
         let fp = self.kv_model_fingerprint();
@@ -4326,7 +4326,7 @@ impl OvRuntimeEngine {
                 // verdict is true so nothing aborts — a hollow warm. The parked slice is the
                 // authoritative cross-chain data, so it wins; chain mode parks nothing, so this is
                 // a false no-op there and the carried/capture path is unchanged.
-                let local_ok = if self.drain_kv_handoff() {
+                let local_ok = if self.drain_kv_handoff(epoch) {
                     true
                 } else if let Some(blob) = carried {
                     let pos_before = self.position;

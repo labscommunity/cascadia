@@ -369,13 +369,16 @@ pub(crate) fn handoff_decision(
 ///
 /// Event names and fields are byte-identical to the OpenVINO drain on purpose — the cert greps them
 /// and cannot tell the engines apart.
+/// `expected_epoch` is the epoch of the RESTORE being served: a slice parked for any other epoch is
+/// dropped, not applied. See `KvHandoffMailbox::take` for why that is a correctness guard.
 pub(crate) fn drain_handoff(
     mailbox: &KvHandoffMailbox,
     model_fp: u64,
     position: usize,
+    expected_epoch: u64,
     apply: impl FnOnce(&KvSnapshot) -> bool,
 ) -> bool {
-    let Some(slot) = mailbox.take() else {
+    let Some(slot) = mailbox.take(expected_epoch) else {
         return false;
     };
     let digest = payload_digest(&slot.payloads);
@@ -536,7 +539,7 @@ impl KvCoordination for SparseMoEEngine {
         // and, from an earlier turn, its own same-epoch capture. A trailing `||` short-circuits the
         // drain away: the head warms from the stale local capture, the pulled slice is never
         // applied, and the verdict still reads true — a hollow warm nothing aborts (07d9bf2/a8fc4b4).
-        let local_ok = if self.drain_kv_handoff() {
+        let local_ok = if self.drain_kv_handoff(epoch) {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {
@@ -952,20 +955,20 @@ mod tests {
     fn drain_handoff_consumes_what_the_plane_parked() {
         let mailbox = KvHandoffMailbox::new();
         assert!(
-            !drain_handoff(&mailbox, 7, 0, |_| true),
+            !drain_handoff(&mailbox, 7, 0, 0xE0, |_| true),
             "an empty mailbox drains false"
         );
         let (manifest, payloads) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
         mailbox.put(0xE0, manifest, payloads);
         assert!(mailbox.ever_parked());
         let mut applied = None;
-        assert!(drain_handoff(&mailbox, 7, 0, |snap| {
+        assert!(drain_handoff(&mailbox, 7, 0, 0xE0, |snap| {
             applied = Some(snap.past_seq_len);
             true
         }));
         assert_eq!(applied, Some(3), "the parked slice is what got applied");
         // One slot: a second drain finds nothing.
-        assert!(!drain_handoff(&mailbox, 7, 0, |_| true));
+        assert!(!drain_handoff(&mailbox, 7, 0, 0xE0, |_| true));
     }
 
     #[test]
@@ -975,7 +978,7 @@ mod tests {
         let mailbox = KvHandoffMailbox::new();
         let (manifest, payloads) = snapshot_to_wire(&[11, 22, 33], &snap(), "peer", 7, 0xE0);
         mailbox.put(0xE0, manifest, payloads);
-        assert!(!drain_handoff(&mailbox, 7, 0, |_| false));
+        assert!(!drain_handoff(&mailbox, 7, 0, 0xE0, |_| false));
     }
 
     #[test]
