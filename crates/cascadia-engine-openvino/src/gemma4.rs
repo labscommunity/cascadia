@@ -698,9 +698,17 @@ impl Gemma4Engine {
                 // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
                 // A prefill reply waits on every remaining stage's
                 // whole-prompt compute — widened budget (see
-                // `recv_tensor_reply_prefill`).
+                // `recv_tensor_reply_prefill`), CEILINGED here: the transport
+                // budget multiplies the operator's frame-transfer knob
+                // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
+                // waiting head holds its admission slot the whole time, so one
+                // dead downstream turned the node into a refuse-everything wall
+                // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
+                // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
+                // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
+                // leaves ~6x headroom for deeper pipelines / longer prompts.
                 if prefill {
-                    guard.recv_reply_prefill().await
+                    recv_prefill_reply_ceilinged(&mut guard).await
                 } else {
                     guard.recv_reply().await
                 }
@@ -1396,10 +1404,46 @@ const G_OPCODE_ABORT_ACK: u8 = 6;
 /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
 /// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
 /// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+/// Ceiling on the widened prefill-reply wait (transport budget = recv_timeout × 10, which is
+/// operator-frame-knob-coupled, not compute-coupled). Measured legit worst: 51 s. See the call site.
+const G_PREFILL_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The prefill reply wait, ceilinged. One definition for the call site and its test — a test that
+/// re-implements the pattern inline pins nothing (deleting the call-site ceiling would leave it
+/// green; this file has shipped that mistake before).
+async fn recv_prefill_reply_ceilinged(
+    g: &mut cascadia_transport::ActivationClient,
+) -> Result<
+    (
+        cascadia_transport::Tensor,
+        cascadia_transport::TransferStats,
+    ),
+    cascadia_transport::TransportError,
+> {
+    match tokio::time::timeout(G_PREFILL_REPLY_CEILING, g.recv_reply_prefill()).await {
+        Ok(r) => r,
+        Err(_) => Err(cascadia_transport::TransportError::SocketClosed),
+    }
+}
 #[cfg(feature = "kv_coord")]
-/// Bound on a downstream CAPTURE ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT. RESTORE and
-/// ABORT have the same unbounded wait and the same wedge — separate follow-up, not v2-reachable.
-const G_CAPTURE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Bound on a downstream CAPTURE/RESTORE/ABORT ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT.
+/// Every driver-side control exchange is bounded (qwen36 does the same via `reply_bounded`):
+/// a dead peer must error the exchange, not wedge the engine step forever.
+const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Bounded control-ack recv shared by the CAPTURE/RESTORE/ABORT exchanges. A
+/// peer that dies without acking must surface as an error here — the caller
+/// holds the downstream lock, so an unbounded wait wedges the engine step (and
+/// with it the whole rank) forever.
+#[cfg(feature = "kv_coord")]
+async fn recv_control_ack_bounded(
+    g: &mut cascadia_transport::ActivationClient,
+) -> Result<WireTensor, cascadia_transport::TransportError> {
+    let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
+        .await
+        .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
+    Ok(ack)
+}
 const G_OPCODE_CAPTURE_V2: u8 = 7;
 
 #[cfg(feature = "kv_coord")]
@@ -1436,9 +1480,7 @@ impl Gemma4Engine {
                 // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
                 // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
                 // unbounded wait here wedges this rank while it holds the downstream lock.
-                let (ack, _) = tokio::time::timeout(G_CAPTURE_ACK_TIMEOUT, g.recv())
-                    .await
-                    .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
+                let ack = recv_control_ack_bounded(&mut g).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -1461,7 +1503,9 @@ impl Gemma4Engine {
             .block_on(async move {
                 let mut g = downstream.lock().await;
                 g.send(&t).await?;
-                let (ack, _) = g.recv().await?;
+                // Bounded like CAPTURE above: an unbounded wait on a dead peer
+                // wedges this rank while it holds the downstream lock.
+                let ack = recv_control_ack_bounded(&mut g).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -1481,7 +1525,9 @@ impl Gemma4Engine {
         self.block_on(async move {
             let mut g = downstream.lock().await;
             g.send(&t).await?;
-            let _ = g.recv().await?;
+            // Bounded like CAPTURE above: an unbounded wait on a dead peer
+            // wedges this rank while it holds the downstream lock.
+            let _ = recv_control_ack_bounded(&mut g).await?;
             Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
@@ -2081,6 +2127,77 @@ impl Builder for Gemma4Builder {
 mod tests {
     use super::*;
     use cascadia_types::PeerLayout;
+
+    /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while
+    /// CAPTURE's was bounded, so a peer that died without acking wedged the
+    /// engine step forever (holding the downstream lock). Every control-ack
+    /// recv now routes through `recv_control_ack_bounded`, which must ERROR on
+    /// a silent peer once the budget lapses, never wedge.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn control_ack_recv_errors_instead_of_wedging_on_a_silent_peer() {
+        // A peer that accepts and then never writes — the dead-peer shape.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let _held_open = accept.await.unwrap();
+
+        // Pause AFTER the real connect so auto-advance only drives the recv
+        // bound (and the test's own backstop), not the connect timeout.
+        tokio::time::pause();
+        let res = tokio::time::timeout(
+            G_CONTROL_ACK_TIMEOUT * 4,
+            super::recv_control_ack_bounded(&mut client),
+        )
+        .await;
+        match res {
+            Ok(Err(_)) => {} // bounded: the dead peer surfaces as an error
+            Ok(Ok(_)) => panic!("a silent peer cannot produce an ack"),
+            Err(_) => panic!("control-ack recv wedged past its bound on a silent peer"),
+        }
+    }
+
+    /// Same incident, prefill flavor: the transport's widened prefill budget is
+    /// recv_timeout × 10 — the rig's 600 s knob made it 6000 s, and the waiting
+    /// head held its admission slot the whole time (a one-slot node refused
+    /// everything for 100 minutes). The ceiling must error a silent downstream
+    /// at G_PREFILL_REPLY_CEILING regardless of how large the operator knob is.
+    #[tokio::test]
+    async fn prefill_reply_wait_is_ceilinged_on_a_silent_downstream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let _held_open = accept.await.unwrap();
+
+        tokio::time::pause();
+        // Under a paused clock BOTH the ceiling and the transport's own 10× budget fire instantly
+        // in real time, so "errors eventually" cannot distinguish them (a first draft of this test
+        // passed with the ceiling deleted). Discriminate on ELAPSED VIRTUAL TIME: with the ceiling,
+        // the error lands at exactly G_PREFILL_REPLY_CEILING; without it, at the transport budget.
+        let budget = cascadia_transport::recv_timeout()
+            .saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR);
+        assert!(
+            budget > G_PREFILL_REPLY_CEILING,
+            "precondition: the transport budget ({budget:?}) must exceed the ceiling in this test \
+             env or the assertion below cannot discriminate — raise the ceiling gap or the env knob"
+        );
+        let t0 = tokio::time::Instant::now();
+        let res = super::recv_prefill_reply_ceilinged(&mut client).await;
+        let elapsed = t0.elapsed();
+        assert!(
+            res.is_err(),
+            "a silent downstream cannot produce a prefill reply"
+        );
+        assert!(
+            elapsed <= G_PREFILL_REPLY_CEILING + std::time::Duration::from_secs(1),
+            "prefill reply errored only after {elapsed:?} — the ceiling was not applied \
+             (transport budget is {budget:?})"
+        );
+    }
 
     #[tokio::test]
     async fn rejects_missing_pipeline_config() {
