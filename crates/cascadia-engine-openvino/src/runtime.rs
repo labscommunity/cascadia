@@ -3901,7 +3901,14 @@ impl OvRuntimeEngine {
         // Captured BEFORE set_state so the ledger can show whether the engine had already advanced past
         // the resume depth when this landed — the timing candidate's signature.
         let pos_before = self.position;
-        match self.runtime.set_state_blob(blob) {
+        // Gate A attributes ~21.7 s of the warm turn to this call, but that figure is a DELTA between
+        // two whole runs on different builds. Time it directly: our Rust-side marshalling measures
+        // 147 ms on a 114.6 MB payload (`apply_path_cost_split`), so whatever lands here is
+        // `ov::VariableState::set_state` and nothing else.
+        let t_set_state = std::time::Instant::now();
+        let set_state = self.runtime.set_state_blob(blob);
+        let set_state_ms = t_set_state.elapsed().as_millis() as u64;
+        match set_state {
             Ok(()) => {
                 self.position = crate::kv_coordination::kv_seq_from_blob(blob).unwrap_or(0) as i64;
                 // Probe A+B (PLANE apply site). `position` settled the depth question (head 97 == tail
@@ -3915,6 +3922,7 @@ impl OvRuntimeEngine {
                     position_before = pos_before,
                     blob_digest = crate::kv_coordination::byte_digest(blob),
                     blob_len = blob.len(),
+                    set_state_ms,
                     mode = "plane",
                     "ov-runtime: apply_warm_resume set position"
                 );

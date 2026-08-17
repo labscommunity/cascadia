@@ -1186,15 +1186,22 @@ pub(crate) fn drain_handoff(
             return false;
         }
     };
-    if apply(&blob) {
+    // `apply` is `set_state_blob` at every production call site. Timed because Gate A's apply cost is
+    // the term that decides whether the plane can ever beat a cold reprefill, and it has only ever
+    // been inferred from a run-to-run delta. See `apply_path_cost_split` for our side of the split.
+    let t_apply = std::time::Instant::now();
+    let applied = apply(&blob);
+    let apply_ms = t_apply.elapsed().as_millis() as u64;
+    if applied {
         tracing::info!(target: "cascadia::kv", event = "kv_handoff_applied_inline",
-            epoch = slot.epoch, position, blob_digest = byte_digest(&blob));
+            epoch = slot.epoch, position, apply_ms, blob_len = blob.len(),
+            blob_digest = byte_digest(&blob));
         true
     } else {
         // set_state failed ⇒ this rank stays cold on a turn the commit path armed as warm, and nothing
         // on this side can undo that. The arm exists to make the failure greppable.
         tracing::warn!(target: "cascadia::kv", event = "kv_handoff_apply_failed",
-            epoch = slot.epoch, position);
+            epoch = slot.epoch, position, apply_ms);
         false
     }
 }
