@@ -428,6 +428,21 @@ class CkptSource:
             # clip cleanly; a wrong-axis expand would corrupt silently.
             assert s.shape == w.shape, f"fp8 scale expand mismatch for {name}: {tuple(s.shape)} vs {tuple(w.shape)}"
             return w * s                                     # dequant = fp8 * scale_inv
+        # Dequant is gated on the SCALE KEY NAME, so a checkpoint that spells it
+        # differently (compressed-tensors / vLLM use `.weight_scale`) would fall
+        # through here and export raw e4m3 codes as weights — magnitudes ~±448
+        # instead of ~±0.05. Every `_require` passes, the manifest is written,
+        # hours of export land on disk, and the model loads and emits noise.
+        # Refuse on the dtype rather than trusting the key spelling.
+        if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raise SystemExit(
+                f"{name}: fp8 tensor with no '{sk}' sibling — cannot dequantize. "
+                "This exporter expects the DeepSeek-style `.weight_scale_inv` "
+                "block scales shipped with zai-org/GLM-5.2-FP8. A checkpoint "
+                "using `.weight_scale` (compressed-tensors/vLLM) needs its own "
+                "dequant path; exporting raw fp8 codes would silently produce a "
+                "garbage model."
+            )
         return t.to(torch.float32)
 
 
