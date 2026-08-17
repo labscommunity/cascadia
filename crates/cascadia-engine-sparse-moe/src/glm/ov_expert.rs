@@ -271,10 +271,22 @@ impl OvExperts {
             return None;
         }
         let (_, _, bytes) = rt.output(0).ok()?;
-        let out = bytes
+        let out: Vec<f32> = bytes
             .chunks_exact(4)
             .map(|c| to_bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
+        // The caller accumulates with `zip`, which truncates silently, so a
+        // short vector would contribute a partly-garbage expert and still be
+        // counted a cache hit — an IR built for other dims infers cleanly, so
+        // nothing else notices. Treat a wrong length as a per-call failure and
+        // fall back to the Rust kernel.
+        if out.len() != self.dim {
+            self.mark_failed(
+                key,
+                &format!("output len {} != dim {}", out.len(), self.dim),
+            );
+            return None;
+        }
         stats::record(key, miss, t0);
         Some(out)
     }
