@@ -34,5 +34,7 @@ tokenizers = { workspace = true }
 half = "2"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` for tokio::time::pause — the control-ack bound test drives a 15 s
+# timeout on the paused clock instead of sleeping it for real.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
