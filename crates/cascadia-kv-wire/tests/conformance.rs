@@ -169,6 +169,19 @@ fn envelope_variants_match_golden() {
                 partner: "c".into(),
             },
         ),
+        // Rank-bound fetch. Appended last and shipped without a golden — its TAG was pinned by
+        // `declared_index`, but nothing pinned its FIELD layout, so reordering `rank` against
+        // `expected_len` would have crossed the repo boundary undetected.
+        (
+            "env_get_v2",
+            KvMessage::GetV2 {
+                partner: PartnerId("c".into()),
+                model_fingerprint: 7,
+                expected_epoch: 9,
+                expected_len: 2,
+                rank: 1,
+            },
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();
