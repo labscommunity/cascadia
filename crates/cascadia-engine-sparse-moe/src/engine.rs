@@ -2983,6 +2983,10 @@ impl<R: StagedRunner> PipelineEngine<R> {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        // Same omission as the pipeline path: the API reads this and reported 0.
+        // `prompt_ids` is already truncated to the context budget above, so its
+        // length is the count actually processed.
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.finish_reason = Some(if hit_context_cap {
             FinishReason::Length
         } else {
@@ -3423,6 +3427,12 @@ impl<R: StagedRunner> PipelineEngine<R> {
         // an orchestrator summing the per-frame SSE `n_tokens` field (which
         // renders `n_tokens.unwrap_or(1)`) doesn't count a phantom token here.
         chunk.n_tokens = Some(0);
+        // Without this the API reports `prompt_tokens: 0` on every response —
+        // it reads `chunk.prompt_tokens`, and this engine never set it (the OV
+        // engines do). `n_prefill`, not `prompt_ids.len()`, because an
+        // over-budget prompt is truncated and the count should describe the
+        // tokens actually processed.
+        chunk.prompt_tokens = Some(a.n_prefill as u32);
         chunk.finish_reason = Some(if a.hit_context_cap {
             FinishReason::Length
         } else {
