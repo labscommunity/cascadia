@@ -7,11 +7,18 @@ is a runtime parameter (`total`), never hardcoded; layers split evenly across
 ranks. Attention is DeepSeek-V3-style **MLA + DSA**, a different family from the
 V4 shell in this crate, so `src/glm/` is mostly a rewrite, not an adapt.
 
-**Status: implemented.**
+**Status: implemented and run on hardware.**
 Numerics are golden-tested 1:1 against a Python CPU reference (`tools/glm5_ref`);
 the FP8→int4 exporter is validated by a synthetic round-trip; the pipeline is
-parity-tested across N ranks over the real loopback transport. Not yet run on the
-744B checkpoint or real hardware — that is the export + deploy phase.
+parity-tested across N ranks over the real loopback transport.
+
+Run on the real 744B int4 export across a 4-node Lunar Lake fleet (CPU): chat and
+per-token SSE streaming both serve correct output; a 386-token prompt prefills as
+two `MAX_BATCH_COUNT` windows and recalls a needle planted in window 1; the
+KV-prefix cache cuts multi-turn TTFT ~5.5x (`reused=174 prompt=184 suffix=10`).
+Measured there, with activations relayed rather than on a direct link: TTFT ~300 s
+short / ~1020–1960 s long, decode ~11 s/token. Prefill dominates (~98% of a
+long-prompt request), so residency and prefix reuse are the levers, not kernels.
 
 ## Architecture
 
@@ -37,17 +44,25 @@ cache) is the only memory-feasible form at 1M ctx.
 ## Size / feasibility
 
 ```
-int4 expert        ~= 18.9 MB   (3 * 6144 * 2048 * 0.5 B)
-routed total       ~= 356 GB    (75 MoE layers * 256) + ~1.4 GB shared
-int4 export        ~= 386 GB    (from a ~755 GB FP8 checkpoint)
-per node (N=4)     ~= 89 GB experts  vs 32 GB RAM
+int4 expert        ~= 21.2 MB   (3 * 6144 * 2048 * 0.5625 B)
+routed total       ~= 409 GB    (75 MoE layers * 257 incl. shared)
+int4 export        ~= 439 GB    (from a ~704 GB FP8 checkpoint)
+per node (N=4)     ~= 110 GB experts  vs 32 GB RAM
 ```
+
+`0.5625` B/weight, not `0.5`: the nibbles are 0.5 B but each group of 32 also
+carries a bf16 scale, which `residency::int4_expert_bytes` counts and the older
+figures did not. Measured against a real export staged on the fleet: a MoE layer
+(shell + 257 experts) is 5.79 GB and a dense layer 476 MB, so 3 dense + 75 MoE +
+embed + head = **439.5 GB**. The earlier `386 GB` understated by ~54 GB (12%),
+which is enough to fail the exporter's own pre-flight space check on a disk
+provisioned to the doc.
 
 Throughput is gated by **residency** (how much of the expert set is RAM-resident),
 not engine math. At N=4 ~35% is resident, so the node streams the rest from NVMe
 → ~0.4–0.6 tok/s single-stream: async/batch + structured-output territory (the
 coding-agent workload), not interactive. Residency improves with N (each node's
-slice shrinks): N=8 → ~45 GB, N=16 → ~22 GB (fits RAM). Cap `max_seq` from the
+slice shrinks): N=8 → ~51 GB, N=16 → ~26 GB (fits RAM). Cap `max_seq` from the
 deployment, never from `max_position` (1M would preallocate TB-scale KV).
 
 ## What's implemented
@@ -101,7 +116,8 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
 
 ## Remaining before / at the hardware phase
 
-- Real 744B export (needs the FP8 checkpoint + ~386 GB disk) — this also confirms
+- Real 744B export (needs the FP8 checkpoint + ~440 GB disk; the exporter's
+  pre-flight check demands that plus a 5% margin) — this also confirms
   the DSA/MTP tensor names against the real config (the exporter loud-fails on a
   mismatch).
 - Deploy across the AI-PCs; measure real tok/s and residency hit-rate.

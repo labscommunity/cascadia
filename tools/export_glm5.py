@@ -440,7 +440,7 @@ def _int4_bin_bytes(hidden: int, inter: int) -> int:
 
 def check_space(out: Path, cfg: dict):
     """Pre-flight: estimate the export size and refuse to start if the disk
-    can't hold it (a 386 GB export that runs out of space at layer 60 is an
+    can't hold it (a 439 GB export that runs out of space at layer 60 is an
     expensive failure). Override with GLM5_SKIP_SPACE_CHECK=1."""
     import shutil
 

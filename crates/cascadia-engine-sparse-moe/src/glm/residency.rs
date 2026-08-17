@@ -1,7 +1,7 @@
 //! Per-node RAM residency for the mmap int4 expert path.
 //!
 //! Cascadia mmaps expert bins and leans on the OS page cache as the LRU. On a
-//! node where experts (~89 GB) far exceed RAM (~32 GB), cold experts thrash the
+//! node where experts (~110 GB) far exceed RAM (~32 GB), cold experts thrash the
 //! NVMe. Residency adds two levers:
 //!   1. a **budget** ([`pin_expert_count`], ported from `cap_for_ram`) for how
 //!      many experts RAM can afford to keep pinned, after reserving the dense
