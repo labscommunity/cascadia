@@ -105,7 +105,7 @@ fn prev_set() -> &'static Mutex<HashSet<u64>> {
 /// Cached `CASCADIA_GLM5_PROFILE` check (read once).
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CASCADIA_GLM5_PROFILE").is_ok())
+    *ON.get_or_init(|| crate::glm::env_flag("CASCADIA_GLM5_PROFILE"))
 }
 
 /// Accumulate `since.elapsed()` into `bucket` (no-op when disabled).

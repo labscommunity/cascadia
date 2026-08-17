@@ -43,7 +43,7 @@ impl OvExperts {
     /// Construct from env, or `None` to keep the Rust expert path:
     /// requires `CASCADIA_DSV4_OV_EXPERTS` set and `<model>/experts_ov` present.
     pub fn from_env(model_dir: &Path, dim: usize) -> Option<Self> {
-        if std::env::var("CASCADIA_DSV4_OV_EXPERTS").is_err() {
+        if !crate::glm::env_flag("CASCADIA_DSV4_OV_EXPERTS") {
             return None;
         }
         let dir = model_dir.join("experts_ov");

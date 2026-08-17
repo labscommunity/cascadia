@@ -203,8 +203,8 @@ impl StageOpts {
     /// logic already lives.
     pub fn from_env() -> Self {
         Self {
-            bf16_head: std::env::var_os("CASCADIA_GLM5_F32_HEAD").is_none(),
-            bf16_kv: std::env::var_os("CASCADIA_GLM5_BF16_KV").is_some(),
+            bf16_head: !crate::glm::env_flag("CASCADIA_GLM5_F32_HEAD"),
+            bf16_kv: crate::glm::env_flag("CASCADIA_GLM5_BF16_KV"),
             experts_mode: None,
             lookahead: None,
             prefix_cache_depth: None,

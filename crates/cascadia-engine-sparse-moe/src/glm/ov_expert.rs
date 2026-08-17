@@ -361,7 +361,7 @@ pub mod stats {
     }
 
     fn enabled() -> bool {
-        *ON.get_or_init(|| std::env::var("CASCADIA_GLM5_OV_STATS").is_ok())
+        *ON.get_or_init(|| crate::glm::env_flag("CASCADIA_GLM5_OV_STATS"))
     }
 
     /// Record one expert call: `miss` = the key was absent (compile path),
