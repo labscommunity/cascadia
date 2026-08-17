@@ -18,6 +18,48 @@
 //!   3. dense/MoE block + full model greedy parity
 //!   4. engine/manifest wiring (`shell_backend = "rust_glm"`)
 
+/// True when `name` is set to a value that means "on".
+///
+/// The `CASCADIA_GLM5_*` switches were presence-only (`var_os(..).is_some()` /
+/// `var(..).is_ok()`), so `FLAG=0` — the obvious way to turn one off — switched
+/// it ON. That is worst for `CASCADIA_GLM5_OV_EXPERTS`, whose docs say `=1` and
+/// whose backend is experimental and measured slower than the Rust kernel: an
+/// operator disabling it would enable it. Treat unset, empty, `0`, `false`,
+/// `no` and `off` as off; anything else (including `1`) as on.
+pub fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("no")
+                || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::env_flag;
+
+    #[test]
+    fn zero_and_false_mean_off_not_on() {
+        let k = "CASCADIA_GLM5_ENV_FLAG_TEST";
+        for off in ["0", "false", "FALSE", "no", "off", "", "  "] {
+            std::env::set_var(k, off);
+            assert!(!env_flag(k), "{off:?} must be off");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            std::env::set_var(k, on);
+            assert!(env_flag(k), "{on:?} must be on");
+        }
+        std::env::remove_var(k);
+        assert!(!env_flag(k), "unset must be off");
+    }
+}
+
 pub mod attn;
 pub mod ffn;
 pub mod gate;

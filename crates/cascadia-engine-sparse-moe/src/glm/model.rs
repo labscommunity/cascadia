@@ -210,7 +210,7 @@ static LAYER_PREFILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 fn attn_profile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CASCADIA_GLM5_ATTN_PROFILE").is_some())
+    *ON.get_or_init(|| crate::glm::env_flag("CASCADIA_GLM5_ATTN_PROFILE"))
 }
 
 /// Full GLM-5.2 model: embed → layers → final RMSNorm → lm_head. Single-stream

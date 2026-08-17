@@ -131,7 +131,7 @@ impl OvExperts {
         cache_entries: Option<u32>,
         cache_mb: Option<u64>,
     ) -> Option<Self> {
-        if std::env::var("CASCADIA_GLM5_OV_EXPERTS").is_err() {
+        if !crate::glm::env_flag("CASCADIA_GLM5_OV_EXPERTS") {
             return None;
         }
         let dir = model_dir.join("experts_ov");

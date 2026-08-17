@@ -51,7 +51,7 @@ pub enum AnyExpert {
 fn r1_read() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CASCADIA_GLM5_R1READ").is_some())
+    *E.get_or_init(|| crate::glm::env_flag("CASCADIA_GLM5_R1READ"))
 }
 
 impl AnyExpert {

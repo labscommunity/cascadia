@@ -412,7 +412,7 @@ impl GlmRunner {
         // 80% of available RAM) plus hundreds of VirtualLock'd bins starves the
         // GPU driver's residency request during weight upload. This knob is what
         // makes that testable; it is not itself the fix.
-        let nopin_env = std::env::var_os("CASCADIA_GLM5_NOPIN").is_some();
+        let nopin_env = crate::glm::env_flag("CASCADIA_GLM5_NOPIN");
         // Pinning and accelerator offload are mutually exclusive on shared-RAM
         // devices: pins + held compiled experts crowd the pool GPU builds
         // allocate from (measured: combined = 100/100 CL_INVALID_EVENT, either
@@ -450,7 +450,7 @@ impl GlmRunner {
             // and re-faulted each token. mlock them unconditionally (~1.8 GB for
             // the full model) so they stay resident — guaranteed hits, ~1/9 of
             // active expert bytes. Disable for an A/B with CASCADIA_GLM5_NOPIN_ACTIVE=1.
-            if std::env::var_os("CASCADIA_GLM5_NOPIN_ACTIVE").is_none() {
+            if !crate::glm::env_flag("CASCADIA_GLM5_NOPIN_ACTIVE") {
                 let mut act = 0usize;
                 for layer in s.layers.iter() {
                     let e = match (layer.moe(), layer.dense_expert()) {
@@ -523,7 +523,7 @@ impl GlmRunner {
         // (streamed experts); eager/bf16 have nothing to warm.
         let lookahead_on = opts
             .lookahead
-            .unwrap_or_else(|| std::env::var_os("CASCADIA_GLM5_LOOKAHEAD").is_some());
+            .unwrap_or_else(|| crate::glm::env_flag("CASCADIA_GLM5_LOOKAHEAD"));
         let lookahead = if mode == ExpertsMode::Mmap && lookahead_on {
             let table: super::lookahead::LookaheadTable = s
                 .layers
@@ -550,7 +550,7 @@ impl GlmRunner {
             total,
             usage,
             usage_path,
-            prefetch: std::env::var("CASCADIA_GLM5_PREFETCH").is_ok(),
+            prefetch: crate::glm::env_flag("CASCADIA_GLM5_PREFETCH"),
             lookahead,
             prefix_cache: SliceKvCache::new(
                 opts.prefix_cache_depth
