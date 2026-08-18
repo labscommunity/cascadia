@@ -15,9 +15,10 @@
 #          dashboard embedded in the binary). Each bundle ships the cascadia
 #          binary PLUS the OpenVINO GenAI runtime libraries it dynamically links.
 #          The binary does NOT work standalone — see INSTALL.md. The dashboard
-#          SPA is built with npm right before the cargo build (web/dist is
-#          generated, not checked in); the cascadia-dashboard build script
-#          fails the job with instructions if that step is ever dropped.
+#          SPA (web/dist is generated, not checked in) is built once in its
+#          own read-only job and downloaded by both build jobs; the
+#          cascadia-dashboard build script fails the job with instructions
+#          if that download is ever dropped.
 # Targets: linux-x86_64, windows-x86_64 (both Intel). macOS has no Intel GPU
 #          runtime — it is stub-only (dev) and intentionally not released here.
 # Runner : GitHub-hosted. The OpenVINO *build* only links against the SDK
@@ -102,9 +103,44 @@ jobs:
               --title "cascadia $TAG" --generate-notes
           fi
 
+  # ── The dashboard SPA is platform-independent, so it is built once here
+  #    and both bundles embed the same dist. Keeping npm out of the build
+  #    jobs matters beyond deduplication: those jobs hold `contents: write`
+  #    and upload the release assets, and `npm ci` runs ~190 third-party
+  #    packages' lifecycle scripts. This job can only read the repo.
+  build-spa:
+    name: dashboard SPA
+    needs: ensure-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Same ref as the build jobs, or a workflow_call run would embed
+          # the SPA from the wrong commit.
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      # Runner-preinstalled Node (>= 20 on all hosted images) — the JS deps
+      # are pinned by package-lock.json via `npm ci`, and a Vite build has
+      # no native-addon sensitivity to the Node minor, so a setup-node
+      # action would only add a supply-chain pin to maintain.
+      - name: Build dashboard SPA
+        working-directory: crates/cascadia-dashboard/web
+        run: npm ci && npm run build
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dashboard-dist
+          path: crates/cascadia-dashboard/web/dist
+          if-no-files-found: error
+          retention-days: 1
+
   build-linux:
     name: linux-x86_64 (openvino)
-    needs: ensure-release
+    needs: [ensure-release, build-spa]
     # ubuntu-22.04 → glibc 2.35 floor, and matches the ubuntu22 OV archive.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
@@ -143,15 +179,13 @@ jobs:
           tar -xzf "$RUNNER_TEMP/ov.tgz" -C "$RUNNER_TEMP/ov" --strip-components=1
           echo "INTEL_OPENVINO_DIR=$RUNNER_TEMP/ov" >> "$GITHUB_ENV"
 
-      # Runner-preinstalled Node (>= 20 on all hosted images) — the JS deps
-      # are pinned by package-lock.json via `npm ci`, and a Vite build has
-      # no native-addon sensitivity to the Node minor, so a setup-node
-      # action would only add a supply-chain pin to maintain.
-      - name: Build dashboard SPA
-        working-directory: crates/cascadia-dashboard/web
-        run: |
-          npm ci
-          npm run build
+      # Built by the build-spa job; web/dist is generated, not checked in.
+      # If this step is ever dropped, cascadia-dashboard's build script fails
+      # the job with instructions rather than silently shipping without a UI.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dashboard-dist
+          path: crates/cascadia-dashboard/web/dist
 
       - name: Build cascadia (openvino + dashboard)
         env:
@@ -198,7 +232,7 @@ jobs:
 
   build-windows:
     name: windows-x86_64 (openvino)
-    needs: ensure-release
+    needs: [ensure-release, build-spa]
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
@@ -219,13 +253,11 @@ jobs:
         with:
           shared-key: release-windows-openvino
 
-      # See the linux job for why preinstalled Node rather than setup-node.
-      - name: Build dashboard SPA
-        working-directory: crates/cascadia-dashboard/web
-        shell: pwsh
-        run: |
-          npm ci
-          npm run build
+      # See the linux job — same artifact, same build-script backstop.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dashboard-dist
+          path: crates/cascadia-dashboard/web/dist
 
       # MSVC (VS 2022 Build Tools) is preinstalled on windows-latest; cc-rs
       # locates it via vswhere, so no Developer Command Prompt is needed here.
