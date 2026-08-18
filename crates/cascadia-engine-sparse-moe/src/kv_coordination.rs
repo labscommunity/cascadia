@@ -17,8 +17,10 @@
 //! an empty cache, never a truncated length. The LOCAL resume path (`KvPrefixCache::lookup`, used by
 //! `generate_with_cache` and this module's own local warm-resume checks) deliberately stays
 //! unconfined — cross-tenant KV *reuse* on that path never crosses the wire and is an H.1 §5
-//! non-goal. `kv_capture`/`captures` (the multi-stage worker stash) is NOT namespaced (H.1a residual):
-//! the CAPTURE frame carries no tenant, so a worker rank has none to tag with.
+//! non-goal. `kv_capture`/`captures` (the multi-stage worker stash) carries the tenant as a VALUE
+//! (H.1a close): the CaptureV2 frame relays the head's turn tenant, consumer-inserted blobs are
+//! tagged with the asserted partner, and `export` confines tagged entries while an untagged one
+//! ("" — legacy v1 frame or tenant-less turn) stays readable by any partner.
 //! **Sharded serve:** under `kv_coord` a `total>1` engine gets the configured cache size and the
 //! head seeds it after a chain-wide `CAPTURE` (engine.rs), so a sharded holder does serve. WITHOUT
 //! the feature the cache is capacity-0 and lookup/insert degrade to None/no-op — the "sharded gap"
@@ -466,7 +468,15 @@ impl KvCoordination for SparseMoEEngine {
         //    so its slice is stashed at CAPTURE time and may serve repeat/later GETs — clone, no remove).
         let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
-        } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+        } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+            // A capture that carries a tenant (CaptureV2 / tagged consumer-insert) is confined to
+            // it. An UNTAGGED capture ("" — every legacy v1 frame, and a tenant-less turn) stays
+            // readable by any partner, so the certified multi-stage cross-chain pull is unchanged.
+            if !cap_ns.is_empty() && cap_ns != partner {
+                tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
+                    epoch = expected_epoch);
+                return None;
+            }
             (tokens.clone(), snap.clone())
         } else {
             return None;
@@ -508,8 +518,18 @@ impl KvCoordination for SparseMoEEngine {
                 };
                 self.kv_capture.remove(&k);
             }
-            self.kv_capture
-                .insert(epoch, (manifest.token_ids.clone(), snap.clone()));
+            // Tagged with the ASSERTED partner, never `manifest.partner` (the serving holder
+            // stamps that and nothing validates it, §12.10.0a) — a pulled blob left untagged
+            // here is servable cross-tenant via the export fallback (the OpenVINO holders
+            // shipped and fixed exactly that; see `insert_both`).
+            self.kv_capture.insert(
+                epoch,
+                (
+                    partner.to_string(),
+                    manifest.token_ids.clone(),
+                    snap.clone(),
+                ),
+            );
         }
         if !self.kv_prefix_cache.enabled() {
             return Ok(()); // cache disabled → prefix-cache mirror is a no-op; the plane staging above still ran
@@ -543,7 +563,7 @@ impl KvCoordination for SparseMoEEngine {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {
-                Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                Some((_ns, _t, snap)) => self.runner.restore_kv(&snap).is_ok(),
                 None => false,
             }
         };
@@ -566,8 +586,10 @@ pub(crate) struct SparseHolderState {
     pub(crate) prefix: KvPrefixCache,
     /// Holder-internal NEGOTIATE→GET correlation (mirror of the engine's `kv_offers`).
     offers: KvOfferStash<KvSnapshot>,
-    /// Mirror of the engine's `kv_capture` (multi-stage per-rank captures). `pub(crate)` for mirroring.
-    pub(crate) captures: std::collections::HashMap<u64, (Vec<i32>, KvSnapshot)>,
+    /// Mirror of the engine's `kv_capture` (multi-stage per-rank captures). `pub(crate)` for
+    /// mirroring. Tenant as VALUE, epoch-only key ("" = untagged/legacy, served to any partner);
+    /// see `SparseMoEEngine::kv_capture`.
+    pub(crate) captures: std::collections::HashMap<u64, (String, Vec<i32>, KvSnapshot)>,
     /// Fingerprint snapshotted at holder creation (the prefix cache's lookup key).
     fp: ModelFingerprint,
 }
@@ -629,14 +651,19 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         // Deleting it (bfae9ffe, reverted) made every rank>0 donor answer `get_none`: sparse-moe
         // plane0 7/7 -> 5/7 and plane1 10/10 -> 6/10, "B tail never restored from a carried blob".
         //
-        // It is ALSO the H.1a residual, and the two facts are not separable here: `captures` is
-        // epoch-keyed with no tenant (the CAPTURE frame carries none for a worker to tag with) and
-        // `synth_epoch` is a pure function of the prefix, so a caller who derives a victim's epoch
-        // is served their slice. Closing that needs a tenant ON THE CAPTURE FRAME — a wire change —
-        // not the removal of this branch. Tracked as a follow-up; do not "fix" it here again.
+        // H.1a close: the CaptureV2 frame carries the head's turn tenant, the stash entry is
+        // tagged with it, and a tagged entry is confined to that tenant here. An UNTAGGED entry
+        // ("" — a legacy v1 frame, or a tenant-less turn including the `kv_tenant_hint_missing`
+        // expiry path) stays readable by any partner: refusing those is exactly what bfae9ffe
+        // did, one frame later. Do not "fix" the fallback by deleting it or refusing "".
         let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
             off
-        } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
+        } else if let Some((cap_ns, tokens, snap)) = g.captures.get(&expected_epoch) {
+            if !cap_ns.is_empty() && cap_ns != partner {
+                tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
+                    epoch = expected_epoch);
+                return None;
+            }
             (tokens.clone(), snap.clone())
         } else {
             return None;
@@ -658,6 +685,11 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
 /// for why it is here and not in `tests/`.
 #[cfg(test)]
 mod wire_tests;
+
+/// The wire contract stated once and instantiated for BOTH MoE holders (this file's
+/// [`SparseMoeKvHolder`] and [`crate::ov_kv_coordination::OvMoeKvHolder`]) — see its module doc.
+#[cfg(test)]
+mod holder_conformance;
 
 #[cfg(test)]
 mod tests {
