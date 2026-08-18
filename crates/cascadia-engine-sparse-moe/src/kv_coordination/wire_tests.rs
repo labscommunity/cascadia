@@ -467,17 +467,24 @@ async fn the_legacy_rank_less_get_carries_no_rank_to_bind() {
     assert!(matches!(reply, KvMessage::Found(_)));
 }
 
-/// The `captures` stash must never answer a wire GET.
+/// The `captures` stash IS reachable over the wire, and that is the H.1a residual — pinned here so
+/// it is a known quantity rather than a surprise.
 ///
-/// `captures` is keyed on epoch ALONE — the CAPTURE frame carries no tenant, so a worker rank has
-/// none to tag entries with — while `synth_epoch` is a pure function of the prefix tokens. So while
-/// `export` fell back to it, any caller who could derive a victim's epoch was served that victim's
-/// slice over the wire. The offer path is partner-scoped and unaffected; this pins the fallback as
-/// removed rather than merely unused, because nothing else fails if it comes back.
+/// `captures` is keyed on epoch ALONE (the CAPTURE frame carries no tenant, so a worker rank has
+/// none to tag entries with) while `synth_epoch` is a pure function of the prefix tokens. A caller
+/// who derives a victim's epoch is therefore served that victim's slice.
+///
+/// It cannot be closed by dropping the fallback: only the HEAD negotiates, so rank>0 has no offer
+/// and serves from exactly this stash. Doing so (bfae9ffe, reverted) took sparse-moe plane0 from
+/// 7/7 to 5/7 and plane1 from 10/10 to 6/10 — every rank>0 donor answered `get_none`. The real fix
+/// is a tenant field on the CAPTURE frame, i.e. a wire change.
+///
+/// This test asserts TODAY'S behaviour. When the wire carries a tenant, invert it: the foreign
+/// partner must then get `NotFound` while the owner is still served.
 #[tokio::test]
-async fn a_capture_is_never_reachable_over_the_wire() {
+async fn a_capture_is_reachable_over_the_wire_h1a_residual() {
     let mut st = SparseHolderState::new(4, fp());
-    // Only a capture — no offer for anyone. Pre-fix this was reachable by every partner alike.
+    // Capture only, no offer — the rank>0 shape.
     let prefix: Vec<i32> = TOKENS[..3].to_vec();
     let epoch = super::synth_epoch(&prefix);
     st.captures.insert(epoch, (prefix, snap()));
@@ -487,12 +494,17 @@ async fn a_capture_is_never_reachable_over_the_wire() {
     });
 
     let len = snap().past_seq_len as u32;
-    for who in [OWNER, "tenant-b"] {
-        let (_c, reply) = ask(&holder, get_v2(who, epoch, len, RANK)).await;
-        assert_eq!(
-            reply,
-            KvMessage::NotFound,
-            "{who} reached the capture stash over the wire"
-        );
-    }
+    // The owner is served — this is the legitimate rank>0 path the cert depends on.
+    let (_c, reply) = ask(&holder, get_v2(OWNER, epoch, len, RANK)).await;
+    assert!(
+        matches!(reply, KvMessage::Found(_)),
+        "rank>0 must serve from its capture stash; refusing it breaks tail warm-resume"
+    );
+    // ...and so is a foreign tenant. That is the residual, asserted rather than implied.
+    let (_c, reply) = ask(&holder, get_v2("tenant-b", epoch, len, RANK)).await;
+    assert!(
+        matches!(reply, KvMessage::Found(_)),
+        "H.1a residual changed shape — if this now refuses, the CAPTURE frame gained a tenant and \
+         this test should be inverted rather than deleted"
+    );
 }

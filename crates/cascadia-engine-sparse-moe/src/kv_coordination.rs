@@ -624,13 +624,21 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         // Replicates `KvCoordination::export` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Offers ONLY. `captures` is keyed on epoch alone — the CAPTURE frame carries no tenant, so
-        // a worker rank has none to tag with — and `synth_epoch` is a pure function of the prefix
-        // tokens. Falling back to it here served any caller who could derive a victim's epoch, over
-        // the wire, across tenants. The OV holder already draws this line (`take_capture`: "the
-        // rank's OWN restore ... `serve` is the wire-facing path"); this is that rule applied here.
-        // Local restore still reads `captures`; the wire never does.
-        let Some((prefix, snap)) = g.offers.take(partner, expected_epoch) else {
+        // The `captures` arm is LOAD-BEARING, not a stray fallback: only the HEAD negotiates, so a
+        // worker rank (rank>0) never has an offer — it serves the slice it stashed from CAPTURE.
+        // Deleting it (bfae9ffe, reverted) made every rank>0 donor answer `get_none`: sparse-moe
+        // plane0 7/7 -> 5/7 and plane1 10/10 -> 6/10, "B tail never restored from a carried blob".
+        //
+        // It is ALSO the H.1a residual, and the two facts are not separable here: `captures` is
+        // epoch-keyed with no tenant (the CAPTURE frame carries none for a worker to tag with) and
+        // `synth_epoch` is a pure function of the prefix, so a caller who derives a victim's epoch
+        // is served their slice. Closing that needs a tenant ON THE CAPTURE FRAME — a wire change —
+        // not the removal of this branch. Tracked as a follow-up; do not "fix" it here again.
+        let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
+            off
+        } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
+            (tokens.clone(), snap.clone())
+        } else {
             return None;
         };
         if snap.past_seq_len as u32 != expected_len {
