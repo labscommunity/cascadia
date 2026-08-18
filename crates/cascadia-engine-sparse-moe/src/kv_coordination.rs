@@ -624,11 +624,13 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         // Replicates `KvCoordination::export` against the mirrored holder cache.
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
-            off
-        } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
-            (tokens.clone(), snap.clone())
-        } else {
+        // Offers ONLY. `captures` is keyed on epoch alone — the CAPTURE frame carries no tenant, so
+        // a worker rank has none to tag with — and `synth_epoch` is a pure function of the prefix
+        // tokens. Falling back to it here served any caller who could derive a victim's epoch, over
+        // the wire, across tenants. The OV holder already draws this line (`take_capture`: "the
+        // rank's OWN restore ... `serve` is the wire-facing path"); this is that rule applied here.
+        // Local restore still reads `captures`; the wire never does.
+        let Some((prefix, snap)) = g.offers.take(partner, expected_epoch) else {
             return None;
         };
         if snap.past_seq_len as u32 != expected_len {
@@ -643,6 +645,11 @@ impl cascadia_engine::KvSnapshotHolder for SparseMoeKvHolder {
         ))
     }
 }
+
+/// The holder driven over the framed wire protocol rather than by direct call — see the module doc
+/// for why it is here and not in `tests/`.
+#[cfg(test)]
+mod wire_tests;
 
 #[cfg(test)]
 mod tests {
