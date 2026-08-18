@@ -237,4 +237,57 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    // The embedded build's half of the same contract. A missing asset used to
+    // come back as 200 + the SPA shell, so a browser asking for a hashed
+    // `.js` got `text/html`, refused it on MIME grounds, and rendered a blank
+    // dashboard — with every response a 200 and nothing in the log.
+
+    #[cfg(feature = "embed-spa")]
+    #[tokio::test]
+    async fn missing_asset_404s_instead_of_serving_the_shell() {
+        let app = make_router(state_with_two_nodes());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/bogus.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "embed-spa")]
+    #[tokio::test]
+    async fn client_routes_still_resolve_to_the_shell() {
+        let app = make_router(state_with_two_nodes());
+        let response = app
+            .oneshot(Request::builder().uri("/chat").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // `/chat` is a client-side route with no file behind it: the SPA
+        // router resolves it, so the shell is the correct answer.
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = &response.headers()[axum::http::header::CONTENT_TYPE];
+        assert!(ct.to_str().unwrap().starts_with("text/html"));
+    }
+
+    #[cfg(feature = "embed-spa")]
+    #[tokio::test]
+    async fn reserved_api_paths_404_rather_than_masking_as_the_shell() {
+        for uri in ["/v1/nope", "/api/nope", "/health"] {
+            let app = make_router(state_with_two_nodes());
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must 404, not return the SPA shell"
+            );
+        }
+    }
 }
