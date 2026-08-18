@@ -71,6 +71,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Rust
+        # Needed by the Cargo.lock refresh step below (cargo update). ubuntu-
+        # latest does not ship cargo, and release-please-action is a Node action
+        # that installs no Rust toolchain, so without this step the job fails
+        # with "cargo: command not found" whenever a release PR is created.
+        # Matches the SHA pin in ci.yml / release.yml / ai-pc-tests.yml.
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
       - name: Run release-please
         id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
