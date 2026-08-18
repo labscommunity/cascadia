@@ -500,6 +500,46 @@ mod tests {
         assert!(holder.export("tenant-a", epoch, len).is_some());
     }
 
+    /// The `captures` stash IS reachable through `export`, and that is the H.1a residual — pinned
+    /// here so it is a known quantity rather than a surprise. Same shape as the K2.6 wire pin
+    /// (`a_capture_is_reachable_over_the_wire_h1a_residual`), on the holder cells 9-10 exercise.
+    ///
+    /// `captures` is keyed on epoch ALONE (the CAPTURE frame carries no tenant, so a worker rank
+    /// has none to tag entries with) while `synth_epoch` is a pure function of the prefix tokens.
+    /// A caller who derives a victim's epoch is therefore served that victim's slice.
+    ///
+    /// It cannot be closed by dropping the fallback: only the HEAD negotiates, so rank>0 has no
+    /// offer and serves from exactly this stash. Doing so (bfae9ffe, reverted) took sparse-moe
+    /// plane0 from 7/7 to 5/7 and plane1 from 10/10 to 6/10 — every rank>0 donor answered
+    /// `get_none`. The real fix is a tenant field on the CAPTURE frame, i.e. a wire change.
+    ///
+    /// This test asserts TODAY'S behaviour. When the wire carries a tenant, invert it: the foreign
+    /// partner must then get `None` while the owner is still served.
+    #[test]
+    fn a_capture_is_reachable_via_export_h1a_residual() {
+        let mut st = OvHolderState::new(4, fp());
+        // Capture only, no offer — the rank>0 shape.
+        let prefix = vec![11i32, 22, 33];
+        let epoch = synth_epoch(&prefix);
+        st.captures.insert(epoch, (prefix, snap(3, 2.0)));
+        let holder = OvMoeKvHolder {
+            cache: Arc::new(Mutex::new(st)),
+            model_fp: fp().digest(),
+        };
+
+        // The owner is served — this is the legitimate rank>0 path the cert depends on.
+        assert!(
+            holder.export("tenant-a", epoch, 3).is_some(),
+            "rank>0 must serve from its capture stash; refusing it breaks tail warm-resume"
+        );
+        // ...and so is a foreign tenant. That is the residual, asserted rather than implied.
+        assert!(
+            holder.export("tenant-b", epoch, 3).is_some(),
+            "H.1a residual changed shape — if this now refuses, the CAPTURE frame gained a tenant \
+             and this test should be inverted rather than deleted"
+        );
+    }
+
     fn ov_slot(model_fp: u64, past: usize) -> cascadia_engine::kv_handoff::KvHandoffSlot {
         let prefix: Vec<i32> = (0..past as i32).collect();
         let (manifest, payloads) =

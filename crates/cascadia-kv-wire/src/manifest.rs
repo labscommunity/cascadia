@@ -67,7 +67,10 @@ pub struct Manifest {
     pub prefix_token_hash: u64,
     /// Negotiated whole-token count; `== token_ids.len()`, `<= request token count` (§6).
     pub prefix_token_len: u32,
-    /// `(producer_nonce_high || monotonic_low)` — globally unique per producing head (§8).
+    /// As built: `synth_epoch` = FNV-1a over the negotiated prefix tokens — a content hash, NOT
+    /// §8's globally-unique `(producer_nonce_high || monotonic_low)`. Same tokens mint the same
+    /// epoch by design; soundness is content determinism under `model_fingerprint`, and the epoch
+    /// does not discriminate origin (argument: enterprise `cascadia-kv-coord/src/outcome.rs`).
     pub snapshot_epoch: u64,
     pub num_layers: u32,
     pub layers: Vec<LayerMeta>,
