@@ -159,6 +159,24 @@ Not sure of a node's address? `cascadia discover` lists Cascadia peers on the LA
 
 For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
 
+### Web dashboard
+
+Workers started with `--api` also serve a browser dashboard at `/` — cluster topology with per-link latency/bandwidth, live request/token counters, and a chat surface. **Release bundles newer than v0.1.8 include it.** Source builds don't by default: the UI is a Vite SPA embedded into the binary behind the `dashboard-embed` cargo feature, and cargo can't run npm for you, so a plain `cargo build` serves the API plus a pointer page at `/` instead. To embed it (needs Node 20+):
+
+```bash
+cd crates/cascadia-dashboard/web
+npm ci && npm run build
+cd ../../..
+cargo build --release -p cascadia --features dashboard-embed   # add openvino for real inference
+```
+
+Use `--release` if you want the single-static-binary property: `rust-embed`
+bakes the assets in for release builds, but reads `web/dist` from disk at
+request time in debug ones, so a debug binary stops serving the UI if that
+directory moves or is rebuilt.
+
+Either way the JSON endpoints the UI reads (`/api/topology`, `/api/stats`) are always served, so during UI development `npm run dev` in `crates/cascadia-dashboard/web` hosts the SPA on :5173 and proxies API calls to a running worker (`VITE_API_PROXY` points it at a non-default host).
+
 ### Engines
 
 ```console

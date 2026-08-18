@@ -1922,7 +1922,20 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // fallback, so it must be merged second.
         let app = api_router.merge(cascadia_dashboard::make_router(dash_state));
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
-        info!(host = %api_host, port = api_port, "API + dashboard serving");
+        // Only claim a dashboard when this build actually embeds one — the
+        // unconditional "API + dashboard serving" line sent the first
+        // source-build user to a bare 404 on `/`. `SPA_EMBEDDED` comes from
+        // the dashboard crate (the feature owner), not a local cfg!, so
+        // feature unification can't make the log disagree with the router.
+        if cascadia_dashboard::SPA_EMBEDDED {
+            info!(host = %api_host, port = api_port, "API + dashboard serving");
+        } else {
+            info!(
+                host = %api_host,
+                port = api_port,
+                "API serving (dashboard UI not embedded in this build; GET / explains how to enable it)"
+            );
+        }
         // NODELAY-on-accept wrapper. tokio's TcpStream defaults to
         // NODELAY=false (Nagle on); for SSE streaming small per-token
         // chunks, Nagle aggregates them into ~3500 B bursts every

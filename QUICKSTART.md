@@ -44,6 +44,12 @@ curl http://localhost:8000/v1/chat/completions \
 You should get a JSON chat-completion response back. That's the whole
 request path working end to end. ✅
 
+Opening <http://localhost:8000/> in a browser shows a pointer page: the web
+dashboard is embedded in the binary only when built with
+`--features dashboard-embed` (release bundles newer than v0.1.8 have it;
+the page and the [README](README.md#web-dashboard) show the two-step
+source build).
+
 ---
 
 ## 2. Real inference on one Intel machine

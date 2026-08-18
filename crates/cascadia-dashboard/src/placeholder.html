@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cascadia</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0d1117; color: #d8dee7;
+  }
+  main { max-width: 42rem; padding: 2.5rem 1.5rem; line-height: 1.6; }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  code, pre {
+    background: #1a212b; border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9em;
+  }
+  code { padding: 0.1rem 0.35rem; }
+  pre { padding: 0.9rem 1rem; overflow-x: auto; }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.25rem 0; }
+  .dim { color: #8b98a9; }
+</style>
+</head>
+<body>
+<main>
+  <h1>cascadia is running &mdash; this build doesn&rsquo;t include the dashboard UI</h1>
+  <p>The API is live on this port:</p>
+  <ul>
+    <li><code>POST /v1/chat/completions</code>, <code>POST /v1/completions</code> &mdash; OpenAI-compatible inference</li>
+    <li><code>GET /v1/models</code>, <code>GET /health</code>, <code>GET /metrics</code></li>
+    <li><code>GET /api/topology</code>, <code>GET /api/stats</code> &mdash; cluster state as JSON</li>
+  </ul>
+  <p>The web dashboard is compiled in behind the <code>dashboard-embed</code> cargo
+  feature, which needs the SPA built first:</p>
+  <pre>cd crates/cascadia-dashboard/web
+npm ci &amp;&amp; npm run build
+cd ../../..
+cargo build --release -p cascadia --features dashboard-embed</pre>
+  <p class="dim">Add <code>openvino</code> to the feature list for real-inference
+  builds. Prebuilt release bundles newer than v0.1.8 ship with the dashboard
+  included.</p>
+</main>
+</body>
+</html>
