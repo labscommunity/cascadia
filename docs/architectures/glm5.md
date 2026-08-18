@@ -33,7 +33,7 @@ long-prompt request), so residency and prefix reuse are the levers, not kernels.
 | sparse attn | **DSA / IndexShare**: lightning indexer scores **raw** positions → top-`index_topk` (2048) causal keys; `index_n_heads=32`, `index_head_dim=128`. **IndexShare**: only `"full"` layers (`config.indexer_types`, 22 of 79 — layers 0,1,2 then every 4th) own an indexer; `"shared"` layers reuse the previous full layer's top-k (carry-forward). Indexer query proj = `wq_b`; interleaved rope; weights FP8 |
 | residual | plain `[b, s, 6144]` — no Hyper-Connections |
 | rope | `rope_theta=8e6`, interleaved, `rope_type="default"` (**no YaRN**), `max_position=1,048,576` (1M ctx) |
-| quant | int4 experts (per-row scales, group-32), FP8 block-128 source; MTP head int8 (int4 collapses accept) |
+| quant | int4 experts (per-row scales, group-32), FP8 block-128 source; MTP head **bf16** (int4 collapses accept; int8 was planned but never implemented) |
 
 Numeric contract (Rust shell == CPU ref): bf16 rounding after each linear /
 norm / rope; f32 accumulation in the attention absorb core, router logits, and
@@ -73,7 +73,7 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
   full model.
 - **Exporter** (`tools/export_glm5.py`): FP8 e4m3 block-128 dequant → int4
   repack + bf16 shells + DSA indexer weights; hard-fails on config surprises;
-  resumable (`.done` markers + disk pre-flight). MTP weights not exported yet.
+  resumable (`.done` markers + disk pre-flight). MTP draft head exported (bf16).
 - **Loader / stage / pipeline**: per-rank layer slice, `arch=="glm5"` sniff,
   N-general even split, shared dsv4 TCP transport. `{1,2,4}`-rank chains match
   single-process bit-for-bit (incl. middle-relay ranks).
@@ -109,9 +109,12 @@ deployment, never from `max_position` (1M would preallocate TB-scale KV).
    the deployment tokenizer).
 5. **AVX-VNNI int4×int8 kernel** (Core Ultra: 256-bit VNNI, no AVX-512) —
    deferred; must be benchmarked on Intel hardware.
-6. **Router-lookahead + coupling prefetch** to hide interconnect — deferred.
-7. **MTP int8 spec-decode** — deferred, conditional on a batched-verify microbench
-   showing net gain; needs KV rewind + accept/reject.
+6. **Router-lookahead prefetch** — done (`src/glm/lookahead.rs`, opt-in via
+   `CASCADIA_GLM5_LOOKAHEAD`, off by default). Hides NVMe latency, not
+   interconnect; the coupling-prefetch half is still deferred.
+7. **MTP spec-decode** — implemented in bf16 (`GlmModel::generate_spec`, KV rewind
+   + accept/reject, `tests/glm5_mtp_spec.rs`). Reachable from `GlmModel` only, not
+   from the served `StagedRunner` path; the go/no-go microbench is still pending.
 8. **KV persistence** for zero re-prefill across restarts — deferred.
 
 ## Remaining before / at the hardware phase

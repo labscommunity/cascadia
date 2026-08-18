@@ -18,7 +18,7 @@ On-disk layout (mirrors tools/export_deepseek_v4.py; consumed by the M3 loader):
 Numeric policy: the shell is dequantized bf16 for the Rust shell backend
 ("rust_glm"); only the SwiGLU FFNs (routed experts, shared expert, dense MLP)
 become int4 binaries (cascadia-int4-gemm group-32 layout). The MTP head weights
-are int8 in deployment (int4 collapses acceptance); --tiny keeps them bf16.
+are bf16 (int4 collapses acceptance; int8 was planned but never implemented).
 """
 import argparse
 import json
@@ -230,8 +230,8 @@ def build_manifest(cfg: dict) -> dict:
                           or (["full"] * cfg["num_layers"] if cfg.get("index_n_heads", 0) > 0 else [])),
         # MTP draft head (layer `num_layers`, DeepSeek-V3 nextn) for speculative
         # decode. True only when the head's weights were actually emitted to
-        # <dir>/mtp.safetensors (block experts are bf16). export_real does not
-        # emit it yet, so it stays false there.
+        # <dir>/mtp.safetensors (block experts are bf16). export_real emits it
+        # too, so this is true there whenever num_nextn_predict_layers > 0.
         "has_mtp": bool(cfg.get("mtp_emitted", False)),
     }
 

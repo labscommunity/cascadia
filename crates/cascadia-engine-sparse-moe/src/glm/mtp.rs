@@ -9,11 +9,14 @@
 //!   hx = MTP_block(hx)                        // a full transformer layer, own KV
 //!   draft = argmax(lm_head · rmsnorm(hx, mtp_norm)); tok = draft; h = hx
 //!
-//! In deployment the MTP head weights are int8 (int4 collapses acceptance to
-//! 0-4%); the shell keeps the same math. `embed`, `final_norm`, and `lm_head`
-//! are shared with the model and passed in. Whether MTP speculative decode is a
-//! net throughput win on the target hardware is gated by a separate microbench
-//! (see docs/architectures/glm5.md); this is the correctness core.
+//! The MTP head weights are exported bf16 (int4 collapses acceptance to 0-4%;
+//! int8 was planned but never implemented, and the exporter has no int8 path);
+//! the shell keeps the same math. `embed`, `final_norm`, and `lm_head` are
+//! shared with the model and passed in. Whether MTP speculative decode is a net
+//! throughput win on the target hardware is gated by a separate microbench (see
+//! docs/architectures/glm5.md); this is the correctness core. Note it is
+//! reachable from `GlmModel::generate_spec` only — the served `StagedRunner`
+//! path does not use it.
 
 use super::model::GlmLayer;
 use crate::dsv4::math::{linear_bf16_w, linear_f32, rmsnorm};
