@@ -46,8 +46,9 @@ request path working end to end. ✅
 
 Opening <http://localhost:8000/> in a browser shows a pointer page: the web
 dashboard is embedded in the binary only when built with
-`--features dashboard-embed` (release bundles have it; the page and the
-[README](README.md#web-dashboard) show the two-step source build).
+`--features dashboard-embed` (release bundles newer than v0.1.8 have it;
+the page and the [README](README.md#web-dashboard) show the two-step
+source build).
 
 ---
 

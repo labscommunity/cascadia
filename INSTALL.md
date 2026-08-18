@@ -115,7 +115,7 @@ The binary is statically linked apart from the OpenVINO dynamic libraries. To ru
 
 ### Web dashboard (optional, either mode)
 
-The browser dashboard served at `/` by `--api` workers is compiled into the binary behind the `dashboard-embed` feature. It needs the SPA built first (Node 20+); without the feature, `/` serves a pointer page and only the JSON/API endpoints are live. Release bundles ship with it embedded.
+The browser dashboard served at `/` by `--api` workers is compiled into the binary behind the `dashboard-embed` feature. It needs the SPA built first (Node 20+); without the feature, `/` serves a pointer page and only the JSON/API endpoints are live. Release bundles newer than v0.1.8 ship with it embedded.
 
 ```bash
 cd crates/cascadia-dashboard/web && npm ci && npm run build && cd -

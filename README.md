@@ -161,7 +161,7 @@ For distributed speculative decoding, run **every** rank with `--engine ov-dist-
 
 ### Web dashboard
 
-Workers started with `--api` also serve a browser dashboard at `/` — cluster topology with per-link latency/bandwidth, live request/token counters, and a chat surface. **Release bundles include it.** Source builds don't by default: the UI is a Vite SPA embedded into the binary behind the `dashboard-embed` cargo feature, and cargo can't run npm for you, so a plain `cargo build` serves the API plus a pointer page at `/` instead. To embed it (needs Node 20+):
+Workers started with `--api` also serve a browser dashboard at `/` — cluster topology with per-link latency/bandwidth, live request/token counters, and a chat surface. **Release bundles newer than v0.1.8 include it.** Source builds don't by default: the UI is a Vite SPA embedded into the binary behind the `dashboard-embed` cargo feature, and cargo can't run npm for you, so a plain `cargo build` serves the API plus a pointer page at `/` instead. To embed it (needs Node 20+):
 
 ```bash
 cd crates/cascadia-dashboard/web
