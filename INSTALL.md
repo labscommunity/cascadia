@@ -123,6 +123,10 @@ cargo build --release -p cascadia --features dashboard-embed        # stub mode
 # or: --features openvino,dashboard-embed                           # real inference
 ```
 
+`--release` is what actually embeds the assets: `rust-embed` reads `web/dist`
+from disk at request time in debug builds, so a debug binary serves the UI
+only while that directory is present and current.
+
 If cargo stops with "`embed-spa` is enabled, but the dashboard SPA has not been built", run the npm step above — `web/dist/` is generated, not checked in.
 
 ---

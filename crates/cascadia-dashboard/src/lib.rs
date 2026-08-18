@@ -33,10 +33,16 @@ use serde::Serialize;
 #[cfg(feature = "embed-spa")]
 mod spa;
 
-/// Whether this build carries the SPA. Exported so the host process can
-/// log what `/` will actually serve — evaluated HERE, in the crate that
-/// owns the feature, so the answer stays correct even if a dependency
-/// other than the host enabled `embed-spa` through feature unification.
+/// Whether the SPA route is compiled into this build. Exported so the host
+/// process can log what `/` will actually serve — evaluated HERE, in the
+/// crate that owns the feature, so the answer stays correct even if a
+/// dependency other than the host enabled `embed-spa` through feature
+/// unification.
+///
+/// This is a build fact, not a promise that assets are readable right now:
+/// `rust-embed` only bakes them into the binary for release builds, and
+/// reads `web/dist` from disk per request in debug ones. `spa::shell` warns
+/// when that read comes up empty.
 pub const SPA_EMBEDDED: bool = cfg!(feature = "embed-spa");
 
 /// Shared state for the dashboard routes.

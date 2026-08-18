@@ -170,6 +170,11 @@ cd ../../..
 cargo build --release -p cascadia --features dashboard-embed   # add openvino for real inference
 ```
 
+Use `--release` if you want the single-static-binary property: `rust-embed`
+bakes the assets in for release builds, but reads `web/dist` from disk at
+request time in debug ones, so a debug binary stops serving the UI if that
+directory moves or is rebuilt.
+
 Either way the JSON endpoints the UI reads (`/api/topology`, `/api/stats`) are always served, so during UI development `npm run dev` in `crates/cascadia-dashboard/web` hosts the SPA on :5173 and proxies API calls to a running worker (`VITE_API_PROXY` points it at a non-default host).
 
 ### Engines
