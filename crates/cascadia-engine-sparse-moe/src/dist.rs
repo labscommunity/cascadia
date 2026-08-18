@@ -151,6 +151,11 @@ pub enum FrameKind {
     // The moved-to head sends this to a moved-to tail that has NO local capture for a FOREIGN chain's
     // epoch; the tail applies the carried blob directly. Appended code — never reorder existing ones.
     RestoreCarry = 0x53_4D_45_42, // "SME\x42" — head→down: RESTORE carrying the pulled slice blob
+    // H.1a close: CAPTURE carrying the head's turn tenant, so a worker rank — which never sees the
+    // GenerationTask — can tag its stashed slice and `export` can confine it to that tenant. Sent
+    // only when the tenant is non-empty; an empty tenant keeps sending the legacy `Capture` frame
+    // byte-identical to today. Appended code — never reorder existing ones.
+    CaptureV2 = 0x53_4D_4532, // "SME\x32" — head→down: CAPTURE(epoch, tenant, tokens)
 }
 
 impl FrameKind {
@@ -174,6 +179,7 @@ impl FrameKind {
             x if x == FrameKind::Restore as u32 => Some(FrameKind::Restore),
             x if x == FrameKind::RestoreAck as u32 => Some(FrameKind::RestoreAck),
             x if x == FrameKind::RestoreCarry as u32 => Some(FrameKind::RestoreCarry),
+            x if x == FrameKind::CaptureV2 as u32 => Some(FrameKind::CaptureV2),
             _ => None,
         }
     }
@@ -600,6 +606,16 @@ pub async fn recv_token_reply(
 /// field against a corrupt/adversarial peer (mirrors `MAX_BATCH_COUNT`). 1 Mi ids = 4 MiB worst case.
 pub const MAX_CAPTURE_TOKENS: u32 = 1 << 20;
 
+/// Cap on a CaptureV2 frame's tenant byte length — bounds the recv-side allocation the same way
+/// `MAX_CAPTURE_TOKENS` does, and no legitimate tenant id approaches it.
+pub const MAX_CAPTURE_TENANT_BYTES: u16 = 256;
+
+/// Bound on every CaptureAck wait. An older peer that meets `CaptureV2` errors WITHOUT acking
+/// (`from_code` → None), and the only ceiling otherwise is the transport's frame-idle default —
+/// reached BEFORE the turn's chunks are returned, so an unbounded wait withholds a finished turn.
+/// Capture is best-effort: on timeout the sender warns, skips the capture, and delivers the turn.
+pub const CAPTURE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Pure frame encoder (testable): kind(4) + epoch(8 BE) + count(4 BE) + count×i32 (BE).
 fn capture_frame_bytes(epoch: u64, tokens: &[i32]) -> Vec<u8> {
     let mut b = Vec::with_capacity(16 + tokens.len() * 4);
@@ -612,13 +628,37 @@ fn capture_frame_bytes(epoch: u64, tokens: &[i32]) -> Vec<u8> {
     b
 }
 
-/// Send a Capture frame downstream (head/mid → next stage).
+/// Pure V2 frame encoder (testable): kind(4) + epoch(8 BE) + tenant_len(2 BE) + tenant UTF-8 +
+/// count(4 BE) + count×i32 (BE). Only ever built with a non-empty tenant (empty stays v1).
+fn capture_frame_bytes_v2(epoch: u64, tokens: &[i32], tenant: &str) -> Vec<u8> {
+    let t = tenant.as_bytes();
+    debug_assert!(!t.is_empty() && t.len() <= MAX_CAPTURE_TENANT_BYTES as usize);
+    let mut b = Vec::with_capacity(18 + t.len() + tokens.len() * 4);
+    b.extend_from_slice(&(FrameKind::CaptureV2 as u32).to_be_bytes());
+    b.extend_from_slice(&epoch.to_be_bytes());
+    b.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    b.extend_from_slice(t);
+    b.extend_from_slice(&(tokens.len() as u32).to_be_bytes());
+    for &tok in tokens {
+        b.extend_from_slice(&tok.to_be_bytes());
+    }
+    b
+}
+
+/// Send a Capture frame downstream (head/mid → next stage). A non-empty `tenant` upgrades the
+/// frame to `CaptureV2` so the downstream rank — which never sees the `GenerationTask` — can tag
+/// its stashed slice; an empty tenant sends the legacy `Capture` frame byte-identical to today.
 pub async fn send_capture(
     cli: &Mutex<ActivationClient>,
     epoch: u64,
     tokens: &[i32],
+    tenant: &str,
 ) -> TransportResult<()> {
-    let bytes = capture_frame_bytes(epoch, tokens);
+    let bytes = if tenant.is_empty() || tenant.len() > MAX_CAPTURE_TENANT_BYTES as usize {
+        capture_frame_bytes(epoch, tokens)
+    } else {
+        capture_frame_bytes_v2(epoch, tokens, tenant)
+    };
     let mut guard = cli.lock().await;
     guard.send_raw(&bytes).await?;
     Ok(())
@@ -655,6 +695,55 @@ pub async fn recv_capture_body_server(
         tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
     }
     Ok((epoch, tokens))
+}
+
+/// Receive a CaptureV2 body from upstream (kind already consumed). Returns `(epoch, tokens, tenant)`.
+pub async fn recv_capture_v2_body_server(
+    srv: &Mutex<ActivationServer>,
+) -> TransportResult<(u64, Vec<i32>, String)> {
+    let mut guard = srv.lock().await;
+    let head = guard.recv_raw(10).await?;
+    if head.len() != 10 {
+        return Err(TransportError::SocketClosed);
+    }
+    let epoch = u64::from_be_bytes(head[0..8].try_into().unwrap());
+    let t_len = u16::from_be_bytes(head[8..10].try_into().unwrap());
+    if t_len == 0 || t_len > MAX_CAPTURE_TENANT_BYTES {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture tenant length {t_len} outside (0, {MAX_CAPTURE_TENANT_BYTES}]"
+        ))));
+    }
+    let t_raw = guard.recv_raw(t_len as usize).await?;
+    if t_raw.len() != t_len as usize {
+        return Err(TransportError::SocketClosed);
+    }
+    let tenant = String::from_utf8(t_raw)
+        .map_err(|_| TransportError::Io(std::io::Error::other("capture tenant not UTF-8")))?;
+    let cnt_raw = guard.recv_raw(4).await?;
+    if cnt_raw.len() != 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let count = u32::from_be_bytes(cnt_raw[0..4].try_into().unwrap());
+    if count > MAX_CAPTURE_TOKENS {
+        return Err(TransportError::Io(std::io::Error::other(format!(
+            "capture token count {count} exceeds MAX_CAPTURE_TOKENS {MAX_CAPTURE_TOKENS}"
+        ))));
+    }
+    let n = count as usize;
+    let body = if n > 0 {
+        guard.recv_raw(n * 4).await?
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    if body.len() != n * 4 {
+        return Err(TransportError::SocketClosed);
+    }
+    let mut tokens = Vec::with_capacity(n);
+    for c in body.chunks_exact(4) {
+        tokens.push(i32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+    }
+    Ok((epoch, tokens, tenant))
 }
 
 /// Send a CaptureAck frame upstream (stage → head-ward). Body: 8 B BE epoch.
@@ -840,6 +929,57 @@ mod capture_frame_tests {
             .collect();
         assert_eq!(got, toks);
         assert_eq!(b.len(), 16 + toks.len() * 4);
+    }
+
+    #[test]
+    fn capture_v2_frame_bytes_layout_roundtrips() {
+        let toks = vec![7, -8, 0, i32::MAX];
+        let epoch = 0xCAFE_F00D_0000_0002u64;
+        let tenant = "tenant-a";
+        let b = capture_frame_bytes_v2(epoch, &toks, tenant);
+        assert_eq!(b[0..4], (FrameKind::CaptureV2 as u32).to_be_bytes());
+        assert_eq!(u64::from_be_bytes(b[4..12].try_into().unwrap()), epoch);
+        let t_len = u16::from_be_bytes(b[12..14].try_into().unwrap()) as usize;
+        assert_eq!(t_len, tenant.len());
+        assert_eq!(&b[14..14 + t_len], tenant.as_bytes());
+        let c0 = 14 + t_len;
+        assert_eq!(
+            u32::from_be_bytes(b[c0..c0 + 4].try_into().unwrap()),
+            toks.len() as u32
+        );
+        let got: Vec<i32> = b[c0 + 4..]
+            .chunks_exact(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got, toks);
+        assert_eq!(b.len(), 18 + t_len + toks.len() * 4);
+    }
+
+    #[test]
+    fn capture_v2_code_is_appended_and_distinct() {
+        // The legacy v1 frame must stay byte-identical (an empty tenant keeps sending it), and the
+        // v2 code must collide with nothing existing.
+        assert_eq!(FrameKind::CaptureV2 as u32, 0x53_4D_4532);
+        for k in [
+            FrameKind::Forward,
+            FrameKind::Reset,
+            FrameKind::Token,
+            FrameKind::ForwardBatch,
+            FrameKind::TokenBatch,
+            FrameKind::ForwardNoSample,
+            FrameKind::ForwardPrefill,
+            FrameKind::Capture,
+            FrameKind::CaptureAck,
+            FrameKind::Restore,
+            FrameKind::RestoreAck,
+            FrameKind::RestoreCarry,
+        ] {
+            assert_ne!(FrameKind::CaptureV2 as u32, k as u32);
+        }
+        assert_eq!(
+            FrameKind::from_code(FrameKind::CaptureV2 as u32),
+            Some(FrameKind::CaptureV2)
+        );
     }
 
     #[test]

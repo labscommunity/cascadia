@@ -36,9 +36,10 @@ use crate::dist::{
 };
 #[cfg(feature = "kv_coord")]
 use crate::dist::{
-    recv_capture_ack_body_client, recv_capture_body_server, recv_restore_ack_body_client,
-    recv_restore_body_server, recv_restore_carry_body_server, send_capture,
-    send_capture_ack_upstream, send_restore, send_restore_ack_upstream, send_restore_carry,
+    recv_capture_ack_body_client, recv_capture_body_server, recv_capture_v2_body_server,
+    recv_restore_ack_body_client, recv_restore_body_server, recv_restore_carry_body_server,
+    send_capture, send_capture_ack_upstream, send_restore, send_restore_ack_upstream,
+    send_restore_carry, CAPTURE_ACK_TIMEOUT,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -1134,9 +1135,13 @@ pub struct SparseMoEEngine {
     /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
     /// on the head), these must survive across turns — a forced move can pull a prefix captured many
     /// turns earlier. Bounded by `kv_prefix_cache.capacity()`; eviction is oldest-arbitrary.
+    // Tenant carried as a VALUE, key stays epoch-only: partner-KEYING would file every legacy
+    // (v1-frame) capture under a local namespace and turn the certified multi-stage cross-chain
+    // warm pull cold. `""` = untagged (legacy frame or tenant-less turn) — served to any partner;
+    // a non-empty tenant confines the entry (H.1a).
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_capture:
-        std::collections::HashMap<u64, (Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
+        std::collections::HashMap<u64, (String, Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
     /// Issue-34 Option C (holder mirror): the lock-free snapshot cache the [`crate::kv_coordination::
     /// SparseMoeKvHolder`] serves from. Populated alongside `kv_prefix_cache` / `kv_offers` /
     /// `kv_capture` so a busy engine answers cross-chain KV pulls without the engine lock.
@@ -1635,18 +1640,32 @@ impl SparseMoEEngine {
             let mut full_tokens: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
             full_tokens.extend(result_tokens.iter().map(|&t| t as i32));
             let epoch = crate::kv_coordination::synth_epoch(&full_tokens);
+            // Bounded: an older peer that meets CaptureV2 errors WITHOUT acking, and the only
+            // ceiling otherwise is the transport frame-idle default — reached before this turn's
+            // already-complete chunks are returned. Timeout ⇒ capture skipped, turn delivered.
             let acked = self.block_on(async {
-                send_capture(&downstream, epoch, &full_tokens)
-                    .await
-                    .map_err(|e| format!("send_capture: {e}"))?;
-                match recv_kind_client(&downstream).await {
-                    Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(&downstream)
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(&downstream, epoch, &full_tokens, &task.tenant)
                         .await
-                        .map(|_| ())
-                        .map_err(|e| format!("recv_capture_ack: {e}")),
-                    Ok(Some(other)) => Err(format!("expected CaptureAck, got {other:?}")),
-                    Ok(None) => Err("downstream closed during capture".into()),
-                    Err(e) => Err(format!("recv_kind (capture): {e}")),
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(&downstream).await {
+                        Ok(Some(FrameKind::CaptureAck)) => {
+                            recv_capture_ack_body_client(&downstream)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| format!("recv_capture_ack: {e}"))
+                        }
+                        Ok(Some(other)) => Err(format!("expected CaptureAck, got {other:?}")),
+                        Ok(None) => Err("downstream closed during capture".into()),
+                        Err(e) => Err(format!("recv_kind (capture): {e}")),
+                    }
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
+                    )),
                 }
             });
             match acked {
@@ -2300,7 +2319,7 @@ impl SparseMoEEngine {
     /// served; warm-pull just loses this rank → consumer degrades to cold). Bounded by the prefix
     /// cache capacity; on overflow an arbitrary older capture is evicted.
     #[cfg(feature = "kv_coord")]
-    fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>) {
+    fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
         if !self.kv_prefix_cache.enabled() {
             return;
         }
@@ -2331,9 +2350,54 @@ impl SparseMoEEngine {
                 };
                 g.captures.remove(&k);
             }
-            g.captures.insert(epoch, (tokens.clone(), snap.clone()));
+            g.captures
+                .insert(epoch, (tenant.to_string(), tokens.clone(), snap.clone()));
         }
-        self.kv_capture.insert(epoch, (tokens, snap));
+        self.kv_capture
+            .insert(epoch, (tenant.to_string(), tokens, snap));
+    }
+
+    /// Relay CAPTURE downstream (preserving the v1/v2 form via `tenant`), await its ack bounded,
+    /// then ack upstream. The bound matters: an older peer that meets CaptureV2 errors WITHOUT
+    /// acking, and an unbounded wait wedges this rank while it holds the downstream lock.
+    #[cfg(feature = "kv_coord")]
+    fn relay_capture_and_ack(
+        &mut self,
+        tenant: &str,
+        epoch: u64,
+        tokens: &[i32],
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+    ) -> Result<(), String> {
+        if let Some(down) = downstream {
+            self.block_on(async {
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(down, epoch, tokens, tenant)
+                        .await
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(down).await {
+                        Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("recv_capture_ack: {e}")),
+                        Ok(Some(other)) => {
+                            Err(format!("expected CaptureAck downstream, got {other:?}"))
+                        }
+                        Ok(None) => Err("downstream closed during capture-ack".into()),
+                        Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                    }
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
+                    )),
+                }
+            })?;
+        }
+        self.block_on(send_capture_ack_upstream(upstream, epoch))
+            .map_err(|e| format!("send_capture_ack: {e}"))
     }
 
     /// Issue-34 consume (§8): broadcast `RESTORE(epoch)` down the chain and return the all-or-nothing
@@ -2543,28 +2607,18 @@ impl SparseMoEEngine {
                 let (epoch, tokens) = self
                     .block_on(recv_capture_body_server(upstream))
                     .map_err(|e| format!("recv_capture: {e}"))?;
-                self.capture_under_epoch(epoch, tokens.clone());
-                if let Some(down) = downstream.as_ref() {
-                    self.block_on(async {
-                        send_capture(down, epoch, &tokens)
-                            .await
-                            .map_err(|e| format!("send_capture: {e}"))?;
-                        match recv_kind_client(down).await {
-                            Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
-                                .await
-                                .map(|_| ())
-                                .map_err(|e| format!("recv_capture_ack: {e}")),
-                            Ok(Some(other)) => {
-                                Err(format!("expected CaptureAck downstream, got {other:?}"))
-                            }
-                            Ok(None) => Err("downstream closed during capture-ack".into()),
-                            Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
-                        }
-                    })?;
-                }
-                self.block_on(send_capture_ack_upstream(upstream, epoch))
-                    .map_err(|e| format!("send_capture_ack: {e}"))?;
-                Ok(())
+                self.capture_under_epoch("", epoch, tokens.clone());
+                self.relay_capture_and_ack("", epoch, &tokens, upstream, downstream.as_ref())
+            }
+            // H.1a: CAPTURE carrying the head's turn tenant; the stash entry is tagged so `export`
+            // confines it to that tenant. Relay preserves the v2 form downstream.
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureV2 => {
+                let (epoch, tokens, tenant) = self
+                    .block_on(recv_capture_v2_body_server(upstream))
+                    .map_err(|e| format!("recv_capture_v2: {e}"))?;
+                self.capture_under_epoch(&tenant, epoch, tokens.clone());
+                self.relay_capture_and_ack(&tenant, epoch, &tokens, upstream, downstream.as_ref())
             }
             // Issue-34 consume (§8): restore THIS rank's KV from its own CAPTURE stash under `epoch`,
             // chain RESTORE downstream, then ack upstream with the all-or-nothing verdict (local && down).
@@ -2589,7 +2643,7 @@ impl SparseMoEEngine {
                     true
                 } else {
                     match self.kv_capture.get(&epoch).cloned() {
-                        Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                        Some((_ns, _toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
                         None => false,
                     }
                 };
@@ -2627,7 +2681,7 @@ impl SparseMoEEngine {
                 Ok(())
             }
             #[cfg(not(feature = "kv_coord"))]
-            FrameKind::Capture => Err(format!(
+            FrameKind::Capture | FrameKind::CaptureV2 => Err(format!(
                 "rank {} received CAPTURE but kv_coord is not built",
                 self.rank
             )),
@@ -2816,7 +2870,9 @@ pub struct OvMoeEngine {
     /// stashed on a CAPTURE frame and restored on a matching RESTORE. Bounded
     /// by the prefix-cache capacity.
     #[cfg(feature = "kv_coord")]
-    kv_capture: std::collections::HashMap<u64, (Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
+    // Tenant as value, epoch-only key — same rule as SparseMoEEngine::kv_capture ("" = untagged).
+    kv_capture:
+        std::collections::HashMap<u64, (String, Vec<i32>, crate::ov_kv_cache::OvMoeKvSnapshot)>,
     /// Cross-chain (Issue-34 Option C) head/single-stage NEGOTIATE→GET offers:
     /// `epoch → (prefix tokens, snapshot)`, short-lived (created on NEGOTIATE, consumed on GET).
     #[cfg(feature = "kv_coord")]
@@ -3213,22 +3269,33 @@ impl OvMoeEngine {
                     if depth >= 1 && depth <= full_tokens.len() {
                         let captured: Vec<i32> = full_tokens[..depth].to_vec();
                         let epoch = crate::kv_coordination::synth_epoch(&captured);
+                        // Bounded ack — same rationale as the SparseMoE head site: an older
+                        // peer errors on CaptureV2 without acking; never withhold the turn.
                         let acked = self.block_on(async {
-                            send_capture(&downstream, epoch, &captured)
-                                .await
-                                .map_err(|e| format!("send_capture: {e}"))?;
-                            match recv_kind_client(&downstream).await {
-                                Ok(Some(FrameKind::CaptureAck)) => {
-                                    recv_capture_ack_body_client(&downstream)
-                                        .await
-                                        .map(|_| ())
-                                        .map_err(|e| format!("recv_capture_ack: {e}"))
+                            match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                                send_capture(&downstream, epoch, &captured, &task.tenant)
+                                    .await
+                                    .map_err(|e| format!("send_capture: {e}"))?;
+                                match recv_kind_client(&downstream).await {
+                                    Ok(Some(FrameKind::CaptureAck)) => {
+                                        recv_capture_ack_body_client(&downstream)
+                                            .await
+                                            .map(|_| ())
+                                            .map_err(|e| format!("recv_capture_ack: {e}"))
+                                    }
+                                    Ok(Some(other)) => {
+                                        Err(format!("expected CaptureAck, got {other:?}"))
+                                    }
+                                    Ok(None) => Err("downstream closed during capture".into()),
+                                    Err(e) => Err(format!("recv_kind (capture): {e}")),
                                 }
-                                Ok(Some(other)) => {
-                                    Err(format!("expected CaptureAck, got {other:?}"))
-                                }
-                                Ok(None) => Err("downstream closed during capture".into()),
-                                Err(e) => Err(format!("recv_kind (capture): {e}")),
+                            })
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(format!(
+                                    "capture ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
+                                )),
                             }
                         });
                         match acked {
@@ -3284,7 +3351,7 @@ impl OvMoeEngine {
     /// capacity; on overflow an arbitrary older capture is evicted. Best-effort — a snapshot failure
     /// just skips it (that rank's warm-pull degrades to cold).
     #[cfg(feature = "kv_coord")]
-    fn capture_under_epoch(&mut self, epoch: u64, tokens: Vec<i32>) {
+    fn capture_under_epoch(&mut self, tenant: &str, epoch: u64, tokens: Vec<i32>) {
         if !self.kv_prefix_cache.enabled() {
             return;
         }
@@ -3316,11 +3383,13 @@ impl OvMoeEngine {
                 };
                 g.captures.remove(&k);
             }
-            g.captures.insert(epoch, (tokens.clone(), snap.clone()));
+            g.captures
+                .insert(epoch, (tenant.to_string(), tokens.clone(), snap.clone()));
         }
         tracing::info!(target: "cascadia::kv", event = "ovmoe_tail_capture_mirror",
             rank = self.rank, epoch, "mirrored tail capture into holder");
-        self.kv_capture.insert(epoch, (tokens, snap));
+        self.kv_capture
+            .insert(epoch, (tenant.to_string(), tokens, snap));
     }
 
     /// Broadcast RESTORE(epoch) down the chain; return the all-or-nothing verdict (true ⇒ every
@@ -3386,26 +3455,46 @@ impl OvMoeEngine {
         &mut self,
         upstream: &Arc<TokioMutex<ActivationServer>>,
         downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        v2: bool,
     ) -> Result<(), String> {
-        let (epoch, tokens) = self
-            .block_on(recv_capture_body_server(upstream))
-            .map_err(|e| format!("recv_capture: {e}"))?;
-        self.capture_under_epoch(epoch, tokens.clone());
+        // v2 carries the head's turn tenant so this rank can tag its stash (H.1a); v1 stays
+        // untagged (""). Relay preserves the form it received.
+        let (epoch, tokens, tenant) = if v2 {
+            self.block_on(recv_capture_v2_body_server(upstream))
+                .map_err(|e| format!("recv_capture_v2: {e}"))?
+        } else {
+            let (epoch, tokens) = self
+                .block_on(recv_capture_body_server(upstream))
+                .map_err(|e| format!("recv_capture: {e}"))?;
+            (epoch, tokens, String::new())
+        };
+        self.capture_under_epoch(&tenant, epoch, tokens.clone());
         if let Some(down) = downstream {
             self.block_on(async {
-                send_capture(down, epoch, &tokens)
-                    .await
-                    .map_err(|e| format!("send_capture: {e}"))?;
-                match recv_kind_client(down).await {
-                    Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                // Bounded — an older peer that meets CaptureV2 errors WITHOUT acking, and an
+                // unbounded wait wedges this rank while it holds the downstream lock.
+                match tokio::time::timeout(CAPTURE_ACK_TIMEOUT, async {
+                    send_capture(down, epoch, &tokens, &tenant)
                         .await
-                        .map(|_| ())
-                        .map_err(|e| format!("recv_capture_ack: {e}")),
-                    Ok(Some(other)) => {
-                        Err(format!("expected CaptureAck downstream, got {other:?}"))
+                        .map_err(|e| format!("send_capture: {e}"))?;
+                    match recv_kind_client(down).await {
+                        Ok(Some(FrameKind::CaptureAck)) => recv_capture_ack_body_client(down)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("recv_capture_ack: {e}")),
+                        Ok(Some(other)) => {
+                            Err(format!("expected CaptureAck downstream, got {other:?}"))
+                        }
+                        Ok(None) => Err("downstream closed during capture-ack".into()),
+                        Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
                     }
-                    Ok(None) => Err("downstream closed during capture-ack".into()),
-                    Err(e) => Err(format!("recv_kind (capture-ack): {e}")),
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "capture relay ack timed out after {CAPTURE_ACK_TIMEOUT:?}"
+                    )),
                 }
             })?;
         }
@@ -3437,7 +3526,7 @@ impl OvMoeEngine {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {
-                Some((_toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                Some((_ns, _toks, snap)) => self.runner.restore_kv(&snap).is_ok(),
                 None => false,
             }
         };
@@ -3567,7 +3656,9 @@ impl OvMoeEngine {
             // acks the all-or-nothing verdict upstream. Reuses the engine-agnostic `dist` codec (the
             // frame carries only the epoch + token vector — KV bytes stay per-rank).
             #[cfg(feature = "kv_coord")]
-            FrameKind::Capture => self.handle_capture(&upstream, downstream.as_ref()),
+            FrameKind::Capture => self.handle_capture(&upstream, downstream.as_ref(), false),
+            #[cfg(feature = "kv_coord")]
+            FrameKind::CaptureV2 => self.handle_capture(&upstream, downstream.as_ref(), true),
             #[cfg(feature = "kv_coord")]
             FrameKind::Restore => self.handle_restore(&upstream, downstream.as_ref()),
             #[cfg(feature = "kv_coord")]
@@ -3817,7 +3908,15 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let model_fp = self.runner.fingerprint().plane_digest();
         let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
-        } else if let Some((tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+        } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
+            // Tagged captures are confined to their tenant; untagged ("" — legacy v1 frames and
+            // tenant-less turns) serve any partner, keeping the certified cross-chain pull
+            // unchanged. See `SparseMoEEngine::export`.
+            if !cap_ns.is_empty() && cap_ns != partner {
+                tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
+                    epoch = expected_epoch);
+                return None;
+            }
             (tokens.clone(), snap.clone())
         } else {
             return None;
@@ -3856,8 +3955,16 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
                 };
                 self.kv_capture.remove(&k);
             }
-            self.kv_capture
-                .insert(epoch, (manifest.token_ids.clone(), snap.clone()));
+            // Tagged with the ASSERTED partner, never `manifest.partner` — see
+            // `SparseMoEEngine::insert` for the full rationale (§12.10.0a).
+            self.kv_capture.insert(
+                epoch,
+                (
+                    partner.to_string(),
+                    manifest.token_ids.clone(),
+                    snap.clone(),
+                ),
+            );
         }
         if !self.kv_prefix_cache.enabled() {
             return Ok(());
@@ -3929,7 +4036,7 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
             true
         } else {
             match self.kv_capture.get(&epoch).cloned() {
-                Some((_t, snap)) => self.runner.restore_kv(&snap).is_ok(),
+                Some((_ns, _t, snap)) => self.runner.restore_kv(&snap).is_ok(),
                 None => false,
             }
         };

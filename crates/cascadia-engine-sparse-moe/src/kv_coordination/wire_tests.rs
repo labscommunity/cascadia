@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 /// a prefix that covers the whole prompt (no tail left to drive prefill).
 const TOKENS: &[i32] = &[11, 22, 33, 44];
 /// The shard this holder is standing in for — what an inbound `GetV2` must name.
-const RANK: u16 = 1;
+pub(super) const RANK: u16 = 1;
 const OWNER: &str = "tenant-a";
 
 // num_heads=1, len=3, qk_head_dim=2, v_head_dim=1 ⇒ 6 u16 of K and 3 u16 of V per layer. Every
@@ -92,13 +92,13 @@ fn wire_err(e: impl std::fmt::Debug) -> Error {
     Error::new(ErrorKind::InvalidData, format!("kv frame: {e:?}"))
 }
 
-async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &KvMessage) -> Result<()> {
+pub(super) async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &KvMessage) -> Result<()> {
     let frame = encode_frame(msg).map_err(wire_err)?;
     w.write_all(&frame).await?;
     w.flush().await
 }
 
-async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<KvMessage> {
+pub(super) async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<KvMessage> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
@@ -117,7 +117,7 @@ async fn write_blob<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<()
     w.flush().await
 }
 
-async fn read_blob<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+pub(super) async fn read_blob<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let mut blob = vec![0u8; u32::from_be_bytes(len_buf) as usize];
@@ -129,7 +129,13 @@ async fn read_blob<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
 
 /// Serve one inbound stream: read one request frame, answer it, return. `local_shard` is the shard
 /// this node holds; a `GetV2` naming any other rank is refused BEFORE the export reaches the holder.
-async fn serve_one<S>(stream: &mut S, holder: &SparseMoeKvHolder, local_shard: u16) -> Result<()>
+/// Generic over `dyn KvSnapshotHolder` — the enterprise loop is too — so `holder_conformance` can
+/// drive BOTH MoE holders through it.
+pub(super) async fn serve_one<S>(
+    stream: &mut S,
+    holder: &dyn KvSnapshotHolder,
+    local_shard: u16,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -172,7 +178,7 @@ where
 
 async fn serve_get<S>(
     stream: &mut S,
-    holder: &SparseMoeKvHolder,
+    holder: &dyn KvSnapshotHolder,
     partner: &str,
     epoch: u64,
     len: u32,
@@ -197,10 +203,13 @@ where
 
 /// Dial the holder, send one request, read its control reply. The server drops its half on return,
 /// so the caller can go on to read the `Found` payloads (already buffered) or observe EOF.
-async fn ask(holder: &Arc<SparseMoeKvHolder>, req: KvMessage) -> (DuplexStream, KvMessage) {
+pub(super) async fn ask<H: KvSnapshotHolder + Send + Sync + 'static>(
+    holder: &Arc<H>,
+    req: KvMessage,
+) -> (DuplexStream, KvMessage) {
     let (mut client, mut server) = tokio::io::duplex(1 << 16);
     let h = Arc::clone(holder);
-    let srv = tokio::spawn(async move { serve_one(&mut server, &h, RANK).await });
+    let srv = tokio::spawn(async move { serve_one(&mut server, &*h, RANK).await });
     write_msg(&mut client, &req).await.expect("request");
     let reply = read_msg(&mut client).await.expect("reply");
     srv.await.expect("serve task").expect("serve loop");
@@ -258,7 +267,7 @@ async fn receive(client: &mut DuplexStream, m: &Manifest) -> Vec<(Vec<u8>, Vec<u
     payloads
 }
 
-fn fnv1a(bytes: impl Iterator<Item = u8>) -> u64 {
+pub(super) fn fnv1a(bytes: impl Iterator<Item = u8>) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(b);
@@ -268,7 +277,7 @@ fn fnv1a(bytes: impl Iterator<Item = u8>) -> u64 {
 }
 
 /// Digest of the bytes that actually arrived, in wire order.
-fn arrived_digest(payloads: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+pub(super) fn arrived_digest(payloads: &[(Vec<u8>, Vec<u8>)]) -> u64 {
     fnv1a(
         payloads
             .iter()
@@ -467,44 +476,6 @@ async fn the_legacy_rank_less_get_carries_no_rank_to_bind() {
     assert!(matches!(reply, KvMessage::Found(_)));
 }
 
-/// The `captures` stash IS reachable over the wire, and that is the H.1a residual — pinned here so
-/// it is a known quantity rather than a surprise.
-///
-/// `captures` is keyed on epoch ALONE (the CAPTURE frame carries no tenant, so a worker rank has
-/// none to tag entries with) while `synth_epoch` is a pure function of the prefix tokens. A caller
-/// who derives a victim's epoch is therefore served that victim's slice.
-///
-/// It cannot be closed by dropping the fallback: only the HEAD negotiates, so rank>0 has no offer
-/// and serves from exactly this stash. Doing so (bfae9ffe, reverted) took sparse-moe plane0 from
-/// 7/7 to 5/7 and plane1 from 10/10 to 6/10 — every rank>0 donor answered `get_none`. The real fix
-/// is a tenant field on the CAPTURE frame, i.e. a wire change.
-///
-/// This test asserts TODAY'S behaviour. When the wire carries a tenant, invert it: the foreign
-/// partner must then get `NotFound` while the owner is still served.
-#[tokio::test]
-async fn a_capture_is_reachable_over_the_wire_h1a_residual() {
-    let mut st = SparseHolderState::new(4, fp());
-    // Capture only, no offer — the rank>0 shape.
-    let prefix: Vec<i32> = TOKENS[..3].to_vec();
-    let epoch = super::synth_epoch(&prefix);
-    st.captures.insert(epoch, (prefix, snap()));
-    let holder = Arc::new(SparseMoeKvHolder {
-        cache: Arc::new(Mutex::new(st)),
-        model_fp: model_fp(),
-    });
-
-    let len = snap().past_seq_len as u32;
-    // The owner is served — this is the legitimate rank>0 path the cert depends on.
-    let (_c, reply) = ask(&holder, get_v2(OWNER, epoch, len, RANK)).await;
-    assert!(
-        matches!(reply, KvMessage::Found(_)),
-        "rank>0 must serve from its capture stash; refusing it breaks tail warm-resume"
-    );
-    // ...and so is a foreign tenant. That is the residual, asserted rather than implied.
-    let (_c, reply) = ask(&holder, get_v2("tenant-b", epoch, len, RANK)).await;
-    assert!(
-        matches!(reply, KvMessage::Found(_)),
-        "H.1a residual changed shape — if this now refuses, the CAPTURE frame gained a tenant and \
-         this test should be inverted rather than deleted"
-    );
-}
+// The H.1a capture-stash pins (tagged capture confined to its tenant; untagged capture serves any
+// partner) moved to `super::holder_conformance`, which states them once and instantiates them for
+// BOTH MoE holders over this same wire harness.
