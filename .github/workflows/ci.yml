@@ -69,3 +69,24 @@ jobs:
         # clean runtime error. Runs every unit test plus the binary
         # e2e tests against the mock engine.
         run: cargo test --workspace --all-targets
+
+      # Everything above builds default features, and `dashboard-embed` is
+      # default-off — so without these steps the whole embedded-SPA path
+      # (spa.rs, rust-embed, mime_guess, and build.rs's success branch) is
+      # first compiled by the release workflow, at tag time. That workflow
+      # only runs once release-please has already created the tag and the
+      # GitHub pre-release, so a break there strands a published release
+      # with no binaries attached. Compile it on every PR instead.
+      #
+      # Runner-preinstalled Node (>= 20 on all hosted images); the JS deps
+      # are pinned by package-lock.json via `npm ci`.
+      - name: Build dashboard SPA
+        working-directory: crates/cascadia-dashboard/web
+        run: npm ci && npm run build
+
+      - name: Lint + test (dashboard embed path)
+        # Also the only lint spa.rs ever gets: the clippy run above is
+        # default-features, so the file is invisible to it.
+        run: |
+          cargo clippy -p cascadia-dashboard --features embed-spa --all-targets
+          cargo test -p cascadia-dashboard --features embed-spa
