@@ -22,6 +22,7 @@ use cascadia_engine_sparse_moe::dist::{
     recv_forward_body_server, recv_kind_server, send_forward, FrameKind,
 };
 use cascadia_engine_sparse_moe::dsv4::stage::Dsv4Runner;
+use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_engine_sparse_moe::SamplingConfig;
 use cascadia_transport::{ActivationClient, ActivationServer};
 use std::path::PathBuf;

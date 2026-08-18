@@ -11,6 +11,7 @@
 
 use cascadia_engine_sparse_moe::dsv4::stage::Dsv4Runner;
 use cascadia_engine_sparse_moe::sampling::{init_rng, sample};
+use cascadia_engine_sparse_moe::staged::StagedRunner;
 use cascadia_engine_sparse_moe::SamplingConfig;
 use std::path::PathBuf;
 

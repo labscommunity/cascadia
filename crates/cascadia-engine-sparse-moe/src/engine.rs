@@ -28,10 +28,11 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use crate::dist::{
-    forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_kind_client,
-    recv_kind_server, recv_token_batch_body_client, recv_token_body_client, send_forward,
-    send_forward_batch, send_forward_nosample, send_forward_prefill, send_reset,
-    send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
+    forward_reset, recv_forward_batch_body_server, recv_forward_body_server, recv_key_body_server,
+    recv_kind_client, recv_kind_server, recv_token_batch_body_client, recv_token_body_client,
+    send_cache_prefix, send_forward, send_forward_batch, send_forward_batch_prefill,
+    send_forward_batch_prefill_nosample, send_forward_nosample, send_forward_prefill, send_reset,
+    send_restore_prefix, send_token_batch_upstream, send_token_upstream, FrameKind, StageTransport,
 };
 use crate::kv_prefix_cache::KvPrefixCache;
 use crate::manifest::Manifest;
@@ -45,6 +46,34 @@ pub struct SparseMoEBuilderConfig {
     pub model_dir: PathBuf,
     pub device: String,
     pub cache_dir: Option<String>,
+    // ---- glm5 tunables, config-threaded ----------------------------------
+    // Each of these is otherwise read from the process environment deep inside
+    // the engine. A host that loads the engine in-process cannot set those
+    // (`set_var` is `unsafe` under edition 2024, and process-global), so they
+    // travel as config instead. `None` means "use the env value", preserving
+    // every existing env-driven deployment byte-for-byte.
+    //
+    // Deliberately absent: `profile`. `CASCADIA_GLM5_PROFILE` is read from a
+    // `OnceLock` process global in the decode loop, which no config can reach;
+    // it stays env-only rather than becoming a field that silently does nothing.
+    /// Context budget. `None` → `CASCADIA_GLM5_MAX_SEQ`, else [`crate::glm::stage::GLM5_DEFAULT_MAX_SEQ`].
+    pub max_seq: Option<usize>,
+    /// KV-prefix-cache depth. `None` → `CASCADIA_GLM5_PREFIX_CACHE` (0 = off).
+    pub prefix_cache_depth: Option<u32>,
+    /// bf16 MLA latent / k_pe KV cache. `None` → `CASCADIA_GLM5_BF16_KV` (off).
+    pub bf16_kv: Option<bool>,
+    /// Force exact-f32 embed + lm_head. `None` → `CASCADIA_GLM5_F32_HEAD`.
+    /// Modelled as the opt-OUT: bf16 head is the default-ON production path.
+    pub f32_head: Option<bool>,
+    /// Async lookahead expert prefetch. `None` → `CASCADIA_GLM5_LOOKAHEAD` (off).
+    pub lookahead: Option<bool>,
+    /// Expert storage mode (`"eager"` | `"mmap"`). `None` → `CASCADIA_GLM5_EXPERTS`.
+    pub experts_mode: Option<String>,
+    /// OV expert cache count backstop. `None` → `CASCADIA_GLM5_OV_CACHE` (64).
+    pub ov_cache_entries: Option<u32>,
+    /// OV expert cache byte budget in MiB (primary bound). `None` →
+    /// `CASCADIA_GLM5_OV_CACHE_MB` (2048).
+    pub ov_cache_mb: Option<u64>,
     /// Extra `(key, value)` OV plugin properties plumbed verbatim from the CLI.
     /// Applied via the shared `PluginConfig` to every OV-compiled IR on this
     /// rank: embedding, transformer shells, head, and — for `ov_ir`-format
@@ -139,6 +168,16 @@ impl SparseMoEBuilderConfig {
             model_dir: model_dir.into(),
             device: device.into(),
             cache_dir: None,
+            // All `None` = "defer to env", so constructing a config changes
+            // nothing for existing env-driven deployments.
+            max_seq: None,
+            prefix_cache_depth: None,
+            bf16_kv: None,
+            f32_head: None,
+            lookahead: None,
+            experts_mode: None,
+            ov_cache_entries: None,
+            ov_cache_mb: None,
             ov_properties: Vec::new(),
             // 0 = unbounded (default); positive = LRU cap. The env var
             // `CASCADIA_MAX_EXPERTS_CACHED` overrides this if set.
@@ -264,6 +303,8 @@ pub struct SparseMoEBuilder {
     /// Set when the manifest's arch is "deepseek_v4" (Rust dsv4 shell +
     /// int4 experts; its manifest schema differs from [`Manifest`]).
     dsv4_runner: Option<crate::dsv4::stage::Dsv4Runner>,
+    /// Set when the manifest's arch is "glm5" (Rust glm5 shell + int4 experts).
+    glm_runner: Option<crate::glm::stage::GlmRunner>,
     tokenizer: Option<Tokenizer>,
     listen_host: String,
     listen_port: Option<u16>,
@@ -277,6 +318,7 @@ impl SparseMoEBuilder {
             runner: None,
             ov_runner: None,
             dsv4_runner: None,
+            glm_runner: None,
             tokenizer: None,
             listen_host: "0.0.0.0".into(),
             listen_port: None,
@@ -424,6 +466,68 @@ impl Builder for SparseMoEBuilder {
             self.dsv4_runner = Some(runner);
             return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
                 "loaded DeepSeek-V4 stage (dsv4 Rust shell)",
+            )])));
+        }
+
+        // glm5 shell backend: like dsv4, its manifest schema differs from the
+        // strict Manifest, so peek the arch first. Rust MLA+DSA shell + int4
+        // experts; 1x-width hidden on the same dist wire (no HC copies, no
+        // input_ids past rank 0).
+        let is_glm = std::fs::read_to_string(self.config.model_dir.join("manifest.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| v.get("arch").and_then(|a| a.as_str()) == Some("glm5"))
+            .unwrap_or(false);
+        if is_glm {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            let max_seq = self
+                .config
+                .max_seq
+                .or_else(|| {
+                    std::env::var("CASCADIA_GLM5_MAX_SEQ")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        // `=0` keeps meaning "fall through to the default",
+                        // not "zero context".
+                        .filter(|&n| n > 0)
+                })
+                .unwrap_or(crate::glm::stage::GLM5_DEFAULT_MAX_SEQ);
+            let runner = crate::glm::stage::GlmRunner::load_staged(
+                &self.config.model_dir,
+                max_seq,
+                rank,
+                total,
+                shard.layer_start,
+                shard.layer_end,
+                crate::glm::stage::StageOpts::resolve(
+                    self.config.f32_head,
+                    self.config.bf16_kv,
+                    self.config.experts_mode.clone(),
+                    self.config.lookahead,
+                    self.config.prefix_cache_depth,
+                    self.config.ov_cache_entries,
+                    self.config.ov_cache_mb,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("glm5 load: {e}")))?;
+            if rank == 0 {
+                let tok_path = self.config.model_dir.join("tokenizer.json");
+                if tok_path.exists() {
+                    self.tokenizer =
+                        Some(Tokenizer::from_file(&tok_path).map_err(|e| {
+                            EngineError::Backend(format!("load tokenizer.json: {e}"))
+                        })?);
+                } else {
+                    warn!(
+                        "no tokenizer.json at {} — glm5 engine will only accept pre-tokenized inputs",
+                        tok_path.display()
+                    );
+                }
+            }
+            self.glm_runner = Some(runner);
+            return Ok(Box::pin(stream::iter(vec![LoadProgress::message(
+                "loaded glm5 stage (glm5 Rust shell)",
             )])));
         }
 
@@ -616,6 +720,32 @@ impl Builder for SparseMoEBuilder {
                 runtime_handle,
                 rank,
                 total,
+                // dsv4 has no config-threaded prefix cache; `None` keeps its
+                // existing env-only behaviour byte-for-byte.
+                None,
+            )));
+        }
+        if let Some(runner) = self.glm_runner {
+            let total = self.config.total.max(1);
+            let rank = self.config.rank.min(total - 1);
+            if rank == 0 && self.tokenizer.is_none() {
+                return Err(EngineError::Backend(
+                    "tokenizer.json missing (required for the glm5 API rank)".into(),
+                ));
+            }
+            let runtime_handle = tokio::runtime::Handle::try_current()
+                .map_err(|_| EngineError::Backend("Builder::build outside tokio context".into()))?;
+            info!(rank, total, "built glm5 engine");
+            return Ok(Box::new(PipelineEngine::new(
+                runner,
+                self.tokenizer,
+                self.transport,
+                runtime_handle,
+                rank,
+                total,
+                // Same value the per-rank SliceKvCache got, so the rank-0 index
+                // and the per-rank caches stay in lockstep.
+                self.config.prefix_cache_depth.map(|d| d as usize),
             )));
         }
         if let Some(ov) = self.ov_runner {
@@ -758,6 +888,23 @@ fn finish_reason_for(n_tokens: usize, max_new: usize) -> FinishReason {
     }
 }
 
+/// Incremental UTF-8-safe streaming delta. `full` is the whole output decoded so
+/// far (`decode(generated)`), `emitted` the byte length already streamed; return
+/// the new bytes to stream and advance `emitted`. A trailing U+FFFD means a
+/// multi-byte char is split across tokens (the tokenizer decoded a partial code
+/// unit) — return nothing and hold `emitted` until the next token completes the
+/// char, so no delta ever carries a lone replacement byte. Mirrors the OV
+/// pipeline engines (qwen36) and assumes `decode` is prefix-stable across a
+/// growing token list (true for these BPE tokenizers).
+fn utf8_safe_delta(full: &str, emitted: &mut usize) -> String {
+    if full.ends_with('\u{FFFD}') {
+        return String::new();
+    }
+    let d = full.get(*emitted..).unwrap_or("").to_string();
+    *emitted = full.len();
+    d
+}
+
 fn sampling_from_task(task: &GenerationTask) -> crate::sampling::SamplingConfig {
     let s = &task.sampling;
     crate::sampling::SamplingConfig {
@@ -809,6 +956,52 @@ fn even_moe_split(total_moe: u32, rank: u32, total: u32) -> (u32, u32) {
 /// Pure, for testing.
 fn worker_should_report_disconnect(peer_disconnected: bool, already_reported: bool) -> bool {
     peer_disconnected && !already_reported
+}
+
+/// Per-token reply budget: no widening. Mirrors `reply_deadline`'s body
+/// (split out, same as `prefill_reply_budget` below, purely so a test can pin
+/// "prefill exceeds per-token" against the real function instead of a
+/// disconnected literal). Pure, for testing.
+fn per_token_reply_budget(recv_timeout: std::time::Duration) -> std::time::Duration {
+    recv_timeout
+}
+
+/// Safety margin the clamped prefill budget must stay under the frame-idle
+/// ceiling by. `recv_token_reply`'s outer `tokio::time::timeout` and the
+/// transport layer's OWN idle-ceiling timeout (inside
+/// `recv_exact_frame_start`, guarding `recv_kind_client`) race the same
+/// silent-peer wait — whichever fires first decides the outcome. If our
+/// budget reaches or exceeds the ceiling, the transport-layer timeout can win
+/// that race: it surfaces `TransportError::FrameIdleCeiling`, which
+/// `ActivationClient::drop_connection_if_recv_fatal` treats as
+/// connection-fatal and permanently drops the client socket (only
+/// `Builder::connect` redials it) — the exact defect D failure mode, just
+/// reached via a wide-open `PREFILL_REPLY_TIMEOUT_FACTOR` instead of an
+/// unbounded recv. 30s is generous next to scheduling jitter and small next
+/// to the ~900s default ceiling.
+const PREFILL_BUDGET_CEILING_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Widened deadline for a BATCHED prefill window's owed Token reply — see
+/// `PipelineEngine::reply_deadline_prefill`. Split out as a free function
+/// (rather than inline in the generic `impl<R: StagedRunner>` block) so the
+/// arithmetic is unit testable without standing up a `StagedRunner`.
+///
+/// Clamped to stay `PREFILL_BUDGET_CEILING_MARGIN` under `frame_idle_ceiling`
+/// when one is configured (`None` = disabled, nothing to stay under) — an
+/// operator raising `CASCADIA_ACTIVATION_TIMEOUT_SECS` (a natural response to
+/// prefills timing out on a slow fleet) widens `recv_timeout` and, with it,
+/// this budget; left unclamped, a high enough setting reaches the frame-idle
+/// ceiling and reinstates defect D (see `PREFILL_BUDGET_CEILING_MARGIN`). Pure,
+/// for testing.
+fn prefill_reply_budget(
+    recv_timeout: std::time::Duration,
+    frame_idle_ceiling: Option<std::time::Duration>,
+) -> std::time::Duration {
+    let widened = recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR);
+    match frame_idle_ceiling {
+        Some(ceiling) => widened.min(ceiling.saturating_sub(PREFILL_BUDGET_CEILING_MARGIN)),
+        None => widened,
+    }
 }
 
 /// Hard cap on the pending-task queue. step() processes one task end-to-end
@@ -1988,6 +2181,16 @@ impl SparseMoEEngine {
                 "rank {} received unexpected TOKEN_BATCH from upstream",
                 self.rank
             )),
+            FrameKind::ForwardBatchPrefill | FrameKind::ForwardBatchPrefillNoSample => {
+                Err(format!(
+                    "rank {} received ForwardBatchPrefill (Rust-shell prefill batching only)",
+                    self.rank
+                ))
+            }
+            FrameKind::RestorePrefix | FrameKind::CachePrefix => Err(format!(
+                "rank {} received a KV-prefix-cache frame (glm5 pipeline engine only)",
+                self.rank
+            )),
         }
     }
 
@@ -2574,8 +2777,17 @@ impl Engine for OvMoeEngine {
 // ids never leave rank 0 (hash-gate layers are always in stage 0).
 // ---------------------------------------------------------------------
 
-pub struct Dsv4Engine {
-    runner: crate::dsv4::stage::Dsv4Runner,
+use crate::staged::StagedRunner;
+
+/// dsv4's concrete engine (historical name kept for its tests + build()).
+pub type Dsv4Engine = PipelineEngine<crate::dsv4::stage::Dsv4Runner>;
+
+/// Arch-agnostic pipeline engine over a [`StagedRunner`]: rank 0 tokenizes +
+/// drives one wire round-trip per token (prompt included), workers run their
+/// layer slice, the last rank samples. Shared by the dsv4 and glm5 Rust shells
+/// (minimax keeps its own engine — different disconnect semantics).
+pub struct PipelineEngine<R: StagedRunner> {
+    runner: R,
     tokenizer: Option<Tokenizer>,
     pending: VecDeque<GenerationTask>,
     transport: StageTransport,
@@ -2587,16 +2799,58 @@ pub struct Dsv4Engine {
     last_rank_history: Vec<i64>,
     last_rank_rng: u64,
     last_rank_rng_seeded: bool,
+    /// Rank-0 KV-prefix index: `(cached prompt prefix tokens, its key)`.
+    /// Insertion-ordered LRU capped at `prefix_cap`, in lockstep with every
+    /// rank's `SliceKvCache`, so a rank-0 index hit is guaranteed still cached on
+    /// all ranks. Unused unless the runner enables prefix caching.
+    prefix_index: Vec<(Vec<u32>, u64)>,
+    prefix_next_key: u64,
+    prefix_cap: usize,
+    /// In-flight streamed generation for rank 0. `None` between tasks; `Some`
+    /// while a task is decoding token-by-token (one `Chunk::token` per `step`).
+    /// Rank 0 serves ONE task at a time (as the monolithic driver did): a new
+    /// task is popped from `pending` only when this is `None`.
+    active: Option<PipeActive>,
 }
 
-impl Dsv4Engine {
+/// Rank-0 per-token streaming state: everything the decode loop threaded as
+/// locals in the old monolithic `step_first`, persisted across `step()` calls
+/// so each call emits exactly one token. `next` is the token to emit on the
+/// NEXT `step` (the prefill sample seeds it); `pos` is the KV position the last
+/// forwarded token occupied; `emitted` is the byte length of the decoded output
+/// already streamed (for UTF-8-safe delta slicing).
+struct PipeActive {
+    id: TaskId,
+    downstream: Arc<TokioMutex<ActivationClient>>,
+    cfg: crate::sampling::SamplingConfig,
+    eos: Vec<u32>,
+    max_new: usize,
+    max_seq: usize,
+    started: Instant,
+    /// The prompt tokens actually prefilled (`prompt_ids[..n_prefill]`), kept
+    /// for the post-decode prefix-cache key.
+    prompt_ids: Vec<u32>,
+    n_prefill: usize,
+    next: i64,
+    pos: usize,
+    generated: Vec<u32>,
+    emitted: usize,
+    hit_context_cap: bool,
+}
+
+impl<R: StagedRunner> PipelineEngine<R> {
+    /// `prefix_cap`: rank-0 KV-prefix-cache depth. `None` defers to
+    /// `CASCADIA_GLM5_PREFIX_CACHE`, preserving the env-only behaviour. This
+    /// index must stay in lockstep with every rank's `SliceKvCache`, so the
+    /// value threaded here is the same one handed to `StageOpts`.
     fn new(
-        runner: crate::dsv4::stage::Dsv4Runner,
+        runner: R,
         tokenizer: Option<Tokenizer>,
         transport: StageTransport,
         runtime_handle: tokio::runtime::Handle,
         rank: u32,
         total: u32,
+        prefix_cap: Option<usize>,
     ) -> Self {
         Self {
             runner,
@@ -2611,7 +2865,60 @@ impl Dsv4Engine {
             last_rank_history: Vec::new(),
             last_rank_rng: 0,
             last_rank_rng_seeded: false,
+            prefix_index: Vec::new(),
+            prefix_next_key: 0,
+            prefix_cap: prefix_cap
+                .or_else(|| {
+                    std::env::var("CASCADIA_GLM5_PREFIX_CACHE")
+                        .ok()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0),
+            active: None,
         }
+    }
+
+    /// Longest cached prompt prefix that is a STRICT prefix of `prompt` (length
+    /// `< prompt.len()`, so at least the last token is always prefilled to
+    /// produce logits). Returns `(key, len)`.
+    fn prefix_reuse(&self, prompt: &[u32]) -> Option<(u64, usize)> {
+        let mut best: Option<(u64, usize)> = None;
+        for (toks, key) in &self.prefix_index {
+            let k = toks.len();
+            if k < prompt.len() && prompt[..k] == toks[..] && best.map_or(true, |(_, b)| k > b) {
+                best = Some((*key, k));
+            }
+        }
+        best
+    }
+
+    /// Record `prompt`'s KV (LRU-evicting in lockstep with the ranks'
+    /// `SliceKvCache`). Returns the key to cache under — the existing one when
+    /// `prompt` is already indexed, a fresh one otherwise.
+    ///
+    /// Reusing the key on a repeat is what keeps the lockstep claim true. This
+    /// index dedups by token sequence; every rank's `SliceKvCache` dedups by
+    /// key. Minting a fresh key for an already-indexed sequence dropped the old
+    /// index entry without evicting anything, while the ranks saw an unfamiliar
+    /// key, appended it, and evicted their oldest — so the two sides drifted
+    /// apart and `prefix_reuse` could hand out a key no rank still held. With
+    /// the key reused, `cache_prefix` hits the key-dedup branch in
+    /// `SliceKvCache::insert` and both sides refresh the same entry to MRU.
+    fn prefix_remember(&mut self, prompt: &[u32]) -> u64 {
+        if let Some(i) = self.prefix_index.iter().position(|(t, _)| t == prompt) {
+            // Refresh to MRU without changing the set; no trim can be due.
+            let entry = self.prefix_index.remove(i);
+            let key = entry.1;
+            self.prefix_index.push(entry);
+            return key;
+        }
+        let key = self.prefix_next_key;
+        self.prefix_next_key += 1;
+        self.prefix_index.push((prompt.to_vec(), key));
+        while self.prefix_index.len() > self.prefix_cap {
+            self.prefix_index.remove(0);
+        }
+        key
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -2676,6 +2983,10 @@ impl Dsv4Engine {
         );
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text);
         chunk.n_tokens = Some(n_tokens);
+        // Same omission as the pipeline path: the API reads this and reported 0.
+        // `prompt_ids` is already truncated to the context budget above, so its
+        // length is the count actually processed.
+        chunk.prompt_tokens = Some(prompt_ids.len() as u32);
         chunk.finish_reason = Some(if hit_context_cap {
             FinishReason::Length
         } else {
@@ -2731,25 +3042,73 @@ impl Dsv4Engine {
     /// without a clean FIN/RST, the failure mode seen on this fleet — surfaces
     /// as a fast error inside a client's request window instead of a wedge.
     fn reply_deadline() -> std::time::Duration {
-        cascadia_transport::recv_timeout()
+        per_token_reply_budget(cascadia_transport::recv_timeout())
+    }
+
+    /// Strict deadline for the Token reply owed to a BATCHED prefill window
+    /// (`forward_prompt_batch_first` / the mid-rank relay in
+    /// `handle_forward_batch_prefill`): unlike dsv4's per-token forwarding,
+    /// every remaining downstream stage must run the WHOLE window (up to
+    /// `MAX_BATCH_COUNT` rows) through compute before replying, so the
+    /// per-token `reply_deadline` above is far too tight — the same widening
+    /// `recv_token_from_downstream` in cascadia-engine-openvino applies for
+    /// its chunked-prefill path, so the two crates agree on what "a prefill
+    /// budget" means. Clamped under the frame-idle ceiling — see
+    /// `prefill_reply_budget`.
+    fn reply_deadline_prefill() -> std::time::Duration {
+        prefill_reply_budget(
+            cascadia_transport::recv_timeout(),
+            cascadia_transport::frame_idle_ceiling(),
+        )
     }
 
     fn step_first(&mut self) -> Vec<(TaskId, Chunk)> {
+        // Token-streaming state machine. When idle, `begin_generation` pops the
+        // next task, runs prefill (batched or per-token), and stashes the
+        // in-flight state in `self.active`; it returns `Some(chunks)` only on a
+        // terminal outcome (no pending task -> empty, or an encode / reset /
+        // prefill failure -> a final / error chunk) and leaves `active` unset.
+        // On success it returns `None` and we fall through to `decode_step`,
+        // which emits the first token this same call. Every subsequent `step`
+        // decodes and emits exactly one token, finalizing (post-decode prefix
+        // cache + final marker) when the task ends. This mirrors the OV
+        // pipeline engines (qwen36) so glm5 + dsv4 stream per-token instead of
+        // returning the whole completion on one final marker — the client sees
+        // the first token after TTFT, not after the full (slow, I/O-bound)
+        // decode.
+        if self.active.is_none() {
+            if let Some(terminal) = self.begin_generation() {
+                return terminal;
+            }
+        }
+        self.decode_step()
+    }
+
+    /// Pop + prefill the next task, seeding `self.active` with the first token
+    /// to emit. Returns `Some(chunks)` on a terminal outcome (no pending task,
+    /// or a setup failure) with `active` left `None`; `None` once streaming has
+    /// begun (`active` is `Some` and `active.next` is the first generated
+    /// token). This is the old monolithic `step_first` up to — but not
+    /// including — the decode loop, which is now `decode_step`.
+    fn begin_generation(&mut self) -> Option<Vec<(TaskId, Chunk)>> {
         let task = match self.pending.pop_front() {
             Some(t) => t,
-            None => return Vec::new(),
+            None => return Some(Vec::new()),
         };
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
             warn!(task = %id, "rank 0 has no downstream; cannot drive pipeline");
-            return vec![(id.clone(), Chunk::error(id, "rank 0 missing downstream"))];
+            return Some(vec![(
+                id.clone(),
+                Chunk::error(id, "rank 0 missing downstream"),
+            )]);
         };
         if self.tokenizer.is_none() {
             warn!(task = %id, "dsv4 rank 0 has no tokenizer");
-            return vec![(
+            return Some(vec![(
                 id.clone(),
                 Chunk::error(id, "dsv4 rank 0 has no tokenizer".to_string()),
-            )];
+            )]);
         }
         let started = Instant::now();
         let prompt_ids: Vec<u32> = match self
@@ -2761,14 +3120,14 @@ impl Dsv4Engine {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
                 warn!(task = %id, "tokenizer encode failed: {e}");
-                return vec![(
+                return Some(vec![(
                     id.clone(),
                     Chunk::error(id, format!("tokenizer encode failed: {e}")),
-                )];
+                )]);
             }
         };
         if prompt_ids.is_empty() {
-            return vec![(id.clone(), Chunk::final_marker(id, ""))];
+            return Some(vec![(id.clone(), Chunk::final_marker(id, ""))]);
         }
         let max_new = task.max_tokens.max(1) as usize;
         let cfg = sampling_from_task(&task);
@@ -2777,7 +3136,7 @@ impl Dsv4Engine {
         self.runner.reset();
         if let Err(e) = self.block_on(send_reset(&downstream)) {
             warn!(task = %id, "send_reset failed: {e}");
-            return vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))];
+            return Some(vec![(id.clone(), Chunk::error(id, format!("reset: {e}")))]);
         }
 
         // Prefill: only the LAST prompt step asks the last rank to sample
@@ -2808,85 +3167,278 @@ impl Dsv4Engine {
                  the response answers only the first {max_seq} tokens"
             );
         }
-        for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
-            let sample_back = i + 1 == n_prefill;
-            match self.forward_one_token_first(
-                t,
-                pos,
-                &cfg,
-                &downstream,
-                sample_back,
-                Self::reply_deadline(),
-            ) {
-                Ok(tok_back) => next = tok_back,
-                Err(e) => {
-                    warn!(task = %id, "prefill forward failed: {e}");
-                    return vec![(id.clone(), Chunk::error(id, e))];
+        if self.runner.supports_batched_prefill() && n_prefill > 0 {
+            // KV-prefix cache (opt-in): restore the longest cached prefix on every
+            // rank, then batch-prefill only the suffix (base = reused length).
+            // Skipping the shared prefix skips re-streaming its experts — ~78% of
+            // decode time on this NVMe-bound workload. `reuse == 0` (disabled or a
+            // miss) is the original full-prefill behaviour.
+            let reuse = if self.runner.prefix_cache_enabled() {
+                match self.prefix_reuse(&prompt_ids[..n_prefill]) {
+                    // Only reuse when this rank actually restored, and to the
+                    // length the index promised. A miss means the index and the
+                    // slice caches disagree; a different length means the cached
+                    // snapshot does not describe `k` tokens. Either way the peers
+                    // have not been told to restore yet, so falling back to a full
+                    // prefill is safe — but `restore_prefix` sets `pos` on a hit,
+                    // so undo it before prefilling from base 0.
+                    Some((key, k)) if self.runner.restore_prefix(key) == Some(k) => {
+                        if let Err(e) = self.block_on(send_restore_prefix(&downstream, key)) {
+                            warn!(task = %id, "send_restore_prefix failed: {e}");
+                            return Some(vec![(
+                                id.clone(),
+                                Chunk::error(id, format!("restore_prefix: {e}")),
+                            )]);
+                        }
+                        info!(
+                            task = %id,
+                            reused = k,
+                            prompt = n_prefill,
+                            suffix = n_prefill - k,
+                            "glm5 kv-prefix cache HIT: prefilling suffix only"
+                        );
+                        k
+                    }
+                    Some((key, k)) => {
+                        warn!(
+                            task = %id,
+                            expected = k,
+                            "glm5 kv-prefix cache index/slice disagreement; full prefill"
+                        );
+                        // Drop the stale entry so the next turn of this
+                        // conversation does not re-miss on the same key.
+                        self.prefix_index.retain(|(_, k2)| *k2 != key);
+                        self.runner.reset();
+                        0
+                    }
+                    None => 0,
                 }
+            } else {
+                0
+            };
+            // Prefill the suffix in windows of at most MAX_BATCH_COUNT rows (the
+            // wire caps one ForwardBatch at MAX_BATCH_COUNT, since it was built for
+            // spec-decode K). KV accumulates across windows exactly as it would
+            // token-by-token; every window but the last is NoSample, and only the
+            // final ForwardBatchPrefill samples the first generated token — so no
+            // mid-prompt row is recorded into the last rank's rep-penalty history.
+            let suffix = &prompt_ids[reuse..n_prefill];
+            let win = crate::dist::MAX_BATCH_COUNT as usize;
+            let n_windows = suffix.len().div_ceil(win);
+            let mut wbase = reuse;
+            for (wi, chunk) in suffix.chunks(win).enumerate() {
+                let is_last = wi + 1 == n_windows;
+                match self.forward_prompt_batch_first(chunk, wbase, &cfg, &downstream, is_last) {
+                    Ok(tok_back) => {
+                        if is_last {
+                            next = tok_back;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(task = %id, "batched prefill window {wi} failed: {e}");
+                        return Some(vec![(id.clone(), Chunk::error(id, e))]);
+                    }
+                }
+                wbase += chunk.len();
             }
-            pos += 1;
+            pos = n_prefill;
+        } else {
+            for (i, &t) in prompt_ids.iter().take(n_prefill).enumerate() {
+                let sample_back = i + 1 == n_prefill;
+                match self.forward_one_token_first(
+                    t,
+                    pos,
+                    &cfg,
+                    &downstream,
+                    sample_back,
+                    Self::reply_deadline(),
+                ) {
+                    Ok(tok_back) => next = tok_back,
+                    Err(e) => {
+                        warn!(task = %id, "prefill forward failed: {e}");
+                        return Some(vec![(id.clone(), Chunk::error(id, e))]);
+                    }
+                }
+                pos += 1;
+            }
         }
 
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new);
-        // Set when the decode loop stops because the context window is full
-        // rather than by the token cap or an EOS. The output was cut off, so the
-        // OpenAI finish_reason must be `length` (not `stop`) even though we
-        // generated fewer than max_new tokens — clients key continuation on it.
-        let mut hit_context_cap = false;
-        loop {
-            let next_u = next as u32;
-            generated.push(next_u);
-            if generated.len() >= max_new || eos.contains(&next_u) {
-                break;
-            }
-            // Stop before forwarding at pos == max_seq (the caches can't hold
-            // that absolute position). Checked after the push so the token
-            // sampled from the last in-range position is still emitted.
-            if pos >= max_seq {
-                hit_context_cap = true;
-                break;
-            }
-            match self.forward_one_token_first(
-                next_u,
-                pos,
-                &cfg,
-                &downstream,
-                true,
-                Self::reply_deadline(),
-            ) {
-                Ok(tok_back) => next = tok_back,
-                Err(e) => {
-                    warn!(task = %id, "decode forward failed; emitting partial output: {e}");
-                    break;
-                }
-            }
-            pos += 1;
-        }
+        // Prefill produced the first token (`next`) at KV position `pos`. Stash
+        // the in-flight state; `decode_step` emits `next` on the next (this)
+        // call and drives one token per `step` from here.
+        self.active = Some(PipeActive {
+            id,
+            downstream,
+            cfg,
+            eos,
+            max_new,
+            max_seq,
+            started,
+            prompt_ids: prompt_ids[..n_prefill].to_vec(),
+            n_prefill,
+            next,
+            pos,
+            generated: Vec::with_capacity(max_new),
+            emitted: 0,
+            hit_context_cap: false,
+        });
+        None
+    }
 
-        let n_tokens = generated.len() as u32;
-        let text = self
+    /// Emit one token from the in-flight task, or finalize when it ends. This is
+    /// one iteration of the old monolithic decode loop: push `next` to
+    /// `generated`, stream its UTF-8-safe delta, then — in the SAME post-push
+    /// order the loop used — stop on max_new / EOS / context-cap, or forward the
+    /// token to obtain the next one. Preserving that order keeps the emitted
+    /// token set, text, count, and finish_reason bit-identical to the batch
+    /// driver. A finalizing step returns `[token, final_marker]`; the runner
+    /// buffers the marker and drains it on the next poll (see
+    /// `cascadia_runner::ChunkStream::poll_next`).
+    fn decode_step(&mut self) -> Vec<(TaskId, Chunk)> {
+        let id = self.active.as_ref().unwrap().id.clone();
+        let next = self.active.as_ref().unwrap().next;
+        let next_u = next as u32;
+
+        // Push first (mirrors the old loop: the token sampled from the last
+        // in-range position is always emitted, even when it triggers the stop).
+        self.active.as_mut().unwrap().generated.push(next_u);
+
+        // UTF-8-safe delta: decode the whole output so far and stream the bytes
+        // past what we've already emitted. A trailing U+FFFD means a multi-byte
+        // char is split across tokens — hold the delta until the next token
+        // completes it (matches qwen36). The token is still counted (n_tokens=1)
+        // so the completion total equals `generated.len()` as the batch driver
+        // reported it.
+        let full = self
             .tokenizer
             .as_ref()
             .unwrap()
-            .decode(&generated, true)
+            .decode(&self.active.as_ref().unwrap().generated, true)
             .unwrap_or_default();
-        let elapsed = started.elapsed().as_secs_f64();
+        let delta = {
+            let a = self.active.as_mut().unwrap();
+            utf8_safe_delta(&full, &mut a.emitted)
+        };
+        let mut token_chunk = Chunk::token(id.clone(), next, delta);
+        token_chunk.n_tokens = Some(1);
+
+        let (gen_len, max_new, is_eos, pos, max_seq) = {
+            let a = self.active.as_ref().unwrap();
+            (
+                a.generated.len(),
+                a.max_new,
+                a.eos.contains(&next_u),
+                a.pos,
+                a.max_seq,
+            )
+        };
+        // Stop on the token cap or an EOS (checked after the push, as the loop
+        // did): the just-emitted token was the last one.
+        if gen_len >= max_new || is_eos {
+            let mut out = vec![(id, token_chunk)];
+            out.extend(self.finalize_pipeline(true));
+            return out;
+        }
+        // Stop before forwarding at pos == max_seq (the caches can't hold that
+        // absolute position); the token sampled from the last in-range position
+        // was already emitted above. `length`, not `stop`.
+        if pos >= max_seq {
+            self.active.as_mut().unwrap().hit_context_cap = true;
+            let mut out = vec![(id, token_chunk)];
+            out.extend(self.finalize_pipeline(true));
+            return out;
+        }
+
+        // Forward the emitted token to sample the next one.
+        let downstream = self.active.as_ref().unwrap().downstream.clone();
+        let cfg = self.active.as_ref().unwrap().cfg.clone();
+        match self.forward_one_token_first(
+            next_u,
+            pos,
+            &cfg,
+            &downstream,
+            true,
+            Self::reply_deadline(),
+        ) {
+            Ok(tok_back) => {
+                let a = self.active.as_mut().unwrap();
+                a.next = tok_back;
+                a.pos += 1;
+                vec![(id, token_chunk)]
+            }
+            Err(e) => {
+                // A mid-decode wire failure emits the partial output as a clean
+                // completion (matches the old loop's `break`): the streamed
+                // tokens stand, finish_reason falls out of the token count.
+                warn!(task = %id, "decode forward failed; emitting partial output: {e}");
+                let mut out = vec![(id, token_chunk)];
+                out.extend(self.finalize_pipeline(false));
+                out
+            }
+        }
+    }
+
+    /// Finish the in-flight task: log throughput, cache the full
+    /// [prompt + response] KV prefix (opt-in, and only when `cache`), and emit
+    /// the final marker with the OpenAI finish_reason. Consumes `self.active`.
+    /// The final marker carries no text — every visible byte already streamed
+    /// as a token delta.
+    ///
+    /// `cache` is false when finalizing from a failed forward. `a.pos` only
+    /// advances on the `Ok` arm, but `forward_one_token_first` mutates the
+    /// runner's KV before it touches the wire — so after a failure the runner
+    /// holds one position more than `a.pos` describes. Caching there would
+    /// store a snapshot one longer than the key naming it, and the next turn
+    /// restoring that key would land every rank at a position rank 0 does not
+    /// prefill from. Skipping it also avoids inserting into the index while a
+    /// `send_cache_prefix` down the just-failed wire drops the peers' copy.
+    fn finalize_pipeline(&mut self, cache: bool) -> Vec<(TaskId, Chunk)> {
+        let Some(a) = self.active.take() else {
+            return Vec::new();
+        };
+        let n_tokens = a.generated.len() as u32;
+        let elapsed = a.started.elapsed().as_secs_f64();
         info!(
-            task = %id,
+            task = %a.id,
             tokens = n_tokens,
             total = self.total,
             elapsed_s = elapsed,
             tok_s = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 },
             "task done (dsv4 pipeline-parallel)"
         );
-        let mut chunk = Chunk::final_marker(id.clone(), text);
-        chunk.n_tokens = Some(n_tokens);
-        chunk.finish_reason = Some(if hit_context_cap {
+        // Cache the full [prompt + generated] KV (positions [0, pos)) on every
+        // rank, so the NEXT turn — which resends this response as an assistant
+        // message — reuses the whole conversation (prompt AND response), not just
+        // the prompt. The key is exactly the tokens whose KV is now cached (pos
+        // covers the prompt plus every forwarded generated token).
+        if cache && self.runner.prefix_cache_enabled() {
+            let gen_cached = a.pos.saturating_sub(a.n_prefill).min(a.generated.len());
+            let mut key_tokens = a.prompt_ids.clone();
+            key_tokens.extend_from_slice(&a.generated[..gen_cached]);
+            let key = self.prefix_remember(&key_tokens);
+            self.runner.cache_prefix(key);
+            if let Err(e) = self.block_on(send_cache_prefix(&a.downstream, key)) {
+                warn!(task = %a.id, "post-decode send_cache_prefix failed: {e}");
+            }
+        }
+        let mut chunk = Chunk::final_marker(a.id.clone(), "");
+        // The completion's tokens all rode the streamed token chunks (each
+        // n_tokens=1); the final marker carries none. Set it explicitly to 0 so
+        // an orchestrator summing the per-frame SSE `n_tokens` field (which
+        // renders `n_tokens.unwrap_or(1)`) doesn't count a phantom token here.
+        chunk.n_tokens = Some(0);
+        // Without this the API reports `prompt_tokens: 0` on every response —
+        // it reads `chunk.prompt_tokens`, and this engine never set it (the OV
+        // engines do). `n_prefill`, not `prompt_ids.len()`, because an
+        // over-budget prompt is truncated and the count should describe the
+        // tokens actually processed.
+        chunk.prompt_tokens = Some(a.n_prefill as u32);
+        chunk.finish_reason = Some(if a.hit_context_cap {
             FinishReason::Length
         } else {
-            finish_reason_for(n_tokens as usize, max_new)
+            finish_reason_for(n_tokens as usize, a.max_new)
         });
-        vec![(id, chunk)]
+        vec![(a.id, chunk)]
     }
 
     fn step_worker(&mut self) -> Vec<(TaskId, Chunk)> {
@@ -2928,6 +3480,70 @@ impl Dsv4Engine {
             FrameKind::ForwardNoSample => {
                 self.handle_forward(&upstream, downstream.as_ref(), false)
             }
+            FrameKind::ForwardBatchPrefill => {
+                // Batched prompt prefill (Rust shell). Fatal on error, like the
+                // other prefill frames: a KV hole would corrupt the whole run.
+                let res = self.handle_forward_batch_prefill(&upstream, downstream.as_ref(), true);
+                if res.is_err() {
+                    self.peer_disconnected = true;
+                }
+                res
+            }
+            FrameKind::ForwardBatchPrefillNoSample => {
+                // An intermediate window of a prompt longer than MAX_BATCH_COUNT:
+                // advance KV over the rows, sample nothing. Same fatal-on-error.
+                let res = self.handle_forward_batch_prefill(&upstream, downstream.as_ref(), false);
+                if res.is_err() {
+                    self.peer_disconnected = true;
+                }
+                res
+            }
+            FrameKind::RestorePrefix => match self.block_on(recv_key_body_server(&upstream)) {
+                Ok(key) => {
+                    // Rank 0 only sends this after restoring the key itself, so a
+                    // miss here means this rank's slice cache has diverged from the
+                    // driver's index — every rank is meant to hold the same keys.
+                    // Continuing would leave this rank at position 0 while rank 0
+                    // prefills from the reused length, which trips the batch
+                    // position assert one frame later with a generic message.
+                    // Latch instead, the same way a malformed frame does, so the
+                    // stage tears down at the point of divergence. Don't relay: the
+                    // ranks below us must not restore either.
+                    if self.runner.restore_prefix(key).is_none() {
+                        self.peer_disconnected = true;
+                        Err(format!(
+                            "restore_prefix: key {key} absent from this rank's slice cache \
+                             (kv-prefix cache diverged from rank 0)"
+                        ))
+                    } else {
+                        match downstream.as_ref() {
+                            Some(down) => self
+                                .block_on(send_restore_prefix(down, key))
+                                .map_err(|e| format!("relay restore_prefix: {e}")),
+                            None => Ok(()),
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.peer_disconnected = true;
+                    Err(format!("recv restore_prefix key: {e}"))
+                }
+            },
+            FrameKind::CachePrefix => match self.block_on(recv_key_body_server(&upstream)) {
+                Ok(key) => {
+                    self.runner.cache_prefix(key);
+                    match downstream.as_ref() {
+                        Some(down) => self
+                            .block_on(send_cache_prefix(down, key))
+                            .map_err(|e| format!("relay cache_prefix: {e}")),
+                        None => Ok(()),
+                    }
+                }
+                Err(e) => {
+                    self.peer_disconnected = true;
+                    Err(format!("recv cache_prefix key: {e}"))
+                }
+            },
             other => Err(format!(
                 "worker received unsupported frame {other:?} (dsv4 has no spec-decode batching)"
             )),
@@ -3024,9 +3640,177 @@ impl Dsv4Engine {
             })
         }
     }
+
+    /// Worker-side ForwardBatchPrefill handler: run ALL `rows` prompt positions
+    /// through my layers as one batch (batch-union MoE dedups their experts),
+    /// then — on the last rank — head+sample ONLY the final row (the first
+    /// generated token; earlier prompt rows are neither sampled nor recorded,
+    /// matching ForwardNoSample) and reply with a single Token. Mid ranks relay
+    /// the batch downstream and pass the single Token back upstream. Only the
+    /// Rust shell (which needs no per-position token id) drives this path.
+    fn handle_forward_batch_prefill(
+        &mut self,
+        upstream: &Arc<TokioMutex<ActivationServer>>,
+        downstream: Option<&Arc<TokioMutex<ActivationClient>>>,
+        sample: bool,
+    ) -> Result<(), String> {
+        let (base, batch_count, sampling_cfg, hidden_f32, in_shape) = self
+            .block_on(recv_forward_batch_body_server(upstream))
+            .map_err(|e| format!("recv_forward_batch(prefill): {e}"))?;
+        let hidden = self.runner.hidden_size();
+        let rows = batch_count as usize;
+        let base = base as usize;
+        if in_shape[0] != 1 || in_shape[1] != batch_count || in_shape[2] as usize != hidden {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "forward_batch_prefill shape {in_shape:?} (expected [1, {batch_count}, {hidden}])"
+            ));
+        }
+        if hidden_f32.len() != rows * hidden {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "forward_batch_prefill hidden len {} != {rows}*{hidden}",
+                hidden_f32.len()
+            ));
+        }
+        if base + rows > self.runner.max_seq() {
+            self.peer_disconnected = true;
+            return Err(format!(
+                "forward_batch_prefill positions {base}..{} exceed context budget {}",
+                base + rows,
+                self.runner.max_seq()
+            ));
+        }
+        let h = self.runner.forward_layers_batch(hidden_f32, base, rows);
+        if self.is_last() {
+            if !sample {
+                // Intermediate window: KV is advanced above; sample nothing and
+                // record nothing (recording mid-prompt rows would poison the
+                // rep-penalty history). Reply with a dummy Token(-1) ack so the
+                // driver can pipeline the next window.
+                return self
+                    .block_on(send_token_upstream(upstream, -1))
+                    .map_err(|e| format!("send_token (batch prefill nosample): {e}"));
+            }
+            let last = (rows - 1) * hidden;
+            let logits = self.runner.head_logits(&h[last..last + hidden]);
+            if !self.last_rank_rng_seeded {
+                self.last_rank_rng = crate::sampling::init_rng(sampling_cfg.seed);
+                self.last_rank_rng_seeded = true;
+            }
+            let token = crate::sampling::sample(
+                &logits,
+                &self.last_rank_history,
+                &sampling_cfg,
+                &mut self.last_rank_rng,
+            );
+            self.last_rank_history.push(token);
+            self.block_on(send_token_upstream(upstream, token))
+                .map_err(|e| format!("send_token (batch prefill): {e}"))
+        } else {
+            let down = downstream.ok_or("mid rank missing downstream")?;
+            self.block_on(async {
+                // Relay with the matching kind so the last rank knows whether to
+                // sample this window.
+                if sample {
+                    send_forward_batch_prefill(
+                        down,
+                        base as u32,
+                        batch_count,
+                        &sampling_cfg,
+                        &h,
+                        [1, batch_count, hidden as u32],
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+                } else {
+                    send_forward_batch_prefill_nosample(
+                        down,
+                        base as u32,
+                        batch_count,
+                        &sampling_cfg,
+                        &h,
+                        [1, batch_count, hidden as u32],
+                    )
+                    .await
+                    .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
+                }
+                // This window's Token reply is owed only after every downstream
+                // stage finishes the WHOLE window, not one token — the per-token
+                // `reply_deadline` above would read a merely-busy peer as dead.
+                // An unbounded recv here (the prior bug) falls through to the
+                // 900s frame-idle ceiling, which is connection-fatal and drops
+                // `ActivationClient::sock` for good (only `Builder::connect`
+                // redials it) — killing this link, and every rank upstream of
+                // it, for the rest of the process.
+                let t = crate::dist::recv_token_reply(down, Self::reply_deadline_prefill()).await?;
+                send_token_upstream(upstream, t)
+                    .await
+                    .map_err(|e| format!("relay token: {e}"))
+            })
+        }
+    }
+
+    /// Rank-0 batched prefill: embed the whole prompt, run my layer slice as one
+    /// batch, ship it downstream as a single ForwardBatchPrefill, and get back
+    /// the first generated token. Advances `self.runner` KV by `rows`. Used only
+    /// when the runner supports batched prefill (no per-position token id needed).
+    fn forward_prompt_batch_first(
+        &mut self,
+        prompt: &[u32],
+        base: usize,
+        cfg: &crate::sampling::SamplingConfig,
+        downstream: &Arc<TokioMutex<ActivationClient>>,
+        sample: bool,
+    ) -> Result<i64, String> {
+        let hidden = self.runner.hidden_size();
+        let rows = prompt.len();
+        let mut batch = vec![0.0f32; rows * hidden];
+        for (r, &t) in prompt.iter().enumerate() {
+            batch[r * hidden..(r + 1) * hidden].copy_from_slice(&self.runner.embed_token(t));
+        }
+        // `base` is the KV position this window starts at (0 = full prefill; > 0
+        // for a restored prefix or a later window of a >MAX_BATCH_COUNT prompt).
+        // Each rank appends rows at [base, ..). `sample=false` windows advance KV
+        // without sampling and reply with a dummy Token(-1).
+        let h = self.runner.forward_layers_batch(batch, base, rows);
+        let cfg = cfg.clone();
+        self.block_on(async {
+            if sample {
+                send_forward_batch_prefill(
+                    downstream,
+                    base as u32,
+                    rows as u32,
+                    &cfg,
+                    &h,
+                    [1, rows as u32, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill: {e}"))?;
+            } else {
+                send_forward_batch_prefill_nosample(
+                    downstream,
+                    base as u32,
+                    rows as u32,
+                    &cfg,
+                    &h,
+                    [1, rows as u32, hidden as u32],
+                )
+                .await
+                .map_err(|e| format!("send_forward_batch_prefill_nosample: {e}"))?;
+            }
+            // Same rule as the mid-rank relay: this window's Token reply is
+            // owed only after every downstream stage finishes the whole
+            // window, so it needs the widened prefill deadline, not the
+            // per-token one — and never the raw, unbounded recv (see the
+            // comment on the mid-rank relay above `handle_forward_batch_prefill`
+            // for why that's connection-fatal, not just slow).
+            crate::dist::recv_token_reply(downstream, Self::reply_deadline_prefill()).await
+        })
+    }
 }
 
-impl Engine for Dsv4Engine {
+impl<R: StagedRunner> Engine for PipelineEngine<R> {
     fn warmup(&mut self) {
         if self.total == 1 {
             if let Some(tok) = self.tokenizer.as_ref() {
@@ -3058,7 +3842,17 @@ impl Engine for Dsv4Engine {
     }
 
     fn cancel(&mut self, task_id: &TaskId) {
+        // Drop it from the queue if it hasn't started. If it's the in-flight
+        // streamed task (rank 0, pipeline mode), drop `active` too so decoding
+        // stops at the current token boundary instead of grinding out the rest
+        // of a completion no one will read — an SSE client that disconnects
+        // mid-stream triggers this via `ChunkStream::drop`. The next task's
+        // `begin_generation` issues a fresh reset + send_reset, so abandoning
+        // mid-sequence leaves no stale KV state to clean up here.
         self.pending.retain(|t| &t.task_id != task_id);
+        if self.active.as_ref().is_some_and(|a| &a.id == task_id) {
+            self.active = None;
+        }
     }
 
     fn step(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
@@ -3088,6 +3882,52 @@ impl Engine for Dsv4Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-token streaming deltas (PipelineEngine::decode_step) must
+    /// reconstruct the full text exactly, never emit a lone U+FFFD, and hold a
+    /// multi-byte char that a tokenizer decodes across two tokens (the partial
+    /// step surfaces as a trailing replacement char) until it completes. `full`
+    /// is `decode(generated)` growing one token per step.
+    #[test]
+    fn utf8_safe_delta_streams_full_text_across_multibyte_split() {
+        // Steps: "Hi" -> partial emoji (trailing U+FFFD) -> completed "Hi 🚀"
+        // -> "Hi 🚀!". The rocket is 4 bytes; its first token decodes to a
+        // partial code unit (U+FFFD), the second completes it.
+        let steps = ["Hi", "Hi \u{FFFD}", "Hi 🚀", "Hi 🚀!"];
+        let mut emitted = 0usize;
+        let mut streamed = String::new();
+        for full in steps {
+            let d = utf8_safe_delta(full, &mut emitted);
+            assert!(
+                !d.contains('\u{FFFD}'),
+                "a streamed delta must never carry a replacement char: {d:?}"
+            );
+            streamed.push_str(&d);
+        }
+        assert_eq!(
+            streamed, "Hi 🚀!",
+            "concatenated deltas must reconstruct the final decoded text"
+        );
+        // The held step emitted nothing; the completing step emitted the whole
+        // rocket at once.
+        assert_eq!(emitted, "Hi 🚀!".len());
+    }
+
+    /// Steady-state (no multi-byte split): each step emits exactly the newly
+    /// decoded suffix, and an EOS/empty final decode adds no phantom bytes.
+    #[test]
+    fn utf8_safe_delta_ascii_is_one_suffix_per_step() {
+        let steps = ["The", "The quick", "The quick brown"];
+        let mut emitted = 0usize;
+        let mut out = String::new();
+        for full in steps {
+            out.push_str(&utf8_safe_delta(full, &mut emitted));
+        }
+        assert_eq!(out, "The quick brown");
+        // A final decode identical to the last (e.g. an EOS skipped by
+        // skip_special_tokens) yields an empty delta.
+        assert_eq!(utf8_safe_delta("The quick brown", &mut emitted), "");
+    }
 
     #[test]
     fn even_moe_split_uniform() {
@@ -3133,5 +3973,102 @@ mod tests {
         // The Err step() returns on that one report is connection-fatal, so
         // run_relay_loop exits ConnectionFatal.
         assert!(EngineError::NotConnected.is_connection_fatal());
+    }
+
+    // -------- batched-prefill reply deadline (regression for the unbounded
+    // recv_kind_client/recv_token_body_client pair — see `prefill_reply_budget`
+    // and its two call sites in `handle_forward_batch_prefill` /
+    // `forward_prompt_batch_first` — AND for the follow-up bug where an
+    // unclamped widened budget could reach the frame-idle ceiling and
+    // reinstate the same failure mode via a different path) --------
+
+    #[test]
+    fn prefill_reply_budget_widens_by_the_documented_factor() {
+        // Pins the concrete factor (10) and a concrete expected duration —
+        // NOT the implementation's own multiplication echoed back at itself,
+        // which would pass even if the multiplication were wrong.
+        assert_eq!(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR, 10);
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, None),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_exceeds_the_per_token_reply_deadline() {
+        // The defect under test: a batched prefill window waits on every
+        // remaining stage's WHOLE window of compute, not one token, so its
+        // budget must be strictly wider than the per-token reply deadline.
+        // Compares against `per_token_reply_budget` (the real function
+        // `reply_deadline` delegates to) rather than a disconnected literal,
+        // so it pins the actual relationship between the two, not a copy of it.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert!(prefill_reply_budget(recv_timeout, None) > per_token_reply_budget(recv_timeout));
+    }
+
+    #[test]
+    fn prefill_reply_budget_saturates_instead_of_panicking() {
+        // saturating_mul must not panic on an absurd configured recv_timeout;
+        // Duration's `*` would.
+        let huge = std::time::Duration::MAX;
+        assert_eq!(prefill_reply_budget(huge, None), std::time::Duration::MAX);
+    }
+
+    #[test]
+    fn prefill_reply_budget_unclamped_when_no_ceiling_is_configured() {
+        // `None` == the operator disabled the ceiling entirely
+        // (`set_frame_idle_ceiling_secs(0)`) — nothing to stay under.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, None),
+            recv_timeout.saturating_mul(cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR)
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_clamps_below_the_frame_idle_ceiling() {
+        // The exact review scenario: CASCADIA_ACTIVATION_TIMEOUT_SECS=90 (a
+        // natural operator response to prefills timing out on a slow fleet)
+        // widens the naive budget to 900s == DEFAULT_FRAME_IDLE_CEILING. Left
+        // unclamped, the transport layer's own idle-ceiling timeout can then
+        // win the race inside `recv_token_reply` and drop the socket for
+        // good — reinstating defect D via a different path. The clamped
+        // budget must land strictly under the ceiling.
+        let recv_timeout = std::time::Duration::from_secs(90);
+        let ceiling = std::time::Duration::from_secs(900);
+        let budget = prefill_reply_budget(recv_timeout, Some(ceiling));
+        assert!(
+            budget < ceiling,
+            "budget {budget:?} must stay strictly under the frame-idle ceiling {ceiling:?}"
+        );
+        assert_eq!(budget, ceiling - PREFILL_BUDGET_CEILING_MARGIN);
+    }
+
+    #[test]
+    fn prefill_reply_budget_ceiling_clamp_never_underflows() {
+        // A ceiling configured at or below the margin must clamp to zero
+        // (fails prefill windows fast) rather than panicking on subtraction
+        // underflow — an operator can set an unusually small idle ceiling.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        let tiny_ceiling = std::time::Duration::from_secs(5);
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, Some(tiny_ceiling)),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn prefill_reply_budget_leaves_the_default_config_unclamped() {
+        // With the fleet's actual defaults (60s recv_timeout, 900s ceiling)
+        // the widened budget (600s) must NOT be affected by the clamp — the
+        // clamp is a safety net for high operator-configured recv_timeout,
+        // not a silent shrink of the common case.
+        let recv_timeout = std::time::Duration::from_secs(60);
+        let ceiling = cascadia_transport::DEFAULT_FRAME_IDLE_CEILING;
+        assert_eq!(
+            prefill_reply_budget(recv_timeout, Some(ceiling)),
+            std::time::Duration::from_secs(600)
+        );
     }
 }

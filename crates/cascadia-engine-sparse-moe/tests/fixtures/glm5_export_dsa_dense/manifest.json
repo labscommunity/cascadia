@@ -1,0 +1,40 @@
+{
+  "arch": "glm5",
+  "num_layers": 4,
+  "dense_layers": [
+    0
+  ],
+  "num_experts": 4,
+  "top_k": 2,
+  "hidden_size": 32,
+  "num_kv_heads": 3,
+  "qk_head_dim": 10,
+  "v_head_dim": 6,
+  "vocab_size": 16,
+  "eos_token_ids": [
+    0
+  ],
+  "experts_format": "int4_bin",
+  "shell_backend": "rust_glm",
+  "expert_intermediate": 32,
+  "num_attention_heads": 3,
+  "q_lora_rank": 16,
+  "kv_lora_rank": 8,
+  "qk_nope_head_dim": 6,
+  "qk_rope_head_dim": 4,
+  "dense_intermediate": 64,
+  "n_shared_experts": 1,
+  "routed_scaling_factor": 2.5,
+  "rope_theta": 8000000.0,
+  "rms_norm_eps": 1e-05,
+  "index_topk": 10000,
+  "index_n_heads": 2,
+  "index_head_dim": 8,
+  "indexer_types": [
+    "full",
+    "full",
+    "full",
+    "full"
+  ],
+  "has_mtp": true
+}

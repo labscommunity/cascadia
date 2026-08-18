@@ -68,6 +68,41 @@ async fn closed_downstream_reply_errors_fast() {
     );
 }
 
+/// A timeout must drop the connection, so a late Token cannot be handed to the
+/// NEXT request as its reply.
+///
+/// Timing out does not cancel the work downstream. The peer is usually alive
+/// and still computing; its Token lands on the socket after we stopped waiting.
+/// The body is eight raw bytes with no sequence number, so a reused connection
+/// serves that stale reply to the following request — every later token off by
+/// one frame, coherent enough that nothing looks broken.
+#[tokio::test]
+async fn late_token_after_timeout_is_not_served_to_the_next_request() {
+    let (s, c) = pair().await;
+
+    // Request 1: downstream stays silent past the deadline.
+    let err = recv_token_reply(&c, Duration::from_millis(300))
+        .await
+        .expect_err("silent peer must yield Err");
+    assert!(err.contains("reply timeout"), "unexpected error: {err}");
+
+    // Downstream finishes late and sends the token it owed request 1.
+    let sb = s.clone();
+    let _ = tokio::spawn(async move { send_token_upstream(&sb, 4242).await }).await;
+
+    // Request 2 must not be given it.
+    let start = Instant::now();
+    let res = recv_token_reply(&c, Duration::from_secs(30)).await;
+    assert!(
+        res.is_err(),
+        "request 1's late token was served to request 2: {res:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "a dropped connection must fail fast, not wait out another deadline"
+    );
+}
+
 /// Happy path: a live downstream that replies with a Token returns its value.
 #[tokio::test]
 async fn downstream_token_reply_returns_value() {

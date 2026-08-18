@@ -615,7 +615,15 @@ fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
 
 /// Frame-start idle ceiling: config > `CASCADIA_FRAME_IDLE_CEILING_SECS` > 900s,
 /// floored at [`recv_timeout`] when enabled (warns once when the floor engages).
-fn frame_idle_ceiling() -> Option<Duration> {
+/// `None` means the ceiling is disabled (`set_frame_idle_ceiling_secs(0)`).
+///
+/// Public so a caller building its OWN wider deadline on top of `recv_timeout`
+/// (e.g. a prefill-reply budget) can clamp under this — any such deadline that
+/// reaches or exceeds the ceiling lets [`recv_exact_frame_start`]'s internal
+/// ceiling timeout fire FIRST, surfacing the connection-fatal
+/// [`TransportError::FrameIdleCeiling`] instead of the caller's own bounded,
+/// non-fatal timeout.
+pub fn frame_idle_ceiling() -> Option<Duration> {
     use std::sync::OnceLock;
     static ENV: OnceLock<Option<u64>> = OnceLock::new(); // env read once
     let env = *ENV.get_or_init(|| {

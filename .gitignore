@@ -32,9 +32,31 @@ shards_cached/
 # Exception: the tiny dsv4 export fixture's tensors are committed — the golden
 # tests (engine/pipeline/wire/mmap) need them and CI cannot regenerate them.
 !crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_export/**/*.safetensors
+# Exception: same reason, glm5 golden fixtures — the loader/pipeline/dsa/
+# indexshare/tiny-indexer/fp8 tests read these directly.
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5/fixtures.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_ml/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_dsa/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_dsa_dense/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_indexshare/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_indexshare_dense/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_indexshare_ml/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_export_tiny_indexer_dense/**/*.safetensors
+!crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_export/**/*.safetensors
+
+# Runtime artifacts the code under test writes INTO fixture dirs while the
+# above golden tests run (routing-usage histogram, exporter resume markers) —
+# never fixture input, so never commit them even though the dirs above are.
+crates/cascadia-engine-sparse-moe/tests/fixtures/**/.coli_usage
+crates/cascadia-engine-sparse-moe/tests/fixtures/**/.*.done
 
 # Local AI-tooling state (agent scratch, never commit)
 .claude/
 .swarm/
 ruvector.db
 crates/cascadia-engine-sparse-moe/tests/fixtures/dsv4_big_export/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_fp8_ckpt/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_boundary/
+crates/cascadia-engine-sparse-moe/tests/fixtures/glm5_attn_ov_parity_windowed/

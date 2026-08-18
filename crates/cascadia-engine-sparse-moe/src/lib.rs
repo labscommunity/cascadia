@@ -39,6 +39,7 @@
 pub mod dist;
 pub mod dsv4;
 pub mod engine;
+pub mod glm;
 pub mod kv_prefix_cache;
 pub mod manifest;
 pub mod ngram_draft;
@@ -46,6 +47,7 @@ pub mod ov_moe;
 pub mod runner;
 pub mod sampling;
 pub mod spec_decode;
+pub mod staged;
 pub mod tensors;
 
 pub use engine::{SparseMoEBuilder, SparseMoEBuilderConfig, SparseMoEEngine};

@@ -108,6 +108,7 @@ fn token_by_token_drive_matches_and_reset_reuses() {
 #[test]
 fn dsv4_runner_single_stage_matches_reference() {
     use cascadia_engine_sparse_moe::dsv4::stage::Dsv4Runner;
+    use cascadia_engine_sparse_moe::staged::StagedRunner;
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dsv4_export");
     let reference: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("reference.json")).unwrap())
