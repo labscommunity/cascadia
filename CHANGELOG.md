@@ -1,5 +1,200 @@
 # Changelog
 
+## [0.2.0](https://github.com/labscommunity/cascadia/compare/v0.1.8...v0.2.0) (2026-08-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* **glm5:** GlmRunner::load_staged now takes a StageOpts argument, and the default embed/lm_head precision is bf16 (set CASCADIA_GLM5_F32_HEAD for exact f32).
+
+### Features
+
+* **api:** accept chat_template_kwargs.enable_thinking (vLLM/SGLang convention) ([46b0fb9](https://github.com/labscommunity/cascadia/commit/46b0fb917cbc217b1ebef66f5c7a066787b5d6db))
+* **api:** ChatPromptRenderer::render_with_opts exposes enable_thinking ([6440d24](https://github.com/labscommunity/cascadia/commit/6440d248464988d69f95e93d8a0a8d118e54df46))
+* **api:** plumb reasoning_effort into the chat template ([744ffca](https://github.com/labscommunity/cascadia/commit/744ffcafdf759aab3117640e81d4cf707d9e30a1))
+* **api:** smoke-render the chat template at load ([dbabf24](https://github.com/labscommunity/cascadia/commit/dbabf2437ac6183ff2edb3f51af2488d6ba7e418))
+* **api:** streaming reasoning splitter for hybrid-reasoning models ([3338f63](https://github.com/labscommunity/cascadia/commit/3338f6365e5841ff09e29e34f1a29c7b5f2d8403))
+* glm-5.2 support in the sparse-moe engine ([8268643](https://github.com/labscommunity/cascadia/commit/8268643b36408cebb356786784c34b971b1485b7))
+* **glm5:** batch-union MoE kernel (dedup expert loads, bit-exact) ([a8436fe](https://github.com/labscommunity/cascadia/commit/a8436fea269e27504a0e3fcabc0c658518c4ea1d))
+* **glm5:** batched prefill across the pipeline (StagedRunner::forward_layers_batch) ([208b654](https://github.com/labscommunity/cascadia/commit/208b654951f81f7c57cd29a073159d2780ae7cbc))
+* **glm5:** batched prefill path (GlmModel::prefill uses batch-union MoE) ([c48a8e7](https://github.com/labscommunity/cascadia/commit/c48a8e712a24c0861162e42dde6ff33c22a0606b))
+* **glm5:** cache prefix KV post-decode (prompt + response) ([36fd8d0](https://github.com/labscommunity/cascadia/commit/36fd8d0444fca5b406c3186b97dfbe0e5acf7099))
+* **glm5:** CASCADIA_GLM5_ATTN_PROFILE — attention share of prefill ([c50f83e](https://github.com/labscommunity/cascadia/commit/c50f83e52b5dbfb453beb7f6344303676fbfd56e))
+* **glm5:** CASCADIA_GLM5_NOPIN kill-switch for the residency A/B ([764acde](https://github.com/labscommunity/cascadia/commit/764acdeaa01286f46b0a9788aa625ab56ebeae41))
+* **glm5:** chunk batched prefill into &lt;=256-row windows for long prompts ([96dccc9](https://github.com/labscommunity/cascadia/commit/96dccc92e047d2f0d5aaa732c3250c3e03d9f80b))
+* **glm5:** default bf16 embed/lm_head; thread precision via StageOpts ([23f5685](https://github.com/labscommunity/cascadia/commit/23f56851ba6ef3a93a2c8ee533c204f2402297f1))
+* **glm5:** distributed IndexShare via full-aligned layer split ([c328182](https://github.com/labscommunity/cascadia/commit/c32818268e1b22e2ca090857eeb5b99fca270b7e))
+* **glm5:** distributed KV-prefix cache rank-0 driver (2b/2) ([f28930f](https://github.com/labscommunity/cascadia/commit/f28930f0af76d36d6aea141a637f58a389c098b3))
+* **glm5:** DSA lightning indexer (raw-position top-k selection) ([dacf16c](https://github.com/labscommunity/cascadia/commit/dacf16c0632c952642a59711e8d4c886f562944a))
+* **glm5:** export + load the DSA indexer per layer (end-to-end long ctx) ([9ce46f1](https://github.com/labscommunity/cascadia/commit/9ce46f1a509e856a1b2ef72b94813adb40b18379))
+* **glm5:** export + load the MTP draft head (bf16) for spec decode ([88d7d5f](https://github.com/labscommunity/cascadia/commit/88d7d5f04938cac7525f6ebf66cb76fea8b04d7d))
+* **glm5:** export_real emits the bf16 MTP draft head from FP8 ([113ca4c](https://github.com/labscommunity/cascadia/commit/113ca4cd2098a4c8a6feef2457e33b508b648d5a))
+* **glm5:** exporter (config validation, manifest, int4 layout) ([89190be](https://github.com/labscommunity/cascadia/commit/89190bef5d32bc226d765a44fa737d8f206e464f))
+* **glm5:** expose layer_split as the single source of truth ([b2cee73](https://github.com/labscommunity/cascadia/commit/b2cee730b87830d3eb59d141fd839775a4024735))
+* **glm5:** full model + greedy-token parity (embed -&gt; layers -&gt; lm_head) ([60fc734](https://github.com/labscommunity/cascadia/commit/60fc734a29625520cc34ff764217296b6d872f27))
+* **glm5:** full transformer layer (norms + attn + MoE, pre-norm) ([a18b5ae](https://github.com/labscommunity/cascadia/commit/a18b5aef13412909bf4aebc4eddd1637b371e2a6))
+* **glm5:** glm5_run example — single-process greedy run harness ([b7234cf](https://github.com/labscommunity/cascadia/commit/b7234cfec920bb5db16f000302b2f2dec3b04b0a))
+* **glm5:** glm5_shardcheck — verify M-rank pipeline == single-process ([e0db0dc](https://github.com/labscommunity/cascadia/commit/e0db0dcc477a3a5f2ad268956f274a6e42567934))
+* **glm5:** glm5_spec bench example (mmap model + MTP spec decode) ([874a094](https://github.com/labscommunity/cascadia/commit/874a09436b29189ee0b18b0dc92bbf17c9f40fab))
+* **glm5:** grammar-constrained decoding with forced-run batching ([9b99573](https://github.com/labscommunity/cascadia/commit/9b99573e0f5f2e0cbde7e7d96336048e9cd24087))
+* **glm5:** IndexShare runtime — shared layers reuse the carried top-k (single-process) ([52973ae](https://github.com/labscommunity/cascadia/commit/52973ae66e102e8221e549f011a0c0e36771223a))
+* **glm5:** int3 expert quant format (A2 foundation) — pack + dequant + tests ([759164c](https://github.com/labscommunity/cascadia/commit/759164c4b350e6dde26fc9f3b64120f87f6dac20))
+* **glm5:** interleaved RoPE reused from the dsv4 shell ([47451c1](https://github.com/labscommunity/cascadia/commit/47451c1fb844caed71953d97e8111171a427abc4))
+* **glm5:** KV snapshot/restore for prefix caching (spike) ([fc0f94d](https://github.com/labscommunity/cascadia/commit/fc0f94d533bdbae3d0aead3687d3a26d69734273))
+* **glm5:** KvPrefixCache — reuse a shared prompt prefix (single-process) ([2ab7918](https://github.com/labscommunity/cascadia/commit/2ab79187dc46f4610cd9f605f58984b7389d1bef))
+* **glm5:** learned-pin residency — record routing, mlock hot experts ([692338a](https://github.com/labscommunity/cascadia/commit/692338a6f5ad7c9c310819c90dcf73497737a3d3))
+* **glm5:** loader + int4 numeric contract + round-trip parity ([ad2b993](https://github.com/labscommunity/cascadia/commit/ad2b993f954d937abd34b75868c61fc3bb999ccb))
+* **glm5:** log KV-prefix cache hits (reused/prompt/suffix) ([1a939f6](https://github.com/labscommunity/cascadia/commit/1a939f6486c83f391dcdedb6a86d2957961870f0))
+* **glm5:** MLA attention (classic V3) with absorbed-latent decode ([d16069f](https://github.com/labscommunity/cascadia/commit/d16069f203a32385d5fd6855883abcb033f8f125))
+* **glm5:** mmap int4 expert path (loads the real model) ([f856794](https://github.com/labscommunity/cascadia/commit/f85679449b0a9f013ba0656442d09e6aeec270b7))
+* **glm5:** MoE block (router + top-k experts + shared expert) ([d96fd3b](https://github.com/labscommunity/cascadia/commit/d96fd3beefabae58966c776e8a83e8c303dccc41))
+* **glm5:** MoE router gate (sigmoid + noaux_tc) with golden harness ([42f99eb](https://github.com/labscommunity/cascadia/commit/42f99ebc1f17be2545cf4db69c9b0096be928cfc))
+* **glm5:** MTP head (DeepSeek-V3 draft chain for speculative decode) ([87f7566](https://github.com/labscommunity/cascadia/commit/87f7566d8214c60836336e607d6bc932f75a8774))
+* **glm5:** MTP speculative decode loop + KV rewind (single-process) ([cc9abb3](https://github.com/labscommunity/cascadia/commit/cc9abb3abe270d9c91dae32cd92a0c8457f446fd))
+* **glm5:** opt-in bf16 embed/lm_head to grow the pin budget ([5228b25](https://github.com/labscommunity/cascadia/commit/5228b2590af33df8bdf935d207992ceaf16aa068))
+* **glm5:** opt-in bf16 MLA KV cache to free long-context RAM ([4389716](https://github.com/labscommunity/cascadia/commit/43897166ca151e86a535834c121024d1d60e10fd))
+* **glm5:** optional OpenVINO expert backend (iGPU / NPU / CPU) ([7caceb6](https://github.com/labscommunity/cascadia/commit/7caceb6e837fbc6f4d30b7b0df61a3b3d9831b2a))
+* **glm5:** OV expert cache knobs config-first + effective-config log ([51d8ef3](https://github.com/labscommunity/cascadia/commit/51d8ef3845b0e1464d1781f4af89db311d764ef4))
+* **glm5:** per-rank slice KV cache + GlmRunner snapshot/restore (Phase 2a) ([b6fbb0a](https://github.com/labscommunity/cascadia/commit/b6fbb0ac5a7234ec0dd2389858bd500d0915f71f))
+* **glm5:** per-section decode profiler (CASCADIA_GLM5_PROFILE) ([aa518c9](https://github.com/labscommunity/cascadia/commit/aa518c9aa13909097aa9b6d9cb9ef456ed1a1ed4))
+* **glm5:** per-token IO + residency telemetry in decode profiler ([be5ba5f](https://github.com/labscommunity/cascadia/commit/be5ba5fab7775de61e27e3dbc59b5a9390817c46))
+* **glm5:** pipeline driver uses batched prefill (ForwardBatchPrefill frame) ([e8e56e5](https://github.com/labscommunity/cascadia/commit/e8e56e512ea11341ac698adca9a6f4e408120259))
+* **glm5:** prefix-cache wire frames + worker handling + trait hooks (2b/1) ([5ab27eb](https://github.com/labscommunity/cascadia/commit/5ab27eb2985df40f50ea33f9d507f8df70ca276e))
+* **glm5:** real FP8-&gt;int4 exporter (export_real) + validated round-trip ([d8b6038](https://github.com/labscommunity/cascadia/commit/d8b60387142c4ad323609f881e6ec4884eff4402))
+* **glm5:** residency budget + routing histogram (learned-pin core) ([3627b32](https://github.com/labscommunity/cascadia/commit/3627b32bf1592aaebe043778d6a6c76af40a2315))
+* **glm5:** resumable exporter (.done markers + disk pre-flight) ([ffd3eb1](https://github.com/labscommunity/cascadia/commit/ffd3eb14783e6e9c1f21a73a78a046fe84bc7f4c))
+* **glm5:** router-lookahead expert prefetch (opt-in) ([42f963f](https://github.com/labscommunity/cascadia/commit/42f963f2f1c1b4787f6ec2bc65038eafc9028f5d))
+* **glm5:** single-stage generate() batch-unions the prefill ([abb318d](https://github.com/labscommunity/cascadia/commit/abb318d45ce7d8451bafa1d0182aa0358377238b))
+* **glm5:** staged GlmRunner + engine sniff (single-stage) ([fd59e26](https://github.com/labscommunity/cascadia/commit/fd59e268df33a613d908d760504d454dcc71ee84))
+* **glm5:** tunables as builder config fields, env as fallback ([88c2244](https://github.com/labscommunity/cascadia/commit/88c224414b97ec868ed64d73e04cec7b6f718e57))
+* **glm5:** wire DSA lightning indexer into MLA attention (long ctx) ([b201f71](https://github.com/labscommunity/cascadia/commit/b201f711d4a36990315cd7e1da88f0197c34a03b))
+* **sparse-moe:** per-token streaming in PipelineEngine (glm5 + dsv4) ([4424e74](https://github.com/labscommunity/cascadia/commit/4424e740a8c7f7a787f840f570d797e11897e672))
+* **tools:** tiny glm5 export gains a real indexer (T3 parity prerequisite) ([401c2d6](https://github.com/labscommunity/cascadia/commit/401c2d6d6013c0a0f1f2445784aa07f8f10a97fb))
+
+
+### Bug Fixes
+
+* **api:** arm tool-call scratchpad scan from the request, not sniffed text ([45a9b2c](https://github.com/labscommunity/cascadia/commit/45a9b2c984c5a77173080211a008ad681bdf5a0a))
+* **api:** don't let a pre-engine 5xx latch pipeline readiness ([afa1257](https://github.com/labscommunity/cascadia/commit/afa1257d727cda329a7b98879c2aacbf250e8524))
+* **api:** don't parse tool calls drafted inside the reasoning scratchpad ([8052976](https://github.com/labscommunity/cascadia/commit/8052976d55d4669af070fbde44a4d3cf5e34ceb4))
+* **api:** drop a GLM tool call whose argument pairs are truncated ([d013ec0](https://github.com/labscommunity/cascadia/commit/d013ec00d68911e292cc13155232294f5bc4f90e))
+* **api:** fail tool requests that cannot be templated ([3f805e3](https://github.com/labscommunity/cascadia/commit/3f805e303a25df381adb072dcfc4b7b0c3181ad8))
+* **api:** map reasoning_effort onto GLM's two-level template vocabulary ([e515aea](https://github.com/labscommunity/cascadia/commit/e515aea1a9f5d47d45413e785a5a0989a48bac1b))
+* **api:** parse GLM zero-argument tool calls instead of dropping them ([0ff0d56](https://github.com/labscommunity/cascadia/commit/0ff0d56bd8c7e77778b488f439e02d970a863069))
+* **api:** parse GLM's arg_key/arg_value tool-call dialect ([97ab19f](https://github.com/labscommunity/cascadia/commit/97ab19ff3fe63bdda3617cbcce56cd19da4acd17))
+* **api:** render chat templates with json.dumps semantics ([1007dd2](https://github.com/labscommunity/cascadia/commit/1007dd27cfa0da89a9cb53f0515ecb32d0814246))
+* **api:** sanitize Jinja2 numeric dot-index for minijinja chat templates ([6749762](https://github.com/labscommunity/cascadia/commit/6749762e9772a59812d7ae4cc255c2165eb5ddab))
+* **ci:** commit glm5 golden fixtures and delete the skip guards hiding them ([2f5ec34](https://github.com/labscommunity/cascadia/commit/2f5ec3439ad82806983900d9d675935579440b30))
+* **dashboard:** 404 a missing SPA asset instead of serving the app shell ([7c84888](https://github.com/labscommunity/cascadia/commit/7c848887526e0d8b9bb0ea0b96d5b4f4c3bc0436))
+* **dashboard:** honest / + embed the SPA in release bundles ([e7d54f8](https://github.com/labscommunity/cascadia/commit/e7d54f81c9b22a8306efe3a8277622d164f859c5))
+* **dashboard:** pointer page at / and honest log when SPA is not embedded ([2af1889](https://github.com/labscommunity/cascadia/commit/2af188991abfe4bef3aba6bdfec9797deccfaa6e))
+* **deps:** bump h2 to 0.4.16 for RUSTSEC-2026-0258 ([93b9574](https://github.com/labscommunity/cascadia/commit/93b9574deed1b097a3fb161c3eaa5360edb9e76f))
+* **dist:** drop the connection when a token reply times out ([fae2173](https://github.com/labscommunity/cascadia/commit/fae217382635114969539e647bfce0571ce9f749))
+* **engine-openvino:** fold seq and position into one unambiguous lead frame ([f483b91](https://github.com/labscommunity/cascadia/commit/f483b91bfaafb8249a1898c2d34030604a17dea1))
+* **engine-openvino:** let a relay rank exit when its downstream stops answering ([10a1fce](https://github.com/labscommunity/cascadia/commit/10a1fce94e350d923ab4974e2b45361d40175c73))
+* **engine-openvino:** NACK the upstream when a relay step fails after consuming ([1ef8f11](https://github.com/labscommunity/cascadia/commit/1ef8f1139e8e95780db1fc7ef64947b8d1b42c49))
+* **engine-openvino:** report why a token wait gave up, and stop flooding on discards ([06c9e80](https://github.com/labscommunity/cascadia/commit/06c9e8016de746206cfe6e9fbb7ca8715bdf0c2e))
+* **engine-openvino:** restore the widened prefill token budget ([269570d](https://github.com/labscommunity/cascadia/commit/269570d5540db4bd1b7300510a42d3431fff2515))
+* **engine-openvino:** validate the token frame by dtype and shape, not length ([a283f82](https://github.com/labscommunity/cascadia/commit/a283f824230c92888ed6ebd9b08d57d48645b7ab))
+* **engine:** per-hop seq echo to discard stale orphan tokens ([030d374](https://github.com/labscommunity/cascadia/commit/030d374ca37da1ca62cb752367078b0668519df0))
+* **engine:** report prompt_tokens instead of always 0 ([94a19d1](https://github.com/labscommunity/cascadia/commit/94a19d1eb0bd3fda658ea8c52b78dfaac22b89c8))
+* **glm5:** address OV-backend review findings + streaming n_tokens ([463d3f3](https://github.com/labscommunity/cascadia/commit/463d3f33300e2f6242bbcecbb29b16a7795a48c1))
+* **glm5:** byte-budget the OV expert cache; typed exhaustion errors ([31bf016](https://github.com/labscommunity/cascadia/commit/31bf016bd613ee89f761509006e9adbd9928b130))
+* **glm5:** correct DSA indexer to the real GLM-5.2 layout (names + IndexShare) ([ddd18b1](https://github.com/labscommunity/cascadia/commit/ddd18b121baddb1e1206cf6d1166e562b5dfb2ed))
+* **glm5:** don't cache the KV prefix when finalizing a failed decode ([c0dff06](https://github.com/labscommunity/cascadia/commit/c0dff06d46d5666ac11edb1a2914687ca0ce6972))
+* **glm5:** exporter carries chat_template.jinja + serving sidecars ([11c8f9f](https://github.com/labscommunity/cascadia/commit/11c8f9f4f741388f6e1526319ca6b037b912d398))
+* **glm5:** gate mmap mlock/madvise(WILLNEED) behind cfg(unix) ([a632d91](https://github.com/labscommunity/cascadia/commit/a632d91beea3c6cded845e873ede7e1d48f50107))
+* **glm5:** gate the nvme_readbench example to unix ([f41bb4c](https://github.com/labscommunity/cascadia/commit/f41bb4c8c4b98dfe29d89bfa7bdad6ad55c89eb1))
+* **glm5:** guard cross-rank IndexShare split + bound context; fix pin budget ([4009d34](https://github.com/labscommunity/cascadia/commit/4009d3488c9e2ff62cfebfe55aed88e8d81db0a1))
+* **glm5:** guard zero-layer ranks + fill each rank's pin budget ([40aea61](https://github.com/labscommunity/cascadia/commit/40aea61afa6a23d5cedeb510ed438a99dc2c1f74))
+* **glm5:** honour restore_prefix's result instead of discarding it ([ccc09ae](https://github.com/labscommunity/cascadia/commit/ccc09aecbd84e568adf816062fa6610cf9d461f9))
+* **glm5:** measure real expert-cache hit% via working-set probe ([2890dcb](https://github.com/labscommunity/cascadia/commit/2890dcbfdcb083a829db923389d3817f925e2b73))
+* **glm5:** MLA latent-norm eps 1e-6 + exporter hardening (pre-run) ([cea167b](https://github.com/labscommunity/cascadia/commit/cea167b68a2bef6105c2d61bcc8ad5bf08dcaf30))
+* **glm5:** OV expert exporter emits int4 (u4) IRs by default ([906b39c](https://github.com/labscommunity/cascadia/commit/906b39ce1ecd967940a2b35877d61dd00a496326))
+* **glm5:** rate-limit OV stats dump; it contended with the decode hot path ([c8747a7](https://github.com/labscommunity/cascadia/commit/c8747a7b1b7cc912437bbf7fd9786da74d4117e0))
+* **glm5:** reject an OV expert output of the wrong length ([5406e48](https://github.com/labscommunity/cascadia/commit/5406e48e9cc10133c6309a923748b7806b12f348))
+* **glm5:** reuse the prefix key for an already-indexed sequence ([bfc59bd](https://github.com/labscommunity/cascadia/commit/bfc59bdbe20ad68f796c2726b3e723b290439bf1))
+* **glm5:** route the remaining env switches through env_flag ([4d6655f](https://github.com/labscommunity/cascadia/commit/4d6655f42264b4e46f5e936d3ea75d77ff1ed665))
+* **glm5:** stop FLAG=0 turning a feature ON ([88db932](https://github.com/labscommunity/cascadia/commit/88db9321e3e93391464a971927921bcded2646c4))
+* **glm5:** stop OV expert accumulation from exhausting the iGPU pool ([195d584](https://github.com/labscommunity/cascadia/commit/195d5841d7ac1e70aa1ec6c3d1ab3e0f94024e7c))
+* **glm5:** working-set governor keeps pressured nodes schedulable ([1d09747](https://github.com/labscommunity/cascadia/commit/1d09747f6f21ac7c8121e177b774b357f0a74bbe))
+* **prefill-reply:** clamp the sparse-moe prefill budget under the frame-idle ceiling ([e1a4cdb](https://github.com/labscommunity/cascadia/commit/e1a4cdb01cc25338bdfd3ab50984d2ee2d82a67b))
+* **prefill-reply:** restore the prefill token-wait budget on both pipeline paths ([0c242ba](https://github.com/labscommunity/cascadia/commit/0c242ba320f8a59dc5594c4b833ffd3773bd391d))
+* **shim:** rebuild when the OV SDK is swapped behind a stable path ([739a658](https://github.com/labscommunity/cascadia/commit/739a65886f00f81f500a4504927833399dfcac9f))
+* **tools:** emit MTP tensors in the fp8 fixture, don't lie in the manifest ([7be8087](https://github.com/labscommunity/cascadia/commit/7be808765d825a8e5aea0a45d9ee67b638e500e5))
+* **tools:** gitignore the two new tiny-indexer fixture dirs ([596fc0a](https://github.com/labscommunity/cascadia/commit/596fc0af9cd4919d69b0d609d6885d741e1ec9bc))
+* **tools:** glm5 expert OV IRs carry the bins' own int4 grid ([70456ef](https://github.com/labscommunity/cascadia/commit/70456efb40f58265b44db4d1c86c2943cce98979))
+* **tools:** import os in the glm5 exporter ([34d785f](https://github.com/labscommunity/cascadia/commit/34d785fa107368b3ea6dac124a7b3dbcd7a03ec4))
+* **tools:** refuse fp8 weights with no recognized block scale ([1f70891](https://github.com/labscommunity/cascadia/commit/1f708911a6567ab1090258df7bf3933185c86262))
+* **transport:** bound every phase of the token recv, not just the frame start ([d592f11](https://github.com/labscommunity/cascadia/commit/d592f113a99c4c186e51fa937433f110c45630f3))
+* **transport:** bounded non-fatal frame-start recv for active token responses ([cfe06aa](https://github.com/labscommunity/cascadia/commit/cfe06aa0edf12698a050e6b56ba38dc69f5f4694))
+* **transport:** bounded non-fatal frame-start recv for active token responses ([09941ba](https://github.com/labscommunity/cascadia/commit/09941bacdbf509223c5f0b7a816c97a73187f76e))
+* **transport:** classify every recv error explicitly, drop the wildcard ([53943f4](https://github.com/labscommunity/cascadia/commit/53943f4418a7063b3f08b7e5127575699e1be79e))
+
+
+### Performance
+
+* **glm5:** async lookahead expert prefetch (opt-in) + Windows autopin fixes ([e89358d](https://github.com/labscommunity/cascadia/commit/e89358dcf9c83fcdd7bc6ab5cc92ce8b5f72a58a))
+* **glm5:** light R1 — explicit concurrent expert reads (opt-in) ([45d212e](https://github.com/labscommunity/cascadia/commit/45d212ec4c61b45ac4a917f5168bd5be4356a1c1))
+* **glm5:** mlock always-active experts (shared + dense) — A1 ([81d4845](https://github.com/labscommunity/cascadia/commit/81d484509f094b5f3c027b2e92c329534deb67c7))
+* **glm5:** native Windows mlock/madvise — VirtualLock + PrefetchVirtualMemory ([a4ddcbb](https://github.com/labscommunity/cascadia/commit/a4ddcbb8d5b9ec68a87369fcdd744e1bb39fd0bb))
+* **glm5:** overlap expert reads with compute in the R1 path ([cf1c14c](https://github.com/labscommunity/cascadia/commit/cf1c14cf55bce462071ea8a398cd57b9200781f9))
+* **glm5:** whole-expert WILLNEED readahead before each expert GEMV ([62714ce](https://github.com/labscommunity/cascadia/commit/62714ce7597e4539487936220a481db0aa9c8d99))
+* **int4:** AVX-512 fused dequant+dot for the expert GEMV ([fe2adc1](https://github.com/labscommunity/cascadia/commit/fe2adc1169505babbb10e271e651347dbefda53c))
+
+
+### Refactor
+
+* **engine-openvino:** one seq counter, and no seq to echo until one arrives ([6bd6bab](https://github.com/labscommunity/cascadia/commit/6bd6baba900fc1e4d125e8b49c6a9dc29d73393d))
+* **engine:** extract StagedRunner trait; Dsv4Engine -&gt; PipelineEngine&lt;R&gt; ([dd718e5](https://github.com/labscommunity/cascadia/commit/dd718e52457372a105dddef26565d2937166f5ee))
+* **glm5:** AnyExpert enum for int4 expert storage (no behavior change) ([a4f3ee4](https://github.com/labscommunity/cascadia/commit/a4f3ee4fcabb76183dde7a11374278f93d95672f))
+
+
+### Documentation
+
+* alpha status; ci: manual dispatch for release PR ([5e90aa4](https://github.com/labscommunity/cascadia/commit/5e90aa42ee0b6e5656f8ab7723943c003c7b1946))
+* bump status from pre-alpha to alpha ([39cae3f](https://github.com/labscommunity/cascadia/commit/39cae3f25d4feaab521a592dd229b8d2764ddbb3))
+* correct the comments the rebase and these fixes falsified ([d0f51b5](https://github.com/labscommunity/cascadia/commit/d0f51b5a362a8fba27d133b848ba7e888374da2e))
+* **dashboard:** only release builds truly embed the SPA ([8a361e6](https://github.com/labscommunity/cascadia/commit/8a361e62ac1065a8c67a8696f996ee94cb063104))
+* document the web dashboard and its two-step embed build ([a075a8d](https://github.com/labscommunity/cascadia/commit/a075a8d0f75a75b67cf6c0a1584fc12b2a76123f))
+* drop the unimplemented /api/events endpoint ([4649ae9](https://github.com/labscommunity/cascadia/commit/4649ae9968ea6c61dad67c9d73247834b4bb7c94))
+* **glm5:** architecture + implementation status ([b7c523c](https://github.com/labscommunity/cascadia/commit/b7c523c1bea1d26ad1ca570d7f04fb4bd52c7ffa))
+* **glm5:** correct the int4 capacity numbers against a real export ([bf66527](https://github.com/labscommunity/cascadia/commit/bf66527d76d662ca68abb604e88e1d6bf84d0160))
+* **glm5:** correct the MTP dtype and the shipped-but-"deferred" entries ([8af9e30](https://github.com/labscommunity/cascadia/commit/8af9e3050694c9c38d9f3bb1db03582c84063262))
+* **glm5:** describe the out-of-process consumer without naming it ([a7e2256](https://github.com/labscommunity/cascadia/commit/a7e22564bb77f56a7bf22e97eeedf3f768e55198))
+* refer to the internal tracker without naming the private repository ([45278bb](https://github.com/labscommunity/cascadia/commit/45278bb5526b52ff5f11bc15e1aa40de23ee1d21))
+* scope the dashboard release-bundle claim to bundles that have it ([9c83ca3](https://github.com/labscommunity/cascadia/commit/9c83ca38c18fa2df06a778f331627d26800ad120))
+
+
+### Testing
+
+* **engine-openvino:** cover the relay escalation decision ([c9a3173](https://github.com/labscommunity/cascadia/commit/c9a3173d707cf2651600ef10d1f17ef09630d9cf))
+* **engine-openvino:** pin the frame-start classification against the real Display ([f2e1951](https://github.com/labscommunity/cascadia/commit/f2e1951df709e000df00122c9ba10417bbf5b9ac))
+* **engine:** pin &lt;/think&gt; special:false survives skip-special decode ([51a995f](https://github.com/labscommunity/cascadia/commit/51a995f83e2f4f629ac0370638f887b947b1b440))
+* **glm5:** 2-rank pipeline over real transport matches single-stage ([2f2da16](https://github.com/labscommunity/cascadia/commit/2f2da16bf411477415760fe54caea1f97eae3823))
+* **glm5:** cover multi-window prefill over the real frames ([fe2de02](https://github.com/labscommunity/cascadia/commit/fe2de0299e93ed86b5c2d1914e532167b14daab0))
+* **glm5:** fail assert_close on non-finite values ([6ac80e1](https://github.com/labscommunity/cascadia/commit/6ac80e16d42b74390c80a43b5f15d2c6a2c173fe))
+* **glm5:** M-rank pipeline parity dry-run (middle-relay ranks) ([ff06e46](https://github.com/labscommunity/cascadia/commit/ff06e46350793a0fe970aba2d320bc70919609c6))
+* **glm5:** nvme_readbench — R1 go/no-go microbench (mmap-fault vs explicit concurrent reads) ([ade2597](https://github.com/labscommunity/cascadia/commit/ade25976bdfbac7ea014abb659ac03044b6b0cae))
+* **glm5:** pin the slice cache's key-reuse eviction contract ([cb6a5bd](https://github.com/labscommunity/cascadia/commit/cb6a5bd6b520d58fb6b2570bb94841cded9db540))
+* **glm5:** take the prefill window from MAX_BATCH_COUNT ([5208c43](https://github.com/labscommunity/cascadia/commit/5208c4332daef0bebb2fae1a3a22be96ae1d1187))
+* **runner:** cover the engine-lock release the bounded token wait exists for ([e8b2e7e](https://github.com/labscommunity/cascadia/commit/e8b2e7e792028e66730457aa8a1072aef22bce3c))
+
+
+### CI
+
+* build, lint and test the dashboard embed path on every PR ([9260088](https://github.com/labscommunity/cascadia/commit/926008864766d4c81e4276d5c9e433b48fbcdf78))
+* make release PR manual dispatch ([20fdcb4](https://github.com/labscommunity/cascadia/commit/20fdcb4193ef84804ec2525e4cee3b649b97a76d))
+* **release:** build and embed the dashboard SPA in release bundles ([4104762](https://github.com/labscommunity/cascadia/commit/410476275ea3c901aab432f2fd6f63a26f0ffded))
+* **release:** build the dashboard SPA in an isolated job ([637b5a5](https://github.com/labscommunity/cascadia/commit/637b5a5b11fb0d16786346c7580de0cbcca6bf84))
+* restrict release-please dispatch to main ([58a2a07](https://github.com/labscommunity/cascadia/commit/58a2a078d452f0e6c38c310e1fb11be1af7538c7))
+
+
+### Miscellaneous
+
+* drop cross-repo issue refs; ignore attn-ov parity fixtures ([cb0e4ed](https://github.com/labscommunity/cascadia/commit/cb0e4ed151c37c1cf778ba37a4fa5e368fa453e4))
+* **dsv4:** vendor the OV expert exporter into tools/ ([e0cfbcb](https://github.com/labscommunity/cascadia/commit/e0cfbcb26b900bfffe451e83c4bf7f914b861eb5))
+
 ## [0.1.8](https://github.com/labscommunity/cascadia/compare/v0.1.7...v0.1.8) (2026-08-11)
 
 
