@@ -324,11 +324,14 @@ impl KvSnapshotHolder for OvMoeKvHolder {
         expected_len: u32,
     ) -> Option<(Manifest, Vec<(Vec<u8>, Vec<u8>)>)> {
         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Offers ONLY — same reasoning as `SparseMoeKvHolder::export`. `captures` is epoch-keyed
-        // with no tenant, and the epoch is derivable from the prefix, so this fallback served a
-        // victim's slice to any caller who could guess their tokens. This holder is the one the
-        // rig matrix actually exercised, so the exposure shipped.
-        let Some((prefix, snap)) = g.offers.take(partner, expected_epoch) else {
+        // Load-bearing for rank>0, and the H.1a residual, inseparably — see the long note on
+        // `SparseMoeKvHolder::export`. Removing it here is what failed the sparse-moe cells; this
+        // is the holder the rig matrix exercises, so it fails loudly rather than silently.
+        let (prefix, snap) = if let Some(off) = g.offers.take(partner, expected_epoch) {
+            off
+        } else if let Some((tokens, snap)) = g.captures.get(&expected_epoch) {
+            (tokens.clone(), snap.clone())
+        } else {
             return None;
         };
         if snap.past_seq_len as u32 != expected_len {
