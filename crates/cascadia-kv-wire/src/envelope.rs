@@ -49,6 +49,16 @@ pub enum ReplicateOutcome {
     RejectedBudget,
 }
 
+/// What a carried candidate is, and therefore which frame fetches from it: a `Primary` holds the
+/// slice in its own engine and answers the rank-bound `GetV2`; a `Replica` holds it in a replica
+/// store and answers only `ReplicaGet`. Mirrors the enterprise's `CandidateKind` (this crate stays
+/// enterprise-dep-free); closed like [`ReplicateOutcome`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidateKind {
+    Primary,
+    Replica,
+}
+
 /// Control envelope on `/cascadia/state/kv/v1`.
 ///
 /// Commit is **in-band** (the warm/cold decision rides the pipeline dispatch, §7) — there is no
@@ -171,6 +181,23 @@ pub enum KvMessage {
         expected_epoch: u64,
         expected_len: u32,
         rank: u16,
+    },
+    /// Head→rank-N: like [`KvMessage::WarmResumeTriggerV2`] but delivers the rank's candidate peer
+    /// list too (issue-34 stale-ad lifecycle). V2 makes the triggered worker resolve
+    /// `prev_chain_id` against its OWN mesh view, so the previous chain's ad has to outlive the
+    /// move on every worker — stale-ad longevity became load-bearing (retracting stale ads broke
+    /// the pull; keeping them cross-pairs fresh spawns). The head computes every rank's candidates
+    /// at hint time, when the ad is guaranteed fresh, so carrying them here lets workers stop
+    /// reading the ad at all. `candidates` is this rank's ordered walk — (32-byte node id, kind),
+    /// primary first, order significant.
+    WarmResumeTriggerV3 {
+        partner: PartnerId,
+        epoch: u64,
+        prefix_token_len: u32,
+        model_fingerprint: u64,
+        prev_chain_id: [u8; 32],
+        rank: u16,
+        candidates: Vec<([u8; 32], CandidateKind)>,
     },
 }
 
@@ -297,6 +324,18 @@ mod tests {
                 request_id: [3u8; 16],
                 partner: "acme".into(),
             },
+            KvMessage::WarmResumeTriggerV3 {
+                partner: PartnerId("acme".into()),
+                epoch: 42,
+                prefix_token_len: 3,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+                candidates: vec![
+                    ([1u8; 32], CandidateKind::Primary),
+                    ([2u8; 32], CandidateKind::Replica),
+                ],
+            },
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
@@ -360,9 +399,23 @@ mod tests {
             standard(),
         )
         .unwrap();
+        assert_eq!(get_v2[0], 17, "GetV2 is appended 8th, index 17");
+        let v3 = bincode::serde::encode_to_vec(
+            KvMessage::WarmResumeTriggerV3 {
+                partner: PartnerId("acme".into()),
+                epoch: 1,
+                prefix_token_len: 1,
+                model_fingerprint: 1,
+                prev_chain_id: [0u8; 32],
+                rank: 0,
+                candidates: vec![],
+            },
+            standard(),
+        )
+        .unwrap();
         assert_eq!(
-            get_v2[0], 17,
-            "GetV2 is the LAST appended variant (index 17)"
+            v3[0], 18,
+            "WarmResumeTriggerV3 is the LAST appended variant (index 18)"
         );
     }
 }

@@ -182,6 +182,23 @@ fn envelope_variants_match_golden() {
                 rank: 1,
             },
         ),
+        // Candidate-carrying trigger. Goldened AT introduction (unlike GetV2): two entries of
+        // DIFFERENT kinds so both the field order and the kind tag encoding are pinned.
+        (
+            "env_warm_resume_trigger_v3",
+            KvMessage::WarmResumeTriggerV3 {
+                partner: PartnerId("c".into()),
+                epoch: 9,
+                prefix_token_len: 2,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+                candidates: vec![
+                    ([1u8; 32], CandidateKind::Primary),
+                    ([2u8; 32], CandidateKind::Replica),
+                ],
+            },
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();
@@ -211,6 +228,7 @@ fn declared_index(msg: &KvMessage) -> u8 {
         KvMessage::WarmResumeTriggerV2 { .. } => 15,
         KvMessage::TenantHint { .. } => 16,
         KvMessage::GetV2 { .. } => 17,
+        KvMessage::WarmResumeTriggerV3 { .. } => 18,
     }
 }
 
@@ -299,8 +317,17 @@ fn every_variant_index_is_pinned() {
             expected_len: 2,
             rank: 1,
         },
+        KvMessage::WarmResumeTriggerV3 {
+            partner: PartnerId("c".into()),
+            epoch: 9,
+            prefix_token_len: 2,
+            model_fingerprint: 7,
+            prev_chain_id: [9u8; 32],
+            rank: 1,
+            candidates: vec![([1u8; 32], CandidateKind::Primary)],
+        },
     ];
-    assert_eq!(all.len(), 18, "every declared variant must be listed here");
+    assert_eq!(all.len(), 19, "every declared variant must be listed here");
     for (position, msg) in all.iter().enumerate() {
         let tag = bincode::serde::encode_to_vec(msg, standard()).unwrap()[0];
         assert_eq!(
