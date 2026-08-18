@@ -48,7 +48,7 @@ Hand-rolled AVX-512 INT4 GEMM kernels for the sparse-MoE expert path — group-3
 
 ## `cascadia-dashboard`
 
-Dashboard HTTP routes (`/api/topology`, `/api/stats`, `/api/events` SSE) and an embedded Vite SPA (behind the `embed-spa` feature) for visualizing a cluster; without the feature, `/` serves a built-in pointer page explaining how to enable the UI. Kept separate from `cascadia-api` so the OpenAI surface doesn't grow a topology dependency or bundled static assets.
+Dashboard HTTP routes (`/api/topology`, `/api/stats`) and an embedded Vite SPA (behind the `embed-spa` feature) for visualizing a cluster; without the feature, `/` serves a built-in pointer page explaining how to enable the UI. Kept separate from `cascadia-api` so the OpenAI surface doesn't grow a topology dependency or bundled static assets.
 
 ## `cascadia-ov-genai-shim`
 

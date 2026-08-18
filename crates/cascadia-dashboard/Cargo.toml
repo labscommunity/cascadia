@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Dashboard HTTP routes (topology, stats, SSE events) and embedded SPA for visualizing a Cascadia cluster."
+description = "Dashboard HTTP routes (topology, stats) and embedded SPA for visualizing a Cascadia cluster."
 
 [dependencies]
 cascadia-topology = { workspace = true }
@@ -26,8 +26,8 @@ default = []
 # Embed the built SPA (web/dist) into the binary so a single static binary
 # ships with the UI. Requires `npm run build` to have been run in `web/`
 # before `cargo build --features embed-spa`. Without the feature, the
-# crate exposes only the JSON + SSE endpoints; an external SPA host (e.g.
-# `vite dev` during local development) supplies the UI.
+# crate serves the JSON endpoints plus a pointer page at `/`; an external
+# SPA host (e.g. `vite dev` during local development) supplies the UI.
 embed-spa = ["dep:rust-embed", "dep:mime_guess"]
 
 [dev-dependencies]

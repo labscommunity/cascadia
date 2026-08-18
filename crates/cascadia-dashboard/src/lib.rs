@@ -6,8 +6,6 @@
 //! * `GET /api/stats` — coarse runtime counters (in-flight requests,
 //!   tokens generated). Read from the shared [`cascadia_types::ApiStats`]
 //!   the OpenAI server bumps on the chat hot path.
-//! * `GET /api/events` — server-sent events for live updates (added in a
-//!   follow-up; the placeholder route returns a one-shot welcome event).
 //! * `embed-spa` feature — when on, serves the built Vite SPA from
 //!   `crates/cascadia-dashboard/web/dist` at `/`, including a fallback to
 //!   `index.html` for client-side routes. When off, `/` serves a small
