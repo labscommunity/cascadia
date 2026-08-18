@@ -14,18 +14,27 @@
 //!     stage_N/...
 //! ```
 //!
-//! Wire format between stages: hidden_states f16. Stateful shards have each
-//! stage track its own absolute-position counter (computing cos/sin locally,
-//! no position metadata on the wire); the counter resets when an activation
-//! with seq_len > 1 arrives (a prefill signal for relay/last stages).
+//! Wire format between stages (non-packed path): each activation is TWO frames,
+//! `[lead] [hidden_states f16]`. The lead is an I64 tensor carrying the per-hop
+//! sequence number, which the downstream neighbour echoes back on its token so
+//! a late orphan token can be discarded rather than read by the next request
+//! (see `encode_wire_lead`). The token reply is I32 `[1,1,2]` = `[token, seq]`.
+//!
+//! Stateful shards send lead `[1,1,1]` = `[seq]`: each stage tracks its own
+//! absolute-position counter (computing cos/sin locally, no position on the
+//! wire), and that counter resets when an activation with seq_len > 1 arrives
+//! (a prefill signal for relay/last stages).
 //!
 //! Stateless static-shape (NPU) shards (`stage_config.stateful == false`)
 //! instead drive a host-side bounded KV ring per stage (see `StaticKv`).
 //! Because static shards are seq=1, the seq>1 prefill signal is unavailable,
-//! so the first stage carries the absolute `position` as an 8-byte prefix on
-//! each activation; downstream stages reset their ring at position 0 and
-//! derive the visible-past count from it, keeping every stage's ring in
-//! lockstep. This path works single- or multi-stage (pipeline-parallel NPU).
+//! so they send lead `[1,1,2]` = `[seq, position]` carrying the absolute
+//! position; downstream stages reset their ring at position 0 and derive the
+//! visible-past count from it, keeping every stage's ring in lockstep. This
+//! path works single- or multi-stage (pipeline-parallel NPU).
+//!
+//! The lead frame's shape is what distinguishes the two paths on the wire, and
+//! a stage rejects a lead that does not match its own staticness.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -304,16 +313,6 @@ fn to_shape3(shape: &[usize]) -> [usize; 3] {
         2 => [1, shape[0], shape[1]],
         _ => [1, 1, shape.last().copied().unwrap_or(0)],
     }
-}
-
-/// Encode the absolute position as its own framed wire tensor (I64 `[1,1,1]`).
-/// The static (NPU) path sends this immediately before each hidden activation
-/// so relay stages reset/align their KV ring; the transport requires
-/// `payload_len == shape*dtype`, so position cannot be packed into the hidden
-/// tensor (and MAX_RANK=3 leaves no spare shape slot). Paired with
-/// `decode_wire_position` — keep the two in sync.
-fn encode_wire_position(position: i64) -> WireTensor {
-    WireTensor::new(WireDType::I64, [1, 1, 1], position.to_le_bytes().to_vec())
 }
 
 /// Refuse a packed variant whose query window is narrower than its slot count.
@@ -632,30 +631,417 @@ fn nack_send_error(send_err: EngineError, body_err: Option<&EngineError>) -> Eng
     }
 }
 
-/// Decode + strictly validate a wire position frame. Must be I64 with exactly
-/// 8 payload bytes and non-negative; anything else (a desynced stream, a
-/// stateful peer that sent a hidden tensor where a position was expected, or
-/// a corrupted frame) is a hard error rather than a silently wrong position.
-/// The sign check matters: downstream ring math casts to usize and the chunk
-/// path adds per-row offsets — a negative value would wrap instead of erroring.
-fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
-    if t.dtype != WireDType::I64 || t.data.len() != 8 {
+// -------- per-hop sequence echo (token desync guard) --------
+
+/// Encode the LEAD activation frame: the per-hop sequence number, plus the
+/// absolute position when the sending stage is static (NPU).
+///
+/// Each stage stamps a monotonic seq on the hidden it sends downstream; the
+/// downstream neighbor echoes it back on the token so a LATE orphaned token
+/// (from a slow/recovering peer) can be detected and discarded instead of
+/// silently read by the next request. Paired with `decode_wire_lead`.
+///
+/// The SHAPE is the discriminator: `[1,1,1]` = `[seq]` on the stateful path,
+/// `[1,1,2]` = `[seq, position]` on the static path. Carrying the position in
+/// this frame rather than a separate one is what makes the wire unambiguous —
+/// a standalone seq frame and a standalone position frame were both I64
+/// `[1,1,1]` with 8 bytes, i.e. byte-identical, so a static peer predating the
+/// seq wire had its position silently bound as a sequence number and the
+/// failure surfaced one frame later as a bogus complaint about the hidden
+/// frame. It also drops one frame per token per hop, which matters because
+/// `set_nodelay` is on: that was a third small TCP segment on every decode step.
+fn encode_wire_lead(seq: u32, position: Option<i64>) -> WireTensor {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&(seq as i64).to_le_bytes());
+    if let Some(p) = position {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    let lanes = if position.is_some() { 2 } else { 1 };
+    WireTensor::new(WireDType::I64, [1, 1, lanes], bytes)
+}
+
+/// Decode + strictly validate the lead frame. Symmetric with
+/// `encode_wire_lead`; the seq lane's i64 carries a u32, so the cast
+/// round-trips (wrap-around values included).
+///
+/// `want_pos` is the RECEIVING stage's own staticness. The frame must carry
+/// exactly the lanes this stage expects, so a stateful/static pipeline
+/// mismatch, a desynced stream, or a peer predating the seq wire is a hard
+/// error here instead of a silent mis-bind. The sign check on the position
+/// lane matters for the same reason it did standalone: ring math casts to
+/// usize and a negative value would wrap rather than error.
+fn decode_wire_lead(t: &WireTensor, want_pos: bool) -> EngineResult<(u32, Option<i64>)> {
+    let lanes: u32 = if want_pos { 2 } else { 1 };
+    let want_len = lanes as usize * 8;
+    if t.dtype != WireDType::I64 || t.shape != [1, 1, lanes] || t.data.len() != want_len {
         return Err(EngineError::Backend(format!(
-            "expected an I64 8-byte position frame, got dtype={:?} len={} — likely a \
-             stateful/static pipeline mismatch or a desynced activation stream",
+            "expected an I64 [1,1,{lanes}] {want_len}-byte lead frame ([seq{}]), got \
+             dtype={:?} shape={:?} len={} — likely a stateful/static pipeline mismatch, a \
+             desynced activation stream, or a peer that predates the seq-tagged wire",
+            if want_pos { ", position" } else { "" },
             t.dtype,
+            t.shape,
             t.data.len()
         )));
     }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&t.data);
-    let position = i64::from_le_bytes(b);
-    if position < 0 {
+    let seq = i64::from_le_bytes(t.data[0..8].try_into().unwrap()) as u32;
+    let position = if want_pos {
+        let p = i64::from_le_bytes(t.data[8..16].try_into().unwrap());
+        if p < 0 {
+            return Err(EngineError::Backend(format!(
+                "negative wire position {p} — corrupted or desynced activation stream"
+            )));
+        }
+        Some(p)
+    } else {
+        None
+    };
+    Ok((seq, position))
+}
+
+/// Encode a token + the echoed per-hop seq as I32 `[1,1,2]` = `[token, seq]`
+/// (8 bytes): the token is element 0, the seq element 1 — i.e. the seq occupies
+/// bytes 4..8, the HIGH half if the payload is read as one little-endian i64.
+/// `decode_token_with_seq` reverses it.
+fn encode_token_with_seq(token: i32, seq: u32) -> WireTensor {
+    let mut bytes = Vec::with_capacity(8);
+    bytes.extend_from_slice(&token.to_le_bytes());
+    bytes.extend_from_slice(&(seq as i32).to_le_bytes());
+    WireTensor::new(WireDType::I32, [1, 1, 2], bytes)
+}
+
+/// Decode an I32 `[1,1,2]` token frame into `(token, echo_seq)`. The seq cast
+/// round-trips the bit pattern (i32 -> u32), so wrap-around values survive.
+///
+/// Validation is STRICT — dtype, shape and length, matching `decode_wire_lead`
+/// and `decode_wire_tokens` rather than checking length alone. A length-only
+/// check accepted any 8-byte frame, and the packed path's reply is exactly
+/// that: `encode_wire_tokens` for one row is I64 `[1,1,1]`, 8 bytes. It decoded
+/// as `token` = the low word and `echo_seq` = 0, and since the first stamped
+/// seq was also 0 the FIRST exchange of a non-packed head wired to a packed
+/// neighbour matched and emitted a token from a structurally mismatched
+/// pipeline; every later step then discarded every reply and stalled the full
+/// deadline. A legacy 4-byte I32 `[1,1,1]` token from a pre-seq peer is caught
+/// here too, with the remedy named.
+fn decode_token_with_seq(t: &WireTensor) -> EngineResult<(i32, u32)> {
+    if t.dtype != WireDType::I32 || t.shape != [1, 1, 2] || t.data.len() != 8 {
         return Err(EngineError::Backend(format!(
-            "negative wire position {position} — corrupted or desynced activation stream"
+            "expected an I32 [1,1,2] 8-byte token frame ([token, seq]), got dtype={:?} \
+             shape={:?} len={} — a 4-byte I32 [1,1,1] frame means the downstream runs a build \
+             predating the seq-tagged token wire (upgrade both stages); an I64 frame means a \
+             packed stage is wired to a non-packed one",
+            t.dtype,
+            t.shape,
+            t.data.len()
         )));
     }
-    Ok(position)
+    let token = i32::from_le_bytes([t.data[0], t.data[1], t.data[2], t.data[3]]);
+    let echo_seq = i32::from_le_bytes([t.data[4], t.data[5], t.data[6], t.data[7]]) as u32;
+    Ok((token, echo_seq))
+}
+
+/// The token value a relay stage sends when its step FAILED after it had
+/// already consumed the upstream's activation group.
+///
+/// A stage that consumed a group OWES its upstream a reply, so a failed step
+/// must still answer — this is the answer that means "the batch is lost, the
+/// link is not", the same contract the packed path states at
+/// `step_relay_packed`. Real tokens are vocab indices produced by
+/// `argmax_last_row`, which starts at `0usize` and only ever returns an index,
+/// so a negative value can never be a legitimate token.
+///
+/// It rides the ORDINARY seq-tagged token frame rather than a distinctly-shaped
+/// one, and that is load-bearing in two directions. The upstream's own token
+/// wait is bounded by the same budget this stage's was, so by the time a
+/// timeout-driven NACK is sent the upstream has usually already given up: the
+/// NACK lands in the socket as a stale frame and is read by the NEXT request. A
+/// shape-distinguished NACK carries no seq, so nothing could reject it and it
+/// would abort the next, healthy generation. Carrying the seq means the
+/// existing stale-discard loop throws it away for free. Second, a
+/// distinctly-shaped NACK would collide with the two foreign 8-byte frames
+/// `decode_token_with_seq` exists to reject — a legacy `[1,1,1]` token and a
+/// packed I64 reply.
+const NACK_TOKEN: i32 = -1;
+
+/// Send the downstream activation frames in wire order: `[lead] [hidden]`,
+/// where `lead` is `[seq]` or `[seq, position]` (see `encode_wire_lead`).
+///
+/// Takes the VALUES, not pre-encoded frames, and encodes here: the lead and the
+/// hidden are both `WireTensor`, so a pre-encoded signature let the two be
+/// transposed at the call site and still compile — on a wire whose frames were
+/// already hard to tell apart. Shared by `send_hidden_downstream` and its
+/// loopback tests so the order is defined in exactly one place.
+async fn send_hidden_frames(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    seq: u32,
+    position: Option<i64>,
+    hid: WireTensor,
+) -> Result<(), cascadia_transport::TransportError> {
+    let lead = encode_wire_lead(seq, position);
+    let mut guard = downstream.lock().await;
+    guard.send(&lead).await?;
+    guard.send(&hid).await?;
+    Ok(())
+}
+
+/// Receive the upstream activation frames in wire order: `[lead] [hidden]` —
+/// the inverse of `send_hidden_frames`. Returns the raw frames so decoding
+/// happens outside the transport closure, where a bad frame yields a clear
+/// `EngineError` instead of a desync.
+///
+/// The LEAD frame is the IDLE "next request" wait (bounded only by the
+/// transport frame-idle ceiling — "no next request yet" is fine). The hidden
+/// frame is a mid-group reply the peer owes promptly once the group has
+/// started, so it is deadlined (`recv_reply`): a half-sent pair must not wedge
+/// the stage for the whole idle ceiling (#75 mid-pair protection, carried over
+/// to the seq-prefixed wire). Note this deadlines the hidden on the STATEFUL
+/// path too, which the pre-seq wire left lenient.
+async fn recv_hidden_frames(
+    upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
+) -> Result<(WireTensor, WireTensor), cascadia_transport::TransportError> {
+    let mut guard = upstream.lock().await;
+    let lead = guard.recv().await?.0;
+    let hid = guard.recv_reply().await?.0;
+    Ok((lead, hid))
+}
+
+/// Hard ceiling on the active token-response wait, independent of the body
+/// `recv_timeout()`. `recv_timeout` is operator-tunable for slow stages, and
+/// letting it govern the token wait would re-couple the engine-lock hold to it —
+/// a high `recv_timeout` would re-grow the self-heal latency the bounded recv
+/// exists to cap (internal tracker, issue #40). A token *response* of an ACTIVE
+/// generation has a tight real deadline regardless, so cap it here.
+const TOKEN_RECV_DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Overall budget for one token wait.
+///
+/// A DECODE reply is one token of compute per remaining stage, so it gets the
+/// base `recv_timeout` capped at [`TOKEN_RECV_DEADLINE_CEILING`]. A PREFILL
+/// reply waits on whole-prompt (or whole-chunk) compute across every remaining
+/// stage, so it scales with tokens-per-frame x pipeline depth — the same
+/// reasoning, and the same factor, as the transport's
+/// [`cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR`]. Both the budget and
+/// the ceiling widen, so the cap keeps its meaning ("an operator-raised
+/// recv_timeout cannot grow the engine-lock hold without bound") on a path
+/// where the wait legitimately scales.
+///
+/// The ceiling is not absolute for prefill on purpose: a tuned-up `recv_timeout`
+/// exists precisely because some stages are slow, and prefill is the case that
+/// legitimately needs it. At the default 60s this yields 60s / 600s; at the
+/// rig's 120s, 120s / 1200s — the same prefill budget `recv_reply_prefill` gave
+/// before, and strictly tighter than it at pathological settings.
+///
+/// Pure, for testing.
+fn token_recv_deadline(recv_timeout: std::time::Duration, prefill: bool) -> std::time::Duration {
+    let factor = if prefill {
+        cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR
+    } else {
+        1
+    };
+    // saturating_mul: an absurdly large configured base must clamp, not panic
+    // the engine thread (Duration's Mul panics on overflow).
+    recv_timeout
+        .saturating_mul(factor)
+        .min(TOKEN_RECV_DEADLINE_CEILING.saturating_mul(factor))
+}
+
+/// Consecutive token-wait timeouts after which a RELAY rank gives up on its
+/// downstream and exits for a supervisor rebuild (see
+/// `escalate_if_downstream_is_gone`). Each timeout already burns a full token
+/// budget, so a small count is minutes of grace, not seconds.
+const RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT: u32 = 3;
+
+/// Fold one token-wait outcome into the consecutive-timeout streak.
+///
+/// ANY answer resets it — a token, a downstream NACK, even a malformed frame.
+/// All three prove bytes are still crossing the link, so the link is not the
+/// suspect; only silence is. `saturating_add` because the streak is only ever
+/// compared against a small threshold and must not wrap on a stage that has
+/// been shouting into the void for a very long time.
+///
+/// Pure, for testing: the streak's reset semantics decide whether a healthy
+/// relay rank gets torn down, and that is not reachable from a unit test
+/// through `OvRuntimeEngine`, which needs a compiled IR to exist at all.
+fn next_timeout_streak(current: u32, timed_out: bool) -> u32 {
+    if timed_out {
+        current.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+/// Whether a relay rank should stop retrying and exit for a supervisor rebuild.
+///
+/// Both conditions are required. The streak alone is not enough: a step that
+/// SUCCEEDED after an earlier timeout must not trip the exit, and the streak is
+/// only cleared by `next_timeout_streak` on the recv path — a step can fail for
+/// reasons that never touch the token wait at all.
+///
+/// Pure, for testing. See [`RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT`].
+fn should_escalate(streak: u32, step_failed: bool) -> bool {
+    step_failed && streak >= RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT
+}
+
+/// Why a bounded token wait ended without a token.
+///
+/// The distinction exists so relay escalation can key on "the downstream never
+/// answered" WITHOUT re-reading error text — the fragility
+/// `EngineError::BatchAborted` was introduced to end. A typed two-way split is
+/// cheaper than a substring rule and cannot be broken by rewording a message.
+#[derive(Debug)]
+enum TokenWaitFailure {
+    /// The budget elapsed with no answer: a frame-start timeout, or the overall
+    /// deadline running out between discards. The only failure that says
+    /// anything about the LINK, and so the only one that counts toward
+    /// escalating a relay rank.
+    TimedOut(EngineError),
+    /// Anything else — a downstream NACK, a malformed frame, a dead socket.
+    /// Bytes arrived or the verdict is already decided elsewhere, so the link
+    /// is not the suspect and the escalation counter resets.
+    Other(EngineError),
+}
+
+impl TokenWaitFailure {
+    fn into_error(self) -> EngineError {
+        match self {
+            TokenWaitFailure::TimedOut(e) | TokenWaitFailure::Other(e) => e,
+        }
+    }
+}
+
+/// The terminal error for a token wait that ran out of budget.
+///
+/// Both exits — the overall deadline elapsing between discards, and a
+/// frame-start timeout inside one recv — come through here, so the diagnosis
+/// does not depend on which one happened to fire. Naming the discard count and
+/// the last echoed seq is the point: without them a persistent seq mismatch
+/// reads as a slow or wedged stage, and the operator investigates the network
+/// instead of a mismatched build. The wording deliberately avoids the
+/// substrings `EngineError::is_connection_fatal` treats as fatal — a token wait
+/// timing out must stay retryable so the head keeps its un-redialable socket.
+fn token_wait_timeout_error(
+    budget: std::time::Duration,
+    awaiting_seq: u32,
+    discarded: u64,
+    last_echo: Option<u32>,
+    cause: &str,
+) -> EngineError {
+    let detail = match (discarded, last_echo) {
+        (0, _) => "no token frame arrived".to_string(),
+        (n, Some(got)) => format!(
+            "{n} stale token frame(s) arrived and were discarded, last echoing seq {got} — a \
+             non-zero count with no match means the downstream is answering a different request, \
+             or runs a build without the seq-echo wire (restart both stages on the same build)"
+        ),
+        (n, None) => format!("{n} frame(s) discarded"),
+    };
+    EngineError::Backend(format!(
+        "timed out after {budget:?} waiting for the downstream token (expected seq \
+         {awaiting_seq}): {detail} [{cause}]"
+    ))
+}
+
+/// Read a seq-tagged token from `downstream`, discarding any STALE orphan
+/// (echoed seq != `awaiting_seq`) and continuing to read. The whole wait is
+/// bounded by ONE overall deadline = `min(recv_timeout(), TOKEN_RECV_DEADLINE_CEILING)`:
+/// each `recv_token` gets the REMAINING budget, and the deadline elapsing (or a
+/// bounded frame-start timeout) returns the Err so the engine lock releases for a
+/// retry (#40 self-heal). Returns the token whose echoed seq matches `awaiting_seq`.
+async fn recv_token_seq_checked(
+    downstream: &Arc<tokio::sync::Mutex<ActivationClient>>,
+    awaiting_seq: u32,
+    prefill: bool,
+) -> Result<i32, TokenWaitFailure> {
+    let budget = token_recv_deadline(cascadia_transport::recv_timeout(), prefill);
+    let deadline_at = std::time::Instant::now() + budget;
+    // Discards are summarised into the terminal error rather than logged per
+    // frame. A peer echoing the wrong seq every time — a version skew, or a
+    // downstream answering a different request — can stream thousands of frames
+    // inside one budget, and a per-frame WARN floods exactly the log an operator
+    // has to read the diagnosis out of.
+    let mut discarded = 0u64;
+    let mut last_echo: Option<u32> = None;
+    loop {
+        let remaining = deadline_at.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(TokenWaitFailure::TimedOut(token_wait_timeout_error(
+                budget,
+                awaiting_seq,
+                discarded,
+                last_echo,
+                "the overall deadline elapsed",
+            )));
+        }
+        let recv = {
+            let mut guard = downstream.lock().await;
+            guard.recv_token(remaining).await
+        };
+        let (tensor, _) = recv.map_err(|e| {
+            // Classify on the TYPED transport error, before flattening: a
+            // frame-start timeout means the downstream never answered, which is
+            // the only thing relay escalation may count.
+            match e {
+                cascadia_transport::TransportError::FrameStartTimeout(_) => {
+                    // Report through the same formatter as the overall-deadline
+                    // exit. Whether the budget runs out inside one recv or
+                    // between two discards is a race, and the operator needs the
+                    // discard context either way — returning the bare transport
+                    // message here would drop it in the common case.
+                    TokenWaitFailure::TimedOut(token_wait_timeout_error(
+                        budget,
+                        awaiting_seq,
+                        discarded,
+                        last_echo,
+                        &e.to_string(),
+                    ))
+                }
+                other => TokenWaitFailure::Other(EngineError::Backend(other.to_string())),
+            }
+        })?;
+        let (token, echo_seq) = decode_token_with_seq(&tensor).map_err(TokenWaitFailure::Other)?;
+        if echo_seq != awaiting_seq {
+            // First discard only: one line says the guard fired and names the
+            // seqs, which is what the rig validation looks for. Any further
+            // discards in the same wait are counted, not logged, and reported
+            // together in the terminal error.
+            if discarded == 0 {
+                warn!(
+                    event = "stale_token_discarded",
+                    expected = awaiting_seq,
+                    got = echo_seq,
+                    "discarding a stale orphan token from downstream (chain re-formed mid-wait); \
+                     further discards in this wait are counted, not logged"
+                );
+            }
+            discarded += 1;
+            last_echo = Some(echo_seq);
+            continue;
+        }
+        if discarded > 0 {
+            debug!(
+                discarded,
+                expected = awaiting_seq,
+                "downstream token arrived after discarding stale orphans"
+            );
+        }
+        // A NACK for THIS generation: the downstream consumed our activation
+        // group and then failed. The batch is lost, the link is not — so this
+        // is `BatchAborted`, which `is_connection_fatal` answers false to
+        // structurally, exactly as the packed path does for its empty-frame
+        // NACK. A relay rank must back off and keep driving on one of these,
+        // not exit for a supervisor rebuild.
+        //
+        // A NACK for a generation we already abandoned is a stale orphan and
+        // was discarded above, by seq, before reaching here.
+        if token < 0 {
+            return Err(TokenWaitFailure::Other(EngineError::BatchAborted(
+                "downstream stage failed its step and NACKed this generation; the pipeline \
+                 link stays aligned"
+                    .into(),
+            )));
+        }
+        return Ok(token);
+    }
 }
 
 // -------- static-KV (NPU) state --------
@@ -1061,6 +1447,31 @@ pub struct OvRuntimeEngine {
     /// `step_first_packed` refuse work immediately instead of serving
     /// guaranteed failures for the life of the process. See [`WireDeadLatch`].
     wire_dead: WireDeadLatch,
+    /// Per-hop sequence echo (token desync guard). Token frames carry no task
+    /// id, so a LATE orphaned token from a slow/recovering downstream would be
+    /// read by the next request → silent off-by-one token desync. Each stage
+    /// stamps a monotonic seq on the hidden it sends downstream and the
+    /// neighbor echoes it on the token; a mismatched echo is discarded.
+    ///
+    /// `awaiting_token_seq`: seq stamped on the LAST hidden sent downstream —
+    /// PRE-incremented per send, so it doubles as the next seq to stamp. The
+    /// token echo must equal it or the token is a stale orphan. Monotonic for
+    /// the engine's lifetime (never reset on cancel/reset_state) so a re-formed
+    /// generation cannot collide with an orphan of the old one.
+    ///
+    /// Pre-incrementing also means the first stamped seq is 1, never 0, so a
+    /// zero echo — the value a foreign or zero-filled frame decodes to — cannot
+    /// match the virgin state of a link that has not sent anything yet.
+    awaiting_token_seq: u32,
+    /// Seq read from the upstream hidden, echoed back on the token this stage
+    /// sends upstream. `None` until a hidden has actually been received:
+    /// "you may only echo a seq you were given" is then enforced by the type
+    /// rather than by a zero that is indistinguishable from a real seq 0.
+    inbound_seq: Option<u32>,
+    /// Relay ranks only: consecutive token-wait TIMEOUTS on the downstream
+    /// link. Reset by any answer at all (a token, a NACK, even a malformed
+    /// frame). Drives `escalate_if_downstream_is_gone`.
+    consecutive_token_timeouts: u32,
 }
 
 impl OvRuntimeEngine {
@@ -1473,6 +1884,10 @@ impl OvRuntimeEngine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        // Stamp the monotonic per-link seq this stage expects the downstream
+        // neighbor to echo back on the token (so a late orphan is detectable).
+        self.awaiting_token_seq = self.awaiting_token_seq.wrapping_add(1);
+        let seq = self.awaiting_token_seq;
         let mut wire_shape = [1u32; MAX_RANK];
         for (i, d) in shape.iter().enumerate().take(MAX_RANK) {
             wire_shape[i] = *d as u32;
@@ -1482,64 +1897,55 @@ impl OvRuntimeEngine {
         // stage can reset its ring at position 0 and align the visible-past
         // count. The wire shape has only MAX_RANK=3 dims (all used by
         // [1,1,hidden]) and the transport requires payload_len == shape*dtype,
-        // so we can't pack it into the hidden tensor — send it as its own
-        // framed I64 tensor first. recv_hidden_from_upstream mirrors the order.
-        let pos = if self.static_kv.is_some() {
-            Some(encode_wire_position(position))
-        } else {
-            None
-        };
-        self.block_on(async move {
-            let mut guard = downstream.lock().await;
-            if let Some(p) = pos {
-                guard.send(&p).await?;
-            }
-            guard.send(&hid).await
-        })
-        .map_err(|e| EngineError::Backend(e.to_string()))?;
+        // so it cannot ride in the hidden tensor — it travels in the lead frame
+        // alongside the seq. Wire order: [lead] [hidden], where lead is
+        // [seq] (stateful) or [seq, position] (static);
+        // recv_hidden_from_upstream mirrors it.
+        let pos = self.static_kv.is_some().then_some(position);
+        self.block_on(send_hidden_frames(&downstream, seq, pos, hid))
+            .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!(position, "downstream send: done");
         Ok(())
     }
 
+    /// `prefill` widens the wait: the reply is owed only after every remaining
+    /// stage has run multi-token inference, so the budget scales with the
+    /// frame's token count and the pipeline depth (see `token_recv_deadline`).
     fn recv_token_from_downstream(&mut self, prefill: bool) -> EngineResult<i32> {
         let downstream = self
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        // MID-TASK reply: we just sent a hidden state and the pipeline owes
-        // us the sampled token back. Use the deadlined `recv_reply`, NOT the
-        // idle-tolerant `recv` — a frame lost between stages (pipeline-leg
-        // reset) would otherwise block this step loop forever with the task
-        // slot held: the live-rig Item-5 wedge ("task active: 1, task done:
-        // 0" all day). On timeout the error propagates to `step_first`'s
-        // catch, which clears the active task and resets state — the slot
-        // is freed and the next submit starts fresh. A prefill reply waits
-        // on every remaining stage's whole-prompt compute, so it gets the
-        // widened budget (see `recv_tensor_reply_prefill`) — a long prompt
-        // on a slow stage must not read as a wedge.
-        let (tensor, _) = self
-            .block_on(async move {
-                let mut guard = downstream.lock().await;
-                if prefill {
-                    guard.recv_reply_prefill().await
-                } else {
-                    guard.recv_reply().await
-                }
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        if tensor.data.len() < 4 {
-            return Err(EngineError::Backend(format!(
-                "downstream sent {}-byte token tensor; need at least 4",
-                tensor.data.len()
-            )));
-        }
-        let token = i32::from_le_bytes([
-            tensor.data[0],
-            tensor.data[1],
-            tensor.data[2],
-            tensor.data[3],
-        ]);
-        Ok(token)
+        // #40. This wait was ALREADY deadlined before the bounded recv landed —
+        // it used `recv_reply`/`recv_reply_prefill`, whose frame-start runs
+        // under `recv_timeout`. What it was not is SURVIVABLE: a reply timeout
+        // surfaced as "recv_exact timed out", which both
+        // `recv_error_is_connection_fatal` and `EngineError::is_connection_fatal`
+        // read as fatal, so the transport dropped the socket — and
+        // `ActivationClient` dials once, at startup, with nothing to re-dial it.
+        // A head that timed out on an orphaned token wait (its chain re-formed
+        // under it after a rank restart) therefore lost its downstream for the
+        // life of the process and answered every later request `NotConnected`.
+        //
+        // So the fix here is the CLASSIFICATION, not the bound: elapsing at the
+        // frame start consumes zero bytes (cancel-safe read), leaves the socket
+        // aligned, and returns a retryable error, so the caller releases the
+        // engine lock and the next request serves on the re-formed chain.
+        //
+        // Keeping the socket is what admits a late orphan token, which the
+        // per-hop seq echo then discards — without it that token would be read
+        // as the NEXT request's and silently desync the stream.
+        //
+        // Unlike the idle-between-requests wait in `recv_hidden_from_upstream`,
+        // this one has a real deadline: an active generation owes a token.
+        let awaiting = self.awaiting_token_seq;
+        let outcome = self.block_on(recv_token_seq_checked(&downstream, awaiting, prefill));
+        // Only SILENCE moves the escalation streak. A token, a downstream NACK
+        // and a malformed frame all reset it — see `next_timeout_streak`.
+        let timed_out = matches!(outcome, Err(TokenWaitFailure::TimedOut(_)));
+        self.consecutive_token_timeouts =
+            next_timeout_streak(self.consecutive_token_timeouts, timed_out);
+        outcome.map_err(TokenWaitFailure::into_error)
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], Option<i64>)> {
@@ -1547,40 +1953,21 @@ impl OvRuntimeEngine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        // Static (NPU) shards send a leading I64 position tensor before the
-        // hidden activation (see send_hidden_downstream). Each frame's payload
-        // must match its shape*dtype, so we recv two separate tensors here.
+        // Wire order is [lead] [hidden] (see send_hidden_frames), where lead is
+        // [seq] or [seq, position]. The LEAD frame's wait is lenient
+        // (idle-between-requests); the hidden that must follow it is deadlined,
+        // and the bounded token deadline lives on the active wait downstream.
         let want_pos = self.static_kv.is_some();
         debug!(want_pos, "upstream recv: waiting");
-        let (pos_tensor, tensor) = self
-            .block_on(async move {
-                let mut guard = upstream.lock().await;
-                // First frame of a task hop is an IDLE wait (bounded only by
-                // the transport's much larger frame-idle ceiling — "no next
-                // request yet" is fine). On the static path the
-                // hidden tensor that must FOLLOW the position frame is a
-                // mid-pair reply: once the pos frame arrived, the peer owes
-                // the hidden promptly — deadline it so a half-sent pair
-                // can't wedge the stage (see `recv_tensor_reply`).
-                let (pos_tensor, t) = if want_pos {
-                    let pos = guard.recv().await?.0;
-                    tracing::debug!("upstream recv: position frame arrived");
-                    let (t, _) = guard.recv_reply().await?;
-                    (Some(pos), t)
-                } else {
-                    let (t, _) = guard.recv().await?;
-                    (None, t)
-                };
-                Ok::<_, cascadia_transport::TransportError>((pos_tensor, t))
-            })
+        let (lead, tensor) = self
+            .block_on(recv_hidden_frames(&upstream))
             .map_err(|e| EngineError::Backend(e.to_string()))?;
         debug!("upstream recv: frames arrived");
-        // Decode + strictly validate the position frame outside the transport
-        // closure (so a bad frame yields a clear EngineError, not a desync).
-        let position = match pos_tensor {
-            Some(p) => Some(decode_wire_position(&p)?),
-            None => None,
-        };
+        // Record the seq this stage must echo back on the token it sends
+        // upstream; decode/validate outside the transport closure so a bad
+        // frame yields a clear EngineError, not a desync.
+        let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
+        self.inbound_seq = Some(inbound_seq);
         let shape = [
             tensor.shape[0] as usize,
             tensor.shape[1] as usize,
@@ -1607,8 +1994,17 @@ impl OvRuntimeEngine {
             .upstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-        let bytes = token.to_le_bytes().to_vec();
-        let tensor = WireTensor::new(WireDType::I32, [1, 1, 1], bytes);
+        // Echo the seq the upstream stamped on the hidden it sent us, so it can
+        // detect a stale orphan if this token arrives after its wait moved on.
+        // There is no seq to echo before a hidden has been received, and every
+        // call site is preceded by one in the same step — so this is a bug
+        // guard, not a runtime condition.
+        let inbound = self.inbound_seq.ok_or_else(|| {
+            EngineError::Backend(
+                "no upstream seq recorded: a token was sent before any hidden was received".into(),
+            )
+        })?;
+        let tensor = encode_token_with_seq(token, inbound);
         self.block_on(async move {
             let mut guard = upstream.lock().await;
             guard.send(&tensor).await
@@ -2829,11 +3225,57 @@ impl OvRuntimeEngine {
         Ok(primary)
     }
 
+    /// Answer the upstream for an activation group this stage has ALREADY
+    /// consumed: the sampled token, or [`NACK_TOKEN`] if the step failed.
+    ///
+    /// Once the group is off the wire the upstream is owed a reply. Returning
+    /// the step's error without answering leaves it waiting out its whole token
+    /// budget for a frame that will never come — a wasted deadline per failure,
+    /// and on a relay rank the error is then swallowed by the loop and retried,
+    /// so the upstream pays it again. The packed path states the same rule at
+    /// `step_relay_packed`; this is the non-packed half of it.
+    ///
+    /// The body's error is what propagates, so the caller still sees why the
+    /// step died. A send failure subsumes it via `nack_send_error`, which keeps
+    /// the transport error outermost (it is what decides whether the relay loop
+    /// exits) while carrying the root cause in its text — a dead upstream is
+    /// exactly when the NACK cannot be delivered either.
+    fn answer_upstream(&mut self, step: EngineResult<i32>) -> EngineResult<()> {
+        let token = match &step {
+            Ok(t) => *t,
+            Err(e) => {
+                warn!(error = %e, "relay step failed; NACKing the upstream");
+                NACK_TOKEN
+            }
+        };
+        match self.send_token_to_upstream(token) {
+            Ok(()) => step.map(|_| ()),
+            Err(send_err) => Err(nack_send_error(send_err, step.as_ref().err())),
+        }
+    }
+
     fn step_last(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
         }
+        // Before this point nothing is owed: a failed recv either got no group
+        // at all, or lost frame alignment, in which case the socket is gone and
+        // there is nothing to answer on. After it, `inbound_seq` is set and
+        // every failure must answer.
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let step = self.relay_last_body(hidden, shape, pos_opt);
+        self.answer_upstream(step)
+    }
+
+    /// Everything `step_last` does between consuming the activation group and
+    /// answering the upstream. Split out so the caller can turn any failure
+    /// into an on-wire NACK instead of a silent one.
+    fn relay_last_body(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos_opt: Option<i64>,
+    ) -> EngineResult<i32> {
         // A seq=1 static frame means this task's prefill chunks are done —
         // with --park-prefill, release the prefill model's weights now.
         if pos_opt.is_some() && shape[1] == 1 {
@@ -2853,16 +3295,76 @@ impl OvRuntimeEngine {
                 r
             }
         };
-        let next = argmax_logits(&out, &out_shape)?;
-        self.send_token_to_upstream(next)?;
-        Ok(())
+        argmax_logits(&out, &out_shape)
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
         if self.packed.is_some() {
             return self.step_relay_packed();
         }
+        // See `step_last`: nothing is owed until the group is consumed.
         let (hidden, shape, pos_opt) = self.recv_hidden_from_upstream()?;
+        let step = self.relay_middle_body(hidden, shape, pos_opt);
+        let answered = self.answer_upstream(step);
+        self.escalate_if_downstream_is_gone(answered)
+    }
+
+    /// A middle rank whose downstream has stopped answering must eventually
+    /// exit so the supervisor rebuilds the stage.
+    ///
+    /// Bounding the token wait made its failure NON-fatal, which is right for
+    /// the head — it has no relay loop, it is driven by stream polls, and it
+    /// dialed its downstream once and cannot re-dial, so tearing it down on a
+    /// transient miss strands it permanently. A middle rank is the opposite
+    /// case: it has a supervisor, and before the bounded recv its timeout
+    /// classified fatal and produced exactly that rebuild. Without this, a
+    /// permanently wedged (as opposed to closed) downstream leaves the relay
+    /// loop backing off and retrying forever, with no self-heal and no
+    /// operator-visible terminal state.
+    ///
+    /// Only CONSECUTIVE token-wait timeouts count, and only timeouts: a NACK or
+    /// a malformed frame proves bytes are still flowing, and
+    /// `recv_token_from_downstream` resets the counter on both. Each timeout
+    /// already costs a full token budget, so the threshold is a small count
+    /// rather than a wall-clock window — no extra clock plumbing for the same
+    /// answer.
+    ///
+    /// The escalation error is `Io(TimedOut)`, which `is_connection_fatal`
+    /// answers structurally. It must not be a `Backend` string chosen to
+    /// contain a fatal substring: that is the fragility the typed
+    /// `BatchAborted` variant was introduced to end.
+    fn escalate_if_downstream_is_gone(&mut self, res: EngineResult<()>) -> EngineResult<()> {
+        if should_escalate(self.consecutive_token_timeouts, res.is_err()) {
+            error!(
+                timeouts = self.consecutive_token_timeouts,
+                "downstream has not answered a token in {} consecutive attempts; this stage \
+                 cannot re-dial it in-process, so it is exiting for the supervisor to rebuild \
+                 the pipeline connection",
+                self.consecutive_token_timeouts
+            );
+            return Err(EngineError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "downstream stage stopped answering ({} consecutive token-wait timeouts); \
+                     rebuilding this stage",
+                    self.consecutive_token_timeouts
+                ),
+            )));
+        }
+        res
+    }
+
+    /// Everything `step_middle` does between consuming the activation group and
+    /// answering the upstream — including the downstream hop, so a downstream
+    /// failure (its NACK included) propagates as an Err and this stage NACKs its
+    /// own upstream in turn. That is what carries an abort all the way to the
+    /// head however deep the pipeline is.
+    fn relay_middle_body(
+        &mut self,
+        hidden: Vec<f32>,
+        shape: [usize; 3],
+        pos_opt: Option<i64>,
+    ) -> EngineResult<i32> {
         // Multi-token hidden = prefill work downstream: a stateful
         // whole-prompt frame, or (static path) a prefill CHUNK — either way
         // the token reply waits on multi-token compute across every remaining
@@ -2891,9 +3393,7 @@ impl OvRuntimeEngine {
         };
         let s3 = to_shape3(&out_shape);
         self.send_hidden_downstream(&out, s3, fwd_pos)?;
-        let token = self.recv_token_from_downstream(prefill_reply)?;
-        self.send_token_to_upstream(token)?;
-        Ok(())
+        self.recv_token_from_downstream(prefill_reply)
     }
 }
 
@@ -4131,6 +4631,9 @@ impl Builder for OvRuntimeBuilder {
             prefill_reload: self.prefill_reload,
             step_warn: StepWarnLimiter::default(),
             wire_dead: WireDeadLatch::default(),
+            awaiting_token_seq: 0,
+            inbound_seq: None,
+            consecutive_token_timeouts: 0,
         }))
     }
 }
@@ -4329,9 +4832,9 @@ mod tests {
 
     #[test]
     fn packed_plan_frame_rejects_bad_frames() {
-        // wrong rank/shape (a scalar position frame from a non-packed peer)
-        let pos = encode_wire_position(5);
-        assert!(decode_wire_plan(&pos, 4).is_err());
+        // wrong rank/shape (a non-packed peer's lead frame)
+        let lead = encode_wire_lead(5, None);
+        assert!(decode_wire_plan(&lead, 4).is_err());
         // slot id beyond this stage's slot count
         let frame = encode_wire_plan(&[Some((9usize, 0i64, 0usize))]);
         let err = decode_wire_plan(&frame, 4).unwrap_err().to_string();
@@ -4965,5 +5468,562 @@ mod tests {
             "prefill validation should be skipped when disabled; got: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------- per-hop sequence echo (token desync guard) --------
+    //
+    // `OvRuntimeEngine` can't be constructed without a compiled OpenVINO IR
+    // (stub mode errors), so these exercise the extracted wire helpers over real
+    // ActivationServer/ActivationClient loopback pairs, mirroring the transport
+    // crate's roundtrip tests.
+    //
+    // send_hidden_frames / recv_hidden_frames / recv_token_seq_checked ARE the
+    // bodies of send_hidden_downstream / recv_hidden_from_upstream /
+    // recv_token_from_downstream, so those three are covered here.
+    // send_token_to_upstream is NOT: its body inlines the encode, the lock and
+    // the send, so what these tests cover of it is the encoder alone.
+    //
+    // Still untested for want of a constructible engine: the field wiring
+    // itself — the stamp/echo assignments and the escalation counter — and the
+    // engine-lock release that motivates the bounded wait. Those need either a
+    // seam that does not exist yet or hardware.
+
+    /// Stand up a connected (client, server) loopback pair. `client` is the
+    /// engine's `downstream` (an ActivationClient); `server` plays the
+    /// downstream/upstream peer.
+    async fn loopback() -> (ActivationClient, ActivationServer) {
+        let mut server = ActivationServer::new("127.0.0.1", 0);
+        server.start().await.unwrap();
+        let port = server.port();
+        let h = tokio::spawn(async move {
+            server.accept().await.unwrap();
+            server
+        });
+        let mut client = ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        let server = h.await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn recv_token_discards_stale_then_returns_correct() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 5u32;
+        // A stale orphan (wrong echoed seq) precedes the correct token.
+        server.send(&encode_token_with_seq(99, 4)).await.unwrap();
+        server
+            .send(&encode_token_with_seq(42, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, awaiting, false)
+            .await
+            .unwrap();
+        assert_eq!(tok, 42, "stale token must be skipped, correct one returned");
+    }
+
+    /// A matching echo returns that token. (Named for what it asserts — the
+    /// value — not for timing, which nothing here measures.)
+    #[tokio::test]
+    async fn recv_token_seq_match_returns_the_token() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 7u32;
+        server
+            .send(&encode_token_with_seq(123, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, awaiting, false)
+            .await
+            .unwrap();
+        assert_eq!(tok, 123);
+    }
+
+    #[test]
+    fn token_frame_carries_token_and_seq() {
+        // send_token_to_upstream emits I32[1,1,2] = [token, inbound_seq].
+        let t = encode_token_with_seq(42, 9);
+        assert_eq!(t.dtype, WireDType::I32);
+        assert_eq!(t.shape, [1, 1, 2]);
+        assert_eq!(t.data.len(), 8);
+        assert_eq!(&t.data[0..4], &42i32.to_le_bytes());
+        assert_eq!(&t.data[4..8], &9i32.to_le_bytes());
+        assert_eq!(decode_token_with_seq(&t).unwrap(), (42, 9));
+    }
+
+    /// The token frame must be validated by dtype AND shape, not length alone.
+    /// Both rejections below are 8-byte frames that a length-only check waved
+    /// through — the packed one silently produced a token on the first exchange
+    /// of a mismatched pipeline, because `echo_seq` decoded as 0 and the first
+    /// stamped seq was 0 too.
+    /// A NACK for the generation we are waiting on aborts it — and does so as
+    /// `BatchAborted`, which is structurally non-fatal, so a relay rank backs
+    /// off and keeps driving instead of exiting for a supervisor rebuild.
+    #[tokio::test]
+    async fn matching_seq_nack_aborts_the_generation_without_killing_the_link() {
+        let (client, mut server) = loopback().await;
+        let awaiting = 5u32;
+        server
+            .send(&encode_token_with_seq(NACK_TOKEN, awaiting))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, awaiting, false)
+            .await
+            .unwrap_err();
+        // `Other`, not `TimedOut`: a NACK proves the link delivered bytes, so
+        // it must not count toward relay escalation.
+        assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
+        let err = err.into_error();
+        assert!(matches!(err, EngineError::BatchAborted(_)), "{err:?}");
+        assert!(
+            !err.is_connection_fatal(),
+            "a NACKed generation must not tear the stage down: {err}"
+        );
+    }
+
+    /// The reason the NACK rides the ordinary seq-tagged frame instead of a
+    /// distinctly-shaped one.
+    ///
+    /// Upstream and downstream run the same token budget, so a timeout-driven
+    /// NACK is typically sent AFTER the upstream already gave up: it sits in
+    /// the socket and is read by the NEXT request. Carrying the seq means the
+    /// existing stale-discard loop throws it away. A shapewise NACK would carry
+    /// no seq, so nothing could reject it and it would abort the next, healthy
+    /// generation instead.
+    #[tokio::test]
+    async fn a_stale_nack_cannot_poison_the_next_generation() {
+        let (client, mut server) = loopback().await;
+        // The abandoned generation's NACK, still in the socket...
+        server
+            .send(&encode_token_with_seq(NACK_TOKEN, 4))
+            .await
+            .unwrap();
+        // ...then the current generation's real token.
+        server.send(&encode_token_with_seq(42, 5)).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, 5, false).await.unwrap();
+        assert_eq!(tok, 42, "a stale NACK must be discarded, not honoured");
+    }
+
+    /// A wait that only ever sees WRONG-seq frames must report why it gave up.
+    /// Without the discard count and the last echoed seq, a version skew or a
+    /// downstream answering a different request is indistinguishable from a
+    /// slow stage, and the operator goes looking at the network.
+    #[tokio::test]
+    async fn a_wait_that_only_discards_reports_the_discards() {
+        let (client, mut server) = loopback().await;
+        cascadia_transport::set_activation_timeout_secs(1);
+        // Three frames, none of them echoing the seq we are waiting on.
+        for s in [11u32, 12, 13] {
+            server.send(&encode_token_with_seq(5, s)).await.unwrap();
+        }
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 99, false)
+            .await
+            .unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+
+        assert!(matches!(err, TokenWaitFailure::TimedOut(_)), "{err:?}");
+        let msg = err.into_error().to_string();
+        assert!(msg.contains("expected seq 99"), "{msg}");
+        assert!(msg.contains("3 stale token frame(s)"), "{msg}");
+        assert!(msg.contains("last echoing seq 13"), "{msg}");
+        assert!(msg.contains("same build"), "no remedy named: {msg}");
+    }
+
+    /// A wait that saw nothing at all says so, rather than implying frames were
+    /// discarded — the two point at completely different causes.
+    #[tokio::test]
+    async fn a_silent_wait_says_no_frame_arrived() {
+        let (client, _server) = loopback().await;
+        cascadia_transport::set_activation_timeout_secs(1);
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 7, false)
+            .await
+            .unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+        let msg = err.into_error().to_string();
+        assert!(msg.contains("no token frame arrived"), "{msg}");
+        // The transport's own wording is carried as the cause, not replaced.
+        assert!(msg.contains("frame-start wait timed out"), "{msg}");
+    }
+
+    /// #40: a bounded frame-start timeout must classify NON-fatal at the ENGINE
+    /// layer too, where the verdict is a substring rule over the flattened
+    /// message.
+    ///
+    /// This assertion lives here, in the crate that depends on BOTH
+    /// `cascadia-transport` and `cascadia-engine`, and builds the string from
+    /// the real `TransportError` Display. The equivalent test in
+    /// `cascadia-engine` hardcoded its own copy of the text — and that crate
+    /// does not depend on the transport at all, so rewording the `#[error]`
+    /// attribute left the test green while production flipped to fatal and
+    /// started dropping a socket the engine cannot re-dial. A pin that cannot
+    /// observe what it pins is not a pin.
+    #[test]
+    fn transport_frame_start_timeout_is_non_fatal_at_the_engine_layer() {
+        let display = cascadia_transport::TransportError::FrameStartTimeout(
+            std::time::Duration::from_secs(120),
+        )
+        .to_string();
+        assert!(
+            !EngineError::Backend(display.clone()).is_connection_fatal(),
+            "a retryable frame-start timeout must not read as fatal: {display}"
+        );
+        // The sibling ceiling stays fatal — the classifier is narrowed, not
+        // blunted, and these two differ only in which recv asked.
+        let ceiling = cascadia_transport::TransportError::FrameIdleCeiling(
+            std::time::Duration::from_secs(900),
+        )
+        .to_string();
+        assert!(
+            EngineError::Backend(ceiling.clone()).is_connection_fatal(),
+            "the idle ceiling must stay fatal: {ceiling}"
+        );
+    }
+
+    /// Whichever exit fires, the wait must stay RETRYABLE. The head cannot
+    /// re-dial its downstream, so a token timeout classifying fatal would drop
+    /// the socket permanently — the #40 brick this bounded recv exists to avoid.
+    #[test]
+    fn a_token_wait_timeout_is_never_connection_fatal() {
+        for (discarded, last) in [(0u64, None), (7, Some(3u32))] {
+            let e = token_wait_timeout_error(
+                std::time::Duration::from_secs(120),
+                42,
+                discarded,
+                last,
+                &cascadia_transport::TransportError::FrameStartTimeout(
+                    std::time::Duration::from_secs(120),
+                )
+                .to_string(),
+            );
+            assert!(!e.is_connection_fatal(), "{e}");
+        }
+    }
+
+    /// The token budget: decode gets the base `recv_timeout`, prefill gets the
+    /// widened one, and BOTH are capped so an operator-raised `recv_timeout`
+    /// cannot grow the engine-lock hold without bound (#40).
+    ///
+    /// This was untestable while the `min()` lived inline in an async fn that
+    /// needed a live socket — flipping it to `max()` passed the whole suite.
+    #[test]
+    fn token_recv_deadline_widens_for_prefill_and_clamps_both() {
+        use std::time::Duration;
+        let f = cascadia_transport::PREFILL_REPLY_TIMEOUT_FACTOR;
+        // Below the ceiling: the configured value governs, x factor for prefill.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(60), false),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(60), true),
+            Duration::from_secs(60) * f
+        );
+        // At the rig's config: decode sits exactly on the ceiling, and prefill
+        // gets the same 1200s `recv_reply_prefill` used to give it.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), false),
+            TOKEN_RECV_DEADLINE_CEILING
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(120), true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // Above it, the cap binds on both paths — this is the assertion a
+        // `max()` typo fails.
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(600), false),
+            TOKEN_RECV_DEADLINE_CEILING
+        );
+        assert_eq!(
+            token_recv_deadline(Duration::from_secs(600), true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
+        // An absurd configured base clamps rather than panicking on overflow.
+        assert_eq!(
+            token_recv_deadline(Duration::MAX, true),
+            TOKEN_RECV_DEADLINE_CEILING * f
+        );
+    }
+
+    /// A frame-start timeout is the ONLY token-wait failure that says anything
+    /// about the link, so it is the only one that may count toward escalating a
+    /// relay rank. Pinned on the TYPED split rather than on message text —
+    /// keying escalation off a substring is the fragility `BatchAborted` exists
+    /// to end.
+    #[tokio::test]
+    async fn only_a_timeout_counts_toward_relay_escalation() {
+        // Silent peer → the bounded frame-start elapses → TimedOut.
+        let (client, _server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        cascadia_transport::set_activation_timeout_secs(1);
+        let err = recv_token_seq_checked(&downstream, 0, false)
+            .await
+            .unwrap_err();
+        cascadia_transport::set_activation_timeout_secs(0);
+        assert!(matches!(err, TokenWaitFailure::TimedOut(_)), "{err:?}");
+
+        // A malformed frame is an answer, not a silence: bytes arrived, so the
+        // link is not the suspect and the counter must reset.
+        let (client, mut server) = loopback().await;
+        server.send(&encode_wire_tokens(&[7])).await.unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let err = recv_token_seq_checked(&downstream, 0, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TokenWaitFailure::Other(_)), "{err:?}");
+    }
+
+    /// The streak counts CONSECUTIVE silences and is cleared by any answer.
+    ///
+    /// The reset is the load-bearing half: without it, three timeouts spread
+    /// across an otherwise healthy day would eventually tear down a working
+    /// relay rank. Note a rebuilt middle also costs the head a restart (it
+    /// cannot re-dial), so a false positive takes down two ranks, not one.
+    #[test]
+    fn timeout_streak_counts_silence_and_resets_on_any_answer() {
+        assert_eq!(next_timeout_streak(0, true), 1);
+        assert_eq!(next_timeout_streak(1, true), 2);
+        assert_eq!(next_timeout_streak(2, true), 3);
+        // A token, a NACK, or a malformed frame all land here.
+        assert_eq!(next_timeout_streak(2, false), 0);
+        assert_eq!(next_timeout_streak(0, false), 0);
+        // A stage shouting into the void for a very long time must not wrap
+        // back under the threshold.
+        assert_eq!(next_timeout_streak(u32::MAX, true), u32::MAX);
+    }
+
+    /// Escalation needs BOTH a failed step and a full streak.
+    #[test]
+    fn relay_escalates_only_on_a_full_streak_of_failures() {
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+        // Short of the threshold: keep serving.
+        for s in 0..n {
+            assert!(!should_escalate(s, true), "escalated early at streak {s}");
+        }
+        assert!(should_escalate(n, true));
+        assert!(should_escalate(n + 1, true));
+        // A step that SUCCEEDED must never trip the exit, whatever the streak —
+        // the streak is only cleared on the recv path, and a success here means
+        // the pipeline just delivered.
+        for s in [0, n, n + 5, u32::MAX] {
+            assert!(!should_escalate(s, false), "escalated on success at {s}");
+        }
+    }
+
+    /// The sequence that distinguishes "dead link" from "unlucky day": an answer
+    /// in the middle of a run of timeouts must prevent the exit entirely.
+    #[test]
+    fn an_answer_between_timeouts_prevents_escalation() {
+        let n = RELAY_TOKEN_TIMEOUTS_BEFORE_EXIT;
+
+        // Uninterrupted silence -> escalates exactly at the threshold.
+        let mut streak = 0;
+        let mut fired_at = None;
+        for attempt in 1..=(n + 2) {
+            streak = next_timeout_streak(streak, true);
+            if should_escalate(streak, true) && fired_at.is_none() {
+                fired_at = Some(attempt);
+            }
+        }
+        assert_eq!(fired_at, Some(n), "should exit on the Nth consecutive miss");
+
+        // Same number of timeouts, one answer partway through -> never exits.
+        let mut streak = 0;
+        for timed_out in [true, true, false, true, true, true] {
+            streak = next_timeout_streak(streak, timed_out);
+            if timed_out && should_escalate(streak, true) {
+                // Only legitimate once the post-reset run reaches the threshold.
+                assert!(streak >= n, "escalated on a broken streak: {streak}");
+            }
+        }
+        // Two timeouts, an answer, then three: the trailing run is what counts.
+        assert_eq!(streak, 3);
+    }
+
+    /// The escalation error must be classifiable by TYPE. `Io(TimedOut)` is
+    /// what makes the relay loop exit for a supervisor rebuild; a `Backend`
+    /// string that merely happens to contain a fatal substring would be one
+    /// rewording away from silently ceasing to escalate.
+    #[test]
+    fn relay_escalation_error_is_structurally_connection_fatal() {
+        let e = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "downstream stage stopped answering (3 consecutive token-wait timeouts)",
+        ));
+        assert!(e.is_connection_fatal());
+        // And a NACK, which shares the "downstream failed" wording space, does
+        // NOT escalate however it is phrased.
+        assert!(!EngineError::BatchAborted(
+            "downstream stage failed its step and NACKed this generation".into()
+        )
+        .is_connection_fatal());
+    }
+
+    /// The sentinel must be unreachable as a real token: sampling returns a
+    /// vocab INDEX from `argmax_last_row`, which starts at `0usize`.
+    #[test]
+    fn nack_sentinel_can_never_be_a_sampled_token() {
+        assert!(NACK_TOKEN < 0);
+        let logits = [0.1f32, 0.9, 0.3];
+        assert!(argmax_last_row(&logits, 3) >= 0);
+        // And it survives the wire as itself.
+        assert_eq!(
+            decode_token_with_seq(&encode_token_with_seq(NACK_TOKEN, 7)).unwrap(),
+            (NACK_TOKEN, 7)
+        );
+    }
+
+    #[test]
+    fn token_frame_rejects_foreign_8_byte_frames() {
+        // A packed stage's single-row reply: I64 [1,1,1], 8 bytes.
+        let packed_reply = encode_wire_tokens(&[7]);
+        assert_eq!(packed_reply.data.len(), 8, "the collision needs 8 bytes");
+        let err = decode_token_with_seq(&packed_reply)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("packed stage is wired to a non-packed"),
+            "{err}"
+        );
+
+        // A pre-seq peer's legacy token: I32 [1,1,1], 4 bytes.
+        let legacy = WireTensor::new(WireDType::I32, [1, 1, 1], 42i32.to_le_bytes().to_vec());
+        let err = decode_token_with_seq(&legacy).unwrap_err().to_string();
+        assert!(err.contains("predating the seq-tagged token wire"), "{err}");
+
+        // A non-packed lead frame that desynced into the token slot.
+        assert!(decode_token_with_seq(&encode_wire_lead(3, None)).is_err());
+
+        // The real thing still decodes.
+        assert_eq!(
+            decode_token_with_seq(&encode_token_with_seq(42, 9)).unwrap(),
+            (42, 9)
+        );
+    }
+
+    #[test]
+    fn lead_frame_roundtrips_on_both_paths() {
+        // Stateful: one lane, seq only.
+        let f = encode_wire_lead(12345, None);
+        assert_eq!(f.dtype, WireDType::I64);
+        assert_eq!(f.shape, [1, 1, 1]);
+        assert_eq!(decode_wire_lead(&f, false).unwrap(), (12345, None));
+        // Static: two lanes, seq THEN position (lane order, not just presence).
+        let f = encode_wire_lead(7, Some(11));
+        assert_eq!(f.shape, [1, 1, 2]);
+        assert_eq!(&f.data[0..8], &7i64.to_le_bytes());
+        assert_eq!(&f.data[8..16], &11i64.to_le_bytes());
+        assert_eq!(decode_wire_lead(&f, true).unwrap(), (7, Some(11)));
+    }
+
+    /// The lead frame's SHAPE is what separates the stateful and static wires.
+    /// A stage must reject a lead that doesn't match its own staticness — this
+    /// is the check that turns a pre-seq peer, or a mismatched pipeline, into a
+    /// hard error instead of a silent mis-bind. Before the position moved into
+    /// this frame, a standalone seq frame and a standalone position frame were
+    /// byte-identical (I64 `[1,1,1]`, 8 bytes) and nothing could tell them apart.
+    #[test]
+    fn lead_frame_shape_mismatch_is_rejected_both_ways() {
+        // A static peer's lead read by a stateful stage.
+        let err = decode_wire_lead(&encode_wire_lead(1, Some(2)), false).unwrap_err();
+        assert!(err.to_string().contains("[1,1,1]"), "{err}");
+        // A stateful peer's lead — and equally a PRE-SEQ static peer's bare
+        // position frame, which has exactly this shape — read by a static stage.
+        let err = decode_wire_lead(&encode_wire_lead(1, None), true).unwrap_err();
+        assert!(err.to_string().contains("[1,1,2]"), "{err}");
+        assert!(err.to_string().contains("predates"), "{err}");
+        // Wrong dtype (an F16 hidden where the lead belongs).
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 1], vec![0, 0]);
+        assert!(decode_wire_lead(&hid, false).is_err());
+        // A negative position would wrap the ring math.
+        let mut bad = encode_wire_lead(1, Some(0));
+        bad.data[8..16].copy_from_slice(&(-3i64).to_le_bytes());
+        let err = decode_wire_lead(&bad, true).unwrap_err();
+        assert!(err.to_string().contains("negative wire position"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hidden_to_token_roundtrip_preserves_seq() {
+        // HEAD sends [lead][hidden] downstream; TAIL recvs them, echoes the
+        // seq on the token; HEAD reads it back and matches on the same seq.
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let stamped = 7u32;
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![1, 2, 3, 4]);
+        send_hidden_frames(&downstream, stamped, None, hid.clone())
+            .await
+            .unwrap();
+
+        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
+        assert!(pos.is_none());
+        assert_eq!(inbound, stamped, "seq must survive the hidden hop");
+        assert_eq!(hid_t.dtype, WireDType::F16);
+        assert_eq!(hid_t.data, hid.data);
+
+        // TAIL echoes the inbound seq on its token.
+        upstream
+            .lock()
+            .await
+            .send(&encode_token_with_seq(55, inbound))
+            .await
+            .unwrap();
+        let tok = recv_token_seq_checked(&downstream, stamped, false)
+            .await
+            .unwrap();
+        assert_eq!(tok, 55);
+    }
+
+    #[tokio::test]
+    async fn static_shard_wire_is_lead_then_hidden() {
+        // Static path: lead carries [seq, position], hidden follows. Distinct
+        // values catch a lane swap or a frame transposition.
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![9, 8, 7, 6]);
+        send_hidden_frames(&downstream, 3, Some(11), hid.clone())
+            .await
+            .unwrap();
+
+        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        assert_eq!(
+            decode_wire_lead(&lead, true).unwrap(),
+            (3, Some(11)),
+            "lead carries seq then position"
+        );
+        assert_eq!(hid_t.data, hid.data, "hidden is the second frame");
+    }
+
+    /// The seq is carried as an i64 lane on the lead wire and an i32 lane on
+    /// the token wire, so the extreme value has to survive both casts and still
+    /// compare equal in the stale check. (This covers the ENCODING, not the
+    /// `wrapping_add` at the stamp site — that lives on the engine struct and
+    /// is not reachable without a compiled IR.)
+    #[tokio::test]
+    async fn seq_at_u32_max_survives_both_wires() {
+        // A seq at u32::MAX must survive the i32 round-trip on both wires and
+        // still match in the stale check (u32::MAX as i32 == -1, back to MAX).
+        assert_eq!(
+            decode_wire_lead(&encode_wire_lead(u32::MAX, None), false).unwrap(),
+            (u32::MAX, None)
+        );
+        let (client, mut server) = loopback().await;
+        server
+            .send(&encode_token_with_seq(8, u32::MAX))
+            .await
+            .unwrap();
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let tok = recv_token_seq_checked(&downstream, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(tok, 8);
     }
 }
