@@ -1179,7 +1179,7 @@ impl Gemma4Engine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: None,
-                prompt_tokens: None,
+                prompt_tokens: Some(active.prompt_ids.len() as u32),
                 error: None,
                 finish_reason: None,
             }

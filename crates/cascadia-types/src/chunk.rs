@@ -163,3 +163,59 @@ impl Chunk {
             .unwrap_or(if self.text.is_empty() { 0 } else { 1 })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every openvino/sparse-moe engine reports token usage over this same
+    /// seam (`prompt_tokens` + `token_count()`), not a per-engine field. Two
+    /// shapes are in use: (a) one token per streamed `Chunk`, finished by an
+    /// empty marker carrying `prompt_tokens` (dist_spec, gemma4, ov-runtime's
+    /// static path, most sparse-moe paths), and (b) a single final chunk
+    /// carrying the whole response with an explicit `n_tokens` (ov-genai,
+    /// spec-decode's packed path, PipelineEngine). Pins that a consumer
+    /// summing `token_count()` across the stream recovers the real prompt
+    /// and completion counts under both shapes.
+    #[test]
+    fn per_token_stream_reports_fed_prompt_len_and_emitted_count() {
+        let fed_prompt_len = 5u32;
+        let emitted = ["The", " quick", " fox"];
+        let mut chunks: Vec<Chunk> = emitted
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Chunk::token("t1", i as i64, *t))
+            .collect();
+        chunks.push(Chunk::final_marker("t1", "").with_prompt_tokens(fed_prompt_len));
+
+        let completion_tokens: u32 = chunks.iter().map(Chunk::token_count).sum();
+        let prompt_tokens = chunks
+            .iter()
+            .find(|c| c.is_final)
+            .and_then(|c| c.prompt_tokens);
+
+        assert_eq!(completion_tokens, emitted.len() as u32);
+        assert_eq!(prompt_tokens, Some(fed_prompt_len));
+    }
+
+    #[test]
+    fn single_final_chunk_reports_fed_prompt_len_and_emitted_count() {
+        let fed_prompt_len = 12u32;
+        let generated_tokens = 7u32;
+        let chunk = Chunk::final_marker("t1", "the quick fox jumps")
+            .with_n_tokens(generated_tokens)
+            .with_prompt_tokens(fed_prompt_len);
+
+        assert_eq!(chunk.token_count(), generated_tokens);
+        assert_eq!(chunk.prompt_tokens, Some(fed_prompt_len));
+    }
+
+    /// An engine that can't tell the prompt length (or hasn't reached the
+    /// final chunk yet) leaves `prompt_tokens` at `None` — the API falls back
+    /// to 0 rather than fabricating a count.
+    #[test]
+    fn prompt_tokens_defaults_to_none() {
+        assert_eq!(Chunk::token("t1", 0, "hi").prompt_tokens, None);
+        assert_eq!(Chunk::final_marker("t1", "").prompt_tokens, None);
+    }
+}

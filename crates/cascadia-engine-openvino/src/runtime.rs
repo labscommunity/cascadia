@@ -3028,7 +3028,7 @@ impl OvRuntimeEngine {
                 is_final: true,
                 logprobs: None,
                 n_tokens: None,
-                prompt_tokens: None,
+                prompt_tokens: Some(active.prompt_ids.len() as u32),
                 error: None,
                 // ov-runtime doesn't yet distinguish length vs stop here; the
                 // API falls back to "stop" (unchanged behavior). #14 follow-up.
