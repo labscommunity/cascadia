@@ -2194,6 +2194,14 @@ impl OvRuntimeEngine {
                                     plane_pulled,
                                     "ov-runtime warm-resumed from KV blob"
                                 );
+                                // Anti-self-deception: raw provenance, not `plane_turn` — the AND
+                                // above is identically false in chain mode and would hide a real
+                                // cross-chain pull behind "local".
+                                let source = if plane_pulled { "pulled" } else { "local" };
+                                let epoch =
+                                    crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                                tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                    source, epoch, len);
                             } else {
                                 // The blob WAS applied — reset_state cannot un-apply it.
                                 self.scrub_after_set_state("head chain-restore incomplete");

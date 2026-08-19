@@ -1899,6 +1899,10 @@ impl SparseMoEEngine {
                             plane_pulled,
                             "multi-stage warm-resumed"
                         );
+                        // Anti-self-deception: unconditional provenance for the cert scrape.
+                        let source = if plane_pulled { "pulled" } else { "local" };
+                        tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                            source, epoch, len = matched);
                         matched
                     } else {
                         warn!(task = %task.task_id, "multi-stage restore incomplete; cold reset");
@@ -3981,6 +3985,10 @@ impl OvMoeEngine {
                             plane_pulled,
                             "multi-stage warm-resumed"
                         );
+                        // Anti-self-deception: unconditional provenance for the cert scrape.
+                        let source = if plane_pulled { "pulled" } else { "local" };
+                        tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                            source, epoch, len = matched);
                         matched
                     } else {
                         warn!(task = %id, "multi-stage restore incomplete; cold reset");
