@@ -173,6 +173,7 @@ mod tests {
             sampling: SamplingParams::default(),
             enable_thinking: false,
             trust_remote_code: false,
+            tenant: String::new(),
             resume_token_ids: None,
         };
         let json = serde_json::to_string(&t).unwrap();
