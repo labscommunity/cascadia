@@ -242,21 +242,14 @@ pub trait KvCoordination {
     ) -> Result<(), ()> {
         Err(())
     }
-    /// Plane-based cross-chain warm-resume: applies the rank's pulled KV staged under `epoch` in this
-    /// engine's cache (splice-agnostic; §0(B)). Returns true on success (state set + warm armed).
-    /// Default: unsupported.
-    #[allow(clippy::result_unit_err)]
-    fn apply_warm_resume(&mut self, _epoch: u64) -> bool {
-        false
-    }
-    /// Undo an [`Self::apply_warm_resume`] that the chain-wide verdict then rejected: drop the armed
-    /// state and fall back to cold. The plane's verdict is meant to be all-or-nothing, but each rank
-    /// applies BEFORE it confirms, so a later rank's failure would otherwise leave this rank warm while
-    /// the head goes cold — the head then prefills a full cold prompt through a rank whose KV is
+    /// Undo a plane-based cross-chain warm-resume that the chain-wide verdict then rejected: drop the
+    /// armed state and fall back to cold. The plane's verdict is meant to be all-or-nothing, but each
+    /// rank applies BEFORE it confirms, so a later rank's failure would otherwise leave this rank warm
+    /// while the head goes cold — the head then prefills a full cold prompt through a rank whose KV is
     /// pre-seeded, producing wrong tokens. A stale arm also contaminates the NEXT request, so this must
     /// be safe to call at any time, including for an epoch this rank never armed.
     ///
-    /// Default: no-op — correct for engines whose `apply_warm_resume` is itself unsupported.
+    /// Default: no-op — correct for engines with no such apply to undo.
     fn abort_warm_resume(&mut self, _epoch: u64) {}
     /// Number of ranks in an N-stage chain that bear OWN KV (the cross-chain pull must GET + restore
     /// only these). Default: all `total_ranks` (every rank has its own KV — ov-runtime/qwen36/dist-spec).
