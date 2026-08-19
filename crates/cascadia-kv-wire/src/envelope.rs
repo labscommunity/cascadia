@@ -199,6 +199,34 @@ pub enum KvMessage {
         rank: u16,
         candidates: Vec<([u8; 32], CandidateKind)>,
     },
+    /// Head→rank-N: like [`KvMessage::WarmResumeTriggerV3`] but carries the move's identity (design
+    /// §B — D4). `move_nonce` is head-minted, random per move, and is what makes a nonce-keyed lease
+    /// addressable: epoch alone repeats (`synth_epoch` is a content hash) and cannot disambiguate two
+    /// competing moves that land on the same `(fingerprint, rank)` slot.
+    WarmResumeTriggerV4 {
+        partner: PartnerId,
+        epoch: u64,
+        prefix_token_len: u32,
+        model_fingerprint: u64,
+        prev_chain_id: [u8; 32],
+        rank: u16,
+        candidates: Vec<([u8; 32], CandidateKind)>,
+        move_nonce: [u8; 16],
+    },
+    /// Head→rank-N: like [`KvMessage::WarmResumeAbort`] but nonce-addressed (design §B — adversarial
+    /// finding 7: a nonce-less abort cannot target a nonce-keyed lease). `epoch` stays for
+    /// diagnostics/legacy correlation; `move_nonce` is the identity that must match the staged move.
+    WarmResumeAbortV2 {
+        epoch: u64,
+        move_nonce: [u8; 16],
+    },
+    /// Head→rank-N: like [`KvMessage::WarmResumeCommit`] but nonce-addressed, same reasoning as
+    /// [`KvMessage::WarmResumeAbortV2`]. The same-stream [`KvMessage::WarmResumeConfirm`] reply
+    /// contract is unchanged.
+    WarmResumeCommitV2 {
+        epoch: u64,
+        move_nonce: [u8; 16],
+    },
 }
 
 /// Cap on the UTF-8 byte length of [`KvMessage::TenantHint`]'s `partner`, enforced by
@@ -336,6 +364,27 @@ mod tests {
                     ([2u8; 32], CandidateKind::Replica),
                 ],
             },
+            KvMessage::WarmResumeTriggerV4 {
+                partner: PartnerId("acme".into()),
+                epoch: 42,
+                prefix_token_len: 3,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+                candidates: vec![
+                    ([1u8; 32], CandidateKind::Primary),
+                    ([2u8; 32], CandidateKind::Replica),
+                ],
+                move_nonce: [4u8; 16],
+            },
+            KvMessage::WarmResumeAbortV2 {
+                epoch: 42,
+                move_nonce: [4u8; 16],
+            },
+            KvMessage::WarmResumeCommitV2 {
+                epoch: 41,
+                move_nonce: [4u8; 16],
+            },
         ];
         for m in msgs {
             let bytes = bincode::serde::encode_to_vec(&m, standard()).unwrap();
@@ -347,75 +396,175 @@ mod tests {
 
     #[test]
     fn new_variants_are_appended_after_warm_resume_abort() {
-        // WarmResumeAbort was the last pre-replication variant; its encoded tag byte must not change.
-        let old =
-            bincode::serde::encode_to_vec(KvMessage::WarmResumeAbort { epoch: 1 }, standard())
-                .unwrap();
-        assert_eq!(
-            old[0], 10,
-            "WarmResumeAbort is variant index 10; appending must not shift it"
-        );
-        let get = bincode::serde::encode_to_vec(
-            KvMessage::ReplicaGet {
-                key: key(),
-                rank: 0,
-                expected_epoch: 0,
-                expected_len: 0,
-            },
-            standard(),
-        )
-        .unwrap();
-        assert_eq!(get[0], 14, "ReplicaGet is appended 4th, index 14");
-        let v2 = bincode::serde::encode_to_vec(
-            KvMessage::WarmResumeTriggerV2 {
-                partner: PartnerId("acme".into()),
-                epoch: 1,
-                prefix_token_len: 1,
-                model_fingerprint: 1,
-                prev_chain_id: [0u8; 32],
-                rank: 0,
-            },
-            standard(),
-        )
-        .unwrap();
-        assert_eq!(v2[0], 15, "WarmResumeTriggerV2 is appended 5th, index 15");
-        let tenant = bincode::serde::encode_to_vec(
-            KvMessage::TenantHint {
-                request_id: [0u8; 16],
-                partner: "acme".into(),
-            },
-            standard(),
-        )
-        .unwrap();
-        assert_eq!(tenant[0], 16, "TenantHint is appended 7th, index 16");
-        let get_v2 = bincode::serde::encode_to_vec(
-            KvMessage::GetV2 {
-                partner: PartnerId("acme".into()),
-                model_fingerprint: 1,
-                expected_epoch: 1,
-                expected_len: 1,
-                rank: 1,
-            },
-            standard(),
-        )
-        .unwrap();
-        assert_eq!(get_v2[0], 17, "GetV2 is appended 8th, index 17");
-        let v3 = bincode::serde::encode_to_vec(
-            KvMessage::WarmResumeTriggerV3 {
-                partner: PartnerId("acme".into()),
-                epoch: 1,
-                prefix_token_len: 1,
-                model_fingerprint: 1,
-                prev_chain_id: [0u8; 32],
-                rank: 0,
-                candidates: vec![],
-            },
-            standard(),
-        )
-        .unwrap();
-        assert_eq!(
-            v3[0], 18,
-            "WarmResumeTriggerV3 is the LAST appended variant (index 18)"
-        );
+        // bincode derives the tag from DECLARATION ORDER, so inserting anywhere but the end
+        // renumbers every later variant silently (each build still round-trips against itself).
+        // Every PRE-EXISTING variant is pinned here, in order, so an insert-in-the-middle mistake
+        // goes red instead of shipping unpinned; the three D4-wire additions are pinned at the end.
+        let all: Vec<(&str, KvMessage)> = vec![
+            (
+                "Negotiate",
+                KvMessage::Negotiate(Negotiate {
+                    partner: PartnerId("acme".into()),
+                    model_fingerprint: 1,
+                    token_ids: vec![1],
+                }),
+            ),
+            (
+                "Offer",
+                KvMessage::Offer(Offer {
+                    snapshot_epoch: 1,
+                    prefix_token_len: 1,
+                }),
+            ),
+            (
+                "Get",
+                KvMessage::Get(Get {
+                    partner: PartnerId("acme".into()),
+                    model_fingerprint: 1,
+                    expected_epoch: 1,
+                    expected_len: 1,
+                }),
+            ),
+            ("Found", KvMessage::Found(manifest())),
+            ("NotFound", KvMessage::NotFound),
+            ("Error", KvMessage::Error("e".into())),
+            (
+                "Hint",
+                KvMessage::Hint(WarmHint {
+                    request_id: [0u8; 16],
+                    prev_chain_id: [0u8; 32],
+                    partner: "acme".into(),
+                }),
+            ),
+            (
+                "WarmResumeTrigger",
+                KvMessage::WarmResumeTrigger {
+                    epoch: 1,
+                    prefix_token_len: 1,
+                    model_fingerprint: 1,
+                    prev_chain_id: [0u8; 32],
+                    rank: 0,
+                },
+            ),
+            (
+                "WarmResumeConfirm",
+                KvMessage::WarmResumeConfirm { epoch: 1, ok: true },
+            ),
+            ("WarmResumeCommit", KvMessage::WarmResumeCommit { epoch: 1 }),
+            ("WarmResumeAbort", KvMessage::WarmResumeAbort { epoch: 1 }),
+            (
+                "ReplicatePush",
+                KvMessage::ReplicatePush {
+                    partner: PartnerId("acme".into()),
+                    epoch: 1,
+                    prefix_token_len: 1,
+                    model_fingerprint: 1,
+                    rank: 0,
+                },
+            ),
+            (
+                "Replicate",
+                KvMessage::Replicate {
+                    key: key(),
+                    rank: 0,
+                    manifest: manifest(),
+                    tokens: vec![1],
+                    blob: vec![0u8; 1],
+                },
+            ),
+            (
+                "ReplicateAck",
+                KvMessage::ReplicateAck {
+                    key: key(),
+                    rank: 0,
+                    outcome: ReplicateOutcome::Accepted,
+                },
+            ),
+            (
+                "ReplicaGet",
+                KvMessage::ReplicaGet {
+                    key: key(),
+                    rank: 0,
+                    expected_epoch: 0,
+                    expected_len: 0,
+                },
+            ),
+            (
+                "WarmResumeTriggerV2",
+                KvMessage::WarmResumeTriggerV2 {
+                    partner: PartnerId("acme".into()),
+                    epoch: 1,
+                    prefix_token_len: 1,
+                    model_fingerprint: 1,
+                    prev_chain_id: [0u8; 32],
+                    rank: 0,
+                },
+            ),
+            (
+                "TenantHint",
+                KvMessage::TenantHint {
+                    request_id: [0u8; 16],
+                    partner: "acme".into(),
+                },
+            ),
+            (
+                "GetV2",
+                KvMessage::GetV2 {
+                    partner: PartnerId("acme".into()),
+                    model_fingerprint: 1,
+                    expected_epoch: 1,
+                    expected_len: 1,
+                    rank: 1,
+                },
+            ),
+            (
+                "WarmResumeTriggerV3",
+                KvMessage::WarmResumeTriggerV3 {
+                    partner: PartnerId("acme".into()),
+                    epoch: 1,
+                    prefix_token_len: 1,
+                    model_fingerprint: 1,
+                    prev_chain_id: [0u8; 32],
+                    rank: 0,
+                    candidates: vec![],
+                },
+            ),
+            (
+                "WarmResumeTriggerV4",
+                KvMessage::WarmResumeTriggerV4 {
+                    partner: PartnerId("acme".into()),
+                    epoch: 1,
+                    prefix_token_len: 1,
+                    model_fingerprint: 1,
+                    prev_chain_id: [0u8; 32],
+                    rank: 0,
+                    candidates: vec![],
+                    move_nonce: [0u8; 16],
+                },
+            ),
+            (
+                "WarmResumeAbortV2",
+                KvMessage::WarmResumeAbortV2 {
+                    epoch: 1,
+                    move_nonce: [0u8; 16],
+                },
+            ),
+            (
+                "WarmResumeCommitV2",
+                KvMessage::WarmResumeCommitV2 {
+                    epoch: 1,
+                    move_nonce: [0u8; 16],
+                },
+            ),
+        ];
+        assert_eq!(all.len(), 22, "every declared variant must be listed here");
+        for (index, (name, msg)) in all.iter().enumerate() {
+            let bytes = bincode::serde::encode_to_vec(msg, standard()).unwrap();
+            assert_eq!(
+                usize::from(bytes[0]),
+                index,
+                "{name} must encode as tag {index}"
+            );
+        }
     }
 }
