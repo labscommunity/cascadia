@@ -470,7 +470,7 @@ impl KvPrefixCache {
     }
 }
 
-fn hash_prefix(prefix: &[i64]) -> u64 {
+pub(crate) fn hash_prefix(prefix: &[i64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     let mut h = DefaultHasher::new();
     prefix.hash(&mut h);

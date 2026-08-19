@@ -2267,7 +2267,7 @@ impl Runner {
         if let Some(c) = cache.as_mut() {
             if c.enabled() {
                 let fingerprint = fp.insert(self.fingerprint());
-                if let Some((snap, _)) = c.lookup_local(prompt_ids, fingerprint) {
+                if let Some((snap, plane_pulled)) = c.lookup_local(prompt_ids, fingerprint) {
                     // Restore into the runner's KV buffers. The
                     // restore validates shape against fingerprint;
                     // a failure here means cache + runner disagree on
@@ -2282,6 +2282,14 @@ impl Runner {
                         full_prompt_len = prompt_ids.len(),
                         "kv-prefix-cache HIT — skipping prefix tokens"
                     );
+                    // Anti-self-deception: unconditional provenance for the cert scrape. Not
+                    // `#[cfg(feature = "kv_coord")]` here — this path (and `lookup_local`) compiles
+                    // regardless, so `epoch` uses the cache's own prefix hash rather than the
+                    // kv_coord-gated `kv_coordination::synth_epoch`.
+                    let source = if plane_pulled { "pulled" } else { "local" };
+                    let epoch = crate::kv_prefix_cache::hash_prefix(&prompt_ids[..cache_skip]);
+                    tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                        source, epoch, len = cache_skip);
                 }
             }
         }
