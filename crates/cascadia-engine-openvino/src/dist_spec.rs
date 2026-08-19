@@ -2749,6 +2749,10 @@ impl OvDistSpecEngine {
                     plane_pulled,
                     "ov-dist-spec pipeline warm-resumed"
                 );
+                // Anti-self-deception: unconditional provenance for the cert scrape.
+                let source = if plane_pulled { "pulled" } else { "local" };
+                tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                    source, epoch, len);
                 t_pos
             } else {
                 warn!(

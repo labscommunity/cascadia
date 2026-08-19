@@ -1286,6 +1286,12 @@ impl Qwen36Engine {
                                     .map(|s| s.min(len))
                                     .unwrap_or(len);
                                 info!(task = %task.task_id, warm_prefix = warm, matched = len, plane_pulled, plane_turn, "qwen36 pipeline warm-resumed");
+                                // Anti-self-deception: raw provenance, not `plane_turn` — the AND
+                                // above is identically false in chain mode and would hide a real
+                                // cross-chain pull behind "local".
+                                let source = if plane_pulled { "pulled" } else { "local" };
+                                tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                    source, epoch = kv_epoch, len);
                                 warm
                             } else {
                                 warn!(task = %task.task_id, "qwen36: pipeline restore incomplete; cold reset");
@@ -1932,6 +1938,11 @@ impl Qwen36Engine {
                                 plane_pulled,
                                 "qwen36 single-box warm-resumed from KV blob"
                             );
+                            // Anti-self-deception: unconditional provenance for the cert scrape.
+                            let source = if plane_pulled { "pulled" } else { "local" };
+                            let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                source, epoch, len);
                             warm
                         }
                         None => {

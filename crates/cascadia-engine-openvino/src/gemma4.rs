@@ -944,6 +944,13 @@ impl Gemma4Engine {
                                 plane_pulled,
                                 "gemma4 warm-resumed from KV blob"
                             );
+                            // Anti-self-deception: unconditional provenance, independent of any
+                            // mode gating, so a head warming off its own local capture never
+                            // reads as a cross-chain pull in the cert scrape.
+                            let source = if plane_pulled { "pulled" } else { "local" };
+                            let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
+                            tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                                source, epoch, len);
                         } else {
                             let _ = self.runtime.reset_state();
                             warn!("gemma4: pipeline restore incomplete; cold reprefill");
