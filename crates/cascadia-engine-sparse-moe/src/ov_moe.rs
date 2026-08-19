@@ -900,10 +900,18 @@ impl OvMoeRunner {
         if let Some(c) = cache.as_mut() {
             if c.enabled() {
                 let fingerprint = fp.insert(self.fingerprint());
-                if let Some((snap, _)) = c.lookup_local(&prompt64, fingerprint) {
+                if let Some((snap, plane_pulled)) = c.lookup_local(&prompt64, fingerprint) {
                     cache_skip = snap.past_seq_len;
                     self.restore_kv(&snap)?;
                     cache_hit = true;
+                    // Anti-self-deception: unconditional provenance for the cert scrape. Not
+                    // `#[cfg(feature = "kv_coord")]` here — this path (and `lookup_local`) compiles
+                    // regardless, so `epoch` uses the cache's own prefix hash rather than the
+                    // kv_coord-gated `kv_coordination::synth_epoch`.
+                    let source = if plane_pulled { "pulled" } else { "local" };
+                    let epoch = crate::ov_kv_cache::hash_prefix(&prompt64[..cache_skip]);
+                    tracing::info!(target: "cascadia::kv", event = "kv_warm_provenance",
+                        source, epoch, len = cache_skip);
                 }
             }
         }

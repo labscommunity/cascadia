@@ -267,7 +267,7 @@ impl OvMoeKvPrefixCache {
     }
 }
 
-fn hash_prefix(prefix: &[i64]) -> u64 {
+pub(crate) fn hash_prefix(prefix: &[i64]) -> u64 {
     let mut h = DefaultHasher::new();
     prefix.hash(&mut h);
     h.finish()
