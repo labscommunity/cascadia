@@ -3,7 +3,18 @@
 //! payloads follow a `Found` as their own length-prefixed frames (same envelope). The codec is sync
 //! and buffer-based so it is trivially testable; the async transport read loop wraps it.
 
-use bincode::config::standard;
+use bincode::config::{standard, Config};
+
+/// Decode/encode config with a byte budget == the frame cap. bincode's `standard()` carries NO limit
+/// (`LIMIT = None`), so a native `String`/`Vec` length prefix inside a frame allocates
+/// attacker-controlled bytes BEFORE any post-decode cap check — a ~10-byte hostile frame declaring an
+/// exabyte string aborts the process (OOM). The outer `MAX_FRAME_LEN` check bounds only the input
+/// slice, not the nested collection prefixes. `with_limit` makes an over-budget length a clean
+/// `DecodeError::LimitExceeded` with no allocation. It does not change the encoded bytes, so goldens
+/// and the wire format are unaffected.
+fn wire_config() -> impl Config {
+    standard().with_limit::<{ MAX_FRAME_LEN as usize }>()
+}
 
 use crate::envelope::{KvMessage, MAX_PARTNER_LEN};
 
@@ -40,7 +51,7 @@ pub fn encode_frame(msg: &KvMessage) -> Result<Vec<u8>, FrameError> {
     if !fields_within_caps(msg) {
         return Err(FrameError::TooLarge);
     }
-    let body = bincode::serde::encode_to_vec(msg, standard()).map_err(|_| FrameError::Encode)?;
+    let body = bincode::serde::encode_to_vec(msg, wire_config()).map_err(|_| FrameError::Encode)?;
     if body.len() as u64 > u64::from(MAX_FRAME_LEN) {
         return Err(FrameError::TooLarge);
     }
@@ -65,7 +76,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<(KvMessage, usize), FrameError> {
     if buf.len() < end {
         return Err(FrameError::Incomplete);
     }
-    let (msg, consumed) = bincode::serde::decode_from_slice(&buf[4..end], standard())
+    let (msg, consumed) = bincode::serde::decode_from_slice(&buf[4..end], wire_config())
         .map_err(|_| FrameError::Decode)?;
     // The declared length must match the bincode encoding exactly — trailing junk inside a frame is a
     // structural anomaly; reject rather than silently swallow it.
@@ -194,5 +205,20 @@ mod tests {
         let mut buf = 4u32.to_be_bytes().to_vec();
         buf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
         assert_eq!(decode_frame(&buf), Err(FrameError::Decode));
+    }
+    /// A hostile frame declaring a huge String length must be REFUSED at decode without allocating,
+    /// not abort the process. The byte-limited config turns the over-budget length prefix into a
+    /// clean Decode error. (Regression for the unbounded-alloc DoS: variant tag 5 = Error(String),
+    /// then a varint declaring an ~8-exabyte string with zero string bytes following.)
+    #[test]
+    fn a_forged_giant_string_length_is_refused_not_allocated() {
+        // body: [tag=5][varint len ~ 0x7000_0000_0000_0000] — a valid-looking Error(String) header
+        // whose declared length dwarfs any real input. bincode varint: 0xFB marks a u64 follows.
+        let mut body = vec![5u8, 0xFBu8];
+        body.extend_from_slice(&0x7000_0000_0000_0000u64.to_le_bytes());
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        // len is well under MAX_FRAME_LEN, so the outer check passes; the inner budget must catch it.
+        assert!(matches!(decode_frame(&frame), Err(FrameError::Decode)));
     }
 }

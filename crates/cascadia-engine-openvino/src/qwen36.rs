@@ -126,6 +126,16 @@ fn decode_fp() -> bool {
     std::env::var("CASCADIA_QWEN36_DECODE_FP").ok().as_deref() == Some("1")
 }
 
+/// Gate for the per-turn `qwen36_postprefill_state` fingerprint (and the set_state round-trip
+/// fingerprint): both call `get_state_blob`, a full KV-state copy. Off by default so a `kv_coord`
+/// build pays nothing on the no-move hot path — matches every sibling diagnostic here.
+fn postprefill_fp() -> bool {
+    std::env::var("CASCADIA_QWEN36_POSTPREFILL_FP")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn prefill_chunk() -> usize {
     if std::env::var("CASCADIA_QWEN36_FORCE_T1_PREFILL")
         .ok()
@@ -1379,7 +1389,7 @@ impl Qwen36Engine {
             // the divergence is upstream of decode. If `fps` matches yet the text still differs, the
             // fold is faithful and the flip is in decode. The two cases need different fixes.
             #[cfg(feature = "kv_coord")]
-            {
+            if postprefill_fp() {
                 let (pos, first) = {
                     let t = self.active.as_ref().unwrap();
                     (t.step, t.next_token)
@@ -2270,31 +2280,35 @@ impl Qwen36Engine {
                 self.state_restored = true;
                 return false;
             }
-            // Issue-34 diag: does the OV state round-trip at the DECLARED level? get_state_blob right
-            // after set — if it differs from `part`, set_state is lossy (fixable serialization). If it
-            // matches yet warm still flips vs cold, the delta is OV-internal (blocked layout / higher
-            // precision not captured by the declared blob) = a floor at this OV version.
-            match st.get_state_blob() {
-                Ok(rt) => {
-                    let set_fnv = crate::kv_coordination::fnv1a64(part);
-                    let rt_fnv = crate::kv_coordination::fnv1a64(&rt);
-                    if set_fnv != rt_fnv {
-                        warn!(
-                            set_fnv,
-                            rt_fnv,
-                            set_len = part.len(),
-                            rt_len = rt.len(),
-                            "qwen36_state_roundtrip_mismatch (set_state lossy at declared level)"
-                        );
-                    } else {
-                        info!(
-                            fnv = set_fnv,
-                            len = part.len(),
-                            "qwen36_state_roundtrip_exact (declared state faithful)"
-                        );
+            // Issue-34 diag (gated: extra get_state_blob copy per restored stage): does the OV state
+            // round-trip at the DECLARED level? get_state_blob right after set — if it differs from
+            // `part`, set_state is lossy (fixable serialization). If it matches yet warm still flips vs
+            // cold, the delta is OV-internal (blocked layout / higher precision) = a floor at this OV version.
+            if postprefill_fp() {
+                match st.get_state_blob() {
+                    Ok(rt) => {
+                        let set_fnv = crate::kv_coordination::fnv1a64(part);
+                        let rt_fnv = crate::kv_coordination::fnv1a64(&rt);
+                        if set_fnv != rt_fnv {
+                            warn!(
+                                set_fnv,
+                                rt_fnv,
+                                set_len = part.len(),
+                                rt_len = rt.len(),
+                                "qwen36_state_roundtrip_mismatch (set_state lossy at declared level)"
+                            );
+                        } else {
+                            info!(
+                                fnv = set_fnv,
+                                len = part.len(),
+                                "qwen36_state_roundtrip_exact (declared state faithful)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "qwen36: get_state_blob for round-trip diag failed")
                     }
                 }
-                Err(e) => warn!(error = %e, "qwen36: get_state_blob for round-trip diag failed"),
             }
         }
         // Warm side of CASCADIA_QWEN36_FP_AT: the state as restored, before any suffix fold. Compare
