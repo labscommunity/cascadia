@@ -199,6 +199,38 @@ fn envelope_variants_match_golden() {
                 ],
             },
         ),
+        // D4 move identity (design §B.1): nonce-carrying trigger/abort/commit. Goldened at
+        // introduction, same reasoning as V3 — pin field order and the nonce array encoding.
+        (
+            "env_warm_resume_trigger_v4",
+            KvMessage::WarmResumeTriggerV4 {
+                partner: PartnerId("c".into()),
+                epoch: 9,
+                prefix_token_len: 2,
+                model_fingerprint: 7,
+                prev_chain_id: [9u8; 32],
+                rank: 1,
+                candidates: vec![
+                    ([1u8; 32], CandidateKind::Primary),
+                    ([2u8; 32], CandidateKind::Replica),
+                ],
+                move_nonce: [4u8; 16],
+            },
+        ),
+        (
+            "env_warm_resume_abort_v2",
+            KvMessage::WarmResumeAbortV2 {
+                epoch: 9,
+                move_nonce: [4u8; 16],
+            },
+        ),
+        (
+            "env_warm_resume_commit_v2",
+            KvMessage::WarmResumeCommitV2 {
+                epoch: 9,
+                move_nonce: [4u8; 16],
+            },
+        ),
     ];
     for (name, msg) in variants {
         let bytes = bincode::serde::encode_to_vec(&msg, standard()).unwrap();
@@ -229,6 +261,9 @@ fn declared_index(msg: &KvMessage) -> u8 {
         KvMessage::TenantHint { .. } => 16,
         KvMessage::GetV2 { .. } => 17,
         KvMessage::WarmResumeTriggerV3 { .. } => 18,
+        KvMessage::WarmResumeTriggerV4 { .. } => 19,
+        KvMessage::WarmResumeAbortV2 { .. } => 20,
+        KvMessage::WarmResumeCommitV2 { .. } => 21,
     }
 }
 
@@ -326,8 +361,26 @@ fn every_variant_index_is_pinned() {
             rank: 1,
             candidates: vec![([1u8; 32], CandidateKind::Primary)],
         },
+        KvMessage::WarmResumeTriggerV4 {
+            partner: PartnerId("c".into()),
+            epoch: 9,
+            prefix_token_len: 2,
+            model_fingerprint: 7,
+            prev_chain_id: [9u8; 32],
+            rank: 1,
+            candidates: vec![([1u8; 32], CandidateKind::Primary)],
+            move_nonce: [4u8; 16],
+        },
+        KvMessage::WarmResumeAbortV2 {
+            epoch: 9,
+            move_nonce: [4u8; 16],
+        },
+        KvMessage::WarmResumeCommitV2 {
+            epoch: 9,
+            move_nonce: [4u8; 16],
+        },
     ];
-    assert_eq!(all.len(), 19, "every declared variant must be listed here");
+    assert_eq!(all.len(), 22, "every declared variant must be listed here");
     for (position, msg) in all.iter().enumerate() {
         let tag = bincode::serde::encode_to_vec(msg, standard()).unwrap()[0];
         assert_eq!(
