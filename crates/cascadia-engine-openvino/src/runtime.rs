@@ -1412,6 +1412,12 @@ struct ActiveTask {
     /// pulled/cached KV blob). The prefill feeds only `prompt_ids[warm_prefix..]`. 0 ⇒ cold (full
     /// prefill), so the default path is unchanged.
     warm_prefix: usize,
+    /// Option B: how many leading entries of `generated` are the resume seed.
+    /// The kv_coord capture key must SKIP them — `prompt_ids` already carries
+    /// the resume ids (appended before prefill), so counting the seed again
+    /// would key the blob at an inflated depth that never matches the real
+    /// fed sequence (dist_spec fixed the same defect; this mirrors it).
+    resume_seed_len: usize,
     /// Wall-clock when the task became active. Used to compute the
     /// final tok/s the engine prints in its `task done` log line.
     started: std::time::Instant,
@@ -2100,7 +2106,32 @@ impl OvRuntimeEngine {
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) so the cold
             // prefill below carries them as context. No-op when not resuming.
-            cascadia_types::append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
+            // `resume_ids()` normalizes a wire-legal `Some([])` to "not resuming".
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                // Peer-supplied indices go straight into native prefill; an
+                // out-of-range id is an OV embedding gather crash, not a typed
+                // error — bound them here.
+                let vocab = tok.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let id = task.task_id.clone();
+                    return Ok(vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                    )]);
+                }
+                // Budget already exhausted by the prefix (total = prefix + new
+                // must equal max_tokens): finish Length with ZERO new tokens.
+                // The old flow sampled the first token before its length check
+                // and overshot the budget by one on peer-supplied input.
+                if r.len() >= task.max_tokens.max(1) as usize {
+                    let mut c = Chunk::final_marker(task.task_id.clone(), "");
+                    c.n_tokens = Some(0);
+                    c.finish_reason = Some(cascadia_types::FinishReason::Length);
+                    return Ok(vec![(task.task_id.clone(), c)]);
+                }
+            }
+            cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             // Issue-34 warm-resume: if a pulled/cached KV blob covers a strict prefix of this
             // prompt, restore it and prefill only the suffix. Gated + best-effort — off-rig
             // set_state_blob returns Stub, so this stays cold. Only the stateful (non-static) path.
@@ -2191,11 +2222,11 @@ impl OvRuntimeEngine {
             // merge at the seam) hits that fn's re-anchor arm and degrades to a
             // resync instead of corrupting. Empty seed on a normal turn ⇒
             // identical to today.
-            let resume_seed: Vec<i32> =
-                cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref())
-                    .into_iter()
-                    .map(|t| t as i32)
-                    .collect();
+            let resume_seed: Vec<i32> = cascadia_types::resume_generated_seed(resume.as_deref())
+                .into_iter()
+                .map(|t| t as i32)
+                .collect();
+            let resume_seed_len = resume_seed.len();
             let resume_last_text = if resume_seed.is_empty() {
                 String::new()
             } else {
@@ -2211,6 +2242,7 @@ impl OvRuntimeEngine {
                 prefilled: false,
                 last_token: 0,
                 warm_prefix,
+                resume_seed_len,
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -2304,14 +2336,14 @@ impl OvRuntimeEngine {
             // the prefix it already received. Refuse loudly so the scheduler can surface
             // or re-route it, rather than being told the resume succeeded.
             // (Unreachable at the `packed_slots = 0` default; guards enabling it.)
-            if task
-                .resume_token_ids
-                .as_ref()
-                .is_some_and(|r| !r.is_empty())
-            {
+            if task.resume_ids().is_some() {
+                // Attributed to the refused task: a bare Err from step() fails
+                // whichever packed stream happened to poll and leaves THIS task
+                // hanging with no error chunk (review finding).
                 return Err(EngineError::Backend(
                     "resume (Option B forced prefix) is unsupported on packed slots".into(),
-                ));
+                )
+                .for_task(task.task_id));
             }
             let tok = self
                 .tokenizer
@@ -3106,7 +3138,10 @@ impl OvRuntimeEngine {
             #[cfg(feature = "kv_coord")]
             {
                 let mut full: Vec<i32> = active.prompt_ids.iter().map(|&t| t as i32).collect();
-                full.extend_from_slice(&active.generated);
+                // Skip the resume seed: `prompt_ids` already carries those ids.
+                full.extend_from_slice(
+                    &active.generated[active.resume_seed_len.min(active.generated.len())..],
+                );
                 // H.1b R2: the namespace this turn belongs to, read off THIS task's own state —
                 // never off a plane-asserted value, which describes a pulled entry, not this turn.
                 let tenant = active.task.tenant.clone();

@@ -119,6 +119,35 @@ pub fn resume_generated_seed(resume: Option<&[i32]>) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// Peer-supplied resume ids are indices into the embedding table, so they must
+/// be validated BEFORE any engine feeds them to a native runtime: a negative or
+/// out-of-vocab id is an out-of-range gather in OpenVINO — crash/UB, not a typed
+/// error. `vocab_size: None` skips the upper bound for engines that cannot
+/// cheaply know it; the sign check always applies.
+pub fn validate_resume_ids(ids: &[i32], vocab_size: Option<u32>) -> Result<(), String> {
+    for (i, &id) in ids.iter().enumerate() {
+        if id < 0 {
+            return Err(format!("resume_token_ids[{i}] = {id} is negative"));
+        }
+        if let Some(v) = vocab_size {
+            if id as u32 >= v {
+                return Err(format!("resume_token_ids[{i}] = {id} >= vocab_size {v}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl GenerationTask {
+    /// The normalized resume prefix: `Some(&ids)` only when non-empty. Engines
+    /// MUST branch on this, never on `resume_token_ids.is_some()` — a wire-legal
+    /// `Some([])` is "not resuming", and predicate drift here already produced
+    /// one engine forcing greedy decode on a non-resumed turn.
+    pub fn resume_ids(&self) -> Option<&[i32]> {
+        self.resume_token_ids.as_deref().filter(|r| !r.is_empty())
+    }
+}
+
 impl GenerationTask {
     pub fn new(task_id: impl Into<TaskId>, prompt: impl Into<String>) -> Self {
         Self {
@@ -203,5 +232,31 @@ mod tests {
     fn resume_generated_seed_maps_and_defaults_empty() {
         assert_eq!(resume_generated_seed(None), Vec::<i64>::new());
         assert_eq!(resume_generated_seed(Some(&[5, 6, 7])), vec![5i64, 6, 7]);
+    }
+    #[test]
+    fn resume_ids_normalizes_empty_to_none() {
+        let mut t = GenerationTask::new("t", "p");
+        assert_eq!(t.resume_ids(), None);
+        t.resume_token_ids = Some(vec![]);
+        assert_eq!(t.resume_ids(), None, "wire-legal Some([]) is NOT resuming");
+        t.resume_token_ids = Some(vec![7]);
+        assert_eq!(t.resume_ids(), Some(&[7][..]));
+    }
+
+    #[test]
+    fn validate_resume_ids_bounds() {
+        assert!(validate_resume_ids(&[0, 1, 2], Some(3)).is_ok());
+        assert!(
+            validate_resume_ids(&[3], Some(3)).is_err(),
+            ">= vocab rejected"
+        );
+        assert!(
+            validate_resume_ids(&[-1], None).is_err(),
+            "negative always rejected"
+        );
+        assert!(
+            validate_resume_ids(&[i32::MAX], None).is_ok(),
+            "no vocab => only sign-checked"
+        );
     }
 }
