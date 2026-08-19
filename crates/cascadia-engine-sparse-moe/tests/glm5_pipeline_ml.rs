@@ -58,7 +58,7 @@ async fn step(
         let cfg2 = cfg.clone();
         let hsend = h; // move; reassigned from the relayed hidden below
         let send_task = tokio::spawn(async move {
-            send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz])
+            send_forward(&client, pos as u32, &cfg2, &hsend, [1, 1, hsz], true)
                 .await
                 .unwrap();
         });
@@ -68,7 +68,7 @@ async fn step(
             Some(FrameKind::Forward),
             "relay {i}: expected Forward frame"
         );
-        let (_p, _c, hw, _s) = recv_forward_body_server(&servers[i]).await.unwrap();
+        let (_p, _c, _ph, hw, _s) = recv_forward_body_server(&servers[i]).await.unwrap();
         send_task.await.unwrap();
         h = ranks[i + 1].forward_layers(hw, pos, None);
     }

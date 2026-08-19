@@ -796,13 +796,28 @@ async fn send_hidden_frames(
 /// the stage for the whole idle ceiling (#75 mid-pair protection, carried over
 /// to the seq-prefixed wire). Note this deadlines the hidden on the STATEFUL
 /// path too, which the pre-seq wire left lenient.
+///
+/// A stateful (non-static) stage may instead be handed a bare I8 KV control
+/// frame (CAPTURE/RESTORE) between turns. That frame stands ALONE — no hidden
+/// follows it — so it returns as `(frame, None)` and the caller handles it and
+/// waits again. Peeking here rather than in the caller is what keeps this the
+/// literal body of `recv_hidden_from_upstream`, and so keeps the loopback tests
+/// below covering it: a peek inlined at the call site would be untested.
 async fn recv_hidden_frames(
     upstream: &Arc<tokio::sync::Mutex<ActivationServer>>,
-) -> Result<(WireTensor, WireTensor), cascadia_transport::TransportError> {
+    want_pos: bool,
+) -> Result<(WireTensor, Option<WireTensor>), cascadia_transport::TransportError> {
     let mut guard = upstream.lock().await;
     let lead = guard.recv().await?.0;
+    // A static shard never receives control frames, and its lead is I64 either
+    // way — so the check costs nothing there and cannot shadow an activation.
+    #[cfg(feature = "kv_coord")]
+    if !want_pos && lead.dtype == WireDType::I8 {
+        return Ok((lead, None));
+    }
+    let _ = want_pos;
     let hid = guard.recv_reply().await?.0;
-    Ok((lead, hid))
+    Ok((lead, Some(hid)))
 }
 
 /// Hard ceiling on the active token-response wait, independent of the body
@@ -1984,13 +1999,11 @@ impl OvRuntimeEngine {
         // (idle-between-requests); the hidden that must follow it is deadlined,
         // and the bounded token deadline lives on the active wait downstream.
         //
-        // A stateful KV worker may also receive a bare I8 control frame (CAPTURE)
-        // between turns. It carries no seq and no hidden follows it, so the first frame
-        // is recv'd on its own here rather than through `recv_hidden_frames`:
-        // I8 => handle the control and loop to the next activation.
+        // `recv_hidden_frames` yields no hidden for a bare I8 KV control frame:
+        // handle it and wait again, since the upstream still owes an activation.
         let want_pos = self.static_kv.is_some();
-        // Re-iterates only on the kv_coord control-frame path (I8 CAPTURE → continue); without
-        // kv_coord that branch is compiled out and the body runs exactly once.
+        // Re-iterates only on the kv_coord control-frame path; without kv_coord that
+        // branch is compiled out and the body runs exactly once.
         #[cfg_attr(not(feature = "kv_coord"), allow(clippy::never_loop))]
         loop {
             let upstream = self
@@ -1998,35 +2011,30 @@ impl OvRuntimeEngine {
                 .clone()
                 .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
             debug!(want_pos, "upstream recv: waiting");
-            let first = self
-                .block_on(async move {
-                    let mut guard = upstream.lock().await;
-                    Ok::<_, cascadia_transport::TransportError>(guard.recv().await?.0)
-                })
+            let (lead, hidden) = self
+                .block_on(recv_hidden_frames(&upstream, want_pos))
                 .map_err(|e| EngineError::Backend(e.to_string()))?;
-            info!(dtype = ?first.dtype, len = first.data.len(), want_pos, "ov_tail_upstream_frame_recv");
-            #[cfg(feature = "kv_coord")]
-            if !want_pos && first.dtype == WireDType::I8 {
-                self.handle_inbound_control(&first)?;
-                continue;
-            }
-            // `first` is an activation lead frame: the hidden it promises is a
-            // mid-group frame the peer owes promptly, so it is deadlined.
-            let upstream = self
-                .upstream
-                .clone()
-                .ok_or_else(|| EngineError::Backend("no upstream".into()))?;
-            let tensor = self
-                .block_on(async move {
-                    let mut guard = upstream.lock().await;
-                    Ok::<_, cascadia_transport::TransportError>(guard.recv_reply().await?.0)
-                })
-                .map_err(|e| EngineError::Backend(e.to_string()))?;
+            info!(dtype = ?lead.dtype, len = lead.data.len(), want_pos, "ov_tail_upstream_frame_recv");
+            let tensor = match hidden {
+                Some(t) => t,
+                #[cfg(feature = "kv_coord")]
+                None => {
+                    self.handle_inbound_control(&lead)?;
+                    continue;
+                }
+                // Unreachable without kv_coord: the peek that yields `None` is compiled out.
+                #[cfg(not(feature = "kv_coord"))]
+                None => {
+                    return Err(EngineError::Backend(
+                        "upstream sent a bare KV control frame, but kv_coord is not built".into(),
+                    ))
+                }
+            };
             debug!("upstream recv: frames arrived");
             // Record the seq this stage must echo back on the token it sends
             // upstream; decode/validate outside the transport closure so a bad
             // frame yields a clear EngineError, not a desync.
-            let (inbound_seq, position) = decode_wire_lead(&first, want_pos)?;
+            let (inbound_seq, position) = decode_wire_lead(&lead, want_pos)?;
             self.inbound_seq = Some(inbound_seq);
             let shape = [
                 tensor.shape[0] as usize,
@@ -2049,7 +2057,6 @@ impl OvRuntimeEngine {
             return Ok((floats, shape, position));
         }
     }
-
 
     fn send_token_to_upstream(&mut self, token: i32) -> EngineResult<()> {
         let upstream = self
@@ -6604,7 +6611,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         let (inbound, pos) = decode_wire_lead(&lead, false).unwrap();
         assert!(pos.is_none());
         assert_eq!(inbound, stamped, "seq must survive the hidden hop");
@@ -6624,6 +6632,41 @@ mod tests {
         assert_eq!(tok, 55);
     }
 
+    /// A bare I8 KV control frame arrives BETWEEN turns and stands alone. It must
+    /// come back with no hidden (nothing to wait for — waiting would wedge the
+    /// stage for the frame-idle ceiling), and the activation sent after it must
+    /// still read back intact: the peek must not consume a frame it did not own.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn bare_control_frame_yields_no_hidden_and_does_not_desync_the_next_activation() {
+        let (client, server) = loopback().await;
+        let downstream = Arc::new(tokio::sync::Mutex::new(client));
+        let upstream = Arc::new(tokio::sync::Mutex::new(server));
+
+        let ctrl = WireTensor::new(WireDType::I8, [1, 1, 1], vec![OPCODE_CAPTURE]);
+        downstream.lock().await.send(&ctrl).await.unwrap();
+
+        let (frame, hidden) = recv_hidden_frames(&upstream, false).await.unwrap();
+        assert_eq!(frame.dtype, WireDType::I8, "control frame comes back as-is");
+        assert!(
+            hidden.is_none(),
+            "a control frame promises no hidden — waiting for one would wedge the stage"
+        );
+
+        // The very next activation must be unaffected.
+        let hid = WireTensor::new(WireDType::F16, [1, 1, 2], vec![4, 3, 2, 1]);
+        send_hidden_frames(&downstream, 9, None, hid.clone())
+            .await
+            .unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, false).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
+        assert_eq!(decode_wire_lead(&lead, false).unwrap(), (9, None));
+        assert_eq!(
+            hid_t.data, hid.data,
+            "stream stayed aligned across the control frame"
+        );
+    }
+
     #[tokio::test]
     async fn static_shard_wire_is_lead_then_hidden() {
         // Static path: lead carries [seq, position], hidden follows. Distinct
@@ -6637,7 +6680,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (lead, hid_t) = recv_hidden_frames(&upstream).await.unwrap();
+        let (lead, hid_t) = recv_hidden_frames(&upstream, true).await.unwrap();
+        let hid_t = hid_t.expect("an activation lead is always followed by its hidden");
         assert_eq!(
             decode_wire_lead(&lead, true).unwrap(),
             (3, Some(11)),

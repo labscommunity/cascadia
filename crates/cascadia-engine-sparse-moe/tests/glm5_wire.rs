@@ -68,13 +68,13 @@ async fn glm5_two_rank_over_real_transport_matches_reference() {
         let client2 = client.clone();
         let cfg2 = cfg.clone();
         let send_task = tokio::spawn(async move {
-            send_forward(&client2, pos as u32, &cfg2, &h, [1, 1, hsz])
+            send_forward(&client2, pos as u32, &cfg2, &h, [1, 1, hsz], true)
                 .await
                 .unwrap();
         });
         let k = recv_kind_server(server).await.unwrap();
         assert_eq!(k, Some(FrameKind::Forward));
-        let (_p, _c, hw, _s) = recv_forward_body_server(server).await.unwrap();
+        let (_p, _c, _ph, hw, _s) = recv_forward_body_server(server).await.unwrap();
         send_task.await.unwrap();
         let hw = r1.forward_layers(hw, pos, None);
         argmax(&r1.head_logits(&hw))
