@@ -9,7 +9,7 @@
 //! engine-rev and decoder (OV's opaque single-payload blob vs sparse-MoE's structured per-layer
 //! snapshot), so no shared helper can check both.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cascadia_kv_wire::Manifest;
 
@@ -51,6 +51,12 @@ struct MailboxInner {
     /// the race that was otherwise diagnosable only by inference across two runs.
     empty_drains: u64,
     ever_parked: bool,
+    /// Design §B.1: fired with the epoch whenever `take` actually drains a slice to the engine —
+    /// the enterprise's only way to observe that drain, since it runs inside the engine's own recv
+    /// loop and cannot be intercepted from outside. `Arc`, not `Box`, so it can be cloned out from
+    /// under the lock before being called (calling it while the mutex is held would deadlock a hook
+    /// that re-enters this mailbox).
+    on_take: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 impl KvHandoffMailbox {
@@ -62,6 +68,13 @@ impl KvHandoffMailbox {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MailboxInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register the drain-observability hook (design §B.1). Registered once at wiring time;
+    /// a later call replaces any previous registration. No-op-by-default when never called — the
+    /// engine's own drain path (`take`) is unchanged either way.
+    pub fn set_on_take(&self, hook: Box<dyn Fn(u64) + Send + Sync>) {
+        self.lock().on_take = Some(Arc::from(hook));
     }
 
     /// Overwrites any unconsumed slice: only the newest pull can still be ahead of the engine's
@@ -111,6 +124,7 @@ impl KvHandoffMailbox {
             }
         }
         let slot = g.slot.take();
+        let mut taken_epoch = None;
         match &slot {
             Some(s) => {
                 g.drained = Some(s.epoch);
@@ -119,6 +133,7 @@ impl KvHandoffMailbox {
                 // slice read as "dropped as foreign, rank provably cold" — suppressing `too_late`
                 // and breaking the upper-bound property `aborts_too_late` documents.
                 g.dropped = None;
+                taken_epoch = Some(s.epoch);
             }
             None => {
                 g.empty_drains += 1;
@@ -143,6 +158,15 @@ impl KvHandoffMailbox {
                         count = g.empty_drains, ever_parked = false);
                 }
             }
+        }
+        let hook = g.on_take.clone();
+        drop(g);
+        // Fire outside the lock: a hook that re-enters this mailbox (e.g. to read counters) would
+        // deadlock against its own drain otherwise. Only a genuine drain fires it — not the
+        // epoch-mismatch drop above (that's a foreign slice discarded, never taken) and not an
+        // empty drain.
+        if let (Some(hook), Some(epoch)) = (hook, taken_epoch) {
+            hook(epoch);
         }
         slot
     }
@@ -225,5 +249,84 @@ impl crate::KvWarmHandoff for KvHandoffMailbox {
 
     fn clear(&self, epoch: u64) -> bool {
         KvHandoffMailbox::clear(self, epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn manifest() -> Manifest {
+        Manifest {
+            schema_version: cascadia_kv_wire::SCHEMA_VERSION,
+            kv_layout_version: cascadia_kv_wire::KV_LAYOUT_VERSION,
+            engine_rev: 0,
+            partner: cascadia_kv_wire::PartnerId("acme".into()),
+            model_fingerprint: 1,
+            prefix_token_hash: 1,
+            prefix_token_len: 0,
+            snapshot_epoch: 0,
+            num_layers: 0,
+            layers: vec![],
+            token_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn on_take_fires_once_with_the_taken_epoch() {
+        let mb = KvHandoffMailbox::new();
+        let seen = Arc::new(AtomicU64::new(0));
+        let fires = Arc::new(AtomicU64::new(0));
+        let (seen2, fires2) = (Arc::clone(&seen), Arc::clone(&fires));
+        mb.set_on_take(Box::new(move |epoch| {
+            seen2.store(epoch, Ordering::SeqCst);
+            fires2.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        mb.put(0x42, manifest(), vec![]);
+        let taken = mb.take(0x42);
+
+        assert!(taken.is_some(), "take must still return the parked slice");
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            1,
+            "hook must fire exactly once"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0x42,
+            "hook must see the taken epoch"
+        );
+    }
+
+    #[test]
+    fn clear_does_not_fire_on_take() {
+        let mb = KvHandoffMailbox::new();
+        let fires = Arc::new(AtomicU64::new(0));
+        let fires2 = Arc::clone(&fires);
+        mb.set_on_take(Box::new(move |_epoch| {
+            fires2.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        mb.put(0x7, manifest(), vec![]);
+        assert!(mb.clear(0x7), "a parked slice must report as retracted");
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "clear must never fire the take hook"
+        );
+    }
+
+    #[test]
+    fn unregistered_hook_does_not_panic() {
+        let mb = KvHandoffMailbox::new();
+        mb.put(0x9, manifest(), vec![]);
+        // No panic, and the drain behaves exactly as before the hook existed.
+        assert!(mb.take(0x9).is_some());
+        assert!(
+            mb.take(0x9).is_none(),
+            "second take on an empty mailbox is a no-op"
+        );
     }
 }
