@@ -42,8 +42,7 @@ impl Engine for MockEngine {
         }
         // Option B resume: the seed ids are already-emitted, so start the
         // echo cursor past them. They are never re-emitted by step().
-        let seed_len =
-            cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref()).len();
+        let seed_len = cascadia_types::resume_generated_seed(task.resume_ids()).len();
         self.pending.push((task, seed_len));
         Ok(())
     }

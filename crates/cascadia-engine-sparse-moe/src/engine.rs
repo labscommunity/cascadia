@@ -1416,13 +1416,37 @@ impl SparseMoEEngine {
         // Option B forced-prefix resume: append the already-emitted assistant
         // tokens after the rendered prompt (concat, not replace) so prefill
         // below carries them as context/KV history. No-op when not resuming.
-        append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
-        let max_new = resume_max_new(task.max_tokens, task.resume_token_ids.as_deref());
+        // `resume_ids()` normalizes a wire-legal `Some([])` to "not resuming" —
+        // the old `is_some()` predicate forced greedy decode on such a turn.
+        let resume = task.resume_ids().map(<[i32]>::to_vec);
+        if let Some(r) = resume.as_deref() {
+            // Peer-supplied indices reach native prefill; bound them first
+            // (also makes the u32 casts below safe).
+            let vocab = tokenizer.get_vocab_size(true) as u32;
+            if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                let id = task.task_id.clone();
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("invalid resume prefix: {e}")),
+                )];
+            }
+        }
+        append_resume_ids(&mut prompt_ids, resume.as_deref());
+        // Non-resume keeps the base contract: max_tokens == 0 still yields one
+        // token (`.max(1)`, matching gemma4/qwen36/ov-runtime). Only a RESUMED
+        // turn may land at zero new tokens (budget exhausted by the prefix) —
+        // review found this branch had silently flipped the plain max_tokens=0
+        // behavior from 1 token to 0.
+        let max_new = if resume.is_some() {
+            resume_max_new(task.max_tokens, resume.as_deref())
+        } else {
+            task.max_tokens.max(1) as usize
+        };
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: a resumed turn MUST decode greedily — sampling would let
         // the continuation diverge from what the client already has. temperature
         // <= 0.0 takes the deterministic argmax path in `sampling::sample`.
-        if task.resume_token_ids.is_some() {
+        if resume.is_some() {
             sampling_cfg.temperature = 0.0;
         }
         if max_new == 0 {
@@ -1492,13 +1516,48 @@ impl SparseMoEEngine {
         // ("hello" + "▁world" -> "helloworld" instead of "hello world").
         // Decode prefix+tail together and slice off the prefix's decoded
         // bytes so the tail keeps its seam spacing.
-        let text = if let Some(resume) = task.resume_token_ids.as_deref() {
-            let prefix_u32: Vec<u32> = resume.iter().map(|&i| i as u32).collect();
-            let prefix_text = tokenizer.decode(&prefix_u32, true).unwrap_or_default();
+        let text = if let Some(r) = resume.as_deref() {
+            let prefix_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
+            // Propagate decode errors — `unwrap_or_default()` on the PREFIX
+            // decode made the slice offset 0, re-emitting the entire forced
+            // prefix to the client (the exact defect dist_spec's comment warns
+            // about); on the FULL decode it silently dropped the whole tail.
+            let prefix_text = match tokenizer.decode(&prefix_u32, true) {
+                Ok(t) => t,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    return vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("resume seed decode failed: {e}")),
+                    )];
+                }
+            };
             let mut full_u32 = prefix_u32;
             full_u32.extend(generated.iter().map(|&i| i as u32));
-            let full_text = tokenizer.decode(&full_u32, true).unwrap_or_default();
-            full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+            let full_text = match tokenizer.decode(&full_u32, true) {
+                Ok(t) => t,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    return vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("resume tail decode failed: {e}")),
+                    )];
+                }
+            };
+            // Divergence guard: the blind byte-offset slice assumes the prefix
+            // decode is a byte-prefix of the full decode. A byte-level seam
+            // (chain A held back a partial UTF-8 char whose token IS in the
+            // prefix) breaks that: U+FFFD bytes in `prefix_text` resolve to
+            // different bytes in `full_text`, and an unlucky boundary silently
+            // re-emits prefix bytes or drops seam text. Re-anchor instead —
+            // emit only what provably follows the prefix (same contract as the
+            // shim's `advance_emitted`).
+            if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
+                full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+            } else {
+                warn!(task = %task.task_id, "resume seam diverged; re-anchoring (tail delta dropped)");
+                String::new()
+            }
         } else {
             let ids_u32: Vec<u32> = generated.iter().map(|&i| i as u32).collect();
             let mut t = tokenizer
@@ -1555,13 +1614,43 @@ impl SparseMoEEngine {
         // tokens after the rendered prompt (concat, not replace) — the
         // distributed prefill loop below is agnostic to id origin, so the
         // appended ids prefill naturally. No-op when not resuming.
-        append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
-
-        let max_new = resume_max_new(task.max_tokens, task.resume_token_ids.as_deref());
+        // `resume_ids()` normalizes a wire-legal `Some([])` to "not resuming" —
+        // the old `is_some()` predicate forced greedy decode on such a turn.
+        let resume = task.resume_ids().map(<[i32]>::to_vec);
+        if let Some(r) = resume.as_deref() {
+            // Peer-supplied indices reach native prefill; bound them first
+            // (also makes the u32 casts below safe).
+            // `tok` above is scoped to the prompt_ids block; re-borrow. The
+            // else-branch there already returned when the tokenizer is absent,
+            // so unwrap_or(0) is unreachable-but-safe.
+            let vocab = self
+                .tokenizer
+                .as_ref()
+                .map(|t| t.get_vocab_size(true))
+                .unwrap_or(0) as u32;
+            if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                let id = task.task_id.clone();
+                return vec![(
+                    id.clone(),
+                    Chunk::error(id, format!("invalid resume prefix: {e}")),
+                )];
+            }
+        }
+        append_resume_ids(&mut prompt_ids, resume.as_deref());
+        // Non-resume keeps the base contract: max_tokens == 0 still yields one
+        // token (`.max(1)`, matching gemma4/qwen36/ov-runtime). Only a RESUMED
+        // turn may land at zero new tokens (budget exhausted by the prefix) —
+        // review found this branch had silently flipped the plain max_tokens=0
+        // behavior from 1 token to 0.
+        let max_new = if resume.is_some() {
+            resume_max_new(task.max_tokens, resume.as_deref())
+        } else {
+            task.max_tokens.max(1) as usize
+        };
         let mut sampling_cfg = sampling_from_task(&task);
         // Option B: force greedy decode on a resumed turn so the continuation
         // is deterministic (see step_single_stage for rationale).
-        if task.resume_token_ids.is_some() {
+        if resume.is_some() {
             sampling_cfg.temperature = 0.0;
         }
         if max_new == 0 {
@@ -1786,13 +1875,48 @@ impl SparseMoEEngine {
         // Option B §17: see step_single_stage for why a resumed turn must
         // decode prefix+tail together (preserves the seam space that a
         // tail-only decode would strip at sequence-start).
-        let text = if let Some(resume) = task.resume_token_ids.as_deref() {
-            let prefix_u32: Vec<u32> = resume.iter().map(|&i| i as u32).collect();
-            let prefix_text = tokenizer.decode(&prefix_u32, true).unwrap_or_default();
+        let text = if let Some(r) = resume.as_deref() {
+            let prefix_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
+            // Propagate decode errors — `unwrap_or_default()` on the PREFIX
+            // decode made the slice offset 0, re-emitting the entire forced
+            // prefix to the client (the exact defect dist_spec's comment warns
+            // about); on the FULL decode it silently dropped the whole tail.
+            let prefix_text = match tokenizer.decode(&prefix_u32, true) {
+                Ok(t) => t,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    return vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("resume seed decode failed: {e}")),
+                    )];
+                }
+            };
             let mut full_u32 = prefix_u32;
             full_u32.extend(result_tokens.iter().map(|&i| i as u32));
-            let full_text = tokenizer.decode(&full_u32, true).unwrap_or_default();
-            full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+            let full_text = match tokenizer.decode(&full_u32, true) {
+                Ok(t) => t,
+                Err(e) => {
+                    let id = task.task_id.clone();
+                    return vec![(
+                        id.clone(),
+                        Chunk::error(id, format!("resume tail decode failed: {e}")),
+                    )];
+                }
+            };
+            // Divergence guard: the blind byte-offset slice assumes the prefix
+            // decode is a byte-prefix of the full decode. A byte-level seam
+            // (chain A held back a partial UTF-8 char whose token IS in the
+            // prefix) breaks that: U+FFFD bytes in `prefix_text` resolve to
+            // different bytes in `full_text`, and an unlucky boundary silently
+            // re-emits prefix bytes or drops seam text. Re-anchor instead —
+            // emit only what provably follows the prefix (same contract as the
+            // shim's `advance_emitted`).
+            if full_text.as_bytes().starts_with(prefix_text.as_bytes()) {
+                full_text.get(prefix_text.len()..).unwrap_or("").to_string()
+            } else {
+                warn!(task = %task.task_id, "resume seam diverged; re-anchoring (tail delta dropped)");
+                String::new()
+            }
         } else {
             let ids_u32: Vec<u32> = result_tokens.iter().map(|&i| i as u32).collect();
             let mut t = tokenizer

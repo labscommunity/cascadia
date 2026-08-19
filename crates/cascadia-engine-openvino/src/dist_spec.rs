@@ -1509,8 +1509,27 @@ impl Engine for OvDistSpecEngine {
             // Option B forced-prefix resume: append the already-emitted assistant
             // tokens after the rendered prompt (concat, not replace) — flows into
             // BOTH the draft and target prefill via start_task's shared feed_ids.
-            // No-op when not resuming.
-            cascadia_types::append_resume_ids(&mut prompt_ids, task.resume_token_ids.as_deref());
+            // No-op when not resuming (`resume_ids()` normalizes `Some([])` too).
+            let resume = task.resume_ids().map(<[i32]>::to_vec);
+            if let Some(r) = resume.as_deref() {
+                // Peer-supplied indices reach native OV prefill — bound them first.
+                let vocab = self.tokenizer.get_vocab_size(true) as u32;
+                if let Err(e) = cascadia_types::validate_resume_ids(r, Some(vocab)) {
+                    let task_id = task.task_id.clone();
+                    let c = Chunk::error(task.task_id, format!("invalid resume prefix: {e}"));
+                    return Ok(vec![(task_id, c)]);
+                }
+                // Exhausted budget (prefix >= max_tokens): finish Length with ZERO
+                // new tokens BEFORE start_task — start_task unconditionally samples
+                // and pushes the first token, which would overshoot the budget.
+                if r.len() >= task.max_tokens.max(1) as usize {
+                    let mut c = Chunk::final_marker(task.task_id.clone(), "");
+                    c.n_tokens = Some(0);
+                    c.finish_reason = Some(cascadia_types::FinishReason::Length);
+                    return Ok(vec![(task.task_id.clone(), c)]);
+                }
+            }
+            cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
             info!(
                 task = %task.task_id,
                 prompt_tokens = prompt_ids.len(),
@@ -1577,8 +1596,11 @@ impl Engine for OvDistSpecEngine {
                     // presented as complete and issue-34's splicer — which only triggers on
                     // a surfaced error — never fires. Clearing `active` first (as runtime.rs
                     // does) keeps a stale task from wedging the next `submit()`.
+                    // `for_task` is load-bearing: an unattributed Err from step() makes the
+                    // runner fail whichever queued stream happened to poll, while THIS
+                    // task's stream hangs with nothing further (review finding).
                     self.active = None;
-                    return Err(e);
+                    return Err(e.for_task(task_id));
                 }
                 Ok(RoundResult {
                     delta,
@@ -1680,7 +1702,7 @@ impl OvDistSpecEngine {
         // `emitted` with the seed's DECODED BYTES so `decode_delta` hands the client
         // only `full[emitted.len()..]` — the forced prefix is never re-emitted.
         // Empty on a normal turn ⇒ identical to today.
-        let mut out = cascadia_types::resume_generated_seed(task.resume_token_ids.as_deref());
+        let mut out = cascadia_types::resume_generated_seed(task.resume_ids());
         // Captured BEFORE `out.push(first)`: the kv_coord capture key must count
         // only the resumed prefix, not the freshly sampled token.
         let resume_seed_len = out.len();
