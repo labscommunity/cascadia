@@ -303,6 +303,12 @@ pub trait KvWarmHandoff: Send + Sync {
     ///
     /// Deliberately no default: an impl that cannot retract has to say so in its own body.
     fn clear(&self, epoch: u64) -> bool;
+
+    /// Register the drain-observability hook (design §B.1): fired with the epoch whenever this
+    /// handoff's drain actually takes a parked slice. Default no-op so implementors that never
+    /// wire an observer need no override; `Arc<dyn KvWarmHandoff>` is the only handle
+    /// [`Engine::kv_handoff`] exposes, so this is the sole way an enterprise wrapper can reach it.
+    fn set_on_take(&self, _hook: Box<dyn Fn(u64) + Send + Sync>) {}
 }
 
 pub trait Engine: Send {
