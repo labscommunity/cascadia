@@ -1278,6 +1278,28 @@ fn chunk_take(c: usize, remaining: usize, position: usize, past_len: usize) -> u
     c.min(remaining).min(window)
 }
 
+/// Effective prefill span for the STATEFUL branch. Default `usize::MAX` = the whole span in ONE
+/// pass (unchanged, fastest).
+///
+/// `CASCADIA_RUNTIME_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A
+/// warm-resumed SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens
+/// at 0) otherwise hit different GEMM batch shapes; over int4 weights the rounding delta flips a
+/// token, so cross-chain warm != cold byte-identical. Under T=1 both traverse the identical
+/// per-token kernel ⇒ bit-identical. Opt-in only — production keeps the single-pass prefill
+/// (warm-resume stays greedy-equivalent there, not bit-identical). Mirrors
+/// `gemma4::prefill_chunk`/`qwen36::prefill_chunk`.
+fn prefill_chunk() -> usize {
+    if std::env::var("CASCADIA_RUNTIME_FORCE_T1_PREFILL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        1
+    } else {
+        usize::MAX
+    }
+}
+
 /// Primary input of one prefill chunk: prompt ids on the embed stage, hidden
 /// rows (`hid` floats per token, row-major) on relay/head stages. Conversion
 /// into the IR's dtype happens directly inside the reusable `primary_buf`.
@@ -2903,29 +2925,69 @@ impl OvRuntimeEngine {
             // warm-resume feeds the suffix at position = real KV depth, where mask_len = kv_depth +
             // input_len holds, so one batched forward works. (The per-token feed it replaces was a
             // workaround for the now-fixed off-by-one and stalled the suffix past the gateway deadline.)
-            let position = self.position;
-            let ts = std::time::Instant::now();
-            let (out, shape) = self.run_first(&tokens, position)?;
-            let alpha = ts.elapsed();
-            self.position += tokens.len() as i64;
-            // 1-token prompt prefill costs the same downstream as a decode
-            // step — keep the strict deadline (mirrors step_middle's
-            // shape[1] > 1) so wedge eviction stays fast.
-            let (nt, wire) = self.resolve_next_token(
-                &out,
-                &shape,
-                single_stage,
-                position,
-                prefill && tokens.len() > 1,
-            )?;
-            if let Some(a) = self.active.as_mut() {
-                a.t_alpha_compute += alpha;
-                a.t_wire += wire;
-                if prefill {
+            //
+            // Issue-34 (C6): fold the prefill in `prefill_chunk()`-sized spans. Default = whole span
+            // (one pass, unchanged/fastest). CASCADIA_RUNTIME_FORCE_T1_PREFILL=1 ⇒ T=1, so a
+            // warm-resumed SUFFIX prefill and a cold FULL prefill traverse the identical per-token
+            // kernel. Without it the two use different GEMM batch shapes (e.g. 22 vs 93 tokens) over
+            // int4 weights, and the rounding delta flips a token ⇒ cross-chain warm != cold. Mirrors
+            // gemma4/qwen36's FORCE_T1_PREFILL.
+            let chunk = prefill_chunk();
+            if prefill && tokens.len() > 1 && chunk < tokens.len() {
+                let mut nt = 0i32;
+                let mut i = 0usize;
+                loop {
+                    let end = (i + chunk).min(tokens.len());
+                    let span = &tokens[i..end];
+                    let pos = self.position;
+                    let ts = std::time::Instant::now();
+                    let (out, shape) = self.run_first(span, pos)?;
+                    let alpha = ts.elapsed();
+                    self.position += span.len() as i64;
+                    // Always use the widened prefill deadline here even for T=1 spans: this is
+                    // part of a prefill, and the first span after a warm RESTORE follows a heavy
+                    // set_state on the downstream stage — the strict decode budget wedges there.
+                    let (token, wire) =
+                        self.resolve_next_token(&out, &shape, single_stage, pos, true)?;
+                    if let Some(a) = self.active.as_mut() {
+                        a.t_alpha_compute += alpha;
+                        a.t_wire += wire;
+                    }
+                    nt = token;
+                    i = end;
+                    if i >= tokens.len() {
+                        break;
+                    }
+                }
+                if let Some(a) = self.active.as_mut() {
                     a.t_prefill = a.started.elapsed();
                 }
+                nt
+            } else {
+                let position = self.position;
+                let ts = std::time::Instant::now();
+                let (out, shape) = self.run_first(&tokens, position)?;
+                let alpha = ts.elapsed();
+                self.position += tokens.len() as i64;
+                // 1-token prompt prefill costs the same downstream as a decode
+                // step — keep the strict deadline (mirrors step_middle's
+                // shape[1] > 1) so wedge eviction stays fast.
+                let (nt, wire) = self.resolve_next_token(
+                    &out,
+                    &shape,
+                    single_stage,
+                    position,
+                    prefill && tokens.len() > 1,
+                )?;
+                if let Some(a) = self.active.as_mut() {
+                    a.t_alpha_compute += alpha;
+                    a.t_wire += wire;
+                    if prefill {
+                        a.t_prefill = a.started.elapsed();
+                    }
+                }
+                nt
             }
-            nt
         };
 
         self.emit_token(next_token)
